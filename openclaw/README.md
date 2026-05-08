@@ -86,7 +86,57 @@ If you want to open a direct session with a specialized agent (bypassing the coo
 - **Development Team Agent**:
   ```bash
   openclaw tui --session agent:devteam:main
-  ```
+  ```## Showcasing the Harness in Action (Demo Scenarios)
+
+After running the installer, you can immediately test and showcase the advanced capabilities of the Kubernetes agentic harness using these structured chat scenarios. 
+
+To run these, start the standard TUI session to chat with the **Main Coordinator** (using `openclaw tui`).
+
+### 1. Infrastructure Scope Binding (Cluster Operator Agent)
+*   **Scenario**: Tell the active `operator` agent to bind its operational scope to a target cluster and region.
+*   **Chat Command**:
+    ```bash
+    @operator Use cluster 'payment-prod' in 'us-central1'.
+    ```
+*   **Expected Behavior**: The `operator` agent will parse the request, locate the `payment-prod` context in `us-central1`, configure its internal `kubectl` credentials, and respond with confirmation of its new active target scope.
+
+### 2. Workload Onboarding & Deployment (Development Team Agent)
+*   **Scenario**: Instruct the active `devteam` agent to deploy a specific application to a target namespace.
+*   **Chat Command**:
+    ```bash
+    @devteam Deploy the payment-gateway application to the 'payment' namespace.
+    ```
+*   **Expected Behavior**: The `devteam` agent will generate the necessary deployment and service manifests, verify them against Pod Security Standards, execute the rollout in the `payment` namespace, and return proof (such as Git SHAs, container digests, and successful rollout status).
+
+### 3. GitOps Manifest Resiliency & Autonomy (Development Team Agent)
+*   **Scenario**: Ask the `devteam` agent to configure node-failure resiliency for a deployment. The agent must autonomously determine and apply the correct Kubernetes strategy (such as configuring `PodAntiAffinity` or pod topology spread constraints) without being given the solution.
+*   **Chat Command**:
+    ```bash
+    @devteam Make my payment-gateway deployment tolerant to node failures.
+    ```
+*   **Expected Behavior**: The `devteam` agent will audit the deployment manifest, identify that all replicas could fail if a single node goes down, autonomously inject a `podAntiAffinity` block into the manifest, apply the change via GitOps, and explain the rationale for its fix.
+
+### 4. Proactive Audit & Auto-Remediation (Cluster Operator Agent)
+*   **Scenario**: Manually trigger a diagnostic patrol to show how the agent identifies and automatically remediates infrastructure failures (e.g., simulating a hung worker node `kubelet` that causes `NodeNotReady`).
+*   **Chat Command**:
+    ```bash
+    @operator Perform a cluster health check.
+    ```
+*   **Expected Behavior**: The `operator` agent will scan all nodes, identify a node in `NotReady` status, execute its remediation playbook to automatically restart the hung `kubelet` process via SSH, verify the node returns to `Ready`, and post a clean incident timeline and trace log summary to the chat.
+
+### 5. Cross-Agent Handoff & Resource Negotiation (Visible Collaboration)
+*   **Scenario**: Showcase how the `operator` and `devteam` agents collaborate, negotiate resource optimizations, and relay requests transparently.
+*   **Trigger Command**:
+    ```bash
+    @operator Analyze resource utilization and suggest optimizations.
+    ```
+*   **Expected Cooperative Flow**:
+    1.  `operator` audits metrics, identifies potential savings by bin-packing, and sends a direct request: `@devteam Proposing a 30% reduction in on-demand nodes for payment-gateway to optimize resource spending. Do you approve?`
+    2.  The `main` agent automatically intercepts and **relays** this proposal to the `devteam` session.
+    3.  `devteam` audits its historical latency profiles and SLO metrics, determines that CPU throttling would cause unacceptable cold-start degradation, and replies: `@operator Rejecting proposal. Historical performance telemetry shows CPU throttling causes severe cold-start latency degradation, violating our payment-gateway SLO.`
+    4.  `main` automatically **relays** the rejection back to `operator` and **mirrors the entire negotiation chat thread** to your active TUI chat screen, allowing the human operator to transparently review the collaborative cost-vs-performance decision.
+
+---
 
 ## References
 

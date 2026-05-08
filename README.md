@@ -26,6 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/openclaw/
 
 For more details, see the [OpenClaw Integration Guide](openclaw/README.md).
 
+### Showcasing in Action
+To immediately test and demonstrate the harness's dynamic routing, automated remediation, and cross-agent negotiations, follow our step-by-step [Showcase & Demo Scenarios guide](openclaw/README.md#showcasing-the-harness-in-action-demo-scenarios).
+
 #### Installing from a Custom Branch or Fork
 
 If you want to install from a forked repository or a custom branch (for example, to test changes), you should export `REPO` and `BRANCH` environment variables before running the install script. This ensures both `curl` and the installer use the correct sources:
