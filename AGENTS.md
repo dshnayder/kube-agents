@@ -19,8 +19,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 This repository is primarily a configuration and documentation repository for AI agents. It does not contain code that requires compilation or traditional building.
 
 To use these agents:
-1. Follow the instructions in [INSTALL.md](file:///usr/local/google/home/bhoekstra/kube-agents/INSTALL.md) to set up and register the Platform Agent in your agent harness.
-2. Refer to [workspace/README.md](file:///usr/local/google/home/bhoekstra/kube-agents/workspace/README.md) for details on how to interact with the cooperative agent layout, use routing shortcuts, and run demo scenarios.
+1. Follow the instructions in [INSTALL.md](INSTALL.md) to set up and register the Platform Agent in your agent harness.
+2. Refer to [workspace/README.md](workspace/README.md) for details on how to interact with the cooperative agent layout, use routing shortcuts, and run demo scenarios.
 
 ## Skills Guidelines
 
