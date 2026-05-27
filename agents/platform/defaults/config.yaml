@@ -1,0 +1,7 @@
+mcp_servers:
+  platform_control:
+    command: "python3"
+    args: ["/opt/data/scripts/platform_mcp_server.py"]
+    connect_timeout: 120
+    # 5-minute timeout to support long GKE reasoning chains
+    timeout: 300
