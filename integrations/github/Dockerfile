@@ -2,18 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies needed for cryptography compilation
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libssl-dev \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Create a non-privileged user
+RUN useradd -u 10001 -m -U appuser && \
+    chown -R appuser:appuser /app
 
-# Install python-cryptography
+# Install python-cryptography (uses precompiled wheels)
 RUN pip install --no-cache-dir cryptography
 
+USER 10001
+
 # Copy application script
-COPY broker.py .
+COPY --chown=appuser:appuser broker.py .
 
 EXPOSE 8080
 
