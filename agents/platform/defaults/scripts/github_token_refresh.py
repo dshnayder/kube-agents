@@ -33,10 +33,15 @@ def get_current_git_repo() -> str:
         # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
         if url.endswith(".git"):
             url = url[:-4]
-        if ":" in url:
-            return url.split(":")[-1]
-        elif "/" in url:
-            parts = url.split("/")
+        # Remove protocol prefix if present (e.g. https://)
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        # If SSH format, split by ':' (e.g. git@github.com:owner/repo)
+        if "@" in url and ":" in url:
+            url = url.split(":", 1)[1]
+        
+        parts = url.strip("/").split("/")
+        if len(parts) >= 2:
             return f"{parts[-2]}/{parts[-1]}"
     except Exception as e:
         log(f"WARNING: Could not parse repository from git config: {e}")
