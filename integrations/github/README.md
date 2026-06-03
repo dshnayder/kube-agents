@@ -1,6 +1,6 @@
 # GitHub Token Broker (Minty)
 
-The **GitHub Token Broker** is implemented using the open-source **`abcxyz/github-token-minter`** (Minty) service. It acts as an authentication proxy for GKE agents, abstracting the master GitHub App private key. It ensures that client agents (such as `platform-agent`) only handle short-lived, repository-scoped installation tokens.
+The **GitHub Token Broker** is implemented using the open-source [abcxyz/github-token-minter](https://github.com/abcxyz/github-token-minter) (Minty) service. It acts as an authentication proxy for GKE agents, abstracting the master GitHub App private key. It ensures that client agents (such as `platform-agent`) only handle short-lived, repository-scoped installation tokens.
 
 ---
 
