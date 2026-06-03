@@ -149,7 +149,7 @@ Minty uses GCP KMS for asymmetric signing using the GitHub App private key.
 
 Create `minty-configmap.yaml` defining access rules for your repositories. Note that the key name in the ConfigMap data maps to the path `/etc/minty/{org}/{repo}.yaml` (using `subPath` mounts).
 
-Example for `dshnayder/infra` repository:
+Example for `YOUR_GITHUB_ORG_OR_USER/YOUR_GITHUB_REPO` repository:
 
 ```yaml
 apiVersion: v1
@@ -158,7 +158,7 @@ metadata:
   name: github-token-minter-config
   namespace: agent-system
 data:
-  dshnayder-infra.yaml: |
+  YOUR_GITHUB_ORG_OR_USER-YOUR_GITHUB_REPO.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
       # Allow GKE cluster OIDC issuer
@@ -168,7 +168,7 @@ data:
         rule:
           if: "assertion.sub == 'system:serviceaccount:agent-system:platform-agent'"
         repositories:
-          - 'infra'
+          - 'YOUR_GITHUB_REPO'
         permissions:
           contents: 'write'
           pull_requests: 'write'

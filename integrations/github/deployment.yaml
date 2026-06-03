@@ -71,8 +71,8 @@ spec:
               memory: "256Mi"
           volumeMounts:
             - name: config-volume
-              mountPath: /etc/minty/dshnayder/infra.yaml
-              subPath: dshnayder-infra.yaml
+              mountPath: /etc/minty/YOUR_GITHUB_ORG_OR_USER/YOUR_GITHUB_REPO.yaml
+              subPath: YOUR_GITHUB_ORG_OR_USER-YOUR_GITHUB_REPO.yaml
       volumes:
         - name: config-volume
           configMap:
