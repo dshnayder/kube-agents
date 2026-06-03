@@ -84,17 +84,14 @@ gcloud iam service-accounts create github-token-minter-sa \
     --description="Service Account for the GitHub Token Minter" \
     --display-name="GitHub Token Minter SA"
 
-# 2. Create the corresponding Kubernetes Service Account (KSA)
-kubectl create serviceaccount github-token-minter-ksa -n agent-system
+# 2. Deploy the Kubernetes Service Account (KSA) (ensure you update placeholders in serviceaccount.yaml first)
+kubectl apply -f serviceaccount.yaml
 
 # 3. Allow GKE KSA to impersonate GCP SA
 gcloud iam service-accounts add-iam-policy-binding github-token-minter-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:YOUR_PROJECT_ID.svc.id.goog[agent-system/github-token-minter-ksa]"
 
-# 4. Annotate the KSA
-kubectl annotate serviceaccount github-token-minter-ksa -n agent-system \
-    iam.gke.io/gcp-service-account=github-token-minter-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
 ```
 
 ### Step 2: GCP KMS Setup and Key Import
