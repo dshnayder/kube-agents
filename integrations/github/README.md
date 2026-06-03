@@ -147,7 +147,7 @@ Minty uses GCP KMS for asymmetric signing using the GitHub App private key.
 
 ### Step 3: Deploy Policy ConfigMap
 
-Create `minty-configmap.yaml` defining access rules for your repositories. Note that the key name in the ConfigMap data maps to the path `/etc/minty/{org}/{repo}.yaml` (using `subPath` mounts).
+Create `configmap.yaml` defining access rules for your repositories. Note that the key name in the ConfigMap data maps to the path `/etc/minty/{org}/{repo}.yaml` (using `subPath` mounts).
 
 Example for `YOUR_GITHUB_ORG_OR_USER/YOUR_GITHUB_REPO` repository:
 
@@ -177,13 +177,13 @@ data:
 Apply it:
 
 ```bash
-kubectl apply -f minty-configmap.yaml
+kubectl apply -f configmap.yaml
 ```
 
 ### Step 4: Deploy Minty Service
 
-Apply the deployment manifest (`minty-deployment.yaml`):
+Apply the deployment manifest (`deployment.yaml`):
 
 ```bash
-kubectl apply -f minty-deployment.yaml
+kubectl apply -f deployment.yaml
 ```
