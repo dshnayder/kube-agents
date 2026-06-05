@@ -73,8 +73,9 @@ def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str, sessi
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
-    if session_id:
-        headers["X-Hermes-Session-Id"] = session_id
+    clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip() if session_id else ""
+    if clean_session_id:
+        headers["X-Hermes-Session-Id"] = clean_session_id
     payload = {
         "model": "hermes-agent",
         "messages": [{"role": "user", "content": query}]
