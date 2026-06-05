@@ -69,6 +69,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+              # Required by s6-overlay to drop privileges to the non-root user
               add:
                 - SETUID
                 - SETGID
