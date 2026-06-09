@@ -1,10 +1,22 @@
+model:
+  provider: custom
+  model: gemini-model
+  default: gemini-model
+  base_url: http://litellm.agent-system.svc.cluster.local/v1
+  api_key: none
+
 # MCP Servers configuration.
 mcp_servers:
+  developer_knowledge:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://developerknowledge.googleapis.com/mcp"
   platform_control:
     command: "python3"
-    args: ["/opt/data/scripts/platform_mcp_server.py"]
+    args:
+      - "/opt/data/scripts/platform_mcp_server.py"
     connect_timeout: 120
-    # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
@@ -15,7 +27,6 @@ mcp_servers:
       API_SERVER_KEY: "${API_SERVER_KEY}"
       YOLO_MODE: "${YOLO_MODE}"
 
-# Explicitly list platform_toolsets
 platform_toolsets:
   cli:
     - hermes-cli
@@ -23,3 +34,6 @@ platform_toolsets:
   api_server:
     - hermes-api-server
     - mcp-developer_knowledge
+
+approvals:
+  cron_mode: approve
