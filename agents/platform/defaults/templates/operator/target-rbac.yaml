@@ -8,6 +8,9 @@ subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: User
     name: operator-agent-gsa@<PROJECT_ID>.iam.gserviceaccount.com
+  - kind: ServiceAccount
+    name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
+    namespace: agent-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
