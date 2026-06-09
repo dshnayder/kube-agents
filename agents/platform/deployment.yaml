@@ -77,7 +77,6 @@ spec:
       labels:
         app: platform-agent
     spec:
-      runtimeClassName: gvisor
       # Configure the pod to run under its dedicated Service Account
       serviceAccountName: platform-agent
       securityContext:
