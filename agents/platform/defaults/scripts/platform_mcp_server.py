@@ -385,7 +385,43 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     if err:
         return err
 
+    manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: {cluster_name}
+  namespace: agent-system
+  annotations:
+    cnrm.cloud.google.com/project-id: "{pid}"
+    cnrm.cloud.google.com/remove-default-node-pool: "true"
+spec:
+  location: "{location}"
+  enableAutopilot: true
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+"""
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
+            temp_f.write(manifest)
+            temp_path = temp_f.name
+            
+        log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
+        apply_manifest(temp_path)
+        
+        # Cleanup intermediate file instantly
+        os.unlink(temp_path)
+    except subprocess.CalledProcessError as e:
+        err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+        log(err_msg)
+        return err_msg
+    except Exception as e:
+        return f"ERROR: GKE Custom Resource deployment failed: {e}"
+
     agent_id = f"operator-{cluster_name}-{location}"
+    try:
+        add_operator_to_state(agent_id, cluster_name, location, pid)
+    except Exception as e:
+        return f"ERROR: Failed to register operator in state registry: {e}"
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         tmpl_file = get_hermes_home() / "templates" / "operator" / "instance.yaml"
@@ -416,43 +452,6 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
                     os.unlink(tmp_p)
         else:
             return f"ERROR: Operator instance template not found at {tmpl_file}"
-    else:
-        manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
-kind: ContainerCluster
-metadata:
-  name: {cluster_name}
-  namespace: agent-system
-  annotations:
-    cnrm.cloud.google.com/project-id: "{pid}"
-    cnrm.cloud.google.com/remove-default-node-pool: "true"
-spec:
-  location: "{location}"
-  enableAutopilot: true
-  privateClusterConfig:
-    enablePrivateNodes: true
-    enablePrivateEndpoint: false
-"""
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
-                temp_f.write(manifest)
-                temp_path = temp_f.name
-                
-            log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
-            apply_manifest(temp_path)
-            
-            # Cleanup intermediate file instantly
-            os.unlink(temp_path)
-        except subprocess.CalledProcessError as e:
-            err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-            log(err_msg)
-            return err_msg
-        except Exception as e:
-            return f"ERROR: GKE Custom Resource deployment failed: {e}"
-
-    try:
-        add_operator_to_state(agent_id, cluster_name, location, pid)
-    except Exception as e:
-        return f"ERROR: Failed to register operator in state registry: {e}"
 
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
@@ -471,6 +470,15 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
     """
     agent_id = f"operator-{cluster_name}-{location}"
 
+    try:
+        delete_cluster_manifest(cluster_name)
+    except subprocess.CalledProcessError as e:
+        err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+        log(err_msg)
+        return err_msg
+    except Exception as e:
+        return f"ERROR: GKE Custom Resource deletion failed: {e}"
+
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         try:
             subprocess.run(
@@ -485,15 +493,6 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
         except Exception as e:
             log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
             return f"ERROR: YOLO Mode cleanup failed: {e}"
-    else:
-        try:
-            delete_cluster_manifest(cluster_name)
-        except subprocess.CalledProcessError as e:
-            err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-            log(err_msg)
-            return err_msg
-        except Exception as e:
-            return f"ERROR: GKE Custom Resource deletion failed: {e}"
 
     try:
         remove_operator_from_state(agent_id)
