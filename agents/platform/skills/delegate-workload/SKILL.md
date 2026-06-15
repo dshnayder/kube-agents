@@ -16,18 +16,15 @@ required_environment_variables:
 
 ## Architecture & Lifecycle
 
-1. **Synchronous Delegation**: This skill delegates generic instructions, operational tasks, or data queries to another specialized agent (e.g., GKE Operator or DevTeam worker agent) and blocks synchronously until the worker returns its final completion response.
-2. **Thought Streaming**: While the worker agent runs, its intermediate reasoning thoughts and tool audit updates stream live into the chat space (for user observation) via `emit_thought` calls.
-3. **Reasoning over Output**: The terminal tool returns the worker's final completion response to your context. You must evaluate this output to answer the user's original request or execute further reasoning.
+1. **Runs API Delegation**: This skill delegates tasks or queries to a specialized peer agent (e.g. Operator or DevTeam agent) using the Hermes Runs API (`POST /v1/runs`).
+2. **Real-time Event Streaming**: The helper script connects to the event stream (`GET /v1/runs/{run_id}/events`) and outputs intermediate thought blocks (`💭 [thinking]`) and tool execution logs (`⚙️ [worker] Started tool: ...` / `✅ [worker] Tool completed`) as they happen.
+3. **Deduplication**: The script automatically filters out reasoning text chunks that are duplicates of the final response to prevent double-printing.
+4. **Final Response Delivery**: Once the run completes, the final result is accumulated and printed.
 
 ## Procedure
 
-To delegate a task or query to a specialized worker agent (e.g., `operator-agent-staging-us-central1` or `devteam-agent-production-payments`), execute the helper script:
+To delegate a task, run the script from the platform agent container:
 
 ```bash
 python3 /opt/data/skills/delegate-workload/scripts/call_agent.py "<target_agent_id>" "<query>"
 ```
-
-## Output Protocol
-
-When you execute this skill script, wait for it to complete. Reason over its output to formulate your final response to the user.

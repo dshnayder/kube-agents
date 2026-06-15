@@ -220,3 +220,14 @@ spec:
       protocol: TCP
     - port: 80
       protocol: TCP
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gke-managed-otel
+      podSelector:
+        matchLabels:
+          app: opentelemetry-collector
+    ports:
+    - port: 4318
+      protocol: TCP
+
