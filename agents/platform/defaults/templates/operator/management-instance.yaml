@@ -116,6 +116,11 @@ spec:
                 secretKeyRef:
                   name: platform-agent-secrets
                   key: api-server-key
+            - name: SWARM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
             - name: YOLO_MODE
               value: "<YOLO_MODE>"
             - name: TARGET_CLUSTER_NAME
