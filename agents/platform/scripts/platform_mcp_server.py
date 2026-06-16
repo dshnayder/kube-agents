@@ -103,11 +103,111 @@ def validate_location(location: str, project_id: str) -> str:
 # =============================================================================
 
 def apply_manifest(path: str):
-    """Execute kubectl apply on the manifest path using secure in-cluster token."""
-    subprocess.run(
-        ["kubectl", "--kubeconfig=/dev/null", "apply", "-f", path],
-        check=True, capture_output=True, text=True
-    )
+    subprocess.run(["kubectl", "apply", "-f", path], check=True, capture_output=True)
+
+def install_kcc_operator(ctx: str) -> bool:
+    log("KCC Setup: Downloading Config Connector operator release bundle...")
+    tmp_dir = tempfile.mkdtemp()
+    tar_path = os.path.join(tmp_dir, "release-bundle.tar.gz")
+    try:
+        # Download from GCS source of truth
+        subprocess.run([
+            "gcloud", "storage", "cp", 
+            "gs://configconnector-operator/latest/release-bundle.tar.gz", 
+            tar_path
+        ], check=True, capture_output=True)
+        
+        log("KCC Setup: Unpacking release bundle...")
+        import tarfile
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(path=tmp_dir)
+            
+        op_path = os.path.join(tmp_dir, "operator-system", "autopilot-configconnector-operator.yaml")
+        mode_path = os.path.join(tmp_dir, "samples", "configconnector_namespaced_mode.yaml")
+        
+        if os.path.exists(op_path) and os.path.exists(mode_path):
+            log("KCC Setup: Applying Config Connector Operator manifest...")
+            subprocess.run(["kubectl", "apply", "-f", op_path, "--context", ctx], check=True, capture_output=True)
+            log("KCC Setup: Configuring Config Connector in namespaced mode...")
+            subprocess.run(["kubectl", "apply", "-f", mode_path, "--context", ctx], check=True, capture_output=True)
+            log("KCC Setup: Config Connector operator successfully installed.")
+            return True
+        else:
+            log("ERROR: Config Connector manifests missing in unpacked bundle.")
+            return False
+    except Exception as e:
+        log(f"ERROR: Config Connector installation failed: {e}")
+        return False
+    finally:
+        # Cleanup temp directory
+        import shutil
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+
+def onboard_namespace_to_kcc(namespace: str, cluster_name: str, pid: str, ctx: str) -> bool:
+    try:
+        # 1. Calculate KCC GSA
+        raw_kcc_gsa = f"kcc-{namespace}-{cluster_name}"
+        clean_kcc_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_kcc_gsa).strip("-")[:30]
+        kcc_gsa_email = f"{clean_kcc_gsa}@{pid}.iam.gserviceaccount.com"
+        
+        # 2. Check and create GSA
+        kcc_gsa_exists = False
+        check_kcc_gsa = subprocess.run(["gcloud", "iam", "service-accounts", "describe", kcc_gsa_email, "--project", pid], capture_output=True)
+        if check_kcc_gsa.returncode == 0:
+            kcc_gsa_exists = True
+            log(f"KCC Onboarding [{namespace}]: GSA {kcc_gsa_email} already exists, skipping creation.")
+        
+        if not kcc_gsa_exists:
+            log(f"KCC Onboarding [{namespace}]: Creating GSA {kcc_gsa_email}...")
+            subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_kcc_gsa, "--display-name", f"KCC SA for {namespace}", "--project", pid], check=True, capture_output=True)
+        
+        # 3. Grant Owner role to GSA (Permitted to create any object)
+        log(f"KCC Onboarding [{namespace}]: Granting Owner role to {kcc_gsa_email}...")
+        subprocess.run([
+            "gcloud", "projects", "add-iam-policy-binding", pid,
+            f"--member=serviceAccount:{kcc_gsa_email}",
+            "--role=roles/owner",
+            "--condition=None"
+        ], check=True, capture_output=True)
+        
+        # 4. Bind Workload Identity
+        kcc_ksa_member = f"serviceAccount:{pid}.svc.id.goog[cnrm-system/cnrm-controller-manager-{namespace}]"
+        log(f"KCC Onboarding [{namespace}]: Granting Workload Identity to {kcc_ksa_member} on {kcc_gsa_email}...")
+        subprocess.run([
+            "gcloud", "iam", "service-accounts", "add-iam-policy-binding", kcc_gsa_email,
+            "--role=roles/iam.workloadIdentityUser",
+            f"--member={kcc_ksa_member}",
+            f"--project={pid}"
+        ], check=True, capture_output=True)
+        
+        # 5. Ensure namespace exists and annotate it
+        log(f"KCC Onboarding [{namespace}]: Annotating namespace {namespace} with project {pid}...")
+        subprocess.run(["kubectl", "create", "namespace", namespace, "--context", ctx, "--dry-run=client", "-o", "yaml", "|", "kubectl", "apply", "--context", ctx, "-f", "-"], shell=True, check=True, capture_output=True)
+        subprocess.run(["kubectl", "annotate", "namespace", namespace, f"cnrm.cloud.google.com/project-id={pid}", "--overwrite", "--context", ctx], check=True, capture_output=True)
+        
+        # 6. Apply ConfigConnectorContext
+        log(f"KCC Onboarding [{namespace}]: Applying ConfigConnectorContext...")
+        kcc_context_yaml = f"""apiVersion: core.cnrm.cloud.google.com/v1beta1
+kind: ConfigConnectorContext
+metadata:
+  name: configconnectorcontext.core.cnrm.cloud.google.com
+  namespace: {namespace}
+spec:
+  googleServiceAccount: "{kcc_gsa_email}"
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tf:
+            tf.write(kcc_context_yaml)
+            tf_path = tf.name
+        subprocess.run(["kubectl", "apply", "-f", tf_path, "--context", ctx], check=True, capture_output=True)
+        if os.path.exists(tf_path):
+            os.unlink(tf_path)
+            
+        log(f"KCC Onboarding [{namespace}]: Successfully configured Config Connector for namespace {namespace}!")
+        return True
+    except Exception as e:
+        log(f"ERROR: KCC onboarding failed for namespace {namespace}: {e}")
+        return False
 
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
@@ -468,6 +568,14 @@ spec:
                 ctx = f"gke_{pid}_{location}_{cluster_name}"
                 subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
                 log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
+                
+                # 3. Download and Install Config Connector Operator dynamically
+                if install_kcc_operator(ctx):
+                    # 4. Onboard system namespace 'agent-system' to KCC so Operator can use KCC
+                    log(f"YOLO Mode: Onboarding namespace 'agent-system' to Config Connector on cluster {cluster_name}...")
+                    onboard_namespace_to_kcc("agent-system", cluster_name, pid, ctx)
+                else:
+                    log(f"WARNING: Config Connector operator installation failed. Skipping namespace onboarding.")
             except Exception as e:
                 err_msg = f"RETRY_REQUIRED: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion failed: {e}"
                 log(err_msg)
@@ -701,6 +809,9 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
                 ctx = f"gke_{pid}_{location}_{cluster_name}"
                 subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
                 log(f"YOLO Mode: Successfully asserted Namespace and RBAC directly onto target cluster {cluster_name}")
+                
+                # 3. Dynamic Config Connector Namespace onboarding on target cluster
+                onboard_namespace_to_kcc(namespace, cluster_name, pid, ctx)
             except Exception as e:
                 log(f"WARNING: YOLO Mode target RBAC assertion failed on {cluster_name}: {e}")
             finally:
