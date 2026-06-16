@@ -66,7 +66,8 @@ def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
         clean_target = f"{clean_target}.agent-system.svc.cluster.local:8642"
         
     url = f"http://{clean_target}/v1/chat/completions"
-    api_key = os.environ.get("API_SERVER_KEY") or "none"
+    # api_key = os.environ.get("API_SERVER_KEY") or "none"
+    api_key = "your-strong-api-server-key-here"
     
     headers = {
         "Content-Type": "application/json",

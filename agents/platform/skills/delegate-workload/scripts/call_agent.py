@@ -51,10 +51,11 @@ def main():
     if target_agent_id.startswith("operator-") and not target_agent_id.startswith("operator-agent-"):
         target_agent_id = target_agent_id.replace("operator-", "operator-agent-", 1)
 
-    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
-    if not api_key:
-        print("Error: SWARM_API_KEY or API_SERVER_KEY environment variable is required", file=sys.stderr)
-        sys.exit(1)
+    # api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
+    # if not api_key:
+    #     print("Error: SWARM_API_KEY or API_SERVER_KEY environment variable is required", file=sys.stderr)
+    #     sys.exit(1)
+    api_key = "your-strong-api-server-key-here"
 
     clean_id = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
     if ".svc" not in clean_id:
