@@ -7,6 +7,7 @@ mcp_servers:
     # 30-minute timeout to support long GKE reasoning chains
     timeout: 1800
     env:
+      HOME: "/opt/data/home"
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
       KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
       HERMES_HOME: "${HERMES_HOME}"

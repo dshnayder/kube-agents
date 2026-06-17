@@ -106,6 +106,8 @@ spec:
               cpu: "4"
               memory: "4Gi"
           env:
+            - name: HOME
+              value: "/opt/data/home"
             - name: API_SERVER_ENABLED
               value: "true"
             - name: HERMES_DASHBOARD
