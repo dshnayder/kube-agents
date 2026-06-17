@@ -496,7 +496,7 @@ spec:
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/operator/SOUL.md")
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - Operator YOLO"
-            indented_soul = "\n".join(f"    {line}" for line in soul_text.splitlines())
+            indented_soul = "\n".join(f"    {line}" if i > 0 else line for i, line in enumerate(soul_text.splitlines()))
             content = content.replace("<OPERATOR_YOLO_SOUL>", indented_soul)
             # Calculate strict multi-tenant Google Service Account identity per agent replica
             raw_gsa = f"op-{cluster_name}-{location}"
