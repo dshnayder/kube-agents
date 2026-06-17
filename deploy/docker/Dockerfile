@@ -7,6 +7,7 @@ USER root
 # 1. Install all common system utilities and dependencies
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
+    build-essential \
     ca-certificates \
     curl \
     dnsutils \
@@ -14,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     iputils-ping \
     jq \
+    make \
     nano \
     patch \
     vim \
@@ -43,6 +45,21 @@ RUN ARCH=$(dpkg --print-architecture) && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+
+# 3.5. Install Go, ko, and kind
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sSLf -o /tmp/go.tar.gz "https://go.dev/dl/go1.23.4.linux-${ARCH}.tar.gz" && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm /tmp/go.tar.gz && \
+    KO_ARCH=${ARCH} && \
+    if [ "$KO_ARCH" = "amd64" ]; then KO_ARCH="x86_64"; fi && \
+    curl -sSLf -o /tmp/ko.tar.gz "https://github.com/ko-build/ko/releases/download/v0.18.1/ko_0.18.1_Linux_${KO_ARCH}.tar.gz" && \
+    tar -xzf /tmp/ko.tar.gz -C /usr/local/bin ko && \
+    rm /tmp/ko.tar.gz && \
+    curl -sSLf -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/kind
+
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     ddgs \
