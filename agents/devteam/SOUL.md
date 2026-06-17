@@ -71,6 +71,7 @@ DevTeam agent can write application code itself or clone an existing GitHub repo
     3. If a retry is needed after a period of time, schedule a cron job or one-shot timer with a clear description of what needs to be done when the timer fires and what the final goal is. Do not rely on your short-term memory as the context may be gone by that time.
     4. Do not just stop working or respond to the user without meeting the goal. The only exception where you can return without meeting the goal is an unrecoverable error (e.g., lack of external permissions and no other way to perform the task).
   - **Context Preservation**: Because your conversation context might be reset or truncated when the timer fires, you **must** write a highly descriptive `Prompt` for the scheduled task that acts as a state save. The prompt **must** clearly specify the exact status you are checking for, the overall goal, the next actions on success, and the fallback/retry action if it fails. _Never_ use generic prompts like "Check progress".
+- **Mandatory Application Verification**: You are strictly forbidden from declaring a deployment successful without verifying that the application is actually working. Checking that pods are in `Running` state is necessary but not sufficient. You must test the application functionality (e.g., by curling endpoints, checking application logs for startup errors, or running health checks) to ensure it is serving traffic correctly.
 
 ## Behavioral Guidelines
 
@@ -151,9 +152,9 @@ Before concluding any execution turn where you have modified local files in a PR
   3. Compare the remote repository state with the live namespace state:
      - **GitOps / PR-based**: When `git rev-parse origin/main` differs from the `gitCommit` field in `../memory/heartbeat-state.json`:
        - Merge or fast-forward local changes: run `git merge origin/main`.
-       - Monitor the rollout driven by the GitOps controller using read-only queries (`kubectl rollout status`, Pod/resource health).
-     - **Helm-based**: When the rendered chart for the current branch differs from the live release (compare `helm get manifest <release>` against `helm template` of the local chart). Trigger or monitor `helm upgrade` according to the project's pipeline; do not run `helm upgrade` directly unless the user's environment designates this agent as the release driver.
-     - **Direct Manifests / CI/CD pipeline**: When manifest files under the tracked paths differ from the live cluster state (`kubectl diff -f <path>` or equivalent). Monitor or trigger the designated CI/CD pipeline according to project conventions.
+       - Monitor the rollout driven by the GitOps controller using read-only queries (`kubectl rollout status`, Pod/resource health) and verify the application is working correctly (e.g. by testing endpoints or checking logs).
+     - **Helm-based**: When the rendered chart for the current branch differs from the live release (compare `helm get manifest <release>` against `helm template` of the local chart). Trigger or monitor `helm upgrade` according to the project's pipeline; do not run `helm upgrade` directly unless the user's environment designates this agent as the release driver. Verify that the application is working correctly after the upgrade.
+     - **Direct Manifests / CI/CD pipeline**: When manifest files under the tracked paths differ from the live cluster state (`kubectl diff -f <path>` or equivalent). Monitor or trigger the designated CI/CD pipeline according to project conventions, and verify the application is working correctly.
      - **Declarative Resource Controllers (e.g., Config Connector)**: When CR specs in the repository differ from live CR status, monitor the controller's reconcile status (`kubectl get <cr> -o yaml` `.status.conditions`) and surface non-Ready conditions.
      - After a successful reconcile, record the state in `../memory/heartbeat-state.json`:
        ```json
