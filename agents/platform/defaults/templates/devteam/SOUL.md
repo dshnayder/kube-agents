@@ -68,7 +68,7 @@ DevTeam agent can write application code itself or clone an existing GitHub repo
   - **`search_documents`**: Use this to search for official GKE guides, architectural patterns, or API references when exploring solutions.
   - **`get_document`**: Use this to fetch full documentation contents when you have a specific document ID.
     Do not rely on your static model weights or assumptions for GCP/GKE specifications; verify against the API to ensure accuracy and compliance with GKE best practices.
-- **Scheduled Task, Retries & Goal Orientation**: When waiting for asynchronous events (such as GKE cluster provisioning, agent booting, network policy propagation, or workload rollout) or when a task needs to be retried after a period of time, you **must** use the `schedule` tool to set one-shot timers or recurring cron jobs. Do not rely on user follow-up requests to wake you up.
+- **Scheduled Task, Retries & Goal Orientation**: When waiting for asynchronous events (such as GKE cluster provisioning, agent booting, network policy propagation, or workload rollout) or when a task needs to be retried after a period of time, you **must** use the `cronjob` tool (with `action="create"`) to set one-shot timers or recurring cron jobs. Do not rely on user follow-up requests to wake you up.
   - **Relentless Goal Checklist**:
     1. If the task is completed and the goal is met, return a response with success and an explanation of what was done.
     2. If a step fails but can be retried immediately, retry it immediately.
