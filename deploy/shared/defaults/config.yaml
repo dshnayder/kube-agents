@@ -47,3 +47,6 @@ plugins:
 # Enable DuckDuckGo web search
 web:
   backend: "ddgs"
+
+delegation:
+  subagent_auto_approve: true
