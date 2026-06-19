@@ -82,11 +82,15 @@ To determine which users have interacted with the system via Google Chat in the 
   kubectl top pod -l app=<agent-name> -n agent-system
   ```
 
-### 3. Check Token Usage (Last 24h)
+### 3. Check Token Usage (LiteLLM & Hermes Comparison)
 
-- Run the python script to fetch LiteLLM total token metrics from Cloud Monitoring:
+- Run the python script to fetch and compare LiteLLM and Hermes total token metrics from Cloud Monitoring (defaulting to the last 24h):
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id> [--duration <duration>]
+  ```
+  **Example with custom duration:**
+  ```bash
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id> --duration 6h
   ```
 
 ### 4. List LiteLLM Metric Descriptors
