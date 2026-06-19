@@ -142,11 +142,40 @@ def on_pre_tool_call(
     return None
 
 
+def on_post_api_request(
+    assistant_message: Any = None,
+    session_id: str = "",
+    **kwargs: Any
+) -> None:
+    """Post-API request hook. Sends LLM reasoning/thoughts to the chat."""
+    if not assistant_message:
+        return
+        
+    reasoning = getattr(assistant_message, "reasoning_content", "") or ""
+    if not reasoning:
+        model_extra = getattr(assistant_message, "model_extra", {}) or {}
+        if isinstance(model_extra, dict):
+            reasoning = model_extra.get("reasoning_content", "") or ""
+
+    if reasoning and isinstance(reasoning, str):
+        metadata = fetch_metadata_from_session_store(session_id)
+        if metadata:
+            chat_id = metadata.get("google_chat_id", "")
+            thread_id = metadata.get("google_thread_id", "")
+            if chat_id:
+                worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
+                worker_id = clean_worker_id(worker_id)
+                thought_text = f"💭 {reasoning}"
+                emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
+    return None
+
+
 def register(ctx: Any) -> None:
     """Register hooks and bind ContextVar to Hermes environment manager."""
     # Register the ContextVar in session_context._VAR_MAP so local.py native bridge copies it!
     session_context._VAR_MAP["KUBERNETES_SERVICE_HOST"] = KUBERNETES_SERVICE_HOST_VAR
     
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("post_api_request", on_post_api_request)
     logger.info("Session Resolver plugin registered successfully!")
 
