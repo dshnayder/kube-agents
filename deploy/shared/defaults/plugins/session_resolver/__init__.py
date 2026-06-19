@@ -23,7 +23,7 @@ KUBERNETES_SERVICE_HOST_VAR = ContextVar("KUBERNETES_SERVICE_HOST", default="")
 SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", "http://platform-agent.agent-system.svc.cluster.local:8699")
 
 
-def fetch_metadata_from_agent_a(session_id: str) -> Optional[Dict[str, Any]]:
+def fetch_metadata_from_session_store(session_id: str) -> Optional[Dict[str, Any]]:
     """Query Platform Agent's metadata API to fetch the active session's metadata."""
     if not session_id:
         return None
@@ -71,6 +71,12 @@ def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thoug
         logger.debug("Failed to emit pre-tool thought to webhook: %s", e)
 
 
+def clean_worker_id(worker_id: str) -> str:
+    import re
+    # Strip template hash and random pod suffix (deployment pods)
+    return re.sub(r'-[a-z0-9]{8,10}-[a-z0-9]{5}$', '', worker_id)
+
+
 def on_pre_tool_call(
     tool_name: str, 
     args: Dict[str, Any], 
@@ -100,7 +106,7 @@ def on_pre_tool_call(
         else:
             logger.info("Fetching fresh metadata for session %s", session_id)
             _SESSION_ID.set(session_id)
-            metadata = fetch_metadata_from_agent_a(session_id) or {}
+            metadata = fetch_metadata_from_session_store(session_id) or {}
             
             user_email = metadata.get("user_email")
             if user_email:
@@ -123,8 +129,15 @@ def on_pre_tool_call(
         # Emit thought to webhook to indicate tool is about to be called
         if chat_id:
             worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
-            args_preview = str(args)[:200] + ("..." if len(str(args)) > 200 else "")
-            thought_text = f"⚙️ Calling tool '{tool_name}' with args: {args_preview}"
+            worker_id = clean_worker_id(worker_id)
+            
+            cmd = args.get("command") if isinstance(args, dict) else None
+            if cmd and isinstance(cmd, str):
+                cmd_preview = cmd[:20] + ("..." if len(cmd) > 20 else "")
+                thought_text = f"⚙️ {tool_name}: {cmd_preview}"
+            else:
+                thought_text = f"⚙️ {tool_name}"
+                
             emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
     else:
         KUBERNETES_SERVICE_HOST_VAR.set("")
@@ -137,6 +150,6 @@ def register(ctx: Any) -> None:
     # Register the ContextVar in session_context._VAR_MAP so local.py native bridge copies it!
     session_context._VAR_MAP["KUBERNETES_SERVICE_HOST"] = KUBERNETES_SERVICE_HOST_VAR
     
-    # ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    # logger.info("Session Resolver plugin registered successfully!")
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    logger.info("Session Resolver plugin registered successfully!")
 

@@ -76,6 +76,7 @@ plugins:
   enabled:
     - session_store
     - session_resolver
+    - delegate_workload
 
 thread_sessions_per_user: true
 group_sessions_per_user: true
@@ -88,7 +89,7 @@ display:
       # - "new": Only show when a new tool starts
       # - "verbose": Show full progress including arguments
       # - "off": Disable tool progress
-      tool_progress: "all"
+      tool_progress: "off"
 
       # (Optional) Clean up progress bubbles when the turn finishes:
       # When true, the temporary progress message is deleted once the final response
