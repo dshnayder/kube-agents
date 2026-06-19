@@ -7,7 +7,13 @@ from contextvars import ContextVar
 from typing import Any, Dict, Optional
 import requests
 from gateway import session_context
-from gateway.session_context import _SESSION_ID, _SESSION_USER_ID, _SESSION_CHAT_ID, _SESSION_THREAD_ID
+from gateway.session_context import (
+    _SESSION_ID,
+    _SESSION_USER_ID,
+    _SESSION_CHAT_ID,
+    _SESSION_THREAD_ID,
+    get_session_env,
+)
 
 logger = logging.getLogger("hermes.plugin.session_resolver")
 
@@ -73,56 +79,57 @@ def on_pre_tool_call(
 ) -> Optional[Dict[str, Any]]:
     """Resolve metadata using session_id and bind variables to the thread context."""
     
-    if session_id:
-        logger.info("Injecting HERMES_SESSION_ID=%s for tool %s", session_id, tool_name)
-        _SESSION_ID.set(session_id)
+    if not session_id:
+        session_id = get_session_env("HERMES_SESSION_ID")
         
-        metadata = fetch_metadata_from_agent_a(session_id)
-        if metadata:
+    if session_id:
+        logger.info("Processing pre_tool_call for session %s, tool %s", session_id, tool_name)
+        
+        # Check if we already have the metadata in context to avoid duplicate HTTP calls
+        existing_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        existing_thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
+        existing_user = get_session_env("HERMES_SESSION_USER_ID")
+        existing_k8s = KUBERNETES_SERVICE_HOST_VAR.get()
+        
+        if existing_chat_id:
+            logger.info("Using cached session metadata for %s", session_id)
+            chat_id = existing_chat_id
+            thread_id = existing_thread_id
+            user_email = existing_user
+            k8s_host = existing_k8s
+        else:
+            logger.info("Fetching fresh metadata for session %s", session_id)
+            _SESSION_ID.set(session_id)
+            metadata = fetch_metadata_from_agent_a(session_id) or {}
+            
             user_email = metadata.get("user_email")
             if user_email:
-                logger.info("Injecting HERMES_SESSION_USER_ID=%s for tool %s", user_email, tool_name)
                 _SESSION_USER_ID.set(user_email)
                 
             chat_id = metadata.get("google_chat_id")
             if chat_id:
-                logger.info("Injecting HERMES_SESSION_CHAT_ID=%s for tool %s", chat_id, tool_name)
                 _SESSION_CHAT_ID.set(chat_id)
                 
             thread_id = metadata.get("google_thread_id")
             if thread_id:
-                logger.info("Injecting HERMES_SESSION_THREAD_ID=%s for tool %s", thread_id, tool_name)
                 _SESSION_THREAD_ID.set(thread_id)
                 
             k8s_host = metadata.get("KUBERNETES_SERVICE_HOST")
             if k8s_host:
-                logger.info("Injecting KUBERNETES_SERVICE_HOST=%s for tool %s", k8s_host, tool_name)
                 KUBERNETES_SERVICE_HOST_VAR.set(k8s_host)
             else:
                 KUBERNETES_SERVICE_HOST_VAR.set("")
                 
-            # Emit thought to webhook to indicate tool is about to be called
-            if chat_id:
-                worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
-                args_preview = str(args)[:200] + ("..." if len(str(args)) > 200 else "")
-                thought_text = f"⚙️ Calling tool '{tool_name}' with args: {args_preview}"
-                emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
-        else:
-            KUBERNETES_SERVICE_HOST_VAR.set("")
-            _SESSION_USER_ID.set("")
+        # Emit thought to webhook to indicate tool is about to be called
+        if chat_id:
+            worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
+            args_preview = str(args)[:200] + ("..." if len(str(args)) > 200 else "")
+            thought_text = f"⚙️ Calling tool '{tool_name}' with args: {args_preview}"
+            emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
     else:
         KUBERNETES_SERVICE_HOST_VAR.set("")
         
     return None
-
-
-def on_post_tool_call(tool_name: str, **kwargs: Any) -> None:
-    """Reset ContextVars to prevent leaking context across thread pools."""
-    KUBERNETES_SERVICE_HOST_VAR.set("")
-    _SESSION_ID.set("")
-    _SESSION_USER_ID.set("")
-    _SESSION_CHAT_ID.set("")
-    _SESSION_THREAD_ID.set("")
 
 
 def register(ctx: Any) -> None:
@@ -131,5 +138,5 @@ def register(ctx: Any) -> None:
     session_context._VAR_MAP["KUBERNETES_SERVICE_HOST"] = KUBERNETES_SERVICE_HOST_VAR
     
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    ctx.register_hook("post_tool_call", on_post_tool_call)
     logger.info("Session Resolver plugin registered successfully!")
+

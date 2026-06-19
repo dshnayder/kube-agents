@@ -25,22 +25,6 @@ init_db()
 class MetadataPayload(BaseModel):
     metadata: dict
 
-@app.post("/v1/sessions/{session_id}/metadata")
-def set_metadata(session_id: str, payload: MetadataPayload):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT OR REPLACE INTO session_metadata (session_id, metadata, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            (session_id, json.dumps(payload.metadata))
-        )
-        conn.commit()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Database write failure: {e}")
-    conn.close()
-    return {"status": "success"}
-
 @app.get("/v1/sessions/{session_id}/metadata")
 def get_metadata(session_id: str):
     conn = sqlite3.connect(DB_PATH)

@@ -85,6 +85,8 @@ CRITICAL EXECUTION MANDATES:
         "input": wrapped_query,
         "prompt": wrapped_query
     }
+    if session_id:
+        payload["session_id"] = session_id
 
     run_url = f"http://{endpoint}/v1/runs"
     

@@ -6,6 +6,21 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger("hermes.plugin.compliance_critic")
 
+
+def normalize_schedule(s: str) -> str:
+    """Normalize common invalid schedule strings (like 'immediate' or seconds) to valid formats."""
+    s = s.strip().lower()
+    if s in ("immediate", "now", "0s", "0m"):
+        return "1m"
+    
+    # Match seconds format (e.g., '30s', '60 seconds') and convert to minutes (rounded up)
+    match = re.match(r'^(\d+)\s*(s|sec|secs|second|seconds)$', s)
+    if match:
+        val = int(match.group(1))
+        mins = (val + 59) // 60
+        return f"{mins}m"
+    return s
+
 def register(ctx):
     llm = ctx.llm
 
@@ -62,7 +77,8 @@ def register(ctx):
             # 3. Schedule Cronjob if missing
             if not is_compliant:
                 followup_prompt = parsed_result.get("recommended_followup_prompt")
-                schedule = parsed_result.get("recommended_schedule", "60s")
+                schedule = parsed_result.get("recommended_schedule", "1m")
+                schedule = normalize_schedule(schedule)
 
                 if not followup_prompt:
                     followup_prompt = f"Check status of pending operation in session {session_id} and continue execution."
