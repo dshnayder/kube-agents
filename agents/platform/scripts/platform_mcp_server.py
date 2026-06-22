@@ -502,7 +502,7 @@ spec:
     # Check if the GKE Custom Resource already exists on the management cluster
     cluster_exists = False
     try:
-        check_cc = subprocess.run(["kubectl", "get", "containercluster", cluster_name, "-n", "agent-system"], capture_output=True)
+        check_cc = subprocess.run(["kubectl", "--kubeconfig=/dev/null", "get", "containercluster", cluster_name, "-n", "agent-system"], capture_output=True)
         if check_cc.returncode == 0:
             cluster_exists = True
     except Exception:
