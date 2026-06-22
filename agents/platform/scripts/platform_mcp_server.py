@@ -594,6 +594,13 @@ spec:
                         "--role=roles/serviceusage.serviceUsageConsumer",
                         "--condition=None"
                     ])
+                    log(f"Granting Monitoring Notification Channel Editor permissions to {gsa_email}...")
+                    run_command_with_retry([
+                        "gcloud", "projects", "add-iam-policy-binding", pid,
+                        f"--member=serviceAccount:{gsa_email}",
+                        "--role=roles/monitoring.notificationChannelEditor",
+                        "--condition=None"
+                    ])
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     run_command_with_retry(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"])
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
@@ -841,6 +848,13 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
                         "gcloud", "projects", "add-iam-policy-binding", pid,
                         f"--member=serviceAccount:{gsa_email}",
                         "--role=roles/serviceusage.serviceUsageConsumer",
+                        "--condition=None"
+                    ])
+                    log(f"Granting Monitoring Notification Channel Editor permissions to {gsa_email}...")
+                    run_command_with_retry([
+                        "gcloud", "projects", "add-iam-policy-binding", pid,
+                        f"--member=serviceAccount:{gsa_email}",
+                        "--role=roles/monitoring.notificationChannelEditor",
                         "--condition=None"
                     ])
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")

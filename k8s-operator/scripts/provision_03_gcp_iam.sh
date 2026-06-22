@@ -132,6 +132,7 @@ verify_operator_agent() {
       "roles/aiplatform.user" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
+      "roles/monitoring.notificationChannelEditor" \
       "roles/logging.viewer"
 }
 execute_operator_agent() {
@@ -139,6 +140,7 @@ execute_operator_agent() {
       "roles/aiplatform.user" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
+      "roles/monitoring.notificationChannelEditor" \
       "roles/logging.viewer"
 }
 
@@ -148,6 +150,7 @@ verify_devteam_agent() {
       "roles/aiplatform.user" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
+      "roles/monitoring.notificationChannelEditor" \
       "roles/logging.viewer"
 }
 execute_devteam_agent() {
@@ -155,6 +158,7 @@ execute_devteam_agent() {
       "roles/aiplatform.user" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
+      "roles/monitoring.notificationChannelEditor" \
       "roles/logging.viewer"
 }
 
