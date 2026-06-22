@@ -24,11 +24,31 @@ mcp_servers:
 # Explicitly list platform_toolsets
 platform_toolsets:
   cli:
-    - hermes-cli
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - delegation
+    - cronjob
     - mcp-developer_knowledge
+    - mcp-platform_control
   api_server:
-    - hermes-api-server
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - delegation
+    - cronjob
     - mcp-developer_knowledge
+    - mcp-platform_control
 
 # Event-driven Webhook Subscriptions engine for Platform Coordinator async tracking
 platforms:

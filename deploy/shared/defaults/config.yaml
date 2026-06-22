@@ -25,11 +25,27 @@ mcp_servers:
 # acts as an explicit passthrough that bypasses the filter and loads the tools natively on boot.
 platform_toolsets:
   cli:
-    - hermes-cli
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - cronjob
     - mcp-developer_knowledge
     - mcp-worker_control
   api_server:
-    - hermes-api-server
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - cronjob
     - mcp-developer_knowledge
     - mcp-worker_control
 

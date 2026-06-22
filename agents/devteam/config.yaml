@@ -1,0 +1,30 @@
+# Explicitly list platform_toolsets for devteam coach
+platform_toolsets:
+  cli:
+    - web
+    - browser
+    - terminal
+    - file
+    - code_execution
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - cronjob
+    - mcp-developer_knowledge
+    - mcp-worker_control
+  api_server:
+    - web
+    - browser
+    - terminal
+    - file
+    - code_execution
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - cronjob
+    - mcp-developer_knowledge
+    - mcp-worker_control

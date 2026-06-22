@@ -123,6 +123,11 @@ COPY agents/devteam/HEARTBEAT.md /opt/defaults/HEARTBEAT.md
 COPY agents/devteam/cron/ /opt/defaults/cron/
 COPY agents/devteam/procedures/ /opt/defaults/procedures/
 
+# Copy devteam defaults configuration as temp file and merge
+COPY agents/devteam/config.yaml /tmp/devteam-config.yaml
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/devteam-config.yaml
+
 # Copy devteam skills
 COPY agents/devteam/skills/ /opt/hermes/skills/
 
