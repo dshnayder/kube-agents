@@ -70,3 +70,8 @@ web:
 
 delegation:
   subagent_auto_approve: true
+
+auxiliary:
+  compression:
+    provider: "main"
+    model: "model-summary"
