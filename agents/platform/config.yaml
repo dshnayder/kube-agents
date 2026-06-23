@@ -27,6 +27,7 @@ platform_toolsets:
     - web
     - terminal
     - file
+    - code_execution
     - skills
     - todo
     - memory
@@ -40,6 +41,7 @@ platform_toolsets:
     - web
     - terminal
     - file
+    - code_execution
     - skills
     - todo
     - memory
