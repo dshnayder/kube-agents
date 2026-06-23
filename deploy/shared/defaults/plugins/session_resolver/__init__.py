@@ -37,6 +37,15 @@ def fetch_metadata_from_session_store(session_id: str) -> Optional[Dict[str, Any
         response = requests.get(url, headers=headers, timeout=5)
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.HTTPError as http_err:
+        if http_err.response is not None and http_err.response.status_code == 404:
+            logger.info("Session %s not started via chat", session_id)
+        else:
+            logger.error(
+                "HTTP error retrieving metadata from Platform Agent (%s) for session %s: %s",
+                url, session_id, http_err
+            )
+        return None
     except Exception as exc:
         logger.error(
             "Failed to retrieve metadata from Platform Agent (%s) for session %s: %s",
@@ -132,7 +141,7 @@ def on_pre_tool_call(
             worker_id = clean_worker_id(worker_id)
             
             cmd_str = str(args)
-            cmd_preview = cmd_str[:30] + ("..." if len(cmd_str) > 30 else "")
+            cmd_preview = cmd_str[:80] + ("..." if len(cmd_str) > 80 else "")
             thought_text = f"⚙️ {tool_name}: {cmd_preview}"
                 
             emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
