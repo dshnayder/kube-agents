@@ -52,18 +52,6 @@ A collision occurs when a placeholder token (e.g., `GC0`) leaks into persistent 
 > [!WARNING]
 > **Context Contamination:** The historical error belonging to **database-alpha** has been falsely attributed to **database-beta** because the literal `GC0` token persisted in the history.
 
-#### Proposed resolution: Compaction using a High-Tier Model
-1. Automatic **Session Compaction** runs using a high-tier model (e.g., `model-summary`).
-2. The model recognizes the placeholders as temporary identifiers and abstracts them away in the summary: `"The user investigated a database failing due to lack of disk space."` (The literal token `GC0` is replaced with the generic term `"a database"`).
-3. The user types a new prompt: `"Is database-beta healthy?"`
-4. The gateway redacts `"database-beta"` to `GC0` (first available counter).
-5. The gateway sends this context:
-   * **History:** `"The user investigated a database failing due to lack of disk space."`
-   * **Prompt:** `"Is GC0 healthy?"`
-6. The LLM sees no mention of `GC0` in the history, preventing context contamination. It treats `GC0` (database-beta) as a clean new entity.
-
-The solution needs to be tested to verify if `GC0` placeholders are not appearing in the session summaries at all.
-
 ---
 
 ## 3. Impact on Agentic AI
@@ -77,18 +65,17 @@ Placeholder collisions are particularly destructive for autonomous coding and tr
 
 ## 4. Mitigation Strategies
 
-Preventing placeholder collisions requires applying the following configurations within the agentic harness codebase:
+### 1. Proposed resolution: Compaction using a High-Tier Model
+1. Automatic **Session Compaction** runs using a high-tier model (e.g., `model-summary`).
+2. The model recognizes the placeholders as temporary identifiers and abstracts them away in the summary: `"The user investigated a database failing due to lack of disk space."` (The literal token `GC0` is replaced with the generic term `"a database"`).
+3. The user types a new prompt: `"Is database-beta healthy?"`
+4. The gateway redacts `"database-beta"` to `GC0` (first available counter).
+5. The gateway sends this context:
+   * **History:** `"The user investigated a database failing due to lack of disk space."`
+   * **Prompt:** `"Is GC0 healthy?"`
+6. The LLM sees no mention of `GC0` in the history, preventing context contamination. It treats `GC0` (database-beta) as a clean new entity.
 
-### 1. High-Tier Compaction Models
-Session compaction (context compression) is performed by querying an LLM to summarize the conversation history. Standard lightweight models (like `gemini-3.1-flash-lite`) are prone to placeholder confusion:
-* **Placeholder Confusion:** Due to high lexical similarity, lightweight models frequently confuse `GC0` with `GC1` during processing.
-* **Reverse Mapping Failures:** When the model confuses the placeholders, the gateway fails to map the placeholder back to its original real name on response return. The raw placeholder (e.g., `GC0`) is returned to the client and stored literally in the session database.
-* **Context Contamination:** During compaction, the low-tier model merges or swaps details between the confused placeholders, permanently corrupting the history log.
-
-**How High-Tier Models Help:**
-A high-tier reasoning model (such as `gemini-3.1-pro-preview`) possesses the instruction-following and attention precision required to:
-* Keep highly similar entities (like `GC0` and `GC1`) strictly distinct throughout reasoning and summarization.
-* Preserve placeholders as exact, immutable identifiers in the summary, ensuring the gateway can always cleanly perform the reverse-translation when the history is reloaded.
+The solution needs to be tested to verify if `GC0` placeholders are not appearing in the session summaries at all.
 
 **Action:** Always route the auxiliary compression task (`auxiliary.compression`) to a **high-tier reasoning model** (such as `gemini-3.1-pro-preview`, aliased as `model-summary` in the LiteLLM gateway):
 
