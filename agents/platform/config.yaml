@@ -95,6 +95,7 @@ plugins:
     - session_store
     - session_resolver
     - delegate_workload
+    - compliance_critic
 
 thread_sessions_per_user: true
 group_sessions_per_user: true
