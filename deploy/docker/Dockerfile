@@ -69,7 +69,9 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     "hermes-agent[google_chat]" \
     opentelemetry-api \
     opentelemetry-sdk \
-    opentelemetry-exporter-otlp-proto-http
+    opentelemetry-exporter-otlp-proto-http \
+    mem0ai \
+    qdrant-client
 
 # 4. Apply the common stage2-hook patch
 COPY deploy/shared/stage2-hook.patch /tmp/stage2-hook.patch
