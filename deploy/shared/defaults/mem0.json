@@ -1,0 +1,28 @@
+{
+  "mode": "oss",
+  "oss": {
+    "llm": {
+      "provider": "openai",
+      "config": {
+        "model": "model-default",
+        "api_key": "none",
+        "openai_base_url": "http://litellm.agent-system.svc.cluster.local/v1"
+      }
+    },
+    "embedder": {
+      "provider": "openai",
+      "config": {
+        "model": "model-default",
+        "api_key": "none",
+        "openai_base_url": "http://litellm.agent-system.svc.cluster.local/v1"
+      }
+    },
+    "vector_store": {
+      "provider": "qdrant",
+      "config": {
+        "url": "http://qdrant-service.agent-system.svc.cluster.local:6333",
+        "collection_name": "mem0"
+      }
+    }
+  }
+}
