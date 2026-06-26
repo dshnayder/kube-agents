@@ -199,21 +199,8 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform plugins
 COPY agents/platform/plugins/ /opt/hermes/plugins/
 
-# Copy platform defaults configuration as temp file
-COPY agents/platform/config.yaml /tmp/platform-config.yaml
-
-# Copy devteam deployment template
-COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
-
-# Copy operator deployment template
-COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
-
-# Copy config merge helper script
-COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
-
-# Dynamically merge config.yamls using helper script
-RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
-    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
+# Copy platform self-contained configuration directly to defaults
+COPY agents/platform/config.yaml /opt/defaults/config.yaml
 
 # Patch 015-supervise-perms to allow group write on supervise dirs (needed when CAP_DAC_OVERRIDE is dropped)
 RUN sed -i 's/chmod 0710/chmod 2770/g' /etc/cont-init.d/015-supervise-perms

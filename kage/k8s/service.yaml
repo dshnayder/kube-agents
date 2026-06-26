@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kage
+  namespace: agent-system
+  labels:
+    app: kage
+spec:
+  ports:
+  - name: api
+    port: 8642
+    protocol: TCP
+    targetPort: 8642
+  - name: dashboard
+    port: 9119
+    protocol: TCP
+    targetPort: 9119
+  - name: kv-store
+    port: 8699
+    protocol: TCP
+    targetPort: 8699
+
+  selector:
+    app: kage
+  type: ClusterIP

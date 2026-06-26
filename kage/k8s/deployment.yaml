@@ -1,0 +1,167 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: kage
+  name: kage
+  namespace: agent-system
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: kage
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: kage
+    spec:
+      containers:
+      - args:
+        - -c
+        - /fluent-bit/etc/fluent-bit.conf
+        image: fluent/fluent-bit:5.0.7
+        imagePullPolicy: IfNotPresent
+        name: hermes-fluent-bit
+        resources:
+          limits:
+            ephemeral-storage: 1Gi
+          requests:
+            cpu: 500m
+            ephemeral-storage: 1Gi
+            memory: 2Gi
+        securityContext:
+          capabilities:
+            drop:
+            - NET_RAW
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /opt/data
+          name: data-volume
+          readOnly: true
+        - mountPath: /fluent-bit/etc
+          name: agent-fluent-bit-config
+          readOnly: true
+        - mountPath: /fluent-bit/state
+          name: agent-fluent-bit-state
+      - args:
+        - gateway
+        - run
+        env:
+        - name: API_SERVER_ENABLED
+          value: "true"
+        - name: HERMES_DASHBOARD
+          value: "0"
+        - name: HERMES_DASHBOARD_INSECURE
+          value: "true"
+        - name: API_SERVER_HOST
+          value: 0.0.0.0
+        - name: API_SERVER_KEY
+          value: your-strong-api-server-key-here
+        - name: SWARM_API_KEY
+          value: your-strong-api-server-key-here
+        - name: YOLO_MODE
+          value: "true"
+        - name: GATEWAY_ALLOW_ALL_USERS
+          value: "true"
+        - name: GOOGLE_CHAT_PROJECT_ID
+          value: agentic-harness-demo
+        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+          value: projects/agentic-harness-demo/subscriptions/platform-agent-chat-events-sub
+        - name: GOOGLE_CHAT_SERVICE_ACCOUNT_JSON
+          value: ""
+        - name: MODEL_NAME
+          value: model-default
+        - name: MODEL_BASE_URL
+          value: http://litellm.agent-system.svc.cluster.local/v1
+        - name: MODEL_API_KEY
+          value: none
+        - name: SESSION_RESOLVER_URL
+          value: http://localhost:8699
+        - name: HERMES_SKIP_CONFIG_MIGRATION
+          value: "1"
+        - name: PYTHONPATH
+          value: /opt/data/python_overrides
+        - name: HERMES_OTEL_EXPORTER
+          value: otlp
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+        - name: OTEL_SERVICE_NAME
+          value: platform-agent
+        - name: AGENT_BROWSER_ARGS
+          value: --no-sandbox
+        envFrom:
+        - secretRef:
+            name: github-token-secret-fixed
+        image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:yolo-single
+        imagePullPolicy: Always
+        name: kage
+        ports:
+        - containerPort: 8642
+          name: api
+          protocol: TCP
+        - containerPort: 9119
+          name: dashboard
+          protocol: TCP
+
+        resources:
+          limits:
+            cpu: "8"
+            ephemeral-storage: 5Gi
+            memory: 16Gi
+          requests:
+            cpu: "8"
+            ephemeral-storage: 5Gi
+            memory: 8Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - SETUID
+            - SETGID
+            - CHOWN
+            - FOWNER
+            - DAC_OVERRIDE
+            drop:
+            - ALL
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /opt/data
+          name: data-volume
+        - mountPath: /run
+          name: run-volume
+
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: kage-sa
+      serviceAccountName: kage-sa
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: kubernetes.io/arch
+        operator: Equal
+        value: amd64
+      volumes:
+
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: kage-pvc
+
+      - emptyDir: {}
+        name: run-volume
+      - configMap:
+          defaultMode: 420
+          name: agent-fluent-bit-config
+        name: agent-fluent-bit-config
+      - emptyDir: {}
+        name: agent-fluent-bit-state

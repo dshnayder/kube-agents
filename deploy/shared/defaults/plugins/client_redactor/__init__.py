@@ -61,7 +61,7 @@ TECHNICAL_ALLOWLIST: Set[str] = {
     "fsgroup", "seccompprofile", "type", "runtimedefault", "hostpath", "emptydir", "configmapref", "secretref",
     # Project specifics
     "hermes", "litellm", "otel", "fluent-bit", "yolo", "devteam", "operator", "platform", "hermes_otel",
-    "compliance_critic", "session_resolver", "tool_overrides", "session_store", "delegate_workload"
+    "compliance_critic", "tool_overrides", "session_store"
 }
 
 PLACEHOLDER_PATTERN = re.compile(r"^GC[a-fA-F0-9]{6}$")
