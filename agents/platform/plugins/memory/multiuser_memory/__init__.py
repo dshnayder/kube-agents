@@ -71,7 +71,7 @@ class MultiUserFileMemoryProvider(MemoryProvider):
             text = path.read_text(encoding="utf-8").strip()
             if not text:
                 return []
-            return [e.strip() for e in text.split("§") if e.strip()]
+            return [e.strip() for e in text.split(ENTRY_DELIMITER) if e.strip()]
         except Exception as e:
             logger.error("Failed reading memory file %s: %s", path, e)
             return []
