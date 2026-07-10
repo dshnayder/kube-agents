@@ -49,16 +49,27 @@ def get_current_git_repo() -> str:
 
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    # 1. Fetch Google ID token from GCP Metadata Server (Workload Identity)
+    # 1. Retrieve Google OIDC identity token via gcloud external command
+    oidc_token = None
     try:
-        req_meta = urllib.request.Request(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token",
-            headers={"Metadata-Flavor": "Google"}
-        )
-        with urllib.request.urlopen(req_meta, timeout=5) as resp_meta:
-            oidc_token = resp_meta.read().decode("utf-8").strip()
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch Google ID token from GCP Metadata Server (http://metadata.google.internal/): {e}") from e
+        oidc_token = subprocess.run(
+            ["gcloud", "auth", "print-identity-token", f"--audiences={TOKEN_BROKER_URL}"],
+            capture_output=True, text=True, check=True,
+            timeout=10
+        ).stdout.strip()
+    except Exception as e1:
+        # If --audiences fails (e.g., when running with human user credentials), retry without flags
+        try:
+            oidc_token = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                capture_output=True, text=True, check=True,
+                timeout=10
+            ).stdout.strip()
+        except Exception as e2:
+            raise RuntimeError(f"Failed to retrieve Google OIDC token via gcloud: {e2}") from e2
+
+    if not oidc_token:
+        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty")
 
     # 2. Dynamically identify target repository from workspace git remote or parameter
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
