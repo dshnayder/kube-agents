@@ -436,8 +436,18 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		}
 	}
 
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "TOKEN_BROKER_URL",
+		Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace),
+	})
+
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
+	}
+
+	var runtimeClassName *string
+	if agent.Spec.Deployment != nil {
+		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
 	containers := buildDefaultContainers(image, pullPolicy, envVars, homeDir)
@@ -484,6 +494,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					},
 				},
 				Spec: corev1.PodSpec{
+					RuntimeClassName:   runtimeClassName,
 					InitContainers:     initContainers,
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
@@ -545,7 +556,7 @@ func buildDefaultContainers(image string, pullPolicy corev1.PullPolicy, envVars 
 					SubPath:   "SETTINGS.md",
 					ReadOnly:  true,
 				},
-        {
+				{
 					Name:      "system-metadata",
 					MountPath: path.Dir(sessionKVDBPath),
 					SubPath:   "session",
@@ -649,14 +660,14 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
-    {
-      Name: "system-metadata",
-      VolumeSource: corev1.VolumeSource{
-        PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-          ClaimName: "system-metadata",
-        },
-      },
-    },
+		{
+			Name: "system-metadata",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "system-metadata",
+				},
+			},
+		},
 		{
 			Name: "settings-volume",
 			VolumeSource: corev1.VolumeSource{

@@ -33,6 +33,7 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
 init_var_model_provider
 
 # Map global state variables to expected template variables
@@ -100,11 +101,23 @@ execute_custom_resource() {
     export SLACK_HOME_CHANNEL_NAME=""
   fi
 
+  # Handle optional GitHub integration variables
+  if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ]; then
+    export GITHUB_FULL_REPO="${GITHUB_ORG}/${GITHUB_REPO}"
+  else
+    export GITHUB_FULL_REPO=""
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   
+  if [[ "$ENABLE_GVISOR" =~ ^(true|yes|1)$ ]]; then
+    print_info "Enabling gVisor runtimeClassName in '$CR_MANIFEST'..."
+    sed -i.bak 's/# runtimeClassName: gvisor/runtimeClassName: gvisor/g' "$CR_MANIFEST" && rm -f "${CR_MANIFEST}.bak"
+  fi
+
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
   kubectl apply -f "$CR_MANIFEST"
 }
