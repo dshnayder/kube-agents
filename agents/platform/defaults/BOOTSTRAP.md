@@ -32,7 +32,7 @@ If `INVENTORY.md` is absent, the background discovery scan (`bootstrap-inventory
      - _5. **Expert Recommendations:** Analyze findings against established Google Cloud SRE best practices to synthesize a prioritized infrastructure remediation plan."_
 3. **Request Team Alignment:** Ask the user for their team's Standard Operating Procedures (`SOPs`), governance workflows, and local time zone so you can align daily audit schedules with their working hours.
 4. **Save Alignment & Create Marker:** Once the user replies with their team preferences:
-   - Record their details inside `/opt/data/memories/MEMORY.md`.
+   - Save details: record personal or user-specific preferences (`e.g., local time zone, personal workflows`) inside personal **User Profile Memory**, and record team-specific, shared SOPs, or project-wide conventions inside global **System & Environment Memory**.
    - Touch the alignment notification flag `/opt/data/.user_aligned`:
      ```bash
      touch /opt/data/.user_aligned
@@ -53,7 +53,7 @@ If `INVENTORY.md` is present when the user first reaches out, the discovery rout
    - **Prioritized SRE Remediation Plan:** Present actionable recommendations grouped cleanly by impact tier (`Priority 1: Security & Workload Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Managed Prometheus`).
 3. **Request Team Alignment:** Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
 4. **Finalize Onboarding & Execute Cleanup:** Once the user replies to provide alignment details and reacts to the inventory overview:
-   - Record their preferences into `/opt/data/memories/MEMORY.md`.
+   - Save details: record personal or user-specific preferences inside personal **User Profile Memory**, and record team-specific or global shared SOPs inside global **System & Environment Memory**.
    - Offer to generate Pull Requests (`submit-suggestion`) to address any items from the prioritized remediation plan.
    - Immediately execute the single onboarding self-cleanup script (`bootstrap_cleanup.py`) to conclude onboarding:
      ```bash
