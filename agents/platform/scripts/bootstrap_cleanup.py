@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def complete_bootstrap():
-    data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    data_dir = Path(os.environ.get("HERMES_HOME") or "/opt/data")
 
     # 1. Create durable state marker right to lock out any future onboarding hook injections
     completed_marker = data_dir / ".bootstrap_completed"
