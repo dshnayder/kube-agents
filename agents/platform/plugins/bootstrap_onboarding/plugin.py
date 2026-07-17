@@ -38,9 +38,9 @@ def _perform_onboarding_cleanup(data_dir: Path) -> None:
     except Exception as e:
         logger.warning("Could not remove %s: %s", inventory_path, e)
 
-    hermes_bin = "/opt/hermes/.venv/bin/hermes"
-    if not Path(hermes_bin).exists():
-        hermes_bin = "hermes"
+    hermes_bin = Path(sys.executable).parent / "hermes"
+    if not hermes_bin.exists():
+        hermes_bin = Path("hermes")
 
     for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
         try:
