@@ -3,7 +3,7 @@
 **Status:** Evaluation / recommendation
 **Date:** 2026-07-22
 **Scope:** Whether [Scion](https://github.com/GoogleCloudPlatform/scion) can host the kube-agents Hermes agents and take over orchestration + communication.
-**Method:** Verified against Scion source (`github.com/GoogleCloudPlatform/scion`, cloned at HEAD `b4c9911`) and the kube-agents source in this repo — **not** against Scion's published docs, which were found to be inaccurate on several points.
+**Method:** Verified against source — Scion (`github.com/GoogleCloudPlatform/scion` @ `b4c9911`), Hermes (`github.com/nousresearch/hermes-agent`), and the kube-agents source in this repo. **Not** taken from published docs, which were found inaccurate on several points.
 
 > ⚠️ Naming note: this "Scion" is **not** the SCION networking project (`scionproto/scion`). It is a Google Cloud AI-agent orchestration platform that happens to share the name.
 
@@ -11,28 +11,31 @@
 
 ## TL;DR
 
-**Partly true, but the "easily" does not hold for our use case — because Scion's "Hermes" is not our Hermes.**
+**The idea is viable.** Porting our Hermes platform-agent **content** — SOUL.md, skills, config.yaml, MCP tools, plugin tools — onto Scion is a **minor-rework** exercise, confirmed by reading both the Hermes and Scion source (they corroborate each other). This is *not* a rewrite.
 
-Scion and kube-agents both build on the same upstream package (`nousresearch/hermes-agent`), but they run it in **opposite modes**:
+The nuance: Scion runs Hermes as a **CLI** (`hermes chat`), not as our **gateway** (`hermes gateway run`). That means we give up the Hermes *gateway* layer — chat adapters, autonomous cron/kanban dispatch, gateway plugin hooks. But that layer is precisely the **"orchestration and communication"** we would be handing to Scion anyway, so losing it is the intent, not a regression.
 
-- **kube-agents** runs `hermes gateway run` — Hermes as a **long-running chat-gateway platform**: profiles, kanban delegation, Google Chat/Slack ingress, cron, and gateway plugin hooks.
-- **Scion** runs `hermes chat --yolo` — Hermes as a **coding-agent CLI** that Scion puppeteers by injecting prompts over `tmux send-keys`.
+The real decision therefore is **not** "can our agent run on Scion" (it can). It is whether we accept three genuine trade-offs:
 
-The part of kube-agents that actually does our job — the Hermes **gateway** — is exactly the part Scion's Hermes integration does **not** run. So "deploy the hermes platform agent harness on top of Scion" is **not a lift-and-shift; it is a re-architecture** onto Scion-native primitives, and it regresses several properties that matter for an always-on fleet operator.
+1. **No self-healing on eviction** — Scion agent pods are bare Pods with `RestartPolicy: Never`; an evicted always-on agent stays dead until manually resumed.
+2. **No Google Chat** — Scion has Slack/Telegram/Discord, but Google Chat is a non-functional stub.
+3. **Stateful data needs a durable backend** — kanban/session/handover state won't survive on Scion's default ephemeral `/workspace`.
 
-**Recommendation:** Do **not** replace the kube-agents platform gateway with Scion. Keep the always-on gateway (chat + monitoring + delegation) on the operator / a plain Kubernetes Deployment. **Do** consider Scion for the piece it is genuinely good at — ephemeral, strongly-isolated **specialist/investigation agents** (our per-cluster Cluster Agents and kanban workers) — where its isolation and security model are a real upgrade. See [Recommended path](#recommended-path-hybrid).
+**Recommendation:** Treat this as a viable path worth a proof-of-concept, scoped to validate those three risks. If self-healing and Google Chat are hard requirements for the always-on front door, prefer a **hybrid**: keep the always-on piece on a K8s Deployment and use Scion for ephemeral, strongly-isolated specialist agents (our Cluster Agents / kanban workers) — where Scion's isolation is a clear security win. See [Recommended path](#recommended-path).
 
 ---
 
 ## Claim-by-claim verdict
 
+Evaluating the original proposition: *"Scion supports hermes, so we could easily deploy the hermes platform agent harness on Scion, add persona types, and let Scion manage orchestration and communication."*
+
 | # | Claim | Verdict | Why |
 |---|-------|---------|-----|
-| 1 | "Scion might solve a lot of these problems (multi-agent + security)" | ✅ **Largely true** | Strong per-agent isolation (own container, credentials, git worktree), native multi-agent projects, a cron scheduler, and bidirectional chat. This is Scion's real strength. |
-| 2 | "It now also supports hermes" | ⚠️ **True but misleading** | There is a built-in `hermes` harness — but it runs Hermes as a **coding CLI**, not as our gateway platform. Not the same capability set. |
-| 3 | "Easily deploy the hermes platform agent harness on top of Scion" | ❌ **Not easily** | Requires abandoning gateway mode and re-modelling profiles, kanban delegation, Google Chat ingress, and gateway plugin hooks onto Scion primitives. |
-| 4 | "Easily add additional agent/persona types" | ⚠️ **Partly** | Scion templates/projects make adding personas straightforward *if* they are Scion-native agents. Our persona model (SOUL.md + gateway profiles) does not port 1:1 — SOUL.md is downgraded into `AGENTS.md`. |
-| 5 | "Let Scion manage orchestration and communication" | ⚠️ **Partly** | Orchestration (spawn/schedule/route) and chat (Slack, Telegram, Discord — **not** Google Chat) exist, but **there is no self-healing**: an evicted agent stays dead until manually resumed. |
+| 1 | "Scion solves multi-agent + security problems" | ✅ **Largely true** | Strong per-agent isolation (own container, credentials, worktree), native multi-agent projects, cron scheduler, bidirectional chat. Its real strength. |
+| 2 | "It now also supports hermes" | ✅ **True** (with a caveat) | Built-in `hermes` harness exists — but runs Hermes as a **CLI**, not our gateway. Content ports; the gateway layer does not. |
+| 3 | "Easily deploy the hermes platform agent on Scion" | ✅ **Content: minor rework** / ⚠️ **orchestration: moderate rework** | Agent content (SOUL.md, skills, config, MCP, plugin tools) ports with minor changes. Re-modelling profile+kanban delegation onto Scion primitives is moderate design work. |
+| 4 | "Easily add additional agent/persona types" | ✅ **True** | Scion templates/projects make new personas straightforward — arguably easier than Hermes profiles. Each persona = a template. |
+| 5 | "Let Scion manage orchestration and communication" | ⚠️ **Mostly, with gaps** | Orchestration (spawn/schedule/route/message) ✅; chat ✅ Slack/Telegram/Discord but ✗ Google Chat; and **no self-healing** on eviction. |
 
 ---
 
@@ -44,78 +47,100 @@ The part of kube-agents that actually does our job — the Hermes **gateway** �
 
 ---
 
-## The critical finding: two meanings of "Hermes"
+## The key distinction: two modes of "Hermes"
 
-Both projects depend on `nousresearch/hermes-agent`, but use it in opposite modes.
+Both projects depend on `nousresearch/hermes-agent`, but use it in different modes.
 
 | | kube-agents | Scion `hermes` harness |
 |---|---|---|
 | Package extra | `hermes-agent[google_chat]` | `hermes-agent[vertex]` |
 | Launch command | `hermes gateway run` | `hermes chat --yolo` — `harnesses/hermes/config.yaml:42` |
-| Operating mode | Long-running **gateway/server** | Interactive **coding-agent CLI** |
-| Input path | Hermes' own ingress (Google Chat/Slack via Pub/Sub pull, Slack socket mode) | Scion injects prompts via `tmux send-keys` — `pkg/runtimebroker/handlers.go:1643` |
-| Uses | profiles, kanban dispatcher, Hermes cron, gateway plugin hooks | none of the above |
-| Scion's own description | — | "Nous Research's AI **coding agent**" — `harnesses/hermes/README.md` |
+| Operating mode | Long-running **gateway/server** | Interactive **CLI**, driven per-prompt |
+| Input path | Hermes' own ingress (Google Chat/Slack via Pub/Sub, socket mode) | Scion injects prompts via `tmux send-keys` — `pkg/runtimebroker/handlers.go:1643` |
+| Provides | profiles, kanban dispatcher, Hermes cron, chat adapters, gateway hooks | agent runtime only; Scion supplies orchestration + chat |
 
-Scion's Hermes has **no hook dialect** (`pkg/sciontool/hooks/dialects/` contains only `claude.go`, `codex.go`, `gemini.go`), and its provisioner does only auth resolution, `AGENTS.md` projection, and MCP config — **no chat ingress** (`harnesses/hermes/provision.py`). So on Scion, Hermes is a puppeteered CLI; it does not run its own gateway or chat adapters.
-
-**Consequence:** "deploying our Hermes platform agent on Scion" means one of two things, both costly:
-
-- **Path A — adopt Scion's `hermes chat` harness (Scion-native).** You lose gateway mode entirely: no profiles, no kanban dispatcher, no Google Chat ingress, and gateway plugin hooks (`pre_gateway_dispatch`: `session_store`, `session_otel_bridge`, `tool_call_audit`, `chat_message_audit`) do not fire because there is no gateway. SOUL.md is downgraded into `AGENTS.md` (the harness declares `system_prompt: partial`). MCP tools carry over. This is a re-architecture onto Scion's native multi-agent primitives.
-- **Path B — run our existing gateway image as an opaque BYO container on Scion.** You keep all gateway features, but Scion adds ~nothing and actively fights you: it forces a `sciontool init` + `tmux` entrypoint (image must ship both), drives via `send-keys` (meaningless to a gateway), gives **no self-healing**, and offers no easy durable RWO volume. You'd be using Scion as a strictly worse Deployment.
+**This is not a blocker — it is a division of labour.** In `hermes chat` mode, the agent's *identity and capabilities* are fully intact (see next section); what the gateway would have provided (chat ingress, autonomous scheduling, dispatch) is instead Scion's job. For the stated goal — "let Scion manage orchestration and communication" — that is exactly the desired split.
 
 ---
 
-## Gaps that matter for an always-on fleet operator
+## Content portability (verified from Hermes **and** Scion source)
 
-All verified against Scion source.
+The critical question is whether our customizations survive when Hermes runs as `hermes chat` under Scion. They do. Hermes reads its persona/config/skills from `$HERMES_HOME`, and Scion sets `HERMES_HOME=/home/scion/.hermes` and lays content there — the two line up:
 
-### 1. No self-healing on eviction (the hard blocker)
-Scion's Kubernetes runtime creates a **bare `corev1.Pod`** with `RestartPolicy: Never` and **no controller/informer/reconcile** watching it (`pkg/runtime/k8s_runtime.go:1208,1237,356`). If a pod is evicted (node upgrade, autoscaler scale-down, preemption, OOM) or the node dies, the agent stays **dead** until a human runs `scion resume` (`cmd/resume.go:23`). Stalled agents are **suspended, not relaunched** (`pkg/hub/server.go:1991`).
+| Artifact | Portability | Evidence |
+|---|---|---|
+| **SOUL.md** (persona) | ✅ **As-is** — Hermes reads it from `$HERMES_HOME` natively in `chat`; Scion never touches it | Hermes `agent/prompt_builder.py:1888`, `system_prompt.py:188`; Scion `provision.py` writes only `.env`/`AGENTS.md`/`mcp.json` |
+| **config.yaml** (model, toolsets, plugins, disabled_toolsets) | ✅ **As-is** — honored by `hermes chat`; provisioner doesn't clobber `~/.hermes/config.yaml` | Hermes `config.py:7286`, `model_tools.py:399`; Scion `provision.py` (no config handling) |
+| **skills/** (SKILL.md) | ✅ **Rename-only** — must live at `.hermes/skills`; Scion auto-copies template `skills/` | Hermes `skills_tool.py:143`; Scion `provision.go:822` |
+| **Plugin tools** (e.g. `handover` → `write_handover`) | ✅ **Works** — registered into the shared tool registry in `chat` mode | Hermes `model_tools.py:204`, `plugins.py:391` |
+| **Plugin agent-lifecycle hooks** (tool/LLM/session) | ✅ **Works** in `chat` | Hermes `agent/turn_*`, `run_agent.py` |
+| **MCP servers** (gke, platform_control, dev-knowledge) | ⚠️ **Re-declare** — must be set in the Scion template's `mcp_servers`, else a shipped `mcp.json` is **deleted** | Scion `provision.py:181-195` |
+| **AGENTS.md** (operating instructions) | ⚠️ **Merge-safe, placement wrinkle** — Scion prepends a managed block; Hermes reads AGENTS.md from **CWD** (`/workspace`) while Scion writes to `$HOME`. Put instructions in SOUL.md to avoid this | Hermes `prompt_builder.py:1932`; Scion `scion_harness.py:822` |
 
-kube-agents today runs the gateway as an operator-managed **Deployment**, which reconciles it back to healthy automatically. For an always-on monitor + chat front door, losing that is a real reliability regression.
+**Gateway-only features that do NOT run under `hermes chat`** — and their Scion replacement:
 
-### 2. Persistence model mismatch
-kube-agents' `/opt/data` is a durable **RWO PVC** holding profiles, fleet handover records, per-cluster kubeconfigs, `kanban.db`, and cron state. Scion's default `/workspace` is **ephemeral EmptyDir** (`pkg/runtime/k8s_runtime.go:1196`). Durable state requires opting into **NFS/Filestore (RWX)**, shared-dir RWX PVCs, or GCS-fuse; there is **no arbitrary RWO-PVC mount and no hostPath** (`k8s_runtime.go:1498-1505`). Our state layout would need rework.
+| Lost (gateway-only) | Replaced by |
+|---|---|
+| Chat adapters (Slack / Google Chat) | Scion channels (Slack ✅, Telegram/Discord ✅; **Google Chat ✗**) |
+| `pre_gateway_dispatch` hooks (`session_store`, `session_otel_bridge`, `tool_call_audit`, `chat_message_audit`) | Scion's own session store, OTel telemetry, and audit |
+| Autonomous cron ticker + kanban auto-dispatch | Scion's cron scheduler + `dispatch_agent` orchestration |
+| HTTP API / dashboard | Scion Hub / dashboard (not needed) |
 
-### 3. Google Chat is a non-functional stub
-kube-agents depends on Google Chat. In Scion, only a signing-key constant exists (`pkg/config/integration_config.go`); there is **no Google Chat channel implementation** and it is not in the channel registry (`pkg/hub/channels.go`). Working chat channels are **Slack** (outbound), plus **Telegram/Discord** (full bidirectional). Bidirectional human→agent input works via `tmux send-keys`.
+### Packaging recipe (minor rework)
 
-### 4. GCP identity is supported but not automated
-Scion sets `serviceAccountName` on the pod for Workload Identity **if you name a pre-bound KSA** (`k8s_runtime.go:1517`, `pkg/api/types.go:318`), but it does **not** create the KSA↔GSA binding, and its metadata-interception path does not work on Kubernetes (the pod drops all capabilities — `k8s_runtime.go:1230`). Our provisioning scripts would still do the binding.
+1. **Rebuild the image `FROM scion-base`**, then `pip install hermes-agent` and copy our content. `scion-base` supplies the `sciontool` + `tmux` + `python3` the pod entrypoint requires (`k8s_runtime.go:933`, `harnesses/hermes/config.yaml:27`).
+2. **Place profile content under `~/.hermes/`** (SOUL.md, config.yaml) and `.hermes/skills/` — via a Scion template `home/` tree (auto-copied, `provision.go:787`) or baked into the image.
+3. **Re-declare MCP servers** in the Scion template's `mcp_servers` (translated into `~/.hermes/mcp.json` by the provisioner).
+4. **Keep operating instructions in SOUL.md** to sidestep the AGENTS.md CWD-vs-HOME wrinkle; expect Scion to prepend a managed block to AGENTS.md.
+5. **Add a durable backend** for mutable state (see below) if kanban/sessions/handover must persist.
 
-### 5. Scion replaces the runtime, not the platform
-LiteLLM, the OTel collector, the GitHub token-minter, and cluster RBAC are all separate dependencies that remain our responsibility regardless of which orchestrator runs the agents.
+---
+
+## The three genuine trade-offs
+
+These survive scrutiny and are the real decision factors — none is about content portability.
+
+### 1. No self-healing on eviction (the hard one)
+Scion's Kubernetes runtime creates a **bare `corev1.Pod`** with `RestartPolicy: Never` and **no controller/informer/reconcile** watching it (`pkg/runtime/k8s_runtime.go:1208,1237,356`). On eviction (node upgrade, autoscaler scale-down, preemption, OOM) or node loss, the agent stays **dead** until a human runs `scion resume` (`cmd/resume.go:23`); stalled agents are **suspended, not relaunched** (`pkg/hub/server.go:1991`). kube-agents today runs the gateway as an operator-managed **Deployment** that reconciles automatically. For an always-on monitor + chat front door this is a real reliability regression — mitigable only by external supervision or by keeping the always-on piece on a Deployment.
+
+### 2. Google Chat is a non-functional stub
+kube-agents depends on Google Chat. In Scion, only a signing-key constant exists (`pkg/config/integration_config.go`); there is **no Google Chat channel implementation** and it is not in the channel registry (`pkg/hub/channels.go`). Working channels: **Slack** (outbound), **Telegram/Discord** (bidirectional). If Google Chat is required, this is a gap (build the channel, or switch to Slack).
+
+### 3. Stateful data needs a durable backend
+Image-baked content (SOUL.md, skills, config) is fine — it is rebuilt each launch. But **mutable** state — `kanban.db`, sessions, handover records — will not persist on Scion's default `/workspace` (**ephemeral EmptyDir**, `k8s_runtime.go:1196`). Durable state requires **NFS/Filestore (RWX)**, shared-dir RWX PVCs, or GCS-fuse; there is **no arbitrary RWO-PVC mount and no hostPath** (`k8s_runtime.go:1498-1505`). This is rework of our state layout.
+
+### Also note (not blockers)
+- **GCP identity**: Scion sets `serviceAccountName` for Workload Identity if you name a pre-bound KSA (`k8s_runtime.go:1517`, `pkg/api/types.go:318`), but does **not** create the KSA↔GSA binding (our provisioning scripts still do), and its metadata-interception path doesn't work on K8s (pod drops all caps, `k8s_runtime.go:1230`).
+- **Scion replaces the runtime, not the platform**: LiteLLM, the OTel collector, the GitHub token-minter, and cluster RBAC remain our responsibility regardless.
+- **Orchestration re-modelling** (moderate): our Chat→Platform→Cluster profile + kanban delegation maps onto Scion projects + `dispatch_agent` + inter-agent messaging — doable, but design work, not a copy.
 
 ---
 
 ## What Scion genuinely gets right (the case *for* it)
 
-Corrected against source — several capabilities are **better** than an initial doc-based read suggested:
-
-- **Long-running agents** — Scion agents are persistent daemons (persistent tmux, `sleep infinity` when idle, no terminal "completed" phase). It is *not* a task-only runner.
-- **Cron scheduler** — first-class `robfig/cron/v3` scheduler with a `dispatch_agent` event that spawns agents on a schedule (`pkg/hub/scheduler.go`, `pkg/hub/server.go:2206`) — directly useful for periodic monitoring.
-- **Security / isolation** — the strongest part of the original claim: each agent gets its own container, credentials, and git worktree — materially stronger tenant isolation than kube-agents' shared-pod-identity profiles.
-- **Bring-your-own image** — templates set image, command/args, env, volumes, resources (`pkg/api/types.go:437`), subject to the image shipping `sciontool` + `tmux`.
+- **Long-running agents** — persistent daemons (persistent tmux, `sleep infinity` when idle, no terminal "completed" phase). Not a task-only runner.
+- **Cron scheduler** — first-class `robfig/cron/v3` with a `dispatch_agent` event that spawns agents on schedule (`pkg/hub/scheduler.go`, `pkg/hub/server.go:2206`) — directly useful for monitoring.
+- **Security / isolation** — the strongest part of the original claim: each agent gets its own container, credentials, and git worktree — materially stronger isolation than kube-agents' shared-pod-identity profiles.
+- **Bring-your-own image** — templates set image, command/args, env, volumes, resources (`pkg/api/types.go:437`), given the image ships `sciontool` + `tmux`.
 - **Bidirectional chat** — Slack, Telegram, Discord, with human input routed into the agent.
-
-These make Scion a strong fit for **ephemeral, isolated specialist agents** — which is precisely how our Cluster Agents and kanban workers already behave.
 
 ---
 
-## Recommended path (hybrid)
+## Recommended path
 
-1. **Keep the always-on gateway on Kubernetes** (operator or a plain Deployment). This is where self-healing, Google Chat ingress, profile-based delegation, and gateway plugin hooks live. Do not move it to Scion.
-2. **Evaluate Scion for ephemeral specialist agents.** Our per-cluster Cluster Agents and kanban workers are already one-shot, task-scoped invocations — an ideal match for Scion's isolation model and `dispatch_agent` scheduling. The no-self-healing and ephemeral-state traits do not hurt here.
-3. **Seam:** the gateway could call Scion's `dispatch_agent` (or the equivalent API) to spawn an isolated investigation agent per cluster/incident, then collect results — replacing in-pod subprocess scaffolding with hardened, separately-credentialed containers. This captures the **security/isolation** win Gari is pointing at without giving up the reliability of the gateway.
+The proposition is viable. De-risk it with a scoped proof-of-concept before committing:
+
+1. **PoC the platform agent on Scion.** Rebuild the image per the [recipe](#packaging-recipe-minor-rework), ship our SOUL.md/skills/config, re-declare MCP, and drive it via Scion. This validates content portability end-to-end (low effort, high signal).
+2. **Explicitly test the three trade-offs:** kill the pod / drain the node and observe recovery (self-healing); confirm the chat channel (Slack vs Google Chat requirement); wire a durable backend for kanban/session/handover state.
+3. **If self-healing or Google Chat are hard requirements, go hybrid:** keep the always-on front door on a K8s Deployment (self-healing + Google Chat + delegation), and use Scion for **ephemeral specialist agents** — our per-cluster Cluster Agents and kanban workers are already one-shot invocations and are an ideal match for Scion's isolation and `dispatch_agent` scheduling. The gateway can call `dispatch_agent` to spawn a hardened, separately-credentialed investigation agent per cluster/incident — capturing the security/isolation win without the reliability regression.
 
 ---
 
 ## Bottom line
 
-- "It supports Hermes" is **true but not the Hermes we run.** Scion drives Hermes as a coding CLI; we run it as a gateway platform.
-- "Easily deploy … and let Scion manage orchestration and communication" is **not accurate for the platform gateway** — it is a re-architecture that drops Google Chat and gateway plugin hooks and regresses self-healing and persistence.
-- Scion's real value for us is **security/isolation of ephemeral specialist agents**, not replacing the platform front door. A **hybrid** captures that value without the regressions.
+- **"It supports hermes" — true.** Our agent *content* (SOUL.md, skills, config, MCP, plugin tools) ports with **minor rework**; both source trees confirm it.
+- **"Let Scion manage orchestration and communication" — mostly yes, by design.** The Hermes gateway features we lose are the ones Scion replaces. Real gaps: **no Google Chat** and **no self-healing on eviction**.
+- **The decision is about trade-offs, not feasibility.** If we can live without automatic eviction recovery (or supervise it externally), don't need Google Chat, and rework state onto a durable backend, deploying our Hermes agent(s) on Scion — and adding persona types as templates — is a realistic architecture. Otherwise, a hybrid captures Scion's security/isolation strengths while keeping the always-on front door reliable.
 
 ---
 
@@ -126,21 +151,36 @@ Scion (`github.com/GoogleCloudPlatform/scion` @ `b4c9911`):
 | Finding | File:line |
 |---|---|
 | Hermes launched as `hermes chat --yolo` (CLI, not gateway) | `harnesses/hermes/config.yaml:42` |
-| Hermes = Nous coding agent; installed via pip | `harnesses/hermes/README.md`, `harnesses/hermes/Dockerfile:38` |
-| No Hermes hook dialect (only claude/codex/gemini) | `pkg/sciontool/hooks/dialects/` |
-| Hermes provisioner does auth/AGENTS.md/MCP only — no ingress | `harnesses/hermes/provision.py` |
+| Hermes provisioner: writes `.env`/`AGENTS.md`/`mcp.json` only; never touches SOUL.md/config.yaml | `harnesses/hermes/provision.py` |
+| Template `home/` tree copied into agent home | `pkg/agent/provision.go:787` |
+| Template `skills/` copied to `.hermes/skills` | `pkg/agent/provision.go:822` |
+| AGENTS.md merged (managed block prepended), not overwritten | `harnesses/scion_harness.py:822` |
+| `mcp.json` deleted if template declares no MCP servers | `harnesses/hermes/provision.py:181-195` |
+| `HERMES_HOME=/home/scion/.hermes`; CWD=`/workspace`; no `-p` flag | `harnesses/hermes/provision.py:232`, `k8s_runtime.go:1224`; `pkg/harness/declarative_generic.go:93` |
+| Image must ship sciontool + tmux + python3 + hermes | `k8s_runtime.go:933`, `harnesses/hermes/config.yaml:27`, `image-build/scion-base/Dockerfile` |
 | Human input injected via tmux send-keys | `pkg/runtimebroker/handlers.go:1643` |
 | K8s object = bare Pod, `RestartPolicy: Never` | `pkg/runtime/k8s_runtime.go:1208,1237,356` |
-| No pod reconcile/informer; stalled agents suspended | `pkg/hub/server.go:1991` |
-| Manual restart only (`scion resume`) | `cmd/resume.go:23` |
-| Default `/workspace` = ephemeral EmptyDir | `pkg/runtime/k8s_runtime.go:1196` |
-| Bind/local volumes unsupported on K8s | `pkg/runtime/k8s_runtime.go:1498-1505` |
+| No pod reconcile/informer; stalled agents suspended; manual `scion resume` | `pkg/hub/server.go:1991`, `cmd/resume.go:23` |
+| Default `/workspace` = ephemeral EmptyDir; no hostPath/RWO-PVC | `pkg/runtime/k8s_runtime.go:1196,1498-1505` |
 | BYO image + command/env/volumes/resources | `pkg/api/types.go:437` |
 | `serviceAccountName` for Workload Identity (binding not created by Scion) | `pkg/runtime/k8s_runtime.go:1517`, `pkg/api/types.go:318` |
 | Pod drops ALL capabilities (metadata interception broken on K8s) | `pkg/runtime/k8s_runtime.go:1230` |
 | Cron scheduler + `dispatch_agent` | `pkg/hub/scheduler.go`, `pkg/hub/server.go:2206` |
-| Chat channels (Slack/Discord/Email/Webhook; no Google Chat) | `pkg/hub/channels.go` |
-| Google Chat is a stub (signing key only) | `pkg/config/integration_config.go` |
+| Chat channels (Slack/Discord/Email/Webhook; Google Chat is a stub) | `pkg/hub/channels.go`, `pkg/config/integration_config.go` |
+
+Hermes (`github.com/nousresearch/hermes-agent`) — what `hermes chat` honors:
+
+| Finding | File:line |
+|---|---|
+| SOUL.md read from `$HERMES_HOME` as identity, in chat mode | `agent/prompt_builder.py:1888`, `agent/system_prompt.py:188` |
+| AGENTS.md read from **CWD** as project context (additive to SOUL.md) | `agent/prompt_builder.py:1932` |
+| Profiles (`-p`) work in chat mode | `hermes_cli/main.py:476-630` |
+| Skills loaded from `$HERMES_HOME/skills`; synced on launch | `tools/skills_tool.py:143`, `hermes_cli/main.py:2542` |
+| config.yaml honored (model, mcp_servers, toolsets, plugins, disabled_toolsets) | `hermes_cli/config.py:7286`, `model_tools.py:399` |
+| MCP servers spawned/connected in chat | `cli.py:1030-1034` |
+| Plugin tools register into shared registry (work in chat) | `model_tools.py:204`, `plugins.py:391` |
+| `pre_gateway_dispatch` hook is gateway-only | `gateway/run.py:10322-10359` |
+| Chat adapters / HTTP API / autonomous cron+kanban are gateway-only | `gateway/run.py` (adapters `9487`, cron `23360`, kanban `8161`) |
 
 kube-agents (this repo):
 
