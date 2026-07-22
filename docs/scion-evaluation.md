@@ -9,12 +9,6 @@
 
 ---
 
-## The question being evaluated
-
-> "I have been talking about multi agent, and security today. Talking to Gari, he brings up Scion again. Scion might solve for a lot of these problems. It now also supports hermes. So we could (potentially) easily deploy the hermes platform agent harness on top of scion, and then (potentially) easily add additional agent/persona types, and let scion manage the orchestration and communication."
-
----
-
 ## TL;DR
 
 **Partly true, but the "easily" does not hold for our use case — because Scion's "Hermes" is not our Hermes.**
