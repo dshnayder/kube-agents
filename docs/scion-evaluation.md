@@ -38,9 +38,39 @@
 
 ## Background: what each system is
 
+**kube-agents** is the system being served — the *consumer*. **Scion**, **Agent Substrate**, and **AX** are the three candidate *runtimes* that could host or spawn its agents. Note the three are not fully parallel: Scion is a full standalone platform; Substrate is a low-level Kubernetes runtime; AX is a thin execution layer that runs *on top of* Substrate.
+
 **kube-agents** — an agentic harness that replaces `kubectl`/`gcloud`/Console with intent-driven agents for GKE fleet operations. Its runtime unit is a single **long-running Hermes gateway pod** (operator-managed Deployment) hosting multiple **profiles**: a Chat Agent front door, a privileged Platform Agent, and dynamically scaffolded per-cluster Cluster Agents. Delegation runs through a **kanban dispatcher** and file-based **handover** channel; chat reaches humans through Hermes' **own** Google Chat/Slack adapters. The platform agent holds **read-only** cluster RBAC and performs all mutations through a **GitOps write path** (human-reviewed PRs).
 
-**Scion** — a container-based orchestration platform for running many LLM "deep agents" (Claude Code, Gemini CLI, Codex, Hermes, …) concurrently, each isolated in its own container with separate credentials and a git worktree. A Hub + Runtime Broker manage agent lifecycle across Docker/Podman/Kubernetes backends.
+**Scion** (`github.com/GoogleCloudPlatform/scion`) — a container-based **orchestration platform** for running many LLM "deep agents" (Claude Code, Gemini CLI, Codex, Hermes, …) concurrently, each isolated in its own container with separate credentials and a git worktree. A **Hub** (control plane + web UI + chat channels + scheduler) and a **Runtime Broker** manage agent lifecycle across Docker/Podman/Kubernetes backends. On Kubernetes it creates a **bare Pod per agent** and drives it via **`pods/exec`** (`tmux send-keys`). It is opinionated and batteries-included: templates/personas, projects, inter-agent messaging, human-in-the-loop attach, Slack/Telegram/Discord. Not the SCION networking project. Most mature of the three; K8s runtime self-described as still rough.
+
+**Agent Substrate** (`github.com/agent-substrate/substrate`) — a **low-level Kubernetes runtime** for "actors" (bursty, mostly-idle agent workloads). Instead of a pod-per-agent, it pre-warms a small pool of **worker Pods** and **multiplexes many actors onto few workers over time** via snapshot **suspend/resume** (demo: ~250 sessions on 8 pods), deliberately keeping the K8s API server and **`pods/exec` out of the hot path**. Its control plane is **pods-read-only**; actor isolation is via **gVisor** (`runsc`) or a Kata micro-VM. It is explicitly *not* an agent SDK and has **no chat, personas, delegation, or task queue** — a pure execution substrate. Pre-production alpha ("VERY early / aspirational").
+
+**AX (Agent Executor)** (`github.com/google/ax`) — a thin **execution/orchestration layer** that runs *on top of* Substrate (or locally). It provides a **single-writer controller + durable append-only event log** for reliable, **resumable** agentic loops, and a bring-your-own **Harness** abstraction (custom image implementing a `HarnessService` gRPC contract, with Skills + MCP support). Its core call is "run a harness against an input → stream output → durable completion." It maps each conversation/execution to a Substrate actor; on Kubernetes it holds **no RBAC and creates no pods** — it deploys via Substrate's CRDs. No chat/persona/hub layer of its own. Earliest-stage of the three (PRs paused, k8s path "experimental").
+
+---
+
+## The three runtimes compared
+
+A head-to-head across the dimensions that matter when choosing a runtime for kube-agents' agents. (Detailed, use-case-specific tables follow in the sections below.)
+
+| Dimension | **Scion** | **Agent Substrate** | **AX (on Substrate)** |
+|---|---|---|---|
+| Layer / what it is | full orchestration **platform** | low-level K8s **runtime** | **execution layer** over Substrate |
+| Execution model | bare Pod per agent | multiplex actors onto a warm worker pool (suspend/resume) | one execution per conversation, delegated to a Substrate actor |
+| Needs `create pods` + **`pods/exec`**? | ✅ **yes** (the decisive con) | ❌ no exec; pods-read-only hot path (only CRD controller creates the pool) | ❌ no k8s RBAC at all |
+| Isolation | container + locked SecurityContext | **gVisor / micro-VM** | **gVisor / micro-VM** (inherited) |
+| Read-only cluster posture | ❌ incompatible | ✅ compatible | ✅ compatible |
+| Self-healing / resumption | ❌ none (bare Pod, `RestartPolicy: Never`) | ⚠️ snapshot suspend/resume (lazy) | ✅ durable event-log replay |
+| Spawn with per-task input | ✅ at dispatch | ❌ `CreateActor` takes no input | ✅ `Exec{inputs}` |
+| Result + completion signal | ⚠️ weak (session/self-report) | ❌ none (traffic to in-actor server only) | ✅ stream + durable `STATE_COMPLETED` |
+| Orchestration surface (chat/personas/hub/delegation) | ✅ rich | ❌ none | ⚠️ conversation/harness only, no chat/persona/delegation |
+| Chat channels | Slack/Telegram/Discord (no Google Chat) | none | none |
+| Run our Hermes content | ✅ minor rework (`hermes chat` honors SOUL/skills/config/MCP) | via a custom actor image (in-actor server) | via a custom `HarnessService` image (Hermes wrapper) |
+| Footprint | Hub + Broker + pods | control plane (ateapi/atecontroller/atelet DaemonSet/atenet) + worker pool | AX server + Substrate + worker pool |
+| Maturity | most mature (K8s runtime "rough") | alpha ("VERY early") | earliest (PRs paused, k8s "experimental") |
+
+**How to read this:** Scion is the only one that ships the *orchestration surface* (chat, personas, delegation) — but it's also the only one that requires the `create pods` + `pods/exec` privilege incompatible with kube-agents' read-only posture. Substrate and AX are runtime layers that preserve the read-only posture and add stronger (gVisor) isolation, at the cost of no orchestration surface and pre-production maturity. Because AX runs on Substrate, the realistic choices are **Scion**, **AX-on-Substrate**, or **raw Substrate** (not AX vs Substrate as independent options).
 
 ---
 
