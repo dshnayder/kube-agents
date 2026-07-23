@@ -2,7 +2,7 @@
 
 **Status:** Evaluation / recommendation
 **Date:** 2026-07-22
-**Scope:** Whether [Scion](https://github.com/GoogleCloudPlatform/scion) can host the kube-agents Hermes agents and take over orchestration + communication — including deployment topology, security posture, and its fitness (vs. alternatives) as a mechanism for **spawning delegated task-workers**.
+**Scope:** Whether [Scion](https://github.com/GoogleCloudPlatform/scion) can host the kube-agents Hermes agents and take over orchestration + communication — including deployment topology, security posture, and fitness (vs. alternatives) as a mechanism for **spawning delegated subagents, each on its own pod with its own KSA**. Options evaluated: Scion, Agent Substrate, AX-on-Substrate, DIY read-only Jobs, extending the existing operator (**recommended**), and SIG Agent Sandbox.
 **Method:** Verified against source — Scion (`github.com/GoogleCloudPlatform/scion` @ `b4c9911`), Hermes (`github.com/nousresearch/hermes-agent`), [Agent Substrate](https://github.com/agent-substrate/substrate), [Agent Executor / AX](https://github.com/google/ax), and the kube-agents source in this repo. **Not** taken from published docs, which were found inaccurate on several points.
 
 > ⚠️ Naming note: this "Scion" is **not** the SCION networking project (`scionproto/scion`). It is a Google Cloud AI-agent orchestration platform that happens to share the name.
@@ -15,9 +15,12 @@
 - **Scion can run in the management cluster**, Hub included, in a shape close to kube-agents (a Hub Deployment + PVC, a Broker Deployment, on-demand agent pods).
 - **The decisive issue is security/RBAC.** Scion's runtime is fundamentally a **mutating** actor: running any agent requires `create pods` + **`pods/exec`** (plus `create/delete secrets` and PVCs). There is **no read-only, GitOps, or exec-free mode**. This is categorically incompatible with kube-agents' hard requirement of a read-only cluster posture where all mutations flow through GitOps.
 - **Genuine pros exist**, concentrated in **per-agent isolation, fleet-scale concurrency, and extensibility** — which are strongest for the *ephemeral subagent* tier, not the privileged platform tier.
-- **For the specific "platform agent plans → delegates to spawned task-workers" pattern, Scion is the wrong-shaped tool.** Its orchestration surface is unused (planning/delegation live in the platform agent), and its create+exec spawn is the un-offset security con. **AX-on-Substrate** offers a constrained, read-only-safe, input→result spawn primitive; a **DIY read-only Kubernetes Job** is the simplest secure baseline. See [Delegated task-workers](#delegated-task-workers-scion-vs-substrateax-vs-diy-jobs).
+- **For the specific "platform agent plans → delegates to spawned task-workers" pattern, Scion is the wrong-shaped tool.** Its orchestration surface is unused (planning/delegation live in the platform agent), and its create+exec spawn is the un-offset security con.
+- **The decisive requirement — each subagent on its own pod with its own KSA — reorders everything.** A KSA is per-Pod, so this needs pod-per-agent. **Substrate/AX are incompatible** (they multiplex actors onto shared pods). The recommended answer is **not a new platform at all**: extend the **existing kube-agents operator** (which already creates per-agent SAs) to render each subagent as its own read-only Job/Deployment with its own KSA. See [Identity](#identity-per-agent-ksa-the-decisive-requirement) and [Recommended design](#recommended-design-per-agent-ksa-via-the-existing-operator).
 
-**Recommendation:** Do not move the read-only platform tier onto Scion. If Scion is adopted, use it in a **hybrid**: kube-agents remains the read-only, GitOps-gated orchestrator and drives Scion to spawn **isolated, read-only subagents in a dedicated agent cluster** (not `kubeagents-system`), behind admission-policy guardrails Scion does not provide. For a *delegated task-worker* mechanism specifically, prefer **DIY read-only Jobs** (low-risk, available now) or **AX-on-Substrate** (best-shaped, but alpha) over Scion. See [Recommendation](#recommendation).
+**Recommendation:** For "each subagent on its own pod with its own KSA," **extend the existing operator** to spawn per-agent, per-KSA, read-only Jobs/Deployments from an `AgentTask` CRD, running the existing Hermes image via its CLI — no new platform, no `pods/exec`, self-healing, LLM kept out of the spawn path. **Substrate/AX** are incompatible with per-agent KSA; **Scion** can do it but only by importing a Hub/Broker + `create pods` + `pods/exec`. Keep the read-only platform tier + GitOps write path unchanged. See [Recommendation](#recommendation).
+
+**Options covered in this doc:** Scion (host / spawn), Agent Substrate, AX-on-Substrate, DIY read-only Jobs, **extend-the-operator (recommended)**, and SIG Agent Sandbox (future).
 
 ---
 
@@ -33,6 +36,9 @@
 | Self-healing on eviction | agent pods are bare Pods, `RestartPolicy: Never`, no reconcile | ❌ **No** |
 | Google Chat ingress | non-functional stub (Slack/Telegram/Discord work) | ❌ **Missing** |
 | Per-agent isolation / tenancy | own container, credentials, worktree, locked SecurityContext | ✅ **Strong (a pro)** |
+| **Per-agent KSA (Scion)** | pod-per-agent; `serviceAccountName` per workload | ✅ native (but via create+exec) |
+| **Per-agent KSA (Substrate/AX)** | actors multiplex onto shared pods; no `serviceAccountName` field | ❌ **Incompatible** |
+| **Per-agent KSA (recommended)** | **extend the existing operator** → per-agent read-only Job/Deployment with its own KSA | ✅ **Best fit, no new platform** |
 
 ---
 
@@ -303,15 +309,156 @@ Ranking: **DIY read-only Jobs (simplest, secure, available now) ≈ AX-on-Substr
 
 ---
 
+## Identity: per-agent KSA (the decisive requirement)
+
+The concrete goal is: **each spawned subagent gets its own Kubernetes ServiceAccount (KSA) → its own Workload Identity, scoped GCP access, and scoped RBAC.** Today all agents run as Hermes *profiles in one pod* and share a single identity — the security problem this effort exists to fix. Because a KSA/token is a **per-Pod** construct, this requirement is really "**one pod (workload) per agent**," which reorders the options and is the opposite pull from the no-exec/gVisor argument above.
+
+### Ranking for per-agent KSA
+
+| Option | Per-agent KSA? | Why |
+|---|---|---|
+| **Extend the operator** (Jobs/Deployments) | ✅ **native, recommended** | operator already creates a per-agent SA; each workload gets its own KSA + WI |
+| **DIY read-only Job** | ✅ **native** | one Job = one pod = one KSA |
+| **Scion** | ✅ native, but heavy | pod-per-agent; `serviceAccountName` per workload — at the cost of Hub/Broker + create+exec |
+| **Raw Substrate** | ❌ **incompatible** | actors multiplex onto *shared* pods; **no `serviceAccountName` field** on any type; worker pods run as namespace `default` |
+| **AX on Substrate** | ❌ **worst** | all workers of one harness share one template/pool/KSA; no per-execution identity |
+
+### Why Substrate/AX cannot do per-agent KSA
+
+- A KSA token is bound to a Pod; Substrate's value is running many actors through a **shared, migrating pool** of Pods — so a per-Pod KSA can never be per-actor. Confirmed: no `serviceAccountName` field on `WorkerPoolSpec`/`ActorTemplateSpec` (`pkg/api/v1alpha1/workerpool_types.go:54-87`, `actortemplate_types.go:283-334`), and the controller never sets one — worker pods run as the namespace **`default`** KSA (`workerpool_apply.go`).
+- Substrate's own threat model wants the pod KSA to be **zero-privilege** and blocks actor access to the K8s API (`threat-model.md:104`).
+- To give personas distinct identities on Substrate you'd need either **one WorkerPool per identity** (defeats multiplexing; the SA field doesn't even exist yet) or Substrate's **SessionIdentity broker** — a per app/user/session **SPIFFE/OIDC** credential (`sessionidentity.go:111,191`) that is deliberately **not a KSA/GSA**, is OIDC-federatable to GCP only in principle (unwired), and whose pod↔session binding checks are **TODOs** (`sessionidentity.go:88-91,155`; `threat-model.md:110`).
+
+### kube-agents already creates per-agent KSAs
+
+The operator you already run creates a ServiceAccount per agent (defaulting to the agent's name), with Workload Identity annotations, automount on: `k8s-operator/internal/controller/platformagent_controller.go:181-195` (`reconcileServiceAccount`, `saName := agent.Name`), `platformagent_manifests.go:535` (`ServiceAccountName: saName`), `common_types.go:161-167` (`ServiceAccountName` + `ServiceAccountAnnotations` for `iam.gke.io/gcp-service-account`). The shared-credentials problem exists only because subagents are *profiles in one pod*, not because the machinery is missing.
+
+---
+
+## Recommended design: per-agent KSA via the existing operator
+
+**Recommendation:** don't adopt a new platform. **Extend the kube-agents operator to spawn each delegated subagent as its own Kubernetes workload — a Job for task-scoped work, a Deployment for long-lived monitors — each with its own KSA + Workload Identity, running the existing Hermes image via its CLI.** This is the smallest, most secure step from where you are.
+
+Why this beats Scion/Substrate/AX for *this* requirement:
+- **Per-agent KSA needs pod-per-agent** — which this is, and the operator already renders per-agent SAs.
+- **`hermes -p <profile> chat -q "<task>"` as the container command** needs **no `HarnessService` wrapper** (unlike AX/Substrate) and **no `pods/exec`** (unlike Scion). The CLI runs as the entrypoint and exits.
+- **Self-healing** comes free (`Job.backoffLimit`; Deployment reconcile), which Scion's bare pods lack.
+- **Zero pre-production dependencies** — no Hub/Broker, no alpha Substrate/AX.
+
+### The `AgentTask` CRD (sketch)
+
+Re-point the planning agent's kanban tool to create `AgentTask` CRs (same "create a task" interface, declarative + auditable backend):
+
+```yaml
+apiVersion: agents.kube-agents.io/v1alpha1
+kind: AgentTask
+metadata:
+  name: kanban-4213
+  namespace: kubeagents-agents
+spec:
+  assignee: cluster-agent            # persona → fixed KSA + template (operator config)
+  target:  { cluster: prod-eu, location: europe-west1 }
+  task: "investigate CrashLoopBackOff in namespace payments"
+  ttlSecondsAfterFinished: 3600
+status:
+  phase: Running                      # Pending | Running | Succeeded | Failed
+  jobRef: kanban-4213-xyz
+  result: ""                          # summary / pointer to result sink
+```
+
+### Controller reconcile flow
+
+```
+planning agent (kanban-only tool) ── creates ──▶ AgentTask CR
+                                                     │  (operator watches)
+                                                     ▼
+                         operator maps assignee ─▶ (fixed KSA, fixed workload template)
+                                                     │  renders:
+                                                     ▼
+   read-only Job:  serviceAccountName=<persona KSA>            (its own Workload Identity)
+                   runtimeClassName=gvisor                      (GKE Sandbox)
+                   command=[hermes,-p,<profile>,chat,-q,<task>] (task as args — no exec)
+                   securityContext: restricted, non-root
+                                                     │
+                   worker runs read-only, writes result to sink (as its own KSA)
+                                                     │  Job completes
+                                                     ▼
+             operator sets AgentTask.status.phase=Succeeded + result  ──▶ planner replans / kanban_complete
+```
+
+### Rendered worker Job (sketch)
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata: { name: kanban-4213-xyz, namespace: kubeagents-agents }
+spec:
+  backoffLimit: 2                     # self-heal on failure
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: agent-cluster-prod-eu   # per-persona KSA ↔ GSA (read-only)
+      runtimeClassName: gvisor                     # optional: GKE Sandbox
+      restartPolicy: OnFailure
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+      - name: worker
+        image: <kube-agents-hermes-image>
+        args: ["-p","cluster","chat","-q","investigate CrashLoopBackOff in namespace payments"]
+        # SOUL.md/skills baked in image or mounted from ConfigMap; KUBECONFIG scoped to target cluster
+```
+
+### Who holds which privilege
+
+| Component | Privilege |
+|---|---|
+| Planning agent (LLM) | only creates `AgentTask` CRs — no spawn, no infra tools |
+| Operator (deterministic controller) | the *only* mutating principal — `jobs`/`serviceaccounts` create in `kubeagents-agents`, **fixed templates, no exec** |
+| Subagent Job pod | its **own read-only KSA**, gVisor sandbox, scoped Workload Identity; cannot touch other agents |
+| Fleet mutations | unchanged — still GitOps PRs (human-reviewed) |
+
+The LLM never chooses identity or image (fixed `assignee → KSA/template` map), which contains prompt injection by construction.
+
+### Kanban board with per-agent identity
+
+Two changes make the board work for remote, individually-identified workers:
+1. **Kanban becomes a networked service** (or the `AgentTask` CRD is the board) — remote pods can't share the `kanban.db` sqlite file.
+2. **Per-KSA authorization** — because each worker has its own identity, the board can enforce that worker-for-card-N reads only card N and writes only its own completion. That per-identity authorization is impossible with today's shared credentials and is the security payoff of the whole exercise. Reporting is either pointer-in/result-out (operator writes `status`) or the worker self-reports over the network authenticated by its KSA.
+
+### What to build
+
+- The `AgentTask` CRD + a reconcile controller in the existing operator (kubebuilder scaffold — same patterns as `PlatformAgent`).
+- Per-persona KSA/GSA provisioning (extends `reconcileServiceAccount` + your IAM scripts).
+- The result sink (or networked kanban-with-per-KSA-authz for self-reporting workers).
+
+### All options at a glance
+
+| Option | Per-agent KSA | No `pods/exec` | Self-heal | Isolation | Maturity | Fit |
+|---|---|---|---|---|---|---|
+| **Extend operator (Jobs/Deployments)** | ✅ | ✅ | ✅ | gVisor via RuntimeClass | ✅ stock K8s + your operator | **recommended** |
+| DIY read-only Job (no CRD) | ✅ | ✅ | ✅ | gVisor via RuntimeClass | ✅ | good baseline |
+| Scion | ✅ | ❌ | ❌ | container | mature (runtime rough) | wrong-shaped, create+exec con |
+| Raw Substrate | ❌ | ✅ | ⚠️ | gVisor/microVM | alpha | incompatible w/ per-KSA |
+| AX on Substrate | ❌ | ✅ | ✅ | gVisor/microVM | earliest | incompatible w/ per-KSA |
+| SIG **Agent Sandbox** (`agents.x-k8s.io`) | ✅ (pod-per-agent) | ✅ | — | pod sandbox | early (upstream) | future substrate to watch |
+
+### Tradeoffs & what to watch
+
+- **Pod-per-task = cold start, no multiplexing density.** Fine for moderate task volume; if you ever need massive, sub-second-idle concurrency, that's the regime where Substrate's multiplexing earns its keep — but you'd give up per-KSA.
+- **Kubernetes SIG Agent Sandbox** (`agents.x-k8s.io`) is the emerging upstream primitive for per-agent sandboxed pods — the natural future substrate *under this same operator-driven design*. Early, but the direction to track. (Scion defines its CRD but doesn't use it.)
+
+---
+
 ## Recommendation
 
-1. **Keep the read-only platform tier on kube-agents.** Its read-only RBAC + GitOps write path is a hard requirement that Scion's runtime cannot satisfy. Do not move it onto Scion.
-2. **If Scion is adopted, use the hybrid:** kube-agents remains the orchestrator and drives the Scion Hub to spawn **ephemeral, read-only subagents** for investigation/specialist work. Fleet mutations still route through kube-agents' GitOps PRs; subagents stay non-mutating investigators.
-3. **Confine Scion's mutating footprint.** Run agent pods in a **dedicated agent cluster** (not `kubeagents-system`), keep the broker SA out of the control-plane namespace, and layer the admission/PodSecurity/NetworkPolicy/SA-pinning controls Scion does not provide (see [Security & RBAC](#security--rbac-the-decisive-concern)).
-4. **For a delegated task-worker mechanism, prefer DIY read-only Jobs or AX-on-Substrate over Scion.** In the "platform agent plans → delegates to spawned workers" design, Scion's orchestration is unused and its create+exec con is not offset. A DIY read-only Job (task-as-args, `backoffLimit` self-heal, GKE Sandbox) is the low-risk baseline; AX-on-Substrate is the best-shaped upgrade (input→result, constrained spawn, gVisor, resumption) once its maturity settles. See [Delegated task-workers](#delegated-task-workers-scion-vs-substrateax-vs-diy-jobs).
-5. **Prove it with a scoped PoC** before committing: validate content portability end-to-end, eviction recovery, the chat channel (Slack vs Google Chat requirement), a durable state backend, and — most importantly — that a prompt-injected agent cannot reach an unconstrained spawn/create path.
+1. **Primary: spawn subagents as per-agent-KSA workloads via the existing operator.** Extend kube-agents with an `AgentTask` CRD + controller that renders each delegated subagent as its own read-only Job/Deployment with its own KSA + Workload Identity, running the existing Hermes image via its CLI. This directly solves the shared-credentials problem, needs no `pods/exec` and no new platform, self-heals, and keeps the LLM out of the spawn path. See [Recommended design](#recommended-design-per-agent-ksa-via-the-existing-operator).
+2. **Keep the read-only platform tier on kube-agents.** Its read-only RBAC + GitOps write path is a hard requirement no external runtime should erode; fleet mutations stay GitOps PRs.
+3. **Do not use Substrate/AX for per-agent identity.** Their multiplexing model is incompatible with per-agent KSA; their alternative (SPIFFE SessionIdentity) is not a KSA/GSA and is not securely enforced yet. Revisit only if you later need massive sub-second-idle concurrency and can accept a non-KSA identity. See [Identity](#identity-per-agent-ksa-the-decisive-requirement).
+4. **Do not adopt Scion for this.** It can do per-agent KSA (pod-per-agent) but drags in a Hub/Broker + an irreducible `create pods` + `pods/exec` privilege for an orchestration surface you won't use. If Scion were ever adopted for other reasons, confine it to a dedicated agent cluster behind admission policy (see [Security & RBAC](#security--rbac-the-decisive-concern)).
+5. **Track SIG Agent Sandbox** (`agents.x-k8s.io`) as the future upstream substrate under the same operator-driven design.
+6. **Prove it with a scoped PoC:** an `AgentTask` → read-only Job with a per-persona KSA running `hermes chat -q`, reporting a result, with a prompt-injected planner unable to choose identity/image.
 
-**Bottom line:** adopting Scion is feasible and brings real isolation/scale/extensibility gains for the *ephemeral subagent tier*. It is **not** appropriate for the *read-only platform tier*, because its runtime requires an irreducible, un-scopable `create pods` + `pods/exec` privilege that contradicts the read-only + GitOps requirement. For spawning **delegated task-workers** specifically, Scion is the wrong-shaped tool — a constrained spawn (DIY read-only Jobs now, AX-on-Substrate later) is both simpler and more secure. The defensible path is a contained hybrid; a wholesale replacement is not.
+**Bottom line:** the requirement — **each subagent on its own pod with its own KSA** — is best met by **extending the operator you already have** to render per-agent, per-KSA, read-only Jobs/Deployments from an `AgentTask` CRD, running the existing Hermes image via its CLI. **Substrate/AX are incompatible** with per-agent KSA (shared-pool multiplexing); **Scion** can do it but only by importing a Hub/Broker and the `create pods` + `pods/exec` privilege that contradicts the read-only posture. The operator path is the smallest, most secure step and beats all three platforms on the actual requirement; Scion/Substrate/AX remain relevant only for different problems (rich orchestration, or extreme multiplexed density with a non-KSA identity).
 
 ---
 
@@ -371,6 +518,10 @@ Agent Substrate (`github.com/agent-substrate/substrate`) and AX (`github.com/goo
 | AX has no k8s client-go dependency; creates no pods / no exec | (no `k8s.io` in `go.mod`; deploys via Substrate CRDs) |
 | Neither ships a kanban board, dispatcher, or task queue | (`grep kanban\|board\|dispatcher` → none) |
 | Maturity: both pre-production alphas | Substrate `README.md`/`docs/architecture.md:3`; AX `README.md`, `manifests/README.md` |
+| **Substrate: no `serviceAccountName` on any type; worker pods run as namespace `default`** | `pkg/api/v1alpha1/workerpool_types.go:54-87`, `actortemplate_types.go:283-334`, `workerpool_apply.go` |
+| Substrate wants pod KSA zero-privilege; blocks actor→K8s API | `docs/threat-model.md:104` |
+| Substrate per-actor identity = SPIFFE/OIDC SessionIdentity broker (not KSA/GSA; binding checks are TODOs) | `cmd/ateapi/internal/sessionidentity/sessionidentity.go:111,191,88-91,155`; `threat-model.md:110` |
+| AX: one harness = one template/pool/KSA; no per-execution identity | `internal/harness/substrate/substrate.go:88-99`; `internal/config/config.go:213-219` |
 
 kube-agents (this repo):
 
@@ -380,3 +531,5 @@ kube-agents (this repo):
 | Read-only platform RBAC + GitOps write path | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Google Chat / Slack ingress wired by the operator | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Durable `/opt/data` RWO PVC (profiles, handover, kanban.db) | `k8s-operator/internal/controller/platformagent_manifests.go` |
+| **Operator already creates a per-agent ServiceAccount (+ WI annotations, automount on)** | `k8s-operator/internal/controller/platformagent_controller.go:181-195`; `platformagent_manifests.go:535`; `api/v1alpha1/common_types.go:161-167` |
+| Current subagents = Hermes profiles in one pod (shared identity) | `agents/{platform,cluster}/`, `scripts/cluster_agent_profile.py` (`hermes -p <name> chat -q "work kanban task <id>"`) |
