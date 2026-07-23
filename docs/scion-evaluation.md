@@ -2,8 +2,8 @@
 
 **Status:** Evaluation / recommendation
 **Date:** 2026-07-22
-**Scope:** Whether [Scion](https://github.com/GoogleCloudPlatform/scion) can host the kube-agents Hermes agents and take over orchestration + communication — including deployment topology and security posture.
-**Method:** Verified against source — Scion (`github.com/GoogleCloudPlatform/scion` @ `b4c9911`), Hermes (`github.com/nousresearch/hermes-agent`), and the kube-agents source in this repo. **Not** taken from published docs, which were found inaccurate on several points.
+**Scope:** Whether [Scion](https://github.com/GoogleCloudPlatform/scion) can host the kube-agents Hermes agents and take over orchestration + communication — including deployment topology, security posture, and its fitness (vs. alternatives) as a mechanism for **spawning delegated task-workers**.
+**Method:** Verified against source — Scion (`github.com/GoogleCloudPlatform/scion` @ `b4c9911`), Hermes (`github.com/nousresearch/hermes-agent`), [Agent Substrate](https://github.com/agent-substrate/substrate), [Agent Executor / AX](https://github.com/google/ax), and the kube-agents source in this repo. **Not** taken from published docs, which were found inaccurate on several points.
 
 > ⚠️ Naming note: this "Scion" is **not** the SCION networking project (`scionproto/scion`). It is a Google Cloud AI-agent orchestration platform that happens to share the name.
 
@@ -15,8 +15,9 @@
 - **Scion can run in the management cluster**, Hub included, in a shape close to kube-agents (a Hub Deployment + PVC, a Broker Deployment, on-demand agent pods).
 - **The decisive issue is security/RBAC.** Scion's runtime is fundamentally a **mutating** actor: running any agent requires `create pods` + **`pods/exec`** (plus `create/delete secrets` and PVCs). There is **no read-only, GitOps, or exec-free mode**. This is categorically incompatible with kube-agents' hard requirement of a read-only cluster posture where all mutations flow through GitOps.
 - **Genuine pros exist**, concentrated in **per-agent isolation, fleet-scale concurrency, and extensibility** — which are strongest for the *ephemeral subagent* tier, not the privileged platform tier.
+- **For the specific "platform agent plans → delegates to spawned task-workers" pattern, Scion is the wrong-shaped tool.** Its orchestration surface is unused (planning/delegation live in the platform agent), and its create+exec spawn is the un-offset security con. **AX-on-Substrate** offers a constrained, read-only-safe, input→result spawn primitive; a **DIY read-only Kubernetes Job** is the simplest secure baseline. See [Delegated task-workers](#delegated-task-workers-scion-vs-substrateax-vs-diy-jobs).
 
-**Recommendation:** Do not move the read-only platform tier onto Scion. If Scion is adopted, use it in a **hybrid**: kube-agents remains the read-only, GitOps-gated orchestrator and drives Scion to spawn **isolated, read-only subagents in a dedicated agent cluster** (not `kubeagents-system`), behind admission-policy guardrails Scion does not provide. See [Recommendation](#recommendation).
+**Recommendation:** Do not move the read-only platform tier onto Scion. If Scion is adopted, use it in a **hybrid**: kube-agents remains the read-only, GitOps-gated orchestrator and drives Scion to spawn **isolated, read-only subagents in a dedicated agent cluster** (not `kubeagents-system`), behind admission-policy guardrails Scion does not provide. For a *delegated task-worker* mechanism specifically, prefer **DIY read-only Jobs** (low-risk, available now) or **AX-on-Substrate** (best-shaped, but alpha) over Scion. See [Recommendation](#recommendation).
 
 ---
 
@@ -215,14 +216,72 @@ Two honest caveats: (1) the isolation pro is achievable **without** Scion — ru
 
 ---
 
+## Delegated task-workers: Scion vs Substrate/AX vs DIY Jobs
+
+This section evaluates a narrower, concrete architecture: **the platform agent plans work and delegates tasks to short-lived worker agents that the runtime spawns.** (Current analogue: the kanban dispatcher runs `hermes -p <cluster> chat -q "work kanban task <id>"` per assigned card.)
+
+### The reframe: the runtime is a pure *executor*
+
+Because planning and delegation live in the platform agent, you are **not** using the runtime's orchestration surface (chat, personas, hub, its own delegation). That **discounts Scion's main advantage** — the batteries-included orchestration is exactly the part you won't use. What actually matters:
+
+1. spawn a worker **with per-task input**
+2. get a **result + completion signal** back (delegation fan-in)
+3. **isolation** between workers
+4. **security of the spawn primitive** (the planner is read-only + prompt-injectable)
+5. **maturity / footprint**
+
+### The candidates
+
+- **Agent Substrate** (`github.com/agent-substrate/substrate`) — a Kubernetes runtime that multiplexes "actors" onto a warm pool of worker Pods via snapshot suspend/resume, keeping the K8s API server and `pods/exec` **out of the hot path**; isolation via **gVisor** (or micro-VM). Not an agent SDK; no chat/persona/delegation.
+- **Agent Executor / AX** (`github.com/google/ax`) — a thin execution layer *on top of* Substrate (or local): a single-writer controller + durable event log giving resumable "run harness against input → stream output → durable completion" executions. Bring-your-own harness via a `HarnessService` gRPC contract.
+- **DIY read-only Job** — the platform agent's own operator spawns a Kubernetes **Job** whose command is `hermes chat -q "work task N"` (task passed as **args at creation**), with a read-only SA and optional **GKE Sandbox (gVisor via RuntimeClass)**.
+
+### Scored for this use case
+
+| Axis | **Scion** | **Substrate (raw)** | **AX (on Substrate)** | **DIY read-only Job** |
+|---|---|---|---|---|
+| Spawn with per-task input | ✅ at dispatch | ❌ `CreateActor` takes no input | ✅ `Exec{inputs}` | ✅ task as command args |
+| Result + completion signal | ⚠️ weak (session/self-report) | ❌ none | ✅ stream + durable `STATE_COMPLETED` | ✅ Job status + logs/sink |
+| Isolation | container + locked SecCtx | ✅ gVisor / microVM | ✅ gVisor / microVM | ✅ via GKE Sandbox (gVisor) |
+| Spawn-primitive security | ❌ `create pods` + **`pods/exec`**; dispatch carries **arbitrary image/command/SA** | ✅ no exec; pods-read-only hot path | ✅ no exec; **fixed harness/template, input-only** | ✅ controller-scoped `jobs:create`; no exec; fixed template |
+| Read-only posture preserved | ❌ (decisive con) | ✅ | ✅ | ✅ |
+| Self-healing / resumption | ❌ none | ⚠️ snapshot resume (lazy) | ✅ event-log replay | ✅ Job `backoffLimit` |
+| No server-wrapper needed | ✅ (drives CLI via exec) | ❌ needs in-actor server | ❌ needs `HarnessService` server | ✅ CLI runs as command |
+| Maturity | most mature (K8s runtime "rough") | ❌ "VERY early / aspirational" | ❌ earliest (PRs paused, k8s "experimental") | ✅ stock Kubernetes |
+
+Evidence: Substrate `CreateActorRequest` carries only an `Actor` (no args/env/input) — `pkg/proto/ateapipb/ateapi.proto:212`; input delivered only via routed traffic to an in-actor server (`demos/counter/counter.go:69`), CLI workloads are fire-and-forget to stdout (`demos/claude-code-multiplex/workload/run.sh:43`). AX `Exec{conversation_id, inputs, harness_id}` → stream → `STATE_COMPLETED` in the event log (`proto/ax.proto:118-137`, `internal/controller/controller.go:151-174`); custom harness = your image implementing `HarnessService` (`proto/ax.proto:92-98`, `internal/config/config.go:213-219`). Neither repo contains a kanban board, dispatcher, or task queue (`grep kanban|board|dispatcher` → none).
+
+### The security point that's decisive for delegation
+
+The planner is read-only and prompt-injectable, and you are giving it a tool that **spawns compute**. The spawn primitive's constraint level is everything:
+
+- **Scion** — `DispatchAgentCreate` carries caller-controlled **image + command + serviceAccountName**, and the broker holds `pods/exec`. A prompt-injected planner reaching this can spawn arbitrary compute and exec into pods.
+- **AX** — the planner picks a **registered `harness_id`** and passes an **input string**; the worker image/template is fixed by your config, the sandbox is gVisor, and the SA is whatever you pin (read-only). Worst case from injection: "run a fixed read-only harness with an attacker-chosen prompt in an isolated sandbox."
+- **DIY Job** — same constrained shape: a fixed Job template, task as input, read-only SA, created by a deterministic controller (not an LLM-driven exec broker).
+
+For a delegation pattern, the **constrained, input-only spawn** (AX or DIY Job) is the security-correct shape; Scion's arbitrary-spawn + exec is not.
+
+### What you build regardless of choice
+
+- The **delegation tool + fan-in** in the platform agent (plan → spawn N → collect → replan). None of the three provide agent-to-agent delegation built in.
+- The **result-reporting mechanism** — isolated workers can't share `kanban.db`; use a networked kanban service (worker self-reports) or pointer-in/result-out (AX-native; Job via a result sink).
+- For AX/Substrate: a **Hermes-as-server wrapper** (because `hermes chat -q` is a CLI, not a server). For Scion: containment (separate cluster + admission policy). For DIY: the Job template + a result sink.
+
+### Verdict for delegated task-workers
+
+Ranking: **DIY read-only Jobs (simplest, secure, available now) ≈ AX-on-Substrate (best-shaped, most secure spawn, but alpha) > Scion (mature but wrong-shaped, un-offset create+exec con).** Scion's orchestration strengths are wasted in this design and its security con is not offset. Prototype the delegation tool against **AX** for the sophisticated path and **read-only Jobs** as the low-risk baseline; choose based on whether gVisor density + resumption are needed now, given Substrate/AX are pre-production.
+
+---
+
 ## Recommendation
 
 1. **Keep the read-only platform tier on kube-agents.** Its read-only RBAC + GitOps write path is a hard requirement that Scion's runtime cannot satisfy. Do not move it onto Scion.
 2. **If Scion is adopted, use the hybrid:** kube-agents remains the orchestrator and drives the Scion Hub to spawn **ephemeral, read-only subagents** for investigation/specialist work. Fleet mutations still route through kube-agents' GitOps PRs; subagents stay non-mutating investigators.
 3. **Confine Scion's mutating footprint.** Run agent pods in a **dedicated agent cluster** (not `kubeagents-system`), keep the broker SA out of the control-plane namespace, and layer the admission/PodSecurity/NetworkPolicy/SA-pinning controls Scion does not provide (see [Security & RBAC](#security--rbac-the-decisive-concern)).
-4. **Prove it with a scoped PoC** before committing: validate content portability end-to-end, eviction recovery, the chat channel (Slack vs Google Chat requirement), a durable state backend, and — most importantly — that a prompt-injected subagent cannot reach the broker's create path.
+4. **For a delegated task-worker mechanism, prefer DIY read-only Jobs or AX-on-Substrate over Scion.** In the "platform agent plans → delegates to spawned workers" design, Scion's orchestration is unused and its create+exec con is not offset. A DIY read-only Job (task-as-args, `backoffLimit` self-heal, GKE Sandbox) is the low-risk baseline; AX-on-Substrate is the best-shaped upgrade (input→result, constrained spawn, gVisor, resumption) once its maturity settles. See [Delegated task-workers](#delegated-task-workers-scion-vs-substrateax-vs-diy-jobs).
+5. **Prove it with a scoped PoC** before committing: validate content portability end-to-end, eviction recovery, the chat channel (Slack vs Google Chat requirement), a durable state backend, and — most importantly — that a prompt-injected agent cannot reach an unconstrained spawn/create path.
 
-**Bottom line:** adopting Scion is feasible and brings real isolation/scale/extensibility gains for the *ephemeral subagent tier*. It is **not** appropriate for the *read-only platform tier*, because its runtime requires an irreducible, un-scopable `create pods` + `pods/exec` privilege that contradicts the read-only + GitOps requirement. The defensible path is a contained hybrid; a wholesale replacement is not.
+**Bottom line:** adopting Scion is feasible and brings real isolation/scale/extensibility gains for the *ephemeral subagent tier*. It is **not** appropriate for the *read-only platform tier*, because its runtime requires an irreducible, un-scopable `create pods` + `pods/exec` privilege that contradicts the read-only + GitOps requirement. For spawning **delegated task-workers** specifically, Scion is the wrong-shaped tool — a constrained spawn (DIY read-only Jobs now, AX-on-Substrate later) is both simpler and more secure. The defensible path is a contained hybrid; a wholesale replacement is not.
 
 ---
 
@@ -266,6 +325,22 @@ Hermes (`github.com/nousresearch/hermes-agent`) — what `hermes chat` honors:
 | MCP servers spawned/connected in chat | `cli.py:1030-1034` |
 | Plugin tools register into shared registry (work in chat) | `model_tools.py:204`, `plugins.py:391` |
 | `pre_gateway_dispatch` hook / chat adapters / autonomous cron+kanban are gateway-only | `gateway/run.py:10322,9487,23360,8161` |
+
+Agent Substrate (`github.com/agent-substrate/substrate`) and AX (`github.com/google/ax`):
+
+| Finding | File:line |
+|---|---|
+| Substrate multiplexes actors onto a warm worker-Pool (Deployment), not pod-per-agent | `cmd/atecontroller/internal/controllers/workerpool_apply.go:30,74` |
+| Control plane → node daemon (DaemonSet) → in-pod driver over gRPC; **no `pods/exec` anywhere** | `internal/proto/ateletpb/atelet.proto:21`; `internal/proto/ateompb/ateom.proto:34`; (no `SubResource("exec")` in repo) |
+| `ateapi` control plane is **pods read-only**; only CRD controller has `pods/deployments: create` | `manifests/ate-install/ate-api-server.yaml:22-24`; `generated/role.yaml:31-52` |
+| Actor isolation via gVisor `runsc` (or Kata micro-VM); one actor per worker at a time | `manifests/ate-install/sandboxconfig-gvisor.yaml`; `cmd/ateom-gvisor/runsc.go`; `docs/glossary.md` |
+| `CreateActorRequest` carries only an `Actor` — **no args/env/input** per actor | `pkg/proto/ateapipb/ateapi.proto:212`; template command/args on the CRD only (`pkg/api/v1alpha1/actortemplate_types.go:99,113`) |
+| Substrate result delivery only via routed traffic to an in-actor server; CLI workloads are fire-and-forget | `demos/counter/counter.go:69`; `demos/claude-code-multiplex/workload/run.sh:43` |
+| AX `Exec{conversation_id, inputs, harness_id}` → stream → durable terminal state | `proto/ax.proto:118-137`; `internal/controller/controller.go:151-174` |
+| AX custom harness = your image implementing `HarnessService` gRPC server | `proto/ax.proto:92-98`; `internal/config/config.go:213-219`; `internal/harness/substrate/substrate.go:90-131` |
+| AX has no k8s client-go dependency; creates no pods / no exec | (no `k8s.io` in `go.mod`; deploys via Substrate CRDs) |
+| Neither ships a kanban board, dispatcher, or task queue | (`grep kanban\|board\|dispatcher` → none) |
+| Maturity: both pre-production alphas | Substrate `README.md`/`docs/architecture.md:3`; AX `README.md`, `manifests/README.md` |
 
 kube-agents (this repo):
 
