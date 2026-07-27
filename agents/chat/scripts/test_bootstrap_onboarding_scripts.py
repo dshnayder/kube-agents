@@ -159,6 +159,27 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate.INVENTORY_PATH, "/opt/data/INVENTORY.md")
         self.assertIn("/opt/data/INVENTORY.md", bootstrap_scan_gate._task_body())
 
+    def test_body_drives_per_cluster_fan_out_and_covers_management(self):
+        """The sweep must scale per cluster and must not leave a management-cluster hole.
+
+        Cluster Agents are pinned read-only to one cluster each, and reconcile
+        deliberately creates none for the cluster the pod itself runs on — so the
+        management cluster is only covered if platform scans it directly.
+        """
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT, body)  # roster first
+        self.assertIn("management cluster", body)  # platform covers it itself
+        self.assertIn("kanban_create", body)  # one child per cluster
+        self.assertIn("parents=", body)  # fan-in collects the results
+        self.assertIn("metadata", body)  # structured child results
+
+    def test_body_degrades_when_no_cluster_agents_exist(self):
+        # main has no cluster-agent subsystem; the same card must still produce a
+        # report there rather than fanning out to an empty roster and writing nothing.
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn("If the script is absent", body)
+        self.assertIn("no Cluster Agents", body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,9 @@ INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory.md",
     "/opt/platform-template/governance/inventory.md",
 )
+# Present only where per-cluster agents are deployed. When absent, the sweep degrades to
+# a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
+RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
 
 
 def _data_dir() -> Path:
@@ -68,15 +71,35 @@ def _task_body() -> str:
         "of these exists:\n"
         f"{instruction_list}\n\n"
         "Audit control plane options, node pools, Workload Identity settings, and running "
-        "workloads across all active cluster contexts.\n\n"
-        f"Write a COMPLETE, verbose, presentation-ready report to `{INVENTORY_PATH}` — a "
-        "greeting header, the full fleet and workload tables, and the full prioritized SRE "
-        "remediation suggestions.\n\n"
+        "workloads. Scale the work out per cluster rather than walking the fleet serially:\n\n"
+        "**Step 1 — reconcile the Cluster Agent roster.** If "
+        f"`{RECONCILE_SCRIPT}` exists, run it first so every managed cluster has an agent. "
+        "It is idempotent and deliberately does NOT create an agent for the management "
+        "cluster this pod runs on. If the script is absent, skip this step — this deployment "
+        "has no Cluster Agents and you will do the whole sweep yourself (Step 4).\n\n"
+        "**Step 2 — scan the management cluster yourself.** No Cluster Agent covers it, so "
+        "its inventory is yours to produce. Skipping it would leave a hole exactly where the "
+        "harness runs.\n\n"
+        "**Step 3 — fan out.** For every OTHER cluster that has an agent (`hermes profile "
+        "list`, names starting `cluster-`), open one child card per cluster with "
+        "`kanban_create(assignee=<that agent>, ...)` asking it to report its own cluster's "
+        "inventory, and to return the findings as structured `metadata` on completion. Each "
+        "Cluster Agent is read-only and pinned to its own cluster, so these run in parallel "
+        "and none can touch another's. Then create ONE aggregation card assigned to "
+        "`platform` with `parents=[<all child card ids>]` — a fan-in child receives every "
+        "parent's `metadata` in its worker context, which is how you collect the results. "
+        "Complete your own card once those are filed; the aggregation card does the write-up.\n\n"
+        "**Step 4 — write the report** (in the aggregation card, or directly here if there "
+        "were no Cluster Agents to fan out to). Combine your management-cluster findings with "
+        "every child's metadata into a COMPLETE, verbose, presentation-ready report at "
+        f"`{INVENTORY_PATH}` — a greeting header, the full fleet and workload tables, and the "
+        "full prioritized SRE remediation suggestions.\n\n"
         f"**The exact path matters.** `{INVENTORY_PATH}` is the Chat Agent's home, not yours; "
         "a separate delivery job reads that file and posts it to the user **verbatim, with no "
         "further editing**. Writing it anywhere else means the user never receives it.\n\n"
-        "Do not message the user directly — delivery is handled for you. Complete the card "
-        "when the report is written."
+        "If a cluster's scan fails or its agent never reports, say so explicitly in the report "
+        "rather than omitting the cluster — a silent gap reads as 'clean'.\n\n"
+        "Do not message the user directly — delivery is handled for you."
     )
 
 
