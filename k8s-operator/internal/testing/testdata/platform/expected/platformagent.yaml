@@ -215,12 +215,15 @@ data:
       api_server:
       - mcp-router
       - kanban
+      - memory
       cli:
       - mcp-router
       - kanban
+      - memory
       google_chat:
       - mcp-router
       - kanban
+      - memory
     platforms:
       google_chat:
         enabled: true
@@ -385,7 +388,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: d408fc4f9e050ce857dc760e62825902903f4120d11c040717f4f79786ec1ace
+        kubeagents.x-k8s.io/config-hash: 1bea9b28663f6de1318a2ae06b6830a3ddf6e64109997cf40022d5adbfad68ab
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9

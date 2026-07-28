@@ -234,10 +234,23 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	}
 	// Delegation toolset (router MCP + kanban) for every platform key the gateway
 	// may resolve under, including `google_chat` (the real chat-ingress key).
+	//
+	// `memory` is listed here AND in DisabledToolsets below. That is deliberate,
+	// not a contradiction — the two entries do different jobs:
+	//   - Hermes builds the tool allowlist from these toolsets, then subtracts
+	//     disabled_toolsets LAST. The `memory` toolset resolves to exactly one
+	//     tool (the built-in `memory`), so enable-then-disable nets to zero and
+	//     the resulting tool list is byte-identical to omitting it. The built-in
+	//     store stays off.
+	//   - Memory-PROVIDER tools take a separate path: inject_memory_provider_tools
+	//     bails unless memory_provider_tools_enabled() sees "memory" in THIS list.
+	//     Without the entry `multiuser_memory` is never injected, which is why the
+	//     front door's memories dir stayed empty despite the provider loading.
+	// Net: multiuser_memory is exposed for per-user writes; `memory` is not.
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":         {"mcp-router", "kanban"},
-		"api_server":  {"mcp-router", "kanban"},
-		"google_chat": {"mcp-router", "kanban"},
+		"cli":         {"mcp-router", "kanban", "memory"},
+		"api_server":  {"mcp-router", "kanban", "memory"},
+		"google_chat": {"mcp-router", "kanban", "memory"},
 	}
 	// Second gate for the kanban orchestrator surface: the kanban tools' check_fn
 	// reads this top-level `toolsets` key (distinct from platform_toolsets above).
@@ -255,6 +268,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,
 	// code-exec, delegate_task, etc.). `kanban` is intentionally NOT disabled —
 	// it is the delegation surface. Only mcp-router + kanban survive.
+	// `memory` IS disabled here: it strips the built-in `memory` tool while
+	// leaving the multiuser_memory provider tool in place (see PlatformToolsets).
 	cfg.Agent.DisabledToolsets = []string{
 		"terminal", "file", "skills", "code_execution", "delegation",
 		"browser", "computer_use", "cronjob", "web", "search", "x_search",
@@ -269,6 +284,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
+	// multiuser_memory provider replaces it and keys each user's notes off the
+	// gateway identity (agent._user_id), writing to memories/users/<user>.md with a
+	// shared MEMORY.md alongside. The provider hydrates both into the system prompt
+	// itself, so the agent reads without a tool call and only writes through one.
+	// This is the only profile that gets it: kanban-spawned specialists carry no
+	// human identity, so their writes would collapse into one anonymous bucket.
 	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = "multiuser_memory"
 	cfg.Memory.UserProfileEnabled = false

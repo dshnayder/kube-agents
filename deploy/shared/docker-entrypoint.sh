@@ -97,6 +97,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # Targeted self-heal: drop `memory.provider` from cluster configs already
+        # on the PVC. The template no longer sets it (multiuser_memory scopes by
+        # gateway user identity, which a dispatcher-spawned worker never has), but
+        # cluster config.yaml is NOT force-synced above — it is identity-stamped
+        # with the cluster name and KUBECONFIG. So remove just this one key and
+        # leave everything else, rather than overwriting the file.
+        [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ] && \
+            "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); p.write_text(yaml.safe_dump(c))" "$d/config.yaml" 2>/dev/null || true
     done
 fi
 
