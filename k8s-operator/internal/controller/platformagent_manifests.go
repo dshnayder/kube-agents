@@ -274,7 +274,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// "memory" from agent.enabled_toolsets, fail the gate in
 	// inject_memory_provider_tools(), and silently kill multiuser_memory — the
 	// provider would still load and log "registered (1 tools)" while never
-	// reaching the model. See the PlatformToolsets note above.
+	// reaching the model. See the PlatformToolsets note above. That omission is
+	// conditional on the built-in store staying off; it is re-added below when
+	// spec.harness.memory.memoryEnabled turns it on.
 	cfg.Agent.DisabledToolsets = []string{
 		"terminal", "file", "skills", "code_execution", "delegation",
 		"browser", "computer_use", "cronjob", "web", "search", "x_search",
@@ -312,6 +314,21 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
 			cfg.Memory.UserProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
 		}
+	}
+
+	// Keeping `memory` out of DisabledToolsets is only safe while the built-in
+	// store is off. memoryEnabled is a supported CRD field, and setting it true
+	// would leave the front door holding a live built-in `memory` tool — a real
+	// read/write surface over a single MEMORY.md/USER.md pair with no per-user
+	// scoping, which is precisely what multiuser_memory exists to avoid. There is
+	// no way to have one without the other: the same toolset name gates the
+	// provider injection and exposes the built-in tool. So when the built-in
+	// store is switched on, put `memory` back in the denylist. Both memory tools
+	// then disappear from the front door — the behaviour this field already had
+	// before the gate was opened, and better than two competing stores on a
+	// profile whose whole point is a minimal tool surface.
+	if cfg.Memory.MemoryEnabled {
+		cfg.Agent.DisabledToolsets = append(cfg.Agent.DisabledToolsets, "memory")
 	}
 
 	if agent.Spec.Integration != nil {
