@@ -36,6 +36,11 @@ flowchart TB
 
 The sandbox image contains only **wrapper binaries** for `gcloud`, `kubectl`, `gh`, and `git`. A wrapper sends the executable name and argument array to Envoy at `127.0.0.1:8765`; the credential runtime executes the corresponding real CLI and returns output and exit status. It never evaluates an agent-supplied shell command, and the runtime's Unix socket is mounted only in the sidecar, so the sandbox cannot bypass Envoy. The real credential-aware CLIs ship in a separate `credential-proxy` image that the sandbox never runs.
 
+**The sandbox environment does not cross the boundary.** The command runs with an environment the sidecar builds itself, so exporting a variable in the agent shell has no effect on the proxied process. Two values are carried explicitly in the request instead, and both must resolve inside the shared agent workspace or the request is rejected with `400`:
+
+- **Working directory** — so relative paths in `git` and `kubectl` arguments mean what the agent intends.
+- **`KUBECONFIG`** — how a Cluster Agent profile pins itself to one target cluster. Its kubeconfig lives on the shared volume, which the sidecar also mounts, so the sidecar reads the file the agent wrote. Without a `KUBECONFIG`, commands use the context the sidecar bootstrapped for the host cluster.
+
 ## Credential placement
 
 | Data                            | Sandbox     | Credential sidecar        |

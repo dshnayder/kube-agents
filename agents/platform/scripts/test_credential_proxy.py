@@ -221,6 +221,65 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
             self.executor().execute(["git", "status"], cwd="/")
 
+    def test_kubeconfig_inside_shared_workspace_reaches_the_command(self):
+        executor = self.executor()
+        pinned = executor.workspace_dir / "profiles" / "cluster-a" / "kubeconfig.yaml"
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_text("apiVersion: v1\n", encoding="utf-8")
+        result = executor._execute(
+            ["/bin/sh", "-c", 'printf "%s" "$KUBECONFIG"'],
+            kubeconfig=str(pinned),
+        )
+        self.assertEqual(str(pinned), result.stdout)
+
+    def test_kubeconfig_defaults_to_the_sidecar_context(self):
+        # Omitting the field must not disturb the bootstrapped context — the
+        # Platform Agent sends no KUBECONFIG and relies on this default.
+        executor = self.executor()
+        result = executor._execute(["/bin/sh", "-c", 'printf "%s" "$KUBECONFIG"'])
+        self.assertEqual(executor.environment["KUBECONFIG"], result.stdout)
+
+    def test_kubeconfig_accepts_multiple_workspace_entries(self):
+        executor = self.executor()
+        first = executor.workspace_dir / "first.yaml"
+        second = executor.workspace_dir / "second.yaml"
+        for path in (first, second):
+            path.write_text("apiVersion: v1\n", encoding="utf-8")
+        result = executor._execute(
+            ["/bin/sh", "-c", 'printf "%s" "$KUBECONFIG"'],
+            kubeconfig=f"{first}:{second}",
+        )
+        self.assertEqual(f"{first}:{second}", result.stdout)
+
+    def test_kubeconfig_surrounding_whitespace_is_ignored(self):
+        # Profile .env files routinely carry a trailing newline; a path that
+        # only differs by whitespace must still resolve, not silently fail.
+        executor = self.executor()
+        pinned = executor.workspace_dir / "kubeconfig.yaml"
+        pinned.write_text("apiVersion: v1\n", encoding="utf-8")
+        result = executor._execute(
+            ["/bin/sh", "-c", 'printf "%s" "$KUBECONFIG"'],
+            kubeconfig=f"  {pinned}\n",
+        )
+        self.assertEqual(str(pinned), result.stdout)
+
+    def test_rejects_kubeconfig_outside_shared_workspace(self):
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            self.executor()._execute(["/bin/true"], kubeconfig="/etc/kubeconfig.yaml")
+
+    def test_rejects_kubeconfig_escaping_the_workspace_by_traversal(self):
+        executor = self.executor()
+        escape = str(executor.workspace_dir / ".." / "home" / ".kube" / "config")
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            executor._execute(["/bin/true"], kubeconfig=escape)
+
+    def test_rejects_kubeconfig_when_any_entry_escapes_the_workspace(self):
+        executor = self.executor()
+        allowed = executor.workspace_dir / "allowed.yaml"
+        allowed.write_text("apiVersion: v1\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            executor._execute(["/bin/true"], kubeconfig=f"{allowed}:/etc/kubeconfig.yaml")
+
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
         self.assertTrue(result.timed_out)

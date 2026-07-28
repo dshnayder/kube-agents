@@ -22,6 +22,16 @@ def execute(
         "argv": argv,
         "cwd": os.getcwd(),
     }
+    # The command runs in the sidecar, so the caller's environment is not
+    # inherited. KUBECONFIG is the one variable an agent legitimately needs to
+    # steer: Cluster Agent profiles pin themselves to a target cluster with it
+    # (see agents/cluster/config.yaml). Forward the path and let the server
+    # decide whether it is acceptable — it only honours paths inside the shared
+    # workspace. Whitespace is stripped because profile .env files routinely
+    # carry a trailing newline.
+    kubeconfig = os.environ.get("KUBECONFIG", "").strip()
+    if kubeconfig:
+        request_payload["kubeconfig"] = kubeconfig
     if stdin is not None:
         request_payload["stdin"] = stdin
     body = json.dumps(

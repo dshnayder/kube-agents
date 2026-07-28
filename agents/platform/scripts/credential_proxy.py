@@ -554,6 +554,7 @@ class CommandExecutor:
         argv: list[str],
         stdin: str | None = None,
         cwd: str | None = None,
+        kubeconfig: str | None = None,
     ) -> ExecutionResult:
         if (
             not isinstance(argv, list)
@@ -567,7 +568,12 @@ class CommandExecutor:
         executable_path = self.executables.get(executable)
         if not executable_path:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
-        return self._execute([executable_path, *argv[1:]], stdin=stdin, cwd=cwd)
+        return self._execute(
+            [executable_path, *argv[1:]],
+            stdin=stdin,
+            cwd=cwd,
+            kubeconfig=kubeconfig,
+        )
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
@@ -575,24 +581,55 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
+    def _within_workspace(self, candidate: Path) -> bool:
+        return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+
+    def _resolve_kubeconfig(self, kubeconfig: str) -> str:
+        """Accept a caller-supplied KUBECONFIG confined to the shared workspace.
+
+        Cluster Agent profiles pin themselves to one cluster through this
+        variable, but the client cannot simply forward its environment: the
+        command executes in the sidecar, where the agent must not be able to
+        reach credential material. Every entry is therefore held to the same
+        containment rule as `cwd` — it must live inside the workspace root the
+        agent already reads and writes. Paths elsewhere in the sidecar
+        filesystem are rejected rather than silently ignored, so a mistake
+        surfaces as an error instead of a command that quietly talks to the
+        wrong cluster.
+        """
+        entries = [entry for entry in kubeconfig.split(os.pathsep) if entry.strip()]
+        if not entries:
+            raise ValueError("kubeconfig must not be empty")
+        resolved = []
+        for entry in entries:
+            candidate = Path(entry.strip()).resolve()
+            if not self._within_workspace(candidate):
+                raise ValueError("kubeconfig is outside the shared workspace")
+            resolved.append(str(candidate))
+        return os.pathsep.join(resolved)
+
     def _execute(
         self,
         argv: list[str],
         stdin: str | None = None,
         cwd: str | None = None,
+        kubeconfig: str | None = None,
     ) -> ExecutionResult:
         started = time.monotonic()
         timed_out = False
         command_cwd = self.workspace_dir
         if cwd:
             requested_cwd = Path(cwd).resolve()
-            if requested_cwd != self.workspace_dir and self.workspace_dir not in requested_cwd.parents:
+            if not self._within_workspace(requested_cwd):
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
+        command_environment = self.environment.copy()
+        if kubeconfig:
+            command_environment["KUBECONFIG"] = self._resolve_kubeconfig(kubeconfig)
         process = subprocess.Popen(
             argv,
             cwd=command_cwd,
-            env=self.environment.copy(),
+            env=command_environment,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -709,6 +746,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             cwd = payload.get("cwd")
             if cwd is not None and not isinstance(cwd, str):
                 raise ValueError("cwd must be a string")
+            kubeconfig = payload.get("kubeconfig")
+            if kubeconfig is not None and not isinstance(kubeconfig, str):
+                raise ValueError("kubeconfig must be a string")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -747,7 +787,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute(argv, stdin=stdin, cwd=cwd)
+            result = self.executor.execute(
+                argv, stdin=stdin, cwd=cwd, kubeconfig=kubeconfig
+            )
+        except ValueError as exc:
+            # Containment rejections (cwd or kubeconfig outside the workspace)
+            # are caller errors, not proxy faults. Returning the reason keeps
+            # them from reading as an unexplained proxy outage — the agent can
+            # correct the path instead of guessing.
+            LOGGER.warning(
+                "command rejected request_id=%s reason=%s", request_id, exc
+            )
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         except Exception as exc:
             LOGGER.exception(
                 "command failed request_id=%s type=%s",
