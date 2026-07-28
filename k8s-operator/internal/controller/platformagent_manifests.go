@@ -235,18 +235,20 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Delegation toolset (router MCP + kanban) for every platform key the gateway
 	// may resolve under, including `google_chat` (the real chat-ingress key).
 	//
-	// `memory` is listed here AND in DisabledToolsets below. That is deliberate,
-	// not a contradiction — the two entries do different jobs:
-	//   - Hermes builds the tool allowlist from these toolsets, then subtracts
-	//     disabled_toolsets LAST. The `memory` toolset resolves to exactly one
-	//     tool (the built-in `memory`), so enable-then-disable nets to zero and
-	//     the resulting tool list is byte-identical to omitting it. The built-in
-	//     store stays off.
-	//   - Memory-PROVIDER tools take a separate path: inject_memory_provider_tools
-	//     bails unless memory_provider_tools_enabled() sees "memory" in THIS list.
-	//     Without the entry `multiuser_memory` is never injected, which is why the
-	//     front door's memories dir stayed empty despite the provider loading.
-	// Net: multiuser_memory is exposed for per-user writes; `memory` is not.
+	// `memory` here is a GATE for the multiuser_memory provider, not a tool grant.
+	// hermes_cli.tools_config._get_platform_tools() resolves this list for the
+	// session's platform key and subtracts agent.disabled_toolsets LAST; what
+	// survives becomes agent.enabled_toolsets. inject_memory_provider_tools()
+	// then bails unless memory_provider_tools_enabled() sees "memory" there, and
+	// that injection is the only path by which multiuser_memory reaches the model.
+	// So `memory` must be listed HERE and must NOT be in DisabledToolsets below —
+	// listing it in both nets to off (the subtraction wins), which is why the
+	// front door's memories dir stayed empty despite the provider loading.
+	//
+	// Price: the built-in `memory` tool is exposed alongside multiuser_memory. It
+	// is inert — MemoryEnabled=false leaves agent._memory_store nil and
+	// tools/memory_tool.py returns "Memory is not available" without touching
+	// disk. SOUL.md §1.6 tells the agent to write through multiuser_memory.
 	cfg.PlatformToolsets = map[string][]string{
 		"cli":         {"mcp-router", "kanban", "memory"},
 		"api_server":  {"mcp-router", "kanban", "memory"},
@@ -268,12 +270,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,
 	// code-exec, delegate_task, etc.). `kanban` is intentionally NOT disabled —
 	// it is the delegation surface. Only mcp-router + kanban survive.
-	// `memory` IS disabled here: it strips the built-in `memory` tool while
-	// leaving the multiuser_memory provider tool in place (see PlatformToolsets).
+	// `memory` is deliberately NOT in this list: disabling it here would strip
+	// "memory" from agent.enabled_toolsets, fail the gate in
+	// inject_memory_provider_tools(), and silently kill multiuser_memory — the
+	// provider would still load and log "registered (1 tools)" while never
+	// reaching the model. See the PlatformToolsets note above.
 	cfg.Agent.DisabledToolsets = []string{
 		"terminal", "file", "skills", "code_execution", "delegation",
 		"browser", "computer_use", "cronjob", "web", "search", "x_search",
-		"vision", "video", "image_gen", "video_gen", "tts", "todo", "memory",
+		"vision", "video", "image_gen", "video_gen", "tts", "todo",
 		"session_search", "project", "homeassistant", "discord",
 		"discord_admin", "spotify",
 	}

@@ -26,8 +26,10 @@ which keeps a private store per user (`memories/users/<user>.md`) plus a shared 
 so they have no memory at all — whatever they need must be spelled out in the card.
 
 - **Reading is free.** Both stores are injected into your context at the start of every session;
-  you do not call a tool to recall. The built-in `memory` tool and `memory_enabled` remain off —
-  `multiuser_memory` replaces them entirely (see `config.yaml`).
+  you do not call a tool to recall.
+- **Only `multiuser_memory` works.** A built-in `memory` tool is also visible — a side effect of
+  how the provider is gated — but `memory_enabled` is off, so it is backed by no store and every
+  call returns "Memory is not available". Never use it (see `config.yaml` and `SOUL.md` §1.6).
 - **Writing is deliberate.** Save durable per-user facts with
   `multiuser_memory(action="add", target="user", …)`; reserve `target="memory"` for facts the user
   states as team- or org-wide. Full rules, including what not to record, are in `SOUL.md` §1.6.
