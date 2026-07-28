@@ -1,6 +1,6 @@
 """Unit tests for the no-LLM onboarding cron scripts.
 
-Run: python3 -m unittest agents/platform/scripts/test_bootstrap_onboarding_scripts.py
+Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.py
 
 Covers the deterministic decision + I/O logic of:
   - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
@@ -174,7 +174,8 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("metadata", body)  # structured child results
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
-        # main has no cluster-agent subsystem; the same card must still produce a
+        # Cluster Agents ship now, but the script is still absent wherever an older
+        # image is running or no cluster has an agent yet. The same card must produce a
         # report there rather than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
         self.assertIn("If the script is absent", body)

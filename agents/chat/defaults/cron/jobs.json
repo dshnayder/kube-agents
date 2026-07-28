@@ -1,6 +1,20 @@
 {
   "jobs": [
     {
+      "id": "cluster-agent-reconcile",
+      "name": "Cluster Agent Reconcile",
+      "schedule": {
+        "kind": "cron",
+        "expr": "11 * * * *",
+        "display": "11 * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "cluster_agent_reconcile.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
       "id": "bootstrap-inventory-scan",
       "name": "First-Time Environment Discovery & Inventory Scan",
       "schedule": {
