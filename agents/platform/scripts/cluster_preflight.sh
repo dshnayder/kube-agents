@@ -39,7 +39,18 @@ HERMES_HOME="${HERMES_HOME:-/opt/data}"
 # On the dispatch path the worker rewrites HERMES_HOME to its own profile home,
 # where the scaffold pins kubeconfig.yaml and writes USER.md. Fall back to that
 # pinned kubeconfig when KUBECONFIG is not already exported.
-KUBECONFIG="${KUBECONFIG:-$HERMES_HOME/kubeconfig.yaml}"
+#
+# Remember whether the fallback was needed. The variable being absent is not a
+# cosmetic difference: checks 2 and 3 read the file by path either way, but the
+# skills run a plain `kubectl`, which can only see the pin through the
+# environment. So an unexported KUBECONFIG means the file is fine and every
+# real command still misses it — check 4 is where that is caught.
+if [ -n "${KUBECONFIG:-}" ]; then
+    KUBECONFIG_EXPORTED=1
+else
+    KUBECONFIG_EXPORTED=0
+    KUBECONFIG="$HERMES_HOME/kubeconfig.yaml"
+fi
 USER_MD="$HERMES_HOME/USER.md"
 
 STATUS="ok"
@@ -140,9 +151,28 @@ fi
 #    `--kubeconfig` (not the environment) on purpose: this must read the pinned
 #    file itself, independent of whatever the ambient context resolves to. Check 4
 #    is what tests the environment path.
+#
+#    Failure of the command itself is reported separately from the command
+#    running and printing nothing. They call for opposite remediations: an empty
+#    current-context really is a broken pin and re-scaffolding fixes it, whereas
+#    a non-zero exit here usually means the credential proxy is unreachable — the
+#    kubeconfig is fine, and re-scaffolding would have to go through that same
+#    proxy to succeed. Swallowing stderr made every proxy outage look like the
+#    former.
 if [ "$STATUS" = "ok" ]; then
-    PINNED_CONTEXT="$(capped kubectl --kubeconfig="$KUBECONFIG" config current-context 2>/dev/null | tr -d '[:space:]')"
-    if [ -z "$PINNED_CONTEXT" ]; then
+    CTX_ERR_FILE="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/preflight_ctx_err.$$")"
+    PINNED_RAW="$(capped kubectl --kubeconfig="$KUBECONFIG" config current-context 2>"$CTX_ERR_FILE")"
+    CTX_RC=$?
+    PINNED_CONTEXT="$(printf '%s' "$PINNED_RAW" | tr -d '[:space:]')"
+    CTX_ERR="$(tr '\n' ' ' <"$CTX_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-500)"
+    rm -f "$CTX_ERR_FILE"
+    [ "$CTX_RC" -eq 124 ] && CTX_ERR="timed out after 15s"
+
+    if [ "$CTX_RC" -ne 0 ]; then
+        fail "Could not read the pinned kubeconfig: kubectl itself failed." \
+             "This is not a bad pin — the command did not run. The credential proxy sidecar is the usual cause; check it is up and reachable, then re-run preflight. Do not re-scaffold: that runs through the same proxy." \
+             "kubectl --kubeconfig=$KUBECONFIG config current-context exited $CTX_RC: ${CTX_ERR:-no error output}"
+    elif [ -z "$PINNED_CONTEXT" ]; then
         fail "The pinned kubeconfig does not select a cluster (no current-context)." \
              "Re-scaffold the profile to re-fetch cluster credentials." \
              "kubectl --kubeconfig=$KUBECONFIG config current-context returned nothing"
@@ -161,12 +191,25 @@ fi
 #    one until the output is wrong: commands run against whatever context the
 #    credential-proxy sidecar last had, which is the host cluster. Check 3 passes in
 #    that case, because check 3 reads the file directly. This compares the two.
+#
+#    Deliberately no `env KUBECONFIG=...` prefix. Re-injecting the variable would
+#    test the proxy transport while assuming away the very thing being checked:
+#    on a profile whose .env never got the pin, the fallback above still finds the
+#    file, checks 2 and 3 pass on it, and a re-injected check 4 passes too — while
+#    every unprefixed `kubectl` the agent actually runs lands on the sidecar's own
+#    context. This has to run exactly as a skill would.
 if [ "$STATUS" = "ok" ]; then
-    EFFECTIVE_CONTEXT="$(capped env KUBECONFIG="$KUBECONFIG" kubectl config current-context 2>/dev/null | tr -d '[:space:]')"
-    if [ "$EFFECTIVE_CONTEXT" != "$PINNED_CONTEXT" ]; then
-        fail "kubectl in this environment does not use this agent's pinned kubeconfig." \
-             "Do not proceed: plain kubectl is talking to another cluster. Escalate to the Platform Agent — the agent image or its credential proxy is not carrying KUBECONFIG through to the command." \
-             "KUBECONFIG=$KUBECONFIG selects ${EFFECTIVE_CONTEXT:-<none>}, but the file itself selects $PINNED_CONTEXT"
+    if [ "$KUBECONFIG_EXPORTED" = "0" ]; then
+        fail "This agent's environment does not export KUBECONFIG." \
+             "Do not proceed: the pinned kubeconfig exists but no command will use it, so every kubectl resolves to the credential proxy's own cluster. Escalate to the Platform Agent to re-pin the profile (cluster_agent_profile.py writes KUBECONFIG into <home>/.env)." \
+             "$KUBECONFIG selects $PINNED_CONTEXT, but KUBECONFIG is unset in the environment; preflight only found the file by falling back to \$HERMES_HOME/kubeconfig.yaml"
+    else
+        EFFECTIVE_CONTEXT="$(capped kubectl config current-context 2>/dev/null | tr -d '[:space:]')"
+        if [ "$EFFECTIVE_CONTEXT" != "$PINNED_CONTEXT" ]; then
+            fail "kubectl in this environment does not use this agent's pinned kubeconfig." \
+                 "Do not proceed: plain kubectl is talking to another cluster. Escalate to the Platform Agent — the agent image or its credential proxy is not carrying KUBECONFIG through to the command." \
+                 "KUBECONFIG=$KUBECONFIG selects ${EFFECTIVE_CONTEXT:-<none>}, but the file itself selects $PINNED_CONTEXT"
+        fi
     fi
 fi
 

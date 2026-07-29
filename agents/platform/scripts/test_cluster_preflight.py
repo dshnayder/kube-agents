@@ -23,6 +23,9 @@ EXPECTED_CONTEXT = f"gke_{PROJECT}_{LOCATION}_{CLUSTER}"
 #                            KUBECONFIG, i.e. the credential-proxy sidecar's own
 #                            context leaking in. Unset means KUBECONFIG is honoured.
 #   FAKE_UNREACHABLE       - make `cluster-info` fail like a dead API server.
+#   FAKE_CONFIG_FAILS      - make `config current-context` fail the way a
+#                            credential-proxy outage does: non-zero, error on
+#                            stderr, nothing on stdout.
 FAKE_KUBECTL = textwrap.dedent(
     """\
     #!/bin/bash
@@ -40,6 +43,10 @@ FAKE_KUBECTL = textwrap.dedent(
 
     case "${ARGS[*]}" in
         "config current-context")
+            if [ -n "${FAKE_CONFIG_FAILS:-}" ]; then
+                echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
+                exit 1
+            fi
             if [ -n "$KCFG" ]; then
                 from_file "$KCFG"
             elif [ -n "${FAKE_AMBIENT_CONTEXT:-}" ]; then
@@ -100,11 +107,17 @@ class ClusterPreflightTest(unittest.TestCase):
         self.kubeconfig.write_text(body, encoding="utf-8")
 
     def run_preflight(self, **extra_env) -> dict:
+        # KUBECONFIG is exported by default because that is the real dispatch
+        # path: cluster_agent_profile.py writes it into the profile's .env and
+        # Hermes loads it. Pass KUBECONFIG=None to model a profile that never
+        # got the pin - which check 4 must now catch rather than paper over.
         env = {
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "HERMES_HOME": str(self.home),
+            "KUBECONFIG": str(self.kubeconfig),
             **extra_env,
         }
+        env = {k: v for k, v in env.items() if v is not None}
         proc = subprocess.run(
             ["bash", str(SCRIPT), "--json"],
             capture_output=True, text=True, timeout=60, env=env,
@@ -177,6 +190,27 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertEqual("failed", result["status"])
         self.assertIn("does not use this agent's pinned kubeconfig", result["reason"])
         self.assertIn("kage-management", result["evidence"])
+
+    def test_fails_when_kubeconfig_is_not_exported_at_all(self):
+        # The gap a re-injected `env KUBECONFIG=...` hid: the profile's .env never
+        # got the pin. The file is present and correct, so checks 2 and 3 pass on
+        # it, and check 4 used to force the variable back in and pass as well -
+        # while every real `kubectl` the agent runs afterwards has no pin at all.
+        result = self.run_preflight(KUBECONFIG=None)
+        self.assertEqual("failed", result["status"])
+        self.assertIn("does not export KUBECONFIG", result["reason"])
+        self.assertIn(".env", result["remediation"])
+
+    def test_reports_a_proxy_outage_as_such_not_as_a_bad_pin(self):
+        # A failing `kubectl config current-context` used to be swallowed, leaving
+        # an empty context that read as "the pin selects no cluster" - and sent the
+        # agent to re-scaffold, which runs through the same broken proxy.
+        result = self.run_preflight(FAKE_CONFIG_FAILS="1")
+        self.assertEqual("failed", result["status"])
+        self.assertIn("kubectl itself failed", result["reason"])
+        self.assertIn("Connection refused", result["evidence"])
+        self.assertNotIn("does not select a cluster", result["reason"])
+        self.assertNotIn("Re-scaffold the profile to re-fetch", result["remediation"])
 
     # ---- The pre-existing checks still work ----------------------------------
 
