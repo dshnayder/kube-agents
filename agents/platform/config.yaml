@@ -45,10 +45,10 @@ platform_toolsets:
 toolsets:
   - kanban
 
-# No memory provider. `multiuser_memory` keys its per-user store off the gateway
-# identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
+# No memory provider. Per-user memory keys its store off the gateway identity
+# (agent._user_id), which only the Chat Agent has — the Platform Agent is
 # reached through the kanban dispatcher, which spawns workers with no human
-# identity attached, so every write here landed in one anonymous `default` bucket.
+# identity attached, so every write here landed in one anonymous bucket.
 # Per-user memory lives on the front door only (see agents/chat/config.yaml); the
 # Platform Agent receives the resolved facts inline in each kanban card body.
 memory:

@@ -156,7 +156,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
 	}
 	// Turning the built-in store on must put `memory` back in the denylist. The
-	// toolset name is listed only to pass the multiuser_memory injection gate;
+	// toolset name is listed only to pass the memory-provider injection gate;
 	// leaving it enabled alongside a live built-in store would hand the front
 	// door a second, unscoped read/write memory tool.
 	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
@@ -166,7 +166,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 
 // The default (no CR override) case: the built-in store stays off, so `memory`
 // must stay OUT of disabled_toolsets — otherwise the subtraction runs last, the
-// gate fails, and multiuser_memory loads but never reaches the model.
+// gate fails, and the memory provider loads but never reaches the model.
 func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
@@ -176,12 +176,12 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	if !strings.Contains(yamlContent, "memory_enabled: false") {
 		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "provider: multiuser_memory") {
-		t.Errorf("expected provider: multiuser_memory by default, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "provider: hindsight") {
+		t.Errorf("expected provider: hindsight by default, got:\n%s", yamlContent)
 	}
 	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
 		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+
-			"runs last and would silently kill multiuser_memory; got %v", disabled)
+			"runs last and would silently kill the memory provider; got %v", disabled)
 	}
 }
 

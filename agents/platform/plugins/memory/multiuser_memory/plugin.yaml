@@ -1,3 +1,0 @@
-name: multiuser_memory
-version: 1.0.0
-description: "Multi-user memory provider isolating USER.md per user_id while keeping MEMORY.md global."

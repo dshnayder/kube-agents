@@ -8202,10 +8202,10 @@ spec:
                           description: MemoryEnabled toggles framework memory persistence.
                           type: boolean
                         provider:
-                          default: multiuser_memory
+                          default: hindsight
                           description:
                             Provider specifies the memory provider implementation
-                            (e.g. "multiuser_memory").
+                            (e.g. "hindsight").
                           type: string
                         userProfileEnabled:
                           default: false

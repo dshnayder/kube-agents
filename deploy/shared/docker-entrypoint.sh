@@ -101,7 +101,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
         # Targeted self-heal: drop `memory.provider` from cluster configs already
-        # on the PVC. The template no longer sets it (multiuser_memory scopes by
+        # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
         # cluster config.yaml is NOT force-synced above — it is identity-stamped
         # with `cluster_identity`, the record cluster_agent_reconcile.py reads to

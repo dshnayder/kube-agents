@@ -238,20 +238,21 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Delegation toolset (router MCP + kanban) for every platform key the gateway
 	// may resolve under, including `google_chat` (the real chat-ingress key).
 	//
-	// `memory` here is a GATE for the multiuser_memory provider, not a tool grant.
+	// `memory` here is a GATE for the memory provider, not a tool grant. The check
+	// is provider-agnostic: it applies to whatever cfg.Memory.Provider names below.
 	// hermes_cli.tools_config._get_platform_tools() resolves this list for the
 	// session's platform key and subtracts agent.disabled_toolsets LAST; what
 	// survives becomes agent.enabled_toolsets. inject_memory_provider_tools()
 	// then bails unless memory_provider_tools_enabled() sees "memory" there, and
-	// that injection is the only path by which multiuser_memory reaches the model.
-	// So `memory` must be listed HERE and must NOT be in DisabledToolsets below —
-	// listing it in both nets to off (the subtraction wins), which is why the
-	// front door's memories dir stayed empty despite the provider loading.
+	// that injection is the only path by which the provider's tools reach the
+	// model. So `memory` must be listed HERE and must NOT be in DisabledToolsets
+	// below — listing it in both nets to off (the subtraction wins), which is why
+	// the front door had no working memory despite the provider loading.
 	//
-	// Price: the built-in `memory` tool is exposed alongside multiuser_memory. It
-	// is inert — MemoryEnabled=false leaves agent._memory_store nil and
+	// Price: the built-in `memory` tool is exposed alongside the provider's own
+	// tools. It is inert — MemoryEnabled=false leaves agent._memory_store nil and
 	// tools/memory_tool.py returns "Memory is not available" without touching
-	// disk. SOUL.md §1.6 tells the agent to write through multiuser_memory.
+	// disk. SOUL.md §1.6 tells the agent to ignore it.
 	cfg.PlatformToolsets = map[string][]string{
 		"cli":         {"mcp-router", "kanban", "memory"},
 		"api_server":  {"mcp-router", "kanban", "memory"},
@@ -275,8 +276,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// it is the delegation surface. Only mcp-router + kanban survive.
 	// `memory` is deliberately NOT in this list: disabling it here would strip
 	// "memory" from agent.enabled_toolsets, fail the gate in
-	// inject_memory_provider_tools(), and silently kill multiuser_memory — the
-	// provider would still load and log "registered (1 tools)" while never
+	// inject_memory_provider_tools(), and silently kill the memory provider — it
+	// would still load and log that it registered its tools while never
 	// reaching the model. See the PlatformToolsets note above. That omission is
 	// conditional on the built-in store staying off; it is re-added below when
 	// spec.harness.memory.memoryEnabled turns it on.
@@ -296,15 +297,16 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// human turn — chat ingress lands here, not on the platform specialist.
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
 	cfg.Display.Platforms = map[string]map[string]any{}
-	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
-	// multiuser_memory provider replaces it and keys each user's notes off the
-	// gateway identity (agent._user_id), writing to memories/users/<user>.md with a
-	// shared MEMORY.md alongside. The provider hydrates both into the system prompt
-	// itself, so the agent reads without a tool call and only writes through one.
+	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the bundled
+	// hindsight provider replaces it, talking HTTP to a self-hosted Hindsight API
+	// and binding each session to one memory bank per user, resolved from the
+	// gateway identity (agent._user_id) through the bank_id_template in
+	// $HERMES_HOME/hindsight/config.json. It runs in its default hybrid mode, so it
+	// recalls into the prompt and retains at session end without being told to.
 	// This is the only profile that gets it: kanban-spawned specialists carry no
 	// human identity, so their writes would collapse into one anonymous bucket.
 	cfg.Memory.MemoryEnabled = false
-	cfg.Memory.Provider = "multiuser_memory"
+	cfg.Memory.Provider = "hindsight"
 	cfg.Memory.UserProfileEnabled = false
 
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
@@ -323,7 +325,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// store is off. memoryEnabled is a supported CRD field, and setting it true
 	// would leave the front door holding a live built-in `memory` tool — a real
 	// read/write surface over a single MEMORY.md/USER.md pair with no per-user
-	// scoping, which is precisely what multiuser_memory exists to avoid. There is
+	// scoping, which is precisely what the per-user provider exists to avoid. There is
 	// no way to have one without the other: the same toolset name gates the
 	// provider injection and exposes the built-in tool. So when the built-in
 	// store is switched on, put `memory` back in the denylist. Both memory tools
