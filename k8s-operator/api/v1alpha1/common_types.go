@@ -73,8 +73,8 @@ type MemorySpec struct {
 	// +optional
 	MemoryEnabled *bool `json:"memoryEnabled,omitempty"`
 
-	// Provider specifies the memory provider implementation (e.g. "hindsight").
-	// +kubebuilder:default="hindsight"
+	// Provider specifies the memory provider implementation (e.g. "kage_memory").
+	// +kubebuilder:default="kage_memory"
 	// +optional
 	Provider string `json:"provider,omitempty"`
 

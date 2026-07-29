@@ -8202,10 +8202,10 @@ spec:
                           description: MemoryEnabled toggles framework memory persistence.
                           type: boolean
                         provider:
-                          default: hindsight
+                          default: kage_memory
                           description:
                             Provider specifies the memory provider implementation
-                            (e.g. "hindsight").
+                            (e.g. "kage_memory").
                           type: string
                         userProfileEnabled:
                           default: false

@@ -48,7 +48,7 @@ the same parts. This uniformity is what makes the roster extensible.
 | **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                                     | `agents/platform/config.yaml`                                            |
 | **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)                                                                                | `agents/platform/skills/`                                                |
 | **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                                              | `agents/platform/governance/`                                            |
-| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                   | `hindsight` (self-hosted)                                                |
+| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                   | `kage_memory` over self-hosted Hindsight                                 |
 | **Triggers + heartbeat** | Event triggers (watches / alert & GitHub webhooks) for reactivity, plus a scheduled tick as backstop — driving proactive audits & drift detection | `INSTALL.md` §3, `agents/platform/cron/jobs.json` (+ Hermes event hooks) |
 | **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA                                                                           | kube-agents controller (`k8s-operator/`, extended)                       |
 | **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs                                                                                   | `PlatformAgentIntegrationSpec`                                           |
@@ -131,7 +131,7 @@ below); v1 coordinates on GitOps + OKF alone.
 
 Runtime **session state** (conversation transcripts, per-user profile facts, mid-task scratch) is a
 _separate_ concern — high-frequency, ephemeral, per-user — handled by the existing gateway store
-(`session_db.sqlite` + the `hindsight` provider, which binds each session to a memory bank per
+(`session_db.sqlite` + the `kage_memory` provider, which binds each session to a memory bank per
 `user_id`). It belongs in neither OKF nor mem0.
 
 How coordination flows: a parent provisioning a child, or an escalation that becomes a change, is a
@@ -146,7 +146,7 @@ at request time.
 > adds no new infrastructure. A **semantic-recall layer (mem0/Qdrant) is deferred post-v1**: it is a
 > stateful vector store whose value (embedding retrieval a flat markdown corpus can't do) is
 > speculative until git/grep/embedding-over-OKF is shown insufficient — add it only on evidence. (The
-> `hindsight` provider choice was about **per-user session isolation in the shared gateway**,
+> memory provider choice was about **per-user session isolation in the shared gateway**,
 > a separate concern from these coordination layers.)
 
 ### 2.4 How humans address agents (the ChatOps gateway)

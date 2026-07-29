@@ -24,9 +24,9 @@
 #   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
 #     this chat thread and posts the specialist's progress back to it as each step
 #     completes, with no blocking timeout.
-#   - `hindsight`: per-user memory. The Chat Agent is the ONLY place a human
-#     identity exists (agent._user_id comes from the gateway), so it is the only
-#     profile that can scope memory per user. See the `memory` note below.
+#   - `kage_memory`: per-user + shared memory. The Chat Agent is the ONLY place a
+#     human identity exists (agent._user_id comes from the gateway), so it is the
+#     only profile that can scope memory per user. See the `memory` note below.
 # Enforcement layers:
 #   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` (no
 #      `hermes-cli`/`hermes-api-server` base bundles, which would grant
@@ -77,7 +77,8 @@ mcp_servers:
 # provider loads but is never exposed. The denylist below has a matching note.
 #
 # The price of leaving the toolset on is that the built-in `memory` tool also
-# appears alongside the provider's `hindsight_*` tools. It is inert:
+# appears alongside the provider's `memory_retain`/`memory_recall`/
+# `memory_reflect` tools. It is inert:
 # `memory_enabled: false` leaves agent._memory_store as None, and
 # tools/memory_tool.py short-circuits on a null store with "Memory is not
 # available", touching no disk.
@@ -154,32 +155,36 @@ platforms:
   google_chat:
     typing_status_text: "Kage is thinking…"
 
-# Per-user memory. The built-in MEMORY.md/USER.md store stays off; the bundled
-# `hindsight` provider replaces it and is the ONLY memory on this profile. It
-# talks HTTP to a self-hosted Hindsight API and binds to one memory bank per
-# user, resolved from the gateway identity (agent._user_id, threaded in by
-# agent_init) through the `bank_id_template` in $HERMES_HOME/hindsight/config.json.
+# Memory. The built-in MEMORY.md/USER.md store stays off; the `kage_memory`
+# provider (agents/platform/plugins/memory/kage_memory/) replaces it and is the
+# ONLY memory on this profile. It holds two bundled-Hindsight instances talking
+# HTTP to a self-hosted Hindsight API: a private bank per user, named from the
+# gateway identity (agent._user_id, threaded in by agent_init) through
+# `bank_id_template` in $HERMES_HOME/hindsight/config.json, and one common bank
+# — `bank_id` in the same file — shared by everyone. A single Hindsight instance
+# binds to exactly one bank and MemoryManager.add_provider takes only one
+# external provider, which is why the two-bank shape needs a wrapper at all.
 #
-# The provider runs in its default `hybrid` memory_mode: it recalls relevant
-# memories into the prompt each turn and retains at session end on its own, so
-# neither the persona nor the operator has to instruct the model to use it. The
-# three `hindsight_*` tools stay available for explicit writes and lookups.
+# The personal bank runs in Hindsight's `hybrid` memory_mode: it recalls into the
+# prompt each turn and retains at session end on its own, so neither the persona
+# nor the operator has to instruct the model to use it. The shared bank is read
+# the same way but has auto-retain OFF — everyone can see it, so it takes
+# deliberate writes only (`memory_retain` with scope "shared").
 #
 # This is the only profile that gets the provider: specialists are spawned by the
 # kanban dispatcher and carry no human identity, so their writes would all land in
-# one anonymous bucket.
+# one anonymous bucket. The provider fails closed on exactly that case — with no
+# user_id, the personal bank is disabled rather than pooled into `kage-user-`.
 #
-# KNOWN GAP — shared Google Chat threads. build_session_key() (gateway/session.py)
-# omits the participant id inside a thread unless `thread_sessions_per_user` is on,
-# so everyone posting in a thread shares one cached Agent and therefore one bank:
-# the second speaker's turns retain into the first speaker's bank, and the first
-# speaker's memories are recalled into the second's context. Hindsight has no
-# equivalent of the guard the previous provider used to fail closed here. Until
-# that is restored, treat per-user memory as DM-only.
+# It also fails closed in shared Google Chat threads. build_session_key()
+# (gateway/session.py) omits the participant id inside a thread unless
+# `thread_sessions_per_user` is on, so everyone posting in a thread would share
+# one cached Agent and therefore one bank. The provider detects that and serves
+# the shared bank only, so personal memory is DM-only by design.
 memory:
   memory_enabled: false
   user_profile_enabled: false
-  provider: hindsight
+  provider: kage_memory
 
 # Chat ingress plugins live with the front door (session_store persists the
 # gateway session; the otel bridge and tool-call audit ride along).

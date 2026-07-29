@@ -297,16 +297,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// human turn — chat ingress lands here, not on the platform specialist.
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
 	cfg.Display.Platforms = map[string]map[string]any{}
-	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the bundled
-	// hindsight provider replaces it, talking HTTP to a self-hosted Hindsight API
-	// and binding each session to one memory bank per user, resolved from the
-	// gateway identity (agent._user_id) through the bank_id_template in
-	// $HERMES_HOME/hindsight/config.json. It runs in its default hybrid mode, so it
-	// recalls into the prompt and retains at session end without being told to.
-	// This is the only profile that gets it: kanban-spawned specialists carry no
-	// human identity, so their writes would collapse into one anonymous bucket.
+	// Memory. The built-in MEMORY.md/USER.md store stays off; the bundled
+	// kage_memory provider replaces it. It wraps two Hindsight instances talking
+	// HTTP to a self-hosted Hindsight API: one private bank per user, resolved
+	// from the gateway identity (agent._user_id) through the bank_id_template in
+	// $HERMES_HOME/hindsight/config.json, plus one common bank shared by everyone.
+	// Both are recalled into the prompt each turn; only the personal bank retains
+	// automatically at session end. This is the only profile that gets it:
+	// kanban-spawned specialists carry no human identity, and the provider fails
+	// closed there rather than collapsing their writes into one anonymous bucket.
 	cfg.Memory.MemoryEnabled = false
-	cfg.Memory.Provider = "hindsight"
+	cfg.Memory.Provider = "kage_memory"
 	cfg.Memory.UserProfileEnabled = false
 
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
