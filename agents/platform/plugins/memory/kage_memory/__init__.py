@@ -25,12 +25,11 @@ holds a handful of facts about one person. ``shared_recall_budget`` and
 Each bank also needs a *mission*: what it is for, and what is worth extracting
 into it. Hindsight's ``bank_mission``/``bank_retain_mission`` config keys are
 read into attributes the plugin never uses, so a mission can only be set on the
-bank itself, through the API. The two banks get there differently. The shared
-bank is one known name, so ``scripts/seed_shared_memory.py`` seeds it out of
-band. Personal banks are created on demand, one per user, the first time
-anything is retained — there is no install-time moment at which a script could
-enumerate them — so this provider applies their mission itself, in
-``_ensure_personal_mission``.
+bank itself, through the API — and this provider is the one that sets it, for
+both banks, in ``_ensure_mission``. A bank that has never been written to does
+not exist yet, so there is no install step and nothing to remember: the first
+session to touch a bank provisions it. Delete a bank, or rebuild Hindsight's
+database, and the next session puts the mission back.
 
 Both are loaded through ``load_memory_provider("hindsight")``, which re-runs the
 plugin's ``register()`` per call and therefore returns independent instances.
@@ -107,10 +106,43 @@ PERSONAL_RETAIN_MISSION = (
     "in the shared bank."
 )
 
+# What the shared bank is for, and how to answer from it.
+#
+# One field, not two. Hindsight's `set_mission` and `set_reflect_mission` are
+# both deprecated aliases for `create_bank(bank_id, mission=...)`, so a bank has
+# a single `mission` and it is what reflect reasons against; the text has to say
+# what the bank holds *and* how to answer from it. `retain_mission` below is
+# genuinely separate — it shapes extraction, not retrieval.
+SHARED_MISSION = (
+    "The shared operational knowledge of this organisation's Kubernetes "
+    "platform team, readable by every user of the Kage agent. It holds "
+    "standard operating procedures, platform conventions and defaults, "
+    "on-call and timezone facts, cluster and environment inventory, and the "
+    "history of releases and infrastructure changes. Facts here are true for "
+    "everybody. Nothing about an individual person belongs in this bank: "
+    "personal preferences, one user's clusters, and anything phrased about "
+    "'me' or 'my' belong in that user's own bank instead. "
+    "When answering, cite the specific procedure, version or dated change that "
+    "supports the answer, and say plainly when the record does not cover the "
+    "question rather than generalising from adjacent facts."
+)
+
+# The shared bank is loaded from documents, not conversation. Hindsight's
+# default extraction assumes dialogue and keeps asides that read as commitments.
+SHARED_RETAIN_MISSION = (
+    "Extract durable, self-contained operational facts. Each fact must stand "
+    "alone without the surrounding document: name the cluster, environment, "
+    "component, version or date it is about rather than saying 'this' or "
+    "'the above'. Keep procedures, thresholds, ownership, defaults, and dated "
+    "changes. Preserve exact identifiers, versions and dates verbatim. Drop "
+    "narrative framing, TODOs, unresolved proposals, and anything true only "
+    "while a document was being written."
+)
+
 # Banks whose mission this process has already settled, so the common case costs
 # nothing. Deliberately per-process rather than persisted: it is only a cache,
 # and re-applying after a restart is idempotent.
-_personal_missions_applied: set = set()
+_missions_applied: set = set()
 
 # Written here rather than fanned out from the sub-providers: theirs name the
 # hindsight_* tools, which this provider does not expose, and two of them would
@@ -228,7 +260,9 @@ class KageMemoryProvider(MemoryProvider):
                 session_id, kwargs, preamble=PERSONAL_PREAMBLE, label="personal",
             )
             self._apply_budget(self._personal, "personal_recall_budget")
-            self._ensure_personal_mission(self._personal)
+            self._ensure_mission(
+                self._personal, PERSONAL_MISSION, PERSONAL_RETAIN_MISSION, "personal",
+            )
 
         self._shared = self._init_hindsight(
             session_id, kwargs, preamble=SHARED_PREAMBLE, label="shared",
@@ -245,6 +279,9 @@ class KageMemoryProvider(MemoryProvider):
             # explicit writes only — never the end-of-session fact extraction.
             self._shared._auto_retain = False
             self._apply_budget(self._shared, "shared_recall_budget")
+            self._ensure_mission(
+                self._shared, SHARED_MISSION, SHARED_RETAIN_MISSION, "shared",
+            )
             logger.info("%s: shared bank=%s (budget=%s)", PROVIDER_NAME, shared_bank,
                         getattr(self._shared, "_budget", "?"))
 
@@ -288,13 +325,16 @@ class KageMemoryProvider(MemoryProvider):
             provider._budget = value
 
     @staticmethod
-    def _ensure_personal_mission(provider: Optional[MemoryProvider]) -> None:
-        """Give a personal bank the editorial guidance the shared bank is seeded with.
+    def _ensure_mission(
+        provider: Optional[MemoryProvider], mission: str, retain_mission: str, label: str,
+    ) -> None:
+        """Provision a bank's editorial guidance, creating the bank if needed.
 
-        The shared bank has one known name and is provisioned out of band, but
-        personal banks are created on demand — Hindsight makes one the first time
-        a user's session retains anything — so nothing outside this process knows
-        the name in advance. Setting it here is the only place it can happen.
+        Neither bank can be seeded ahead of time. A Hindsight bank does not exist
+        until something is written to it, and personal banks are named after the
+        user, so no install step could enumerate them. Doing it here means the
+        first session to touch a bank provisions it, a deleted bank comes back
+        correctly, and there is no manual step for an operator to forget.
 
         ``retain_mission`` is the sentinel for "already done": the bank-level
         ``mission`` is not part of the ``get_bank_config`` payload (that returns
@@ -310,27 +350,28 @@ class KageMemoryProvider(MemoryProvider):
         if provider is None:
             return
         bank_id = str(getattr(provider, "_bank_id", "") or "").strip()
-        if not bank_id or bank_id in _personal_missions_applied:
+        if not bank_id or bank_id in _missions_applied:
             return
         # Recorded before the attempt, not after: if the API is down, every
         # subsequent session in this process would otherwise retry a call that is
         # already known to be failing, on the session-creation path.
-        _personal_missions_applied.add(bank_id)
+        _missions_applied.add(bank_id)
         try:
             client = provider._get_client()
             config = (client.get_bank_config(bank_id) or {}).get("config") or {}
-            if config.get("retain_mission") == PERSONAL_RETAIN_MISSION:
+            if config.get("retain_mission") == retain_mission:
                 return
             # create_bank doubles as the update path — it is what Hindsight's own
             # deprecated set_mission() calls — and leaves existing facts intact.
-            # It must come first: it is the call that may create the bank, and
+            # It must come first: it is the call that creates the bank, and
             # update_bank_config only edits one that exists.
-            client.create_bank(bank_id=bank_id, mission=PERSONAL_MISSION)
-            client.update_bank_config(bank_id, retain_mission=PERSONAL_RETAIN_MISSION)
-            logger.info("%s: applied mission to personal bank %s", PROVIDER_NAME, bank_id)
+            client.create_bank(bank_id=bank_id, mission=mission)
+            client.update_bank_config(bank_id, retain_mission=retain_mission)
+            logger.info("%s: provisioned mission on %s bank %s",
+                        PROVIDER_NAME, label, bank_id)
         except Exception as e:
-            logger.warning("%s: could not set the mission on personal bank %s: %s",
-                           PROVIDER_NAME, bank_id, e)
+            logger.warning("%s: could not set the mission on %s bank %s: %s",
+                           PROVIDER_NAME, label, bank_id, e)
 
     def _init_hindsight(
         self, session_id: str, kwargs: Dict[str, Any], *, preamble: str, label: str,

@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
-"""Provision the shared memory bank and bulk-load the org corpus into it.
+"""Bulk-load the org corpus into the shared memory bank.
 
 The `kage_memory` provider gives every user a private Hindsight bank plus one
 bank shared by everyone. The shared bank is the org's knowledge — SOPs,
 conventions, timezone and on-call facts, release and change history — and is
-expected to be much larger than any personal bank. Two things follow from that,
-and neither is reachable from the agent:
+expected to be much larger than any personal bank. Filling it is not something
+the agent can do: `memory_retain` takes one string at a time and auto-retain is
+deliberately off for the shared bank, so seeding a document set through chat
+would be absurd. The client's `retain_files` and `retain_batch` take the whole
+set in one call, which is what this does.
 
-1. **The bank needs a mission.** Hindsight uses a bank's `mission` to decide
-   what is worth keeping and its `retain_mission` to shape extraction. The
-   Hermes plugin exposes `bank_mission`/`bank_retain_mission` config keys but
-   never sends them anywhere — they are read into attributes nothing reads back
-   (`plugins/memory/hindsight/__init__.py:1308-1309`). The mission is a property
-   of the bank, so it is set here, once, through the API. Only the *shared*
-   bank: personal banks are created on demand per user, so nothing knows their
-   names ahead of time and `kage_memory` sets their mission itself, at session
-   start (`_ensure_personal_mission`).
-
-2. **The corpus is loaded out of band.** `memory_retain` takes one string at a
-   time and auto-retain is deliberately off for the shared bank. Seeding a
-   document set through the chat agent would be absurd; the client's
-   `retain_files` and `retain_batch` take the whole set in one call.
+This script does **not** set the bank's mission. The provider does that itself
+when a session starts (`kage_memory._ensure_mission`), for the shared and
+personal banks alike, so there is no provisioning step to run at install time
+and nothing to redo when Hindsight's database is rebuilt.
 
 Run it from the gateway pod, which already has `hindsight_client` and can reach
-the Hindsight service:
+the Hindsight service (paths are resolved inside the pod):
 
     kubectl exec -n kubeagents-system deploy/platform-agent-gateway \
         -c platform-agent -- /opt/hermes/.venv/bin/python3 \
-        /opt/data/scripts/seed_shared_memory.py --mission-only
+        /opt/data/scripts/seed_shared_memory.py --files '/opt/data/corpus/*.md'
 
-    # …then load a corpus (paths are read inside the pod):
-    … seed_shared_memory.py --files /opt/data/corpus/*.md
     … seed_shared_memory.py --text "Release 0.9 shipped 2026-07-14."
 
 Connection settings come from $HERMES_HOME/hindsight/config.json — the same file
@@ -47,41 +38,6 @@ import sys
 from pathlib import Path
 
 DEFAULT_BANK_ID = "kage-shared"
-
-# What the bank is for, and how to answer from it.
-#
-# These are one field, not two. `set_mission` and `set_reflect_mission` are both
-# deprecated aliases for `create_bank(bank_id, mission=...)` — a bank has a
-# single `mission`, and it is what reflect reasons against. Setting a "purpose"
-# and then a "reflect mission" just overwrites the first with the second, so the
-# text has to do both jobs at once. `retain_mission` below is genuinely
-# separate: it shapes extraction, not retrieval.
-MISSION = (
-    "The shared operational knowledge of this organisation's Kubernetes "
-    "platform team, readable by every user of the Kage agent. It holds "
-    "standard operating procedures, platform conventions and defaults, "
-    "on-call and timezone facts, cluster and environment inventory, and the "
-    "history of releases and infrastructure changes. Facts here are true for "
-    "everybody. Nothing about an individual person belongs in this bank: "
-    "personal preferences, one user's clusters, and anything phrased about "
-    "'me' or 'my' belong in that user's own bank instead. "
-    "When answering, cite the specific procedure, version or dated change that "
-    "supports the answer, and say plainly when the record does not cover the "
-    "question rather than generalising from adjacent facts."
-)
-
-# How to extract from the corpus. Documents, not conversation — the default
-# extraction assumes dialogue and would keep asides that read as commitments.
-RETAIN_MISSION = (
-    "Extract durable, self-contained operational facts. Each fact must stand "
-    "alone without the surrounding document: name the cluster, environment, "
-    "component, version or date it is about rather than saying 'this' or "
-    "'the above'. Keep procedures, thresholds, ownership, defaults, and dated "
-    "changes. Preserve exact identifiers, versions and dates verbatim. Drop "
-    "narrative framing, TODOs, unresolved proposals, and anything true only "
-    "while a document was being written."
-)
-
 
 def load_hindsight_config() -> dict:
     """Read the provider's own config so this script cannot drift from it."""
@@ -110,25 +66,6 @@ def connect(config: dict):
     return Hindsight(base_url=api_url, api_key=api_key)
 
 
-def ensure_bank(client, bank_id: str) -> None:
-    """Create the bank with its mission, or refresh the mission if it exists.
-
-    One path covers both cases. `create_bank` doubles as the update path — it is
-    what Hindsight's own deprecated `set_mission()` calls underneath — and it
-    leaves an existing bank's facts alone. It has to come first, because it is
-    the call that may create the bank and `update_bank_config` only edits one
-    that already exists.
-
-    There is deliberately no "does it exist?" branch here: `get_bank_config`
-    answers for an unknown bank with defaults rather than raising, so branching
-    on it would be branching on nothing. Safe to re-run either way — a mission is
-    declarative, not appended.
-    """
-    client.create_bank(bank_id=bank_id, mission=MISSION)
-    client.update_bank_config(bank_id, retain_mission=RETAIN_MISSION)
-    print(f"set mission and retain_mission on bank {bank_id}")
-
-
 def retain_files(client, bank_id: str, patterns: list[str], context: str) -> None:
     paths: list[str] = []
     for pattern in patterns:
@@ -153,8 +90,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--bank-id", default=None,
                         help=f"Shared bank id (default: from config, else {DEFAULT_BANK_ID})")
-    parser.add_argument("--mission-only", action="store_true",
-                        help="Create/refresh the bank and its mission, ingest nothing.")
     parser.add_argument("--files", nargs="+", metavar="GLOB",
                         help="Documents to ingest (paths resolved where this runs).")
     parser.add_argument("--text", nargs="+", metavar="FACT",
@@ -163,14 +98,13 @@ def main() -> None:
                         help="Provenance label attached to what is ingested.")
     args = parser.parse_args()
 
-    if not (args.mission_only or args.files or args.text):
-        parser.error("nothing to do: pass --mission-only, --files, or --text")
+    if not (args.files or args.text):
+        parser.error("nothing to do: pass --files or --text")
 
     config = load_hindsight_config()
     bank_id = args.bank_id or config.get("shared_bank_id") or config.get("bank_id") or DEFAULT_BANK_ID
     client = connect(config)
     try:
-        ensure_bank(client, bank_id)
         if args.files:
             retain_files(client, bank_id, args.files, args.context)
         if args.text:

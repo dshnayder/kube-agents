@@ -176,12 +176,16 @@ platforms:
 # facts about one person, so each sets its own recall depth through
 # `shared_recall_budget` / `personal_recall_budget` in the same config.json
 # (low|mid|high; unset leaves Hindsight's own default of mid). The corpus itself
-# is loaded out of band by agents/platform/scripts/seed_shared_memory.py, which
-# also sets the shared bank's mission — Hindsight's `bank_mission` config key is
-# read into an attribute the plugin never uses, so a bank's purpose and its
-# extraction prompt can only be set on the bank, through the API. Personal banks
-# get their mission from the provider instead, at session start: they are created
-# on demand per user, so no install-time script can name them in advance.
+# is loaded out of band by agents/platform/scripts/seed_shared_memory.py — the
+# shared bank takes deliberate writes only, and a document set cannot sensibly be
+# fed through chat one string at a time.
+#
+# Each bank's mission — what it holds and what is worth extracting into it — is
+# provisioned by the provider itself when a session starts. Hindsight's
+# `bank_mission` config key is read into an attribute the plugin never uses, so a
+# mission can only be set on the bank through the API; doing it at session start
+# means there is no install step, and a deleted bank or a rebuilt Hindsight
+# database comes back correctly on its own.
 #
 # This is the only profile that gets the provider: specialists are spawned by the
 # kanban dispatcher and carry no human identity, so their writes would all land in
