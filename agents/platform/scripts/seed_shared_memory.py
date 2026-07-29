@@ -12,7 +12,10 @@ and neither is reachable from the agent:
    Hermes plugin exposes `bank_mission`/`bank_retain_mission` config keys but
    never sends them anywhere — they are read into attributes nothing reads back
    (`plugins/memory/hindsight/__init__.py:1308-1309`). The mission is a property
-   of the bank, so it is set here, once, through the API.
+   of the bank, so it is set here, once, through the API. Only the *shared*
+   bank: personal banks are created on demand per user, so nothing knows their
+   names ahead of time and `kage_memory` sets their mission itself, at session
+   start (`_ensure_personal_mission`).
 
 2. **The corpus is loaded out of band.** `memory_retain` takes one string at a
    time and auto-retain is deliberately off for the shared bank. Seeding a
@@ -108,27 +111,22 @@ def connect(config: dict):
 
 
 def ensure_bank(client, bank_id: str) -> None:
-    """Create the bank with its mission, or update the mission if it exists.
+    """Create the bank with its mission, or refresh the mission if it exists.
 
-    create_bank is not idempotent, so an existing bank takes the update path.
-    Both are safe to re-run: the mission is declarative, not appended.
+    One path covers both cases. `create_bank` doubles as the update path — it is
+    what Hindsight's own deprecated `set_mission()` calls underneath — and it
+    leaves an existing bank's facts alone. It has to come first, because it is
+    the call that may create the bank and `update_bank_config` only edits one
+    that already exists.
+
+    There is deliberately no "does it exist?" branch here: `get_bank_config`
+    answers for an unknown bank with defaults rather than raising, so branching
+    on it would be branching on nothing. Safe to re-run either way — a mission is
+    declarative, not appended.
     """
-    try:
-        client.get_bank_config(bank_id)
-    except Exception:
-        client.create_bank(
-            bank_id=bank_id,
-            name="Kage shared memory",
-            mission=MISSION,
-            retain_mission=RETAIN_MISSION,
-        )
-        print(f"created bank {bank_id} with mission")
-        return
-    # create_bank doubles as the update path for an existing bank — it is what
-    # the deprecated set_mission() calls underneath.
     client.create_bank(bank_id=bank_id, mission=MISSION)
     client.update_bank_config(bank_id, retain_mission=RETAIN_MISSION)
-    print(f"updated mission on existing bank {bank_id}")
+    print(f"set mission and retain_mission on bank {bank_id}")
 
 
 def retain_files(client, bank_id: str, patterns: list[str], context: str) -> None:

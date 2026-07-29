@@ -179,7 +179,9 @@ platforms:
 # is loaded out of band by agents/platform/scripts/seed_shared_memory.py, which
 # also sets the shared bank's mission — Hindsight's `bank_mission` config key is
 # read into an attribute the plugin never uses, so a bank's purpose and its
-# extraction prompt can only be set on the bank, through the API.
+# extraction prompt can only be set on the bank, through the API. Personal banks
+# get their mission from the provider instead, at session start: they are created
+# on demand per user, so no install-time script can name them in advance.
 #
 # This is the only profile that gets the provider: specialists are spawned by the
 # kanban dispatcher and carry no human identity, so their writes would all land in

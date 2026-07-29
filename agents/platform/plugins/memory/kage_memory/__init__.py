@@ -21,10 +21,16 @@ The two are not symmetric in size. The shared bank is the org's corpus — SOPs,
 conventions, release history — and is expected to grow large; the personal bank
 holds a handful of facts about one person. ``shared_recall_budget`` and
 ``personal_recall_budget`` let each side set its own recall depth accordingly.
-The shared bank's *mission* (what it is for, and how facts are extracted into
-it) is not settable from here: Hindsight's ``bank_mission`` config key is read
-into an attribute the plugin never uses, so the mission belongs to the bank
-itself and is set through the API by ``scripts/seed_shared_memory.py``.
+
+Each bank also needs a *mission*: what it is for, and what is worth extracting
+into it. Hindsight's ``bank_mission``/``bank_retain_mission`` config keys are
+read into attributes the plugin never uses, so a mission can only be set on the
+bank itself, through the API. The two banks get there differently. The shared
+bank is one known name, so ``scripts/seed_shared_memory.py`` seeds it out of
+band. Personal banks are created on demand, one per user, the first time
+anything is retained — there is no install-time moment at which a script could
+enumerate them — so this provider applies their mission itself, in
+``_ensure_personal_mission``.
 
 Both are loaded through ``load_memory_provider("hindsight")``, which re-runs the
 plugin's ``register()`` per call and therefore returns independent instances.
@@ -72,6 +78,39 @@ NO_IDENTITY_NOTICE = (
 
 _SCOPES = ("personal", "shared", "both")
 _VALID_BUDGETS = ("low", "mid", "high")
+
+# What a personal bank is for, and what is worth keeping in it.
+#
+# Without these a personal bank comes up with an empty mission and Hindsight
+# extracts whatever seemed notable in the transcript — which in practice means
+# the state of individual kanban cards and the assistant's own bookkeeping.
+# Those read as facts but expire when the work closes, and they keep being
+# injected into the prompt long after they stop being true.
+PERSONAL_MISSION = (
+    "What one person's assistant needs to remember about them: where they work "
+    "and in which timezone, which clusters, projects and environments are "
+    "theirs, how they prefer work to be done, and what they are responsible "
+    "for. Everything here is about this individual. Facts that hold for the "
+    "whole team belong in the shared bank instead."
+)
+
+PERSONAL_RETAIN_MISSION = (
+    "Extract only durable facts about this person. Keep their location, "
+    "timezone, role and responsibilities; the clusters, projects and "
+    "environments they call their own; and the working preferences they state. "
+    "Phrase each fact to stand alone and name the person rather than saying "
+    "'the user'. "
+    "Drop the state of individual tasks and tickets, decisions scoped to one "
+    "piece of work, and anything the assistant itself did — that is a record of "
+    "a conversation, not a fact about a person, and it stops being true once "
+    "the work closes. Drop anything that holds for the whole team; that belongs "
+    "in the shared bank."
+)
+
+# Banks whose mission this process has already settled, so the common case costs
+# nothing. Deliberately per-process rather than persisted: it is only a cache,
+# and re-applying after a restart is idempotent.
+_personal_missions_applied: set = set()
 
 # Written here rather than fanned out from the sub-providers: theirs name the
 # hindsight_* tools, which this provider does not expose, and two of them would
@@ -189,6 +228,7 @@ class KageMemoryProvider(MemoryProvider):
                 session_id, kwargs, preamble=PERSONAL_PREAMBLE, label="personal",
             )
             self._apply_budget(self._personal, "personal_recall_budget")
+            self._ensure_personal_mission(self._personal)
 
         self._shared = self._init_hindsight(
             session_id, kwargs, preamble=SHARED_PREAMBLE, label="shared",
@@ -246,6 +286,51 @@ class KageMemoryProvider(MemoryProvider):
         value = str(config.get(key) or "").strip().lower()
         if value in _VALID_BUDGETS:
             provider._budget = value
+
+    @staticmethod
+    def _ensure_personal_mission(provider: Optional[MemoryProvider]) -> None:
+        """Give a personal bank the editorial guidance the shared bank is seeded with.
+
+        The shared bank has one known name and is provisioned out of band, but
+        personal banks are created on demand — Hindsight makes one the first time
+        a user's session retains anything — so nothing outside this process knows
+        the name in advance. Setting it here is the only place it can happen.
+
+        ``retain_mission`` is the sentinel for "already done": the bank-level
+        ``mission`` is not part of the ``get_bank_config`` payload (that returns
+        ``{bank_id, config}``, and mission is bank metadata), so it cannot be
+        compared cheaply. The two are always written together, which makes one a
+        sound proxy for the other.
+
+        Costs one read per bank per process and two writes only when the text has
+        actually changed. Failures are logged and swallowed — an unguided bank is
+        worse than a guided one, but it still works, and memory must never be the
+        reason a session fails to start.
+        """
+        if provider is None:
+            return
+        bank_id = str(getattr(provider, "_bank_id", "") or "").strip()
+        if not bank_id or bank_id in _personal_missions_applied:
+            return
+        # Recorded before the attempt, not after: if the API is down, every
+        # subsequent session in this process would otherwise retry a call that is
+        # already known to be failing, on the session-creation path.
+        _personal_missions_applied.add(bank_id)
+        try:
+            client = provider._get_client()
+            config = (client.get_bank_config(bank_id) or {}).get("config") or {}
+            if config.get("retain_mission") == PERSONAL_RETAIN_MISSION:
+                return
+            # create_bank doubles as the update path — it is what Hindsight's own
+            # deprecated set_mission() calls — and leaves existing facts intact.
+            # It must come first: it is the call that may create the bank, and
+            # update_bank_config only edits one that exists.
+            client.create_bank(bank_id=bank_id, mission=PERSONAL_MISSION)
+            client.update_bank_config(bank_id, retain_mission=PERSONAL_RETAIN_MISSION)
+            logger.info("%s: applied mission to personal bank %s", PROVIDER_NAME, bank_id)
+        except Exception as e:
+            logger.warning("%s: could not set the mission on personal bank %s: %s",
+                           PROVIDER_NAME, bank_id, e)
 
     def _init_hindsight(
         self, session_id: str, kwargs: Dict[str, Any], *, preamble: str, label: str,
