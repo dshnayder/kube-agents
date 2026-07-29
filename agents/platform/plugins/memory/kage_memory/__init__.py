@@ -17,6 +17,15 @@ Hindsight instances and fans the provider protocol across both:
   every conversation, but never auto-retained: it takes explicit writes only,
   because everything in it is visible to every user.
 
+The two are not symmetric in size. The shared bank is the org's corpus — SOPs,
+conventions, release history — and is expected to grow large; the personal bank
+holds a handful of facts about one person. ``shared_recall_budget`` and
+``personal_recall_budget`` let each side set its own recall depth accordingly.
+The shared bank's *mission* (what it is for, and how facts are extracted into
+it) is not settable from here: Hindsight's ``bank_mission`` config key is read
+into an attribute the plugin never uses, so the mission belongs to the bank
+itself and is set through the API by ``scripts/seed_shared_memory.py``.
+
 Both are loaded through ``load_memory_provider("hindsight")``, which re-runs the
 plugin's ``register()`` per call and therefore returns independent instances.
 Reusing the upstream provider wholesale — rather than forking its ~92 KB
@@ -62,6 +71,7 @@ NO_IDENTITY_NOTICE = (
 )
 
 _SCOPES = ("personal", "shared", "both")
+_VALID_BUDGETS = ("low", "mid", "high")
 
 # Written here rather than fanned out from the sub-providers: theirs name the
 # hindsight_* tools, which this provider does not expose, and two of them would
@@ -178,6 +188,7 @@ class KageMemoryProvider(MemoryProvider):
             self._personal = self._init_hindsight(
                 session_id, kwargs, preamble=PERSONAL_PREAMBLE, label="personal",
             )
+            self._apply_budget(self._personal, "personal_recall_budget")
 
         self._shared = self._init_hindsight(
             session_id, kwargs, preamble=SHARED_PREAMBLE, label="shared",
@@ -193,7 +204,9 @@ class KageMemoryProvider(MemoryProvider):
             # Everything in this bank is visible to every user, so it takes
             # explicit writes only — never the end-of-session fact extraction.
             self._shared._auto_retain = False
-            logger.info("%s: shared bank=%s", PROVIDER_NAME, shared_bank)
+            self._apply_budget(self._shared, "shared_recall_budget")
+            logger.info("%s: shared bank=%s (budget=%s)", PROVIDER_NAME, shared_bank,
+                        getattr(self._shared, "_budget", "?"))
 
         if self._personal is None and self._shared is None:
             logger.warning("%s: no memory banks available for session %s",
@@ -213,6 +226,26 @@ class KageMemoryProvider(MemoryProvider):
             if value:
                 return value
         return DEFAULT_SHARED_BANK_ID
+
+    @staticmethod
+    def _apply_budget(provider: Optional[MemoryProvider], key: str) -> None:
+        """Give each bank its own recall thoroughness.
+
+        Hindsight resolves a single ``recall_budget`` per instance into
+        ``_budget`` and reads that attribute at call time on every recall and
+        reflect, so overriding it here is enough. The two banks want different
+        values: the shared bank holds the org-wide corpus — SOPs, conventions,
+        release history — and earns a deeper search, while the personal bank is
+        a handful of facts about one person and does not.
+
+        Unset leaves Hindsight's own resolution (``mid`` by default) in place.
+        """
+        if provider is None:
+            return
+        config = getattr(provider, "_config", None) or {}
+        value = str(config.get(key) or "").strip().lower()
+        if value in _VALID_BUDGETS:
+            provider._budget = value
 
     def _init_hindsight(
         self, session_id: str, kwargs: Dict[str, Any], *, preamble: str, label: str,

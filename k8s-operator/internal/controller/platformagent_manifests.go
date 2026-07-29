@@ -333,7 +333,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// then disappear from the front door — the behaviour this field already had
 	// before the gate was opened, and better than two competing stores on a
 	// profile whose whole point is a minimal tool surface.
-	if cfg.Memory.MemoryEnabled {
+	//
+	// userProfileEnabled has to be tested too, and it is easy to miss: Hermes
+	// constructs the store when EITHER flag is set (agent_init.py builds
+	// MemoryStore on `_memory_enabled or _user_profile_enabled`), and the
+	// built-in tool checks only that the store exists — it has no per-target
+	// gate. So userProfileEnabled alone makes the tool live for MEMORY.md as
+	// well as USER.md.
+	if cfg.Memory.MemoryEnabled || cfg.Memory.UserProfileEnabled {
 		cfg.Agent.DisabledToolsets = append(cfg.Agent.DisabledToolsets, "memory")
 	}
 

@@ -171,6 +171,16 @@ platforms:
 # the same way but has auto-retain OFF — everyone can see it, so it takes
 # deliberate writes only (`memory_retain` with scope "shared").
 #
+# The two banks are not the same size. The shared bank is the org's corpus —
+# SOPs, conventions, release history — while a personal bank is a handful of
+# facts about one person, so each sets its own recall depth through
+# `shared_recall_budget` / `personal_recall_budget` in the same config.json
+# (low|mid|high; unset leaves Hindsight's own default of mid). The corpus itself
+# is loaded out of band by agents/platform/scripts/seed_shared_memory.py, which
+# also sets the shared bank's mission — Hindsight's `bank_mission` config key is
+# read into an attribute the plugin never uses, so a bank's purpose and its
+# extraction prompt can only be set on the bank, through the API.
+#
 # This is the only profile that gets the provider: specialists are spawned by the
 # kanban dispatcher and carry no human identity, so their writes would all land in
 # one anonymous bucket. The provider fails closed on exactly that case — with no

@@ -164,6 +164,28 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	}
 }
 
+// userProfileEnabled on its own is enough to make the built-in tool live: Hermes
+// builds the store when either flag is set and the tool has no per-target gate,
+// so USER.md alone still exposes a read/write surface over MEMORY.md too.
+func TestBuildConfigMap_UserProfileAloneClosesMemoryGate(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{
+					MemoryEnabled:      ptr.To(false),
+					UserProfileEnabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	yamlContent := buildConfigMap(agent).Data["config.yaml"]
+	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
+		t.Errorf("expected `memory` in disabled_toolsets when only user_profile_enabled is true, got:\n%s", yamlContent)
+	}
+}
+
 // The default (no CR override) case: the built-in store stays off, so `memory`
 // must stay OUT of disabled_toolsets — otherwise the subtraction runs last, the
 // gate fails, and the memory provider loads but never reaches the model.
