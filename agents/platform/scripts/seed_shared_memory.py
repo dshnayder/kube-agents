@@ -45,8 +45,14 @@ from pathlib import Path
 
 DEFAULT_BANK_ID = "kage-shared"
 
-# What the bank is for. Hindsight weighs candidate facts against this, so it is
-# the main lever on what a large corpus admits and what it drops.
+# What the bank is for, and how to answer from it.
+#
+# These are one field, not two. `set_mission` and `set_reflect_mission` are both
+# deprecated aliases for `create_bank(bank_id, mission=...)` — a bank has a
+# single `mission`, and it is what reflect reasons against. Setting a "purpose"
+# and then a "reflect mission" just overwrites the first with the second, so the
+# text has to do both jobs at once. `retain_mission` below is genuinely
+# separate: it shapes extraction, not retrieval.
 MISSION = (
     "The shared operational knowledge of this organisation's Kubernetes "
     "platform team, readable by every user of the Kage agent. It holds "
@@ -55,7 +61,10 @@ MISSION = (
     "history of releases and infrastructure changes. Facts here are true for "
     "everybody. Nothing about an individual person belongs in this bank: "
     "personal preferences, one user's clusters, and anything phrased about "
-    "'me' or 'my' belong in that user's own bank instead."
+    "'me' or 'my' belong in that user's own bank instead. "
+    "When answering, cite the specific procedure, version or dated change that "
+    "supports the answer, and say plainly when the record does not cover the "
+    "question rather than generalising from adjacent facts."
 )
 
 # How to extract from the corpus. Documents, not conversation — the default
@@ -68,15 +77,6 @@ RETAIN_MISSION = (
     "changes. Preserve exact identifiers, versions and dates verbatim. Drop "
     "narrative framing, TODOs, unresolved proposals, and anything true only "
     "while a document was being written."
-)
-
-# Reflect over an org corpus should answer from the record, not infer about a
-# person the way the default (conversation-derived) mission does.
-REFLECT_MISSION = (
-    "Answer from the organisation's recorded operational knowledge. Cite the "
-    "specific procedure, version or dated change that supports the answer, and "
-    "say plainly when the record does not cover the question rather than "
-    "generalising from adjacent facts."
 )
 
 
@@ -121,13 +121,13 @@ def ensure_bank(client, bank_id: str) -> None:
             name="Kage shared memory",
             mission=MISSION,
             retain_mission=RETAIN_MISSION,
-            reflect_mission=REFLECT_MISSION,
         )
         print(f"created bank {bank_id} with mission")
         return
-    client.set_mission(bank_id, MISSION)
+    # create_bank doubles as the update path for an existing bank — it is what
+    # the deprecated set_mission() calls underneath.
+    client.create_bank(bank_id=bank_id, mission=MISSION)
     client.update_bank_config(bank_id, retain_mission=RETAIN_MISSION)
-    client.set_reflect_mission(bank_id, REFLECT_MISSION)
     print(f"updated mission on existing bank {bank_id}")
 
 
