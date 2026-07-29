@@ -12,6 +12,16 @@ import urllib.request
 import uuid
 
 
+SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+
+# Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
+# `container clusters get-credentials`. `git` and `gh` ignore the variable, so
+# forwarding it to them buys nothing and costs plenty — the server rejects an
+# out-of-workspace path rather than ignoring it, which would turn a stray
+# KUBECONFIG into a 400 on a command that has nothing to do with Kubernetes.
+KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
+
+
 def execute(
     endpoint: str,
     argv: list[str],
@@ -29,9 +39,10 @@ def execute(
     # decide whether it is acceptable — it only honours paths inside the shared
     # workspace. Whitespace is stripped because profile .env files routinely
     # carry a trailing newline.
-    kubeconfig = os.environ.get("KUBECONFIG", "").strip()
-    if kubeconfig:
-        request_payload["kubeconfig"] = kubeconfig
+    if argv and argv[0] in KUBECONFIG_AWARE:
+        kubeconfig = os.environ.get("KUBECONFIG", "").strip()
+        if kubeconfig:
+            request_payload["kubeconfig"] = kubeconfig
     if stdin is not None:
         request_payload["stdin"] = stdin
     body = json.dumps(
@@ -78,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "executable",
-        choices=("kubectl", "gcloud", "gh", "git"),
+        choices=SUPPORTED_EXECUTABLES,
     )
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     return parser.parse_args()
@@ -86,7 +97,7 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     invoked_as = os.path.basename(sys.argv[0])
-    if invoked_as in {"kubectl", "gcloud", "gh", "git"}:
+    if invoked_as in set(SUPPORTED_EXECUTABLES):
         endpoint = os.getenv("CREDENTIAL_PROXY_URL")
         if endpoint is None:
             print("CREDENTIAL_PROXY_URL is not configured", file=sys.stderr)
