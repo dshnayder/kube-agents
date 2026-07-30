@@ -170,8 +170,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /tmp/platform-base-confi
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Shared plugins available to all profiles (memory backend used by the Chat Agent).
+# Plugins land in the shared plugin root regardless of which profile owns them —
+# /opt/hermes/plugins is the only path Hermes resolves them from. The source
+# directory records ownership: kube_agents_memory needs the user identity that
+# only chat ingress carries, so it lives with the Chat Agent.
 COPY agents/platform/plugins/ /opt/hermes/plugins/
+COPY agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config

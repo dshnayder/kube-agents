@@ -8202,10 +8202,10 @@ spec:
                           description: MemoryEnabled toggles framework memory persistence.
                           type: boolean
                         provider:
-                          default: kage_memory
+                          default: kube_agents_memory
                           description:
                             Provider specifies the memory provider implementation
-                            (e.g. "kage_memory").
+                            (e.g. "kube_agents_memory").
                           type: string
                         userProfileEnabled:
                           default: false

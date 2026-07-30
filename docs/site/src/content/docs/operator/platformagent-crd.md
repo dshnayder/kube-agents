@@ -43,7 +43,7 @@ Framework-level settings passed to Hermes. `clusterName` and `location` are requ
 | `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
 | `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                       |
 | `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                |
-| `memory.provider`                        | string | Memory provider implementation. Default `kage_memory`.                               |
+| `memory.provider`                        | string | Memory provider implementation. Default `kube_agents_memory`.                        |
 | `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                   |
 
 ## `spec.deployment`

@@ -20,21 +20,24 @@ The roster of specialist agents is **dynamic** — always read it live with `lis
 ## Memory
 
 The Chat Agent is the **only** profile with memory, because it is the only one that knows who it
-is talking to: the gateway threads the sender's identity into the `kage_memory` provider, which
-binds the session to that user's own memory bank plus one bank shared by everyone. Specialists
-are spawned by the kanban dispatcher with no human identity, so they have no memory at all —
-whatever they need must be spelled out in the card.
+is talking to: the gateway threads the sender's identity into the `kube_agents_memory` provider,
+which tags everything that user says with `user:<id>` and lets them read that plus anything tagged
+`scope:shared`. Specialists are spawned by the kanban dispatcher with no human identity, so they
+have no memory at all — whatever they need must be spelled out in the card.
 
-- **Two banks: personal and shared.** Personal is private to the current user; shared is visible
+- **Two scopes: personal and shared.** Personal is private to the current user; shared is visible
   to the whole organisation. Both are read automatically; only personal is written automatically.
-- **Reading and writing are automatic.** Relevant memories from both banks are recalled into your
-  context each turn, and durable facts are retained to the personal bank when the session ends.
+- **Reading and writing are automatic.** Relevant memories from both scopes are recalled into your
+  context each turn, and durable facts are retained to personal memory when the session ends.
 - **The tools are for the exceptions.** `memory_recall` to look up something not already in
   context, `memory_retain` to store a fact immediately, `memory_reflect` to ask an open question
   about what is remembered. Each takes a `scope` (`personal`, `shared`, or `both`) — writes
   default to `personal`, reads to `both`. Full rules are in `SOUL.md` §1.6.
 - **Personal memory is DM-only.** In a thread more than one person can post in, the sender cannot
-  be attributed, so the personal bank is disabled and only the shared bank works.
+  be attributed, so personal memory is disabled and only shared memory works.
+- **A stated role goes to shared, deliberately.** Who holds which role, owns which system, or
+  approves what is org knowledge the rest of the fleet needs; preferences and possessions stay
+  personal. It is never automatic, and you say so when you do it — conditions in `SOUL.md` §1.6.
 - **The built-in `memory` tool does nothing.** It is visible as a side effect of how the provider
   is gated, but `memory_enabled` is off, so it is backed by no store and every call returns
   "Memory is not available". Never use it (see `config.yaml` and `SOUL.md` §1.6).

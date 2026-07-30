@@ -51,6 +51,7 @@ Generated from each script's own comment banner.
 | 9 | [`provision_09_deploy_litellm.sh`](provision_09_deploy_litellm.sh) | **Deploy LiteLLM Gateway** — Idempotent script that connects to GKE and deploys the LiteLLM Gateway. |
 | 10 | [`provision_10_deploy_github_minter.sh`](provision_10_deploy_github_minter.sh) | **Deploy GitHub Token Minter** — Idempotent script that deploys the GitHub Token Minter. Runs only when GITHUB_ORG, GITHUB_REPO, and GITHUB_APP_ID are all set; skipped otherwise. |
 | 11 | [`provision_11_deploy_inference_replay.sh`](provision_11_deploy_inference_replay.sh) | **Deploy Inference Replay Proxy (optional)** — Idempotent script that deploys the Inference Replay proxy in front of the LiteLLM gateway. Skipped unless INFERENCE_REPLAY_ENABLED=true. The proxy intercepts the `litellm` Service so agents need no configuration changes. With REPLAY_MODE=off (default) it is a pure pass-through; flip the `inference-replay-config` ConfigMap to `on` to start recording/replaying. |
+| 12 | [`provision_12_deploy_hindsight.sh`](provision_12_deploy_hindsight.sh) | **Deploy Hindsight Memory Store** — Idempotent script that connects to GKE and deploys Hindsight — the API server and the Postgres/pgvector database behind the Chat Agent's long-term memory. Requires step 9, since Hindsight sends its extraction and consolidation calls through the LiteLLM gateway. |
 
 ### Teardown steps
 
@@ -67,6 +68,7 @@ Generated from each script's own comment banner.
 | 9 | [`teardown_09_deploy_litellm.sh`](teardown_09_deploy_litellm.sh) | **Teardown LiteLLM Gateway** — Idempotent script to undeploy the LiteLLM gateway. |
 | 10 | [`teardown_10_deploy_github_minter.sh`](teardown_10_deploy_github_minter.sh) | **Teardown GitHub Token Minter** — Idempotent script to clean up the GitHub Token Minter. |
 | 11 | [`teardown_11_deploy_inference_replay.sh`](teardown_11_deploy_inference_replay.sh) | **Teardown Inference Replay Proxy** — Idempotent script to undeploy the Inference Replay proxy and restore the original LiteLLM Service. Safe to run even when the proxy was never deployed. |
+| 12 | [`teardown_12_deploy_hindsight.sh`](teardown_12_deploy_hindsight.sh) | **Teardown Hindsight Memory Store** — Idempotent script to undeploy the Hindsight API and its Postgres database. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: provisioning-steps -->

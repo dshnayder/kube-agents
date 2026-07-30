@@ -33,9 +33,22 @@ fi
 # bumping its mtime, so on the next image roll cp -u sees the PVC copy as "newer"
 # and never overwrites it — leaving a stale toolset/persona config live. These
 # files are image-owned (not runtime state), so overwrite them unconditionally.
+#
+# hindsight/config.json is in this list because it was NOT, once: the memory
+# provider's connection config was hand-written onto the PVC and so survived
+# every roll carrying whichever design was current when it was last touched. It
+# kept pointing the single-bank provider at a bank name from the two-bank era —
+# invisible to any code review or manifest diff. It is image-owned: the
+# Hindsight service address is fixed by its install manifests, and the bank is
+# a constant in the provider.
 if [ -d "/opt/defaults" ]; then
-    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
-        [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
+    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+        if [ -f "/opt/defaults/$f" ]; then
+            # Nested paths need their parent: step 2's recursive copy creates it
+            # on a fresh PVC, but the force-sync must not depend on that.
+            mkdir -p "$(dirname "$TARGET_DIR/$f")" 2>/dev/null || true
+            cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
+        fi
     done
 fi
 

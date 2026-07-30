@@ -198,8 +198,8 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	if !strings.Contains(yamlContent, "memory_enabled: false") {
 		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "provider: kage_memory") {
-		t.Errorf("expected provider: kage_memory by default, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "provider: kube_agents_memory") {
+		t.Errorf("expected provider: kube_agents_memory by default, got:\n%s", yamlContent)
 	}
 	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
 		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+

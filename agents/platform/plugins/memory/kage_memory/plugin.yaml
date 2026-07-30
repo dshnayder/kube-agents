@@ -1,3 +1,0 @@
-name: kage_memory
-version: 1.0.0
-description: "Two-bank memory provider: a private Hindsight bank per user plus one common bank shared by everyone."

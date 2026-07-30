@@ -24,9 +24,10 @@
 #   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
 #     this chat thread and posts the specialist's progress back to it as each step
 #     completes, with no blocking timeout.
-#   - `kage_memory`: per-user + shared memory. The Chat Agent is the ONLY place a
-#     human identity exists (agent._user_id comes from the gateway), so it is the
-#     only profile that can scope memory per user. See the `memory` note below.
+#   - `kube_agents_memory`: per-user + shared memory. The Chat Agent is the ONLY
+#     place a human identity exists (agent._user_id comes from the gateway), so
+#     it is the only profile that can scope memory per user. See the `memory`
+#     note below.
 # Enforcement layers:
 #   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` (no
 #      `hermes-cli`/`hermes-api-server` base bundles, which would grant
@@ -155,52 +156,58 @@ platforms:
   google_chat:
     typing_status_text: "Kage is thinking…"
 
-# Memory. The built-in MEMORY.md/USER.md store stays off; the `kage_memory`
-# provider (agents/platform/plugins/memory/kage_memory/) replaces it and is the
-# ONLY memory on this profile. It holds two bundled-Hindsight instances talking
-# HTTP to a self-hosted Hindsight API: a private bank per user, named from the
-# gateway identity (agent._user_id, threaded in by agent_init) through
-# `bank_id_template` in $HERMES_HOME/hindsight/config.json, and one common bank
-# — `bank_id` in the same file — shared by everyone. A single Hindsight instance
-# binds to exactly one bank and MemoryManager.add_provider takes only one
-# external provider, which is why the two-bank shape needs a wrapper at all.
+# Memory. The built-in MEMORY.md/USER.md store stays off; the
+# `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)
+# replaces it and is the ONLY memory on this profile. It wraps one bundled
+# Hindsight instance talking HTTP to a self-hosted Hindsight API, and keeps every
+# user's memories in a single bank (`bank_id` in
+# $HERMES_HOME/hindsight/config.json), separated by a scope tag: `user:<id>`
+# taken from the gateway identity (agent._user_id, threaded in by agent_init) for
+# private facts, `scope:shared` for organisation-wide ones. Recall asks for the
+# current user's tag plus the shared tag and nothing else comes back.
 #
-# The personal bank runs in Hindsight's `hybrid` memory_mode: it recalls into the
+# The wrapper exists because Hindsight cannot be configured to do this on its
+# own: `{user}` substitution is applied to `bank_id` and to no other setting, so
+# a configured `retain_tags: "user:{user_id}"` would tag every user with that
+# literal string. See docs/designs/memory-tag-isolation.md for what the wrapper
+# pins and why each one is load-bearing.
+#
+# Personal memory runs in Hindsight's `hybrid` memory_mode: it recalls into the
 # prompt each turn and retains at session end on its own, so neither the persona
-# nor the operator has to instruct the model to use it. The shared bank is read
-# the same way but has auto-retain OFF — everyone can see it, so it takes
-# deliberate writes only (`memory_retain` with scope "shared").
+# nor the operator has to instruct the model to use it. Shared memory is read the
+# same way but never auto-retains — everyone can see it, so it takes deliberate
+# writes only (`memory_retain` with scope "shared"). Recall depth for both is
+# `recall_budget` in the same config.json (low|mid|high; unset leaves Hindsight's
+# own default of mid).
 #
-# The two banks are not the same size. The shared bank is the org's corpus —
-# SOPs, conventions, release history — while a personal bank is a handful of
-# facts about one person, so each sets its own recall depth through
-# `shared_recall_budget` / `personal_recall_budget` in the same config.json
-# (low|mid|high; unset leaves Hindsight's own default of mid). The corpus itself
-# is loaded out of band by agents/platform/scripts/seed_shared_memory.py — the
-# shared bank takes deliberate writes only, and a document set cannot sensibly be
-# fed through chat one string at a time.
+# There is no bulk-load path into the shared corpus, by design: it fills from
+# conversation one deliberate write at a time, the same way personal memory
+# does. Nothing expires on its own,
+# and nothing prunes it either: agents/chat/scripts/memory_ttl_curator.py exists
+# for that but is shelved and on no schedule (see
+# docs/designs/memory-distill-then-retire.md).
 #
-# Each bank's mission — what it holds and what is worth extracting into it — is
-# provisioned by the provider itself when a session starts. Hindsight's
-# `bank_mission` config key is read into an attribute the plugin never uses, so a
-# mission can only be set on the bank through the API; doing it at session start
-# means there is no install step, and a deleted bank or a rebuilt Hindsight
-# database comes back correctly on its own.
+# The bank's mission and its retain strategies — what it holds, and what is worth
+# extracting into it under each scope — are provisioned by the provider itself
+# when a session starts. Hindsight's `bank_mission` config key is read into an
+# attribute the plugin never uses, so a mission can only be set through the API;
+# doing it at session start means there is no install step, and a deleted bank or
+# a rebuilt Hindsight database comes back correctly on its own.
 #
 # This is the only profile that gets the provider: specialists are spawned by the
 # kanban dispatcher and carry no human identity, so their writes would all land in
 # one anonymous bucket. The provider fails closed on exactly that case — with no
-# user_id, the personal bank is disabled rather than pooled into `kage-user-`.
+# user_id there is no personal scope, and auto-retain is switched off entirely.
 #
 # It also fails closed in shared Google Chat threads. build_session_key()
 # (gateway/session.py) omits the participant id inside a thread unless
 # `thread_sessions_per_user` is on, so everyone posting in a thread would share
-# one cached Agent and therefore one bank. The provider detects that and serves
-# the shared bank only, so personal memory is DM-only by design.
+# one cached Agent and therefore one identity. The provider detects that and
+# serves shared memory only, so personal memory is DM-only by design.
 memory:
   memory_enabled: false
   user_profile_enabled: false
-  provider: kage_memory
+  provider: kube_agents_memory
 
 # Chat ingress plugins live with the front door (session_store persists the
 # gateway session; the otel bridge and tool-call audit ride along).
