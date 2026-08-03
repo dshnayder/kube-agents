@@ -1,0 +1,117 @@
+---
+# Round B — write the rung-1414 shared corpus onto the gateway PVC in the layout
+# `multiuser_memory` expects.
+#
+# MultiUserFileMemoryProvider._path_for() (agents/platform/plugins/memory/
+# multiuser_memory/__init__.py:120) resolves the shared store as
+# `$HERMES_HOME/memories/MEMORY.md`, and docker-entrypoint.sh:5 sets
+# HERMES_HOME=$PLATFORM_AGENT_HOME=/opt/data. Entries are joined by "\n§\n"
+# (ENTRY_DELIMITER); the file we ship is already in that form, so this Job only
+# has to place bytes — no parsing, no transformation, nothing the provider has
+# to agree with beyond the delimiter.
+#
+# A Job rather than `kubectl exec`: writes into the shared gateway pod are not
+# an accepted mechanism here, and a Job is. The PVC is ReadWriteOnce on
+# standard-rwo, so this must land on the node already holding the gateway —
+# GCE PD allows multiple pods per node on one RWO volume. nodeName pins it.
+#
+# The whole body runs under the image's own interpreter rather than shell
+# utilities: it decompresses, writes, hashes and counts entries with the same
+# split the provider uses, so "the file is correct" is asserted against the
+# provider's own definition of correct and not against `wc`.
+#
+# The existing MEMORY.md (if any) is copied aside before the overwrite so the
+# roll back at the end of Round B can restore the gateway exactly as found.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-write
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-write
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-write
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: write
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import gzip, hashlib, os, shutil, sys
+
+              EXPECT_SHA = "9c4b40a4c02cd3cca0d50c343386017aa67d7b66fbf0d24dad5f61580fd57952"
+              EXPECT_ENTRIES = 1414
+              DEST = "/opt/data/memories"
+              MEM = os.path.join(DEST, "MEMORY.md")
+              BAK = MEM + ".pre-roundb"
+
+              os.makedirs(DEST, exist_ok=True)
+              print("== before ==")
+              for n in sorted(os.listdir(DEST)):
+                  print(f"  {n}  {os.path.getsize(os.path.join(DEST, n))}")
+
+              if os.path.exists(MEM) and not os.path.exists(BAK):
+                  shutil.copy2(MEM, BAK)
+                  print(f"backed up MEMORY.md -> {os.path.basename(BAK)} ({os.path.getsize(BAK)} bytes)")
+              else:
+                  print("no pre-existing MEMORY.md to back up (or backup already present)")
+
+              with gzip.open("/corpus/MEMORY.md.gz", "rb") as fh:
+                  blob = fh.read()
+              tmp = MEM + ".tmp"
+              with open(tmp, "wb") as fh:
+                  fh.write(blob)
+              os.replace(tmp, MEM)
+
+              got = hashlib.sha256(blob).hexdigest()
+              text = blob.decode("utf-8").strip()
+              entries = [e for e in text.split("\n§\n") if e.strip()]
+
+              print("== after ==")
+              print(f"bytes:   {len(blob)}")
+              print(f"sha256:  {got}")
+              print(f"expect:  {EXPECT_SHA}")
+              print(f"entries: {len(entries)} (expect {EXPECT_ENTRIES})")
+              print(f"first:   {entries[0][:110]}")
+              print(f"last:    {entries[-1][:110]}")
+
+              ok = got == EXPECT_SHA and len(entries) == EXPECT_ENTRIES
+              print("RESULT:", "OK" if ok else "MISMATCH")
+              sys.exit(0 if ok else 1)
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            - name: corpus
+              mountPath: /corpus
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data
+        - name: corpus
+          configMap:
+            name: kube-agents-roundb-memory

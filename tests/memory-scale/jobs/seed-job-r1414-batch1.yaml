@@ -1,0 +1,105 @@
+---
+# Reseeds the full 1,414-record shared corpus into a FRESH Hindsight bank, one
+# record per retain call (#117).
+#
+# This is a corrected re-run of `seed-job-r1414.yaml`, which is kept unchanged as
+# the record of what Round A actually measured. The difference is one flag.
+#
+# `--batch 5` (the seeder's default) hands Hindsight five items in a single retain
+# call, and Hindsight collapses that call into ONE document, keeping one item's
+# `context` as the document label. 1,664 records became 335 documents, and four
+# identifiers in five were destroyed before recall ever ran. Round A's citation
+# numbers therefore measure the seeder, not the provider — see
+# transcript/README.md#correction-round-as-citation-numbers-measure-the-seeder.
+#
+# `--batch 1` is the fix, and it is a fix to the apparatus rather than to the
+# system under test, which is why it is allowed to land before the re-measurement
+# in #118 while every product-side fix (#111-#116) waits until after.
+#
+# Preconditions, all verified before this runs:
+#   - PVC data-hindsight-postgresql-0 was deleted and recreated, so the bank is
+#     empty. The seeder resumes from `context`, so a stale bank would make this a
+#     no-op rather than a reseed.
+#   - hindsight-api and hindsight-postgresql are both back at 1 replica.
+#
+# Expect 1,414 documents, not 335. That count IS the verification.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-fleettest-seed-r1414-batch1
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: memory-seed
+    fleettest.kube-agents.io/rung: "1414"
+    fleettest.kube-agents.io/batch: "1"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: memory-seed
+        fleettest.kube-agents.io/rung: "1414"
+        fleettest.kube-agents.io/batch: "1"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260730-200423
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /tmp/work
+              tar xzf /corpus-archive/corpus.tar.gz -C /tmp/work
+              echo "corpus unpacked: $(ls /tmp/work/corpus | tr '\n' ' ')"
+              exec /opt/hermes/.venv/bin/python3 /script/seed_fleet.py \
+                --corpus /tmp/work/corpus \
+                --rung "${RUNG}" \
+                --batch 1 \
+                --sleep 1
+          env:
+            - name: RUNG
+              value: "1414"
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: BANK_ID
+              value: kube-agents-memory
+            - name: HOME
+              value: /tmp
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: corpus-archive
+              mountPath: /corpus-archive
+              readOnly: true
+            - name: script
+              mountPath: /script
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: corpus-archive
+          configMap:
+            name: kube-agents-fleettest-corpus
+        - name: script
+          configMap:
+            name: kube-agents-fleettest-script

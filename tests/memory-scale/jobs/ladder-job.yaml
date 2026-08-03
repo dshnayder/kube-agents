@@ -1,0 +1,119 @@
+---
+# The whole Hindsight ladder in one Job: seed a rung, score it, move up.
+#
+# Why one Job rather than five plus a local driver
+# ------------------------------------------------
+# The full ladder is roughly five hours of extraction. A driver running on the
+# laptop would have to survive that, and would also have to keep a port-forward
+# alive to score each rung — two failure modes that have nothing to do with what
+# is being measured. In-cluster, the scorer talks to the service directly and
+# the whole run survives the laptop closing, which is what was asked for.
+#
+# Resumability is what makes this safe to (re)start. The seeder keys on the
+# `context` field it writes, so documents already in the bank are skipped: the
+# ~105 documents the standalone r100 Job wrote before this replaced it are not
+# lost and not duplicated. It is also what makes the nested rungs cheap — rung
+# 200 writes only the 100-document delta over rung 100, so walking the ladder
+# costs the corpus once rather than five times.
+#
+# Results go to stdout between markers rather than to a file, because a Job's
+# filesystem does not outlive it and `kubectl logs` does.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-fleettest-ladder
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: ladder
+spec:
+  # No retries: a restart would replay every rung from the beginning. Resuming
+  # is a deliberate act (re-apply the Job), not something to happen silently.
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: ladder
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ladder
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260730-200423
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              PY=/opt/hermes/.venv/bin/python3
+              mkdir -p /tmp/work /tmp/results
+              tar xzf /corpus-archive/corpus.tar.gz -C /tmp/work
+              echo "corpus unpacked: $(ls /tmp/work/corpus | wc -l) files"
+
+              for RUNG in 100 200 400 800 1414; do
+                echo ""
+                echo "##### SEED rung ${RUNG} #####"
+                $PY /script/seed_fleet.py \
+                  --corpus /tmp/work/corpus --rung "${RUNG}" --batch 5 --sleep 2
+
+                echo ""
+                echo "##### SCORE rung ${RUNG} #####"
+                $PY /script/eval_fleet.py \
+                  --provider hindsight \
+                  --rung "${RUNG}" \
+                  --queries /tmp/work/corpus/../queries.json \
+                  --corpus /tmp/work/corpus \
+                  --api-url "${HINDSIGHT_API_URL}" \
+                  --bank "${BANK_ID}" \
+                  --out "/tmp/results/hindsight-results-r${RUNG}.json" || \
+                  echo "(scorer exited non-zero — see LEAK lines above)"
+
+                echo "##### RESULT-JSON rung ${RUNG} BEGIN #####"
+                cat "/tmp/results/hindsight-results-r${RUNG}.json"
+                echo ""
+                echo "##### RESULT-JSON rung ${RUNG} END #####"
+              done
+
+              echo ""
+              echo "##### LADDER COMPLETE #####"
+          env:
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: BANK_ID
+              value: kube-agents-memory
+            - name: HOME
+              value: /tmp
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: corpus-archive
+              mountPath: /corpus-archive
+              readOnly: true
+            - name: script
+              mountPath: /script
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: corpus-archive
+          configMap:
+            name: kube-agents-fleettest-corpus
+        - name: script
+          configMap:
+            name: kube-agents-fleettest-script

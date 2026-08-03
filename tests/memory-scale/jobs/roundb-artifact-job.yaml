@@ -1,0 +1,104 @@
+---
+# Round B probe 1 — read back the specialist's own working artefacts.
+#
+# Scope is deliberately narrow: the three files the platform agent produced for
+# kanban task t_d1b32bd1 during this probe, under
+# /opt/data/kanban/attachments/t_d1b32bd1/. Nothing else on the PVC is opened,
+# and nothing is written.
+#
+# Why it matters to the study rather than to curiosity: Round A's specialist
+# reported verifying against "a freshly re-pulled 335-document corpus" — bulk
+# tool access to the Hindsight bank. In Round B the bank is unreachable
+# (hindsight-api is at zero replicas), so whatever the specialist checked, it
+# checked some other way. If it grepped /opt/data/memories/MEMORY.md then the
+# file provider affords a second access path — direct search over raw text —
+# that Hindsight does not, and the comparison has to say so out loud instead of
+# attributing the difference to recall quality.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-artifact
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-artifact
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-artifact
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: read
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import os
+
+              D = "/opt/data/kanban/attachments/t_d1b32bd1"
+              if not os.path.isdir(D):
+                  print("MISSING:", D)
+                  raise SystemExit(0)
+
+              names = sorted(os.listdir(D))
+              print("== files ==")
+              for n in names:
+                  print(f"  {n}  {os.path.getsize(os.path.join(D, n))} bytes")
+
+              # The two scripts are small and are the direct evidence of method.
+              for n in names:
+                  if not n.endswith(".py"):
+                      continue
+                  print(f"\n===== {n} =====")
+                  print(open(os.path.join(D, n), encoding="utf-8", errors="replace").read()[:6000])
+
+              # The write-up is potentially long: report how it sourced its
+              # claims rather than reproducing it.
+              for n in names:
+                  if not n.endswith(".md"):
+                      continue
+                  txt = open(os.path.join(D, n), encoding="utf-8", errors="replace").read()
+                  print(f"\n===== {n} ({len(txt)} chars) — head =====")
+                  print(txt[:2500])
+
+              print("\n== method markers across all artefacts ==")
+              markers = ["memories/MEMORY.md", "MEMORY.md", "grep", "hindsight", "Hindsight",
+                         "memory_recall", "multiuser_memory", "recall", "fleet-config",
+                         "system prompt", "335", "1414", "1,414"]
+              blob = ""
+              for n in names:
+                  try:
+                      blob += open(os.path.join(D, n), encoding="utf-8", errors="replace").read()
+                  except Exception:
+                      pass
+              for m in markers:
+                  print(f"  {blob.count(m):4d}  {m}")
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data
+            readOnly: true

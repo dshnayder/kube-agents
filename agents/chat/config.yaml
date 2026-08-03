@@ -169,7 +169,7 @@ platforms:
 # The wrapper exists because Hindsight cannot be configured to do this on its
 # own: `{user}` substitution is applied to `bank_id` and to no other setting, so
 # a configured `retain_tags: "user:{user_id}"` would tag every user with that
-# literal string. See docs/designs/memory-tag-isolation.md for what the wrapper
+# literal string. See docs/designs/memory.md for what the wrapper
 # pins and why each one is load-bearing.
 #
 # Personal memory runs in Hindsight's `hybrid` memory_mode: it recalls into the
@@ -185,7 +185,7 @@ platforms:
 # does. Nothing expires on its own,
 # and nothing prunes it either: agents/chat/scripts/memory_ttl_curator.py exists
 # for that but is shelved and on no schedule (see
-# docs/designs/memory-distill-then-retire.md).
+# docs/designs/memory.md).
 #
 # The bank's mission and its retain strategies — what it holds, and what is worth
 # extracting into it under each scope — are provisioned by the provider itself

@@ -1,0 +1,94 @@
+---
+# Sever the flat file store for the Hindsight arm of the re-run (#118).
+#
+# This is the mirror image of the control Round B needed. There, `hindsight-api`
+# and then `hindsight-postgresql` were scaled to 0 so the file provider provably
+# could not reach the bank — and that turned out to be necessary, because the
+# first two probe-1 attempts both answered from Hindsight anyway, by two different
+# improvised routes.
+#
+# The same discipline has to apply in the other direction: while Hindsight is the
+# configured provider, the 444,531-byte flat store must not be sitting at the path
+# a file-based reader would look at. The `multiuser_memory` plugin is not even
+# present in image dev-20260730-200423, so nothing in the harness can load it —
+# but "no component we know of reads it" is exactly the assumption Round B
+# falsified twice, and the A/B is only honest if both arms are severed the same
+# way.
+#
+# RENAME, not delete. The file is already preserved in the repository as
+# tests/memory-scale/fixtures/MEMORY.md.gz (444,531 bytes,
+# sha256 9c4b40a4c02cd3cca0d50c343386017aa67d7b66fbf0d24dad5f61580fd57952) and it
+# is the measured object behind the 110,799-token figure, so nothing is lost
+# either way — but an in-cluster rename makes Round B replayable without a
+# re-upload, and makes this reversible with one `mv`.
+#
+# ONE literal path. `memories/users/` is not touched: those are the user's own
+# per-user files, which are off-limits for the whole test.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-rounda2-sever-file-store
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: rounda2-sever
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: rounda2-sever
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # platform-agent-data is ReadWriteOnce, so this has to land on whichever
+      # node already has it attached — the gateway's node.
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sever
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260730-200423
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import hashlib, os
+
+              SRC = "/opt/data/memories/MEMORY.md"
+              DST = "/opt/data/memories/MEMORY.md.roundb-archived"
+
+              if not os.path.exists(SRC):
+                  print("ALREADY SEVERED: no file at", SRC)
+              else:
+                  data = open(SRC, "rb").read()
+                  print(f"found: {len(data):,} bytes")
+                  print("sha256:", hashlib.sha256(data).hexdigest())
+                  os.rename(SRC, DST)
+                  print("renamed ->", DST)
+
+              print("\nverify:")
+              print("  MEMORY.md gone: ", not os.path.exists(SRC))
+              print("  archive present:", os.path.exists(DST))
+              udir = "/opt/data/memories/users"
+              print("  users/ untouched:", os.path.isdir(udir),
+                    len(os.listdir(udir)) if os.path.isdir(udir) else "n/a", "files")
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data

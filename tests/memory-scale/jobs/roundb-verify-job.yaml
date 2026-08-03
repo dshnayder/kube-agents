@@ -1,0 +1,115 @@
+---
+# Round B pre-flight — exercise the real provider against the real PVC before
+# handing the probe window to a human.
+#
+# The write Job proved the bytes are at /opt/data/memories/MEMORY.md, and the
+# operator's rendered config.yaml proves the toolset gate is open. What is not
+# yet proven is that MultiUserFileMemoryProvider itself loads in this image and
+# turns those bytes into a system-prompt block. Ten probes is ~40 minutes of a
+# person's attention; sixty seconds of Job is cheap insurance against spending
+# it on a silently-empty memory.
+#
+# Read-only: it never writes, and it mounts the PVC only to read the store the
+# provider would read.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-verify
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-verify
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-verify
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          env:
+            - name: HERMES_HOME
+              value: /opt/data
+            - name: HOME
+              value: /tmp
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import importlib.util, os, sys
+
+              PLUGIN = "/opt/hermes/plugins/memory/multiuser_memory/__init__.py"
+              print("plugin on disk:", os.path.exists(PLUGIN))
+              print("store on disk: ", os.path.exists("/opt/data/memories/MEMORY.md"))
+
+              for p in ("/opt/hermes", "/opt/hermes/src", "/opt/hermes/hermes"):
+                  if os.path.isdir(p) and p not in sys.path:
+                      sys.path.insert(0, p)
+
+              spec = importlib.util.spec_from_file_location("mum", PLUGIN)
+              mod = importlib.util.module_from_spec(spec)
+              try:
+                  spec.loader.exec_module(mod)
+              except Exception as e:
+                  print("IMPORT FAILED:", type(e).__name__, e)
+                  sys.exit(2)
+
+              prov = mod.MultiUserFileMemoryProvider()
+              prov.initialize("roundb-preflight", hermes_home="/opt/data",
+                              user_id="preflight", chat_type="dm")
+              print("provider name:", prov.name, "| available:", prov.is_available())
+
+              block = prov.system_prompt_block()
+              entries = prov._read_entries("memory")
+              print(f"shared entries read: {len(entries)}")
+              print(f"system_prompt_block: {len(block)} chars  (~{len(block)//4} tokens)")
+
+              # Probe-relevant spot checks: each of these is the ground truth for
+              # one Round A probe, so their presence is what makes Round B a
+              # like-for-like comparison rather than a different question.
+              checks = {
+                  "probe 4  ADR-2026-051 Chainguard":  "ADR-2026-051",
+                  "probe 5  RB-004 restore runbook":   "RB-004",
+                  "probe 6  ADR-2026-046 Arm":         "ADR-2026-046",
+                  "probe 7  RB-011 etcd":              "RB-011",
+                  "probe 8  RB-019 credential leak":   "RB-019",
+                  "probe 8  ADR-2026-052 SA keys":     "ADR-2026-052",
+                  "probe 9  mfs-prod-euw1-06":         "mfs-prod-euw1-06",
+                  "probe 10 ADR-2026-091 top of series": "ADR-2026-091",
+                  "negative mfs-prod-euw1-99 absent":  "mfs-prod-euw1-99",
+                  "negative ADR-2026-099 absent":      "ADR-2026-099",
+              }
+              print("-- ground-truth presence in the block --")
+              for label, needle in checks.items():
+                  print(f"  {'HIT ' if needle in block else 'miss'}  {label}")
+
+              print("RESULT:", "OK" if len(entries) == 1414 else "MISMATCH")
+              sys.exit(0 if len(entries) == 1414 else 1)
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data
+            readOnly: true

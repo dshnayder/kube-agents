@@ -102,7 +102,7 @@ Explicitly disabled — the Platform Agent doesn't retain memory across sessions
 
 No memory provider is configured either. Per-user memory scopes its store by the sender's gateway identity, and the Platform Agent is reached through the kanban dispatcher, which spawns workers with no human identity attached — so per-user memory only makes sense on the [Chat Agent](/kube-agents/concepts/chatops/), the profile that actually receives chat ingress. The Chat Agent records each user's durable facts and resolves them into concrete values before delegating, so the Platform Agent gets what it needs inline in the card body.
 
-How that profile keeps every user's memory apart — one Hindsight bank, scope tags, and the upstream defaults it has to override — is documented in [`docs/designs/memory-tag-isolation.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory-tag-isolation.md), with the retention policy in [`docs/designs/memory-distill-then-retire.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory-distill-then-retire.md).
+How that profile keeps every user's memory apart — one Hindsight bank, scope tags, and the upstream defaults it has to override — is documented in [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md), along with the retention mechanism and the scale test that chose a document store over a flat file.
 
 ### `plugins`
 

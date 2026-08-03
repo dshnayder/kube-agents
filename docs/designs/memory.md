@@ -1,0 +1,965 @@
+# Memory
+
+**Status:** implemented on the Chat Agent profile. The A/B that decided it is
+complete on both layers — retrieval and answer quality — and is summarised in
+[The experiment](#the-experiment). Four follow-ups are open and named in
+[What is still unproven](#what-is-still-unproven).
+
+Why the fleet's long-term memory is a document store and not a file, how one
+Hindsight bank holds every user's memory without leaking between them, and what
+the measurements say the change bought.
+
+| Layer                     | Where it lives                                                                                              |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)    |
+| Its connection file       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)            |
+| The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md) |
+| Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                     |
+| The experiment            | [`tests/memory-scale/`](../../tests/memory-scale/README.md)                                                 |
+
+---
+
+## Background
+
+### Why the agent needs memory at all
+
+An agent that answers questions about a fleet has to know things nobody will
+restate for it in the prompt: which ADR is current, which of three dated
+versions of a retention policy still applies, who owns a control, which cluster
+is the exception to the rule everyone else follows. None of that is derivable
+from the cluster — it is organisational knowledge, and it accrues.
+
+Two properties make it awkward. It **grows monotonically**: nobody deletes an
+ADR, they supersede it. And it is **mostly superseded**: a mature corpus
+accumulates stale answers faster than current ones. A memory system for this
+workload is judged on how well it separates the live answer from its own history,
+not on how much it can hold.
+
+There is a second axis. The Chat Agent is a front door for a whole team, so its
+memory is multi-tenant by construction: Alice's cluster preferences must not
+surface in Bob's prompt, while the org's decisions must surface for both.
+
+### What Hermes gives you by default
+
+Hermes ships a built-in, file-backed memory in
+[`tools/memory_tool.py`](https://github.com/vectorize-io/hermes-agent): two
+Markdown files under `$HERMES_HOME`, `MEMORY.md` (what the agent has learned) and
+`USER.md` (what it knows about the user), entries separated by `§`. Both are read
+once and injected into the system prompt as a **frozen snapshot at session
+start** — mid-session writes hit disk immediately but do not change the prompt,
+which is what preserves the prefix cache for the rest of the session.
+
+Critically, it is **bounded**: 2,200 characters for `MEMORY.md`, 1,375 for
+`USER.md`, with an LLM consolidation pass when a write would exceed the limit.
+That bound is the whole reason the design works. It is also single-user — there is
+no `user_id` anywhere in it.
+
+### The plugin providers
+
+Hermes' memory-provider interface (`agent/memory_provider.py`) is an ABC —
+`initialize`, `system_prompt_block`, `prefetch`, `sync_turn`, `get_tool_schemas`,
+`handle_tool_call`, plus lifecycle hooks — and exactly **one** external provider
+may register at a time (`MemoryManager` rejects a second). Eight ship in
+`plugins/memory/`:
+
+| Plugin        | Shape                                        | Multi-user support               |
+| ------------- | -------------------------------------------- | -------------------------------- |
+| `hindsight`   | Self-hostable document store + consolidation | Tag scoping (`scope`, `user_id`) |
+| `honcho`      | Hosted, per-peer session memory              | First-class peers / namespaces   |
+| `mem0`        | Hosted vector memory                         | `user_id` throughout             |
+| `retaindb`    | Hosted                                       | `user_id` throughout             |
+| `openviking`  | Hosted, tenant-scoped                        | Tenants and namespaces           |
+| `byterover`   | Hosted                                       | Minimal                          |
+| `supermemory` | Hosted                                       | Minimal                          |
+| `holographic` | Local HRR experiment                         | None                             |
+
+Only `hindsight` is both self-hostable and multi-user, and self-hosting is
+non-negotiable here: the corpus is a bank's internal fleet topology, ownership map
+and incident history. That is why the shortlist has one entry on it.
+
+### `multiuser_memory`, the provider this replaced
+
+Before Hindsight this repository carried its own provider,
+[`multiuser_memory`](../../tests/memory-scale/fixtures/multiuser_memory.py)
+(vendored into the test tree because it no longer exists on `main`). It took
+Hermes' file memory and made it multi-user in the obvious way: one Markdown file
+per user under `memories/users/<id>.md`, one shared `memories/MEMORY.md`, `§` as
+the entry delimiter, and `system_prompt_block()` concatenating the relevant files
+into the system prompt.
+
+It did the isolation job correctly — the experiment measured **zero tag leaks**
+from it at every corpus size. What it dropped, in porting the design, was the
+**character bound**. `system_prompt_block()` has no truncation, no budget and no
+relevance filter. That single omission is the entire subject of the next section.
+
+---
+
+## Summary
+
+### The problem, stated as arithmetic
+
+A flat file injected whole into the system prompt costs context linearly in
+corpus size, and pays that cost on **every turn, before the user has said
+anything**. Measured against a 1,414-record shared corpus by calling the real
+provider's own `system_prompt_block()`:
+
+```
+1,414 shared records → 443,196 characters ≈ 110,799 tokens
+```
+
+Claude Opus 5 on Vertex carries a 200k window. So the corpus fits — the file
+provider does not fall over — but it occupies **55% of the window as a fixed tax
+on every turn**. Extrapolating the same slope, roughly **2,600 shared records
+exhausts the window on its own**, leaving nothing for the conversation, the tool
+schemas, or the agent's own persona. A bank's fleet knowledge reaches 2,600
+records quickly.
+
+Cost is the ceiling, but it is not the only defect. Injecting everything means
+**ranking nothing**. On the six policies in the corpus that exist in three dated
+versions, the file provider put the _current_ version ahead of its superseded
+predecessors only **43%** of the time; the model has to rebuild the supersession
+chain from prose, on every turn, out of its own budget. And a flat file can only
+carry an identifier that somebody happened to write into a sentence: of 1,664
+corpus records, the file store holds the content of all of them and the **handle
+for 193**. It answers correctly, without provenance, and never says provenance
+was unavailable.
+
+### How Hindsight solves it
+
+Hindsight is a document store with an LLM consolidation layer in front of it.
+Writes go in as _facts_; a background pass consolidates them into _observations_;
+recall does semantic search over the observation layer and returns a
+**budget-bounded** set of results, which are injected into the current turn rather
+than into the system prompt.
+
+The consequence in one line: **context cost decouples from corpus size.**
+
+| Provider   | Rung | Gold recall | Contamination | Current ranked first | Context tokens |
+| ---------- | ---: | ----------: | ------------: | -------------------: | -------------: |
+| Hindsight  |  100 |       0.718 |         0.407 |                0.833 |          4,588 |
+| Hindsight  |  200 |       0.718 |         0.407 |                0.833 |          4,544 |
+| Hindsight  |  400 |       0.718 |         0.407 |                0.833 |          4,468 |
+| Hindsight  |  800 |       0.718 |         0.407 |                0.833 |          4,322 |
+| Hindsight  | 1414 |       0.702 |         0.407 |                0.833 |      **4,264** |
+| File-based |  100 |       1.000 |         0.722 |                0.429 |         13,780 |
+| File-based |  200 |       1.000 |         0.722 |                0.429 |         24,661 |
+| File-based |  400 |       1.000 |         0.722 |                0.429 |         46,633 |
+| File-based |  800 |       1.000 |         0.722 |                0.429 |         79,616 |
+| File-based | 1414 |       1.000 |         0.722 |                0.429 |    **110,907** |
+
+Hindsight's context cost **shrinks slightly as the corpus grows** (4,588 → 4,264)
+as consolidation compresses. Contamination — superseded or out-of-scope material
+sitting in the window — is **0.407 against 0.722**. The current version of a
+contested policy arrives first **83%** of the time against **43%**. And because a
+document store carries identifiers out-of-band rather than in prose, it can cite
+records the flat file structurally cannot: measured head to head on the same ten
+questions, **59 citations against 34**, with 23 of the 59 from families the flat
+file holds no handle for.
+
+### The honest caveat, and the recommendation
+
+**The file provider is not less accurate at this corpus size.** Its gold recall of
+1.000 is not a retrieval achievement — recall of everything is what "no retrieval"
+means — but on the ten hand-scored answer probes it made **zero** citation errors
+against Hindsight's **one**. Anyone arguing this case on accuracy will lose the
+argument to the data.
+
+The case is **cost, ranking, and provenance**:
+
+- the flat file buys the same answer for 110,799 tokens a turn and has a hard
+  ceiling around 2,600 records;
+- it ranks the superseded version first more often than not;
+- it cannot cite seven-eighths of what it knows, and nothing in its output
+  signals that.
+
+The two failure modes are asymmetric, which is the part that decides it. Hindsight
+mis-seeded cites confidently and wrongly — visible on inspection, attributable to a
+cause, fixable by reseeding. The file store answers fluently without provenance and
+the reader has no way to tell that checking was foreclosed.
+
+**Recommendation: adopt Hindsight**, with three conditions tracked as work items —
+per-unit provenance on retain (#111/#116), recall returning what it _searched_ and
+not only what it _found_ (#113), and shared-scope read access for specialists
+(#112). Scope of evidence: one synthetic corpus, one model, ten hand-scored probes
+per arm. Enough to decide direction; not a benchmark.
+
+---
+
+## The design
+
+One Hindsight bank, `kube-agents-memory`, behind a slim wrapper around the stock
+Hindsight provider. Every memory carries a scope tag; the wrapper's entire job is
+to resolve the current human's identity into the right tags and pin the four
+settings that would otherwise leak or silently lose data.
+
+### The two pods
+
+Hindsight is self-hosted in-cluster, installed by provisioning step 12 from
+[`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md).
+It adds exactly two workloads to `kubeagents-system`.
+
+**1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
+
+- Image `ghcr.io/vectorize-io/hindsight-api:0.8.6`, pinned by digest.
+- Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
+  `/health` backs both probes. Liveness waits 30s because model loading dominates
+  cold start.
+- `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. The embedding and reranking
+  models are baked into the image, so the pod needs **no Hugging Face egress** —
+  and both flags must stay set, or the libraries reach out on every cold start and
+  hang where there is no route out of the cluster.
+- Extraction and consolidation call an LLM. That goes through the **same LiteLLM
+  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://litellm/v1`,
+  model `model-default`), so routing and cost attribution stay in one place. The
+  API key is the literal string `none`, matching how the agents authenticate;
+  it is a placeholder the client library insists on, not a credential.
+- Requests 500m/1Gi, limits 2 CPU/4Gi. Runs non-root, no privilege escalation, all
+  capabilities dropped.
+
+**2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
+
+- `ankane/pgvector`, digest-pinned because upstream publishes only a floating
+  `latest` tag and a reschedule could otherwise change the database engine
+  underneath the data. pgvector supplies the vector extension the embeddings need.
+- One 8Gi `ReadWriteOnce` volume from a `volumeClaimTemplate`. `PGDATA` points at a
+  **subdirectory** of the mount, not the root: the RWO volume arrives with a
+  `lost+found` entry and `initdb` refuses a non-empty data directory.
+- **Passwordless** (`POSTGRES_HOST_AUTH_METHOD=trust`). It is reachable only from
+  the API pod, holds nothing that is not already in the agent's context, and a
+  password would have to be generated, agreed between two keys and rotated by
+  someone. Note this is read by `initdb` once and written into `pg_hba.conf`;
+  flipping it on an existing volume does nothing.
+- A `NetworkPolicy` (`networkpolicy.yaml`) permits ingress on 5432 **only** from
+  pods labelled as the API component. Ingress only — Postgres makes no outbound
+  calls. Caveat for reviewers: GKE enforces network policy only on clusters that
+  have it enabled; on a Standard cluster without Dataplane V2 the object applies
+  cleanly and does nothing, which is why the database is also on a ClusterIP
+  service with no external route.
+
+Deleting the Postgres PVC is a complete, safe reset of memory — see
+[Bank provisioning is lazy](#bank-provisioning-is-lazy).
+
+### How Hindsight itself works
+
+Enough of the model to read the wrapper.
+
+- **Bank.** The top-level container, addressed as
+  `/v1/{tenant}/banks/{bank_id}`; this deployment uses tenant `default` and the
+  single bank `kube-agents-memory`. A bank carries a **mission** (free text telling
+  the extractor what this bank is for) and a **config** (retain strategies, default
+  strategy, and so on). Note `PUT /banks/{id}` is both create and update — `POST`
+  is 405 — and `PATCH /banks/{id}/config` wraps its payload as `{"updates": {...}}`.
+- **Two layers.** A write lands in the **fact** layer. A background consolidation
+  pass groups related facts into **observations** — the LLM-written synthesis layer.
+  **Recall reads observations, not facts.** Everything about scoping, and the whole
+  TTL problem below, follows from that one sentence.
+- **Retain strategies.** Named bundles of extraction settings selected per write.
+  A missing strategy is _not_ an error — `apply_strategy` logs a warning and
+  silently falls back to the bank default — so callers that depend on one must
+  check for it themselves.
+- **Tags and `observation_scopes`.** Facts carry tags. `observation_scopes`
+  controls how the consolidator groups them, which is a separate decision from how
+  recall filters them.
+- **Three operations.** `retain` writes; `recall` does semantic search and returns
+  matching units; `reflect` asks the LLM to synthesise an answer across the bank
+  rather than return individual matches. All three take a **budget**
+  (`low`/`mid`/`high`) that bounds how much comes back — this is the mechanism that
+  makes context cost independent of corpus size.
+
+### One bank, two scopes
+
+| Scope    | Tag            | Written by                             | Read by        |
+| -------- | -------------- | -------------------------------------- | -------------- |
+| Personal | `user:<id>`    | automatic capture, and `memory_retain` | that user only |
+| Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
+
+`<id>` is the gateway identity (`agent._user_id`), sanitised by
+`_sanitize_user_id`, which mirrors Hindsight's own `_sanitize_bank_segment`:
+non-alphanumerics collapse to `-`, runs of `-` collapse to one, and leading or
+trailing `-`/`_` are stripped. Recall asks for `[user:<id>, scope:shared]` with
+match mode `any_strict`, and nothing else can come back.
+
+One bank rather than one bank per user is a deliberate choice. Per-user banks make
+shared knowledge either impossible or duplicated, and each bank carries its own
+mission, config and consolidation state to keep in sync. Tags do the same job in
+one place.
+
+### Why a wrapper rather than configuration
+
+Hindsight has every mechanism this needs. What it has no way to do is learn the
+**current user's id**. `{user}` substitution is applied by
+`_resolve_bank_id_template`, which the plugin calls for `bank_id` and for nothing
+else. `retain_tags` and `recall_tags` are read as **literal config strings**, so a
+configured `retain_tags: "user:{user_id}"` tags every user with the eleven
+characters `user:{user_id}` — no isolation, no error, and a config file that reads
+as though it were working.
+
+Resolving that identity into the right tags is most of what the wrapper does.
+Everything else is still the stock provider, loaded at runtime through
+`load_memory_provider("hindsight")` and mutated in place after `initialize()` —
+never forked. Every value the wrapper overrides is read by the stock provider at
+call time, which is why attribute assignment is sufficient and no config-file
+contract is needed. Not forking means a Hermes base-image bump brings Hindsight
+fixes with it.
+
+`register(ctx)` calls `ctx.register_memory_provider(KubeAgentsMemoryProvider())`;
+`deploy/shared/defaults/config.yaml` sets `provider: custom`, and
+`agents/chat/config.yaml` names `kube_agents_memory`.
+
+One subtlety worth knowing before editing: Hermes calls `is_available()` **before**
+`initialize()` and drops the provider outright if it says no
+(`agent_init.py`), so it must be answerable with no bank built. It answers by
+delegating to a throwaway stock provider, whose own availability check is stateless
+— it reads the config file.
+
+### The four pinned settings
+
+Each is set by the wrapper rather than left to configuration, because each is a
+silent leak or a silent loss if it is wrong. This is the section to read before
+changing anything in `_apply_scoping`.
+
+**1. `recall_tags_match = "any_strict"`.** Hindsight's tag matcher treats `any` and
+`all` as _"matching tags **or** no tags at all"_; only the `_strict` variants
+exclude untagged rows. The plugin's default is `any`, which in a shared bank
+returns every untagged memory to every user. The corollary matters as much: under
+`any_strict` an **untagged memory is invisible to everyone**, so anything written
+into this bank must carry a scope tag or it is silently lost. That is why the
+wrapper attaches one on every write path, and why the TTL curator aborts outright
+on an observation it cannot scope.
+
+**2. `observation_scopes = [[scope_tag]]`.** Recall returns observations, so
+isolation is only real if the observation layer is scoped too. Hindsight's default,
+`combined`, scopes an observation by the full tag set of its sources — and the
+stock provider attaches a `session:<id>` lineage tag to every auto-retained turn,
+which would make each session its own scope and mean nothing said last week ever
+consolidates with what is said today. Pinning the scope to the single scope tag
+fixes isolation and cross-session consolidation together. `per_tag` is the wrong
+tool despite sounding right: it emits one observation per individual tag, so a fact
+tagged `["user:alice", "cluster:foo"]` yields a `cluster:foo` observation carrying
+no user tag at all.
+
+**3. Prefetch is forced to `recall` mode, and `memory_reflect` is
+reimplemented.** `hindsight_reflect` and reflect-mode prefetch both call
+`areflect(bank_id, query, budget)` with **no tag arguments**. In one bank that
+synthesises across every user — the one path that would cross users even with
+everything else correct. The REST API and the generated client both accept `tags`,
+`tags_match` and `exclude_mental_models` on reflect; only the plugin omits them. So
+the wrapper implements `memory_reflect` against the client directly and pins
+`_prefetch_method = "recall"`, whose filter path does apply the tags. Mental models
+are excluded because they are bank-level and not tag-scoped; this deployment creates
+none, so the exclusion costs nothing and closes the last unscoped path.
+
+**4. Shared writes bypass the stock retain path.** `_build_retain_kwargs` merges the
+instance's `_retain_tags` into every write and offers no per-call
+`observation_scopes` or `strategy`. A shared fact must not inherit the caller's
+`user:` tag — it would consolidate into that person's scope and become invisible to
+everyone else. `_retain()` therefore builds its own item and calls `aretain_batch`
+directly, which also avoids swapping instance attributes around an asynchronous
+writer thread.
+
+The bank name is pinned the same way, for a different reason — see
+[Where the connection settings come from](#where-the-connection-settings-come-from).
+
+### Bank provisioning is lazy
+
+A Hindsight bank does not exist until something is written to it, so there is
+nothing to provision at install time. `_ensure_bank()` runs on **session creation**:
+it reads the bank config, compares `retain_strategies` and
+`retain_default_strategy` against the provider's constants, and if they differ
+calls `create_bank(mission=BANK_MISSION)` followed by `update_bank_config(...)`.
+`create_bank` doubles as the update path — it is what Hindsight's own deprecated
+`set_mission()` calls — and leaves existing facts intact, so this is safe to
+re-run.
+
+Three details that are easy to get wrong:
+
+- `_bank_provisioned` is a **process-level set, recorded before the attempt, not
+  after**. If the API is down, every subsequent session in that process would
+  otherwise retry a known-failing call on the session-creation path.
+- The strategies are the sentinel for "already done" because the bank-level
+  `mission` is _not_ part of the `get_bank_config` payload (which returns
+  `{bank_id, config}`). Mission and strategies are always written together, which
+  makes the strategies a sound proxy for both.
+- Failures are logged and **swallowed**. An unguided bank is worse than a guided
+  one but still works, and memory must never be the reason a session fails to
+  start.
+
+The upside of doing it here is that deleting the Postgres PVC is a complete reset:
+the first DM afterwards rebuilds the bank correctly, with no operator step for
+anyone to forget. The downside is that between a wipe and the first chat the bank
+is bare, which is why the test harness ships
+[`rounda2-provision-bank.yaml`](../../tests/memory-scale/jobs/rounda2-provision-bank.yaml)
+— a Job that does exactly what `_ensure_bank` does, parsing the constants straight
+out of the installed plugin source with `ast` rather than retyping them.
+
+The three retain strategies:
+
+| Strategy     | Settings                             | Used by                                    |
+| ------------ | ------------------------------------ | ------------------------------------------ |
+| `personal`   | personal extraction mission          | automatic capture; `memory_retain` default |
+| `shared`     | shared extraction mission            | `memory_retain(scope="shared")`            |
+| `checkpoint` | `retain_extraction_mode: "verbatim"` | the TTL curator (built, not running)       |
+
+`retain_default_strategy` is `personal`, so anything that reaches the bank without
+naming a strategy is treated as one person's fact rather than as org knowledge.
+
+### How memory is populated
+
+Two paths, and the split between them is the safety property.
+
+**Automatic capture — always personal, never shared.** `sync_turn(user, assistant)`
+fires after each completed turn and `on_session_end(messages)` at teardown, both
+delegating to the stock provider, which extracts durable facts under the `personal`
+strategy. Both are **gated on `self._user_tag`**: if the speaker cannot be
+attributed, nothing is captured at all. Interrupted turns are skipped by Hermes
+before the provider ever sees them — a partial assistant output is not durable
+conversational truth.
+
+**Explicit writes — the only way anything becomes shared.** `memory_retain` builds
+one item with `tags`, `observation_scopes: [tags]`, the matching `strategy`, and an
+optional short `context` label, then calls `aretain_batch(..., retain_async=False)`.
+Synchronous, so the tool result reflects the write.
+
+Because automatic capture is personal-only, **nothing reaches shared memory without
+a deliberate `memory_retain(scope="shared")` by the model**. That is the floor the
+rest of the scope design sits on.
+
+#### What goes in which scope
+
+Tag isolation works, and the first thing that proved was that it isolates too much.
+_"Alice is a tech lead in GKE"_, said by Alice in her own DM, is captured by the
+automatic path — which is always personal — and lands under `user:alice`, where no
+other user can reach it. Asked _"who can approve this?"_ as a different user, the
+agent answered _"ask a tech lead."_ Re-stated as `scope:shared`, the same question
+answered _"Alice is a tech lead in GKE who can review and approve these changes."_
+The org-chart knowledge the fleet most needs is exactly what automatic capture
+files privately.
+
+The discriminator: **would another user need this to know who to ask, or who
+approves?** Roles, ownership and approval authority are shared. Preferences,
+defaults, possessions and working style are personal.
+
+This is enforced in the **persona, not in the wrapper**.
+[`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 carries the rule and four
+conditions on it: stated not inferred, roles and ownership only, never automatic,
+and the agent says out loud that it wrote something org-wide so the user can
+object. The alternatives — a classifier in the wrapper deciding scope per fact, or
+a second retain strategy splitting each turn into a personal and a shared
+extraction — both put a judgement about meaning into a layer that only manipulates
+tags. The wrapper would stop being slim, and a misclassification would be a silent
+leak of a personal fact into shared memory with no human in the loop. The model is
+already making that judgement; the persona is where it is directed.
+
+### How recalled memories reach the model
+
+Two distinct channels, and conflating them is the most common misreading of this
+design.
+
+**Channel 1 — the system prompt block: instructions only, no content.**
+`system_prompt_block()` returns a fixed header plus one of two bodies, chosen at
+`initialize()` time: `SYSTEM_PROMPT_BODY` when both scopes are reachable, or
+`SYSTEM_PROMPT_SHARED_ONLY` plus an explanation when personal memory is off. It
+tells the model that it has memory, what the two scopes mean, and when to write.
+**It never contains recalled facts.** This is the structural difference from the
+file provider, whose `system_prompt_block()` _was_ the corpus.
+
+**Channel 2 — per-turn prefetch, injected into the user message.** On each turn
+Hermes calls `on_turn_start()`, then `prefetch_all(user_message)` before the tool
+loop (`agent/turn_context.py`). The wrapper delegates to the stock provider's
+recall-mode prefetch, which runs a semantic search over the observation layer with
+the pinned tag filter and the configured budget, and returns a text block. The
+wrapper sets `provider._recall_prompt_preamble = RECALL_PREAMBLE`, which frames
+that block as:
+
+> Durable facts recalled from previous sessions… Do not look these up with a tool —
+> they are already here.
+
+That block is composed into the **API copy** of the current user message — Hermes
+stamps it as an `api_content` sidecar, deliberately _not_ into the stored content.
+The reason is prefix-cache stability: if the injection were persisted, the next
+turn would replay the message without it, diverging the request prefix at that
+point and re-prefilling everything after it. So the recalled block is sent, is not
+replayed, and does not accumulate.
+
+After the turn, `queue_prefetch_all()` warms the next turn's recall in the
+background against the message just handled, so the latency is usually paid off the
+critical path.
+
+The net effect: **memory content enters the context per turn, sized by budget, and
+leaves again**. That is why the context column in the ladder is flat.
+
+### The tools
+
+The Chat Agent gets three, from `get_tool_schemas()`:
+
+| Tool             | Scope parameter                                   | Notes                                              |
+| ---------------- | ------------------------------------------------- | -------------------------------------------------- |
+| `memory_retain`  | `personal` \| `shared` — defaults to `personal`   | Requires `content`; optional short `context` label |
+| `memory_recall`  | `personal` \| `shared` \| `both` — default `both` | Semantic search; returns matches                   |
+| `memory_reflect` | same as recall                                    | Synthesises an answer across memories              |
+
+`handle_tool_call` validates scope before dispatch, rejects `scope="both"` on a
+write, and degrades a read: with no user identity, `both` narrows to `shared` (the
+shared half is still answerable and the system prompt has already explained why the
+personal half is not), while an explicit `personal` returns the disabling reason as
+an error. `_tags_for(scope)` is the single place tags are derived, used by both the
+read and write paths.
+
+`memory_recall` at `scope="both"` delegates straight to `hindsight_recall`, whose
+own `_recall_tags` already cover both. A narrower scope swaps `_recall_tags` for the
+call and restores it in a `finally`. `memory_reflect` never delegates — see pinned
+setting 3.
+
+For the Chat Agent to see any of this, `memory` must be listed in
+`platform_toolsets` **and** absent from `agent.disabled_toolsets`; the denylist is
+applied last, over every platform key, and silently wins. `memory` there is a
+**gate for the provider, not a tool grant** — `inject_memory_provider_tools()` bails
+unless the gate is on, and that injection is the only path by which the provider's
+tools reach the model.
+
+#### What subagents get today: nothing
+
+Kanban-spawned specialists run with `memory_enabled: false`
+(`agents/platform/config.yaml:55`). They carry **no memory provider, no memory
+tools, and no injected memory block** — deliberately, because a specialist carries
+no human identity and so cannot scope a write, and pooling every specialist's writes
+into one anonymous bucket is worse than not writing.
+
+That is the current state of `main`, and it is also what the experiment measured on
+both arms, which makes specialists a **constant in the A/B rather than a variable**.
+It is not a satisfactory end state, for the reason in
+[Specialists have no memory, and improvise one](#specialists-have-no-memory-and-improvise-one).
+
+**Proposed, not built (#112).** Give specialists shared-scope access, read-only,
+in both forms:
+
+- **Injected context** is the floor — it guarantees the specialist starts with the
+  shared corpus whether or not it thinks to ask. A tool alone can be skipped in
+  favour of something improvised, and one such improvisation proved durable.
+- **`memory_recall` as a tool** is the loop. Specialist work is iterative — it
+  writes its own verification harnesses and scans for contradictions — and a block
+  fixed at session start cannot answer a follow-up.
+
+The decisive argument for including the tool is **failure legibility**. Injected
+context that is unavailable arrives as an absent block, indistinguishable from
+"nothing is recorded about this". A tool call returns an error, and an error is a
+fact the agent can report. That is what turns #113 from prompt wording into a
+mechanism.
+
+**Not `memory_retain`, in any form.** A specialist that could write shared memory
+could launder its own derived-from-prior-runs conclusions into the corpus as facts.
+The provider already fails closed there; #112 must not open it.
+
+### Where the connection settings come from
+
+The stock provider reads `$HERMES_HOME/hindsight/config.json`. That file is
+**image-owned**:
+
+```json
+{
+  "mode": "local_external",
+  "api_url": "http://hindsight-api.kubeagents-system.svc.cluster.local:8888",
+  "memory_mode": "hybrid",
+  "recall_budget": "mid"
+}
+```
+
+It ships as
+[`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)
+and `deploy/shared/docker-entrypoint.sh` force-copies it over the PVC copy on every
+start (step 2a), alongside `config.yaml` and the persona files. It carries the
+connection settings and nothing else. `_apply_budget()` honours `recall_budget` if
+it is one of `low`/`mid`/`high`, and otherwise leaves Hindsight's own resolution
+alone.
+
+It is image-owned because it was not, once. The file was hand-written onto the PVC,
+where it survived every image roll carrying whichever design was current when it was
+last touched — and kept naming a bank from a two-bank era that no longer existed.
+Tag isolation was unaffected, since the wrapper pins the tags itself, and that is
+precisely what made it invisible: **no code review and no manifest diff can see a
+file that exists only on a volume.**
+
+So the bank name is not a setting. `_apply_scoping` pins `DEFAULT_BANK_ID`, clears
+`_bank_id_template`, and **logs a warning if a config file disagrees rather than
+obeying it**; the TTL curator hardcodes the same constant. The URL the config does
+carry is fixed by the install; installing Hindsight into a different namespace means
+editing this defaults file and rebuilding the agent image, which the integration
+kustomization says out loud.
+
+### Failing closed
+
+Personal memory is switched off — leaving only `scope:shared` reachable — whenever
+the speaker cannot be attributed. Decided once, at `initialize()`.
+
+- **No `user_id`.** Nothing to scope by. Automatic capture is disabled outright
+  (`_auto_retain = False`, `_tags = None`), so an anonymous session cannot write
+  untagged rows that `any_strict` would make invisible anyway.
+- **A shared thread.** `build_session_key()` (`gateway/session.py`) omits the
+  participant id inside a thread unless `thread_sessions_per_user` is set, so the
+  second person to post reuses the first person's cached `Agent` — and
+  `agent._user_id` was frozen at construction. A per-user tag would then recall A's
+  memories into B's prompt and retain B's turns under A's name. Nothing in the
+  provider protocol identifies the speaker per call — `system_prompt_block()` takes
+  no arguments and `handle_tool_call()` is passed no identity — so there is no way
+  to detect this later.
+
+Both cases put an explanation into the system prompt, so the agent tells the user
+why rather than appearing to have forgotten them. This is what makes personal memory
+DM-only by design.
+
+#### Why a space stays on one session
+
+`thread_sessions_per_user` would restore attribution, and with it personal memory,
+by giving each participant their own session. It is deliberately left off: a space's
+value is the shared thread, and with per-user sessions Bob's follow-up lands in a
+session that never saw Alice ask the question.
+
+The cost of that choice is that **failing closed protects the store, not the
+transcript.** A space is one conversation, so Alice's "my cluster is clusterA" is in
+the model's context when Bob later says "delete my cluster" — and nothing in the
+memory layer was involved in binding the two. Switching personal memory off does not
+prevent it. The control is in the persona: SOUL.md §1.6 requires a possessive in a
+space to resolve only from the current speaker's own words, and requires a
+destructive delegation to be confirmed against a named target first.
+
+### Bounding the bank — built, then shelved
+
+Hindsight never forgets. There is no TTL, no decay and no eviction anywhere in its
+bank configuration or its API. A mechanism to bound it exists and **nothing runs
+it**:
+[`agents/chat/scripts/memory_ttl_curator.py`](../../agents/chat/scripts/memory_ttl_curator.py)
+is on no cron schedule and defaults to dry run. It is kept because the problem is
+real and will return.
+
+Plain expiry does not work. Facts and observations live in one table, and recall
+returns observations. An observation records provenance in `source_memory_ids` with
+no foreign key, so the cascade is application code with an explicit contract
+(`delete_stale_observations_for_memories`): delete any observation referencing a
+removed fact — _its text is stale once even one source disappears_ — and reset the
+survivors for re-consolidation. Every removal path runs it. So _"retire the
+evidence, keep the conclusion"_ is not something the API can be asked for.
+
+**Distill, then retire** was the answer: write the observation layer back down into
+the fact layer as fresh verbatim checkpoints, then retire the aged cohort, so the
+conclusion survives its evidence. Checkpoints use the `checkpoint` strategy pinning
+`retain_extraction_mode: verbatim`, because re-summarising a summary every cycle
+walks the bank away from what was said; they carry their source observation's scope
+tag, because under `any_strict` an unscoped checkpoint consolidates into an
+observation no recall will ever match; and they are marked by `context` rather than
+by a tag (tags are what consolidation is scoped by) or a document id (the caller's
+is not what comes back). Each run retires the previous run's checkpoints, so exactly
+one generation is ever live.
+
+It was shelved because the end-to-end run took the observation layer from 22 rows to
+10 to 2 over three cycles. Each cycle rebuilds that layer by re-consolidating, and
+re-summarising a summary compounds — the layer does not settle, it keeps shrinking.
+The checkpoints survive untouched in the fact layer, but recall reads observations
+only, so the bank answers as though it had forgotten nearly everything while every
+checkpoint sits unread. Safe for the store, lossy for what the agent can reach — the
+opposite of the intent. Both repairs were rejected: making recall read the fact layer
+puts raw facts in the hot path forever to compensate for a weekly job, and keeping
+distillation without retirement is pure growth.
+
+What must be settled before it runs is **what recall reads**, because that is what
+decides whether retiring the evidence loses anything. Until then the bank holds facts
+in the tens, unbounded growth is not a problem this deployment has, and the script's
+`--min-units` default of 200 makes it a no-op at the current size even if run.
+
+---
+
+## The experiment
+
+Everything below is reproducible from
+[`tests/memory-scale/`](../../tests/memory-scale/README.md), which holds the
+harness, the corpus generator, the fixtures, the Kubernetes Jobs, the raw scorer
+output, and a
+[full transcript](../../tests/memory-scale/transcript/README.md) of every probe with
+per-answer scoring. This section states the findings and points at the file for each
+one.
+
+### What was built
+
+A synthetic fleet — 500 "Meridian" clusters, two years of decisions — generated from
+a fixed seed (`20260731`) by
+[`harness/gen_fleet_corpus.py`](../../tests/memory-scale/harness/gen_fleet_corpus.py),
+so it is reproducible rather than a one-off artefact. **1,664 records across eleven
+categories**, of which **1,414 are `scope: shared`** and 250 are per-user.
+
+The corpus is adversarial in the way a real one is: six policies exist in three
+dated versions each with `supersedes` links in the prose, 55 exception records
+contradict the general rule, 450 inventory records disagree with each other about
+the same clusters, and two probes ask about a cluster and an ADR that do not exist.
+
+Twenty-six scored probes in
+[`queries.json`](../../tests/memory-scale/queries.json), each naming its **gold
+documents** plus strings that must and must not appear.
+
+### Two terms the numbers depend on
+
+A **rung** is a nested prefix of the shared corpus: 100, 200, 400, 800, then all
+1,414. The same probes run at every rung, so scaling is a measured curve rather than
+an extrapolation from one point.
+
+**Gold recall** is the share of gold documents that came back, matched by
+identifier. It measures the **retrieval layer only** — what the provider put in
+front of the model, before the model said anything.
+
+### The retrieval ladder
+
+The table is in [the summary](#how-hindsight-solves-it). Three readings of it.
+
+**Neither provider leaked a tag at any rung.** That is the isolation result and it
+is the uninteresting one: both are correct.
+
+**The file provider's 1.000 gold recall is not a retrieval result.** It scores
+perfectly because it injects the entire corpus; recall of everything is what "no
+retrieval" means. What it costs is the next two columns — contamination 0.722
+against 0.407, and the current version of a contested policy ranked first 43% of the
+time against 83%.
+
+A live probe showed a model partly compensating for the 43%. Asked for the current
+service-account-key policy with the file provider configured, the agent led with
+`ADR-2026-052` as current and correctly relegated the 2024 and 2025 versions to
+history — because the corpus writes the supersession chain into the prose, so a
+model that reads all three can rebuild it. Two limits: it depends on the corpus
+carrying those markers, which no provider can guarantee; and in that probe the three
+ADRs sat adjacent in the first 1% of the block. What the metric measures correctly is
+the **work** — with Hindsight the current version arrives first and the superseded
+ones mostly do not arrive at all.
+
+**1.000 also overstates what the model uses.** Asked how to back up a production
+cluster with the file provider configured, the agent answered accurately and cited
+four identifiers without error — but named three of the four clusters excluded from
+the default backup plan, and two of the three Sev-1 postmortems with the same root
+cause. **Both omitted records are present verbatim in the store.** Nothing failed in
+storage or retrieval; the provider injected them and the model did not use them. The
+scorer credits a gold document for _sitting in the context window_, so Hindsight's
+0.702 (measured on what retrieval returned) and the file provider's 1.000 (measured
+on what was shipped) are not comparable in the direction the table implies.
+
+The tempting explanation is depth, and it does not survive: every fact that probe
+used sat in the first 45% of the block, both misses sat at 47.5% and 64.3%, and the
+next probe then used records at 52%, 59% and 59.5% without difficulty. Two further
+counterexamples followed. The honest statement is the narrower one: a
+110,799-token injected block can contain a fact the answer omits, the omission is
+invisible to gold-recall scoring, and we cannot predict which facts go missing.
+([probe 5 re-run](../../tests/memory-scale/transcript/README.md#round-b-probe-5-re-run-the-first-measurement-of-the-file-provider))
+
+### Is 0.702 gold recall bad, and what is lost
+
+It is better than it looks, and the shortfall is almost entirely a **citation
+problem rather than a knowledge problem**.
+
+Hindsight paraphrases, so a gold document can be fully present in the context inside
+an observation that dropped its identifier. `diagnose_miss()` separates the two cases
+by content-word overlap: **`id_stripped`** means the substance is there and only the
+citation is gone; **`absent`** means no recalled unit carries the content and the
+model genuinely cannot answer from it.
+
+Of 34 gold-document slots at rung 1414, twelve missed. **Eleven were `id_stripped`
+or `partial`. Exactly one — `ADR-2026-052` — was `absent`.** So the honest statement
+is: _at 1,414 documents Hindsight lost one fact and thirty-three citations_, in 2% of
+the context the alternative needed. The per-miss table with coverage figures is in
+the [scorer output](../../tests/memory-scale/results/).
+
+And the one lost fact was not a Hindsight property. It was a seeder bug — see
+[What the experiment got wrong](#what-the-experiment-got-wrong). After the reseed,
+`ADR-2026-052` came back correctly and was cited by name in the probe that had
+previously lost it, which closes that evidence chain.
+
+### The identifier finding
+
+Eleven of the twelve misses are in the `EXC-`, `OWN-`, `MIG-` and `CONV-` families.
+Running that down turned up the fact that decides the comparison.
+
+A corpus record's identifier is either written into its own prose —
+`"ADR-2026-044 (2026-01-28, current). Decision: …"` — or carried beside it as an
+HTML-comment directive, `<!-- id: CONV-034 -->`. The file store renders facts and
+drops comments:
+
+| Prefix                                                          | In corpus | In the file store |
+| --------------------------------------------------------------- | --------: | ----------------: |
+| `ADR-`, `RB-`, `PM-`                                            |   **193** |           **193** |
+| `CONV-`, `DEP-`, `OWN-`, `EXC-`, `GOT-`, `CAP-`, `MIG-`, `INV-` |     1,471 |             **0** |
+
+`MEMORY.md` holds the _content_ of all 1,414 shared records and the _handle_ for 193. **A flat file can only carry the identifiers somebody happened to write into a
+sentence.** A document store carries them out-of-band on
+`retain_params.context` — 964 distinct corpus identifiers were present there — which
+is the structural difference between the two designs and the reason this is a
+document store.
+
+This was not designed in deliberately. It was found while scoring, and then
+independently reconfirmed six times across the run.
+
+### Answer quality, head to head
+
+Ten of the 26 probes can only be judged from what the model _says_: the six contested
+policies, two procedural runbooks whose failure mode is a plausible reordering, and
+two negatives, where inventing a nonexistent cluster is a property of the reply and
+of nothing else.
+
+They were asked by hand, one per message, **non-delegated at the chat-agent layer** —
+which matters, because the chat agent is the only profile carrying the configured
+provider. The file arm is Round B; the Hindsight arm is Round A′, run against a
+corrected `--batch 1` reseed with the flat store deleted (not renamed) and the PVC
+surveyed for caches. Both arms were severed the same way: Round B scaled Hindsight to
+zero, Round A′ deleted the file. Scoring rules and every raw answer are in
+[the transcript](../../tests/memory-scale/transcript/README.md).
+
+| Arm                  | Probes | Citations | Citation errors | From metadata-only-id families |
+| -------------------- | -----: | --------: | --------------: | -----------------------------: |
+| File-based (Round B) |     10 |        34 |           **0** |                              0 |
+| Hindsight (Round A′) |     10 |    **59** |               1 |                   **23 (39%)** |
+
+Both arms answered every question correctly and refused all three traps. Read that
+table honestly in both directions: the file provider made **no** citation errors and
+Hindsight made one, while Hindsight produced **1.74× the citations**, 39% of them
+from families the flat file structurally cannot handle.
+
+**The one error** was on the nonexistent-cluster probe. The agent correctly refused
+to invent `mfs-prod-euw2-09` and correctly named real European clusters, then added
+that there is _"no `-09` in europe recorded at all"_ — which is false; four such
+clusters exist. It converted _"not in what I retrieved"_ into _"not recorded
+anywhere"_. That is #113, and the same run showed it is an **interface** fix rather
+than a prompt fix: on the nonexistent-ADR probe the agent made the same class of
+negative claim but scoped it to its own retrieval, and was right. Recall should
+return what it _searched_, not only what it _found_.
+
+Three behaviours appeared in the Hindsight arm that had no counterpart in the file
+arm:
+
+- **Reasoning across retrieved records.** On the etcd probe the agent noticed the
+  deprecation register contradicts itself about the Velero runbook (three records,
+  three different dates); on the cluster probe it noticed the inventory records
+  disagree with each other and **downgraded its own confidence accordingly**.
+  Neither observation is stated in any single record.
+- **Calibrated uncertainty.** On the leaked-credential probe it gave `RB-019` step by
+  step and explicitly flagged step 3 as _"wording I'd want confirmed against the
+  runbook text"_ — and it was right anyway. That is the inverse of the earlier
+  mis-seeded run's confident fabrication.
+- **Provenance that can be checked at all**, which is the 59-vs-34 column.
+
+One imprecision was scored short of an error: on two probes the agent attached the
+standard escalation ladder to runbooks that do not carry it. 39 of 44 runbooks do, so
+this is generalisation from a dominant pattern rather than invention — and it is
+direct experimental support for #116 (provenance marking on shared memory).
+
+The conclusion the data supports is the one in
+[the summary](#the-honest-caveat-and-the-recommendation): **provenance and cost, not
+accuracy.** _"File memory gives wrong answers"_ would not have survived this run.
+
+### Specialists have no memory, and improvise one
+
+Kanban-spawned specialists ran with `memory_enabled: false` in both rounds, making
+them a constant. The way they behave without a provider is nonetheless the strongest
+operational finding in the test.
+
+Five probes were void because the specialist reached the corpus by a route the
+experiment had closed — a different one each time:
+
+| Route it used                                               | How it was caught                    |
+| ----------------------------------------------------------- | ------------------------------------ |
+| A stale on-disk export left over from the previous round    | Its own verification script opens it |
+| Direct SQL to Postgres, bypassing the scaled-down API       | It volunteered it                    |
+| Scaled the database back up via its GCP service account     | GKE audit log                        |
+| Derived the answer from its own prior runs, via the task DB | It said so, unprompted               |
+| A corpus cache it had written into **its own skill file**   | Its own verification script loads it |
+
+A specialist with no memory provider does not degrade gracefully and does not report
+a gap. It improvises a data path and answers with full confidence and real
+identifiers.
+
+The last route is the one that persists. Over the run the specialist accumulated a
+79,815-byte file at `skills/governance/meridian-standards-lookup/SKILL.md` carrying
+103 distinct corpus identifiers — a private replica of the shared corpus, in a
+location that reloads into its context on every invocation, still growing as the
+probes went on. No cleanup holds against this: deleting the export, closing the
+database and revoking the escalation path all did nothing, because the specialist had
+already copied what it needed into a file it owns.
+
+That is the shape of the problem. **An agent that needs shared knowledge and is given
+no sanctioned way to reach it will build an unsanctioned one**, and the durable form
+of that is a stale, unreviewable, per-specialist fork of the corpus that nobody
+curates and nobody can audit. The failure is not that it goes without; it is that it
+succeeds. This is the argument for #112, whose shape is in
+[The tools](#what-subagents-get-today-nothing), and it is tracked separately as #122.
+
+Closing the third route required removing `roles/container.admin` and
+`roles/container.clusterAdmin` from the agent's GCP service account, which was
+evaluated _in addition to_ its Kubernetes RBAC and let it undo a change its in-cluster
+identity was explicitly denied. That is a real product finding, not a memory finding,
+and is tracked as #119.
+
+The fourth void probe is also the best agent behaviour in the test and worth recording
+as the target: it refused to claim a fresh read it did not have, distinguished
+derived-from-prior-runs from verified-now, reported its own controls green _while
+still rating the source stale_, noted that the failure mode is indistinguishable from
+an outage so the next agent may not notice, correctly diagnosed its own permissions,
+and escalated to a human.
+
+### What the experiment got wrong
+
+Recorded because the corrections are load-bearing, and because a proof whose errors
+are hidden is not one.
+
+**The first run's citation numbers measured the seeder, not Hindsight.**
+`seed_fleet.py` defaults to `--batch 5`, and Hindsight collapses a multi-item retain
+into **one document keeping one item's `context` as the label**. 1,664 records became
+**335 documents**: 156 carried a title identifier absent from their own body, 278 held
+no identifier at all, and of 193 distinct identifiers only 37 appeared in both roles —
+so 156 could never be returned as a citation by any recall. Reproduced against a
+second, independently fetched export with every figure identical.
+([the correction](../../tests/memory-scale/transcript/README.md#correction-round-as-citation-numbers-measure-the-seeder))
+
+The decisive case: a document labelled `DEP-001` whose body was the text of `DEP-001`,
+`DEP-002` and `DEP-003`. When the agent said _"the deprecation is DEP-001, and
+DEP-003 doesn't exist"_ it was reading a corrupted index correctly. The fix is one
+record per retain call plus per-unit provenance (#111) — **not** the `document_id`
+field originally filed, which would have returned the packed document's identifier
+authoritatively and made a wrong citation look sourced. Reseeding with `--batch 1`
+produced 1,664 documents and 4,400 memory units, and Round A′ was run against that.
+**Always seed with `--batch 1`.**
+
+**The answer probes were initially scored at the wrong layer.** The first scored
+replies were the specialist's, and the specialist has no memory provider in either
+round. Both arms were re-run non-delegated at the chat-agent layer, which is the
+head-to-head reported above.
+
+**Five suspected false positives, and zero true ones.** Across both rounds, five
+answers were initially recorded as agent errors and then withdrawn on re-querying the
+corpus — including one where the "inverted" phrasing turned out to be verbatim from
+the source record, and one where a boilerplate clause running through an entire ADR
+family was the genuine source. None survived. The rule this produced, and the reason
+it is written down: **re-query before recording an error.**
+
+### What is still unproven
+
+- **#111 / #116 — per-unit provenance.** The seeder is fixed; provenance marking on
+  shared memory is not built. The escalation-ladder imprecision is what it would have
+  caught.
+- **#113 — recall should return what it searched.** The one scored error in the
+  Hindsight arm, and the same run demonstrated the fix is an interface change rather
+  than prompt wording.
+- **#112 — specialists get shared-scope read access.** Five improvised data paths
+  argue for it; the token arithmetic for the alternative is one-sided (injecting the
+  file store into every specialist turn puts a three-way delegation past 330k tokens
+  before anyone asks a question), but the Hindsight side needs a live run. #115 is the
+  validation replay once these land.
+- **The near-duplicate hypothesis.** 52 of 55 deprecation records share a boilerplate
+  sentence, which could defeat individuation. It was not what caused the observed
+  errors, so it is untested rather than disproven.
+- **Scope of the evidence.** One synthetic corpus, one model, ten hand-scored probes
+  per arm, one operator scoring them. Enough to decide direction; not a benchmark, and
+  it should not be quoted as one.
+
+---
+
+## Related
+
+- [`tests/memory-scale/`](../../tests/memory-scale/README.md) — the harness,
+  fixtures, job manifests and raw results behind every number above.
+- [`tests/memory-scale/transcript/`](../../tests/memory-scale/transcript/README.md) —
+  every probe, verbatim, with per-answer scoring and the run's own corrections.
+- [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)
+  — installing and operating the two pods.
+- `agents/chat/SOUL.md` §1.6 — the agent-facing rules for using the two scopes.

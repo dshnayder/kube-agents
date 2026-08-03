@@ -5,7 +5,7 @@ a [Hindsight](https://github.com/vectorize-io/hindsight) API server and the
 Postgres/pgvector database it keeps its memories in.
 
 Why the design is what it is — one bank, scope tags, the settings the provider
-pins — lives in [tag isolation](../../../../docs/designs/memory-tag-isolation.md). This
+pins — lives in [tag isolation](../../../../docs/designs/memory.md). This
 README covers only the manifests in this directory.
 
 ## Install

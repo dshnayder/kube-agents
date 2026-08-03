@@ -75,7 +75,7 @@ to an archive table with its reason and its causal edges recorded, and
 **Shelved: nothing schedules this.** Running it is an operator action, and it
 **reports without acting unless told otherwise** — pass `--commit` (or set
 `MEMORY_TTL_COMMIT=1`) to make it write. Read
-docs/designs/memory-distill-then-retire.md before you do; retiring the evidence
+docs/designs/memory.md before you do; retiring the evidence
 costs more than it saves while recall reads the observation layer alone.
 
     kubectl exec -n kubeagents-system deploy/platform-agent-gateway \

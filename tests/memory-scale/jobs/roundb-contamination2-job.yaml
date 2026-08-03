@@ -1,0 +1,118 @@
+---
+# Round B — inventory the specialist's self-built durable corpus cache.
+#
+# probe 5's verify_backup.py revealed three data paths, none of them the file
+# provider: /opt/data/kanban.db (its own prior runs), an on-disk artifact
+# "written from a live corpus read", and a verified-standards table the agent
+# appended to its OWN skill file. All three are Round A Hindsight reads
+# persisted across the round boundary, so probes 6-10 are contaminated until
+# they are gone.
+#
+# Read-only. Writes nothing, deletes nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-contamination2
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-contamination2
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-contamination2
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: read
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import os, re, sqlite3
+
+              CORPUS_IDS = re.compile(r'\b(?:ADR-20\d\d-\d\d\d|RB-\d\d\d|PM-20\d\d-\d\d\d|CONV-\d\d\d|EXC-\d\d\d|DEP-\d\d\d|OWN-\d\d\d|GOT-\d\d\d|CAP-\d\d\d|MIG-\d\d\d|INV-\d\d\d)\b')
+
+              def report(label, path):
+                  if not os.path.exists(path):
+                      print(f"  ABSENT   {label}: {path}"); return
+                  txt = open(path, encoding="utf-8", errors="replace").read()
+                  ids = set(CORPUS_IDS.findall(txt))
+                  print(f"  PRESENT  {label}: {path}")
+                  print(f"           {os.path.getsize(path):,} bytes, {len(ids)} distinct corpus ids")
+                  if ids:
+                      print(f"           {', '.join(sorted(ids)[:14])}{' ...' if len(ids)>14 else ''}")
+
+              print("== named sources from verify_backup.py ==")
+              report("live-read artifact", "/opt/data/artifacts/runbook-answers-backup-and-etcd.md")
+              report("self-written skill", "/opt/data/profiles/platform/skills/governance/meridian-standards-lookup/SKILL.md")
+
+              print("\n== /opt/data/artifacts ==")
+              d="/opt/data/artifacts"
+              if os.path.isdir(d):
+                  for n in sorted(os.listdir(d)):
+                      report(n, os.path.join(d,n))
+              else:
+                  print("  (no such directory)")
+
+              print("\n== self-written skills under the platform profile ==")
+              base="/opt/data/profiles/platform/skills"
+              for dp,dn,fn in os.walk(base) if os.path.isdir(base) else []:
+                  dn[:] = [x for x in dn if x!="__pycache__"]
+                  for n in fn:
+                      p=os.path.join(dp,n)
+                      txt=open(p,encoding="utf-8",errors="replace").read()
+                      ids=set(CORPUS_IDS.findall(txt))
+                      if ids:
+                          print(f"  {len(ids):4d} ids  {os.path.getsize(p):>8,} B  {p}")
+
+              print("\n== kanban.db ==")
+              db="/opt/data/kanban.db"
+              if os.path.exists(db):
+                try:
+                  c=sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                  tot=set(); rows=0
+                  for q in ("select summary||' '||coalesce(metadata,'') from task_runs",
+                            "select coalesce(body,'') from task_comments",
+                            "select coalesce(title,'')||' '||coalesce(body,'') from tasks"):
+                      for (t,) in c.execute(q):
+                          rows+=1; tot |= set(CORPUS_IDS.findall(t or ""))
+                  print(f"  {rows:,} rows, {len(tot)} distinct corpus ids carried in the kanban record")
+                  c.close()
+                except Exception as e:
+                  print(f"  {os.path.getsize(db):,} bytes on disk; could not open read-only here ({e})")
+              else:
+                  print("  (absent)")
+
+              print("\n== is the file provider's store reachable at all? ==")
+              report("MEMORY.md", "/opt/data/memories/MEMORY.md")
+              print("\n== Round A leftovers ==")
+              print("  /opt/data/docs/standards exists:", os.path.isdir("/opt/data/docs/standards"))
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data
+            readOnly: true

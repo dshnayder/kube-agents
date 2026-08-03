@@ -1,0 +1,120 @@
+---
+# Second cleanup pass + proof that the Hindsight boundary is actually closed.
+#
+# Round B probe 1, attempt 2, was void because the specialist bypassed the
+# scaled-down hindsight-api and read the corpus straight out of Postgres. It said
+# so itself: "the hindsight-api deployment has been at 0/0 replicas for ~12h; it
+# read the corpus straight from Postgres instead." In doing so it recreated
+# /opt/data/docs/standards/ — the directory the first cleanup removed.
+#
+# hindsight-postgresql is now scaled to 0 (PVC preserved). This job:
+#   1. deletes the two paths the user named, and
+#   2. proves from inside the cluster that neither the API nor the database
+#      answers, so the next probe cannot reach Hindsight by any route.
+#
+# The delete list is a literal allowlist. /opt/data/memories/ is not in it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-cleanup2
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-cleanup2
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-cleanup2
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cleanup
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import os, shutil, socket
+
+              TARGETS = [
+                  "/opt/data/docs/standards",
+                  "/opt/data/kanban/attachments/t_e18a42c5",
+              ]
+
+              print("== deleting ==")
+              for t in TARGETS:
+                  if not os.path.exists(t):
+                      print(f"  (absent)  {t}")
+                      continue
+                  if os.path.isdir(t):
+                      for dp, _, fn in os.walk(t):
+                          for f in sorted(fn):
+                              p = os.path.join(dp, f)
+                              print(f"    {os.path.getsize(p):>9}  {p}")
+                      shutil.rmtree(t)
+                  else:
+                      print(f"    {os.path.getsize(t):>9}  {t}")
+                      os.remove(t)
+                  print(f"  removed  {t}")
+
+              gone = all(not os.path.exists(t) for t in TARGETS)
+              print(f"\nall targets gone: {gone}")
+
+              print("\n== the file store, which must be intact ==")
+              M = "/opt/data/memories/MEMORY.md"
+              raw = open(M, encoding="utf-8").read()
+              entries = [e for e in raw.split("\n§\n") if e.strip()]
+              size = os.path.getsize(M)
+              print(f"  MEMORY.md {size} bytes, {len(entries)} entries (expect 444531 / 1414)")
+              print(f"  users/: {sorted(os.listdir('/opt/data/memories/users'))}")
+              store_ok = size == 444531 and len(entries) == 1414
+
+              # Is Hindsight genuinely unreachable? Both the API and the database,
+              # since the last probe used the second when the first was down.
+              print("\n== hindsight reachability from inside the cluster ==")
+              endpoints = [
+                  ("hindsight-api.kubeagents-system.svc.cluster.local", 8888),
+                  ("hindsight-postgresql.kubeagents-system.svc.cluster.local", 5432),
+                  ("hindsight-postgresql-hl.kubeagents-system.svc.cluster.local", 5432),
+                  ("hindsight-postgresql-0.hindsight-postgresql-hl.kubeagents-system.svc.cluster.local", 5432),
+              ]
+              closed = True
+              for host, port in endpoints:
+                  try:
+                      with socket.create_connection((host, port), timeout=5):
+                          print(f"  REACHABLE  {host}:{port}   <-- boundary is open")
+                          closed = False
+                  except socket.gaierror as e:
+                      print(f"  no dns     {host}:{port}  ({e.strerror or e})")
+                  except (OSError, TimeoutError) as e:
+                      print(f"  refused    {host}:{port}  ({type(e).__name__})")
+
+              print(f"\nboundary closed: {closed}")
+              ok = gone and store_ok and closed
+              print(f"RESULT: {'OK' if ok else 'FAILED'}")
+              raise SystemExit(0 if ok else 1)
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data

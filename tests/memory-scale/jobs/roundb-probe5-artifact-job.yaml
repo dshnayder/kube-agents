@@ -1,0 +1,106 @@
+---
+# Round B probe 5 — determine what the specialist actually read.
+#
+# The specialist reported: "the standards corpus was offline for this run, so the
+# answer was reproduced from its durable cross-run record (4-7 corroborating
+# records per claim, no dissent) rather than a fresh read." That is improvisation
+# route 4 again -- deriving from its own prior runs -- and if the substance came
+# from there, probe 5 measures Round A's Hindsight reads laundered through a
+# specialist, not the file provider, and must be voided.
+#
+# The counter-hypothesis is that the chat agent (which does carry MEMORY.md in its
+# system prompt) supplied the facts and the specialist only verified them. The
+# harness scripts are the direct evidence: if verify_backup.py opens
+# /opt/data/memories/MEMORY.md, the file provider is what was measured.
+#
+# Reads only /opt/data/kanban/attachments/t_4b08716e. Writes nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-roundb-probe5-artifact
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-fleettest
+    app.kubernetes.io/component: roundb-probe5-artifact
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-agents-fleettest
+        app.kubernetes.io/component: roundb-probe5-artifact
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeName: gke-kage-management-default-pool-5c8ec3be-nwj9
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: read
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:dev-20260729-155133
+          command: ["/opt/hermes/.venv/bin/python3", "-c"]
+          args:
+            - |
+              import os
+
+              D = "/opt/data/kanban/attachments/t_4b08716e"
+              if not os.path.isdir(D):
+                  print("MISSING:", D)
+                  raise SystemExit(0)
+
+              paths = []
+              for dp, dn, fn in os.walk(D):
+                  dn[:] = [d for d in dn if d != "__pycache__"]
+                  for n in sorted(fn):
+                      paths.append(os.path.join(dp, n))
+
+              print("== files ==")
+              for p in paths:
+                  print(f"  {os.path.getsize(p):>9}  {p}")
+
+              # The scripts are the direct evidence of method.
+              for p in paths:
+                  if p.endswith(".py"):
+                      print(f"\n===== {os.path.basename(p)} =====")
+                      print(open(p, encoding="utf-8", errors="replace").read()[:7000])
+
+              for p in paths:
+                  if p.endswith(".md"):
+                      txt = open(p, encoding="utf-8", errors="replace").read()
+                      print(f"\n===== {os.path.basename(p)} ({len(txt)} chars) — head =====")
+                      print(txt[:3000])
+
+              blob = ""
+              for p in paths:
+                  try:
+                      blob += open(p, encoding="utf-8", errors="replace").read()
+                  except Exception:
+                      pass
+
+              print("\n== method markers ==")
+              for m in ["memories/MEMORY.md", "MEMORY.md", "system_prompt", "system prompt",
+                        "grep", "all_docs.json", "psycopg", "postgres", "POSTGRES", "psql",
+                        "hindsight", "Hindsight", "8888", "5432", "recall", "multiuser_memory",
+                        "1414", "1,414", "335", "§"]:
+                  print(f"  {blob.count(m):5d}  {m}")
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: platform-agent-data
+            readOnly: true

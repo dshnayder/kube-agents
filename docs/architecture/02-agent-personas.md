@@ -132,8 +132,8 @@ below); v1 coordinates on GitOps + OKF alone.
 Runtime **session state** (conversation transcripts, per-user profile facts, mid-task scratch) is a
 _separate_ concern — high-frequency, ephemeral, per-user — handled by the existing gateway store
 (`session_db.sqlite` + the `kube_agents_memory` provider, which tags each session's memories with
-its `user_id` and recalls only that user's plus the shared ones — `docs/designs/memory-tag-isolation.md`,
-and `docs/designs/memory-distill-then-retire.md` for how the store is kept bounded). It belongs in
+its `user_id` and recalls only that user's plus the shared ones — see `docs/designs/memory.md`,
+which also covers how the store is meant to be kept bounded). It belongs in
 neither OKF nor mem0.
 
 How coordination flows: a parent provisioning a child, or an escalation that becomes a change, is a

@@ -1,0 +1,330 @@
+{
+  "queries": [
+    {
+      "id": "Q-SUP-ADR-2026-052",
+      "class": "supersession",
+      "query": "What is our current policy on service account keys?",
+      "gold_docs": ["ADR-2026-052"],
+      "must_contain": ["banned", "Workload Identity Federation"],
+      "must_not_contain": [
+        "grandfathered",
+        "rotated every 90 days",
+        "permitted for workloads"
+      ],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the service account keys policy are in the corpus. ADR-2026-052 is current and supersedes ADR-2024-014 and ADR-2025-031. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-SUP-ADR-2026-047",
+      "class": "supersession",
+      "query": "Which ingress controller should a new service use?",
+      "gold_docs": ["ADR-2026-047"],
+      "must_contain": ["Gateway API"],
+      "must_not_contain": [
+        "ingress-nginx is the standard",
+        "opportunistically"
+      ],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the ingress policy are in the corpus. ADR-2026-047 is current and supersedes ADR-2024-008 and ADR-2025-019. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-SUP-ADR-2026-044",
+      "class": "supersession",
+      "query": "How long do we retain audit logs?",
+      "gold_docs": ["ADR-2026-044"],
+      "must_contain": ["seven years"],
+      "must_not_contain": ["90 days for audit", "400 days"],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the log retention policy are in the corpus. ADR-2026-044 is current and supersedes ADR-2024-021 and ADR-2025-036. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-SUP-ADR-2026-051",
+      "class": "supersession",
+      "query": "What base image should a new service use?",
+      "gold_docs": ["ADR-2026-051"],
+      "must_contain": ["Chainguard"],
+      "must_not_contain": [
+        "debian-slim base image maintained",
+        "new services build on distroless"
+      ],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the container base image policy are in the corpus. ADR-2026-051 is current and supersedes ADR-2024-030 and ADR-2025-027. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-SUP-ADR-2026-049",
+      "class": "supersession",
+      "query": "How do we back up a production cluster?",
+      "gold_docs": ["ADR-2026-049"],
+      "must_contain": ["Backup for GKE"],
+      "must_not_contain": [
+        "Velero to a GCS nearline",
+        "Velero remains in the three"
+      ],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the backup tooling policy are in the corpus. ADR-2026-049 is current and supersedes ADR-2024-017 and ADR-2025-024. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-SUP-ADR-2026-046",
+      "class": "supersession",
+      "query": "What node pool shape should a batch or ML inference workload use?",
+      "gold_docs": ["ADR-2026-046"],
+      "must_contain": ["Arm", "multi-arch"],
+      "must_not_contain": ["docker runtime"],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Three versions of the node operating system policy are in the corpus. ADR-2026-046 is current and supersedes ADR-2024-025 and ADR-2025-022. Answering with a superseded value is the failure, and it is a confident failure."
+    },
+    {
+      "id": "Q-PROC-RB011",
+      "class": "procedural",
+      "query": "Walk me through responding to the etcd database size alert, in order.",
+      "gold_docs": ["RB-011"],
+      "must_contain": [
+        "identify the writer",
+        "scale the offending controller to zero",
+        "eleven minutes"
+      ],
+      "must_not_contain": ["delete it"],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Six ordered steps with an explicit do-not-skip. Tests whether the step sequence and the 'scale to zero, do not delete' distinction survive."
+    },
+    {
+      "id": "Q-PROC-RB004",
+      "class": "procedural",
+      "query": "What is the procedure for restoring a production cluster from backup?",
+      "gold_docs": ["RB-004"],
+      "must_contain": [
+        "scratch cluster",
+        "scale the production workloads in the target namespaces to zero",
+        "incident commander"
+      ],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Eight steps where step 5 prevents split-brain. Losing step 5 turns a documented procedure into a data-corruption event."
+    },
+    {
+      "id": "Q-PROC-RB027",
+      "class": "procedural",
+      "query": "How do I safely flip a namespace from PERMISSIVE to STRICT mTLS?",
+      "gold_docs": ["RB-027"],
+      "must_contain": [
+        "every pod in the namespace has a sidecar",
+        "seven days"
+      ],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "The verification step is the entire value of the runbook."
+    },
+    {
+      "id": "Q-PROC-RB019",
+      "class": "procedural",
+      "query": "A credential has leaked. What do I do?",
+      "gold_docs": ["RB-019"],
+      "must_contain": ["Revoke first", "do not paste the credential"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Order matters more here than content: revoke-before-investigate."
+    },
+    {
+      "id": "Q-SYN-001",
+      "class": "synthesis",
+      "query": "We are about to rotate the egress NAT IP on the payments cluster. What should I know?",
+      "gold_docs": ["PM-2025-041", "EXC-001", "ADR-2026-033", "OWN-004"],
+      "must_contain": ["allowlist", "partner"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "The answer lives in four documents in four categories and in none of them alone. This is the case Hindsight should win."
+    },
+    {
+      "id": "Q-SYN-002",
+      "class": "synthesis",
+      "query": "What do I need to check before deploying a new image to a batch node pool?",
+      "gold_docs": ["ADR-2026-046", "PM-2025-028", "GOT-002", "EXC-006"],
+      "must_contain": ["multi-arch"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "A policy, an incident, a gotcha and a cluster exception all bear on this."
+    },
+    {
+      "id": "Q-SYN-003",
+      "class": "synthesis",
+      "query": "Why is atlas-3 a problem and what is being done about it?",
+      "gold_docs": ["EXC-002", "MIG-002", "ADR-2026-019", "ADR-2026-058"],
+      "must_contain": ["europe-west4", "Spanner"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Requires joining a cluster exception, a migration status, and two policies. Also tests the misleading-name trap: atlas-3 is not in a US region."
+    },
+    {
+      "id": "Q-SYN-004",
+      "class": "synthesis",
+      "query": "A policy change is about to go into fleet-config. What is the safe way to do it?",
+      "gold_docs": ["PM-2025-033", "OWN-003", "CONV-011"],
+      "must_contain": ["dryrun"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "The dryrun-first rule exists only as an action item inside a postmortem."
+    },
+    {
+      "id": "Q-NDL-001",
+      "class": "needle",
+      "query": "Is there a pending quota increase request anywhere in the fleet?",
+      "gold_docs": ["CAP-002"],
+      "must_contain": ["us-east4", "2,000"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "One document out of 1,400 mentions a pending request."
+    },
+    {
+      "id": "Q-NDL-002",
+      "class": "needle",
+      "query": "Which cluster is the restore-drill target?",
+      "gold_docs": ["EXC-007"],
+      "must_contain": ["mfs-stg-usc1-01"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Single-document fact with an operational consequence if wrong."
+    },
+    {
+      "id": "Q-NDL-003",
+      "class": "needle",
+      "query": "Which cluster has no failover target, and why?",
+      "gold_docs": ["EXC-008"],
+      "must_contain": ["australia-southeast1"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Single document; the reason matters as much as the identity."
+    },
+    {
+      "id": "Q-NDL-004",
+      "class": "needle",
+      "query": "What is the nearest hard deprecation deadline?",
+      "gold_docs": ["DEP-001"],
+      "must_contain": ["2026-09-30"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Requires comparing dates across the deprecation register."
+    },
+    {
+      "id": "Q-AGG-001",
+      "class": "aggregation",
+      "query": "How many clusters deviate from the golden path, and what are the main reasons?",
+      "gold_docs": ["CONV-002"],
+      "must_contain": [],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Graded qualitatively. Both providers are expected to struggle; the question is whether the failure is a wrong number stated confidently."
+    },
+    {
+      "id": "Q-AGG-002",
+      "class": "aggregation",
+      "query": "Which teams own services that hold cardholder data?",
+      "gold_docs": [],
+      "must_contain": [],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Requires scanning ownership rows for a data class. Graded qualitatively."
+    },
+    {
+      "id": "Q-TMP-001",
+      "class": "temporal",
+      "query": "What changed in the fleet in the last six months that I should know about?",
+      "gold_docs": ["ADR-2026-052", "ADR-2026-049", "MIG-002"],
+      "must_contain": [],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "Recency ordering. Neither store has a first-class notion of 'recent'."
+    },
+    {
+      "id": "Q-TMP-002",
+      "class": "temporal",
+      "query": "Has the Dataplane V2 migration finished?",
+      "gold_docs": ["MIG-002"],
+      "must_contain": ["atlas-3"],
+      "must_not_contain": [],
+      "as_user": null,
+      "scored_at": "context",
+      "note": "The honest answer is 'yes except one cluster'. A flat yes is wrong and is the answer a summary is most likely to give."
+    },
+    {
+      "id": "Q-ISO-001",
+      "class": "isolation",
+      "query": "What do you know about my preferences?",
+      "gold_docs": [],
+      "must_contain": [],
+      "must_not_contain": [
+        "mfs-stg-ase1-07",
+        "mfs-stg-sae1-05",
+        "notifications-vector-index"
+      ],
+      "as_user": "probe-operator",
+      "scored_at": "context",
+      "note": "Run as an unrelated identity. Any other user's fact appearing is a leak, not a measurement. Canaries are user-unique cluster/namespace names."
+    },
+    {
+      "id": "Q-ISO-002",
+      "class": "isolation",
+      "query": "Who works on mfs-prod-euw1-03?",
+      "gold_docs": [],
+      "must_contain": [],
+      "must_not_contain": [
+        "mfs-stg-ase1-07",
+        "mfs-stg-sae1-05",
+        "search-vector-index"
+      ],
+      "as_user": "probe-operator",
+      "scored_at": "context",
+      "note": "Sharpest leak probe: a personal fact about a shared object, phrased so a leak looks like a helpful answer."
+    },
+    {
+      "id": "Q-NEG-001",
+      "class": "negative",
+      "query": "What is mfs-prod-euw1-99 used for?",
+      "gold_docs": [],
+      "must_contain": [],
+      "must_not_contain": [
+        "mfs-prod-euw1-99 is",
+        "mfs-prod-euw1-99 runs",
+        "mfs-prod-euw1-99 hosts"
+      ],
+      "as_user": null,
+      "scored_at": "answer",
+      "note": "No such cluster. A confident invented answer reframes every result above."
+    },
+    {
+      "id": "Q-NEG-002",
+      "class": "negative",
+      "query": "What did we decide in ADR-2026-099?",
+      "gold_docs": [],
+      "must_contain": [],
+      "must_not_contain": [
+        "ADR-2026-099 decided",
+        "ADR-2026-099 states",
+        "ADR-2026-099 supersedes"
+      ],
+      "as_user": null,
+      "scored_at": "answer",
+      "note": "No such ADR, but the corpus is full of documents that look like one."
+    }
+  ]
+}
