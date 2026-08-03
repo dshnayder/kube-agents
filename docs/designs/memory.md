@@ -181,7 +181,9 @@ the reader has no way to tell that checking was foreclosed.
 per-unit provenance on retain (#111/#116), recall returning what it _searched_ and
 not only what it _found_ (#113, now built —
 [a read names its outcome](#a-read-names-its-outcome)), and shared-scope read
-access for specialists (#112). Scope of evidence: one synthetic corpus, one model,
+access for specialists (#112, now built —
+[what subagents get](#what-subagents-get-shared-memory-read-only)). Scope of
+evidence: one synthetic corpus, one model,
 ten hand-scored probes per arm. Enough to decide direction; not a benchmark.
 
 ---
@@ -549,21 +551,43 @@ applied last, over every platform key, and silently wins. `memory` there is a
 unless the gate is on, and that injection is the only path by which the provider's
 tools reach the model.
 
-#### What subagents get today: nothing
+#### What subagents get: shared memory, read-only
 
-Kanban-spawned specialists run with `memory_enabled: false`
-(`agents/platform/config.yaml:55`). They carry **no memory provider, no memory
-tools, and no injected memory block** — deliberately, because a specialist carries
-no human identity and so cannot scope a write, and pooling every specialist's writes
-into one anonymous bucket is worse than not writing.
+Kanban-spawned specialists used to carry **no memory provider, no memory tools, and
+no injected memory block**. That was deliberate — a specialist carries no human
+identity, so it cannot scope a write, and pooling every specialist's writes into one
+anonymous bucket is worse than not writing. It is also what the experiment measured
+on both arms, which makes specialists a **constant in the A/B rather than a
+variable**.
 
-That is the current state of `main`, and it is also what the experiment measured on
-both arms, which makes specialists a **constant in the A/B rather than a variable**.
-It is not a satisfactory end state, for the reason in
-[Specialists have no memory, and improvise one](#specialists-have-no-memory-and-improvise-one).
+What the experiment then showed is that withholding memory did not stop the
+specialist needing the corpus; it stopped it getting the corpus from a curated
+source. Across ten probes it improvised five routes to the same data, the worst of
+them durable: a 79,815-byte fork of the shared corpus written into its own skill
+file, reloaded into context on every invocation, curated by nobody and auditable by
+nobody. See
+[Specialists have no memory, and improvise one](#specialists-have-no-memory-and-improvise-one)
+for the full accounting. **A stale private copy is a worse outcome than a read.**
 
-**Proposed, not built (#112).** Give specialists shared-scope access, read-only,
-in both forms:
+So the platform profile now reads shared memory and writes nothing
+([`agents/platform/config.yaml`](../../agents/platform/config.yaml)):
+
+```yaml
+memory:
+  memory_enabled: false
+  provider: kube_agents_memory
+  read_only: true
+  user_profile_enabled: false
+```
+
+`memory_enabled: false` is not a contradiction. It gates Hermes' **built-in**
+`MEMORY.md`/`USER.md` file store, which the `memory` toolset surfaces on any profile
+that lists it; the provider loads off `provider` alone. Leaving it false is what
+keeps the built-in tool inert — a null store, short-circuited before it touches disk
+— and so what makes the profile read-only in fact rather than only in the provider.
+
+The specialist gets both forms of read, and they are not separable: enabling the
+provider gives Hermes something to `prefetch` from, and prefetch is the injection.
 
 - **Injected context** is the floor — it guarantees the specialist starts with the
   shared corpus whether or not it thinks to ask. A tool alone can be skipped in
@@ -576,12 +600,58 @@ The decisive argument for including the tool is **failure legibility**. Injected
 context that is unavailable arrives as an absent block, indistinguishable from
 "nothing is recorded about this". A tool call returns a named outcome, and a named
 outcome is a fact the agent can report — which is what
-[a read names its outcome](#a-read-names-its-outcome) already builds, and why it
-landed before this.
+[a read names its outcome](#a-read-names-its-outcome) builds, and why it landed
+first.
+
+What is tunable is how much gets injected, not whether. The platform profile's
+`recall_budget` is `low` against the Chat Agent's `mid`, on the reasoning that a
+specialist arrives with a task already stated and a long tool loop ahead of it, so
+context spent at turn start is context it does not have for the work. That is a
+starting point to be measured, not a finding.
+
+**Personal memory stays impossible here**, and always will be: it keys off the
+gateway identity, which only the Chat Agent has. The provider fails closed on this
+by itself — with no `user_id` it recalls `scope:shared` and nothing else.
+
+##### What `read_only` does
+
+It is a profile setting rather than something inferred from the session, because the
+two identity-less cases are not the same. A shared Google Chat space also has no
+single `user_id`, and it deliberately **keeps** shared writes: there are humans in
+the room who can vouch for one. A dispatcher-spawned specialist has nobody. Only the
+profile config knows which case it is in.
+
+`_memory_is_read_only()` reads `memory.read_only` through `load_config()`, which
+resolves via `HERMES_HOME` and is therefore profile-scoped — a kanban worker is
+launched with `HERMES_HOME` pointed at `profiles/platform`
+(`hermes_cli/kanban_db.py`). It **defaults to False**: a profile that says nothing
+keeps its write tools, and a config read that raises does not silently disarm the
+front door.
+
+When it is on, four things change, because one of them failing open would be silent:
+
+| Surface            | Behaviour under `read_only`                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| Tool schemas       | `memory_retain` is not advertised at all                                                            |
+| `handle_tool_call` | A `memory_retain` call is refused with `status: read_only`, worded so it does not read as retryable |
+| Automatic capture  | `sync_turn` and `on_session_end` do not fire, and `_auto_retain` is cleared on the stock provider   |
+| System prompt      | `SYSTEM_PROMPT_READ_ONLY` — says there is no write path, and not to cache what was read             |
+
+Omitting the schema is the primary control; advertising the tool and refusing the
+call would spend a turn and read as a transient failure worth retrying. The refusal
+is the backstop for an invented call or a schema cached across a config change.
 
 **Not `memory_retain`, in any form.** A specialist that could write shared memory
 could launder its own derived-from-prior-runs conclusions into the corpus as facts.
-The provider already fails closed there; #112 must not open it.
+What it works out during a task is a finding for its result, not a recorded fact.
+
+The prompt's "do not cache what you read" is a partial, prose-only mitigation for
+the skill-file fork (#122); the durable control — making the specialist's own skill
+directory unwritable — is tracked separately.
+
+[`tests/memory/test_read_only_profile.py`](../../tests/memory/test_read_only_profile.py)
+locks down all four surfaces, that reads are untouched, and that the setting
+defaults off.
 
 ### Where the connection settings come from
 
@@ -604,6 +674,12 @@ start (step 2a), alongside `config.yaml` and the persona files. It carries the
 connection settings and nothing else. `_apply_budget()` honours `recall_budget` if
 it is one of `low`/`mid`/`high`, and otherwise leaves Hindsight's own resolution
 alone.
+
+`$HERMES_HOME` is per-profile, so the platform specialist needs **its own copy** —
+[`agents/platform/hindsight/config.json`](../../agents/platform/hindsight/config.json),
+identical but for `recall_budget: low`. The default profile's copy is not on its
+path, and without one the provider has nothing to connect to. It is force-synced the
+same way, by step 2.6, for the same reason.
 
 It is image-owned because it was not, once. The file was hand-written onto the PVC,
 where it survived every image roll carrying whichever design was current when it was
@@ -916,8 +992,10 @@ That is the shape of the problem. **An agent that needs shared knowledge and is 
 no sanctioned way to reach it will build an unsanctioned one**, and the durable form
 of that is a stale, unreviewable, per-specialist fork of the corpus that nobody
 curates and nobody can audit. The failure is not that it goes without; it is that it
-succeeds. This is the argument for #112, whose shape is in
-[The tools](#what-subagents-get-today-nothing), and it is tracked separately as #122.
+succeeds. This is the argument for #112, and it is why the specialist now reads
+shared memory: [what subagents get](#what-subagents-get-shared-memory-read-only).
+The route itself — a skill directory its own occupant can write to — is tracked
+separately as #122.
 
 Closing the third route required removing `roles/container.admin` and
 `roles/container.clusterAdmin` from the agent's GCP service account, which was
@@ -976,11 +1054,13 @@ it is written down: **re-query before recording an error.**
   three outcomes; but the thing it is meant to prevent is a model's inference, and
   no live probe has been run against it. It stays here until #115 re-measures the
   one scored error in the Hindsight arm.
-- **#112 — specialists get shared-scope read access.** Five improvised data paths
-  argue for it; the token arithmetic for the alternative is one-sided (injecting the
-  file store into every specialist turn puts a three-way delegation past 330k tokens
-  before anyone asks a question), but the Hindsight side needs a live run. #115 is the
-  validation replay once these land.
+- **#112 — specialists get shared-scope read access.** Built and unit-tested, and
+  the token arithmetic for the alternative is one-sided (injecting the file store
+  into every specialist turn puts a three-way delegation past 330k tokens before
+  anyone asks a question). What is unproven is the thing the change is for: whether a
+  specialist with a sanctioned read stops improvising an unsanctioned one. That is a
+  behavioural claim and only a live delegated run can settle it. The `low` recall
+  budget is likewise a guess until measured. #115 is the validation replay.
 - **The near-duplicate hypothesis.** 52 of 55 deprecation records share a boilerplate
   sentence, which could defeat individuation. It was not what caused the observed
   errors, so it is untested rather than disproven.

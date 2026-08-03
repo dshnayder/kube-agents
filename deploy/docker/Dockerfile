@@ -154,6 +154,12 @@ COPY --chown=hermes:hermes agents/platform/CAPABILITIES.md /opt/platform-templat
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
+# The specialist's Hindsight connection file. Profile-scoped: a kanban worker
+# runs with HERMES_HOME pointed at profiles/platform, and the plugin resolves
+# $HERMES_HOME/hindsight/config.json, so the default profile's copy is not
+# visible from here. Image-owned and force-synced by the entrypoint, for the
+# reason in step 2a.
+COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into

@@ -101,9 +101,21 @@ fi
 # name and description in profiles/<name>/profile.yaml, a separate file that no
 # template ships, so it is never overwritten here. Per-profile runtime state
 # (USER.md, memory/, sessions/) is likewise left untouched.
+#
+# hindsight/config.json is in the platform list for the same reason it is in
+# step 2a's: it is the memory provider's connection config, it is image-owned,
+# and a copy left on the PVC would silently outlive the design that wrote it.
+# The profile needs its own because a kanban worker runs with HERMES_HOME set to
+# profiles/platform, and the plugin resolves $HERMES_HOME/hindsight/config.json —
+# the default profile's copy is not on that path.
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
-        [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
+    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+        if [ -f "$PLATFORM_TEMPLATE/$f" ]; then
+            # Nested paths need their parent; the scaffold in 2.5 predates this
+            # file, so an existing profile will not have the directory.
+            mkdir -p "$(dirname "$TARGET_DIR/profiles/platform/$f")" 2>/dev/null || true
+            cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
+        fi
     done
 fi
 CLUSTER_TEMPLATE="/opt/cluster-template"

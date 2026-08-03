@@ -255,6 +255,22 @@ SYSTEM_PROMPT_SHARED_ONLY = (
     "\n"
     + MEMORY_ABSENCE_RULE
 )
+SYSTEM_PROMPT_READ_ONLY = (
+    "You can **read** the organisation's shared long-term memory: standard "
+    "procedures, platform conventions and defaults, cluster and environment "
+    "inventory, ownership, and the history of releases and infrastructure "
+    "changes. Relevant entries are injected into your context automatically; "
+    "`memory_recall` searches them and `memory_reflect` synthesises across them "
+    "when you need something the injected entries do not cover.\n"
+    "\n"
+    "You **cannot write** to memory, and there is no tool that would let you. "
+    "What you conclude during a task is a finding, not a recorded fact: report "
+    "it in your result. Do not cache what you read here into a file, a skill or "
+    "a note for later — a private copy goes stale the moment shared memory is "
+    "corrected, and nobody can review it. Read it again next time.\n"
+    "\n"
+    + MEMORY_ABSENCE_RULE
+)
 
 
 def _sanitize_user_id(user_id: str) -> str:
@@ -267,6 +283,34 @@ def _sanitize_user_id(user_id: str) -> str:
     """
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(user_id or ""))
     return re.sub(r"-{2,}", "-", cleaned).strip("-_")
+
+
+def _memory_is_read_only() -> bool:
+    """Read ``memory.read_only`` from the active profile's config.yaml.
+
+    Profile-scoped: ``load_config()`` resolves through ``HERMES_HOME``, and a
+    kanban worker is launched with ``HERMES_HOME`` pointed at its own profile
+    directory (``hermes_cli/kanban_db.py`` — ``env["HERMES_HOME"] =
+    resolve_profile_env(profile_arg)``). So the platform specialist reads
+    ``profiles/platform/config.yaml`` and the Chat Agent reads its own.
+
+    It is a setting rather than something derived from the session because the
+    two identity-less cases are not the same. A shared chat space has humans in
+    it who can vouch for a shared write; a dispatcher-spawned specialist has
+    nobody. Only the second is read-only, and only the profile config knows
+    which one it is.
+
+    Defaults to False — a profile that says nothing keeps the write tools.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+        memory = config.get("memory")
+        if isinstance(memory, dict):
+            return bool(memory.get("read_only", False))
+    except Exception as e:
+        logger.debug("Could not read memory.read_only, assuming writable: %s", e)
+    return False
 
 
 def _thread_sessions_are_per_user() -> bool:
@@ -294,6 +338,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._user_tag: str = ""
         self._personal_disabled_reason: str = ""
         self._session_id: str = ""
+        self._read_only: bool = False
 
     @property
     def name(self) -> str:
@@ -317,6 +362,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._hindsight = None
         self._user_tag = ""
         self._personal_disabled_reason = ""
+        self._read_only = _memory_is_read_only()
 
         user_id = _sanitize_user_id(kwargs.get("user_id") or "")
 
@@ -359,10 +405,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
 
         self._apply_scoping(self._hindsight)
         self._ensure_bank(self._hindsight)
-        logger.info("%s: bank=%s scope=%s budget=%s", PROVIDER_NAME,
+        logger.info("%s: bank=%s scope=%s budget=%s writes=%s", PROVIDER_NAME,
                     getattr(self._hindsight, "_bank_id", "?"),
                     self._user_tag or "shared-only",
-                    getattr(self._hindsight, "_budget", "?"))
+                    getattr(self._hindsight, "_budget", "?"),
+                    "denied (read_only)" if self._read_only else "allowed")
 
     def _init_hindsight(self, session_id: str, kwargs: Dict[str, Any]) -> Optional[MemoryProvider]:
         provider = load_memory_provider("hindsight")
@@ -414,7 +461,12 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         # Write side. Automatic capture is always personal — shared facts are
         # written deliberately, through the tool. With no identity there is
         # nobody to attribute a turn to, so nothing is captured automatically.
-        if self._user_tag:
+        if self._read_only:
+            provider._retain_tags = []
+            provider._tags = None
+            provider._observation_scopes = None
+            provider._auto_retain = False
+        elif self._user_tag:
             provider._retain_tags = [self._user_tag]
             provider._tags = [self._user_tag]
             # One durable scope per user. Without this the `session:<id>` tag the
@@ -505,6 +557,8 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if self._hindsight is None:
             return ""
+        if self._read_only:
+            return f"{SYSTEM_PROMPT_HEADER}\n{SYSTEM_PROMPT_READ_ONLY}"
         if not self._user_tag:
             reason = self._personal_disabled_reason
             block = f"{SYSTEM_PROMPT_HEADER}\n{SYSTEM_PROMPT_SHARED_ONLY}"
@@ -531,11 +585,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     # — it takes explicit writes through memory_retain(scope="shared").
 
     def sync_turn(self, user_content: str, assistant_content: str, **kwargs: Any) -> None:
-        if self._user_tag:
+        if self._user_tag and not self._read_only:
             self._call("sync_turn", user_content, assistant_content, **kwargs)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if self._user_tag:
+        if self._user_tag and not self._read_only:
             self._call("on_session_end", messages)
 
     # -- tools ---------------------------------------------------------------
@@ -558,7 +612,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 "the whole team or organisation — every user can read it."
             ),
         }
-        return [
+        # A read-only profile is not shown the write tool at all. Advertising it
+        # and refusing the call would spend a turn and read as a transient
+        # failure worth retrying; the absent schema is unambiguous. The refusal
+        # in handle_tool_call stays as the backstop.
+        retain: List[Dict[str, Any]] = [] if self._read_only else [
             {
                 "name": "memory_retain",
                 "description": (
@@ -576,7 +634,9 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                     },
                     "required": ["content"],
                 },
-            },
+            }
+        ]
+        return retain + [
             {
                 "name": "memory_recall",
                 "description": (
@@ -621,6 +681,16 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             return tool_error(f"Unknown memory tool: {tool_name}")
 
         is_write = tool_name == "memory_retain"
+        if is_write and self._read_only:
+            # Backstop for the schema omission above. Reached only if the model
+            # invents the call or a cached schema outlives a config change.
+            logger.warning("%s: refused a write on a read-only profile", PROVIDER_NAME)
+            return tool_error(
+                "Memory is read-only for this agent — there is no way to write to it "
+                "from here, and retrying will not change that. Report the fact in "
+                "your result instead; recording it is the front-door agent's job.",
+                status="read_only",
+            )
         scope = str(args.get("scope") or ("personal" if is_write else "both")).strip().lower()
         if scope not in _SCOPES or (is_write and scope == "both"):
             return tool_error(
