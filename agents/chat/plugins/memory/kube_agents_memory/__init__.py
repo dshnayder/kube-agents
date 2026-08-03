@@ -42,6 +42,14 @@ each is pinned here rather than left to configuration:
   provenance tags ride along. Hindsight's own consolidator documents this as the
   intended use of explicit scopes.
 
+A fourth upstream behaviour is corrected rather than pinned. The stock read
+tools answer an empty result with the string ``"No relevant memories found."``,
+which a model reads as *no such record exists* — a claim it will then make
+confidently about a store that holds the fact. ``memory_recall`` and
+``memory_reflect`` are therefore implemented here to name their outcome
+(``found`` / ``no_match`` / ``unreachable``) and to report the search they ran,
+so absence is attributable to a query and a scope. See ``NO_MATCH_GUIDANCE``.
+
 The two banks this replaced also carried a mission each — what the bank is for,
 and what is worth extracting into it. One bank has one ``retain_mission``, but
 ``retain_mission`` is a per-bank *configurable* field, and configurable fields
@@ -174,7 +182,53 @@ RECALL_PREAMBLE = (
     "Durable facts recalled from previous sessions — both what you know about "
     "the person you are talking to and what the organisation has recorded for "
     "everyone. Use them to answer directly and to resolve possessives before "
-    "delegating. Do not look these up with a tool — they are already here."
+    "delegating. Do not look these up with a tool — they are already here. "
+    "These are the entries that matched this turn, not an index of everything "
+    "recorded; something absent here may still be in memory."
+)
+
+# What a read reports about itself.
+#
+# The stock tool answers an empty recall with the bare string "No relevant
+# memories found." A model reads that as *no such record exists* and will then
+# say so with full confidence: in the scale test, a specialist reported a real
+# ADR as "zero records — its content isn't recorded anywhere retrievable" while
+# the ADR's text sat in the store it was nominally reading. The failure is in the
+# return value, not the model. Three outcomes are not interchangeable, and the
+# tool has to name which one happened rather than leaving it to be inferred:
+#
+#   found       — the store answered, and matched
+#   no_match    — the store answered, and matched nothing *for this query*
+#   unreachable — the store did not answer; nothing was searched at all
+#
+# Every return therefore also carries a `searched` envelope — bank, scope tags,
+# query, layer — so an empty result is attributable to a search that was run,
+# rather than reading as a property of the world.
+NO_MATCH_GUIDANCE = (
+    "The store was reachable and answered: this query matched nothing. That is "
+    "not the same as the record not existing. Recall is a semantic search that "
+    "returns top matches over the consolidated layer, so a record phrased "
+    "differently, held under a scope not searched here, or retained but not yet "
+    "consolidated will not surface. Do not report that something does not exist "
+    "on the strength of this result — report that the search did not surface it, "
+    "and try an exact identifier, different wording, or a wider scope."
+)
+UNREACHABLE_GUIDANCE = (
+    "Memory could not be reached, so nothing was searched. This is a failure of "
+    "the store, not an absence of records. Say that memory was unavailable; do "
+    "not answer as though it were empty."
+)
+
+# The rule the return values above exist to make followable. Stated in the system
+# prompt as well as in each result, because the injected block has no return
+# value to carry it: when nothing matches, no memory block appears at all, and
+# silence is the one outcome the tool cannot annotate.
+MEMORY_ABSENCE_RULE = (
+    "Memory is a search, not an index. Neither the injected entries nor a "
+    "`memory_recall` result is a list of everything recorded, and a read can "
+    "fail to reach the store entirely. Never state that a record does not exist "
+    "because memory did not return it — say that you could not find it, and name "
+    "which it was: the search matched nothing, or memory was unavailable."
 )
 
 SYSTEM_PROMPT_HEADER = "# Memory"
@@ -189,13 +243,17 @@ SYSTEM_PROMPT_BODY = (
     "default; use them only when the injected memories are not enough. "
     "`memory_retain` writes a personal fact unless you pass `scope: \"shared\"`, "
     "which you should do only for facts that are true for everybody, never for "
-    "one person's preferences."
+    "one person's preferences.\n"
+    "\n"
+    + MEMORY_ABSENCE_RULE
 )
 SYSTEM_PROMPT_SHARED_ONLY = (
     "You have long-term memory, but only the **shared** part of it is reachable "
     "here — the facts this organisation has recorded for everyone. Relevant "
     "entries are injected into your context automatically. `memory_recall` and "
-    "`memory_reflect` search them; `memory_retain` adds to them."
+    "`memory_reflect` search them; `memory_retain` adds to them.\n"
+    "\n"
+    + MEMORY_ABSENCE_RULE
 )
 
 
@@ -524,7 +582,10 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 "description": (
                     "Search long-term memory. Relevant memories are already recalled "
                     "into your context each turn; use this only for something you "
-                    "need now and cannot see there."
+                    "need now and cannot see there. Returns a `status` of `found`, "
+                    "`no_match` (searched, matched nothing) or `unreachable` (the "
+                    "store did not answer) — the last two are not evidence that a "
+                    "record does not exist."
                 ),
                 "parameters": {
                     "type": "object",
@@ -623,22 +684,76 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         if not query:
             return tool_error("Missing required parameter: query")
         tags = self._tags_for(scope)
-
         if tool_name == "memory_recall":
-            # The stock tool already applies _recall_tags, which cover 'both'.
-            # Narrower scopes need the filter swapped for the call.
-            if scope == "both":
-                return self._hindsight.handle_tool_call("hindsight_recall", {"query": query})
-            previous = self._hindsight._recall_tags
-            self._hindsight._recall_tags = tags
-            try:
-                return self._hindsight.handle_tool_call("hindsight_recall", {"query": query})
-            finally:
-                self._hindsight._recall_tags = previous
+            return self._recall(query, scope, tags)
+        return self._reflect(query, scope, tags)
 
-        return self._reflect(query, tags)
+    def _searched(self, tool_name: str, query: str, scope: str, tags: List[str]) -> Dict[str, Any]:
+        """Describe the search that was run, whatever its outcome.
 
-    def _reflect(self, query: str, tags: List[str]) -> str:
+        Returned alongside every read so that "nothing came back" is a statement
+        about a query and a scope, not about the world. See NO_MATCH_GUIDANCE.
+        """
+        envelope: Dict[str, Any] = {
+            "tool": tool_name,
+            "query": query,
+            "scope": scope,
+            "bank": self._hindsight._bank_id,
+            "tags": list(tags),
+        }
+        if tool_name == "memory_recall":
+            types = getattr(self._hindsight, "_recall_types", None)
+            if types:
+                envelope["layer"] = list(types)
+        return envelope
+
+    def _recall(self, query: str, scope: str, tags: List[str]) -> str:
+        """Search, and report what was searched.
+
+        Written against the client rather than delegated to ``hindsight_recall``
+        for two reasons. The stock tool collapses an empty result set to the
+        string "No relevant memories found." and a transport failure to a generic
+        tool error, which is exactly the conflation this replaces; and it filters
+        on the instance's own ``_recall_tags``, so a narrower scope could only be
+        served by mutating that attribute around the call and restoring it after.
+        One direct call serves every scope and keeps the outcome distinguishable.
+        """
+        searched = self._searched("memory_recall", query, scope, tags)
+        recall_kwargs: Dict[str, Any] = {
+            "bank_id": self._hindsight._bank_id,
+            "query": query,
+            "budget": getattr(self._hindsight, "_budget", "mid"),
+            "max_tokens": getattr(self._hindsight, "_recall_max_tokens", 4096),
+            "tags": tags,
+            "tags_match": TAGS_MATCH,
+        }
+        types = getattr(self._hindsight, "_recall_types", None)
+        if types:
+            recall_kwargs["types"] = list(types)
+        try:
+            response = self._hindsight._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs)
+            )
+        except Exception as e:
+            logger.warning("%s: recall failed (scope=%s): %s", PROVIDER_NAME, scope, e)
+            return tool_error(
+                f"Memory is unreachable: {e}. {UNREACHABLE_GUIDANCE}",
+                status="unreachable",
+                searched=searched,
+            )
+        results = list(getattr(response, "results", None) or [])
+        if not results:
+            return json.dumps(
+                {"status": "no_match", "searched": searched, "matches": 0,
+                 "result": NO_MATCH_GUIDANCE}
+            )
+        lines = [f"{i}. {getattr(r, 'text', '') or ''}" for i, r in enumerate(results, 1)]
+        return json.dumps(
+            {"status": "found", "searched": searched, "matches": len(results),
+             "result": "\n".join(lines)}
+        )
+
+    def _reflect(self, query: str, scope: str, tags: List[str]) -> str:
         """Synthesize across memories, with the tag filter the stock tool omits.
 
         ``hindsight_reflect`` calls ``areflect(bank_id, query, budget)`` and
@@ -648,6 +763,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         bank-level and not tag-scoped — this deployment creates none, so the
         exclusion costs nothing and removes the one remaining unscoped path.
         """
+        searched = self._searched("memory_reflect", query, scope, tags)
         bank_id = self._hindsight._bank_id
         budget = getattr(self._hindsight, "_budget", "mid")
         try:
@@ -658,9 +774,18 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 )
             )
         except Exception as e:
-            logger.warning("%s: reflect failed: %s", PROVIDER_NAME, e)
-            return tool_error(f"Failed to reflect: {e}")
-        return json.dumps({"result": getattr(response, "text", "") or "No relevant memories found."})
+            logger.warning("%s: reflect failed (scope=%s): %s", PROVIDER_NAME, scope, e)
+            return tool_error(
+                f"Memory is unreachable: {e}. {UNREACHABLE_GUIDANCE}",
+                status="unreachable",
+                searched=searched,
+            )
+        text = str(getattr(response, "text", "") or "").strip()
+        if not text:
+            return json.dumps(
+                {"status": "no_match", "searched": searched, "result": NO_MATCH_GUIDANCE}
+            )
+        return json.dumps({"status": "found", "searched": searched, "result": text})
 
     # -- helper --------------------------------------------------------------
 

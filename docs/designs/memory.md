@@ -179,9 +179,10 @@ the reader has no way to tell that checking was foreclosed.
 
 **Recommendation: adopt Hindsight**, with three conditions tracked as work items —
 per-unit provenance on retain (#111/#116), recall returning what it _searched_ and
-not only what it _found_ (#113), and shared-scope read access for specialists
-(#112). Scope of evidence: one synthetic corpus, one model, ten hand-scored probes
-per arm. Enough to decide direction; not a benchmark.
+not only what it _found_ (#113, now built —
+[a read names its outcome](#a-read-names-its-outcome)), and shared-scope read
+access for specialists (#112). Scope of evidence: one synthetic corpus, one model,
+ten hand-scored probes per arm. Enough to decide direction; not a benchmark.
 
 ---
 
@@ -505,10 +506,41 @@ personal half is not), while an explicit `personal` returns the disabling reason
 an error. `_tags_for(scope)` is the single place tags are derived, used by both the
 read and write paths.
 
-`memory_recall` at `scope="both"` delegates straight to `hindsight_recall`, whose
-own `_recall_tags` already cover both. A narrower scope swaps `_recall_tags` for the
-call and restores it in a `finally`. `memory_reflect` never delegates — see pinned
-setting 3.
+Neither read delegates to the stock tool. `memory_reflect` cannot, because
+`hindsight_reflect` drops the tag filter (pinned setting 3). `memory_recall` no
+longer does either, for the reason below; both call the client directly, and
+`_tags_for(scope)` supplies the filter, so every scope takes one code path.
+
+#### A read names its outcome
+
+Three things can happen to a read, and they are not interchangeable:
+
+| `status`      | What happened                                  | What the caller may conclude          |
+| ------------- | ---------------------------------------------- | ------------------------------------- |
+| `found`       | The store answered and matched                 | These are matches, not the full index |
+| `no_match`    | The store answered; this query matched nothing | Nothing — the record may still exist  |
+| `unreachable` | The store did not answer; nothing was searched | Nothing about the contents at all     |
+
+The stock tools collapse the last two into one string, `"No relevant memories
+found."`, and a model reads that as _no such record exists_ — then says so with
+full confidence. The experiment caught exactly that: a specialist reported a real
+ADR as "zero records — its content isn't recorded anywhere retrievable" while the
+ADR's text sat in the store it was nominally reading
+([Answer quality, head to head](#answer-quality-head-to-head)). The failure is in
+the return value, not the model.
+
+So every read also returns a **`searched` envelope** — bank, scope tags, query,
+and for recall the layer (`_recall_types`, `observation` by default) — which makes
+an empty result attributable to a search that was run rather than a property of
+the world. `no_match` and `unreachable` each carry standing guidance
+(`NO_MATCH_GUIDANCE`, `UNREACHABLE_GUIDANCE`) naming what may not be inferred.
+`unreachable` is returned through `tool_error`, so it is an error in the
+transcript as well as a status field.
+
+The rule is also stated in the system prompt (`MEMORY_ABSENCE_RULE`), because one
+surface has no return value to carry it: when the per-turn prefetch matches
+nothing, **no memory block appears at all**, and silence is the one outcome a tool
+cannot annotate. `tests/memory/test_recall_reporting.py` locks the contract down.
 
 For the Chat Agent to see any of this, `memory` must be listed in
 `platform_toolsets` **and** absent from `agent.disabled_toolsets`; the denylist is
@@ -542,9 +574,10 @@ in both forms:
 
 The decisive argument for including the tool is **failure legibility**. Injected
 context that is unavailable arrives as an absent block, indistinguishable from
-"nothing is recorded about this". A tool call returns an error, and an error is a
-fact the agent can report. That is what turns #113 from prompt wording into a
-mechanism.
+"nothing is recorded about this". A tool call returns a named outcome, and a named
+outcome is a fact the agent can report — which is what
+[a read names its outcome](#a-read-names-its-outcome) already builds, and why it
+landed before this.
 
 **Not `memory_retain`, in any form.** A specialist that could write shared memory
 could launder its own derived-from-prior-runs conclusions into the corpus as facts.
@@ -823,7 +856,9 @@ clusters exist. It converted _"not in what I retrieved"_ into _"not recorded
 anywhere"_. That is #113, and the same run showed it is an **interface** fix rather
 than a prompt fix: on the nonexistent-ADR probe the agent made the same class of
 negative claim but scoped it to its own retrieval, and was right. Recall should
-return what it _searched_, not only what it _found_.
+return what it _searched_, not only what it _found_ — which is now what it does
+([a read names its outcome](#a-read-names-its-outcome)), pending the re-measurement
+in #115.
 
 Three behaviours appeared in the Hindsight arm that had no counterpart in the file
 arm:
@@ -937,9 +972,10 @@ it is written down: **re-query before recording an error.**
 - **#111 / #116 — per-unit provenance.** The seeder is fixed; provenance marking on
   shared memory is not built. The escalation-ladder imprecision is what it would have
   caught.
-- **#113 — recall should return what it searched.** The one scored error in the
-  Hindsight arm, and the same run demonstrated the fix is an interface change rather
-  than prompt wording.
+- **#113 — recall returns what it searched.** Built, and unit-tested against the
+  three outcomes; but the thing it is meant to prevent is a model's inference, and
+  no live probe has been run against it. It stays here until #115 re-measures the
+  one scored error in the Hindsight arm.
 - **#112 — specialists get shared-scope read access.** Five improvised data paths
   argue for it; the token arithmetic for the alternative is one-sided (injecting the
   file store into every specialist turn puts a three-way delegation past 330k tokens
