@@ -50,9 +50,15 @@ start** — mid-session writes hit disk immediately but do not change the prompt
 which is what preserves the prefix cache for the rest of the session.
 
 Critically, it is **bounded**: 2,200 characters for `MEMORY.md`, 1,375 for
-`USER.md`, with an LLM consolidation pass when a write would exceed the limit.
-That bound is the whole reason the design works. It is also single-user — there is
-no `user_id` anywhere in it.
+`USER.md`. The bound is admission control on writes, not truncation on reads — a
+write that would push the file past its limit is refused, and the refusal hands
+the model the current entries with an instruction to consolidate (merge
+overlapping entries with `replace`, drop stale ones with `remove`) and retry in
+the same turn, with a three-failure circuit breaker so a memory that cannot be
+made to fit does not cost the user their reply. That bound is the whole reason
+the design works: it is the only thing that ever removes an entry, so it is what
+forces the file to stay a summary. It is also single-user — there is no `user_id`
+anywhere in it.
 
 ### The plugin providers
 
