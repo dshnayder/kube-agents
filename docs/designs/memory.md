@@ -87,16 +87,37 @@ and incident history. That is why the shortlist has one entry on it.
 
 Before Hindsight this repository carried its own provider,
 [`multiuser_memory`](../../tests/memory-scale/fixtures/multiuser_memory.py)
-(vendored into the test tree because it no longer exists on `main`). It took
+(vendored into the test tree because this branch removes it). It took
 Hermes' file memory and made it multi-user in the obvious way: one Markdown file
 per user under `memories/users/<id>.md`, one shared `memories/MEMORY.md`, `§` as
 the entry delimiter, and `system_prompt_block()` concatenating the relevant files
 into the system prompt.
 
 It did the isolation job correctly — the experiment measured **zero tag leaks**
-from it at every corpus size. What it dropped, in porting the design, was the
-**character bound**. `system_prompt_block()` has no truncation, no budget and no
-relevance filter. That single omission is the entire subject of the next section.
+from it at every corpus size. What it lost, in porting the design, was everything
+the built-in does that the file format does not show.
+
+The port matched what was visible: the `§` delimiter, the tool schema, the file
+layout. It silently dropped five behaviours — the **character bound**, the file
+lock serialising read-modify-write, the external-drift guard, the prompt-injection
+scan on stored entries, and the frozen system-prompt snapshot that keeps the
+prefix cache valid across a session. Nobody noticed, for the same reason the port
+read as faithful in the first place: a lookalike is indistinguishable from its
+reference right up until one of the invisible behaviours is needed.
+
+The first of the five is the one this document is about.
+`system_prompt_block()` had no truncation, no budget and no relevance filter, so
+the store feeding it was an append-only log injected whole on every turn. That
+omission is the entire subject of the next section.
+
+The provider has since been rewritten to subclass Hermes' own `MemoryStore` and
+delegate to its `memory_tool()` dispatcher, overriding only where the personal
+file lives. All five behaviours return by inheritance rather than by porting, and
+the contract becomes the one the design always intended: whatever the built-in
+memory does, this does, including its bugs. This branch removes the provider
+regardless — the rewrite matters for deployments that stay on the file store, and
+it does not change the arithmetic below. It changes which side of that arithmetic
+the file store lands on, which is [the third arm](#why-not-just-bound-the-file).
 
 ---
 
@@ -161,6 +182,52 @@ document store carries identifiers out-of-band rather than in prose, it can cite
 records the flat file structurally cannot: measured head to head on the same ten
 questions, **59 citations against 34**, with 23 of the 59 from families the flat
 file holds no handle for.
+
+### Why not just bound the file?
+
+It is the first objection anyone raises at 110,907 tokens, and it deserves a
+number rather than an argument.
+
+Hermes' built-in memory is already bounded: **2,200 characters** for `MEMORY.md`,
+**1,375** for `USER.md`. The bound is **admission control on writes, not
+truncation on reads** — a write that would push the file past its limit is
+refused, and the refusal hands the model the current entries with an instruction
+to consolidate (merge overlapping entries with `replace`, drop stale ones with
+`remove`) and retry within the same turn, behind a three-failure circuit breaker
+so a memory that cannot be made to fit costs a few tool calls rather than the
+user's reply. There is no background summarisation pass: the model doing the
+consolidating is the one holding the turn, spending the user's latency to do it.
+
+Now apply that bound to this corpus. The 1,414 shared records average 313
+characters each (min 141, median 247, max 1,891). Filling `MEMORY.md` in corpus
+order until the next write is refused:
+
+```
+4 of 1,414 entries fit — 2,181 of 2,200 characters — 0.28% of the corpus
+```
+
+Which makes the comparison three arms, not two:
+
+| Arm                                        |       Gold recall | Context tokens | Share of a 200k window |
+| ------------------------------------------ | ----------------: | -------------: | ---------------------: |
+| File-based, unbounded (what was measured)  |             1.000 |        110,799 |                    55% |
+| File-based, bounded as the built-in bounds | ~0 _(arithmetic)_ |           ~550 |                  <0.3% |
+| Hindsight                                  |             0.702 |          4,264 |                   2.1% |
+
+The bounded row is arithmetic, not a measurement — no scored run was made against
+a 4-entry store, because there is nothing left to score.
+
+The bound is not a defect in the built-in store, and raising it is not the fix.
+The ceiling is what makes that design work: nothing in a file store ever removes
+an entry on its own, so admission control is the only mechanism that keeps the
+file a summary rather than a log. And raising the ceiling raises the per-turn tax
+by exactly the amount raised, because the tax _is_ the file, injected whole.
+
+That is the argument in one table. **There is no setting of the file store that is
+both affordable and complete.** Unbounded, it is perfectly accurate and costs 55%
+of the window before anyone has spoken. Bounded as designed, it costs almost
+nothing and holds 0.28% of what the fleet knows. Decoupling cost from corpus size
+is not an optimisation of the file store — it is the only other option.
 
 ### The honest caveat, and the recommendation
 
@@ -1038,6 +1105,16 @@ field originally filed, which would have returned the packed document's identifi
 authoritatively and made a wrong citation look sourced. Reseeding with `--batch 1`
 produced 1,664 documents and 4,400 memory units, and Round A′ was run against that.
 **Always seed with `--batch 1`.**
+
+**The file arm was measured unbounded, and that needs saying out loud.**
+`measure_file_based.py` writes `MEMORY.md` and `users/*.md` itself, in the on-disk
+format, and stubs `atomic_replace`; it never goes through the provider's write
+path, so admission control was never in play — and the provider being measured had
+none anyway. The 1.000 / 110,907 row is therefore the _unbounded_ file store,
+which is exactly what shipped. Adding the bound does not move that row, it
+produces a different one: [the third arm](#why-not-just-bound-the-file). Both are
+reported, because dropping the unbounded row would quietly discard the strongest
+result the file store has.
 
 **The answer probes were initially scored at the wrong layer.** The first scored
 replies were the specialist's, and the specialist has no memory provider in either
