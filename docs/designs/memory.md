@@ -106,19 +106,9 @@ prefix cache valid across a session. Nobody noticed, for the same reason the por
 read as faithful in the first place: a lookalike is indistinguishable from its
 reference right up until one of the invisible behaviours is needed.
 
-The first of the five is the one this document is about.
-`system_prompt_block()` had no truncation, no budget and no relevance filter, so
-the store feeding it was an append-only log injected whole on every turn. That
-omission is the entire subject of the next section.
-
-The provider has since been rewritten to subclass Hermes' own `MemoryStore` and
-delegate to its `memory_tool()` dispatcher, overriding only where the personal
-file lives. All five behaviours return by inheritance rather than by porting, and
-the contract becomes the one the design always intended: whatever the built-in
-memory does, this does, including its bugs. This branch removes the provider
-regardless — the rewrite matters for deployments that stay on the file store, and
-it does not change the arithmetic below. It changes which side of that arithmetic
-the file store lands on, which is [the capacity proof](#bounded-as-designed-a-capacity-proof).
+The first of the five is the one this document is about, and it is the reason the
+measured file-based arm looks the way it does:
+[a file store must be bounded, and this one was not](#a-file-store-must-be-bounded-and-this-one-was-not).
 
 ---
 
@@ -129,29 +119,90 @@ that claim, and it is built so that every load-bearing number is either measured
 in [the experiment](#the-experiment) or arithmetic on two measured quantities.
 Where something is unmeasured it is labelled unmeasured and carries no weight.
 
-### The alternative, stated precisely
+### A file store must be bounded, and this one was not
 
-The thing Hindsight replaces is Hermes' built-in file memory: two Markdown files
-concatenated into the system prompt at session start. Its size is fixed in
-source — `MemoryStore.__init__` in `tools/memory_tool.py` defaults to
+Hermes' built-in file memory is bounded, and the limits are in source rather than
+in configuration: `MemoryStore.__init__` in `tools/memory_tool.py` defaults to
 **2,200 characters** for `MEMORY.md` and **1,375** for `USER.md`.
 
-That bound is **admission control on writes, not truncation on reads**. A write
+The bound is **admission control on writes, not truncation on reads**. A write
 that would push a file past its limit is refused, and the refusal hands the model
-the current entries with an instruction to consolidate — merge overlapping
-entries with `replace`, drop stale ones with `remove` — and retry within the same
-turn, behind a three-failure circuit breaker so a memory that cannot be made to
-fit costs a few tool calls rather than the user's reply. Nothing truncates at read
+the current entries with an instruction to consolidate — merge overlapping entries
+with `replace`, drop stale ones with `remove` — and retry within the same turn,
+behind a three-failure circuit breaker so a memory that cannot be made to fit
+costs a few tool calls rather than the user's reply. Nothing truncates at read
 time: `_render_block()` renders whatever is on disk, whole.
 
-So there are exactly two ways to run a file store, and the case for Hindsight is
-that **both are measured, and neither works at fleet scale.**
+That bound is the load-bearing part of the design, not a safety margin bolted onto
+it. **Nothing else in a file store ever removes an entry.** There is no eviction,
+no TTL, no relevance filter, no background compaction. Admission control is the
+sole mechanism that keeps the file a summary rather than an append-only log, and a
+file store without it does not degrade gracefully — it grows without limit until
+the window is gone.
 
-### Bounded as designed: a capacity proof
+[`multiuser_memory`](#multiuser_memory-the-provider-this-replaced) — the provider
+this repository shipped and the one the experiment measured — **did not have it.**
+The port reproduced the `§` entry format, the tool schema and the file layout, and
+silently dropped the bound along with four other invisible behaviours. So the
+measured file-based arm below is not a legitimate configuration anyone would
+choose. It is a defect, and the correct implementation of a per-user file store is
+the bounded one.
 
-Take the built-in at its shipped limit and point it at the corpus the experiment
-uses — 1,414 shared records, **443,196 characters**, measured by calling the real
-provider's own `system_prompt_block()`.
+**That defect is now fixed.** The provider was rewritten to subclass `MemoryStore`
+and delegate to upstream's `memory_tool()` dispatcher, overriding only where the
+personal file lives, so the bound and the other four behaviours return by
+inheritance rather than by porting. Which means the two sections that follow are
+not a choice between two options. They are **what was measured** (unbounded, the
+bug) and **what the corrected implementation can hold** (bounded, the fix) — and
+the case for Hindsight is that neither one can carry a fleet's knowledge.
+
+### Unbounded: memory eats the window
+
+Because the shipped provider had no bound, the experiment could measure the cost
+of unboundedness directly rather than having to model it. The store is
+concatenated into the system prompt at session start, **on every turn, before the
+user has said anything**:
+
+```
+1,414 shared records → 443,196 characters ≈ 110,799 tokens
+```
+
+Claude Opus 5 on Vertex carries a 200k window, so the corpus fits and the provider
+does not fall over. It occupies **55% of the window as a fixed tax**. The question
+is what the remaining 45% still has to pay for, because memory is not the only
+thing in there. Measured from the profile sources in this repository, at
+`TOK_PER_CHAR = 0.25`:
+
+| What must also fit                              | Size                             |
+| ----------------------------------------------- | -------------------------------- |
+| Chat Agent persona (`SOUL.md` + `AGENTS.md`)    | 28,244 ch ≈ **7,061 tok**        |
+| Hermes' own base system prompt                  | not measured here, non-zero      |
+| Tool schemas for the delegation surface         | not measured here, non-zero      |
+| A skill body, loaded on demand                  | up to 101,431 ch across 17 files |
+| The conversation itself, and delegated progress | grows for the length of a thread |
+
+Three consequences, each arithmetic on a measured quantity:
+
+- **The hard ceiling.** Extrapolating the measured slope, roughly **2,600 shared
+  records exhausts the 200k window on its own** — no persona, no tools, no
+  conversation. A fleet reaches 2,600 records quickly.
+- **Skills stop loading.** The Platform Agent's seventeen skill bodies total
+  101,431 characters ≈ 25,358 tokens. A specialist carrying the same store spends
+  55% of its window on memory before it opens the skill it was delegated work to
+  use.
+- **Delegation becomes impossible.** This system's normal path is Chat Agent →
+  specialist → cluster agent. Injecting the store into each of the three costs
+  `3 × 110,799 = 332,397 tokens` of memory alone — **1.66 windows**, before a
+  single persona, tool schema or user word. The architecture does not merely get
+  expensive; it stops working.
+
+This is the failure mode the bound exists to prevent, and it is why leaving
+`multiuser_memory` unbounded was never a viable answer to "the file is too big."
+
+### Bounded: what 2,200 characters holds
+
+Now run the corrected implementation — bounded exactly as the built-in bounds —
+against the same corpus.
 
 ```
 2,200 of 443,196 characters = 0.50% of the corpus
@@ -159,67 +210,45 @@ provider's own `system_prompt_block()`.
 
 At the corpus mean of 313 characters per record (min 141, median 247, max 1,891),
 2,200 characters is **about seven records** of 1,414. Filling `MEMORY.md` in
-corpus order until the next write is refused fits **four** — the first four
-records happen to run above mean. Either way the share is the same half a percent.
+corpus order until the next write is refused fits **four**, the first four running
+above mean. Either way the share is the same half a percent, and the per-turn cost
+falls from 110,799 tokens to roughly **550**.
 
 **No recall figure is reported for this arm, and none is needed.** That is the
 point of stating it as capacity rather than as a measurement. A measurement would
 tell you how one consolidation strategy performed on one run; the capacity bound
 holds for _every_ strategy, including a perfect one, because no strategy stores
-more than 2,200 characters. It is an upper bound, and an upper bound of 0.50% is a
-stronger claim than any recall number we could have gone and measured.
+more than 2,200 characters. An upper bound of 0.50% over all possible strategies
+is a stronger claim than any single measured number, and it is the one the
+decision rests on.
 
-What that leaves is a real and useful thing — a running, model-curated summary of
-the fleet's conventions, for about 550 tokens a turn. It is not a knowledge base,
-and no setting makes it one.
+What the bounded store leaves is real and worth having — a running, model-curated
+summary of the fleet's conventions for about 550 tokens a turn, with total recall
+of what it holds. It is a good conventions store. It is not a knowledge base, and
+no setting makes it one.
 
-### Unbounded: the measured arm
+### Why you cannot tune between them
 
-The provider this repository actually shipped,
-[`multiuser_memory`](#multiuser_memory-the-provider-this-replaced), had no bound
-— which is why the experiment could measure the other horn directly rather than
-having to model it. Injected whole, on every turn, before the user has said
-anything:
+The obvious move is to raise the limit until the corpus fits. That is not
+available, for a reason that is arithmetic rather than taste: **the tax _is_ the
+file, injected whole**, so raising the ceiling raises the per-turn cost by exactly
+the amount raised. A limit large enough to hold this corpus reproduces the
+unbounded arm at 55% of the window. A limit small enough to be affordable holds
+half a percent. The two sections above are not the ends of a spectrum with a
+comfortable middle — they are the same curve read at two points, and every point
+on it trades recall against window one-for-one.
 
-```
-1,414 shared records → 443,196 characters ≈ 110,799 tokens
-```
+Nor can the bound be removed to escape the trade, because removing it is what
+produced the defect in the first place.
 
-Claude Opus 5 on Vertex carries a 200k window, so the corpus fits — the file
-provider does not fall over. It occupies **55% of the window as a fixed tax on
-every turn**. Extrapolating the measured slope, roughly **2,600 shared records
-exhausts the window on its own**, leaving nothing for the conversation, the tool
-schemas, or the agent's own persona.
+**There is no setting of a file store that is both affordable and complete.** That
+sentence is the case for a different storage layer, and it rests on two measured
+quantities and a division.
 
-Cost is the ceiling but not the only defect, and the other two are measured too:
-
-- **Injecting everything means ranking nothing.** On the six policies in the
-  corpus that exist in three dated versions, the file provider put the _current_
-  version ahead of its superseded predecessors **42.9%** of the time. The model
-  rebuilds the supersession chain from prose, on every turn, out of its own budget.
-- **It can only carry an identifier somebody wrote into a sentence.** Of 1,664
-  corpus records the file store holds the content of all of them and the handle
-  for **193**. The other 1,471 arrive as prose with their identifier stripped. It
-  answers correctly, without provenance, and nothing in its output signals that
-  provenance was unavailable.
-
-### The two horns are not a dial
-
-The obvious move — raise the limit until it fits — is not available, and the
-reason is arithmetic rather than preference. The tax **is** the file, injected
-whole, so raising the ceiling raises the per-turn cost by exactly the amount
-raised. A limit large enough to hold this corpus is the unbounded arm, at 55% of
-the window; a limit small enough to be free holds half a percent.
-
-Nor is the bound a defect to be patched out. It is the only mechanism in a file
-store that ever removes an entry — nothing else deletes, ever — so it is the sole
-reason the file stays a summary rather than becoming an append-only log. Remove it
-and you have the unbounded arm by another route, which is precisely how the
-shipped provider ended up there.
-
-**There is no setting of the file store that is both affordable and complete.**
-That sentence is the case for a different storage layer, and it rests on two
-measured quantities and a division.
+The way out is not a bigger file or a smaller one. It is to stop paying for
+knowledge the current turn does not need — which means the store has to be
+_searched_ at turn time rather than _injected_ at session start. That is a
+retrieval mechanism, and it is what Hindsight is.
 
 ### What a document store does instead
 
@@ -1157,7 +1186,7 @@ format, and stubs `atomic_replace`; it never goes through the provider's write
 path, so admission control was never in play — and the provider being measured had
 none anyway. The 1.000 / 110,907 row is therefore the _unbounded_ file store,
 which is exactly what shipped. Adding the bound does not move that row, it
-produces a different one: [the capacity proof](#bounded-as-designed-a-capacity-proof). Both are
+produces a different one: [what a bounded store holds](#bounded-what-2200-characters-holds). Both are
 reported, because dropping the unbounded row would quietly discard the strongest
 result the file store has.
 
