@@ -25,7 +25,8 @@ the measurements say the change bought.
 ### Why the agent needs memory at all
 
 An agent that answers questions about a fleet has to know things nobody will
-restate for it in the prompt: which ADR is current, which of three dated versions
+restate for it in the prompt: which architecture decision is current, which of three
+dated versions
 of a retention policy still applies, who owns a control, which cluster is the
 exception to the rule everyone else follows. None of that is derivable from the
 cluster — it is organisational knowledge, and it accrues.
@@ -567,8 +568,8 @@ Three things can happen to a read, and they are not interchangeable:
 The stock tools collapse the last two into one string, `"No relevant memories
 found."`, and a model reads that as _no such record exists_ — then says so with
 full confidence. The experiment caught exactly that: a specialist reported a real
-ADR as "zero records — its content isn't recorded anywhere retrievable" while the
-ADR's text sat in the store it was nominally reading
+decision record as "zero records — its content isn't recorded anywhere retrievable"
+while that record's text sat in the store it was nominally reading
 ([Answer quality, head to head](#answer-quality-head-to-head)). The failure is in
 the return value, not the model.
 
@@ -838,7 +839,8 @@ categories**, of which **1,414 are `scope: shared`** and 250 are per-user.
 The corpus is adversarial in the way a real one is: six policies exist in three
 dated versions each with `supersedes` links in the prose, 55 exception records
 contradict the general rule, 450 inventory records disagree with each other about
-the same clusters, and two probes ask about a cluster and an ADR that do not exist.
+the same clusters, and two probes ask about a cluster and a decision record that do
+not exist.
 
 Twenty-six scored probes in
 [`queries.json`](../../tests/memory-scale/queries.json), each naming its **gold
@@ -873,7 +875,7 @@ service-account-key policy with the file provider configured, the agent led with
 history — because the corpus writes the supersession chain into the prose, so a
 model that reads all three can rebuild it. Two limits: it depends on the corpus
 carrying those markers, which no provider can guarantee; and in that probe the three
-ADRs sat adjacent in the first 1% of the block. What the metric measures correctly is
+versions sat adjacent in the first 1% of the block. What the metric measures correctly is
 the **work** — with Hindsight the current version arrives first and the superseded
 ones mostly do not arrive at all.
 
@@ -932,6 +934,12 @@ drops comments:
 | `ADR-`, `RB-`, `PM-`                                            |   **193** |           **193** |
 | `CONV-`, `DEP-`, `OWN-`, `EXC-`, `GOT-`, `CAP-`, `MIG-`, `INV-` |     1,471 |             **0** |
 
+Those prefixes are the corpus's record families: architecture decisions,
+runbooks, postmortems, conventions, deprecations, ownership, exceptions, gotchas,
+capacity, migrations, inventory. They are literal identifiers in
+[the corpus generator](../../tests/memory-scale/harness/gen_fleet_corpus.py) and
+are quoted here as they appear in the data.
+
 `MEMORY.md` holds the _content_ of all 1,414 shared records and the _handle_ for 193. **A flat file can only carry the identifiers somebody happened to write into a
 sentence.** A document store carries them out-of-band on
 `retain_params.context` — 964 distinct corpus identifiers were present there — which
@@ -971,7 +979,7 @@ to invent `mfs-prod-euw2-09` and correctly named real European clusters, then ad
 that there is _"no `-09` in europe recorded at all"_ — which is false; four such
 clusters exist. It converted _"not in what I retrieved"_ into _"not recorded
 anywhere"_. That is #113, and the same run showed it is an **interface** fix rather
-than a prompt fix: on the nonexistent-ADR probe the agent made the same class of
+than a prompt fix: on the nonexistent-record probe the agent made the same class of
 negative claim but scoped it to its own retrieval, and was right. Recall should
 return what it _searched_, not only what it _found_ — which is now what it does
 ([a read names its outcome](#a-read-names-its-outcome)), pending the re-measurement
@@ -1092,8 +1100,8 @@ head-to-head reported above.
 **Five suspected false positives, and zero true ones.** Across both rounds, five
 answers were initially recorded as agent errors and then withdrawn on re-querying the
 corpus — including one where the "inverted" phrasing turned out to be verbatim from
-the source record, and one where a boilerplate clause running through an entire ADR
-family was the genuine source. None survived. The rule this produced, and the reason
+the source record, and one where a boilerplate clause running through an entire
+decision-record family was the genuine source. None survived. The rule this produced, and the reason
 it is written down: **re-query before recording an error.**
 
 ### What is still unproven
