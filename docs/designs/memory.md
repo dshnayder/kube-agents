@@ -39,7 +39,7 @@ and injected into the system prompt as a **frozen snapshot at session start**, s
 mid-session writes hit disk without moving the prompt or spoiling the prefix
 cache. It is **bounded** (2,200 and 1,375 characters) and **single-user**: there
 is no `user_id` anywhere in it. The bound is the subject of
-[the decision](#a-file-store-must-be-bounded-and-this-one-was-not).
+[the decision](#a-file-store-is-bounded-or-it-eats-the-window).
 
 ### The plugin providers
 
@@ -84,92 +84,88 @@ Every load-bearing number below is measured in [the experiment](#the-experiment)
 or arithmetic on two measured quantities. Anything unmeasured is labelled and
 carries no weight.
 
-### A file store must be bounded, and this one was not
+### The fleet the memory has to serve
+
+The A/B ran against a synthetic bank's platform team: **500 GKE clusters and two
+years of accumulated decisions.** 1,664 records, of which **1,414 are shared**,
+across eleven families — architecture decisions, runbooks, postmortems,
+conventions, deprecations, ownership, exceptions, gotchas, capacity, migrations,
+inventory. Six policies exist in three dated versions each, 55 records are
+exceptions contradicting the rule they name, and the inventory disagrees with
+itself about the same clusters ([What was built](#what-was-built)).
+
+That shape is the problem, not the volume. 443,196 characters is a third of a
+novel. But it is knowledge nobody restates in the prompt, it is contested, and it
+only accrues — and any real fleet of that size looks like it after two years.
+
+### A file store is bounded, or it eats the window
 
 Hermes bounds its file memory in source — `MemoryStore.__init__` in
 `tools/memory_tool.py` — at **2,200 characters** for `MEMORY.md` and **1,375** for
-`USER.md`. It is **admission control on writes, not truncation on reads**: a write
-that would exceed the limit is refused, and the refusal hands the model the
-current entries with an instruction to consolidate and retry within the same turn,
-behind a three-failure circuit breaker.
+`USER.md`, as admission control on writes: a write that would exceed the limit is
+refused, and the model is told to consolidate and retry.
 
-That bound is load-bearing, not a safety margin. **Nothing else in a file store
-ever removes an entry** — no eviction, no TTL, no relevance filter, no background
-compaction. Admission control is the sole mechanism keeping the file a summary
-rather than an append-only log.
+That bound is load-bearing. **Nothing else in a file store ever removes an
+entry** — no eviction, no TTL, no relevance filter, no compaction. Admission
+control is the sole mechanism keeping the file a summary rather than an
+append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-replaced)
+lost it in the port, so the file arm the experiment measured is a defect rather
+than a configuration anyone would choose. That is now fixed — the provider
+subclasses `MemoryStore` and delegates to upstream's `memory_tool()`, so the bound
+returns by inheritance. Both settings were costed, and neither carries this fleet.
 
-[`multiuser_memory`](#multiuser_memory-the-provider-this-replaced) did not have
-it. So the file-based arm the experiment measured is a **defect, not a
-configuration anyone would choose** — the correct implementation of a per-user
-file store is the bounded one. That defect is now fixed: the provider was
-rewritten to subclass `MemoryStore` and delegate to upstream's `memory_tool()`, so
-the bound and the other four behaviours return by inheritance rather than by
-porting.
+**Unbounded, memory is 55% of the window before the user speaks.** The store is
+concatenated into the system prompt at session start, on every turn: 443,196
+characters ≈ **110,799 tokens** against Opus 5's 200k. What must share the rest,
+measured from this repository at `TOK_PER_CHAR = 0.25` — the Chat Agent's persona
+is 7,061 tokens, the Platform Agent's seventeen skill bodies 25,358, then Hermes'
+base prompt, the tool schemas and the conversation itself. The window exhausts at
+roughly **2,600 records** with all of that at zero, and delegation is already
+impossible: Chat Agent → specialist → cluster agent is `3 × 110,799 = 332,397
+tokens`, **1.66 windows of memory alone**.
 
-The two sections below are therefore not options to choose between: they are what
-was measured (the bug) and what the fix can hold. Neither carries a fleet.
+**Bounded, it holds about seven records of 1,414.** 2,200 of 443,196 characters is
+**0.50% of the corpus**; at the corpus mean of 313 characters per record, roughly
+**seven records** for about 550 tokens a turn. No recall figure is reported for
+this arm and none is needed — a measurement would describe one consolidation
+strategy, while the capacity bound holds for _every_ strategy including a perfect
+one. An upper bound of 0.50% is the stronger claim.
 
-### Unbounded: memory eats the window
+Raising the ceiling does not escape the trade, because **the tax _is_ the file,
+injected whole**. The two settings are one curve read at two points, exchanging
+recall for window one for one. There is no setting of a file store that is both
+affordable and complete.
 
-The store is concatenated into the system prompt at session start, on every turn,
-before the user has said anything:
+### Why retrieval is the way out
 
-```
-1,414 shared records → 443,196 characters ≈ 110,799 tokens
-```
+Both settings pay for the whole corpus on every turn, because both decide what the
+model sees at **session start** — before the question exists. Any given question
+needs a handful of records, and which handful is unknowable until it is asked.
 
-Opus 5 on Vertex carries a 200k window, so the corpus fits — and takes **55% of it
-as a fixed tax**. What must share the rest, measured from the profile sources in
-this repository at `TOK_PER_CHAR = 0.25`: the Chat Agent's persona
-(`SOUL.md` + `AGENTS.md`) is 28,244 ch ≈ **7,061 tok**; the Platform Agent's
-seventeen skill bodies are 101,431 ch ≈ **25,358 tok**; then Hermes' own base
-prompt, the tool schemas, and the conversation itself.
+So stop injecting the store and start searching it: pay for the corpus once, in
+storage, and per turn only for what the current question needs. Storage grows with
+the fleet; context does not. That is retrieval, and of the eight plugin providers
+only Hindsight is both self-hostable and multi-user.
 
-Three consequences, each arithmetic on a measured quantity:
-
-- **The window exhausts at roughly 2,600 records** on the measured slope — with
-  persona, tools and conversation all at zero.
-- **Skills stop loading.** A specialist spends 55% of its window on memory before
-  it opens the skill it was delegated work to use.
-- **Delegation stops working.** Chat Agent → specialist → cluster agent is the
-  normal path here. Three stores is `3 × 110,799 = 332,397 tokens` — **1.66
-  windows** of memory alone, before a persona, a tool schema or a user word.
-
-### Bounded: what 2,200 characters holds
-
-Run the corrected implementation against the same corpus:
-
-```
-2,200 of 443,196 characters = 0.50% of the corpus
-```
-
-At the corpus mean of 313 characters per record, that is **about seven records**
-of 1,414, for roughly **550 tokens** a turn.
-
-**No recall figure is reported for this arm, and none is needed.** A measurement
-would tell you how one consolidation strategy performed on one run; the capacity
-bound holds for _every_ strategy, including a perfect one, because none stores
-more than 2,200 characters. An upper bound of 0.50% is the stronger claim.
-
-What is left is a good conventions store. It is not a knowledge base, and no
-setting makes it one: **the tax _is_ the file, injected whole**, so raising the
-ceiling raises cost by exactly the amount raised. The two sections above are the
-same curve read at two points, trading recall against window one-for-one — and
-the bound cannot be removed to escape the trade, because removing it is what
-produced the defect.
-
-**There is no setting of a file store that is both affordable and complete.** The
-way out is to stop paying for knowledge the current turn does not need — to
-_search_ the store at turn time instead of _injecting_ it at session start. That
-is retrieval, and that is Hindsight.
-
-### What a document store does instead
+### How Hindsight answers it
 
 Hindsight is a document store with an LLM consolidation layer in front of it.
 Writes go in as _facts_; a background pass consolidates them into _observations_;
 recall does semantic search over the observation layer and returns a
-**budget-bounded** set of results, injected into the current turn rather than into
-the system prompt. Context cost decouples from corpus size:
+**budget-bounded** set of results, injected into the **current turn** rather than
+into the system prompt.
+
+It has every mechanism this needs except one: no way to learn who is speaking. So
+the provider here is a slim wrapper, [`kube_agents_memory`](#the-design), which
+resolves the gateway identity and stamps `user:<id>` on a personal write and
+`scope:shared` on a deliberate shared one, then asks recall for
+`[user:<id>, scope:shared]` and nothing else. One bank holds every user's memory
+and the fleet's; the tags keep them apart. Everything else is stock, so a
+base-image bump brings upstream fixes with no port to redo. Detail in
+[the design](#the-design).
+
+The store therefore holds everything and the window carries only what the turn
+needs — context cost decouples from corpus size:
 
 | Provider   | Rung | Gold recall | Contamination | Current ranked first | Context tokens |
 | ---------- | ---: | ----------: | ------------: | -------------------: | -------------: |
@@ -186,47 +182,43 @@ the system prompt. Context cost decouples from corpus size:
 
 The file column grows 8× across the ladder; the Hindsight column **shrinks**
 (4,588 → 4,264) as consolidation compresses. That divergence, not any single row,
-is the result.
+is the result. Retrieval also buys ranking and provenance: contamination —
+superseded or out-of-scope material in the window — is **0.407 against 0.722**, the
+current version of a contested policy arrives first **83.3%** of the time against
+**42.9%**, and because a document store carries identifiers out-of-band instead of
+hoping they appear in prose, **964 distinct corpus identifiers** sit on retrieval
+labels against 193 reachable in the file.
 
-Retrieval also buys ranking and provenance. Contamination — superseded or
-out-of-scope material in the window — is **0.407 against 0.722**, and the current
-version of a contested policy arrives first **83.3%** of the time against
-**42.9%**. And because a document store carries identifiers out-of-band rather
-than hoping they appear in prose, **964 distinct corpus identifiers** sit on
-retrieval labels against 193 reachable in the file: head to head on ten questions,
-**59 citations against 34**, with **23 from record families the file store holds
-no handle for at all**.
+### What is adopted
 
-### Where the decision is close, and where it is not
-
-- **Below roughly seven shared records the file store wins outright** — total
-  recall for ~550 tokens, no pods, no network hop, no operational surface. This
-  decision is about a fleet knowledge base, not a store of conventions.
-- **Hindsight is not more accurate at this corpus size.** 1.000 gold recall is
-  what "no retrieval" means, and on the ten hand-scored probes the file store made
-  **zero** citation errors against Hindsight's **one**. Both answered every
-  question correctly and refused all three traps.
-- **Isolation is a wash** — zero tag leaks from either provider at every rung.
-
-So the case is cost, ranking and provenance — and one asymmetry decides it.
-Hindsight mis-seeded cites confidently and wrongly: visible, attributable, fixable
-by reseeding, as [the seeder correction](#what-the-experiment-got-wrong) shows end
-to end. The file store answers fluently without provenance, and the reader cannot
-tell that checking was foreclosed. **A wrong answer you can catch is a better
-failure than a right answer you cannot audit.**
-
-### The decision
-
-**Adopt Hindsight as the Chat Agent's memory provider**, with three conditions
+**Hindsight becomes the Chat Agent's memory provider**, with three conditions
 tracked as work items: per-unit provenance on retain (#111/#116); recall reporting
 what it _searched_ and not only what it _found_ (#113, built —
 [a read names its outcome](#a-read-names-its-outcome)); and shared-scope read
 access for specialists (#112, built —
 [what subagents get](#what-subagents-get-shared-memory-read-only)).
 
-Scope of the evidence, so it is not quoted beyond what it supports: one synthetic
-corpus, one model, five corpus sizes, ten hand-scored probes per arm, one operator
-scoring them. Enough to decide direction. Not a benchmark.
+Three things it does not buy, so the case is not quoted beyond what it supports:
+
+- **Below roughly seven shared records the file store wins outright** — total
+  recall for ~550 tokens, no pods, no network hop. This decision is about a fleet
+  knowledge base, not a store of conventions.
+- **Hindsight is not more accurate at this corpus size.** 1.000 gold recall is what
+  "no retrieval" means, and on the ten hand-scored probes the file store made
+  **zero** citation errors against Hindsight's **one**. Both answered every
+  question correctly and refused all three traps.
+- **Isolation is a wash** — zero tag leaks from either provider at every rung.
+
+So the case is cost, ranking and provenance, and one asymmetry decides it.
+Hindsight mis-seeded cites confidently and wrongly: visible, attributable, fixable
+by reseeding, as [the seeder correction](#what-the-experiment-got-wrong) shows end
+to end. The file store answers fluently without provenance, and the reader cannot
+tell that checking was foreclosed. **A wrong answer you can catch is a better
+failure than a right answer you cannot audit.**
+
+Scope of the evidence: one synthetic corpus, one model, five corpus sizes, ten
+hand-scored probes per arm, one operator scoring them. Enough to decide direction.
+Not a benchmark.
 
 ---
 
@@ -858,7 +850,7 @@ front of the model, before the model said anything.
 
 ### The retrieval ladder
 
-The table is in [the decision](#what-a-document-store-does-instead). Three readings of it.
+The table is in [the decision](#how-hindsight-answers-it). Three readings of it.
 
 **Neither provider leaked a tag at any rung.** That is the isolation result and it
 is the uninteresting one: both are correct.
@@ -1005,7 +997,7 @@ this is generalisation from a dominant pattern rather than invention — and it 
 direct experimental support for #116 (provenance marking on shared memory).
 
 The conclusion the data supports is the one in
-[the decision](#where-the-decision-is-close-and-where-it-is-not): **provenance and cost, not
+[the decision](#what-is-adopted): **provenance and cost, not
 accuracy.** _"File memory gives wrong answers"_ would not have survived this run.
 
 ### Specialists have no memory, and improvise one
@@ -1088,7 +1080,7 @@ format, and stubs `atomic_replace`; it never goes through the provider's write
 path, so admission control was never in play — and the provider being measured had
 none anyway. The 1.000 / 110,907 row is therefore the _unbounded_ file store,
 which is exactly what shipped. Adding the bound does not move that row, it
-produces a different one: [what a bounded store holds](#bounded-what-2200-characters-holds). Both are
+produces a different one: [what a bounded store holds](#a-file-store-is-bounded-or-it-eats-the-window). Both are
 reported, because dropping the unbounded row would quietly discard the strongest
 result the file store has.
 
