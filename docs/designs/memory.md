@@ -1,7 +1,8 @@
 # Memory
 
 **Status:** implemented on the Chat Agent profile. The A/B that decided it is
-complete on both layers — retrieval and answer quality — and is summarised in
+complete on both layers — retrieval and answer quality. The argument it produced
+is [The decision](#the-decision); the raw evidence behind every number there is
 [The experiment](#the-experiment). Four follow-ups are open and named in
 [What is still unproven](#what-is-still-unproven).
 
@@ -117,49 +118,119 @@ the contract becomes the one the design always intended: whatever the built-in
 memory does, this does, including its bugs. This branch removes the provider
 regardless — the rewrite matters for deployments that stay on the file store, and
 it does not change the arithmetic below. It changes which side of that arithmetic
-the file store lands on, which is [the third arm](#why-not-just-bound-the-file).
+the file store lands on, which is [the capacity proof](#bounded-as-designed-a-capacity-proof).
 
 ---
 
-## Summary
+## The decision
 
-### The problem, stated as arithmetic
+The fleet's shared knowledge outgrows a file. This section is the argument for
+that claim, and it is built so that every load-bearing number is either measured
+in [the experiment](#the-experiment) or arithmetic on two measured quantities.
+Where something is unmeasured it is labelled unmeasured and carries no weight.
 
-A flat file injected whole into the system prompt costs context linearly in
-corpus size, and pays that cost on **every turn, before the user has said
-anything**. Measured against a 1,414-record shared corpus by calling the real
-provider's own `system_prompt_block()`:
+### The alternative, stated precisely
+
+The thing Hindsight replaces is Hermes' built-in file memory: two Markdown files
+concatenated into the system prompt at session start. Its size is fixed in
+source — `MemoryStore.__init__` in `tools/memory_tool.py` defaults to
+**2,200 characters** for `MEMORY.md` and **1,375** for `USER.md`.
+
+That bound is **admission control on writes, not truncation on reads**. A write
+that would push a file past its limit is refused, and the refusal hands the model
+the current entries with an instruction to consolidate — merge overlapping
+entries with `replace`, drop stale ones with `remove` — and retry within the same
+turn, behind a three-failure circuit breaker so a memory that cannot be made to
+fit costs a few tool calls rather than the user's reply. Nothing truncates at read
+time: `_render_block()` renders whatever is on disk, whole.
+
+So there are exactly two ways to run a file store, and the case for Hindsight is
+that **both are measured, and neither works at fleet scale.**
+
+### Bounded as designed: a capacity proof
+
+Take the built-in at its shipped limit and point it at the corpus the experiment
+uses — 1,414 shared records, **443,196 characters**, measured by calling the real
+provider's own `system_prompt_block()`.
+
+```
+2,200 of 443,196 characters = 0.50% of the corpus
+```
+
+At the corpus mean of 313 characters per record (min 141, median 247, max 1,891),
+2,200 characters is **about seven records** of 1,414. Filling `MEMORY.md` in
+corpus order until the next write is refused fits **four** — the first four
+records happen to run above mean. Either way the share is the same half a percent.
+
+**No recall figure is reported for this arm, and none is needed.** That is the
+point of stating it as capacity rather than as a measurement. A measurement would
+tell you how one consolidation strategy performed on one run; the capacity bound
+holds for _every_ strategy, including a perfect one, because no strategy stores
+more than 2,200 characters. It is an upper bound, and an upper bound of 0.50% is a
+stronger claim than any recall number we could have gone and measured.
+
+What that leaves is a real and useful thing — a running, model-curated summary of
+the fleet's conventions, for about 550 tokens a turn. It is not a knowledge base,
+and no setting makes it one.
+
+### Unbounded: the measured arm
+
+The provider this repository actually shipped,
+[`multiuser_memory`](#multiuser_memory-the-provider-this-replaced), had no bound
+— which is why the experiment could measure the other horn directly rather than
+having to model it. Injected whole, on every turn, before the user has said
+anything:
 
 ```
 1,414 shared records → 443,196 characters ≈ 110,799 tokens
 ```
 
-Claude Opus 5 on Vertex carries a 200k window. So the corpus fits — the file
-provider does not fall over — but it occupies **55% of the window as a fixed tax
-on every turn**. Extrapolating the same slope, roughly **2,600 shared records
+Claude Opus 5 on Vertex carries a 200k window, so the corpus fits — the file
+provider does not fall over. It occupies **55% of the window as a fixed tax on
+every turn**. Extrapolating the measured slope, roughly **2,600 shared records
 exhausts the window on its own**, leaving nothing for the conversation, the tool
-schemas, or the agent's own persona. A bank's fleet knowledge reaches 2,600
-records quickly.
+schemas, or the agent's own persona.
 
-Cost is the ceiling, but it is not the only defect. Injecting everything means
-**ranking nothing**. On the six policies in the corpus that exist in three dated
-versions, the file provider put the _current_ version ahead of its superseded
-predecessors only **43%** of the time; the model has to rebuild the supersession
-chain from prose, on every turn, out of its own budget. And a flat file can only
-carry an identifier that somebody happened to write into a sentence: of 1,664
-corpus records, the file store holds the content of all of them and the **handle
-for 193**. It answers correctly, without provenance, and never says provenance
-was unavailable.
+Cost is the ceiling but not the only defect, and the other two are measured too:
 
-### How Hindsight solves it
+- **Injecting everything means ranking nothing.** On the six policies in the
+  corpus that exist in three dated versions, the file provider put the _current_
+  version ahead of its superseded predecessors **42.9%** of the time. The model
+  rebuilds the supersession chain from prose, on every turn, out of its own budget.
+- **It can only carry an identifier somebody wrote into a sentence.** Of 1,664
+  corpus records the file store holds the content of all of them and the handle
+  for **193**. The other 1,471 arrive as prose with their identifier stripped. It
+  answers correctly, without provenance, and nothing in its output signals that
+  provenance was unavailable.
+
+### The two horns are not a dial
+
+The obvious move — raise the limit until it fits — is not available, and the
+reason is arithmetic rather than preference. The tax **is** the file, injected
+whole, so raising the ceiling raises the per-turn cost by exactly the amount
+raised. A limit large enough to hold this corpus is the unbounded arm, at 55% of
+the window; a limit small enough to be free holds half a percent.
+
+Nor is the bound a defect to be patched out. It is the only mechanism in a file
+store that ever removes an entry — nothing else deletes, ever — so it is the sole
+reason the file stays a summary rather than becoming an append-only log. Remove it
+and you have the unbounded arm by another route, which is precisely how the
+shipped provider ended up there.
+
+**There is no setting of the file store that is both affordable and complete.**
+That sentence is the case for a different storage layer, and it rests on two
+measured quantities and a division.
+
+### What a document store does instead
 
 Hindsight is a document store with an LLM consolidation layer in front of it.
 Writes go in as _facts_; a background pass consolidates them into _observations_;
 recall does semantic search over the observation layer and returns a
-**budget-bounded** set of results, which are injected into the current turn rather
-than into the system prompt.
+**budget-bounded** set of results, injected into the current turn rather than into
+the system prompt.
 
-The consequence in one line: **context cost decouples from corpus size.**
+The consequence in one line: **context cost decouples from corpus size.** Measured
+across five rungs:
 
 | Provider   | Rung | Gold recall | Contamination | Current ranked first | Context tokens |
 | ---------- | ---: | ----------: | ------------: | -------------------: | -------------: |
@@ -174,90 +245,64 @@ The consequence in one line: **context cost decouples from corpus size.**
 | File-based |  800 |       1.000 |         0.722 |                0.429 |         79,616 |
 | File-based | 1414 |       1.000 |         0.722 |                0.429 |    **110,907** |
 
-Hindsight's context cost **shrinks slightly as the corpus grows** (4,588 → 4,264)
-as consolidation compresses. Contamination — superseded or out-of-scope material
-sitting in the window — is **0.407 against 0.722**. The current version of a
-contested policy arrives first **83%** of the time against **43%**. And because a
-document store carries identifiers out-of-band rather than in prose, it can cite
-records the flat file structurally cannot: measured head to head on the same ten
-questions, **59 citations against 34**, with 23 of the 59 from families the flat
-file holds no handle for.
+The file column grows 8× across the ladder. The Hindsight column **shrinks**
+(4,588 → 4,264) as consolidation compresses. That divergence, not any single row,
+is the result: it is the difference between a cost that tracks how much the fleet
+knows and one that does not.
 
-### Why not just bound the file?
+The retrieval quality that buys:
 
-It is the first objection anyone raises at 110,907 tokens, and it deserves a
-number rather than an argument.
+- **Contamination** — superseded or out-of-scope material occupying the window —
+  **0.407 against 0.722**.
+- **The current version of a contested policy arrives first 83.3% of the time,
+  against 42.9%.**
+- **Provenance.** A document store carries identifiers out-of-band instead of
+  hoping they appear in prose: **964 distinct corpus identifiers** live on
+  retrieval labels, against 193 reachable in the file. Head to head on the same
+  ten questions that is **59 citations against 34**, with **23 of the 59 from
+  record families the file store holds no handle for at all**.
 
-Hermes' built-in memory is already bounded: **2,200 characters** for `MEMORY.md`,
-**1,375** for `USER.md`. The bound is **admission control on writes, not
-truncation on reads** — a write that would push the file past its limit is
-refused, and the refusal hands the model the current entries with an instruction
-to consolidate (merge overlapping entries with `replace`, drop stale ones with
-`remove`) and retry within the same turn, behind a three-failure circuit breaker
-so a memory that cannot be made to fit costs a few tool calls rather than the
-user's reply. There is no background summarisation pass: the model doing the
-consolidating is the one holding the turn, spending the user's latency to do it.
+### Where the decision is close, and where it is not
 
-Now apply that bound to this corpus. The 1,414 shared records average 313
-characters each (min 141, median 247, max 1,891). Filling `MEMORY.md` in corpus
-order until the next write is refused:
+Stated plainly, because it is checkable and someone will check it.
 
-```
-4 of 1,414 entries fit — 2,181 of 2,200 characters — 0.28% of the corpus
-```
+**Below roughly seven shared records, the file store wins outright.** 2,200
+characters at the corpus mean is where the bounded arm stops losing information,
+and beneath that line it delivers total recall for ~550 tokens with no pods, no
+network hop and no operational surface. Hindsight there is strictly worse on every
+axis. This decision is about a fleet knowledge base, not about a store of
+conventions, and the two should not be argued as if they were the same thing.
 
-Which makes the comparison three arms, not two:
+**Hindsight is not more accurate at this corpus size.** The file store's 1.000
+gold recall is not a retrieval achievement — recall of everything is what "no
+retrieval" means — and on the ten hand-scored answer probes it made **zero**
+citation errors against Hindsight's **one**. Both answered every question
+correctly and both refused all three traps. Anyone arguing this case on accuracy
+will lose it to the data.
 
-| Arm                                        |       Gold recall | Context tokens | Share of a 200k window |
-| ------------------------------------------ | ----------------: | -------------: | ---------------------: |
-| File-based, unbounded (what was measured)  |             1.000 |        110,799 |                    55% |
-| File-based, bounded as the built-in bounds | ~0 _(arithmetic)_ |           ~550 |                  <0.3% |
-| Hindsight                                  |             0.702 |          4,264 |                   2.1% |
+**Isolation is a wash: zero tag leaks from either provider at every rung.** The
+file store's per-user files were never the problem.
 
-The bounded row is arithmetic, not a measurement — no scored run was made against
-a 4-entry store, because there is nothing left to score.
+So the case is cost, ranking and provenance — and one asymmetry that decides it.
+Hindsight mis-seeded cites confidently and wrongly: visible on inspection,
+attributable to a cause, fixable by reseeding, as
+[the seeder correction](#what-the-experiment-got-wrong) demonstrates end to end.
+The file store answers fluently without provenance, and the reader has no way to
+tell that checking was foreclosed. A wrong answer you can catch is a better
+failure than a right answer you cannot audit.
 
-The bound is not a defect in the built-in store, and raising it is not the fix.
-The ceiling is what makes that design work: nothing in a file store ever removes
-an entry on its own, so admission control is the only mechanism that keeps the
-file a summary rather than a log. And raising the ceiling raises the per-turn tax
-by exactly the amount raised, because the tax _is_ the file, injected whole.
+### The decision
 
-That is the argument in one table. **There is no setting of the file store that is
-both affordable and complete.** Unbounded, it is perfectly accurate and costs 55%
-of the window before anyone has spoken. Bounded as designed, it costs almost
-nothing and holds 0.28% of what the fleet knows. Decoupling cost from corpus size
-is not an optimisation of the file store — it is the only other option.
+**Adopt Hindsight as the Chat Agent's memory provider**, on the evidence above,
+with three conditions tracked as work items: per-unit provenance on retain
+(#111/#116); recall reporting what it _searched_ and not only what it _found_
+(#113, built — [a read names its outcome](#a-read-names-its-outcome)); and
+shared-scope read access for specialists (#112, built —
+[what subagents get](#what-subagents-get-shared-memory-read-only)).
 
-### The honest caveat, and the recommendation
-
-**The file provider is not less accurate at this corpus size.** Its gold recall of
-1.000 is not a retrieval achievement — recall of everything is what "no retrieval"
-means — but on the ten hand-scored answer probes it made **zero** citation errors
-against Hindsight's **one**. Anyone arguing this case on accuracy will lose the
-argument to the data.
-
-The case is **cost, ranking, and provenance**:
-
-- the flat file buys the same answer for 110,799 tokens a turn and has a hard
-  ceiling around 2,600 records;
-- it ranks the superseded version first more often than not;
-- it cannot cite seven-eighths of what it knows, and nothing in its output
-  signals that.
-
-The two failure modes are asymmetric, which is the part that decides it. Hindsight
-mis-seeded cites confidently and wrongly — visible on inspection, attributable to a
-cause, fixable by reseeding. The file store answers fluently without provenance and
-the reader has no way to tell that checking was foreclosed.
-
-**Recommendation: adopt Hindsight**, with three conditions tracked as work items —
-per-unit provenance on retain (#111/#116), recall returning what it _searched_ and
-not only what it _found_ (#113, now built —
-[a read names its outcome](#a-read-names-its-outcome)), and shared-scope read
-access for specialists (#112, now built —
-[what subagents get](#what-subagents-get-shared-memory-read-only)). Scope of
-evidence: one synthetic corpus, one model,
-ten hand-scored probes per arm. Enough to decide direction; not a benchmark.
+Scope of the evidence, so it is not quoted beyond what it supports: one synthetic
+corpus, one model, five corpus sizes, ten hand-scored probes per arm, one operator
+scoring them. Enough to decide direction. Not a benchmark.
 
 ---
 
@@ -888,7 +933,7 @@ front of the model, before the model said anything.
 
 ### The retrieval ladder
 
-The table is in [the summary](#how-hindsight-solves-it). Three readings of it.
+The table is in [the decision](#what-a-document-store-does-instead). Three readings of it.
 
 **Neither provider leaked a tag at any rung.** That is the isolation result and it
 is the uninteresting one: both are correct.
@@ -1029,7 +1074,7 @@ this is generalisation from a dominant pattern rather than invention — and it 
 direct experimental support for #116 (provenance marking on shared memory).
 
 The conclusion the data supports is the one in
-[the summary](#the-honest-caveat-and-the-recommendation): **provenance and cost, not
+[the decision](#where-the-decision-is-close-and-where-it-is-not): **provenance and cost, not
 accuracy.** _"File memory gives wrong answers"_ would not have survived this run.
 
 ### Specialists have no memory, and improvise one
@@ -1112,7 +1157,7 @@ format, and stubs `atomic_replace`; it never goes through the provider's write
 path, so admission control was never in play — and the provider being measured had
 none anyway. The 1.000 / 110,907 row is therefore the _unbounded_ file store,
 which is exactly what shipped. Adding the bound does not move that row, it
-produces a different one: [the third arm](#why-not-just-bound-the-file). Both are
+produces a different one: [the capacity proof](#bounded-as-designed-a-capacity-proof). Both are
 reported, because dropping the unbounded row would quietly discard the strongest
 result the file store has.
 
