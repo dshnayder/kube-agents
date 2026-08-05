@@ -45,10 +45,18 @@ fi
 # can route to it. Its persona/config/skills are baked at /opt/platform-template;
 # executable scripts stay in the shared $TARGET_DIR/scripts and are not overlaid.
 PLATFORM_TEMPLATE="/opt/platform-template"
-if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -d "$TARGET_DIR/profiles/platform" ] && [ -f "$TARGET_DIR/scripts/profile_scaffold.py" ]; then
+# The image's own copy of the scaffolder, never the volume's. Step 2 seeds
+# $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
+# mtime for — the same trap step 2a exists to work around for config.yaml. This
+# is the one script in the pod whose job is to make the volume track the image,
+# so it is the one script that must not be read back off the volume: last
+# release's scaffolder running this release's template is how a partial upgrade
+# looks like a successful one.
+SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
+if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -d "$TARGET_DIR/profiles/platform" ] && [ -f "$SCAFFOLD" ]; then
     PLATFORM_DESC="Platform Agent: fleet-wide GKE architecture, cluster lifecycle/provisioning, multi-tenancy, and the GitOps write path (Pull Requests). Owns per-cluster agent lifecycle."
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
-        "$TARGET_DIR/scripts/profile_scaffold.py" \
+        "$SCAFFOLD" \
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
         --plugins /opt/defaults/plugins \
@@ -88,10 +96,36 @@ fi
 # name and description in profiles/<name>/profile.yaml, a separate file that no
 # template ships, so it is never overwritten here. Per-profile runtime state
 # (USER.md, memory/, sessions/) is likewise left untouched.
-if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
-        [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
-    done
+#
+# The sync goes through profile_scaffold.py --items rather than a `cp -f` loop
+# because the list is no longer files-only: cron/, skills/, and governance/ carry
+# the machinery CAPABILITIES.md advertises. `[ -f ]` is false for a directory, so
+# naming them in a shell loop would be a silent no-op — an upgraded install would
+# take the new CAPABILITIES.md and none of what it describes. --items copies each
+# entry with copytree(dirs_exist_ok=True), which handles both. The profile already
+# exists here, so the scaffold's `hermes profile create` is a no-op and only the
+# overlay runs; --plugins is deliberately omitted (step 2.5 owns that).
+#
+# cron/jobs.json is the one entry that is merged rather than replaced, inside
+# profile_scaffold.py. It is image-owned and runtime state in the same file: the
+# schedules, prompts and `enabled` flags ship in the image, but the scheduler
+# writes each job's run history back into it and the operator can add jobs of
+# its own. Copying it wholesale erased both on every pod restart, which let a
+# daily audit fire a second time the same morning. The merge is per key — the
+# image wins every key it ships, the volume keeps every key it does not — so
+# flipping `enabled` to false in the image still disables a watchdog.
+#
+# Known limit: the overlay adds and overwrites, it never prunes. A skill or SOP
+# dropped from the image stays on the PVC until an operator removes it by hand.
+# That is the deliberate trade — this path must not start silently deleting from
+# a user's volume — not an oversight.
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$SCAFFOLD" ]; then
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SCAFFOLD" \
+        --name platform \
+        --template "$PLATFORM_TEMPLATE" \
+        --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
+        >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
@@ -148,16 +182,16 @@ if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
-# 5.5. Initialize default GKE context for the container to the host cluster
-if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
-    echo "Configuring default kubectl context to host cluster: $GKE_CLUSTER_NAME ($GKE_LOCATION)..."
-    gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" ${GOOGLE_CHAT_PROJECT_ID:+--project="$GOOGLE_CHAT_PROJECT_ID"} >/dev/null 2>&1 || true
-    # Backup static context configuration specifically for the event-watcher sidecar
-    if [ -f "$HOME/.kube/config" ]; then
-        cp "$HOME/.kube/config" "$HOME/.kube/watcher.config.tmp" && mv "$HOME/.kube/watcher.config.tmp" "$HOME/.kube/watcher.config"
-    fi
-fi
-
+# 5.5. The default kubectl context is NOT established here. `gcloud` in this
+# container is the credential-proxy shim, so get-credentials would execute in
+# the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
+# outright, because this script runs from a working directory outside
+# CREDENTIAL_PROXY_WORKSPACE_ROOT. The sidecar bootstraps its own context from
+# CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
+# operator), which runs inside the workspace root before the proxy serves any
+# request. The event-watcher does not need a copy either: it reads
+# /var/run/event-watcher/watcher.config and falls back to its in-cluster config
+# when that file is absent, which it always is.
 
 # 6. Execute primary process
 exec "$@"

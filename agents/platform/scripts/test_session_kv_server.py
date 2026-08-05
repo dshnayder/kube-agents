@@ -200,7 +200,40 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
             query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=", query)
+            # With no project configured the console links carry no project
+            # qualifier at all — `?project=` / `;project=` are omitted rather
+            # than emitted empty, which would send the reader to a dead link.
+            self.assertNotIn("project=", query)
+
+    @patch.dict(os.environ, {"GKE_CLUSTER_NAME": "platform-agent-host"})
+    def test_build_agent_query_names_the_events_cluster(self):
+        # The event came from a different cluster than the one this agent runs
+        # on; the prompt must name the event's cluster, not the host's.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message",
+            "cluster": "prod-us-central1"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        self.assertIn("prod-us-central1", query)
+        self.assertNotIn("platform-agent-host", query)
+
+    @patch.dict(os.environ, {"GKE_CLUSTER_NAME": "platform-agent-host"})
+    def test_build_agent_query_falls_back_to_host_cluster(self):
+        # No cluster on the payload (non-watcher caller, or a watcher started
+        # without --cluster-name): fall back to the host cluster env var.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        self.assertIn("platform-agent-host", query)
 
 
 if __name__ == "__main__":
