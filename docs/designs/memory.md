@@ -147,6 +147,22 @@ storage, and per turn only for what the current question needs. Storage grows wi
 the fleet; context does not. That is retrieval, and of the eight plugin providers
 only Hindsight is both self-hostable and multi-user.
 
+**The same conclusion, reached independently.** A separate internal agent platform —
+a hosted coding agent, a different domain with a different corpus — began with the
+same single-file memory and replaced it with the same architecture, for the same
+stated reason: a file loaded whole on every turn wastes tokens and degrades as it
+grows. The two designs match mechanism for mechanism — one document per memory
+rather than one file for all of them, embedding search putting only the relevant few
+into the current turn, the agent writing its own observations as it works, and a
+nightly consolidation pass that merges duplicates, resolves contradictions between
+older and newer observations, and prunes what has stopped earning its place. They
+diverge on one point, instructively: theirs serves a single engineer and needs no
+scope model at all, where a shared fleet agent needs
+[one bank and two scopes](#one-bank-two-scopes). This is corroboration and not
+evidence — none of it is measured on this corpus and no number here depends on it.
+What it establishes is that the failure being designed around is not an artefact of
+this repository's file provider.
+
 ### How Hindsight answers it
 
 Hindsight is a document store with an LLM consolidation layer in front of it.
