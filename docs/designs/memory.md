@@ -25,8 +25,7 @@ the measurements say the change bought.
 ### Why the agent needs memory at all
 
 An agent that answers questions about a fleet has to know things nobody will
-restate for it in the prompt: which architecture decision is current, which of three
-dated versions
+restate for it in the prompt: which architecture decision is current, which version
 of a retention policy still applies, who owns a control, which cluster is the
 exception to the rule everyone else follows. None of that is derivable from the
 cluster — it is organisational knowledge, and it accrues.
@@ -57,7 +56,7 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 | `supermemory` | Hosted                                       | Minimal                          |
 | `holographic` | Local HRR experiment                         | None                             |
 
-Self-hosting is non-negotiable — the corpus is a bank's internal fleet topology,
+Self-hosting is highly desired — the corpus is a bank's internal fleet topology,
 ownership map and incident history — and `hindsight` is the only entry that is
 both self-hostable and multi-user. The shortlist has one name on it.
 
@@ -110,9 +109,7 @@ entry** — no eviction, no TTL, no relevance filter, no compaction. Admission
 control is the sole mechanism keeping the file a summary rather than an
 append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-replaced)
 lost it in the port, so the file arm the experiment measured is a defect rather
-than a configuration anyone would choose. That is now fixed — the provider
-subclasses `MemoryStore` and delegates to upstream's `memory_tool()`, so the bound
-returns by inheritance. Both settings were costed, and neither carries this fleet.
+than a configuration anyone would choose.
 
 **Unbounded, memory is 55% of the window before the user speaks.** The store is
 concatenated into the system prompt at session start, on every turn: 443,196
@@ -148,10 +145,8 @@ the fleet; context does not. That is retrieval, and of the eight plugin provider
 only Hindsight is both self-hostable and multi-user.
 
 **The same conclusion, reached independently.** A separate internal agent platform —
-a hosted coding agent, a different domain with a different corpus — began with the
-same single-file memory and replaced it with the same architecture, for the same
-stated reason: a file loaded whole on every turn wastes tokens and degrades as it
-grows. The two designs match mechanism for mechanism — one document per memory
+Google's hosted agent — uses a similar architecture for the same reason: a file
+loaded whole on every turn wastes tokens and degrades as it grows. The two designs match mechanism for mechanism — one document per memory
 rather than one file for all of them, embedding search putting only the relevant few
 into the current turn, the agent writing its own observations as it works, and a
 nightly consolidation pass that merges duplicates, resolves contradictions between
@@ -207,34 +202,7 @@ labels against 193 reachable in the file.
 
 ### What is adopted
 
-**Hindsight becomes the Chat Agent's memory provider**, with three conditions
-tracked as work items: per-unit provenance on retain (#111/#116); recall reporting
-what it _searched_ and not only what it _found_ (#113, built —
-[a read names its outcome](#a-read-names-its-outcome)); and shared-scope read
-access for specialists (#112, built —
-[what subagents get](#what-subagents-get-shared-memory-read-only)).
-
-Three things it does not buy, so the case is not quoted beyond what it supports:
-
-- **Below roughly seven shared records the file store wins outright** — total
-  recall for ~550 tokens, no pods, no network hop. This decision is about a fleet
-  knowledge base, not a store of conventions.
-- **Hindsight is not more accurate at this corpus size.** 1.000 gold recall is what
-  "no retrieval" means, and on the ten hand-scored probes the file store made
-  **zero** citation errors against Hindsight's **one**. Both answered every
-  question correctly and refused all three traps.
-- **Isolation is a wash** — zero tag leaks from either provider at every rung.
-
-So the case is cost, ranking and provenance, and one asymmetry decides it.
-Hindsight mis-seeded cites confidently and wrongly: visible, attributable, fixable
-by reseeding, as [the seeder correction](#what-the-experiment-got-wrong) shows end
-to end. The file store answers fluently without provenance, and the reader cannot
-tell that checking was foreclosed. **A wrong answer you can catch is a better
-failure than a right answer you cannot audit.**
-
-Scope of the evidence: one synthetic corpus, one model, five corpus sizes, ten
-hand-scored probes per arm, one operator scoring them. Enough to decide direction.
-Not a benchmark.
+**Hindsight becomes the Chat Agent's memory provider**.
 
 ---
 
@@ -284,10 +252,7 @@ It adds exactly two workloads to `kubeagents-system`.
   flipping it on an existing volume does nothing.
 - A `NetworkPolicy` (`networkpolicy.yaml`) permits ingress on 5432 **only** from
   pods labelled as the API component. Ingress only — Postgres makes no outbound
-  calls. Caveat for reviewers: GKE enforces network policy only on clusters that
-  have it enabled; on a Standard cluster without Dataplane V2 the object applies
-  cleanly and does nothing, which is why the database is also on a ClusterIP
-  service with no external route.
+  calls.
 
 Deleting the Postgres PVC is a complete, safe reset of memory — see
 [Bank provisioning is lazy](#bank-provisioning-is-lazy).
@@ -410,8 +375,9 @@ everyone else. `_retain()` therefore builds its own item and calls `aretain_batc
 directly, which also avoids swapping instance attributes around an asynchronous
 writer thread.
 
-The bank name is pinned the same way, for a different reason — see
-[Where the connection settings come from](#where-the-connection-settings-come-from).
+The bank name is pinned the same way, for a different reason: `_apply_scoping` sets
+`DEFAULT_BANK_ID` and clears `_bank_id_template`, so a hand-edited config file cannot
+move the bank.
 
 ### Bank provisioning is lazy
 
@@ -696,7 +662,7 @@ could launder its own derived-from-prior-runs conclusions into the corpus as fac
 What it works out during a task is a finding for its result, not a recorded fact.
 
 The prompt's "do not cache what you read" is a partial, prose-only mitigation for
-the skill-file fork (#122); the durable control — making the specialist's own skill
+the skill-file fork; the durable control — making the specialist's own skill
 directory unwritable — is tracked separately.
 
 [`tests/memory/test_read_only_profile.py`](../../tests/memory/test_read_only_profile.py)
@@ -730,20 +696,6 @@ alone.
 identical but for `recall_budget: low`. The default profile's copy is not on its
 path, and without one the provider has nothing to connect to. It is force-synced the
 same way, by step 2.6, for the same reason.
-
-It is image-owned because it was not, once. The file was hand-written onto the PVC,
-where it survived every image roll carrying whichever design was current when it was
-last touched — and kept naming a bank from a two-bank era that no longer existed.
-Tag isolation was unaffected, since the wrapper pins the tags itself, and that is
-precisely what made it invisible: **no code review and no manifest diff can see a
-file that exists only on a volume.**
-
-So the bank name is not a setting. `_apply_scoping` pins `DEFAULT_BANK_ID`, clears
-`_bank_id_template`, and **logs a warning if a config file disagrees rather than
-obeying it**; the TTL curator hardcodes the same constant. The URL the config does
-carry is fixed by the install; installing Hindsight into a different namespace means
-editing this defaults file and rebuilding the agent image, which the integration
-kustomization says out loud.
 
 ### Failing closed
 
@@ -986,12 +938,11 @@ from families the flat file structurally cannot handle.
 to invent `mfs-prod-euw2-09` and correctly named real European clusters, then added
 that there is _"no `-09` in europe recorded at all"_ — which is false; four such
 clusters exist. It converted _"not in what I retrieved"_ into _"not recorded
-anywhere"_. That is #113, and the same run showed it is an **interface** fix rather
-than a prompt fix: on the nonexistent-record probe the agent made the same class of
+anywhere"_. The same run showed that this needs an **interface** fix rather than a
+prompt fix: on the nonexistent-record probe the agent made the same class of
 negative claim but scoped it to its own retrieval, and was right. Recall should
 return what it _searched_, not only what it _found_ — which is now what it does
-([a read names its outcome](#a-read-names-its-outcome)), pending the re-measurement
-in #115.
+([a read names its outcome](#a-read-names-its-outcome)), pending re-measurement.
 
 Three behaviours appeared in the Hindsight arm that had no counterpart in the file
 arm:
@@ -1010,11 +961,10 @@ arm:
 One imprecision was scored short of an error: on two probes the agent attached the
 standard escalation ladder to runbooks that do not carry it. 39 of 44 runbooks do, so
 this is generalisation from a dominant pattern rather than invention — and it is
-direct experimental support for #116 (provenance marking on shared memory).
+direct experimental support for provenance marking on shared memory.
 
-The conclusion the data supports is the one in
-[the decision](#what-is-adopted): **provenance and cost, not
-accuracy.** _"File memory gives wrong answers"_ would not have survived this run.
+The conclusion the data supports is **provenance and cost, not accuracy.**
+_"File memory gives wrong answers"_ would not have survived this run.
 
 ### Specialists have no memory, and improvise one
 
@@ -1049,16 +999,16 @@ That is the shape of the problem. **An agent that needs shared knowledge and is 
 no sanctioned way to reach it will build an unsanctioned one**, and the durable form
 of that is a stale, unreviewable, per-specialist fork of the corpus that nobody
 curates and nobody can audit. The failure is not that it goes without; it is that it
-succeeds. This is the argument for #112, and it is why the specialist now reads
-shared memory: [what subagents get](#what-subagents-get-shared-memory-read-only).
-The route itself — a skill directory its own occupant can write to — is tracked
-separately as #122.
+succeeds. That is the argument for sanctioned access, and it is why the specialist
+now reads shared memory:
+[what subagents get](#what-subagents-get-shared-memory-read-only). The route itself —
+a skill directory its own occupant can write to — is tracked separately.
 
 Closing the third route required removing `roles/container.admin` and
 `roles/container.clusterAdmin` from the agent's GCP service account, which was
 evaluated _in addition to_ its Kubernetes RBAC and let it undo a change its in-cluster
 identity was explicitly denied. That is a real product finding, not a memory finding,
-and is tracked as #119.
+and is tracked separately.
 
 The fourth void probe is also the best agent behaviour in the test and worth recording
 as the target: it refused to claim a fresh read it did not have, distinguished
@@ -1084,7 +1034,7 @@ second, independently fetched export with every figure identical.
 The decisive case: a document labelled `DEP-001` whose body was the text of `DEP-001`,
 `DEP-002` and `DEP-003`. When the agent said _"the deprecation is DEP-001, and
 DEP-003 doesn't exist"_ it was reading a corrupted index correctly. The fix is one
-record per retain call plus per-unit provenance (#111) — **not** the `document_id`
+record per retain call plus per-unit provenance — **not** the `document_id`
 field originally filed, which would have returned the packed document's identifier
 authoritatively and made a wrong citation look sourced. Reseeding with `--batch 1`
 produced 1,664 documents and 4,400 memory units, and Round A′ was run against that.
@@ -1114,20 +1064,20 @@ it is written down: **re-query before recording an error.**
 
 ### What is still unproven
 
-- **#111 / #116 — per-unit provenance.** The seeder is fixed; provenance marking on
+- **Per-unit provenance.** The seeder is fixed; provenance marking on
   shared memory is not built. The escalation-ladder imprecision is what it would have
   caught.
-- **#113 — recall returns what it searched.** Built, and unit-tested against the
-  three outcomes; but the thing it is meant to prevent is a model's inference, and
-  no live probe has been run against it. It stays here until #115 re-measures the
-  one scored error in the Hindsight arm.
-- **#112 — specialists get shared-scope read access.** Built and unit-tested, and
+- **Recall returns what it searched.** Built, and unit-tested against the three
+  outcomes; but the thing it is meant to prevent is a model's inference, and no live
+  probe has been run against it. It stays here until the validation replay
+  re-measures the one scored error in the Hindsight arm.
+- **Specialists get shared-scope read access.** Built and unit-tested, and
   the token arithmetic for the alternative is one-sided (injecting the file store
   into every specialist turn puts a three-way delegation past 330k tokens before
   anyone asks a question). What is unproven is the thing the change is for: whether a
   specialist with a sanctioned read stops improvising an unsanctioned one. That is a
   behavioural claim and only a live delegated run can settle it. The `low` recall
-  budget is likewise a guess until measured. #115 is the validation replay.
+  budget is likewise a guess until measured. Both wait on the validation replay.
 - **The near-duplicate hypothesis.** 52 of 55 deprecation records share a boilerplate
   sentence, which could defeat individuation. It was not what caused the observed
   errors, so it is untested rather than disproven.
