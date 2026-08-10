@@ -491,6 +491,44 @@ tags. The wrapper would stop being slim, and a misclassification would be a sile
 leak of a personal fact into shared memory with no human in the loop. The model is
 already making that judgement; the persona is where it is directed.
 
+#### The third path, once: the old file store
+
+A volume that predates this provider still has its memory in Markdown, and the new
+provider never reads those files. Without something to move them, the day the image
+rolls is the day everything the agent had learned goes dark while staying perfectly
+intact on disk — neither reachable nor gone, and unnoticed until a question that
+used to work stops working.
+
+[`agents/chat/scripts/memory_file_import.py`](../../agents/chat/scripts/memory_file_import.py)
+runs from the entrypoint on every start (step 5.6), backgrounded and non-fatal, and
+exits immediately when there is nothing to move — which is every start after the one
+that moved it. It reads both layouts, the built-in `MEMORY.md`/`USER.md` and
+`multiuser_memory`'s `memories/`, retains each entry under the scope its file
+implies, verifies the entry is in the bank, and only then deletes the file. What
+stays behind is a receipt under `$HERMES_HOME/hindsight/imported/` carrying the
+source path, its hash and the entry count, and none of the text — leaving the
+content readable on the volume is the thing being undone.
+
+Two decisions are worth stating here because they are properties of the design
+rather than of the script:
+
+- **A personal store has to arrive under the tag its owner will read back with.**
+  `multiuser_memory` named its files `<sanitized>_<sha256(raw)[:12]>.md`, and the
+  sanitized half is lossy — `alice@corp.com` and `alice_corp.com` collide. The
+  twelve hex characters are not: they are a checksum over the raw id, so the
+  original is recovered by search and then _confirmed_ by hash. Where nothing
+  matches, the file is left where it is and reported. A personal memory filed under
+  the wrong tag is a leak, and one filed under a tag nobody carries is a silent
+  loss; a guess risks both.
+- **The delete is gated per entry, on the bank.** An entry the extractor discards as
+  non-durable produces no memory unit, so its file survives and the run says which
+  entry it was. The one unrecoverable mistake available here is deleting the last
+  copy of something.
+
+The built-in `USER.md` carries no identity at all — it belonged to whoever ran a
+single-user agent — so it is migrated only when `--user-id` says who that was, and
+skipped otherwise.
+
 ### How recalled memories reach the model
 
 Two distinct channels, and conflating them is the most common misreading of this

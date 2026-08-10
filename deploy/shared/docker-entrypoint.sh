@@ -460,5 +460,34 @@ fi
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
 # credential-proxy container, not this one.
 
+# 5.6. Migrate any file-based memory store into Hindsight.
+#
+# A volume that predates the Hindsight provider still has its memory sitting in
+# Markdown. The new provider never reads those files, so without this the day the
+# image rolls is the day everything the agent had learned goes dark while staying
+# perfectly intact on disk — neither reachable nor gone, and nobody notices until
+# a question that used to work stops working.
+#
+# Backgrounded, because it waits on Hindsight and on LLM extraction and must not
+# hold up readiness; non-fatal, because a failed migration leaves every file
+# exactly where it was and the next start tries again. The script is idempotent
+# and exits immediately when there is nothing to move, which is every start after
+# the one that moved it. See the script's own docstring for how deletion is gated
+# on verification.
+#
+# Deliberately unlocked: two pods briefly sharing the volume during a rollout
+# could at worst retain an entry twice, which consolidation absorbs, whereas a
+# lock file outliving a SIGKILL would skip the migration permanently and
+# silently.
+if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && [ -f "$TARGET_DIR/hindsight/config.json" ]; then
+    echo "Checking for a file-based memory store to migrate..."
+    (
+        HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+            "$TARGET_DIR/scripts/memory_file_import.py" \
+            >>"$TARGET_DIR/logs/memory_file_import.log" 2>&1 \
+            || echo "WARN: file-memory migration did not complete; the store is untouched and the next start will retry (see logs/memory_file_import.log)" >&2
+    ) &
+fi
+
 # 6. Execute primary process
 exec "$@"
