@@ -2,22 +2,23 @@
 
 ## Summary
 
-A long-running agent on an enterprise fleet accumulates more organisational
-knowledge than a file-based memory can carry. Measured against a 500-cluster
-synthetic fleet, the file store injects 110,799 tokens into every turn — 55% of a
-200k window — and bounding it to the limit Hermes ships leaves room for about seven
-records. Retrieval answers the same questions from 4,264 tokens. The fleet needs
-retrieval memory; this document is that design and the measurement behind it.
+An agent that runs an enterprise fleet accumulates organisational knowledge —
+which decision is current, who owns what, which cluster is the exception — and it
+has to carry that knowledge from one conversation to the next. Hermes ships a
+file-based memory for this. At fleet scale it does not hold: left unbounded it
+consumes most of the model's context window on every turn, and bounded to the size
+Hermes allows it holds almost nothing.
 
-**Status:** implemented on the Chat Agent profile. The A/B that decided it is
-complete on both layers — retrieval and answer quality. The argument it produced
-is [The decision](#the-decision); the raw evidence behind every number there is
-[The experiment](#the-experiment). Four follow-ups are open and named in
+So we built a retrieval-backed memory on Hindsight, and measured the two against
+each other on a synthetic enterprise fleet — both what each puts in front of the
+model and the answers each produces. Retrieval answered the same questions from a
+small fraction of the context, and could say where each answer came from. That is
+the change this document designs.
+
+**Status:** implemented on the Chat Agent profile. The argument is
+[The decision](#the-decision), the evidence behind it is
+[The experiment](#the-experiment), and the open follow-ups are in
 [What is still unproven](#what-is-still-unproven).
-
-Why the fleet's long-term memory is a document store and not a file, how one
-Hindsight bank holds every user's memory without leaking between them, and what
-the measurements say the change bought.
 
 | Layer                     | Where it lives                                                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
