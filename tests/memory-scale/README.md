@@ -64,7 +64,7 @@ python3 harness/gen_fleet_corpus.py --out corpus/
 Seed a Hindsight bank. **Use `--batch 1`.** The default is 5, and Hindsight
 collapses a multi-item retain into one document keeping one item's `context` as
 the label — which is how the first run destroyed four identifiers in five before
-recall ever ran ([the correction](transcript/README.md#correction-round-as-citation-numbers-measure-the-seeder)):
+recall ever ran ([the correction](transcript/README.md#correction-the-delegated-baselines-citation-numbers-measure-the-seeder)):
 
 ```sh
 python3 harness/seed_fleet.py --bank kube-agents-memory --rung 1414 --batch 1
@@ -92,7 +92,7 @@ worth anything if it runs against the actual code.
 
 ## Fixtures
 
-`fixtures/MEMORY.md.gz` is Round B's shared store exactly as it sat on the
+`fixtures/MEMORY.md.gz` is the file arm's shared store exactly as it sat on the
 gateway PVC: 444,531 bytes, 1,414 entries separated by `\n§\n`,
 sha256 `9c4b40a4c02cd3cca0d50c343386017aa67d7b66fbf0d24dad5f61580fd57952`.
 
@@ -109,25 +109,28 @@ number.
 
 Every interaction with the live cluster went through a Job rather than
 `kubectl exec`, mounting the gateway PVC. They are kept because several of them
-are the evidence for a finding rather than just plumbing:
+are the evidence for a finding rather than just plumbing. The filenames carry the
+run labels the transcript used before it was relabelled: `roundb-*` are the
+**file arm's** controls, `rounda2-*` the **Hindsight arm's**.
 
-| Job                             | What it establishes                                                        |
+| Job | What it establishes |
+
 | ------------------------------- | -------------------------------------------------------------------------- |
-| `seed-job-r*.yaml`              | Seeded each rung; `roundb-write` wrote the file-provider store             |
-| `seed-job-r1414-batch1.yaml`    | The corrected reseed, one record per retain call (#117)                    |
-| `roundb-verify.yaml`            | The real provider, loaded from the running image, against the real PVC     |
-| `roundb-packing*.yaml`          | The seed-packing measurement, and its independent reproduction             |
-| `roundb-probe1{c,d}-*.yaml`     | Which data path a specialist actually used, recovered from its own scripts |
-| `roundb-cleanup2.yaml`          | That the Hindsight boundary was closed — API and Postgres both refusing    |
-| `rounda2-sever-file-store`      | The flat store's live sha256, matching the repository fixture              |
-| `rounda2-purge-file-store`      | The flat store deleted, and the PVC survey: 72 corpus-bearing files        |
-| `rounda2-provision-bank`        | A bare bank provisioned with the provider's own constants, read via `ast`  |
-| `rounda2-cleanup-answer-caches` | The doc-shaped caches removed; logs and databases deliberately kept        |
+| `seed-job-r*.yaml` | Seeded each rung; `roundb-write` wrote the file-provider store |
+| `seed-job-r1414-batch1.yaml` | The corrected reseed, one record per retain call (#117) |
+| `roundb-verify.yaml` | The real provider, loaded from the running image, against the real PVC |
+| `roundb-packing*.yaml` | The seed-packing measurement, and its independent reproduction |
+| `roundb-probe1{c,d}-*.yaml` | Which data path a specialist actually used, recovered from its own scripts |
+| `roundb-cleanup2.yaml` | That the Hindsight boundary was closed — API and Postgres both refusing |
+| `rounda2-sever-file-store` | The flat store's live sha256, matching the repository fixture |
+| `rounda2-purge-file-store` | The flat store deleted, and the PVC survey: 72 corpus-bearing files |
+| `rounda2-provision-bank` | A bare bank provisioned with the provider's own constants, read via `ast` |
+| `rounda2-cleanup-answer-caches` | The doc-shaped caches removed; logs and databases deliberately kept |
 
-The `rounda2-*` jobs are the mirror of the Round B controls. Round B scaled
-Hindsight to zero so the file provider could not reach it; these delete the flat
-store so Hindsight's arm cannot reach _that_. Both arms have to be severed the
-same way or the A/B is not one.
+The `rounda2-*` jobs are the mirror of the file arm's controls. The file arm
+scaled Hindsight to zero so the file provider could not reach it; these delete
+the flat store so the Hindsight arm cannot reach _that_. Both arms have to be
+severed the same way or the A/B is not one.
 
 The survey job is worth reading before writing another control. It found the
 corpus cached across 72 files, the densest being the specialist's own
@@ -144,12 +147,12 @@ worth copying if you write another one against a shared volume.
 
 Stated here so nobody lifts a figure without them:
 
-- **Round A's citation counts measure the seeder, not Hindsight.** The bank was
+- **The delegated baseline's citation counts measure the seeder, not Hindsight.** The bank was
   seeded with the default `--batch 5`.
-  [The correction](transcript/README.md#correction-round-as-citation-numbers-measure-the-seeder)
+  [The correction](transcript/README.md#correction-the-delegated-baselines-citation-numbers-measure-the-seeder)
   has the measurement.
 - **The answer-quality probes must be scored at the chat-agent layer.** The
-  platform specialist has `memory_enabled: false` in both rounds
+  platform specialist has `memory_enabled: false` in both arms
   (`agents/platform/config.yaml`), so it carries no memory provider either way —
   it is a constant, not the variable under test.
 - **`queries.json`'s substring checks are a first pass, not the verdict.** They

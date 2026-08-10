@@ -866,7 +866,7 @@ next probe then used records at 52%, 59% and 59.5% without difficulty. Two furth
 counterexamples followed. The honest statement is the narrower one: a
 110,799-token injected block can contain a fact the answer omits, the omission is
 invisible to gold-recall scoring, and we cannot predict which facts go missing.
-([the probe in full](../../tests/memory-scale/transcript/README.md#round-b-probe-5-re-run-the-first-measurement-of-the-file-provider))
+([the probe in full](../../tests/memory-scale/transcript/README.md#file-arm-probe-5-the-first-measurement-of-the-file-provider))
 
 ### Is 0.702 gold recall bad, and what is lost
 

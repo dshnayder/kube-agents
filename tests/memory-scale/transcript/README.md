@@ -1,47 +1,66 @@
 # Experiment transcript
 
 The raw record of the memory scale test: the probe protocol, the corrections the
-run made to itself, the Round B isolation log, and the per-probe scoring for
-Round A.
+run made to itself, the file arm's isolation log, and the per-probe scoring.
 
 This is evidence, not narrative. What it argues for is in
 [`docs/designs/memory.md`](../../../docs/designs/memory.md); how to re-run any of
 it is in [the harness README](../README.md).
 
-**Complete, with one gap.** Both arms have now run all ten probes non-delegated
-at the chat-agent layer: the file provider in Round B, Hindsight in
-[Round A′](#round-a-the-ten-probes-against-hindsight-non-delegated) against a
-`--batch 1` reseed. Those two are the head-to-head. The original Round A probes
-1–3 were scored inline during the run and are recovered in the design doc rather
-than here; Round A throughout was delegated to a memory-less specialist and is
-kept as the record of what that measures, not as an arm of the comparison.
+**Three runs, and only two of them are the comparison.** Each section below is
+labelled with the run it belongs to:
+
+| Run                    | Provider   | Delegation                          | Bank        | Is it an arm?                                                         |
+| ---------------------- | ---------- | ----------------------------------- | ----------- | --------------------------------------------------------------------- |
+| **File arm**           | file-based | suppressed, at the chat-agent layer | —           | yes                                                                   |
+| **Hindsight arm**      | Hindsight  | suppressed, at the chat-agent layer | `--batch 1` | yes                                                                   |
+| **Delegated baseline** | Hindsight  | delegated to a specialist           | `--batch 5` | no — the specialist carries no provider, so it measures improvisation |
+
+The two arms ran the same ten probes and are the head-to-head. The delegated
+baseline is kept because what it measures — an agent with no memory answering
+from whatever it can scavenge — turned out to be the finding behind several of
+the open work items, not because it compares to anything.
+
+**Complete, with one gap.** The delegated baseline's probes 1–3 were scored
+inline during the run and are recovered in the design doc rather than here. Its
+probes 4–10 sit physically between the file arm's run-state section and the file
+arm's probes, in the order they were run.
 
 ## Contents
 
 - [Protocol: the ten answer-quality probes](#protocol-the-ten-answer-quality-probes)
-- [Correction: Round A's citation numbers measure the seeder](#correction-round-as-citation-numbers-measure-the-seeder)
-- [Round B: run state, isolation, and rollback](#round-b-run-state-isolation-and-rollback)
-- [Round B, probes 5 and 6: void, and the route that persists](#round-b-probes-5-and-6-void-and-the-route-that-persists)
-- [Round B, probe 5 re-run: the first measurement of the file provider](#round-b-probe-5-re-run-the-first-measurement-of-the-file-provider)
-- [Round B, probe 6 re-run: no errors, and the depth reading falls over](#round-b-probe-6-re-run-no-errors-and-the-depth-reading-falls-over)
-- [Round B, probe 7 re-run: the trap, refused correctly](#round-b-probe-7-re-run-the-trap-refused-correctly)
-- [Round B, probe 8 re-run: the fact Hindsight lost outright](#round-b-probe-8-re-run-the-fact-hindsight-lost-outright)
-- [Round B, probe 9 re-run: the second trap, and an aggregation the file wins](#round-b-probe-9-re-run-the-second-trap-and-an-aggregation-the-file-wins)
-- [Round B, probe 10 re-run: the negative probe the flat file is equipped for](#round-b-probe-10-re-run-the-negative-probe-the-flat-file-is-equipped-for)
-- [Round B at the chat-agent layer: interim summary after six probes](#round-b-at-the-chat-agent-layer-interim-summary-after-six-probes)
-- [Round B, probe 1 re-run: the supersession chain, and a caveat on 0.429](#round-b-probe-1-re-run-the-supersession-chain-and-a-caveat-on-0429)
-- [Round B, probe 2 re-run: ingress controller](#round-b-probe-2-re-run-ingress-controller)
-- [Round B, probe 3 re-run: audit log retention](#round-b-probe-3-re-run-audit-log-retention)
-- [Round B, probe 4 re-run: base image](#round-b-probe-4-re-run-base-image)
-- [Round B at the chat-agent layer: all ten probes](#round-b-at-the-chat-agent-layer-all-ten-probes)
-- [Round A′: the ten probes against Hindsight, non-delegated](#round-a-the-ten-probes-against-hindsight-non-delegated)
-- [Round A, probe 4: base image](#round-a-probe-4-base-image)
-- [Round A, probe 5: cluster backup](#round-a-probe-5-cluster-backup)
-- [Round A, probe 6: node pool shape](#round-a-probe-6-node-pool-shape)
-- [Round A, probe 7: etcd runbook](#round-a-probe-7-etcd-runbook)
-- [Round A, probe 8: leaked credential](#round-a-probe-8-leaked-credential)
-- [Round A, probe 9: nonexistent cluster](#round-a-probe-9-nonexistent-cluster)
-- [Round A, probe 10: nonexistent ADR](#round-a-probe-10-nonexistent-adr)
+- [Correction: the delegated baseline's citation numbers measure the seeder](#correction-the-delegated-baselines-citation-numbers-measure-the-seeder)
+
+File arm:
+
+- [File arm: run state, isolation, and rollback](#file-arm-run-state-isolation-and-rollback)
+- [File arm, probes 5 and 6 (delegated): void, and the route that persists](#file-arm-probes-5-and-6-delegated-void-and-the-route-that-persists)
+- [File arm, probe 5: the first measurement of the file provider](#file-arm-probe-5-the-first-measurement-of-the-file-provider)
+- [File arm, probe 6: no errors, and the depth reading falls over](#file-arm-probe-6-no-errors-and-the-depth-reading-falls-over)
+- [File arm, probe 7: the trap, refused correctly](#file-arm-probe-7-the-trap-refused-correctly)
+- [File arm, probe 8: the fact Hindsight lost outright](#file-arm-probe-8-the-fact-hindsight-lost-outright)
+- [File arm, probe 9: the second trap, and an aggregation the file wins](#file-arm-probe-9-the-second-trap-and-an-aggregation-the-file-wins)
+- [File arm, probe 10: the negative probe the flat file is equipped for](#file-arm-probe-10-the-negative-probe-the-flat-file-is-equipped-for)
+- [File arm: interim summary after six probes](#file-arm-interim-summary-after-six-probes)
+- [File arm, probe 1: the supersession chain, and a caveat on 0.429](#file-arm-probe-1-the-supersession-chain-and-a-caveat-on-0429)
+- [File arm, probe 2: ingress controller](#file-arm-probe-2-ingress-controller)
+- [File arm, probe 3: audit log retention](#file-arm-probe-3-audit-log-retention)
+- [File arm, probe 4: base image](#file-arm-probe-4-base-image)
+- [File arm: all ten probes](#file-arm-all-ten-probes)
+
+Hindsight arm:
+
+- [Hindsight arm: the ten probes, non-delegated](#hindsight-arm-the-ten-probes-non-delegated)
+
+Delegated baseline (not an arm):
+
+- [Delegated baseline, probe 4: base image](#delegated-baseline-probe-4-base-image)
+- [Delegated baseline, probe 5: cluster backup](#delegated-baseline-probe-5-cluster-backup)
+- [Delegated baseline, probe 6: node pool shape](#delegated-baseline-probe-6-node-pool-shape)
+- [Delegated baseline, probe 7: etcd runbook](#delegated-baseline-probe-7-etcd-runbook)
+- [Delegated baseline, probe 8: leaked credential](#delegated-baseline-probe-8-leaked-credential)
+- [Delegated baseline, probe 9: nonexistent cluster](#delegated-baseline-probe-9-nonexistent-cluster)
+- [Delegated baseline, probe 10: nonexistent ADR](#delegated-baseline-probe-10-nonexistent-adr)
 
 ## Protocol: the ten answer-quality probes
 
@@ -68,25 +87,25 @@ where the reply can differ from the context:
 
 #### How to run it
 
-Round A was actually run **twice**, and the report has to say which run each
-number came from:
+The delegated baseline was actually run **twice**, under two presentations, and
+the report has to say which one each number came from:
 
-| run | where       | presentation                      |
-| --- | ----------- | --------------------------------- |
-| A1  | DM          | all ten probes in a single prompt |
-| A2  | group space | one probe per message             |
+| presentation    | where       | what was sent                     |
+| --------------- | ----------- | --------------------------------- |
+| single prompt   | DM          | all ten probes in a single prompt |
+| one per message | group space | one probe per message             |
 
-**A2 is the parity target for Round B**, which is how probe 1 was sent. A1 is a
-second measurement of a different thing — one recall serving ten topics — not a
-replicate of A2, and it must not be pooled with it.
+**One per message is the parity target for the file arm**, which is how probe 1
+was sent. The single prompt is a second measurement of a different thing — one
+recall serving ten topics — not a replicate, and the two must not be pooled.
 
 Send each question in the **group space, to `@kage`** — not a DM. The earlier
-instruction here said DM and was wrong, for two reasons. Round A was run in the
+instruction here said DM and was wrong, for two reasons. The delegated baseline was run in the
 group space, so a DM would break parity. And `multiuser_memory._session_is_shared`
 (lines 106-118) suppresses the personal store only when `chat_type != "dm"`: in a
 DM it would inject
 `/opt/data/memories/users/dmitryshnayder_google.com_ab4bc33e9a14.md`, 1,594 bytes
-of real personal memory that Round A never saw. Send them in the order below and
+of real personal memory that the delegated baseline never saw. Send them in the order below and
 paste the replies back; I will score them against the answer key.
 
 Do not preface the questions with context or combine them into one message. Each
@@ -94,11 +113,11 @@ probe must arrive as a cold question, because that is the situation being
 measured: someone asking the fleet assistant a question two years into the
 fleet's life.
 
-##### Round A — current image (Hindsight)
+##### Hindsight — the current image
 
 Nothing to change; this is what is deployed now.
 
-##### Round B — the file-based provider
+##### File-based — the previous image
 
 Requires rolling the gateway to `dev-20260729-155133`, which is the last image
 containing `multiuser_memory`. Verified by listing the plugin directory inside
@@ -167,16 +186,16 @@ Mechanical, against `queries.json`, so the judgement is not mine after the fact:
 - **negative** — a pass is declining to answer or saying it has no record. Any
   description of the nonexistent cluster or ADR is a fail, however hedged.
 
-## Correction: Round A's citation numbers measure the seeder
+## Correction: the delegated baseline's citation numbers measure the seeder
 
-Found 2026-08-01 while scoring Round B probe 1. This invalidates one of Round A's two headline
+Found 2026-08-01 while scoring file-arm probe 1. This invalidates one of the delegated baseline's two headline
 numbers and reverses the fix I filed for it.
 
 #### What I claimed
 
 > `document_id` is populated on 0 of 364 recalled units … roughly one citation in four is wrong, and
 > that rate does not move. It is a property of the binding step, not of the retrieval.
-> — [probe 6](#round-a-probe-6-node-pool-shape), [probe 10](#round-a-probe-10-nonexistent-adr)
+> — [probe 6](#delegated-baseline-probe-6-node-pool-shape), [probe 10](#delegated-baseline-probe-10-nonexistent-adr)
 
 Filed as **#111 — populate `document_id` on recall**.
 
@@ -230,7 +249,7 @@ The record does; its identifier was discarded at retain time.
 
 1. **The ~25% attribution error rate is not a Hindsight measurement.** Four of every five record ids
    were destroyed before recall ever ran. Any citation landing on a pack-mate is a harness artifact.
-   Every mis-citation in Round A that I traced to "near-duplicate individuation failure" —
+   Every mis-citation in the delegated baseline that I traced to "near-duplicate individuation failure" —
    DEP-001/DEP-003, DEP-011, DEP-051, CONV-001 for CONV-002, CONV-007 for CONV-011, OWN-002 for
    OWN-003 — is off by less than a pack width.
 2. **#111 is the wrong fix and would have made things worse.** Populating `document_id` returns the
@@ -256,11 +275,11 @@ Nothing here touches the substance results, which never depended on document lab
 
 #### Required rework
 
-- Reseed the bank with **`--batch 1`** so one corpus record is one document, then re-run Round A's
+- Reseed the bank with **`--batch 1`** so one corpus record is one document, then re-run the delegated baseline's
   ten probes. Only the citation numbers are in question, but they cannot be salvaged by re-scoring.
 - Retire **#111** as written; replace with "one record per retain call" plus per-unit provenance.
 
-## Round B: run state, isolation, and rollback
+## File arm: run state, isolation, and rollback
 
 Opened 2026-08-01 ~00:58 UTC.
 
@@ -281,12 +300,12 @@ delete, not a restore. (`memories/users/` existed and was left alone.)
 Scaling `hindsight-api` to 0 was not an isolation boundary. Two attempts at probe 1 both answered
 from Hindsight rather than the file store, by two different routes:
 
-| attempt | route it actually used                                                          | how it was caught                                                                                                                            |
-| ------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1       | `/opt/data/docs/standards/corpus/all_docs.json` — a Round A leftover on the PVC | its own `verify_sa_key_answer.py` opens that path; 0 references to `MEMORY.md`/`grep`/`1414` across its artefacts                            |
-| 2       | **direct SQL to `hindsight-postgresql`**, bypassing the down API                | it said so unprompted: _"the hindsight-api deployment has been at 0/0 replicas for ~12h; it read the corpus straight from Postgres instead"_ |
+| attempt | route it actually used                                                                     | how it was caught                                                                                                                            |
+| ------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1       | `/opt/data/docs/standards/corpus/all_docs.json` — a delegated-baseline leftover on the PVC | its own `verify_sa_key_answer.py` opens that path; 0 references to `MEMORY.md`/`grep`/`1414` across its artefacts                            |
+| 2       | **direct SQL to `hindsight-postgresql`**, bypassing the down API                           | it said so unprompted: _"the hindsight-api deployment has been at 0/0 replicas for ~12h; it read the corpus straight from Postgres instead"_ |
 
-Attempt 2 also recreated `/opt/data/docs/standards/` and rebuilt Round A's exact harness by name
+Attempt 2 also recreated `/opt/data/docs/standards/` and rebuilt the delegated baseline's exact harness by name
 (`fetch_docs.py`, `q.py`, `verify_chains.py`, `verify_sa_key_answer.py`, `mutate_sa_key_answer.py`).
 
 Fix, authorised by the user 2026-07-31:
@@ -400,7 +419,7 @@ false deliberately: setting either would make the operator append `memory` to `d
 
 Claude Opus 5 on Vertex carries a 200k window, so the corpus _fits_ — the file provider does not fall
 over at 1,414 documents. It occupies **55% of the context window as a fixed tax**. Hindsight's recall
-windows across the same ten probes in Round A ran 22–63 units; the largest, probe 6, was ~9k tokens.
+windows across the same ten probes in the delegated baseline ran 22–63 units; the largest, probe 6, was ~9k tokens.
 
 That is the crossover, and it is not a cliff — it is a slope with a hard wall at the end:
 
@@ -416,11 +435,11 @@ Linear in corpus size, by construction: `system_prompt_block()` concatenates eve
 truncation, no budget, no relevance filter. Extrapolating the same slope, ~2,600 shared documents
 exhausts the window on its own.
 
-#### Probe protocol — unchanged from Round A
+#### Probe protocol — unchanged from the delegated baseline
 
 Same ten questions, same order, same scoring rules ([Protocol](#protocol-the-ten-answer-quality-probes)). Ask in a DM to `@kage`.
 
-## Round A, probe 4: base image
+## Delegated baseline, probe 4: base image
 
 **Question:** What base image should a new service use?
 **Route:** chat agent → delegated to platform agent (kanban `t_6b28ae4e`)
@@ -527,7 +546,7 @@ localisation leaking into an English conversation). The write-up the agent produ
 delivered to the user; it sits on the host at
 `/opt/data/docs/standards/base-image-new-service-2026-07-31.md`.
 
-## Round A, probe 5: cluster backup
+## Delegated baseline, probe 5: cluster backup
 
 **Question:** How do we back up a production cluster?
 **Route:** chat agent → platform agent (kanban `t_a4514b9c`)
@@ -625,7 +644,7 @@ honestly declared. The damage is confined to the reference numbers: anyone who f
 expecting vega-02's backup exclusion would land on an unrelated storage-class exception for a
 different cluster in a different region.
 
-## Round A, probe 6: node pool shape
+## Delegated baseline, probe 6: node pool shape
 
 **Question:** What node pool shape should a batch or ML inference workload use?
 **Route:** chat agent → platform agent (kanban `t_cd23d85d`)
@@ -717,10 +736,10 @@ binding step, not of the retrieval. More retrieved context does not make it wors
 identifiers do not make it better. The only thing that scales the absolute error count is how many
 identifiers the answer chooses to assert.
 
-That is the single most reportable number from Round A, and it is exactly what populating
+That is the single most reportable number from the delegated baseline, and it is exactly what populating
 `document_id` (#111) is predicted to move.
 
-## Round A, probe 7: etcd runbook
+## Delegated baseline, probe 7: etcd runbook
 
 **Question:** Walk me through responding to the etcd database size alert, in order.
 **Route:** chat agent → platform agent (kanban `t_b47f7b58`)
@@ -816,7 +835,7 @@ probe and also carries an out-of-sequence prerequisite.
 | identifiers wrong           | 12                   |
 | **per-citation error rate** | **~26%** (unchanged) |
 
-## Round A, probe 8: leaked credential
+## Delegated baseline, probe 8: leaked credential
 
 **Question:** A credential has leaked. What do I do?
 **Route:** chat agent → platform agent (kanban `t_e817a615`), completed at ~39–44 min
@@ -939,7 +958,7 @@ Worth recording, because the failures above should not obscure it:
 
 A misleading error surface on a credential path. Unrelated to this test; worth a card.
 
-#### Running totals — Round A, 7 scored probes
+#### Running totals — delegated baseline, 7 scored probes
 
 |                                        |                                         |
 | -------------------------------------- | --------------------------------------- |
@@ -950,7 +969,7 @@ A misleading error surface on a credential path. Unrelated to this test; worth a
 | identifiers wrong                      | 12                                      |
 | **per-citation error rate**            | **~23%**                                |
 
-## Round A, probe 9: nonexistent cluster
+## Delegated baseline, probe 9: nonexistent cluster
 
 **Question:** What is mfs-prod-euw1-99 used for?
 **Route:** chat agent → platform agent (kanban `t_becc496f`), ~38 min
@@ -1059,7 +1078,7 @@ when it can see thirteen units but cannot tell which fields it has already count
 This is the same root defect wearing a third costume: without individuation, the model cannot tell
 "two records agreeing" from "one record seen twice."
 
-#### Running totals — Round A, 8 scored probes
+#### Running totals — delegated baseline, 8 scored probes
 
 |                             |                                              |
 | --------------------------- | -------------------------------------------- |
@@ -1071,7 +1090,7 @@ This is the same root defect wearing a third costume: without individuation, the
 | identifiers wrong           | 14                                           |
 | **per-citation error rate** | **~25%** — unmoved across eight probes       |
 
-## Round A, probe 10: nonexistent ADR
+## Delegated baseline, probe 10: nonexistent ADR
 
 **Question:** What did we decide in ADR-2026-099?
 **Route:** chat agent → platform agent (kanban `t_2314e0f2`), ~4 min
@@ -1154,10 +1173,10 @@ already made and merely has to be read out. Attribution fails because the model 
 believes, looks across 22–63 paraphrased units for the one that licenses it, and has **no field
 telling it which unit that is**. `document_id` is populated on 0 of 364 units.
 
-That is the whole story of Round A, and it is a far more precise claim than "the agent sometimes gets
+That is the whole story of the delegated baseline, and it is a far more precise claim than "the agent sometimes gets
 citations wrong."
 
-#### Round A complete — final tally
+#### Delegated baseline complete — final tally
 
 | metric                                       | result                                                                    |
 | -------------------------------------------- | ------------------------------------------------------------------------- |
@@ -1183,7 +1202,7 @@ off-by-one aggregates, and one instance of fictional policy applied to real infr
 Every one of those failures has an identified mechanism and a filed fix (#111–#114, #116). None of
 them is a retrieval failure.
 
-## Round B, probes 5 and 6: void, and the route that persists
+## File arm, probes 5 and 6 (delegated): void, and the route that persists
 
 Probe 5 (_"How do we back up a production cluster?"_, `t_4b08716e`) and probe 6
 (_"What node pool shape should a batch or ML inference workload use?"_,
@@ -1207,7 +1226,7 @@ The substance was nonetheless correct on every point checked against the corpus 
 `CONV-015`'s daily/thirty-day baseline, `CONV-027`'s Terraform boundary, all four
 excluded clusters, `EXC-007` as the drill target, `DEP-054`'s 2026-08-06 removal
 date, and the three Sev-1s whose root cause really is _"a PersistentVolume in a
-zone the backup plan did not cover"_. It is Round A's Hindsight reads replayed
+zone the backup plan did not cover"_. It is the delegated baseline's Hindsight reads replayed
 from cache.
 
 Probe 5 did produce one clean incidental confirmation of
@@ -1245,18 +1264,18 @@ nothing, because the corpus had already been copied somewhere the specialist own
 It was deleted by `jobs/roundb-cleanup-skillcache-job.yaml` (one literal path,
 user-authorised; `MEMORY.md` verified intact at 444,531 bytes afterwards).
 
-The structural conclusion is that Round B cannot measure the file provider
+The structural conclusion is that the file arm cannot measure the file provider
 through the delegation path at all. Only the chat agent carries `MEMORY.md`; a
 kanban-spawned specialist has no provider in either round, so every delegated
 probe measures improvisation. The remaining probes are sent with delegation
 suppressed, which is what scoring at the chat-agent layer requires anyway.
 
-## Round B, probe 5 re-run: the first measurement of the file provider
+## File arm, probe 5: the first measurement of the file provider
 
 Probe 5 was re-sent with delegation suppressed — _"Answer from your own memory,
 directly — do not delegate to the platform agent and do not create a kanban
 task."_ The chat agent answered inline (_"Answering from my own shared-memory
-notes — no delegation, no card filed"_), which makes this the first Round B probe
+notes — no delegation, no card filed"_), which makes this the first file-arm probe
 that measures the configured provider rather than a specialist's improvisation.
 
 ### Scoring
@@ -1278,7 +1297,7 @@ to both an incident commander and the disaster-recovery team is also right;
 `RB-004` says the first, `OWN-002` the second.
 
 **Four identifiers cited, zero of them wrong.** That is the number to compare
-against Round A, and the comparison is not a provider result — Round A's citation
+against the delegated baseline, and the comparison is not a provider result — the delegated baseline's citation
 errors came from the `--batch 5` seeding, not from Hindsight.
 
 ### What it missed, and where those facts were sitting
@@ -1346,7 +1365,7 @@ attribution gap is a property of the format.
 **Verdict: scored.** Accurate, correctly cited, and materially incomplete in a way
 the store cannot be blamed for.
 
-## Round B, probe 6 re-run: no errors, and the depth reading falls over
+## File arm, probe 6: no errors, and the depth reading falls over
 
 Probe 6 re-sent with delegation suppressed. The chat agent answered inline.
 
@@ -1410,7 +1429,7 @@ identifier is necessary for attribution, not sufficient for it.
 **Verdict: scored.** Accurate, correctly cited, and the strongest single answer
 of the run on either provider.
 
-## Round B, probe 7 re-run: the trap, refused correctly
+## File arm, probe 7: the trap, refused correctly
 
 Probe 7 asks for the etcd restore runbook. **There is no such runbook**, and the
 premise is false in a way the corpus supports rather than merely omits: Meridian
@@ -1446,7 +1465,7 @@ nothing either way about depth.
 
 The failure this experiment most needs to rule out is a provider that makes
 things up when the corpus is silent. Both improvised specialist answers earlier
-in Round B converted an unreachable source into a confident assertion of
+in the file arm converted an unreachable source into a confident assertion of
 nonexistence (`ADR-2026-081`, _"zero records"_). This probe is the mirror case —
 a genuine nonexistence — and the chat agent got it right on the substance and
 right on the reason, then volunteered the adjacent material instead of stopping
@@ -1459,7 +1478,7 @@ cost, not on accuracy, and probe 7 is the check that keeps it honest.
 **Verdict: scored.** Correct refusal, correct reason, no fabrication, and the
 substitute material is accurate.
 
-## Round B, probe 8 re-run: the fact Hindsight lost outright
+## File arm, probe 8: the fact Hindsight lost outright
 
 Probe 8 asks what to do about a service account key committed to a public repo.
 
@@ -1522,10 +1541,10 @@ cannot attribute.
 
 **Verdict: scored.** Accurate, correctly cited, complete.
 
-## Round B, probe 9 re-run: the second trap, and an aggregation the file wins
+## File arm, probe 9: the second trap, and an aggregation the file wins
 
 Probe 9 asks about `mfs-prod-euw2-09`, which does not exist. The scoring rule is
-the one used in Round A: a pass is declining to answer or saying there is no
+the one used in the delegated baseline: a pass is declining to answer or saying there is no
 record, and any description of the fictional cluster is a fail however hedged.
 
 ### Scoring
@@ -1567,9 +1586,9 @@ europe-west2 footprint"_ is only a safe thing to say if you have seen the whole
 fleet.
 
 Worth being precise about what this does and does not show. It is not evidence
-that Hindsight fails the probe; Round A passed the nonexistent-cluster probe too,
+that Hindsight fails the probe; the delegated baseline passed the nonexistent-cluster probe too,
 and produced a flawless enumeration of all twenty euw1 clusters plus two
-fleet-wide aggregates. The two runs are not a clean A/B in any case — Round A
+fleet-wide aggregates. The two runs are not a clean A/B in any case — the delegated baseline
 asked about `mfs-prod-euw1-99`, and that probe was **delegated**, so it carries
 the same caveat as every other delegated probe in this experiment. What this
 probe shows is that fleet-wide aggregation is a real query class, that the file
@@ -1585,7 +1604,7 @@ metadata-only-id family. There was nothing available to cite.
 
 A correct, well-reasoned, fleet-wide answer with zero attribution is what the
 flat file produces when the question happens to land entirely outside the three
-prose-id families. Round A's answer to the same probe class carried citations —
+prose-id families. The delegated baseline's answer to the same probe class carried citations —
 two of which were wrong, a transposition between `EXC-003` and `DEP-051` — which
 is the asymmetry the design doc rests on: a wrong citation is visible and
 fixable, and no citation is neither.
@@ -1593,7 +1612,7 @@ fixable, and no citation is neither.
 **Verdict: scored.** Correct refusal, correct and non-obvious reason, real
 alternatives offered, and entirely unattributable.
 
-## Round B, probe 10 re-run: the negative probe the flat file is equipped for
+## File arm, probe 10: the negative probe the flat file is equipped for
 
 Probe 10 asks what was decided in `ADR-2026-099`, which was never written.
 
@@ -1651,7 +1670,7 @@ substitute for repeated sampling and should not be read as one.
 **Verdict: scored.** Correct refusal, five correct supporting facts, fully
 attributed.
 
-## Round B at the chat-agent layer: interim summary after six probes
+## File arm: interim summary after six probes
 
 | #   | probe                      | verdict | citations | errors |
 | --- | -------------------------- | ------- | --------: | -----: |
@@ -1665,7 +1684,7 @@ attributed.
 **Thirteen more decimal places would not change the summary: zero citation errors
 across six probes, and all three traps refused correctly.** The file provider
 does not fabricate, and at the chat-agent layer it is a good deal better than the
-delegated Round B probes made it look — those were measuring a memory-less
+delegated file-arm probes made it look — those were measuring a memory-less
 specialist improvising, not the provider.
 
 Two probes went against the recommendation in the design doc and are recorded as
@@ -1680,11 +1699,12 @@ One probe found the cost that gold-recall scoring cannot see: probe 5 omitted
 And six probes out of six confirmed the identifier finding, ending with probe 9
 and probe 10 demonstrating both of its faces on the same store.
 
-**Still outstanding:** probes 1–4 at this layer, and the whole of Round A, which
-was delegated throughout and must be re-run non-delegated against a `--batch 1`
-reseed before any head-to-head number in this document is load-bearing.
+**Still outstanding:** probes 1–4 at this layer, and the whole Hindsight side,
+which so far exists only as the delegated baseline and must be re-run
+non-delegated against a `--batch 1` reseed before any head-to-head number in this
+document is load-bearing.
 
-## Round B, probe 1 re-run: the supersession chain, and a caveat on 0.429
+## File arm, probe 1: the supersession chain, and a caveat on 0.429
 
 Probe 1 (`Q-SUP-ADR-2026-052`) asks for the current policy on service account
 keys. A wrong answer quotes the 90-day rotation that `ADR-2026-052` banned. This
@@ -1747,7 +1767,7 @@ show it being free, and it does not show it scaling.
 **Verdict: scored.** Accurate, complete, current-first, and the one probe that
 argues for softening a headline claim rather than supporting it.
 
-## Round B, probe 2 re-run: ingress controller
+## File arm, probe 2: ingress controller
 
 Probe 2 (`Q-SUP-ADR-2026-047`) asks which ingress controller a new service should
 use. A wrong answer recommends ingress-nginx.
@@ -1785,7 +1805,7 @@ name of the one cluster that still matters are not.
 
 **Verdict: scored.** Accurate, complete, current-first.
 
-## Round B, probe 3 re-run: audit log retention
+## File arm, probe 3: audit log retention
 
 Probe 3 (`Q-SUP-ADR-2026-044`) asks how long audit logs are retained. A wrong
 answer says 90 or 400 days.
@@ -1827,7 +1847,7 @@ Same adjacency caveat as probes 1 and 2: the three ADRs sit at 1.5%, 1.5% and
 
 **Verdict: scored.** Accurate, complete, current-first.
 
-## Round B, probe 4 re-run: base image
+## File arm, probe 4: base image
 
 Probe 4 (`Q-SUP-ADR-2026-051`) asks what base image a new service should use. A
 wrong answer says distroless or debian-slim.
@@ -1859,7 +1879,7 @@ description of probe 5 and nothing more.
 
 **Verdict: scored.** Accurate, complete, current-first.
 
-## Round B at the chat-agent layer: all ten probes
+## File arm: all ten probes
 
 | #   | probe                 | class        | verdict | citations | errors |
 | --- | --------------------- | ------------ | ------- | --------: | -----: |
@@ -1876,7 +1896,7 @@ description of probe 5 and nothing more.
 
 **Thirty-four citations, zero errors, three traps refused, six supersession
 probes all answering current-first.** At the chat-agent layer the file provider
-is materially better than the delegated Round B probes made it look — those were
+is materially better than the delegated file-arm probes made it look — those were
 measuring a memory-less specialist improvising, and they produced the run's only
 fabrications.
 
@@ -1910,16 +1930,16 @@ The case for Hindsight is unchanged and is narrower than "it recalls better": it
 is provenance, currency-ranking that does not depend on the corpus being written
 with explicit supersession prose, and 4,264 tokens against 110,799.
 
-**Now closed:** the whole of Round A was delegated throughout and had to be re-run
-non-delegated against a `--batch 1` reseed before any head-to-head number here
-could be load-bearing. That re-run is
-[Round A′](#round-a-the-ten-probes-against-hindsight-non-delegated), and the
+**Now closed:** the Hindsight side existed only as the delegated baseline and had
+to be re-run non-delegated against a `--batch 1` reseed before any head-to-head
+number here could be load-bearing. That re-run is
+[the Hindsight arm](#hindsight-arm-the-ten-probes-non-delegated), and the
 comparison it makes against the table above is the one this document exists to
 support.
 
-## Round A′: the ten probes against Hindsight, non-delegated
+## Hindsight arm: the ten probes, non-delegated
 
-The head-to-head Round B's closing note said was outstanding. Same ten questions,
+The head-to-head that the file arm's closing note left outstanding. Same ten questions,
 same wording, same "do not delegate to the platform agent and do not create a
 kanban task" prefix, against the corrected bank.
 
@@ -1928,12 +1948,12 @@ under it:
 
 - **The bank was reseeded with `--batch 1`** — 1,664 records, 0 failed, 1,664
   documents against the flawed run's 335, 4,400 memory units, 1,664 distinct
-  contexts, 0 empty. The `--batch 5` packing defect that produced Round A's
+  contexts, 0 empty. The `--batch 5` packing defect that produced the delegated baseline's
   citation errors is gone
-  ([the correction](#correction-round-as-citation-numbers-measure-the-seeder)).
-- **The flat store was deleted**, not renamed — the mirror of Round B scaling
+  ([the correction](#correction-the-delegated-baselines-citation-numbers-measure-the-seeder)).
+- **The flat store was deleted**, not renamed — the mirror of the file arm's scaling
   Hindsight to zero. Its live sha256 matched the repository fixture, so nothing
-  was lost. Renaming was tried first and was the wrong instinct: Round B had
+  was lost. Renaming was tried first and was the wrong instinct: the file arm had
   already established twice over that a nominally-unreachable source is still
   reachable.
 - **The PVC was surveyed**, because removing the one file we knew about is what
@@ -1942,7 +1962,7 @@ under it:
   identifiers) and `kanban.db` (119) were deliberately kept, since they are the
   evidence behind the improvisation-route findings.
 - **No delegation occurred.** Zero attachment directories were modified during
-  the run and the five most recent kanban tasks are all Round B's — checked
+  the run and the five most recent kanban tasks are all the file arm's — checked
   independently of the probe prefix, because the prefix is an instruction and
   instructions are not controls.
 
@@ -2021,7 +2041,7 @@ searched, not only what it found.
 
 ### Reasoning across retrieved records — twice, and new
 
-Neither behaviour below appears anywhere in Round A or Round B.
+Neither behaviour below appears anywhere in the delegated baseline or the file arm.
 
 **Probe 7** listed the three Velero-runbook deprecation records and observed that
 the register contradicts itself. All three are exact — `DEP-054` (2026-08-06, 14
@@ -2057,7 +2077,7 @@ bindings, not from what you believe it was for"_ — so "establish blast radius"
 right anyway. The agent graded its own confidence and located the uncertainty on
 the one item it was least sure of.
 
-This is the precise inverse of Round A's failure mode, where seeder-mangled
+This is the precise inverse of the delegated baseline's failure mode, where seeder-mangled
 citations came out confident and wrong. It is worth stating plainly that the
 failure mode which motivated half this document was an artefact of `--batch 5`,
 and that with one document per record the same agent volunteers where its evidence
@@ -2082,7 +2102,7 @@ sentence came from which record, and boilerplate true of 39 records bleeds onto 
 
 ### `ADR-2026-052` recovered: the seeder evidence chain closes
 
-`ADR-2026-052` was Hindsight's only outright loss in Round A — the sole `absent`
+`ADR-2026-052` was Hindsight's only outright loss in the delegated baseline — the sole `absent`
 miss at 0.098 coverage, and the single strongest result against the
 recommendation. Probe 8 returned it with the correct date (2026-04-20), the
 correct supersession pair (`ADR-2025-031`, `ADR-2024-014`), and the correct
@@ -2099,10 +2119,10 @@ measurement that motivated it has been retaken.
 Both arms answered the same ten questions non-delegated. Counting only identifiers
 each answer named itself:
 
-| arm                  | citations | from metadata-only-id families |
-| -------------------- | --------: | -----------------------------: |
-| File-based (Round B) |        34 |                              0 |
-| Hindsight (Round A′) |    **59** |                   **23 (39%)** |
+| arm        | citations | from metadata-only-id families |
+| ---------- | --------: | -----------------------------: |
+| File-based |        34 |                              0 |
+| Hindsight  |    **59** |                   **23 (39%)** |
 
 The zero is structural, not incidental. `MEMORY.md` contains 193 identifiers —
 69 `ADR-`, 44 `RB-`, 80 `PM-` — because those three families write the id into
@@ -2122,7 +2142,7 @@ appeared as unattributed assertions or did not appear at all.
 Probe 5 is the sharpest single case: 14 citations against the file arm's 4, on the
 same question, with the file arm having the entire corpus in its window.
 
-### What Round A′ changes about the argument
+### What the Hindsight arm changes about the argument
 
 **Against the recommendation:**
 
@@ -2139,12 +2159,12 @@ same question, with the file arm having the entire corpus in its window.
 - **59 citations against 34**, with 23 of those from families the flat file
   cannot name at all. The reader can check Hindsight's answers.
 - **Reasoning across records** appeared twice and never in the file arm.
-- **Calibrated uncertainty** appeared where Round A had confident fabrication,
+- **Calibrated uncertainty** appeared where the delegated baseline had confident fabrication,
   once the seeder was fixed.
 - **4,264 tokens against 110,799** — a 55% fixed context tax per turn on a 200k
   window, which is what actually caps the fleet at roughly 2,600 shared documents.
 
 The case is unchanged and still narrower than "it recalls better": provenance,
 currency-ranking that does not depend on the corpus being written with explicit
-supersession prose, and cost. Round A′ strengthens the provenance half with a
+supersession prose, and cost. The Hindsight arm strengthens the provenance half with a
 measured number and weakens the accuracy half with a real error. Both go in.
