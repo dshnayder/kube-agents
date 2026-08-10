@@ -57,8 +57,10 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 | `holographic` | Local HRR experiment                         | None                             |
 
 Self-hosting is highly desired — the corpus is a bank's internal fleet topology,
-ownership map and incident history — and `hindsight` is the only entry that is
-both self-hostable and multi-user. The shortlist has one name on it.
+ownership map and incident history, and a hosted provider puts all of it outside the
+customer's boundary. `hindsight` is the only entry that is both self-hostable and
+multi-user, so it is the one candidate that does not trade one of those against the
+other.
 
 ### `multiuser_memory`, the provider this replaced
 
@@ -326,7 +328,7 @@ fixes with it.
 
 One subtlety worth knowing before editing: Hermes calls `is_available()` **before**
 `initialize()` and drops the provider outright if it says no
-(`agent_init.py`), so it must be answerable with no bank built. It answers by
+(`agent/agent_init.py`), so it must be answerable with no bank built. It answers by
 delegating to a throwaway stock provider, whose own availability check is stateless
 — it reads the config file.
 
@@ -855,7 +857,7 @@ next probe then used records at 52%, 59% and 59.5% without difficulty. Two furth
 counterexamples followed. The honest statement is the narrower one: a
 110,799-token injected block can contain a fact the answer omits, the omission is
 invisible to gold-recall scoring, and we cannot predict which facts go missing.
-([probe 5 re-run](../../tests/memory-scale/transcript/README.md#round-b-probe-5-re-run-the-first-measurement-of-the-file-provider))
+([the probe in full](../../tests/memory-scale/transcript/README.md#round-b-probe-5-re-run-the-first-measurement-of-the-file-provider))
 
 ### Is 0.702 gold recall bad, and what is lost
 
@@ -918,16 +920,16 @@ of nothing else.
 
 They were asked by hand, one per message, **non-delegated at the chat-agent layer** —
 which matters, because the chat agent is the only profile carrying the configured
-provider. The file arm is Round B; the Hindsight arm is Round A′, run against a
-corrected `--batch 1` reseed with the flat store deleted (not renamed) and the PVC
-surveyed for caches. Both arms were severed the same way: Round B scaled Hindsight to
-zero, Round A′ deleted the file. Scoring rules and every raw answer are in
+provider. Each arm ran with the other provider severed, so neither could answer from
+the other's store: the file arm ran with Hindsight scaled to zero, and the Hindsight
+arm with the flat store deleted — deleted, not renamed — and the volume surveyed for
+leftover caches. Scoring rules and every raw answer are in
 [the transcript](../../tests/memory-scale/transcript/README.md).
 
-| Arm                  | Probes | Citations | Citation errors | From metadata-only-id families |
-| -------------------- | -----: | --------: | --------------: | -----------------------------: |
-| File-based (Round B) |     10 |        34 |           **0** |                              0 |
-| Hindsight (Round A′) |     10 |    **59** |               1 |                   **23 (39%)** |
+| Arm        | Probes | Citations | Citation errors | From metadata-only-id families |
+| ---------- | -----: | --------: | --------------: | -----------------------------: |
+| File-based |     10 |        34 |           **0** |                              0 |
+| Hindsight  |     10 |    **59** |               1 |                   **23 (39%)** |
 
 Both arms answered every question correctly and refused all three traps. Read that
 table honestly in both directions: the file provider made **no** citation errors and
@@ -954,8 +956,7 @@ arm:
   Neither observation is stated in any single record.
 - **Calibrated uncertainty.** On the leaked-credential probe it gave `RB-019` step by
   step and explicitly flagged step 3 as _"wording I'd want confirmed against the
-  runbook text"_ — and it was right anyway. That is the inverse of the earlier
-  mis-seeded run's confident fabrication.
+  runbook text"_ — and it was right anyway.
 - **Provenance that can be checked at all**, which is the 59-vs-34 column.
 
 One imprecision was scored short of an error: on two probes the agent attached the
@@ -968,7 +969,7 @@ _"File memory gives wrong answers"_ would not have survived this run.
 
 ### Specialists have no memory, and improvise one
 
-Kanban-spawned specialists ran with `memory_enabled: false` in both rounds, making
+Kanban-spawned specialists ran with `memory_enabled: false` in both arms, making
 them a constant. The way they behave without a provider is nonetheless the strongest
 operational finding in the test.
 
@@ -977,7 +978,7 @@ experiment had closed — a different one each time:
 
 | Route it used                                               | How it was caught                    |
 | ----------------------------------------------------------- | ------------------------------------ |
-| A stale on-disk export left over from the previous round    | Its own verification script opens it |
+| A stale on-disk export left over from earlier in the test   | Its own verification script opens it |
 | Direct SQL to Postgres, bypassing the scaled-down API       | It volunteered it                    |
 | Scaled the database back up via its GCP service account     | GKE audit log                        |
 | Derived the answer from its own prior runs, via the task DB | It said so, unprompted               |
@@ -1037,8 +1038,8 @@ DEP-003 doesn't exist"_ it was reading a corrupted index correctly. The fix is o
 record per retain call plus per-unit provenance — **not** the `document_id`
 field originally filed, which would have returned the packed document's identifier
 authoritatively and made a wrong citation look sourced. Reseeding with `--batch 1`
-produced 1,664 documents and 4,400 memory units, and Round A′ was run against that.
-**Always seed with `--batch 1`.**
+produced 1,664 documents and 4,400 memory units, and the Hindsight arm reported
+above was run against that. **Always seed with `--batch 1`.**
 
 **The file arm was measured unbounded, and that needs saying out loud.**
 `measure_file_based.py` writes `MEMORY.md` and `users/*.md` itself, in the on-disk
@@ -1052,10 +1053,10 @@ result the file store has.
 
 **The answer probes were initially scored at the wrong layer.** The first scored
 replies were the specialist's, and the specialist has no memory provider in either
-round. Both arms were re-run non-delegated at the chat-agent layer, which is the
+arm. Both arms were re-asked non-delegated at the chat-agent layer, which is the
 head-to-head reported above.
 
-**Five suspected false positives, and zero true ones.** Across both rounds, five
+**Five suspected false positives, and zero true ones.** Across both arms, five
 answers were initially recorded as agent errors and then withdrawn on re-querying the
 corpus — including one where the "inverted" phrasing turned out to be verbatim from
 the source record, and one where a boilerplate clause running through an entire
