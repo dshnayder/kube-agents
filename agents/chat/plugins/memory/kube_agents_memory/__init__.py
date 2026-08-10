@@ -99,7 +99,7 @@ SHARED_STRATEGY = "shared"
 #
 # `memory_ttl_curator.py` would keep the bank bounded by distilling the
 # observation layer back into facts and then retiring the aged originals. It is
-# shelved and on no schedule, but the strategy is still provisioned here so the
+# deferred and on no schedule yet, but the strategy is still provisioned here so the
 # bank is ready for it rather than needing a migration later. A checkpoint is
 # only sound if it carries the observation's text *unchanged* — re-summarising a
 # summary every cycle is a game of telephone, and the bank would drift away from

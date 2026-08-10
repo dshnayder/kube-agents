@@ -72,7 +72,7 @@ Nothing here is destructive in the irreversible sense. Invalidation moves a row
 to an archive table with its reason and its causal edges recorded, and
 `PATCH {"state": "valid"}` puts it back.
 
-**Shelved: nothing schedules this.** Running it is an operator action, and it
+**Deferred: nothing schedules this yet.** Running it is an operator action, and it
 **reports without acting unless told otherwise** — pass `--commit` (or set
 `MEMORY_TTL_COMMIT=1`) to make it write. Read
 docs/designs/memory.md before you do; retiring the evidence

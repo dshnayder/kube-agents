@@ -755,14 +755,15 @@ prevent it. The control is in the persona: SOUL.md §1.6 requires a possessive i
 space to resolve only from the current speaker's own words, and requires a
 destructive delegation to be confirmed against a named target first.
 
-### Bounding the bank — built, then shelved
+### Bounding the bank — built, deferred, and coming back soon
 
 Hindsight never forgets. There is no TTL, no decay and no eviction anywhere in its
 bank configuration or its API. A mechanism to bound it exists and **nothing runs
 it**:
 [`agents/chat/scripts/memory_ttl_curator.py`](../../agents/chat/scripts/memory_ttl_curator.py)
-is on no cron schedule and defaults to dry run. It is kept because the problem is
-real and will return.
+is on no cron schedule and defaults to dry run. **This is deferred, not dropped**
+— the design is expected back in the near term, and the rest of this section is
+written for whoever picks it up.
 
 Plain expiry does not work. Facts and observations live in one table, and recall
 returns observations. An observation records provenance in `source_memory_ids` with
@@ -783,7 +784,7 @@ by a tag (tags are what consolidation is scoped by) or a document id (the caller
 is not what comes back). Each run retires the previous run's checkpoints, so exactly
 one generation is ever live.
 
-It was shelved because the end-to-end run took the observation layer from 22 rows to
+It was deferred because the end-to-end run took the observation layer from 22 rows to
 10 to 2 over three cycles. Each cycle rebuilds that layer by re-consolidating, and
 re-summarising a summary compounds — the layer does not settle, it keeps shrinking.
 The checkpoints survive untouched in the fact layer, but recall reads observations
@@ -794,9 +795,14 @@ puts raw facts in the hot path forever to compensate for a weekly job, and keepi
 distillation without retirement is pure growth.
 
 What must be settled before it runs is **what recall reads**, because that is what
-decides whether retiring the evidence loses anything. Until then the bank holds facts
-in the tens, unbounded growth is not a problem this deployment has, and the script's
-`--min-units` default of 200 makes it a no-op at the current size even if run.
+decides whether retiring the evidence loses anything. That is the next question on
+this design's list, and the deferral is what buys time to answer it properly rather
+than a decision to leave the bank unbounded: today it holds facts in the tens,
+unbounded growth is not yet a problem this deployment has, and the script's
+`--min-units` default of 200 makes it a no-op at the current size even if run. Every
+one of those is a property of a young bank, so the mechanism has to be settled well
+before the bank stops being young — which is why it comes back rather than waits for
+the growth to force it.
 
 ---
 
