@@ -15,9 +15,7 @@ model and the answers each produces. Retrieval answered the same questions from 
 small fraction of the context, and could say where each answer came from. That is
 the change this document designs.
 
-**Status:** implemented on the Chat Agent profile. The argument is
-[The decision](#the-decision), the evidence behind it is
-[The experiment](#the-experiment), and the open follow-ups are in
+**Status:** implemented on the Chat Agent profile. The open follow-ups are in
 [What is still unproven](#what-is-still-unproven).
 
 | Layer                     | Where it lives                                                                                              |
@@ -27,6 +25,18 @@ the change this document designs.
 | The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md) |
 | Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                     |
 | The experiment            | [`tests/memory-scale/`](../../tests/memory-scale/README.md)                                                 |
+
+## How to read this document
+
+Each section goes a level deeper than the one before it, so a human reader can
+stop as soon as they have what they came for. An agent should read all of it.
+
+| Section                           | What it gives you                                          |
+| --------------------------------- | ---------------------------------------------------------- |
+| [Background](#background)         | what Hermes ships, and why it was not enough               |
+| [The decision](#the-decision)     | the argument, and the numbers it rests on                  |
+| [The design](#the-design)         | how the provider works and how users stay isolated         |
+| [The experiment](#the-experiment) | the fleet it was measured against, the method, the results |
 
 ---
 
