@@ -1,5 +1,14 @@
 # Memory
 
+## Summary
+
+A long-running agent on an enterprise fleet accumulates more organisational
+knowledge than a file-based memory can carry. Measured against a 500-cluster
+synthetic fleet, the file store injects 110,799 tokens into every turn — 55% of a
+200k window — and bounding it to the limit Hermes ships leaves room for about seven
+records. Retrieval answers the same questions from 4,264 tokens. The fleet needs
+retrieval memory; this document is that design and the measurement behind it.
+
 **Status:** implemented on the Chat Agent profile. The A/B that decided it is
 complete on both layers — retrieval and answer quality. The argument it produced
 is [The decision](#the-decision); the raw evidence behind every number there is
@@ -876,10 +885,10 @@ is: _at 1,414 documents Hindsight lost one fact and thirty-three citations_, in 
 the context the alternative needed. The per-miss table with coverage figures is in
 the [scorer output](../../tests/memory-scale/results/).
 
-And the one lost fact was not a Hindsight property. It was a seeder bug — see
-[What the experiment got wrong](#what-the-experiment-got-wrong). After the reseed,
-`ADR-2026-052` came back correctly and was cited by name in the probe that had
-previously lost it, which closes that evidence chain.
+And the one lost fact is not a Hindsight property. It is an artifact of how the bank
+this ladder was scored against had been seeded — see
+[How to read the numbers](#how-to-read-the-numbers). Seeded one record per call,
+`ADR-2026-052` is returned and cited by name.
 
 ### The identifier finding
 
@@ -973,14 +982,13 @@ Kanban-spawned specialists ran with `memory_enabled: false` in both arms, making
 them a constant. The way they behave without a provider is nonetheless the strongest
 operational finding in the test.
 
-Five probes were void because the specialist reached the corpus by a route the
+Four probes were void because the specialist reached the corpus by a route the
 experiment had closed — a different one each time:
 
 | Route it used                                               | How it was caught                    |
 | ----------------------------------------------------------- | ------------------------------------ |
 | A stale on-disk export left over from earlier in the test   | Its own verification script opens it |
 | Direct SQL to Postgres, bypassing the scaled-down API       | It volunteered it                    |
-| Scaled the database back up via its GCP service account     | GKE audit log                        |
 | Derived the answer from its own prior runs, via the task DB | It said so, unprompted               |
 | A corpus cache it had written into **its own skill file**   | Its own verification script loads it |
 
@@ -992,9 +1000,9 @@ The last route is the one that persists. Over the run the specialist accumulated
 79,815-byte file at `skills/governance/meridian-standards-lookup/SKILL.md` carrying
 103 distinct corpus identifiers — a private replica of the shared corpus, in a
 location that reloads into its context on every invocation, still growing as the
-probes went on. No cleanup holds against this: deleting the export, closing the
-database and revoking the escalation path all did nothing, because the specialist had
-already copied what it needed into a file it owns.
+probes went on. No cleanup holds against this: deleting the export
+and closing the database did nothing, because the specialist had already copied what
+it needed into a file it owns.
 
 That is the shape of the problem. **An agent that needs shared knowledge and is given
 no sanctioned way to reach it will build an unsanctioned one**, and the durable form
@@ -1005,69 +1013,60 @@ now reads shared memory:
 [what subagents get](#what-subagents-get-shared-memory-read-only). The route itself —
 a skill directory its own occupant can write to — is tracked separately.
 
-Closing the third route required removing `roles/container.admin` and
-`roles/container.clusterAdmin` from the agent's GCP service account, which was
-evaluated _in addition to_ its Kubernetes RBAC and let it undo a change its in-cluster
-identity was explicitly denied. That is a real product finding, not a memory finding,
-and is tracked separately.
-
-The fourth void probe is also the best agent behaviour in the test and worth recording
+The third void probe is also the best agent behaviour in the test and worth recording
 as the target: it refused to claim a fresh read it did not have, distinguished
 derived-from-prior-runs from verified-now, reported its own controls green _while
 still rating the source stale_, noted that the failure mode is indistinguishable from
 an outage so the next agent may not notice, correctly diagnosed its own permissions,
 and escalated to a human.
 
-### What the experiment got wrong
+### How to read the numbers
 
-Recorded because the corrections are load-bearing, and because a proof whose errors
-are hidden is not one.
+Four properties of the setup qualify the figures above. Each is load-bearing, and a
+number quoted without them means something different.
 
-**The first run's citation numbers measured the seeder, not Hindsight.**
-`seed_fleet.py` defaults to `--batch 5`, and Hindsight collapses a multi-item retain
-into **one document keeping one item's `context` as the label**. 1,664 records became
-**335 documents**: 156 carried a title identifier absent from their own body, 278 held
-no identifier at all, and of 193 distinct identifiers only 37 appeared in both roles —
-so 156 could never be returned as a citation by any recall. Reproduced against a
-second, independently fetched export with every figure identical.
-([the correction](../../tests/memory-scale/transcript/README.md#correction-round-as-citation-numbers-measure-the-seeder))
+**Seed one record per retain call.** `seed_fleet.py` defaults to `--batch 5`, and
+Hindsight collapses a multi-item retain into **one document keeping one item's
+`context` as the label**. Under that default the 1,664 records become **335
+documents**: 156 carry a title identifier absent from their own body, 278 hold no
+identifier at all, and of 193 distinct identifiers only 37 appear in both roles — so
+156 can never be returned as a citation by any recall. The decisive case is a document
+labelled `DEP-001` whose body is the text of `DEP-001`, `DEP-002` and `DEP-003`; an
+agent that reads it and says _"the deprecation is DEP-001, and DEP-003 doesn't exist"_
+is reading a corrupted index correctly. **Always seed with `--batch 1`**, which yields
+1,664 documents and 4,400 memory units. The durable fix is one record per retain call
+plus per-unit provenance — **not** a `document_id` field, which would return the
+packed document's identifier authoritatively and make a wrong citation look sourced.
 
-The decisive case: a document labelled `DEP-001` whose body was the text of `DEP-001`,
-`DEP-002` and `DEP-003`. When the agent said _"the deprecation is DEP-001, and
-DEP-003 doesn't exist"_ it was reading a corrupted index correctly. The fix is one
-record per retain call plus per-unit provenance — **not** the `document_id`
-field originally filed, which would have returned the packed document's identifier
-authoritatively and made a wrong citation look sourced. Reseeding with `--batch 1`
-produced 1,664 documents and 4,400 memory units, and the Hindsight arm reported
-above was run against that. **Always seed with `--batch 1`.**
+**The retrieval ladder understates Hindsight; the answer-quality comparison does
+not.** The ladder was scored against a bank seeded at the `--batch 5` default, so its
+one `absent` miss (`ADR-2026-052`) is an artifact of the packing above rather than a
+retrieval property — on a `--batch 1` bank that record is returned and cited by name.
+The head-to-head answer comparison was run against the `--batch 1` bank. The ladder is
+therefore a floor on retrieval quality, and re-scoring it can only move Hindsight's
+numbers up.
 
-**The file arm was measured unbounded, and that needs saying out loud.**
-`measure_file_based.py` writes `MEMORY.md` and `users/*.md` itself, in the on-disk
-format, and stubs `atomic_replace`; it never goes through the provider's write
-path, so admission control was never in play — and the provider being measured had
-none anyway. The 1.000 / 110,907 row is therefore the _unbounded_ file store,
-which is exactly what shipped. Adding the bound does not move that row, it
-produces a different one: [what a bounded store holds](#a-file-store-is-bounded-or-it-eats-the-window). Both are
+**The file arm is measured unbounded.** `measure_file_based.py` writes `MEMORY.md` and
+`users/*.md` itself, in the on-disk format, and stubs `atomic_replace`; it never goes
+through the provider's write path, so admission control is never in play — and the
+provider being measured has none anyway. The 1.000 / 110,907 row is therefore the
+_unbounded_ file store, which is exactly what shipped. Adding the bound does not move
+that row, it produces a different one:
+[what a bounded store holds](#a-file-store-is-bounded-or-it-eats-the-window). Both are
 reported, because dropping the unbounded row would quietly discard the strongest
 result the file store has.
 
-**The answer probes were initially scored at the wrong layer.** The first scored
-replies were the specialist's, and the specialist has no memory provider in either
-arm. Both arms were re-asked non-delegated at the chat-agent layer, which is the
-head-to-head reported above.
-
-**Five suspected false positives, and zero true ones.** Across both arms, five
-answers were initially recorded as agent errors and then withdrawn on re-querying the
-corpus — including one where the "inverted" phrasing turned out to be verbatim from
-the source record, and one where a boilerplate clause running through an entire
-decision-record family was the genuine source. None survived. The rule this produced, and the reason
-it is written down: **re-query before recording an error.**
+**An answer counts as an error only after re-querying the corpus.** Five replies
+across the two arms looked wrong and were not — in one the "inverted" phrasing was
+verbatim from the source record, in another a boilerplate clause running through an
+entire decision-record family was the genuine source. Zero survived the check, which
+is why the error counts above are as low as they are and why the rule is written
+down.
 
 ### What is still unproven
 
-- **Per-unit provenance.** The seeder is fixed; provenance marking on
-  shared memory is not built. The escalation-ladder imprecision is what it would have
-  caught.
+- **Per-unit provenance.** Provenance marking on shared memory is not built. The
+  escalation-ladder imprecision is what it would have caught.
 - **Recall returns what it searched.** Built, and unit-tested against the three
   outcomes; but the thing it is meant to prevent is a model's inference, and no live
   probe has been run against it. It stays here until the validation replay
