@@ -104,9 +104,16 @@ does not degrade search gracefully — it skips the semantic branch entirely
 (`src/utils/search.py`) and leaves keyword matching. Either therefore means
 declaring a second model, an embedding model, in LiteLLM — which this project does
 not do, since LiteLLM carries only the model the installer defines — or running a
-second inference server. `hindsight` embeds and reranks in-pod from models baked
-into the image (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), and asks LiteLLM for
-one model, the installer's.
+second inference server.
+
+The transport list is a constraint on the customer as much as on us. It admits an
+OpenAI-compatible `base_url` override, but nothing outside those two wire formats:
+an install standardised on Anthropic has no embedding API to point at, and one on
+Bedrock, Azure or an in-house embedder has to front it with a compatible shim
+first. `hindsight` embeds and reranks in-pod from models baked into the image
+(`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), and asks LiteLLM for one model, the
+installer's — so the customer's choice of provider is a question the memory store
+never asks.
 
 **One principal per read.** `mem0`'s recall filters on `user_id` alone — "scoped to
 user_id only — by design", `plugins/memory/mem0/__init__.py`. `honcho` has richer
@@ -118,12 +125,24 @@ organisation-wide bucket a read can include, which is the half of the problem th
 document is about: a specialist spawned without a human identity would have nothing
 to read at all.
 
+Note what that does to the argument that `honcho` needs no wrapper. Its native
+tenancy is real, and for per-user isolation alone it would need nothing from us.
+But per-user memory _and_ an org-wide corpus is the requirement, and the second
+half has no native form: it would have to be a synthetic organisation peer that
+every real peer observes and that identity-less specialists read as, plus the code
+to keep writes flowing to the right one of the two. That is a wrapper, sitting on
+top of a plugin that is already 7,096 lines — and a stranger one than tags, because
+it encodes org knowledge as one fictional peer's beliefs inside a model built for
+beliefs _about_ peers.
+
 So `hindsight` is the only entry that is self-hostable, multi-user, **and** able to
 embed without new infrastructure — the one candidate that does not trade one of those
 against the others. Two smaller differences point the same way: `honcho` self-hosts
-as four workloads (API, a background deriver, pgvector and Redis) against
-Hindsight's two, and it is AGPL-3.0 where Hindsight is MIT, which is a question a
-bank's legal review will ask about a service it runs inside its own boundary.
+as four workloads against Hindsight's two, and the two that are its own code — the
+API and the background deriver, both built from the `plastic-labs/honcho` tree —
+are AGPL-3.0 where Hindsight is MIT. The other two are stock images, `pgvector` and
+`redis`. A copyleft licence on a service the customer runs inside its own boundary
+is a question their legal review will ask.
 
 ### `multiuser_memory`, the provider this displaces
 
