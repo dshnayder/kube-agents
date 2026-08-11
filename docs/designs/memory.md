@@ -144,6 +144,12 @@ are AGPL-3.0 where Hindsight is MIT. The other two are stock images, `pgvector` 
 `redis`. A copyleft licence on a service the customer runs inside its own boundary
 is a question their legal review will ask.
 
+What the extra workloads do _not_ buy is a better database story. `honcho` runs one
+`pgvector` service behind one volume, exactly as this does; its `redis` adds a second
+stateful component rather than removing the first. Single-instance Postgres is a
+property of both, and of anything else Postgres-backed — an availability question
+answered by ordinary Postgres HA, not by the choice of memory provider.
+
 ### `multiuser_memory`, the provider this displaces
 
 This repository already carried its own provider
