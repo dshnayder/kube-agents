@@ -82,15 +82,13 @@ Chat Agent keeps the store to itself.
 `MEMORY.md` / `USER.md` files, which have no per-user scoping. Both providers above replace that
 store rather than supplement it, so both run with `memoryEnabled: false`.
 
-Do not confuse that field with the installer's `MEMORY_ENABLED`, which answers the broader question
-of whether this install remembers anything at all and defaults to `true`. Provisioning step 8
-derives the CR field from it rather than copying it: `memoryEnabled` ends up true only for an
-install that wants memory and names no provider, and the provider is forced to `none` whenever
-`MEMORY_ENABLED` is false.
+The installer's `MEMORY_ENABLED` variable is that same built-in store and nothing more; provisioning
+step 8 copies it into this field unchanged. It is not a master switch — whether the agent remembers
+anything is `provider`'s question, and `none` is how that answers no.
 
-The provisioning scripts read the same choice: step 13 deploys Hindsight only when memory is
-enabled _and_ the provider is Hindsight-backed. Both of those default to yes, so a stock install
-gets the two Hindsight workloads. See
+The provisioning scripts read only the provider: step 13 deploys Hindsight when `MEMORY_PROVIDER` is
+Hindsight-backed, which is what a stock install gets, and nothing when it is `multiuser_memory` or
+`none`. See
 [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
 
 ### `spec.harness.tuning`

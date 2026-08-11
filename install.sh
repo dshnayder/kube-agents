@@ -1054,16 +1054,18 @@ main() {
     esac
   fi
 
-  # MEMORY_ENABLED answers "does this agent remember anything at all", and both
-  # stores need it: provisioning step 13 will not deploy Hindsight without it,
-  # and step 8 wipes the provider back to `none` when it is false, so that a
-  # provider left at its default cannot point the agent at a store this install
-  # never deployed.
+  # MEMORY_PROVIDER carries the whole choice — including "no memory at all",
+  # which is what `none` means. Everything downstream reads it and nothing else:
+  # provisioning step 13 deploys Hindsight only for a Hindsight-backed provider,
+  # the specialist overlay blanks anything that cannot be made read-only, and the
+  # entrypoint gates the one-way file import the same way.
   #
-  # It is *not* the same question as spec.harness.memory.memoryEnabled on the CR,
-  # which switches on Hermes' built-in MEMORY.md/USER.md — a store with no
-  # per-user scoping that each provider below replaces rather than supplements.
-  # Step 8 derives that narrower field; see the comment there.
+  # MEMORY_ENABLED is a different switch and stays false. It turns on Hermes'
+  # *built-in* MEMORY.md/USER.md, which has no per-user scoping and would sit
+  # alongside whichever provider is chosen — two competing stores in front of one
+  # agent. Every provider here replaces it rather than supplementing it. Nothing
+  # about memory keys off this flag, so an upgrade cannot read a false left in an
+  # old vars.sh as "this install wanted no memory".
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
@@ -1073,14 +1075,11 @@ main() {
   # `kube_agents_memory` is the default provider everywhere it is named with no
   # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
   # and `hindsight` is what an install that says nothing about memory gets.
-  local memory_enabled="true"
+  local memory_enabled="false"
   local memory_provider="kube_agents_memory"
   case "$memory_mode" in
     file) memory_provider="multiuser_memory" ;;
-    off)
-      memory_enabled="false"
-      memory_provider="none"
-      ;;
+    off) memory_provider="none" ;;
   esac
 
   # 10. Repository Cloning & Execution Context

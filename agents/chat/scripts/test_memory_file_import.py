@@ -27,6 +27,9 @@ BANK = "kube-agents-memory"
 # turned '@' into '_', and the twelve hex characters are sha256 of the raw id.
 KNOWN_STEM = "dmitryshnayder_google.com_ab4bc33e9a14"
 KNOWN_RAW = "dmitryshnayder@google.com"
+# The scope tag that identity resolves to. The digest is the same twelve
+# characters as the filename's, because both hash the raw id.
+KNOWN_TAG = "user:dmitryshnayder-google-com_ab4bc33e9a14"
 
 
 class FakeHindsight:
@@ -94,7 +97,22 @@ class OwnerRecoveryTest(unittest.TestCase):
 
     def test_recovered_id_produces_the_tag_the_provider_will_read(self):
         raw = mfi.recover_raw_user_id(KNOWN_STEM)
-        self.assertEqual(mfi.sanitize_user_id(raw), "dmitryshnayder-google-com")
+        self.assertEqual(f"{mfi.USER_TAG_PREFIX}{mfi.sanitize_user_id(raw)}", KNOWN_TAG)
+
+    def test_identities_that_sanitize_alike_still_get_different_tags(self):
+        # The readable half is lossy and the tag is the whole isolation boundary,
+        # so these two people must not share one. Email-shaped ids differing only
+        # in punctuation are the realistic case, not a contrived one.
+        first = mfi.sanitize_user_id("alice.smith@corp.example")
+        second = mfi.sanitize_user_id("alice-smith@corp.example")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("alice-smith-corp-example_"))
+
+    def test_an_empty_identity_sanitizes_to_nothing(self):
+        # Not to a hash of the empty string: the caller reads "" as "no identity"
+        # and refuses to touch personal memory on it.
+        self.assertEqual(mfi.sanitize_user_id(""), "")
+        self.assertEqual(mfi.sanitize_user_id("   "), "")
 
     def test_an_id_that_needed_no_substitution_still_verifies(self):
         raw = "slackbot"
@@ -153,7 +171,7 @@ class DiscoveryTest(TempHome):
         self.assertEqual(by_label["memories/MEMORY.md"].tag, mfi.SHARED_TAG)
 
         personal = by_label[f"memories/users/{KNOWN_STEM}.md"]
-        self.assertEqual(personal.tag, "user:dmitryshnayder-google-com")
+        self.assertEqual(personal.tag, KNOWN_TAG)
         self.assertEqual(personal.strategy, mfi.PERSONAL_STRATEGY)
         self.assertEqual(skipped, [])
 
@@ -167,7 +185,7 @@ class DiscoveryTest(TempHome):
     def test_builtin_user_file_is_migrated_when_told_whose_it_is(self):
         self.write("USER.md", ["a preference"])
         sources, skipped = mfi.discover(self.home, KNOWN_RAW)
-        self.assertEqual([s.tag for s in sources], ["user:dmitryshnayder-google-com"])
+        self.assertEqual([s.tag for s in sources], [KNOWN_TAG])
         self.assertEqual(skipped, [])
 
     def test_an_unrecoverable_owner_is_reported_not_guessed(self):

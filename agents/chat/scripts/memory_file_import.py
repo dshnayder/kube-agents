@@ -216,10 +216,17 @@ def sanitize_user_id(user_id: str) -> str:
     """Mirror of `kube_agents_memory._sanitize_user_id`.
 
     Must stay identical: this produces the tag the migrated entries are filed
-    under, and the provider produces the tag they are read back with.
+    under, and the provider produces the tag they are read back with. The
+    trailing digest is what makes the tag collision-free; see the provider's
+    docstring for why a readable-only tag is not safe here.
     """
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(user_id or ""))
-    return re.sub(r"-{2,}", "-", cleaned).strip("-_")
+    raw = str(user_id or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", raw)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned}_{digest}" if cleaned else digest
 
 
 def recover_raw_user_id(stem: str) -> str | None:

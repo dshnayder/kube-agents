@@ -316,15 +316,15 @@ is either a database nobody asked for or a memory tool that never loads.
 | `spec.harness.memory.provider`                      | the answer, on the CR — the only copy the running system reads                 |
 | `MEMORY_PROVIDER` env on the pod                    | the same value, for the entrypoint, which runs before `config.yaml` is in play |
 
-Alongside it travels `MEMORY_ENABLED`, the answer to the blunter question of
-whether this install remembers anything at all. It is **not** the CR's
-`spec.harness.memory.memoryEnabled`, and provisioning step 8 derives the one from
-the other rather than passing it through. The CR field switches on Hermes' own
-`MEMORY.md`/`USER.md`, a store with no per-user scoping that each provider here
-replaces rather than supplements, so it is true only for the one combination that
-asks for memory and names no provider. The same step forces the provider back to
-`none` when `MEMORY_ENABLED` is false, since the provider otherwise keeps its
-default name and would leave the agent pointed at a Hindsight nobody deployed.
+`MEMORY_PROVIDER` is the only variable in that answer. The install also writes
+`MEMORY_ENABLED`, and it is deliberately **not** consulted anywhere in the list
+above: it switches on Hermes' own `MEMORY.md`/`USER.md`, a store with no per-user
+scoping that each provider here replaces rather than supplements, so every install
+this repository has ever written set it `false` while running a provider quite
+happily. Deriving one from the other — reading a false `MEMORY_ENABLED` as "this
+install wants no memory" — would switch off a working file store on the next
+upgrade and strand every user's `USER.md`. Whether the agent remembers anything is
+`MEMORY_PROVIDER`'s question, and `none` is how it answers no.
 
 `file` maps to `multiuser_memory` rather than to Hermes' built-in file store,
 because the built-in is gated by `memory_enabled`, and the operator disables the
@@ -514,11 +514,21 @@ the lever either.
 | Personal | `user:<id>`    | automatic capture, and `memory_retain` | that user only |
 | Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
 
-`<id>` is the gateway identity (`agent._user_id`), sanitised by
-`_sanitize_user_id`, which mirrors Hindsight's own `_sanitize_bank_segment`:
-non-alphanumerics collapse to `-`, runs of `-` collapse to one, and leading or
-trailing `-`/`_` are stripped. Recall asks for `[user:<id>, scope:shared]` with
-match mode `any_strict`, and nothing else can come back.
+`<id>` is the gateway identity (`agent._user_id`) run through
+`_sanitize_user_id`, which produces `<readable>_<digest>`. The readable half
+mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
+`-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
+The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
+is lossy while the tag is the entire isolation boundary — identities are
+email-shaped, punctuation is what distinguishes many of them, and
+`alice.smith@corp.example` and `alice+dev@corp.example`-style pairs otherwise
+land on one tag and read each other's private facts. `multiuser_memory` guarded
+the same thing the same way in its filenames. An empty identity produces an
+empty string rather than a hash of nothing, which is what lets the provider fail
+closed on personal memory; see
+[`tests/memory/test_user_tag_isolation.py`](../../tests/memory/test_user_tag_isolation.py).
+Recall asks for `[user:<id>, scope:shared]` with match mode `any_strict`, and
+nothing else can come back.
 
 One bank rather than one bank per user is a deliberate choice. Per-user banks make
 shared knowledge either impossible or duplicated, and each bank carries its own
@@ -727,7 +737,9 @@ rather than of the script:
   original is recovered by search and then _confirmed_ by hash. Where nothing
   matches, the file is left where it is and reported. A personal memory filed under
   the wrong tag is a leak, and one filed under a tag nobody carries is a silent
-  loss; a guess risks both.
+  loss; a guess risks both. The recovered id then goes through the same
+  `_sanitize_user_id` the provider uses, digest and all, so the entry arrives under
+  the exact tag its owner recalls with.
 - **The delete is gated per entry, on the bank.** An entry the extractor discards as
   non-durable produces no memory unit, so its file survives and the run says which
   entry it was. The one unrecoverable mistake available here is deleting the last

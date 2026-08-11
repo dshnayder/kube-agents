@@ -64,6 +64,7 @@ deliberate: a Hermes base-image bump brings Hindsight fixes along with it and
 there is no merge to redo.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -285,13 +286,37 @@ SYSTEM_PROMPT_READ_ONLY = (
 def _sanitize_user_id(user_id: str) -> str:
     """Reduce a gateway identity to something safe to use as a tag value.
 
-    Mirrors Hindsight's own ``_sanitize_bank_segment``: alphanumerics, dash and
-    underscore survive, everything else collapses to a single dash. Applied for
-    the same reason it is applied to bank names — the value is attacker-adjacent
-    (it comes from the chat platform) and ends up in a query filter.
+    The readable half mirrors Hindsight's own ``_sanitize_bank_segment``:
+    alphanumerics, dash and underscore survive, everything else collapses to a
+    single dash. Applied for the same reason it is applied to bank names — the
+    value is attacker-adjacent (it comes from the chat platform) and ends up in a
+    query filter.
+
+    That half is **lossy**, and here the tag is the entire isolation boundary, so
+    a collision is not a cosmetic problem: two identities that sanitize alike
+    would read each other's private memories and retain into each other's scope.
+    Identities are email-shaped in every deployed configuration
+    (``session_store/store.py`` treats the Google Chat ``user_id`` as an address),
+    and punctuation is exactly what varies between them — ``a.b@corp.com`` and
+    ``a-b@corp.com`` both reduce to ``a-b-corp-com``, as do ``alice@eng.corp.com``
+    and ``alice.eng@corp.com``.
+
+    A short digest of the *raw* identity is therefore appended, which is what
+    ``multiuser_memory`` has always done for its filenames. The readable half
+    stays first so a tag is still recognisable in the bank; the digest is what
+    makes it unique. Whitespace is stripped before hashing so a padded copy of an
+    id resolves to the same person.
+
+    Returns ``""`` for an empty identity — the caller reads that as "no identity"
+    and fails closed on personal memory, so it must not become a hash of nothing.
     """
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(user_id or ""))
-    return re.sub(r"-{2,}", "-", cleaned).strip("-_")
+    raw = str(user_id or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", raw)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned}_{digest}" if cleaned else digest
 
 
 def _memory_is_read_only() -> bool:

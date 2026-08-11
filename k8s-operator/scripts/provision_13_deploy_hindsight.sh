@@ -5,9 +5,9 @@
 # Idempotent script that connects to GKE and deploys Hindsight — the API server
 # and the Postgres/pgvector database behind the Chat Agent's long-term memory.
 # Requires step 9, since Hindsight sends its extraction and consolidation calls
-# through the LiteLLM gateway. Skipped unless the install asked for it: memory
-# must be enabled and MEMORY_PROVIDER must name a Hindsight-backed provider, so
-# an install that chose `multiuser_memory` or `none` runs no database.
+# through the LiteLLM gateway. Skipped unless the install asked for it:
+# MEMORY_PROVIDER must name a Hindsight-backed provider, so an install that chose
+# `multiuser_memory` or `none` runs no database.
 # ==============================================================================
 
 set -e
@@ -37,31 +37,25 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "MEMORY_ENABLED" "true" "Enable agent memory persistence? (true/false)"
 init_var_memory_provider
 
 # ─── Memory Selection Gate ────────────────────────────────────────────────────
 #
 # Hindsight is one memory provider among several, so deploying an API server and
-# a Postgres database is only right when this install chose that provider and
-# left memory on. Both halves matter: the provider name alone would still deploy
-# Hindsight for an install with memory switched off, since the provider keeps
-# its default value in that case.
+# a Postgres database is only right when this install chose that provider.
 #
-# Both defaults below say yes, matching the installer — the common case is an
-# install that wants memory and never had an opinion about which store.
+# MEMORY_PROVIDER alone decides it. MEMORY_ENABLED is deliberately not consulted:
+# it gates Hermes' built-in MEMORY.md store, not the provider, and every install
+# this repo has written set it false while running a provider quite happily.
+# Reading it here would have skipped the deployment for every upgrade.
+# `none` is how an install says it wants no memory at all.
 #
 # The gate lives here rather than in provision.sh because this step is also
 # reachable on its own, through `make gcp-provision-13-deploy-hindsight`.
 #
 # Exits 0, not 1: "nothing to deploy" is the correct outcome of this step for
-# these settings, not a failure of it. Turning memory on later is a matter of
-# re-running the step — nothing about it is one-way.
-if ! is_truthy "${MEMORY_ENABLED:-true}"; then
-  print_info "Agent memory is disabled (MEMORY_ENABLED='${MEMORY_ENABLED:-false}')."
-  print_info "Skipping the Hindsight deployment — re-run this step after enabling it."
-  exit 0
-fi
+# these settings, not a failure of it. Switching the provider later is a matter
+# of re-running the step — nothing about it is one-way.
 if ! memory_provider_uses_hindsight "$MEMORY_PROVIDER"; then
   print_info "Memory provider is '${MEMORY_PROVIDER}', which does not use Hindsight."
   print_info "Skipping the Hindsight deployment. Re-run this step after switching"
