@@ -102,7 +102,7 @@ class MultiUserMemoryTestCase(unittest.TestCase):
     def provider(self, **kwargs):
         p = mum.MultiUserFileMemoryProvider()
         kwargs.setdefault("hermes_home", str(self.home))
-        kwargs.setdefault("user_id", "dmitry@example.com")
+        kwargs.setdefault("user_id", "alice@example.com")
         p.initialize("session-1", **kwargs)
         return p
 
@@ -131,7 +131,7 @@ class TestPrivateStore(MultiUserMemoryTestCase):
         self.provider(chat_type="dm").handle_tool_call(
             "multiuser_memory", {"action": "add", "target": "user", "content": "x"}
         )
-        self.assertEqual(self.user_files(), [_expected_filename("dmitry@example.com")])
+        self.assertEqual(self.user_files(), [_expected_filename("alice@example.com")])
 
     def test_hash_separates_identities_that_sanitize_alike(self):
         # "a@b.com" and "a_b.com" both sanitize to "a_b.com"; only the digest

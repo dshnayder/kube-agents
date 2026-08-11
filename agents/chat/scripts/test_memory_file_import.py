@@ -23,13 +23,15 @@ import memory_file_import as mfi  # noqa: E402
 
 BANK = "kube-agents-memory"
 
-# The real filename from the deployment this migration exists for: the sanitizer
-# turned '@' into '_', and the twelve hex characters are sha256 of the raw id.
-KNOWN_STEM = "dmitryshnayder_google.com_ab4bc33e9a14"
-KNOWN_RAW = "dmitryshnayder@google.com"
+# A filename in the exact shape the deployment this migration exists for
+# produces: the sanitizer turned '@' into '_', and the twelve hex characters are
+# sha256 of the raw id. The three constants are a real, self-consistent triple —
+# recovering the stem must yield the raw id, which must hash back to the digest.
+KNOWN_STEM = "alice_example.com_ff8d9819fc0e"
+KNOWN_RAW = "alice@example.com"
 # The scope tag that identity resolves to. The digest is the same twelve
 # characters as the filename's, because both hash the raw id.
-KNOWN_TAG = "user:dmitryshnayder-google-com_ab4bc33e9a14"
+KNOWN_TAG = "user:alice-example-com_ff8d9819fc0e"
 
 
 class FakeHindsight:
@@ -92,7 +94,7 @@ class ParsingTest(TempHome):
 
 
 class OwnerRecoveryTest(unittest.TestCase):
-    def test_recovers_the_real_deployment_filename(self):
+    def test_recovers_the_raw_id_from_the_stored_filename(self):
         self.assertEqual(mfi.recover_raw_user_id(KNOWN_STEM), KNOWN_RAW)
 
     def test_recovered_id_produces_the_tag_the_provider_will_read(self):
