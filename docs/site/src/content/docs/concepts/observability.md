@@ -11,7 +11,7 @@ The Platform Agent (Hermes) Deployment exports OpenTelemetry traces, and LiteLLM
 
 ### Prometheus metrics
 
-- **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 4000). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
+- **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 8080). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
 - **vLLM** — per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools. Exposed on its own `/metrics` endpoint and scraped by GKE Managed Prometheus.
 - **Hindsight** — the Chat Agent's memory store. Retrieval and reranking latency (`hindsight_operation_duration_seconds`), HTTP request counts and durations, database pool wait times, and the token spend of its own extraction and consolidation calls (`hindsight_llm_*`, which bill through LiteLLM). Served on the API's ordinary HTTP port (8888), not a separate metrics listener, and scraped via the `hindsight-monitoring` `PodMonitoring` in `k8s-operator/config/integrations/hindsight/podmonitoring.yaml`. Recall latency is dominated by the reranker, so `hindsight_operation_duration_seconds` is the signal to watch — see [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md) for why. The Postgres StatefulSet exports nothing; the `ankane/pgvector` image ships no exporter.
 
