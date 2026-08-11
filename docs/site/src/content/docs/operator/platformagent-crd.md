@@ -37,21 +37,61 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                    | Type   | Purpose                                                                              |
-| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
-| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
-| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
-| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
-| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
-| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
-| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                       |
-| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                |
-| `memory.provider`                        | string | Memory provider implementation. Default `kube_agents_memory`.                        |
-| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                   |
-| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                |
-| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`.                    |
-| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).            |
+| Field                                    | Type   | Purpose                                                                                   |
+| ---------------------------------------- | ------ | ----------------------------------------------------------------------------------------- |
+| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.      |
+| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                      |
+| `projectId`                              | string | GCP Project ID of the cluster. Required.                                                  |
+| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                     |
+| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                       |
+| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                  |
+| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                            |
+| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                     |
+| `memory.provider`                        | string | Memory provider implementation. Default `kube_agents_memory`; `none` for none. See below. |
+| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                        |
+| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                     |
+| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`.                         |
+| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                 |
+
+### `spec.harness.memory`
+
+`provider` picks which long-term memory implementation the agents load. Two ship in this repository,
+and the difference between them is the whole choice:
+
+| Value                            | Fits                       | What it costs to run                                      | What it gives                                            |
+| -------------------------------- | -------------------------- | --------------------------------------------------------- | -------------------------------------------------------- |
+| `kube_agents_memory` _(default)_ | enterprise deployments     | a Hindsight API server and a Postgres database in-cluster | ranked recall, per-user and shared scopes, consolidation |
+| `multiuser_memory`               | small or personal installs | nothing — a per-user Markdown file inside the pod         | verbatim recall of everything, no ranking or search      |
+| `none`                           | —                          | nothing                                                   | no provider; Hermes' built-in store only                 |
+
+The split is about how the store is read, not about how good it is. The file provider concatenates
+everything into the system prompt on every turn, so it is bounded by the context window; Hindsight
+retrieves only what a question needs, so its cost per turn barely moves as the store grows. A fleet
+of a few clusters and a handful of people will not reach the bound, and paying for a database there
+buys nothing.
+
+Anything else is passed through to Hermes untouched, so its own external providers (`hindsight`,
+`mem0`, `openviking`, …) work if you bring their configuration. `none` is this API's spelling of
+Hermes' empty string, which cannot be expressed here: an absent field takes the CRD default.
+
+Only a Hindsight-backed provider reaches the specialist profiles, because only that one can be made
+read-only and scoped by tag. Under any other value the specialists get no provider at all and the
+Chat Agent keeps the store to itself.
+
+`memoryEnabled` and `userProfileEnabled` are a **different** mechanism — Hermes' built-in
+`MEMORY.md` / `USER.md` files, which have no per-user scoping. Both providers above replace that
+store rather than supplement it, so both run with `memoryEnabled: false`.
+
+Do not confuse that field with the installer's `MEMORY_ENABLED`, which answers the broader question
+of whether this install remembers anything at all and defaults to `true`. Provisioning step 8
+derives the CR field from it rather than copying it: `memoryEnabled` ends up true only for an
+install that wants memory and names no provider, and the provider is forced to `none` whenever
+`MEMORY_ENABLED` is false.
+
+The provisioning scripts read the same choice: step 13 deploys Hindsight only when memory is
+enabled _and_ the provider is Hindsight-backed. Both of those default to yes, so a stock install
+gets the two Hindsight workloads. See
+[`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
 
 ### `spec.harness.tuning`
 

@@ -7,7 +7,7 @@ sidebar:
 
 The Platform Agent's runtime wiring is declared in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). It tells Hermes which MCP servers to start, which toolsets to expose to which surfaces, and which plugins to load.
 
-The pod's other profiles have their own configs. The Chat Agent's deliberately minimal [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml): a `router` MCP server for specialist discovery, toolsets pinned to `mcp-router` + `kanban` + the `memory` gate on every surface (including the real `google_chat` ingress key), the chat-side plugins (`session_store`, `session_otel_bridge`, `tool_call_audit`, the first-run `bootstrap_onboarding` hook, `legacy_slash_commands`, which unwraps a typed `/hermes <subcommand>` into the real gateway command — see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) — and `agent_roster`, which injects the routable specialists into every turn so delegation needs no `list_agents` roundtrip, see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/agent_roster/README.md)), the `kube_agents_memory` provider for per-user and shared memory (see [`memory`](#memory) below for why it lives on this profile only), and no file or cloud tools. Note that on an operator-deployed pod the repository file is _not_ what runs: the operator renders its own `config.yaml` into the `<agent>-config` ConfigMap and mounts it over `/opt/data/config.yaml`, so the operator's version wins on the default profile and `agents/chat/config.yaml` must be kept in sync with it — see [Operator](/kube-agents/operator/). The Platform Agent's own `config.yaml` has no such caveat: it is image-owned and force-synced from the baked template on every start. The per-cluster Cluster Agents are stamped from the read-only [`agents/cluster/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/config.yaml) template — see [Cluster Agents](/kube-agents/concepts/cluster-agents/). This page annotates the Platform Agent's file; the other two are self-documenting by design.
+The pod's other profiles have their own configs. The Chat Agent's deliberately minimal [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml): a `router` MCP server for specialist discovery, toolsets pinned to `mcp-router` + `kanban` + the `memory` gate on every surface (including the real `google_chat` ingress key), the chat-side plugins (`session_store`, `session_otel_bridge`, `tool_call_audit`, the first-run `bootstrap_onboarding` hook, `legacy_slash_commands`, which unwraps a typed `/hermes <subcommand>` into the real gateway command — see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) — and `agent_roster`, which injects the routable specialists into every turn so delegation needs no `list_agents` roundtrip, see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/agent_roster/README.md)), a memory provider for per-user and shared memory — `kube_agents_memory` by default, though the install chooses it and the operator writes the choice in (see [`memory`](#memory) below) — and no file or cloud tools. Note that on an operator-deployed pod the repository file is _not_ what runs: the operator renders its own `config.yaml` into the `<agent>-config` ConfigMap and mounts it over `/opt/data/config.yaml`, so the operator's version wins on the default profile and `agents/chat/config.yaml` must be kept in sync with it — see [Operator](/kube-agents/operator/). The Platform Agent's own `config.yaml` has no such caveat: it is image-owned and force-synced from the baked template on every start. The per-cluster Cluster Agents are stamped from the read-only [`agents/cluster/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/config.yaml) template — see [Cluster Agents](/kube-agents/concepts/cluster-agents/). This page annotates the Platform Agent's file; the other two are self-documenting by design.
 
 ## Full file
 
@@ -42,12 +42,14 @@ platform_toolsets:
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - memory
   api_server:
     - hermes-api-server
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - memory
 
 # Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools
 # live in the core pool (surfaced via hermes-cli/hermes-api-server), and their
@@ -58,8 +60,17 @@ platform_toolsets:
 toolsets:
   - kanban
 
+# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
+# audits outgrow.
+agent:
+  max_turns: 250
+
+# Shared memory, read-only. `provider` here is only the no-operator default: the
+# operator overwrites it from spec.harness.memory.provider.
 memory:
   memory_enabled: false
+  provider: kube_agents_memory
+  read_only: true
   user_profile_enabled: false
 
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
@@ -91,7 +102,7 @@ Toolsets group MCP servers into named bundles for different Hermes surfaces:
 - **`cli`** — Exposed to the Hermes CLI (interactive terminal usage inside the pod).
 - **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers).
 
-Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-agent_common` (a local Python server, `agent_common_server.py`) and `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) are declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at runtime.
+Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`), and both list `memory`. That entry is a gate, not a tool grant: Hermes only injects the memory provider's tools into a profile that names it, and a specialist reached as a kanban worker resolves its toolsets from `cli` while the API-server path uses `api_server`, so it has to appear on both for the two routes to see the same memory. Which tools it actually yields is decided by the provider — see [`memory`](#memory). `mcp-agent_common` (a local Python server, `agent_common_server.py`) and `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) are declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at runtime.
 
 ### `toolsets`
 
@@ -99,11 +110,13 @@ A second, top-level gate distinct from `platform_toolsets`: listing `kanban` her
 
 ### `memory`
 
-Explicitly disabled — the Platform Agent doesn't retain memory across sessions. Every conversation starts fresh.
+`memory_enabled: false` and `user_profile_enabled: false` switch off Hermes' built-in file store (`MEMORY.md` / `USER.md`). They are not what turns memory off here — they gate a different mechanism from the provider below, and leaving them on would hand this profile a writable file store alongside a provider designed to be read-only.
 
-No memory provider is configured either. Per-user memory scopes its store by the sender's gateway identity, and the Platform Agent is reached through the kanban dispatcher, which spawns workers with no human identity attached — so per-user memory only makes sense on the [Chat Agent](/kube-agents/concepts/chatops/), the profile that actually receives chat ingress. The Chat Agent records each user's durable facts and resolves them into concrete values before delegating, so the Platform Agent gets what it needs inline in the card body.
+**Personal memory is impossible on this profile and always will be.** It keys off the gateway identity, and the Platform Agent is reached through the kanban dispatcher, which spawns workers with no human attached — so personal memory only makes sense on the [Chat Agent](/kube-agents/concepts/chatops/), the profile that actually receives chat ingress. The provider fails closed on that by itself: with no user identity it recalls `scope:shared` only.
 
-How that profile keeps every user's memory apart — one Hindsight bank, scope tags, and the upstream defaults it has to override — is documented in [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md), along with the retention mechanism and the scale test that chose a document store over a flat file.
+**Shared memory is readable**, because withholding it did not stop this agent needing the corpus — it stopped it getting the corpus from a curated source. `read_only: true` is what keeps that one-way: it removes `memory_retain` from the schemas the model sees, refuses the call if it is made anyway, and turns off automatic capture. The measurement behind both decisions, and the reasoning for the read-only boundary, are in [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
+
+`provider` is a default, not the decision. The choice belongs to the install — `--memory=` on `install.sh`, carried as `spec.harness.memory.provider` — and the operator overwrites this key from the CR through the profile's overlay, because this file is baked into the image. It writes an empty value for any provider that cannot be made read-only and scoped by tag, which is every provider except the two Hindsight-backed ones; a per-user file provider has no gateway identity to key on here. The value in the file is what a run without the operator gets. The field itself is documented in the [`PlatformAgent` CRD reference](/kube-agents/operator/platformagent-crd/); which providers are selectable, and what each costs to run, is in [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
 
 ### `plugins`
 

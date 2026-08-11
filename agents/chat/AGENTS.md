@@ -19,11 +19,12 @@ The roster of specialist agents is **dynamic** — read it off the `[SPECIALIST 
 
 ## Memory
 
-The Chat Agent is the **only** profile with memory, because it is the only one that knows who it
-is talking to: the gateway threads the sender's identity into the `kube_agents_memory` provider,
-which tags everything that user says with `user:<id>` and lets them read that plus anything tagged
-`scope:shared`. Specialists are spawned by the kanban dispatcher with no human identity, so they
-have no memory at all — whatever they need must be spelled out in the card.
+The Chat Agent is the **only** profile that can write memory or read a person's, because it is the
+only one that knows who it is talking to: the gateway threads the sender's identity into the
+`kube_agents_memory` provider, which tags everything that user says with `user:<id>` and lets them
+read that plus anything tagged `scope:shared`. Specialists are spawned by the kanban dispatcher
+with no human identity, so they get **shared memory only, and read-only** — anything personal must
+be spelled out in the card, resolved to concrete values.
 
 - **Two scopes: personal and shared.** Personal is private to the current user; shared is visible
   to the whole organisation. Both are read automatically; only personal is written automatically.

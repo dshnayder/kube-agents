@@ -43,8 +43,8 @@ export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 DEFAULT_AGENT_IMAGE="$(registry_prefix)/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 warn_on_registry_prefix_mismatch "AGENT_IMAGE"
-init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
-init_var "MEMORY_PROVIDER" "kube_agents_memory" "Enter agent memory provider"
+init_var "MEMORY_ENABLED" "true" "Enable agent memory persistence? (true/false)"
+init_var_memory_provider
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -112,11 +112,30 @@ execute_custom_resource() {
     export GITHUB_FULL_REPO=""
   fi
 
-  # Normalize memory variables to strict boolean values
-  if is_truthy "${MEMORY_ENABLED:-false}"; then
+  # Normalize memory variables to strict boolean values.
+  #
+  # MEMORY_ENABLED is the install's answer to "does this agent remember things".
+  # With it off, the provider is forced back to `none`: it keeps its default
+  # value otherwise, and a CR naming kube_agents_memory would point the agent at
+  # a Hindsight service that step 13 — gated on the same two variables — never
+  # deployed.
+  if is_truthy "${MEMORY_ENABLED:-true}"; then
     export MEMORY_ENABLED="true"
   else
     export MEMORY_ENABLED="false"
+    export MEMORY_PROVIDER="none"
+  fi
+
+  # spec.harness.memory.memoryEnabled is the narrower question: it switches on
+  # Hermes' *built-in* MEMORY.md/USER.md store, which has no per-user scoping.
+  # A named provider replaces that store rather than supplementing it, so the
+  # two answers coincide only when memory is wanted and no provider was chosen.
+  # Rendering MEMORY_ENABLED straight into the CR would put two competing stores
+  # in front of one agent.
+  if [ "$MEMORY_ENABLED" = "true" ] && [ "${MEMORY_PROVIDER:-none}" = "none" ]; then
+    export BUILTIN_MEMORY_ENABLED="true"
+  else
+    export BUILTIN_MEMORY_ENABLED="false"
   fi
 
   if is_truthy "${USER_PROFILE_ENABLED:-false}"; then
@@ -133,7 +152,7 @@ execute_custom_resource() {
   fi
 
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME IMAGE_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED HERMES_DASHBOARD_ENABLED
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME IMAGE_TAG GITHUB_FULL_REPO MEMORY_ENABLED BUILTIN_MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED HERMES_DASHBOARD_ENABLED
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

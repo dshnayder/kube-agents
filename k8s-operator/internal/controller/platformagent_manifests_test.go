@@ -2931,7 +2931,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
 		pluginWithProfile("second", "platform", ""),
-	}, nil)
+	}, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -2955,7 +2955,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\nlogging:\n  level: debug\napprovals:\n  cron_mode: approve\n"),
-	}, nil)
+	}, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -2975,7 +2975,7 @@ func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\n"),
-	}, limits(8, 200))
+	}, limits(8, 200), nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -2994,7 +2994,7 @@ func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 }
 
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
-	if got := renderProfileOverlayYAML(nil, nil); got != "" {
+	if got := renderProfileOverlayYAML(nil, nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
 	}
 }
@@ -3047,11 +3047,100 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 	}
 }
 
+// With no targeted plugin and no tuning, the platform profile still gets an overlay —
+// it carries the memory provider, which follows the CR — but nothing else does, and
+// that overlay says nothing beyond the provider.
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
 	for k := range data {
+		if k == profileOverlayKey(platformProfileName) {
+			continue
+		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
 			t.Errorf("unexpected overlay key %q when no plugin targets a profile and no tuning is set", k)
+		}
+	}
+
+	overlay, ok := data[profileOverlayKey(platformProfileName)]
+	if !ok {
+		t.Fatalf("the platform overlay must always be written, got keys %v", mapKeys(data))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Errorf("platform overlay must carry memory alone here, got %v", parsed)
+	}
+	memory, _ := parsed["memory"].(map[string]any)
+	if fmt.Sprint(memory["provider"]) != defaultMemoryProvider {
+		t.Errorf("provider = %v, want %q", memory["provider"], defaultMemoryProvider)
+	}
+}
+
+// The specialist profiles only get a provider that can be made read-only and scoped by
+// tag. A per-user file provider has no gateway identity to key on there, so the overlay
+// blanks it rather than passing it through — see memoryOverlay.
+func TestBuildConfigMapDataPlatformOverlayFollowsProvider(t *testing.T) {
+	for _, tc := range []struct{ provider, want string }{
+		{"", defaultMemoryProvider},
+		{"kube_agents_memory", defaultMemoryProvider},
+		{"hindsight", "hindsight"},
+		{"multiuser_memory", ""},
+		{"none", ""},
+		{"NONE", ""},
+	} {
+		agent := newTestPlatformAgent()
+		if agent.Spec.Harness == nil {
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+		}
+		agent.Spec.Harness.Memory = &agentv1alpha1.MemorySpec{Provider: tc.provider}
+
+		overlay := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+		var parsed map[string]any
+		if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+			t.Fatalf("provider %q: unmarshal platform overlay: %v", tc.provider, err)
+		}
+		memory, _ := parsed["memory"].(map[string]any)
+		got := ""
+		if memory["provider"] != nil {
+			got = fmt.Sprint(memory["provider"])
+		}
+		if got != tc.want {
+			t.Errorf("provider %q: platform overlay provider = %q, want %q", tc.provider, got, tc.want)
+		}
+	}
+}
+
+// `none` is the only way to say "no external provider": an empty field takes the CRD
+// default, so the sentinel has to survive as far as the rendered config and become the
+// empty string Hermes itself uses.
+func TestRenderConfigYAMLProviderNoneMeansNoProvider(t *testing.T) {
+	for _, tc := range []struct{ provider, want string }{
+		{"", defaultMemoryProvider},
+		{"none", ""},
+		{"None", ""},
+		{"  none  ", ""},
+		{"multiuser_memory", "multiuser_memory"},
+		{"mem0", "mem0"},
+	} {
+		agent := newTestPlatformAgent()
+		if agent.Spec.Harness == nil {
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+		}
+		agent.Spec.Harness.Memory = &agentv1alpha1.MemorySpec{Provider: tc.provider}
+
+		var parsed map[string]any
+		if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+			t.Fatalf("provider %q: unmarshal rendered YAML: %v", tc.provider, err)
+		}
+		memory, _ := parsed["memory"].(map[string]any)
+		got := ""
+		if memory["provider"] != nil {
+			got = fmt.Sprint(memory["provider"])
+		}
+		if got != tc.want {
+			t.Errorf("provider %q: rendered provider = %q, want %q", tc.provider, got, tc.want)
 		}
 	}
 }
@@ -3108,11 +3197,16 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
 	}
 
-	// And the default profile never gets an overlay — it is rendered whole.
-	for k := range buildConfigMapData(agent, nil) {
-		if strings.HasPrefix(k, profileOverlayPrefix) {
-			t.Errorf("tuning.default must not produce an overlay, got key %q", k)
+	// And the default profile never gets an overlay — it is rendered whole. The
+	// platform profile's is not from tuning: it always carries the memory provider.
+	for k, v := range buildConfigMapData(agent, nil) {
+		if !strings.HasPrefix(k, profileOverlayPrefix) {
+			continue
 		}
+		if k == profileOverlayKey(platformProfileName) && !strings.Contains(v, "max_turns") {
+			continue
+		}
+		t.Errorf("tuning.default must not produce an overlay, got key %q", k)
 	}
 }
 
@@ -3184,7 +3278,7 @@ approvals:
 		t.Errorf("targeted plugin's pubsub subscription must reach the DEFAULT profile, got %v", rendered["platforms"])
 	}
 	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil)), &overlay); err != nil {
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil)), &overlay); err != nil {
 		t.Fatalf("unmarshal overlay: %v", err)
 	}
 	if _, ok := overlay["platforms"]; ok {

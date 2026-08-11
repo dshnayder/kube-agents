@@ -22,6 +22,15 @@ The step deploys the manifests and waits for `hindsight-api` to become ready,
 which takes longer than the rest of the install because the API loads its
 embedding and reranking models at startup.
 
+It deploys nothing at all unless the install asked for this store: `MEMORY_ENABLED`
+must be true **and** `MEMORY_PROVIDER` must name a Hindsight-backed provider
+(`kube_agents_memory` or `hindsight`). Both default that way, so a stock install
+gets these workloads; it is an install that chose the file-based
+`multiuser_memory`, or no memory at all, that runs no database — see
+[choosing a provider](../../../../docs/designs/memory.md#choosing-a-provider). The
+step exits 0 when it skips, so re-running it after switching the provider is all it
+takes to bring the store up later.
+
 To apply the manifests directly — the same thing the step does, without the
 readiness gate:
 

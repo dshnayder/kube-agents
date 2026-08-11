@@ -21,6 +21,8 @@ the change this document designs.
 | Layer                     | Where it lives                                                                                                                                             |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                   |
+| The lighter alternative   | [`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)                                                       |
+| Which one an install gets | `install.sh --memory=`, carried as `spec.harness.memory.provider` — see [Choosing a provider](#choosing-a-provider)                                        |
 | Its recall settings       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                           |
 | Its endpoint              | `HINDSIGHT_API_URL`, derived from the namespace in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)       |
 | The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                |
@@ -110,20 +112,29 @@ So `hindsight` is the only entry that is self-hostable, multi-user, **and** able
 embed without new infrastructure — the one candidate that does not trade one of those
 against the others.
 
-### `multiuser_memory`, the provider this replaced
+### `multiuser_memory`, the provider this displaces
 
-This repository carried its own provider
-([vendored into the test tree](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/fixtures/multiuser_memory.py);
-this branch removes it): one Markdown file per user under
-`memories/users/<id>.md`, one shared `memories/MEMORY.md`, and
-`system_prompt_block()` concatenating both into the prompt.
+This repository already carried its own provider
+([`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)):
+one Markdown file per user under `memories/users/<id>.md`, one shared
+`memories/MEMORY.md`, and `system_prompt_block()` concatenating both into the
+prompt.
 
 It isolated users correctly — **zero tag leaks** at every corpus size. What it
-lost in the port was everything the built-in does that the file format does not
-show: the character bound, the file lock, the external-drift guard, the
-prompt-injection scan, and the frozen snapshot. A lookalike is indistinguishable
-from its reference right up until one of the invisible behaviours is needed. The
-first of the five is what this document is about.
+lost in the port from the built-in was everything the built-in does that the file
+format does not show: the character bound, the file lock, the external-drift
+guard, the prompt-injection scan, and the frozen snapshot. A lookalike is
+indistinguishable from its reference right up until one of the invisible
+behaviours is needed. The first of the five is what this document is about.
+
+**It stays in the tree**, as the choice for an install that will not run a
+database for memory. Everything below argues that a file store does not hold at
+fleet scale, and none of it argues that a file store is wrong for a fleet of five
+clusters and three people. What it costs to run is nothing; what it costs to use
+is the whole store in the window on every turn, which is affordable exactly as
+long as the store is small. Which provider an install gets is the operator's
+choice, not this document's — see
+[Choosing a provider](#choosing-a-provider).
 
 ---
 
@@ -157,7 +168,7 @@ refused, and the model is told to consolidate and retry.
 That bound is load-bearing. **Nothing else in a file store ever removes an
 entry** — no eviction, no TTL, no relevance filter, no compaction. Admission
 control is the sole mechanism keeping the file a summary rather than an
-append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-replaced)
+append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-displaces)
 lost it in the port, so the file arm the experiment measured is a defect rather
 than a configuration anyone would choose.
 
@@ -252,7 +263,12 @@ labels against 193 reachable in the file.
 
 ### What is adopted
 
-**Hindsight becomes the Chat Agent's memory provider**.
+**Hindsight becomes the Chat Agent's default memory provider**. Default, not only:
+the argument above is about fleet scale, and an install that is not at fleet scale
+can still choose the file store or no memory at all
+([Choosing a provider](#choosing-a-provider)). What the default settles is which
+way an install goes when nobody has an opinion, and everything from here on
+describes that path.
 
 ---
 
@@ -263,9 +279,89 @@ Hindsight provider. Every memory carries a scope tag; the wrapper's entire job i
 to resolve the current human's identity into the right tags and pin the four
 settings that would otherwise leak or silently lose data.
 
+### Choosing a provider
+
+**Which one to pick, in one line each.** `multiuser_memory` for a small or personal
+deployment: it costs nothing to run and holds everything verbatim, and the whole
+store rides in the context window on every turn, so it is bounded by the window
+rather than by disk. `kube_agents_memory` for an enterprise fleet: it retrieves
+only what a question needs, so the per-turn cost barely moves as the corpus grows,
+and it pays for that with an API server and a Postgres database. The number that
+separates them is measured in [the experiment](#the-experiment) — at fleet scale
+the file store is 55% of the window before the user has spoken, while retrieval
+answered the same questions from a small fraction of it. Below the bound there is
+nothing to buy: a handful of clusters and a handful of people will not reach it,
+and a database there is cost without a benefit.
+
+**Memory is on by default, and `kube_agents_memory` is what it means.** An install
+that says nothing about memory gets ranked recall and the two workloads behind it;
+`--memory=file` steps down to the file store, and `--memory=off` retains nothing.
+The default runs the other way from the usual "opt in to the expensive thing"
+because the cheap thing here is not free: an agent that forgets every conversation
+makes the same person re-state the same context indefinitely, and that is the cost
+paid by every install that never found the flag. An install small enough to prefer
+the file store is the one in a position to say so. `kube_agents_memory` is also the
+provider named wherever there is no install to ask — the CRD default, `common.sh`,
+and both profiles' `config.yaml`.
+
+The choice is made once, at install, and then carried by the CR. Four places have
+to agree about it, and the reason they are listed together is that a disagreement
+between any two of them is silent: the install still succeeds, and what is wrong
+is either a database nobody asked for or a memory tool that never loads.
+
+| Where                                               | What it holds                                                                  |
+| --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `install.sh --memory=hindsight\|file\|off`          | the question a human answers, also prompted interactively                      |
+| `MEMORY_PROVIDER` in `k8s-operator/scripts/vars.sh` | the answer, as a provider name; validated against `MEMORY_PROVIDER_CHOICES`    |
+| `spec.harness.memory.provider`                      | the answer, on the CR — the only copy the running system reads                 |
+| `MEMORY_PROVIDER` env on the pod                    | the same value, for the entrypoint, which runs before `config.yaml` is in play |
+
+Alongside it travels `MEMORY_ENABLED`, the answer to the blunter question of
+whether this install remembers anything at all. It is **not** the CR's
+`spec.harness.memory.memoryEnabled`, and provisioning step 8 derives the one from
+the other rather than passing it through. The CR field switches on Hermes' own
+`MEMORY.md`/`USER.md`, a store with no per-user scoping that each provider here
+replaces rather than supplements, so it is true only for the one combination that
+asks for memory and names no provider. The same step forces the provider back to
+`none` when `MEMORY_ENABLED` is false, since the provider otherwise keeps its
+default name and would leave the agent pointed at a Hindsight nobody deployed.
+
+`file` maps to `multiuser_memory` rather than to Hermes' built-in file store,
+because the built-in is gated by `memory_enabled`, and the operator disables the
+`memory` toolset whenever that flag is on — an install choosing "files" would get a
+`MEMORY.md` the agent could read and not write. `multiuser_memory` has real
+per-user scoping and runs with `memory_enabled: false`, so the toolset gate stays
+open.
+
+`off` maps to **`none`**, not to an empty string. Hermes spells "no provider" as
+`""`, but an empty string cannot survive the trip: an absent CR field takes the
+kubebuilder default, so `""` round-trips back to `kube_agents_memory`. The sentinel
+is translated back to Hermes' spelling at the single point where `config.yaml` is
+rendered — `resolveMemoryProvider` in
+[`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go).
+
+Three things then read the choice rather than assuming it:
+
+- **Provisioning step 13 deploys nothing** unless memory is enabled _and_ the
+  provider is Hindsight-backed. Both halves matter: the provider keeps its default
+  name when memory is switched off, so the name alone would have stood up a
+  Postgres database for a memory nobody turned on. It exits 0 — for those settings
+  "nothing to deploy" is the step succeeding, and turning memory on later is a
+  matter of re-running it.
+- **The specialist profiles get a provider only if it is Hindsight-backed**, via
+  the platform profile's overlay. Anything else is blanked there, because
+  [what makes a specialist's memory safe](#what-subagents-get-shared-memory-read-only)
+  is `read_only` plus tag scoping, and a per-user file provider has neither an
+  identity to key on nor a read-only mode.
+- **The one-way file import** below is gated the same way.
+
+The teardown for step 13 is deliberately **not** gated. Undeploy is idempotent, and
+a gate there would orphan the workloads of any install that changed its provider
+after the fact.
+
 ### The two pods
 
-Hindsight is self-hosted in-cluster, installed by provisioning step 12 from
+Hindsight is self-hosted in-cluster, installed by provisioning step 13 from
 [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md).
 It adds exactly two workloads to `kubeagents-system`.
 
@@ -607,7 +703,14 @@ used to work stops working.
 [`agents/chat/scripts/memory_file_import.py`](../../agents/chat/scripts/memory_file_import.py)
 runs from the entrypoint on every start (step 5.6), backgrounded and non-fatal, and
 exits immediately when there is nothing to move — which is every start after the one
-that moved it. It reads both layouts, the built-in `MEMORY.md`/`USER.md` and
+that moved it. It runs **only for a Hindsight-backed provider**, which is the one
+irreversible step in the entrypoint: it moves the Markdown into the provider and
+unlinks the original. The gate used to be the presence of
+`hindsight/config.json`, an image-owned file and therefore always present, so an
+install that had deliberately kept the file store had it taken away on the next
+roll. `MEMORY_PROVIDER` on the pod is what it reads instead, and an _unset_
+variable — an operator too old to send it — still takes the old file-presence
+path, which is the safe reading of an install that predates the choice. It reads both layouts, the built-in `MEMORY.md`/`USER.md` and
 `multiuser_memory`'s `memories/`, retains each entry under the scope its file
 implies, verifies the entry is in the bank, and only then deletes the file. What
 stays behind is a receipt under `$HERMES_HOME/hindsight/imported/` carrying the
@@ -747,7 +850,7 @@ source. Across ten probes it improvised five routes to the same data, the worst 
 them durable: a 79,815-byte fork of the shared corpus written into its own skill
 file, reloaded into context on every invocation, curated by nobody and auditable by
 nobody. See
-[Specialists have no memory, and improvise one](#specialists-have-no-memory-and-improvise-one)
+[Specialists with no memory improvise one](#specialists-with-no-memory-improvise-one)
 for the full accounting. **A stale private copy is a worse outcome than a read.**
 
 So the platform profile now reads shared memory and writes nothing
@@ -1226,7 +1329,7 @@ direct experimental support for provenance marking on shared memory.
 The conclusion the data supports is **provenance and cost, not accuracy.**
 _"File memory gives wrong answers"_ would not have survived this run.
 
-### Specialists have no memory, and improvise one
+### Specialists with no memory improvise one
 
 Kanban-spawned specialists ran with `memory_enabled: false` in both arms, making
 them a constant. The way they behave without a provider is nonetheless the strongest

@@ -58,6 +58,7 @@ PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
+PARAM_MEMORY="${MEMORY:-hindsight}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_REGISTRY_PREFIX="${REGISTRY_PREFIX:-ghcr.io/gke-labs/kube-agents}"
 
@@ -83,6 +84,20 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent permission boundary: read-only | gke-admin (default: read-only)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
+  --memory=MODE                 Long-term agent memory: hindsight | file | off
+                                (default: hindsight)
+                                  hindsight ENTERPRISE deployments, and the default. Searchable,
+                                            ranked recall that stays affordable as the store
+                                            grows (kube_agents_memory, the default provider).
+                                            Deploys the Hindsight API and a Postgres
+                                            database into the cluster.
+                                  file      SMALL / PERSONAL deployments. Per-user Markdown
+                                            files inside the pod (multiuser_memory). No extra
+                                            services, but the whole store is loaded into the
+                                            model's context every turn, so it stops scaling
+                                            once there is more than a few pages of it.
+                                  off       nothing is retained between sessions. No memory
+                                            provider, and no database to run.
   --image-tag=TAG               Validated immutable release tag or full commit SHA (required)
   --registry-prefix=PATH        Container registry path without a URL scheme
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
@@ -109,6 +124,7 @@ parse_args() {
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
       --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
       --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
@@ -402,6 +418,7 @@ write_json_report() {
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-false},
+  "memory_mode": "$(json_escape "${memory_mode:-hindsight}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "vars_file": "$(json_escape "${vars_file:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -969,6 +986,16 @@ main() {
     print_error "--enable-web-ui must be either true or false."
     exit 1
   fi
+  # An agent that forgets every conversation is the worse default, so memory is
+  # on unless it is turned off. The choice decides two things: whether the
+  # harness keeps memory at all, and — when it does — whether that costs an
+  # extra API server and Postgres database in the cluster. Nothing downstream
+  # infers one from the other, so both are recorded.
+  local memory_mode="${PARAM_MEMORY:-hindsight}"
+  if [[ ! "$memory_mode" =~ ^(off|file|hindsight)$ ]]; then
+    print_error "--memory must be one of: off, file, hindsight."
+    exit 1
+  fi
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local perm_choice=""
     prompt_menu "Select Platform Agent Permission Boundary:" \
@@ -1001,7 +1028,60 @@ main() {
     if [ "$webui_choice" = "2" ]; then
       PARAM_ENABLE_WEBUI="true"
     fi
+
+    # The two stores differ in what they cost to run and in how far they scale,
+    # and the label says which so the choice can be made without reading a design
+    # doc: the file store adds no services but is loaded into the model's context
+    # whole on every turn, so it is bounded by the window; Hindsight retrieves only
+    # what a question needs, at the price of an API server and a database.
+    #
+    # The searchable store is listed first because prompt_menu's default answer is
+    # always option 1, and this is the one an install should get for saying nothing.
+    local memory_choice=""
+    prompt_menu "Should the agent remember things between conversations?" \
+      "Searchable store (Default) - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
+      "Files on the agent's own disk - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "No - Nothing is retained once a session ends" \
+      memory_choice
+
+    # Every branch assigns, rather than letting option 1 fall through to
+    # --memory=: an answer given at the prompt is the more recent instruction of
+    # the two, and the permission-set and gVisor prompts above already work this way.
+    case "$memory_choice" in
+      1) memory_mode="hindsight" ;;
+      2) memory_mode="file" ;;
+      3) memory_mode="off" ;;
+    esac
   fi
+
+  # MEMORY_ENABLED answers "does this agent remember anything at all", and both
+  # stores need it: provisioning step 13 will not deploy Hindsight without it,
+  # and step 8 wipes the provider back to `none` when it is false, so that a
+  # provider left at its default cannot point the agent at a store this install
+  # never deployed.
+  #
+  # It is *not* the same question as spec.harness.memory.memoryEnabled on the CR,
+  # which switches on Hermes' built-in MEMORY.md/USER.md — a store with no
+  # per-user scoping that each provider below replaces rather than supplements.
+  # Step 8 derives that narrower field; see the comment there.
+  #
+  # `none` rather than an empty string: the choice has to survive the trip
+  # through the CR, and an absent provider takes the CRD default. The operator
+  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
+  # in k8s-operator/scripts/common.sh.
+  #
+  # `kube_agents_memory` is the default provider everywhere it is named with no
+  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # and `hindsight` is what an install that says nothing about memory gets.
+  local memory_enabled="true"
+  local memory_provider="kube_agents_memory"
+  case "$memory_mode" in
+    file) memory_provider="multiuser_memory" ;;
+    off)
+      memory_enabled="false"
+      memory_provider="none"
+      ;;
+  esac
 
   # 10. Repository Cloning & Execution Context
   print_step "9. Setting up Workspace Repository"
@@ -1078,8 +1158,8 @@ main() {
   write_state_var "$vars_file" KMS_KEYRING "$kms_keyring"
   write_state_var "$vars_file" KMS_KEY "$kms_key"
   write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
-  write_state_var "$vars_file" MEMORY_ENABLED "false"
-  write_state_var "$vars_file" MEMORY_PROVIDER "kube_agents_memory"
+  write_state_var "$vars_file" MEMORY_ENABLED "$memory_enabled"
+  write_state_var "$vars_file" MEMORY_PROVIDER "$memory_provider"
   write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
@@ -1105,6 +1185,7 @@ main() {
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
+  echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi

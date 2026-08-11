@@ -407,6 +407,9 @@ data:
     web:
       backend: ddgs
   leader_elect.py: <OMITTED_FOR_TESTS>
+  profile-platform.overlay.yaml: |
+    memory:
+      provider: kube_agents_memory
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -575,7 +578,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: fef1e11718ad49c2948801a46405b6f16a28b5ef646079f3b0ff22bd0771d3f3
+        kubeagents.x-k8s.io/config-hash: b4255f749261bb928b0c1cc627ff193715872ae0677b61d08b5776ec79c1b4d7
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -643,6 +646,8 @@ spec:
               value: /opt/defaults/scripts
             - name: HINDSIGHT_API_URL
               value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: MEMORY_PROVIDER
+              value: kube_agents_memory
             - name: AGENT_SHARED_STATE_SETUP
               value: owner
             - name: API_SERVER_MODEL_NAME

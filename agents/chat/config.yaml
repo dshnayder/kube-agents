@@ -194,10 +194,17 @@ platforms:
 # doing it at session start means there is no install step, and a deleted bank or
 # a rebuilt Hindsight database comes back correctly on its own.
 #
-# This is the only profile that gets the provider: specialists are spawned by the
-# kanban dispatcher and carry no human identity, so their writes would all land in
-# one anonymous bucket. The provider fails closed on exactly that case — with no
-# user_id there is no personal scope, and auto-retain is switched off entirely.
+# This is the only profile that gets the provider in a WRITABLE form: specialists
+# are spawned by the kanban dispatcher and carry no human identity, so their writes
+# would all land in one anonymous bucket. The provider fails closed on exactly that
+# case — with no user_id there is no personal scope, and auto-retain is switched off
+# entirely. They do get the same provider under `read_only: true`, which is why
+# agents/platform/config.yaml names it too.
+#
+# `provider` here is a default, not the decision. On an operator-deployed pod this
+# whole file is replaced by the rendered ConfigMap, which carries the install's
+# choice from spec.harness.memory.provider; the value below is what a run without
+# the operator gets. See docs/designs/memory.md#choosing-a-provider.
 #
 # It also fails closed in shared Google Chat threads. build_session_key()
 # (gateway/session.py) omits the participant id inside a thread unless

@@ -128,6 +128,14 @@ agent:
 # gates only the built-in file store, and the provider loads off `provider`
 # alone. See the note on the toolset gate above.
 #
+# `provider` here is a default, not the decision. The operator overwrites it from
+# spec.harness.memory.provider through this profile's overlay (memoryOverlay in
+# k8s-operator/internal/controller/platformagent_manifests.go), because the choice
+# belongs to the install and this file is baked into the image. It writes an empty
+# value for any provider that cannot be made read-only and scoped by tag — a
+# per-user file provider has no identity to key on here. The value below is what a
+# run without the operator gets.
+#
 # See docs/designs/memory.md and agents/chat/config.yaml (the front door, where
 # writes do happen).
 memory:

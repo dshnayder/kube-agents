@@ -695,7 +695,30 @@ fi
 # could at worst retain an entry twice, which consolidation absorbs, whereas a
 # lock file outliving a SIGKILL would skip the migration permanently and
 # silently.
-if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && [ -f "$TARGET_DIR/hindsight/config.json" ]; then
+#
+# Gated on the chosen provider, because this is the one step here that is not
+# reversible: it moves the Markdown into the provider and unlinks the original.
+# It used to be gated on hindsight/config.json existing, but that file is
+# image-owned and therefore always present, so an install that had deliberately
+# kept the file-based store still had it taken away. MEMORY_PROVIDER comes from
+# the operator (see buildDeployment); an empty value is a real answer — "no
+# provider" — while an *unset* one means an operator too old to send it, where
+# the old file-presence behaviour is the safe reading.
+memory_import_wanted() {
+    # ${VAR+x} is "x" when VAR is set to anything at all, including the empty
+    # string, and "" only when it is unset — which is the distinction that
+    # matters here and that a plain -z test would collapse.
+    if [ -z "${MEMORY_PROVIDER+x}" ]; then
+        [ -f "$TARGET_DIR/hindsight/config.json" ]
+        return
+    fi
+    case "$MEMORY_PROVIDER" in
+        kube_agents_memory | hindsight) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; then
     echo "Checking for a file-based memory store to migrate..."
     (
         HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \

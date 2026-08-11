@@ -56,6 +56,7 @@ _(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.co
 - **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials.
+- **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=hindsight|file|off`, default `hindsight`). The default is **on**: an install that says nothing gets `hindsight`, which suits **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster. It selects `kube_agents_memory`, the default provider. Pick `file` for **small or personal** deployments — per-user Markdown inside the pod, no extra services, but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
 
 ### Non-Interactive & AI Agent Execution Mode
