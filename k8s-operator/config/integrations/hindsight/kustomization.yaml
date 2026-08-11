@@ -6,10 +6,10 @@ kind: Kustomization
 # every other step, and every in-cluster address below is a short service name
 # that resolves wherever it lands.
 #
-# One thing does not follow: the Chat Agent image bakes the API's fully-qualified
-# URL into agents/chat/defaults/hindsight/config.json. Installing into a
-# namespace other than kubeagents-system means changing that file and rebuilding
-# the agent image.
+# The agent side follows too: the operator derives the API's fully-qualified URL
+# from the agent's namespace and passes HINDSIGHT_API_URL, so nothing here is
+# pinned to kubeagents-system and no image rebuild is needed to install
+# elsewhere.
 
 resources:
   - postgresql.yaml

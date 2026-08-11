@@ -342,12 +342,11 @@ rendered — `resolveMemoryProvider` in
 
 Three things then read the choice rather than assuming it:
 
-- **Provisioning step 13 deploys nothing** unless memory is enabled _and_ the
-  provider is Hindsight-backed. Both halves matter: the provider keeps its default
-  name when memory is switched off, so the name alone would have stood up a
-  Postgres database for a memory nobody turned on. It exits 0 — for those settings
-  "nothing to deploy" is the step succeeding, and turning memory on later is a
-  matter of re-running it.
+- **Provisioning step 13 deploys nothing** unless the provider is Hindsight-backed.
+  That is the whole gate — `multiuser_memory` and `none` stand up no database. It
+  exits 0 rather than failing, because for those settings "nothing to deploy" is
+  the step succeeding, and switching the provider later is a matter of re-running
+  it.
 - **The specialist profiles get a provider only if it is Hindsight-backed**, via
   the platform profile's overlay. Anything else is blanked there, because
   [what makes a specialist's memory safe](#what-subagents-get-shared-memory-read-only)
@@ -646,11 +645,11 @@ out of the installed plugin source with `ast` rather than retyping them.
 
 The three retain strategies:
 
-| Strategy     | Settings                             | Used by                                    |
-| ------------ | ------------------------------------ | ------------------------------------------ |
-| `personal`   | personal extraction mission          | automatic capture; `memory_retain` default |
-| `shared`     | shared extraction mission            | `memory_retain(scope="shared")`            |
-| `checkpoint` | `retain_extraction_mode: "verbatim"` | the TTL curator (built, not running)       |
+| Strategy     | Settings                           | Used by                                    |
+| ------------ | ---------------------------------- | ------------------------------------------ |
+| `personal`   | personal extraction mission        | automatic capture; `memory_retain` default |
+| `shared`     | shared extraction mission          | `memory_retain(scope="shared")`            |
+| `checkpoint` | `retain_extraction_mode: "chunks"` | the TTL curator (built, not running)       |
 
 `retain_default_strategy` is `personal`, so anything that reaches the bank without
 naming a strategy is treated as one person's fact rather than as org knowledge.
@@ -1058,10 +1057,10 @@ survivors for re-consolidation. Every removal path runs it. So _"retire the
 evidence, keep the conclusion"_ is not something the API can be asked for.
 
 **Distill, then retire** was the answer: write the observation layer back down into
-the fact layer as fresh verbatim checkpoints, then retire the aged cohort, so the
+the fact layer as fresh unrewritten checkpoints, then retire the aged cohort, so the
 conclusion survives its evidence. Checkpoints use the `checkpoint` strategy pinning
-`retain_extraction_mode: verbatim`, because re-summarising a summary every cycle
-walks the bank away from what was said; they carry their source observation's scope
+`retain_extraction_mode: chunks`, because re-summarising a summary every cycle walks
+the bank away from what was said; they carry their source observation's scope
 tag, because under `any_strict` an unscoped checkpoint consolidates into an
 observation no recall will ever match; and they are marked by `context` rather than
 by a tag (tags are what consolidation is scoped by) or a document id (the caller's

@@ -49,13 +49,18 @@ Two properties fall out of doing it in that order:
 
 Checkpoints are written under the `checkpoint` retain strategy, which
 `kube_agents_memory` provisions on the bank and which pins extraction to
-`verbatim`. That matters: Hindsight's default extraction would re-summarise the
+`chunks`. That matters: Hindsight's default extraction would re-summarise the
 observation, and re-summarising a summary every cycle is a game of telephone that
-walks the bank away from what was actually said. In `verbatim` mode
-`_collapse_to_verbatim` overwrites the fact text with the raw chunk, so one
-checkpoint in is one fact out, unchanged. The LLM still runs — it attaches
-entities and dates — so this is not a free operation and the run is paced
-accordingly.
+walks the bank away from what was actually said. In `chunks` mode the chunk is
+stored as it arrived, so one checkpoint in is one fact out, unchanged.
+
+`verbatim` was the obvious choice and is the wrong one. It preserves the text too,
+but it still calls the extraction LLM to attach entities and dates — and asks it to
+re-emit the observation inside a JSON response schema, which at scale fails often
+enough (5% of observations in the re-test) to abort every pass at the safety check.
+`chunks` runs no LLM at all, so the write is fast and cannot fail that way; the
+price is that checkpoints carry no extracted entities and the graph retriever
+cannot see them. See docs/designs/memory.md for the run that established this.
 
 **Every checkpoint must land back in the scope it came from.** One bank holds
 every user's memories, kept apart by a scope tag (`user:<id>`, or `scope:shared`
@@ -389,15 +394,16 @@ def curate(api: Hindsight, bank_id: str, *, ttl_days: int, min_units: int,
         summary.update(distilled=len(items), retired=len(doomed), skipped="dry run")
         return summary
 
-    # --- Distil: the observation layer, verbatim, as new facts -----------------
+    # --- Distil: the observation layer, unchanged, as new facts ----------------
     # One item per call, which is slower than it looks like it needs to be and is
-    # not negotiable. Extraction runs per request and fails the whole request if
-    # any single item in it trips the extraction LLM into emitting malformed JSON
-    # — roughly one observation in three hundred, measured against a live bank.
-    # Because the request is neither atomic nor idempotent, a failed multi-item
-    # call leaves its successful prefix behind, so there is no batch size at which
-    # a retry or a per-item fallback does not duplicate rows. Sending them one at
-    # a time makes a bad observation cost exactly that observation.
+    # not negotiable. Retain fails or succeeds per request, and because the request
+    # is neither atomic nor idempotent a failed multi-item call leaves its
+    # successful prefix behind — so there is no batch size at which a retry or a
+    # per-item fallback does not duplicate rows. That is how a 646-unit bank became
+    # 1,959 during the re-test. Sending them one at a time makes a bad item cost
+    # exactly that item. The `chunks` extraction mode removes the failure this was
+    # first written for (a per-request extraction LLM emitting malformed JSON), but
+    # not the non-atomicity, which is a property of the endpoint.
     #
     # Failures are counted, not swallowed: the landed check below still refuses to
     # retire anything unless every checkpoint is durable.
@@ -416,13 +422,13 @@ def curate(api: Hindsight, bank_id: str, *, ttl_days: int, min_units: int,
     # followed by a full retire is the one way this script can lose knowledge.
     #
     # Counted as a delta against the pre-write listing, not by timestamp: one
-    # item does not always mean one row (verbatim mode emits a fact per chunk, so
+    # item does not always mean one row (`chunks` mode emits a fact per chunk, so
     # an observation longer than the bank's chunk size lands as several), and a
     # delta needs no clock the two services have to agree on.
     landed = len([u for u in api.units(bank_id, type="world", state="valid")
                   if u.get("context") == CHECKPOINT_CONTEXT]) - len(superseded)
     if landed < len(items):
-        detail = (f"{unwritable} rejected by extraction" if unwritable
+        detail = (f"{unwritable} rejected by retain" if unwritable
                   else "retain reported success")
         summary["skipped"] = (f"aborted before retiring: {landed}/{len(items)} "
                               f"checkpoints landed ({detail})")

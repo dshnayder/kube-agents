@@ -82,13 +82,19 @@ live in LiteLLM's own secret and never reach this pod.
 http://hindsight-api.kubeagents-system.svc.cluster.local:8888
 ```
 
-That URL is baked into `agents/chat/defaults/hindsight/config.json`, which the
-container entrypoint force-syncs onto the agent's PVC on every start. The
-manifests themselves are namespace-agnostic — every in-cluster address in them is
-a short service name, and the provisioning step applies them with `-n $NAMESPACE`
-— but the agent image is not. Installing into a different namespace means editing
-that file and rebuilding the agent image; a hand-edit on the PVC is overwritten
-on the next roll.
+Nothing bakes that URL in. The operator derives it from the agent's namespace and
+passes it as `HINDSIGHT_API_URL`; `agents/chat/defaults/hindsight/config.json`
+carries `mode`, `memory_mode` and `recall_budget` and deliberately **no**
+`api_url` key, because the plugin prefers the file over the environment and a
+value left there would outrank the operator's silently. Installing into a
+different namespace therefore needs no edit and no image rebuild. The manifests
+are namespace-agnostic for the same reason — every in-cluster address in them is
+a short service name, and the provisioning step applies them with `-n $NAMESPACE`.
+
+The config file itself is image-owned: the entrypoint force-syncs it onto the
+agent's PVC on every start, so a hand-edit there is overwritten on the next roll.
+That is deliberate — see the comment above the force-sync loop in
+[`deploy/shared/docker-entrypoint.sh`](../../../../deploy/shared/docker-entrypoint.sh).
 
 There are no banks to provision. A Hindsight bank does not exist until something
 writes to it, and the provider creates `kube-agents-memory` with its mission and
