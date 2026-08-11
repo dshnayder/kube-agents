@@ -82,12 +82,40 @@ spec:
             # a Secret.
             - name: HINDSIGHT_API_DATABASE_URL
               value: postgresql://hindsight@hindsight-postgresql:5432/hindsight
+            # Recall is dominated by the cross-encoder reranker (see
+            # docs/designs/memory.md, "What a recall costs"). Length-sorted
+            # bucket batching groups candidates of similar length into the same
+            # batch, so short ones stop being padded up to the longest in the
+            # batch. Hindsight ships it off by default and documents it as a
+            # 36-54% speedup; measured on the agent's own path it roughly halves
+            # recall latency, and the same query returns the same units before
+            # and after — it changes how pairs are grouped, not how they are
+            # scored.
+            - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
+              value: "true"
+          # Recall is CPU-bound on the cross-encoder reranker, which runs a
+          # transformer forward pass per candidate in-process (see
+          # docs/designs/memory.md, "What a recall costs").
+          #
+          # Do not raise these expecting a speedup — that experiment has been
+          # run. Going from 500m/2 to 2/4 left recall latency unchanged. The
+          # quota IS read: the API's _thread_limits.py sizes native pools from
+          # the cgroup quota rather than os.cpu_count(), so the thread count did
+          # rise. It bought nothing because an e2-standard-4 is two physical
+          # cores behind four hyperthreads, and threads sharing a core share the
+          # vector units this work saturates. Faster needs more REAL cores, or a
+          # cheaper stage 4 — see HINDSIGHT_API_RERANKER_* in the API's
+          # config.py, mostly unset here.
+          #
+          # The request also cannot match the limit: a node allocates 3920m and
+          # the system daemonsets hold roughly 1250m of it, so a 4-CPU request
+          # would leave this pod Pending forever.
           resources:
             requests:
-              cpu: 500m
+              cpu: "2"
               memory: 1Gi
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: 4Gi
           securityContext:
             runAsNonRoot: true

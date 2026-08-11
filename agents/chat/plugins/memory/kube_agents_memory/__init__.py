@@ -103,10 +103,19 @@ SHARED_STRATEGY = "shared"
 # bank is ready for it rather than needing a migration later. A checkpoint is
 # only sound if it carries the observation's text *unchanged* — re-summarising a
 # summary every cycle is a game of telephone, and the bank would drift away from
-# what was actually said. `verbatim` extraction is what guarantees that:
-# `_collapse_to_verbatim` in Hindsight's extractor overwrites the fact text with
-# the raw chunk, so one checkpoint in is one fact out, byte for byte. The LLM
-# still runs, but only to attach entities and dates — never to rewrite.
+# what was actually said.
+#
+# `chunks` extraction is what guarantees that, and it is the mode that runs no
+# LLM at all: `extract_facts_from_contents` dispatches to `_extract_facts_chunks`
+# before it takes any LLM queue or lock, storing each chunk as-is. `verbatim` was
+# the obvious choice and is the wrong one — it also preserves the text, but it
+# still calls the LLM to attach entities and dates, and that call is asked to
+# re-emit the observation inside a JSON response schema. Measured against a
+# 207-observation bank, 10 of them (5%) came back as `JSONDecodeError` from the
+# extraction LLM, which is enough to abort every curator pass: an observation
+# that cannot be checkpointed is one whose evidence must not be retired. The
+# price of `chunks` is that checkpoints carry no extracted entities, so the graph
+# retriever cannot see them; semantic and BM25 retrieval are unaffected.
 CHECKPOINT_STRATEGY = "checkpoint"
 
 PERSONAL_RETAIN_MISSION = (
@@ -137,7 +146,7 @@ SHARED_RETAIN_MISSION = (
 RETAIN_STRATEGIES = {
     PERSONAL_STRATEGY: {"retain_mission": PERSONAL_RETAIN_MISSION},
     SHARED_STRATEGY: {"retain_mission": SHARED_RETAIN_MISSION},
-    CHECKPOINT_STRATEGY: {"retain_extraction_mode": "verbatim"},
+    CHECKPOINT_STRATEGY: {"retain_extraction_mode": "chunks"},
 }
 
 # What the bank is for, and how to answer from it.

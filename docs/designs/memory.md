@@ -256,8 +256,10 @@ It adds exactly two workloads to `kubeagents-system`.
   model `model-default`), so routing and cost attribution stay in one place. The
   API key is the literal string `none`, matching how the agents authenticate;
   it is a placeholder the client library insists on, not a credential.
-- Requests 500m/1Gi, limits 2 CPU/4Gi. Runs non-root, no privilege escalation, all
-  capabilities dropped.
+- Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root, no privilege escalation, all
+  capabilities dropped. The CPU numbers are sized for model inference rather than for
+  serving HTTP, though measurement says the headroom goes unused —
+  see [What a recall costs](#what-a-recall-costs).
 
 **2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
 
@@ -292,7 +294,13 @@ Enough of the model to read the wrapper.
 - **Two layers.** A write lands in the **fact** layer. A background consolidation
   pass groups related facts into **observations** — the LLM-written synthesis layer.
   **Recall reads observations, not facts.** Everything about scoping, and the whole
-  TTL problem below, follows from that one sentence.
+  TTL problem below, follows from that one sentence. It is a default rather than a
+  law: the plugin sends `types` on every recall from `recall_types`, which defaults
+  to `["observation"]` and which this deployment does not set. Note the layer is
+  _not_ what `memory_mode` selects — that is `context`/`tools`/`hybrid`, and it
+  chooses whether memories arrive by injection, by tool call, or both.
+  Querying the API directly without `types` returns both layers, so a probe that
+  bypasses the plugin will not show you what the agent sees.
 - **Retain strategies.** Named bundles of extraction settings selected per write.
   A missing strategy is _not_ an error — `apply_strategy` logs a warning and
   silently falls back to the bank default — so callers that depend on one must
@@ -305,6 +313,75 @@ Enough of the model to read the wrapper.
   rather than return individual matches. All three take a **budget**
   (`low`/`mid`/`high`) that bounds how much comes back — this is the mechanism that
   makes context cost independent of corpus size.
+
+#### What a recall costs
+
+A recall is not a database query with a model bolted on; it is a model inference
+with a database query in front of it, and the two differ by three orders of
+magnitude. A live chat turn against the 4,427-unit bank:
+
+```
+[2] Parallel retrieval (1 fact_types): semantic=300(0.028s), bm25=84, graph=282(0.096s) ... 0.395s
+[4] Reranking [cross-encoder]: 300 candidates scored in 14.195s (pre-filtered 220)
+Complete: 52 facts (3750 tok) | 14.637s
+```
+
+Stage 4 is effectively all of it, and the reason is the kind of model it uses.
+Stages 1–3 run a **bi-encoder**: every unit was embedded once at write time, the
+query is embedded once, and ranking is arithmetic over vectors in an index — hence
+300 semantic hits in 28 milliseconds. Stage 4 runs a **cross-encoder**, which
+concatenates the query with one candidate and runs a full transformer forward pass
+over the pair. It is much the better ranker, because the query's tokens attend to
+the document's, and it is unbatchable across queries and uncacheable by
+construction: the input does not exist until the query arrives and is different for
+every candidate. `300 candidates scored` means 300 forward passes on CPU, inside the
+request. Two concurrent recalls do not queue, they halve each other.
+
+**A large bank is therefore felt as latency, not just as storage — but as a
+threshold, not a slope.** A bank small enough that the tag filter cannot fill the
+budget reranks only what it found, and is quick. Once it is large enough to fill the
+budget, every question pays the full-size rerank, and growth past that point costs
+almost nothing further. The live bank holds 4,427 units, of which the 1,595
+observations are eligible — five times what the budget will take — and stage 2 still
+finds candidates in 0.4s. Ten times the bank would rerank the same 300 pairs.
+
+Two things follow. The user-visible symptom is a slow agent with nothing in the reply
+to suggest memory is the reason, and it appears abruptly, at a corpus size in the low
+hundreds rather than at any size worth calling large. And because the cost is flat
+above the threshold, **bounding the bank does not fix it** — see
+[Bounding the bank](#bounding-the-bank--built-deferred-and-not-urgent), which
+is worth doing for context quality and storage, not for latency.
+
+What does fix it is making stage 4 itself cheaper.
+`HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING` sorts candidates by length before
+batching them, so a short candidate is no longer padded out to the longest one in
+its batch. Hindsight ships it **off**, with a source comment reading
+`opt-in, 36-54% speedup`. Enabling it in
+[`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) roughly
+halved recall latency against the default on the agent's own path, and it costs
+nothing: it changes how pairs are grouped, not how they are scored, and the same
+query returns the same units before and after. No new dependency, no egress, no
+model change, no loss of ranking quality.
+
+Three other levers were measured and are not worth retrying. Raising the pod's CPU
+limit from 500m/2 to 2/4 changed nothing — the quota _is_ read
+(`hindsight_api/_thread_limits.py` sizes native pools from it), but an
+`e2-standard-4` is two physical cores behind four hyperthreads, and threads sharing
+a core share the vector units this work saturates. Dropping `recall_budget` from
+`mid` to `low` bought 16% at the cost of narrowing what the reranker may choose
+from, which is why the Chat Agent stayed at `mid` — see
+[Where the connection settings come from](#where-the-connection-settings-come-from).
+And `RERANKER_LOCAL_FP16` is documented as faster on MPS and CUDA, not on CPU.
+
+The remaining knobs are untried: `RERANKER_LOCAL_BATCH_SIZE` (32),
+`RERANKER_LITELLM_MAX_TOKENS_PER_DOC`, and `HINDSIGHT_API_RERANKER_PROVIDER`, which
+can hand stage 4 to `litellm`, `cohere`, `openrouter` or a `tei` sidecar. The
+`litellm` route would need a rerank model added to the LiteLLM config, which the
+install script does not define — see
+[`k8s-operator/config/integrations/litellm/base/config.yaml`](../../k8s-operator/config/integrations/litellm/base/config.yaml),
+which deliberately declares `model-default` and nothing else. The local model is
+already `cross-encoder/ms-marco-MiniLM-L-6-v2`, six layers, so shrinking it is not
+the lever either.
 
 ### One bank, two scopes
 
@@ -680,10 +757,13 @@ outcome is a fact the agent can report — which is what
 first.
 
 What is tunable is how much gets injected, not whether. The platform profile's
-`recall_budget` is `low` against the Chat Agent's `mid`, on the reasoning that a
-specialist arrives with a task already stated and a long tool loop ahead of it, so
-context spent at turn start is context it does not have for the work. That is a
-starting point to be measured, not a finding.
+`recall_budget` is `low`, on the reasoning that a specialist arrives with a task
+already stated and a long tool loop ahead of it, so context spent at turn start is
+context it does not have for the work. The Chat Agent is at `mid`, because for it
+the injected block _is_ the work. The budget is also the count of pairs the reranker
+scores, so it is a latency knob as well as a context one — but a weak one, and
+dropping the Chat Agent to `low` was tried and reverted; see
+[What a recall costs](#what-a-recall-costs).
 
 **Personal memory stays impossible here**, and always will be: it keys off the
 gateway identity, which only the Chat Agent has. The provider fails closed on this
@@ -753,9 +833,10 @@ alone.
 
 `$HERMES_HOME` is per-profile, so the platform specialist needs **its own copy** —
 [`agents/platform/hindsight/config.json`](../../agents/platform/hindsight/config.json),
-identical but for `recall_budget: low`. The default profile's copy is not on its
-path, and without one the provider has nothing to connect to. It is force-synced the
-same way, by step 2.6, for the same reason.
+identical but for `recall_budget: low`. The duplication is the point: the default
+profile's copy is not on the specialist's path, and without one the provider has
+nothing to connect to.
+It is force-synced the same way, by step 2.6, for the same reason.
 
 ### Failing closed
 
@@ -793,14 +874,15 @@ prevent it. The control is in the persona: SOUL.md §1.6 requires a possessive i
 space to resolve only from the current speaker's own words, and requires a
 destructive delegation to be confirmed against a named target first.
 
-### Bounding the bank — built, deferred, and coming back soon
+### Bounding the bank — built, deferred, and not urgent
 
 Hindsight never forgets. There is no TTL, no decay and no eviction anywhere in its
 bank configuration or its API. A mechanism to bound it exists and **nothing runs
 it**:
 [`agents/chat/scripts/memory_ttl_curator.py`](../../agents/chat/scripts/memory_ttl_curator.py)
-is on no cron schedule and defaults to dry run. **This is deferred, not dropped**
-— the design is expected back in the near term, and the rest of this section is
+is on no cron schedule and defaults to dry run. **This is deferred, not dropped** —
+it has been built and tested and its failure mode is understood, but nothing is
+pushing it, for the reasons at the end of this section. The rest of what follows is
 written for whoever picks it up.
 
 Plain expiry does not work. Facts and observations live in one table, and recall
@@ -823,24 +905,88 @@ is not what comes back). Each run retires the previous run's checkpoints, so exa
 one generation is ever live.
 
 It was deferred because the end-to-end run took the observation layer from 22 rows to
-10 to 2 over three cycles. Each cycle rebuilds that layer by re-consolidating, and
-re-summarising a summary compounds — the layer does not settle, it keeps shrinking.
-The checkpoints survive untouched in the fact layer, but recall reads observations
-only, so the bank answers as though it had forgotten nearly everything while every
-checkpoint sits unread. Safe for the store, lossy for what the agent can reach — the
-opposite of the intent. Both repairs were rejected: making recall read the fact layer
-puts raw facts in the hot path forever to compensate for a weekly job, and keeping
-distillation without retirement is pure growth.
+10 to 2 over three cycles. That was re-run at scale on an isolated 300-fact scratch
+bank, and the finding held — but the explanation in this document did not, so the
+rest of this section is what the re-test actually showed.
 
-What must be settled before it runs is **what recall reads**, because that is what
-decides whether retiring the evidence loses anything. That is the next question on
-this design's list, and the deferral is what buys time to answer it properly rather
-than a decision to leave the bank unbounded: today it holds facts in the tens,
-unbounded growth is not yet a problem this deployment has, and the script's
-`--min-units` default of 200 makes it a no-op at the current size even if run. Every
-one of those is a property of a young bank, so the mechanism has to be settled well
-before the bank stops being young — which is why it comes back rather than waits for
-the growth to force it.
+**Two bugs had to be fixed before a single pass could complete at all.** Both are
+fixed in the script and the provisioning; both are worth knowing about because they
+are properties of Hindsight's retain endpoint, not of this script.
+
+The first is that `retain` is neither atomic nor idempotent. A multi-item call that
+fails returns 500 having already persisted the items that succeeded, and the client
+retried 500s six times — so one malformed extraction response turned a 646-unit bank
+into 1,959, most of them duplicate checkpoints. Checkpoints are now written one item
+per call, and a 500 is the one status the retain path does not retry.
+
+The second is that the `checkpoint` strategy was provisioned as
+`retain_extraction_mode: verbatim`, which preserves the text but still calls the
+extraction LLM to attach entities and dates — and asks it to re-emit the observation
+inside a JSON response schema. 10 of 207 observations (5%) came back as
+`JSONDecodeError`, and since an observation that cannot be checkpointed is one whose
+evidence must not be retired, every pass aborted at the safety check with
+`distilled=0 retired=0`. The mode that runs no LLM at all is `chunks`, which stores
+each chunk as-is; the strategy now uses it. Nothing failed afterwards, and writing
+300 items went from 55 minutes to under 100 seconds. The price is that checkpoints
+carry no extracted entities, so the graph retriever cannot see them.
+
+**With both fixed, three full cycles ran, and the collapse is real and worse than
+row counts suggest.** From 300 facts and 295 observations:
+
+| after | world | observations | distinct identifiers reachable |
+| --- | --- | --- | --- |
+| seed | 300 | 295 | 162 |
+| cycle 1 | 295 | 53 | — |
+| cycle 2 | 53 | 32 | — |
+| cycle 3 | 32 | 32 | 50 |
+
+The observation layer converges rather than vanishing, but it converges at about a
+tenth of what went in: 73,588 characters of seeded fact became 7,437, and 112 of the
+162 distinct identifiers in the corpus — `RB-100` through `RB-109`, `ADR-2026` and
+the rest — are gone from the bank entirely. There is also a window in every cycle,
+between the retire and the next consolidation, where the bank holds **zero**
+observations and recall returns nothing at all.
+
+Two corrections follow, and they matter more than the numbers. **The cause is not
+paraphrase drift.** `chunks` rewrites nothing, and the collapse is unchanged, so it
+is not a game of telephone: it is consolidation's fan-in. Consolidation turns N facts
+into fewer than N observations by design, and feeding the observation layer back in
+as facts asks it to do that again to its own output, every cycle. **And the
+checkpoints do not survive as a safety net.** This document previously said they sit
+unread in the fact layer while recall looks elsewhere; they do not, because each
+cycle's checkpoints are copies of the already-collapsed observation layer rather than
+of the original facts. The fact layer is denuded in lockstep — 50 of 162 identifiers
+in _either_ layer after three cycles. That also kills the repair recorded here
+earlier: `recall_types` takes a list, and `"observation,world"` is a one-line config
+change, but there is nothing left in the fact layer for it to find.
+
+What must be settled before this runs is therefore no longer "what recall reads" but
+**what gets checkpointed**. Distilling the observation layer is what compounds;
+checkpointing the aged _facts_ themselves, or exempting checkpoints from
+re-consolidation so they cannot be merged a second time, are the two directions worth
+trying, and neither has been tested.
+
+**None of that is urgent, and the deferral is open-ended rather than a queued task.**
+Storage is not going to force the question. Postgres sits on an 8Gi volume
+(`data-hindsight-postgresql-0`), and a unit costs about 1.5KB of embedding — 384
+dimensions at four bytes, `DEFAULT_EMBEDDING_DIMENSION` against
+`BAAI/bge-small-en-v1.5` — plus the text itself, which measures around 250 bytes a
+unit across the live bank. Allowing generously for row overhead and the vector index,
+that volume holds on the order of a million units. This deployment's real
+conversational memory is in the tens; the 4,427 units in the bank today are almost
+entirely the synthetic corpus from [the experiment](#the-experiment), and the
+script's `--min-units` default of 200 makes the curator a no-op at the real size even
+if something ran it. At any plausible rate of accumulation that is years of headroom,
+not months.
+
+Nor does latency force it, for the reason given in
+[What a recall costs](#what-a-recall-costs): the rerank cost is flat above a
+threshold the bank has already crossed, so a smaller bank is not a faster one. What
+would eventually force it is context quality — a bank crowded enough that the
+reranker's 300 candidates are worse than they could be — and that is a judgement
+call, not a disk alarm. Until someone can point at that, this stays where it is: the
+mechanism is built and its failure mode is now understood and written down, which is
+the state it should be parked in.
 
 ---
 

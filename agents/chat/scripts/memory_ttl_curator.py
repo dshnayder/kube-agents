@@ -133,6 +133,7 @@ PAGE_SIZE = 200
 RETIRED_TYPES = ("world", "experience")
 
 
+
 def load_hindsight_config() -> dict:
     """Read the provider's own config so this script cannot drift from it.
 
@@ -178,8 +179,13 @@ class Hindsight:
         if api_key:
             self._headers["Authorization"] = f"Bearer {api_key}"
 
+    # A 500 from `retain` is not in this set, and that omission is the point;
+    # see the comment on `retain`.
+    RETRY_CODES = (429, 500, 502, 503, 504)
+
     def call(self, method: str, path: str, body: dict | None = None,
-             timeout: int = 300, retries: int = 6) -> dict:
+             timeout: int = 300, retries: int = 6,
+             retry_codes: tuple[int, ...] | None = None) -> dict:
         """Issue a request, backing off on rate limits.
 
         Extraction and consolidation both go through the shared LiteLLM pool, and
@@ -188,13 +194,14 @@ class Hindsight:
         """
         url = self._base + self._prefix + path
         data = json.dumps(body).encode() if body is not None else None
+        codes = self.RETRY_CODES if retry_codes is None else retry_codes
         delay = 5
         for attempt in range(retries):
             request = urllib.request.Request(url, data=data, method=method, headers=self._headers)
             try:
                 return json.loads(urllib.request.urlopen(request, timeout=timeout).read() or "{}")
             except urllib.error.HTTPError as e:
-                retryable = e.code in (429, 500, 502, 503, 504)
+                retryable = e.code in codes
                 if not retryable or attempt == retries - 1:
                     raise RuntimeError(f"HTTP {e.code} on {method} {path}: {e.read()[:300]!r}") from e
             except (urllib.error.URLError, TimeoutError) as e:
@@ -234,8 +241,18 @@ class Hindsight:
     def retain(self, bank_id: str, items: list[dict]) -> dict:
         # Synchronous: the retire pass must not start until the checkpoints are
         # durable, and "async accepted" says nothing about that.
+        #
+        # A 500 is deliberately not retried here, unlike everywhere else. Retain
+        # is not atomic and not idempotent: when one item fails extraction the
+        # request returns 500 having already persisted the items that succeeded,
+        # so a retry re-writes them. Retrying six times on a 295-item call is how
+        # a single malformed-JSON response from the extraction LLM turned a bank
+        # of 646 units into 1,959, most of them duplicate checkpoints. The
+        # transient codes are still worth retrying; this one is deterministic in
+        # the content, so retrying only multiplies the damage.
         return self.call("POST", f"/banks/{bank_id}/memories",
-                         {"items": items, "async": False}, timeout=900)
+                         {"items": items, "async": False}, timeout=900,
+                         retry_codes=(429, 502, 503, 504))
 
     def invalidate(self, bank_id: str, memory_id: str, reason: str) -> dict:
         # The request field is `reason`; the field it lands in — and the one the
@@ -373,7 +390,25 @@ def curate(api: Hindsight, bank_id: str, *, ttl_days: int, min_units: int,
         return summary
 
     # --- Distil: the observation layer, verbatim, as new facts -----------------
-    api.retain(bank_id, items)
+    # One item per call, which is slower than it looks like it needs to be and is
+    # not negotiable. Extraction runs per request and fails the whole request if
+    # any single item in it trips the extraction LLM into emitting malformed JSON
+    # — roughly one observation in three hundred, measured against a live bank.
+    # Because the request is neither atomic nor idempotent, a failed multi-item
+    # call leaves its successful prefix behind, so there is no batch size at which
+    # a retry or a per-item fallback does not duplicate rows. Sending them one at
+    # a time makes a bad observation cost exactly that observation.
+    #
+    # Failures are counted, not swallowed: the landed check below still refuses to
+    # retire anything unless every checkpoint is durable.
+    unwritable = 0
+    for index, item in enumerate(items):
+        try:
+            api.retain(bank_id, [item])
+        except RuntimeError as e:
+            unwritable += 1
+            print(f"  {bank_id}: checkpoint {index} of {len(items)} could not be "
+                  f"written — {e}", file=sys.stderr)
 
     # --- Verify before retiring ------------------------------------------------
     # The whole design rests on the checkpoints existing. If retain reported
@@ -387,8 +422,10 @@ def curate(api: Hindsight, bank_id: str, *, ttl_days: int, min_units: int,
     landed = len([u for u in api.units(bank_id, type="world", state="valid")
                   if u.get("context") == CHECKPOINT_CONTEXT]) - len(superseded)
     if landed < len(items):
+        detail = (f"{unwritable} rejected by extraction" if unwritable
+                  else "retain reported success")
         summary["skipped"] = (f"aborted before retiring: {landed}/{len(items)} "
-                              f"checkpoints landed")
+                              f"checkpoints landed ({detail})")
         return summary
     summary["distilled"] = landed
 
