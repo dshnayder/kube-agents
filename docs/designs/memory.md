@@ -933,12 +933,12 @@ carry no extracted entities, so the graph retriever cannot see them.
 **With both fixed, three full cycles ran, and the collapse is real and worse than
 row counts suggest.** From 300 facts and 295 observations:
 
-| after | world | observations | distinct identifiers reachable |
-| --- | --- | --- | --- |
-| seed | 300 | 295 | 162 |
-| cycle 1 | 295 | 53 | — |
-| cycle 2 | 53 | 32 | — |
-| cycle 3 | 32 | 32 | 50 |
+| after   | world | observations | distinct identifiers reachable |
+| ------- | ----- | ------------ | ------------------------------ |
+| seed    | 300   | 295          | 162                            |
+| cycle 1 | 295   | 53           | —                              |
+| cycle 2 | 53    | 32           | —                              |
+| cycle 3 | 32    | 32           | 50                             |
 
 The observation layer converges rather than vanishing, but it converges at about a
 tenth of what went in: 73,588 characters of seeded fact became 7,437, and 112 of the
