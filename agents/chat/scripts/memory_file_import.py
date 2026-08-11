@@ -213,7 +213,7 @@ class Hindsight:
 
 
 def sanitize_user_id(user_id: str) -> str:
-    """Mirror of `kube_agents_memory._sanitize_user_id`.
+    """Mirror of `kube_agents_memory.sanitize_user_id`.
 
     Must stay identical: this produces the tag the migrated entries are filed
     under, and the provider produces the tag they are read back with. The
@@ -479,7 +479,7 @@ def main() -> None:
         sys.exit("No Hindsight endpoint: the config has no api_url and "
                  "HINDSIGHT_API_URL is unset.")
     # The bank name is the provider's constant, not a config value, for the
-    # reason `_apply_scoping` gives: a stale bank_id on the PVC used to win.
+    # reason `client.apply_scoping` gives: a stale bank_id on the PVC used to win.
     bank_id = args.bank or DEFAULT_BANK_ID
     api = Hindsight(api_url, config.get("api_key") or config.get("apiKey"))
 

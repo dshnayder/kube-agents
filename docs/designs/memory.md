@@ -546,7 +546,7 @@ the lever either.
 | Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
 
 `<id>` is the gateway identity (`agent._user_id`) run through
-`_sanitize_user_id`, which produces `<readable>_<digest>`. The readable half
+`sanitize_user_id`, which produces `<readable>_<digest>`. The readable half
 mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
 `-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
 The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
@@ -598,7 +598,7 @@ delegating to a throwaway stock provider, whose own availability check is statel
 
 Each is set by the wrapper rather than left to configuration, because each is a
 silent leak or a silent loss if it is wrong. This is the section to read before
-changing anything in `_apply_scoping`.
+changing anything in `apply_scoping`.
 
 **1. `recall_tags_match = "any_strict"`.** Hindsight's tag matcher treats `any` and
 `all` as _"matching tags **or** no tags at all"_; only the `_strict` variants
@@ -639,14 +639,14 @@ everyone else. `_retain()` therefore builds its own item and calls `aretain_batc
 directly, which also avoids swapping instance attributes around an asynchronous
 writer thread.
 
-The bank name is pinned the same way, for a different reason: `_apply_scoping` sets
+The bank name is pinned the same way, for a different reason: `apply_scoping` sets
 `DEFAULT_BANK_ID` and clears `_bank_id_template`, so a hand-edited config file cannot
 move the bank.
 
 ### Bank provisioning is lazy
 
 A Hindsight bank does not exist until something is written to it, so there is
-nothing to provision at install time. `_ensure_bank()` runs on **session creation**:
+nothing to provision at install time. `ensure_bank()` runs on **session creation**:
 it reads the bank config, compares `retain_strategies` and
 `retain_default_strategy` against the provider's constants, and if they differ
 calls `create_bank(mission=BANK_MISSION)` followed by `update_bank_config(...)`.
@@ -672,7 +672,7 @@ the first DM afterwards rebuilds the bank correctly, with no operator step for
 anyone to forget. The downside is that between a wipe and the first chat the bank
 is bare, which is why the test harness ships
 [`rounda2-provision-bank.yaml`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/jobs/rounda2-provision-bank.yaml)
-— a Job that does exactly what `_ensure_bank` does, parsing the constants straight
+— a Job that does exactly what `ensure_bank` does, parsing the constants straight
 out of the installed plugin source with `ast` rather than retyping them.
 
 The three retain strategies:
@@ -769,7 +769,7 @@ rather than of the script:
   matches, the file is left where it is and reported. A personal memory filed under
   the wrong tag is a leak, and one filed under a tag nobody carries is a silent
   loss; a guess risks both. The recovered id then goes through the same
-  `_sanitize_user_id` the provider uses, digest and all, so the entry arrives under
+  `sanitize_user_id` the provider uses, digest and all, so the entry arrives under
   the exact tag its owner recalls with.
 - **The delete is gated per entry, on the bank.** An entry the extractor discards as
   non-durable produces no memory unit, so its file survives and the run says which
@@ -951,7 +951,7 @@ single `user_id`, and it deliberately **keeps** shared writes: there are humans 
 the room who can vouch for one. A dispatcher-spawned specialist has nobody. Only the
 profile config knows which case it is in.
 
-`_memory_is_read_only()` reads `memory.read_only` through `load_config()`, which
+`memory_is_read_only()` reads `memory.read_only` through `load_config()`, which
 resolves via `HERMES_HOME` and is therefore profile-scoped — a kanban worker is
 launched with `HERMES_HOME` pointed at `profiles/platform`
 (`hermes_cli/kanban_db.py`). It **defaults to False**: a profile that says nothing

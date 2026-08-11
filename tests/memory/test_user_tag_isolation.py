@@ -38,7 +38,7 @@ from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
     USER_TAG_PREFIX,
     KubeAgentsMemoryProvider,
-    _sanitize_user_id,
+    sanitize_user_id,
 )
 
 # Pairs that the readable half alone maps onto one string. All are plausible
@@ -54,40 +54,40 @@ COLLIDING = [
 def test_the_readable_half_really_does_collide():
     """Without this the rest of the file would be testing nothing."""
     for left, right in COLLIDING:
-        readable = lambda s: _sanitize_user_id(s).rsplit("_", 1)[0]  # noqa: E731
+        readable = lambda s: sanitize_user_id(s).rsplit("_", 1)[0]  # noqa: E731
         assert readable(left) == readable(right), (left, right)
 
 
 def test_colliding_identities_get_different_tags():
     for left, right in COLLIDING:
-        assert _sanitize_user_id(left) != _sanitize_user_id(right), (left, right)
+        assert sanitize_user_id(left) != sanitize_user_id(right), (left, right)
 
 
 def test_the_tag_stays_readable():
     """A digest-only tag would make the bank unauditable by a person."""
-    tag = _sanitize_user_id("alice.smith@corp.example")
+    tag = sanitize_user_id("alice.smith@corp.example")
     assert tag.startswith("alice-smith-corp-example_"), tag
     assert tag.endswith(hashlib.sha256(b"alice.smith@corp.example").hexdigest()[:12]), tag
 
 
 def test_the_same_identity_always_gets_the_same_tag():
     """Not a session nonce — yesterday's memories have to come back today."""
-    assert _sanitize_user_id("alice@corp.example") == _sanitize_user_id("alice@corp.example")
+    assert sanitize_user_id("alice@corp.example") == sanitize_user_id("alice@corp.example")
     # Padding is a transport artefact, not a different person.
-    assert _sanitize_user_id("  alice@corp.example  ") == _sanitize_user_id("alice@corp.example")
+    assert sanitize_user_id("  alice@corp.example  ") == sanitize_user_id("alice@corp.example")
 
 
 def test_an_empty_identity_produces_no_tag():
     """Must stay falsy: ``initialize`` reads it as "nobody" and refuses."""
     for empty in ("", "   ", None):
-        assert _sanitize_user_id(empty) == "", repr(empty)
+        assert sanitize_user_id(empty) == "", repr(empty)
 
 
 def test_an_identity_of_pure_punctuation_still_gets_a_tag():
     """Nothing readable survives, but the person is real and must be separable."""
-    tag = _sanitize_user_id("@@@")
+    tag = sanitize_user_id("@@@")
     assert tag == hashlib.sha256(b"@@@").hexdigest()[:12], tag
-    assert tag != _sanitize_user_id("///")
+    assert tag != sanitize_user_id("///")
 
 
 def test_no_identity_still_fails_closed_on_personal_memory():
@@ -101,7 +101,7 @@ def test_no_identity_still_fails_closed_on_personal_memory():
 def test_an_identity_becomes_the_tag_the_provider_scopes_on():
     p = KubeAgentsMemoryProvider()
     p.initialize("session-2", user_id="alice.smith@corp.example", chat_type="dm")
-    assert p._user_tag == f"{USER_TAG_PREFIX}{_sanitize_user_id('alice.smith@corp.example')}"
+    assert p._user_tag == f"{USER_TAG_PREFIX}{sanitize_user_id('alice.smith@corp.example')}"
     assert p._personal_disabled_reason == ""
 
 
@@ -109,9 +109,9 @@ def test_the_migration_script_agrees_with_the_provider():
     """Two copies of one algorithm; a drift strands every migrated memory."""
     for left, right in COLLIDING:
         for raw in (left, right):
-            assert mfi.sanitize_user_id(raw) == _sanitize_user_id(raw), raw
+            assert mfi.sanitize_user_id(raw) == sanitize_user_id(raw), raw
     for edge in ("", "   ", "@@@", "  alice@corp.example  ", "slackbot"):
-        assert mfi.sanitize_user_id(edge) == _sanitize_user_id(edge), repr(edge)
+        assert mfi.sanitize_user_id(edge) == sanitize_user_id(edge), repr(edge)
 
 
 if __name__ == "__main__":

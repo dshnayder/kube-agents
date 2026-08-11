@@ -36,7 +36,7 @@ import kube_agents_memory  # noqa: E402
 from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
 
 
-def provider(*, read_only, user_tag="user:dmitry"):
+def provider(*, read_only, user_tag="user:alice"):
     """A provider in one of the two modes, wired to a stub client."""
     p = KubeAgentsMemoryProvider()
     p._read_only = read_only
@@ -80,7 +80,7 @@ def test_reads_are_untouched():
     r = json.loads(p.handle_tool_call("memory_recall", {"query": "RB-114"}))
     assert r["status"] == "found", r
     assert "RB-114" in r["result"], r
-    assert calls["recall"]["tags"] == ["user:dmitry", SHARED_TAG], calls
+    assert calls["recall"]["tags"] == ["user:alice", SHARED_TAG], calls
 
 
 def test_the_write_call_is_refused_anyway():
@@ -124,15 +124,14 @@ def test_scoping_clears_the_stock_providers_own_write_state():
         _tags=["stale"],
         _observation_scopes=[["stale"]],
     )
-    p, _ = provider(read_only=True)
-    p._apply_scoping(stock)
+    kube_agents_memory.apply_scoping(stock, user_tag="user:alice", read_only=True)
     assert stock._auto_retain is False
     assert stock._retain_tags == []
     assert stock._tags is None
     assert stock._observation_scopes is None
     # The read filter still has to be set, including the user's own tag: a
     # specialist that cannot write can still be handed a user's session.
-    assert stock._recall_tags == ["user:dmitry", SHARED_TAG]
+    assert stock._recall_tags == ["user:alice", SHARED_TAG]
 
 
 def test_the_prompt_says_read_only_and_says_not_to_cache():
@@ -150,7 +149,7 @@ def test_the_prompt_says_read_only_and_says_not_to_cache():
 
 def test_read_only_defaults_off_and_is_read_from_the_profile_config():
     """A profile that says nothing keeps its write tools; a broken config too."""
-    read = kube_agents_memory._memory_is_read_only
+    read = kube_agents_memory.memory_is_read_only
 
     saved = sys.modules.get("hermes_cli.config")
 

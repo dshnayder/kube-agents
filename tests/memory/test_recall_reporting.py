@@ -37,15 +37,15 @@ sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 
 from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
 
-PLUGIN = os.path.join(
-    _REPO, "agents", "chat", "plugins", "memory", "kube_agents_memory", "__init__.py"
+PLUGIN_DIR = os.path.join(
+    _REPO, "agents", "chat", "plugins", "memory", "kube_agents_memory"
 )
 
 
 def provider(*, results=None, recall_exc=None, reflect_text="", reflect_exc=None):
     """A provider wired to a stub client, plus a dict recording its call kwargs."""
     p = KubeAgentsMemoryProvider()
-    p._user_tag = "user:dmitry"
+    p._user_tag = "user:alice"
     calls = {}
 
     class StubClient:
@@ -66,7 +66,7 @@ def provider(*, results=None, recall_exc=None, reflect_text="", reflect_exc=None
         _budget="mid",
         _recall_max_tokens=4096,
         _recall_types=["observation"],
-        _recall_tags=["user:dmitry", SHARED_TAG],
+        _recall_tags=["user:alice", SHARED_TAG],
         _recall_tags_match="any_strict",
         _run_hindsight_operation=lambda op: op(StubClient()),
     )
@@ -79,7 +79,7 @@ def test_found_reports_matches_and_the_search():
     assert r["status"] == "found", r
     assert r["matches"] == 1, r
     assert "ADR-2026-081 mandates" in r["result"], r
-    assert r["searched"]["tags"] == ["user:dmitry", SHARED_TAG], r
+    assert r["searched"]["tags"] == ["user:alice", SHARED_TAG], r
     assert r["searched"]["layer"] == ["observation"], r
     assert calls["recall"]["tags_match"] == "any_strict", calls
 
@@ -109,16 +109,16 @@ def test_unreachable_is_a_distinct_outcome():
 def test_scope_still_narrows_the_tag_filter():
     p, calls = provider(results=[SimpleNamespace(text="x")])
     p.handle_tool_call("memory_recall", {"query": "q", "scope": "personal"})
-    assert calls["recall"]["tags"] == ["user:dmitry"], calls
+    assert calls["recall"]["tags"] == ["user:alice"], calls
     p.handle_tool_call("memory_recall", {"query": "q", "scope": "both"})
-    assert calls["recall"]["tags"] == ["user:dmitry", SHARED_TAG], calls
+    assert calls["recall"]["tags"] == ["user:alice", SHARED_TAG], calls
 
 
 def test_reflect_reports_the_same_three_outcomes():
     p, calls = provider(reflect_text="   ")
     r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
     assert r["status"] == "no_match", r
-    assert calls["reflect"]["tags"] == ["user:dmitry", SHARED_TAG], calls
+    assert calls["reflect"]["tags"] == ["user:alice", SHARED_TAG], calls
 
     p, _ = provider(reflect_text="Etcd is owned by the storage team.")
     r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
@@ -130,13 +130,20 @@ def test_reflect_reports_the_same_three_outcomes():
 
 
 def test_the_stock_read_tool_is_no_longer_delegated_to():
-    """The stock tool is what conflated the outcomes; nothing may route back."""
-    src = open(PLUGIN, encoding="utf-8").read()
-    assert 'handle_tool_call("hindsight_' not in src, "read path delegates to the stock tool"
-    for line in src.splitlines():
-        if "No relevant memories found" in line:
-            # Only survives where it is quoted as the defect being described.
-            assert line.lstrip().startswith(("#", "tools answer", "string")), line
+    """The stock tool is what conflated the outcomes; nothing may route back.
+
+    Scans every module in the package, not just the entry point — the read path
+    lives in `session.py` and `client.py` since the split.
+    """
+    sources = sorted(f for f in os.listdir(PLUGIN_DIR) if f.endswith(".py"))
+    assert len(sources) >= 4, sources
+    for name in sources:
+        src = open(os.path.join(PLUGIN_DIR, name), encoding="utf-8").read()
+        assert 'handle_tool_call("hindsight_' not in src, f"{name} delegates to the stock tool"
+        for line in src.splitlines():
+            if "No relevant memories found" in line:
+                # Only survives where it is quoted as the defect being described.
+                assert line.lstrip().startswith(("#", "tools answer", "string")), (name, line)
 
 
 def test_the_absence_rule_reaches_the_system_prompt():

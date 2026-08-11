@@ -134,7 +134,7 @@ identifier appears, add its source here.
 | fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                          |
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                      |
 | Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                    |
-| Memory bank name, scope-tag spelling, and provider name              | `agents/chat/plugins/memory/kube_agents_memory/__init__.py`                           |
+| Memory bank name, scope-tag spelling, and provider name              | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py`                      |
 | Per-profile Hindsight recall settings the agent uses                 | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go`                         |
 
