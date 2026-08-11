@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **208** `.md`/`.mdx` documents outside the root-level
+The repository tracks **206** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -60,9 +60,7 @@ kube-agents/
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
-├── tests/e2e/                                     Google Chat E2E suite README
-└── tests/memory-scale/                            Memory provider A/B: harness, fixtures,
-                                                   results, and the experiment transcript
+└── tests/e2e/                                     Google Chat E2E suite README
 ```
 
 The published documentation site is built from `docs/site/src/content/docs/`
@@ -316,8 +314,6 @@ only what the title does not say.
 | `terraform/modules/chat-pubsub/README.md`              | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM; mutually exclusive with `provision_05_gcp_gchat.sh`.       | Chat Pub/Sub, service identities, IAM                              | Infrastructure engineers                                                                  |
 | `terraform/modules/github-minter/README.md`            | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (PEM import stays with `provision_10_deploy_github_minter.sh`).                  | Minter GSA, KMS asymmetric key, WI                                 | Infrastructure engineers                                                                  |
 | `tests/e2e/README.md`                                  | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection).                                                         | Hybrid auth, Pub/Sub injection, CI setup                           | CI maintainers                                                                            |
-| `tests/memory-scale/README.md`                         | Component README | The A/B that chose the memory provider: a synthetic 500-cluster corpus put in front of the same agent through Hindsight and through the file-based provider, with the harness, fixtures and raw results.            | Corpus generator, rungs, gold recall, context cost, seed packing   | Anyone re-running the test or checking a number in `docs/designs/memory.md`               |
-| `tests/memory-scale/transcript/README.md`              | Component README | The raw evidence for that A/B: the probe protocol, the two corrections the run made to itself, the file arm's isolation and rollback log, and the per-probe scoring for all three runs.                             | Probe scoring, seed packing, isolation boundary, rollback          | Anyone checking a claim in `docs/designs/memory.md` against the transcript it came from   |
 
 ## 5. Keeping this map fresh
 

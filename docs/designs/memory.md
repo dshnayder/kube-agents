@@ -18,13 +18,21 @@ the change this document designs.
 **Status:** implemented on the Chat Agent profile. The open follow-ups are in
 [What is still unproven](#what-is-still-unproven).
 
-| Layer                     | Where it lives                                                                                              |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)    |
-| Its connection file       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)            |
-| The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md) |
-| Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                     |
-| The experiment            | [`tests/memory-scale/`](../../tests/memory-scale/README.md)                                                 |
+| Layer                     | Where it lives                                                                                                                                             |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                   |
+| Its connection file       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                           |
+| The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                |
+| Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                                                                    |
+| The experiment            | [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) (archive branch, see below) |
+
+The experiment that decided this is about a megabyte of corpus fixtures, job
+manifests and raw scorer output. It is kept out of this repository so the
+shipped tree carries only design and code, and lives on the
+[`experiment/memory-scale-ab`](https://github.com/dshnayder/kube-agents/tree/experiment/memory-scale-ab/tests/memory-scale)
+branch of the fork — the same commit as this change, so the harness runs against
+exactly the code described here. Every link below into `tests/memory-scale/`
+points there.
 
 ## How to read this document
 
@@ -85,7 +93,7 @@ other.
 ### `multiuser_memory`, the provider this replaced
 
 This repository carried its own provider
-([vendored into the test tree](../../tests/memory-scale/fixtures/multiuser_memory.py);
+([vendored into the test tree](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/fixtures/multiuser_memory.py);
 this branch removes it): one Markdown file per user under
 `memories/users/<id>.md`, one shared `memories/MEMORY.md`, and
 `system_prompt_block()` concatenating both into the prompt.
@@ -506,7 +514,7 @@ The upside of doing it here is that deleting the Postgres PVC is a complete rese
 the first DM afterwards rebuilds the bank correctly, with no operator step for
 anyone to forget. The downside is that between a wipe and the first chat the bank
 is bare, which is why the test harness ships
-[`rounda2-provision-bank.yaml`](../../tests/memory-scale/jobs/rounda2-provision-bank.yaml)
+[`rounda2-provision-bank.yaml`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/jobs/rounda2-provision-bank.yaml)
 — a Job that does exactly what `_ensure_bank` does, parsing the constants straight
 out of the installed plugin source with `ast` rather than retyping them.
 
@@ -993,10 +1001,10 @@ the state it should be parked in.
 ## The experiment
 
 Everything below is reproducible from
-[`tests/memory-scale/`](../../tests/memory-scale/README.md), which holds the
+[`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md), which holds the
 harness, the corpus generator, the fixtures, the Kubernetes Jobs, the raw scorer
 output, and a
-[full transcript](../../tests/memory-scale/transcript/README.md) of every probe with
+[full transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) of every probe with
 per-answer scoring. This section states the findings and points at the file for each
 one.
 
@@ -1004,7 +1012,7 @@ one.
 
 A synthetic fleet — 500 "Meridian" clusters, two years of decisions — generated from
 a fixed seed (`20260731`) by
-[`harness/gen_fleet_corpus.py`](../../tests/memory-scale/harness/gen_fleet_corpus.py),
+[`harness/gen_fleet_corpus.py`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/harness/gen_fleet_corpus.py),
 so it is reproducible rather than a one-off artefact. **1,664 records across eleven
 categories**, of which **1,414 are `scope: shared`** and 250 are per-user.
 
@@ -1015,7 +1023,7 @@ the same clusters, and two probes ask about a cluster and a decision record that
 not exist.
 
 Twenty-six scored probes in
-[`queries.json`](../../tests/memory-scale/queries.json), each naming its **gold
+[`queries.json`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/queries.json), each naming its **gold
 documents** plus strings that must and must not appear.
 
 ### Two terms the numbers depend on
@@ -1067,7 +1075,7 @@ next probe then used records at 52%, 59% and 59.5% without difficulty. Two furth
 counterexamples followed. The honest statement is the narrower one: a
 110,799-token injected block can contain a fact the answer omits, the omission is
 invisible to gold-recall scoring, and we cannot predict which facts go missing.
-([the probe in full](../../tests/memory-scale/transcript/README.md#file-arm-probe-5-the-first-measurement-of-the-file-provider))
+([the probe in full](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md#file-arm-probe-5-the-first-measurement-of-the-file-provider))
 
 ### Is 0.702 gold recall bad, and what is lost
 
@@ -1084,7 +1092,7 @@ Of 34 gold-document slots at rung 1414, twelve missed. **Eleven were `id_strippe
 or `partial`. Exactly one — `ADR-2026-052` — was `absent`.** So the honest statement
 is: _at 1,414 documents Hindsight lost one fact and thirty-three citations_, in 2% of
 the context the alternative needed. The per-miss table with coverage figures is in
-the [scorer output](../../tests/memory-scale/results/).
+the [scorer output](https://github.com/dshnayder/kube-agents/tree/experiment/memory-scale-ab/tests/memory-scale/results/).
 
 And the one lost fact is not a Hindsight property. It is an artifact of how the bank
 this ladder was scored against had been seeded — see
@@ -1109,7 +1117,7 @@ drops comments:
 Those prefixes are the corpus's record families: architecture decisions,
 runbooks, postmortems, conventions, deprecations, ownership, exceptions, gotchas,
 capacity, migrations, inventory. They are literal identifiers in
-[the corpus generator](../../tests/memory-scale/harness/gen_fleet_corpus.py) and
+[the corpus generator](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/harness/gen_fleet_corpus.py) and
 are quoted here as they appear in the data.
 
 `MEMORY.md` holds the _content_ of all 1,414 shared records and the _handle_ for 193. **A flat file can only carry the identifiers somebody happened to write into a
@@ -1134,7 +1142,7 @@ provider. Each arm ran with the other provider severed, so neither could answer 
 the other's store: the file arm ran with Hindsight scaled to zero, and the Hindsight
 arm with the flat store deleted — deleted, not renamed — and the volume surveyed for
 leftover caches. Scoring rules and every raw answer are in
-[the transcript](../../tests/memory-scale/transcript/README.md).
+[the transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md).
 
 | Arm        | Probes | Citations | Citation errors | From metadata-only-id families |
 | ---------- | -----: | --------: | --------------: | -----------------------------: |
@@ -1290,9 +1298,9 @@ down.
 
 ## Related
 
-- [`tests/memory-scale/`](../../tests/memory-scale/README.md) — the harness,
+- [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) — the harness,
   fixtures, job manifests and raw results behind every number above.
-- [`tests/memory-scale/transcript/`](../../tests/memory-scale/transcript/README.md) —
+- [`tests/memory-scale/transcript/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) —
   every probe, verbatim, with per-answer scoring and the run's own corrections.
 - [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)
   — installing and operating the two pods.
