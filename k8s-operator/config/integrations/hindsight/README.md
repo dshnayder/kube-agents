@@ -11,7 +11,7 @@ README covers only the manifests in this directory.
 ## Install
 
 Nothing here is a manual step. Hindsight is
-[provisioning step 12](../../../scripts/README.md), so a full install
+[provisioning step 13](../../../scripts/README.md), so a full install
 brings it up along with everything else:
 
 ```sh
@@ -105,6 +105,16 @@ kubectl delete pvc data-hindsight-postgresql-0 -n kubeagents-system
   where there is no route out of the cluster.
 - **LLM calls go through LiteLLM**, the same gateway the agents use, so model
   routing and cost attribution stay in one place. That makes step 9 a
-  prerequisite for step 12.
+  prerequisite for step 13.
 - **The database is the memory.** Deleting the `data-hindsight-postgresql-0` PVC
   discards every stored memory. There is no other copy.
+- **Metrics.** The API serves Prometheus text on its ordinary port (8888,
+  `/metrics`), scraped by GKE Managed Prometheus through
+  [`podmonitoring.yaml`](podmonitoring.yaml). Postgres exports nothing. What the
+  metrics are good for is the site's
+  [observability page](../../../../docs/site/src/content/docs/concepts/observability.md).
+- **`app.kubernetes.io/component`.** These are the only objects in the repo that
+  set it, because one integration here runs two unrelated workloads. It is in
+  both selectors, so it cannot be changed without recreating the Deployment and
+  StatefulSet. See the site's
+  [resource labels reference](../../../../docs/site/src/content/docs/reference/resource-labels.md).

@@ -71,6 +71,11 @@ The exposed ports:
 - `config/integrations/github/` — Minty deployment.
 - `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and a `chatgpt` overlay).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
+- `config/integrations/hindsight/` — the Chat Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
+
+Each is built and applied on its own; there is no aggregate kustomization over
+`config/integrations/`, because all but Hindsight need `envsubst` over the built
+output before it can be applied.
 
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
@@ -79,4 +84,5 @@ make deploy                     # operator
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy
+make deploy-hindsight           # memory store
 ```
