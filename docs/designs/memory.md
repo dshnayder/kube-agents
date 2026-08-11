@@ -79,7 +79,7 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 | Plugin        | Shape                                        | Multi-user support               |
 | ------------- | -------------------------------------------- | -------------------------------- |
 | `hindsight`   | Self-hostable document store + consolidation | Tag scoping (`scope`, `user_id`) |
-| `honcho`      | Hosted, per-peer session memory              | First-class peers / namespaces   |
+| `honcho`      | Self-hostable, per-peer conversation memory  | First-class peers, dyadic reads  |
 | `mem0`        | Cloud, self-hosted server, or in-process OSS | `user_id` only — no shared scope |
 | `retaindb`    | Hosted                                       | `user_id` throughout             |
 | `openviking`  | Hosted, tenant-scoped                        | Tenants and namespaces           |
@@ -89,28 +89,41 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 
 Self-hosting is highly desired — the corpus is a bank's internal fleet topology,
 ownership map and incident history, and a hosted provider puts all of it outside the
-customer's boundary. That alone does not narrow the field to one: `mem0` self-hosts
-too, either as a server over HTTP or in-process against pgvector. Two other things
-narrow it.
+customer's boundary. That alone does not narrow the field to one. `mem0` self-hosts,
+either as a server over HTTP or in-process against pgvector, and `honcho` self-hosts
+as a container set the plugin will talk to over a configured `baseUrl`
+(`plugins/memory/honcho/config_schema.py`). Two other requirements narrow it, and
+they eliminate both.
 
 **An embedder you have to supply.** `mem0`'s in-process mode requires an `embedder`
 section and accepts exactly two providers for it, `openai` and `ollama`
-(`plugins/memory/mem0/_oss_providers.py`). Self-hosting it therefore means either
-declaring an embedding model in LiteLLM — which this project does not do, since
-LiteLLM carries only the model the installer defines — or running a second inference
-server for the embeddings. `hindsight` embeds and reranks in-pod from models baked
+(`plugins/memory/mem0/_oss_providers.py`). `honcho` is stricter still: its
+`EmbeddingTransport` is `Literal["openai", "gemini"]` (`src/config.py`) with no
+in-process option at all, and turning embeddings off with `EMBED_MESSAGES=false`
+does not degrade search gracefully — it skips the semantic branch entirely
+(`src/utils/search.py`) and leaves keyword matching. Either therefore means
+declaring a second model, an embedding model, in LiteLLM — which this project does
+not do, since LiteLLM carries only the model the installer defines — or running a
+second inference server. `hindsight` embeds and reranks in-pod from models baked
 into the image (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), and asks LiteLLM for
 one model, the installer's.
 
 **One principal per read.** `mem0`'s recall filters on `user_id` alone — "scoped to
-user_id only — by design", `plugins/memory/mem0/__init__.py`. There is no
+user_id only — by design", `plugins/memory/mem0/__init__.py`. `honcho` has richer
+identity than either of the others — peers are first-class and the plugin resolves
+the gateway identity to one natively — but every read is scoped to a perspective:
+search filters on `peer_perspective`, and conclusions are dyadic, one observer's
+view of one target peer (`plugins/memory/honcho/session.py`). Neither offers an
 organisation-wide bucket a read can include, which is the half of the problem this
 document is about: a specialist spawned without a human identity would have nothing
 to read at all.
 
 So `hindsight` is the only entry that is self-hostable, multi-user, **and** able to
 embed without new infrastructure — the one candidate that does not trade one of those
-against the others.
+against the others. Two smaller differences point the same way: `honcho` self-hosts
+as four workloads (API, a background deriver, pgvector and Redis) against
+Hindsight's two, and it is AGPL-3.0 where Hindsight is MIT, which is a question a
+bank's legal review will ask about a service it runs inside its own boundary.
 
 ### `multiuser_memory`, the provider this displaces
 
