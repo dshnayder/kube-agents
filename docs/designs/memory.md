@@ -77,7 +77,7 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 | ------------- | -------------------------------------------- | -------------------------------- |
 | `hindsight`   | Self-hostable document store + consolidation | Tag scoping (`scope`, `user_id`) |
 | `honcho`      | Hosted, per-peer session memory              | First-class peers / namespaces   |
-| `mem0`        | Hosted vector memory                         | `user_id` throughout             |
+| `mem0`        | Cloud, self-hosted server, or in-process OSS | `user_id` only — no shared scope |
 | `retaindb`    | Hosted                                       | `user_id` throughout             |
 | `openviking`  | Hosted, tenant-scoped                        | Tenants and namespaces           |
 | `byterover`   | Hosted                                       | Minimal                          |
@@ -86,9 +86,28 @@ Exactly one external provider may register at a time (`agent/memory_provider.py`
 
 Self-hosting is highly desired — the corpus is a bank's internal fleet topology,
 ownership map and incident history, and a hosted provider puts all of it outside the
-customer's boundary. `hindsight` is the only entry that is both self-hostable and
-multi-user, so it is the one candidate that does not trade one of those against the
-other.
+customer's boundary. That alone does not narrow the field to one: `mem0` self-hosts
+too, either as a server over HTTP or in-process against pgvector. Two other things
+narrow it.
+
+**An embedder you have to supply.** `mem0`'s in-process mode requires an `embedder`
+section and accepts exactly two providers for it, `openai` and `ollama`
+(`plugins/memory/mem0/_oss_providers.py`). Self-hosting it therefore means either
+declaring an embedding model in LiteLLM — which this project does not do, since
+LiteLLM carries only the model the installer defines — or running a second inference
+server for the embeddings. `hindsight` embeds and reranks in-pod from models baked
+into the image (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), and asks LiteLLM for
+one model, the installer's.
+
+**One principal per read.** `mem0`'s recall filters on `user_id` alone — "scoped to
+user_id only — by design", `plugins/memory/mem0/__init__.py`. There is no
+organisation-wide bucket a read can include, which is the half of the problem this
+document is about: a specialist spawned without a human identity would have nothing
+to read at all.
+
+So `hindsight` is the only entry that is self-hostable, multi-user, **and** able to
+embed without new infrastructure — the one candidate that does not trade one of those
+against the others.
 
 ### `multiuser_memory`, the provider this replaced
 
