@@ -538,6 +538,58 @@ which deliberately declares `model-default` and nothing else. The local model is
 already `cross-encoder/ms-marco-MiniLM-L-6-v2`, six layers, so shrinking it is not
 the lever either.
 
+#### A second pod buys throughput, not speed
+
+Every lever above makes one recall cheaper. A second replica makes none of them
+cheaper; it makes more recalls fit at once. That is the other axis, and it is the one
+the CPU-limit null result points at. Measured on `kage-management` against the live
+bank at `budget: mid`, twelve recalls per concurrency level, one run per
+configuration, driven from an in-cluster Job so kube-proxy is in the path — a
+`kubectl port-forward` binds one endpoint for the life of the tunnel and would have
+measured a single pod twice:
+
+| Concurrent recalls | 1 replica | 2 replicas    | p50: 1 → 2 replicas |
+| ------------------ | --------- | ------------- | ------------------- |
+| 1                  | 0.073 rps | 0.076 rps     | 13.6s → 13.2s       |
+| 2                  | 0.087 rps | 0.096 rps     | 22.7s → 20.5s       |
+| 4                  | 0.089 rps | **0.162 rps** | 44.1s → **22.8s**   |
+
+At one replica, throughput is flat from concurrency 2 upward while latency rises
+linearly — "two concurrent recalls halve each other" as a curve rather than a
+sentence. The second replica returns 82% of a theoretical doubling at concurrency 4,
+and aggregate CPU across the two pods was 3,600m against 1,830m for the single pod,
+so the extra cores are working rather than idling behind the scheduler.
+
+**This is the counterpart to the CPU-limit result above.** Raising the limit on one
+`e2-standard-4` bought nothing because the node has two physical cores behind its
+four hyperthreads; a pod on a _different_ node is the only way to add cores the
+cross-encoder can use. Required pod anti-affinity is therefore load-bearing, not
+hygiene — two co-scheduled replicas reproduce the null result.
+
+Concurrency 2 gains only 10% because kube-proxy balances per connection, at random:
+with two requests in flight both land on the same pod about half the time, which
+predicts a p50 near 20.3s against the 20.5s measured. That is the production shape
+too, since each agent turn opens its own connection.
+
+Two things this does not buy. Single-user latency is unchanged — 13.2s against 13.6s
+— so replicas add capacity, not speed. And a replica is not free of Postgres:
+`ankane/pgvector` ships stock `max_connections = 100` while
+`HINDSIGHT_API_DB_POOL_MAX_SIZE` defaults to 100 _per pod_, so one replica already
+sits at parity with the server. The runs above pinned it to 40. Postgres itself never
+participated, at 12–19m of CPU throughout.
+
+The topology is supported rather than tolerated: the API runs the worker in-process
+(`WORKER_ENABLED` defaults true), workers claim tasks with `SELECT … SKIP LOCKED`,
+and startup migrations take a `pg_advisory_lock`, so replicas neither double-run
+consolidation nor race Alembic.
+
+[`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) still ships
+`replicas: 1`, and `kage-management` runs two by hand. Two replicas double an
+install's baseline CPU request to four cores and need two schedulable nodes, which a
+small cluster will not have. Read the 82% as the size of the effect rather than as a
+figure to three digits: it is one run per configuration, and only the concurrency-4
+row is outside the noise the random load-balancing introduces.
+
 ### One bank, two scopes
 
 | Scope    | Tag            | Written by                             | Read by        |
