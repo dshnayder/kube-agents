@@ -462,9 +462,15 @@ def main() -> None:
         return
 
     config = load_hindsight_config(args.home)
-    api_url = str(config.get("api_url") or "").strip()
+    # Same precedence the plugin uses: the file first, the environment second.
+    # The shipped config carries no api_url — the operator derives the endpoint
+    # from the namespace and passes HINDSIGHT_API_URL — but an operator-written
+    # file still wins, so the two never disagree silently.
+    api_url = (str(config.get("api_url") or "").strip()
+               or os.environ.get("HINDSIGHT_API_URL", "").strip())
     if not api_url:
-        sys.exit("No api_url in the Hindsight config.")
+        sys.exit("No Hindsight endpoint: the config has no api_url and "
+                 "HINDSIGHT_API_URL is unset.")
     # The bank name is the provider's constant, not a config value, for the
     # reason `_apply_scoping` gives: a stale bank_id on the PVC used to win.
     bank_id = args.bank or DEFAULT_BANK_ID

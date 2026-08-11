@@ -162,9 +162,11 @@ fi
 # provider's connection config was hand-written onto the PVC and so survived
 # every roll carrying whichever design was current when it was last touched. It
 # kept pointing the single-bank provider at a bank name from the two-bank era —
-# invisible to any code review or manifest diff. It is image-owned: the
-# Hindsight service address is fixed by its install manifests, and the bank is
-# a constant in the provider.
+# invisible to any code review or manifest diff. It is image-owned because
+# nothing in it is per-install: the bank is a constant in the provider, and the
+# service address is not in this file at all — the operator derives it from the
+# agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
+# when the file is silent. That is why no `api_url` key belongs here.
 if [ -d "/opt/defaults" ]; then
     for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
         if [ -f "/opt/defaults/$f" ]; then

@@ -1379,6 +1379,21 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "PYTHONPATH",
 		Value: "/opt/defaults/scripts",
 	})
+	// The memory provider's endpoint, derived from the namespace the same way the
+	// model endpoint is (cfg.Model.BaseURL above) — the two are the same class of
+	// value and had drifted into two mechanisms, one namespace-aware and one a
+	// baked literal. The image-owned hindsight/config.json deliberately carries no
+	// `api_url` so this wins: the plugin reads the file first and the environment
+	// only as a fallback, so a value left in the file would silently outrank this.
+	// Set unconditionally rather than gated on the provider — the variable is inert
+	// unless a Hindsight-backed provider loads, and gating it would make the
+	// endpoint depend on a field the CR may override to something unrelated.
+	// Kanban workers are subprocesses of this container, so their platform profile
+	// inherits it and needs no second copy.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HINDSIGHT_API_URL",
+		Value: fmt.Sprintf("http://hindsight-api.%s.svc.cluster.local:8888", agent.Namespace),
+	})
 
 	dashboardEnabled := isDashboardEnabled(agent)
 

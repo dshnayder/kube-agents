@@ -135,7 +135,8 @@ identifier appears, add its source here.
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                      |
 | Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                    |
 | Memory bank name, scope-tag spelling, and provider name              | `agents/chat/plugins/memory/kube_agents_memory/__init__.py`                           |
-| Hindsight endpoint and per-profile recall settings the agent uses    | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
+| Per-profile Hindsight recall settings the agent uses                 | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
+| Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go`                         |
 
 ## 3. Documentation eras and status
 

@@ -21,7 +21,8 @@ the change this document designs.
 | Layer                     | Where it lives                                                                                                                                             |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                   |
-| Its connection file       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                           |
+| Its recall settings       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                           |
+| Its endpoint              | `HINDSIGHT_API_URL`, derived from the namespace in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)       |
 | The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                |
 | Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                                                                    |
 | The experiment            | [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) (archive branch, see below) |
@@ -838,13 +839,15 @@ defaults off.
 
 ### Where the connection settings come from
 
-The stock provider reads `$HERMES_HOME/hindsight/config.json`. That file is
-**image-owned**:
+They come from two places, split by whether the value is the same in every
+install.
+
+**What is the same everywhere** lives in `$HERMES_HOME/hindsight/config.json`,
+which is **image-owned**:
 
 ```json
 {
   "mode": "local_external",
-  "api_url": "http://hindsight-api.kubeagents-system.svc.cluster.local:8888",
   "memory_mode": "hybrid",
   "recall_budget": "mid"
 }
@@ -853,10 +856,29 @@ The stock provider reads `$HERMES_HOME/hindsight/config.json`. That file is
 It ships as
 [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)
 and `deploy/shared/docker-entrypoint.sh` force-copies it over the PVC copy on every
-start (step 2a), alongside `config.yaml` and the persona files. It carries the
-connection settings and nothing else. `_apply_budget()` honours `recall_budget` if
-it is one of `low`/`mid`/`high`, and otherwise leaves Hindsight's own resolution
-alone.
+start (step 2a), alongside `config.yaml` and the persona files. `_apply_budget()`
+honours `recall_budget` if it is one of `low`/`mid`/`high`, and otherwise leaves
+Hindsight's own resolution alone.
+
+**What depends on the install** — the endpoint — is not in that file at all. The
+operator derives it from the agent's namespace and passes it as an environment
+variable:
+
+```go
+Value: fmt.Sprintf("http://hindsight-api.%s.svc.cluster.local:8888", agent.Namespace)
+```
+
+`buildDeployment` in
+[`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go),
+next to the `cfg.Model.BaseURL` that derives the LiteLLM endpoint the same way. The
+two are the same class of value and were briefly two mechanisms — one namespace-aware,
+one a literal naming `kubeagents-system` — which meant a release installed into any
+other namespace would have reached its model gateway and not its memory. The plugin
+reads `api_url` from the file and `HINDSIGHT_API_URL` only as a fallback, so the key
+has to be **absent** here for the operator's value to be used at all; an `api_url`
+left in the file would outrank it silently, which is the same failure the force-sync
+above exists to prevent. `memory_file_import.py` and `memory_ttl_curator.py` resolve
+it with the same precedence.
 
 `$HERMES_HOME` is per-profile, so the platform specialist needs **its own copy** —
 [`agents/platform/hindsight/config.json`](../../agents/platform/hindsight/config.json),

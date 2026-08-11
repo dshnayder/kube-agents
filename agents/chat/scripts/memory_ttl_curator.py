@@ -464,9 +464,15 @@ def main() -> None:
         parser.error("--ttl-days cannot be negative")
 
     config = load_hindsight_config()
-    api_url = str(config.get("api_url") or "").strip()
+    # Same precedence the plugin uses: the file first, the environment second.
+    # The shipped config carries no api_url — the operator derives the endpoint
+    # from the namespace and passes HINDSIGHT_API_URL — but an operator-written
+    # file still wins, so the two never disagree silently.
+    api_url = (str(config.get("api_url") or "").strip()
+               or os.environ.get("HINDSIGHT_API_URL", "").strip())
     if not api_url:
-        sys.exit("No api_url in the Hindsight config.")
+        sys.exit("No Hindsight endpoint: the config has no api_url and "
+                 "HINDSIGHT_API_URL is unset.")
     api = Hindsight(api_url, config.get("api_key") or config.get("apiKey"))
 
     now = datetime.now(timezone.utc)
