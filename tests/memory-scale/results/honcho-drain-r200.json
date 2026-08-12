@@ -1,0 +1,8 @@
+{
+  "workspace": "meridian",
+  "drain_seconds": 24.3,
+  "work_units_total": 453,
+  "work_units_completed": 453,
+  "sessions": 61,
+  "stable_polls": 3
+}

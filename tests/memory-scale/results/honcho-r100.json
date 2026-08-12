@@ -1,0 +1,2950 @@
+{
+  "provider": "honcho",
+  "label": "honcho (workspace=meridian, surface=message-search, limit=100, char_budget=18,000)",
+  "rung": "100",
+  "default_user": "user07",
+  "tok_per_char": 0.25,
+  "isolation_enforced": false,
+  "summary": {
+    "overall": {
+      "gold_miss_verdicts": {
+        "absent": 2,
+        "partial": 1
+      },
+      "probes": 26,
+      "gold_recall": 0.952,
+      "must_contain_rate": 1.0,
+      "contamination_rate": 0.87,
+      "current_ranked_first": 0.857,
+      "contested_probes": 7,
+      "avg_context_tokens": 4353,
+      "total_tag_leaks": 476,
+      "deferred_to_answer_layer": [
+        "Q-NEG-001",
+        "Q-NEG-002"
+      ]
+    },
+    "by_class": {
+      "aggregation": {
+        "probes": 2,
+        "gold_recall": 1.0,
+        "must_contain_rate": null,
+        "contamination_rate": null,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 38.5,
+        "avg_context_tokens": 4367
+      },
+      "isolation": {
+        "probes": 2,
+        "gold_recall": null,
+        "must_contain_rate": null,
+        "contamination_rate": 0.667,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 88.5,
+        "avg_context_tokens": 4107
+      },
+      "needle": {
+        "probes": 4,
+        "gold_recall": 1.0,
+        "must_contain_rate": 1.0,
+        "contamination_rate": null,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 47.75,
+        "avg_context_tokens": 4424
+      },
+      "negative": {
+        "probes": 2,
+        "gold_recall": null,
+        "must_contain_rate": null,
+        "contamination_rate": null,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 61.5,
+        "avg_context_tokens": 4474
+      },
+      "procedural": {
+        "probes": 4,
+        "gold_recall": 1.0,
+        "must_contain_rate": 1.0,
+        "contamination_rate": 1.0,
+        "current_ranked_first": 1.0,
+        "contested_probes": 1,
+        "avg_units": 21.75,
+        "avg_context_tokens": 4272
+      },
+      "supersession": {
+        "probes": 6,
+        "gold_recall": 1.0,
+        "must_contain_rate": 1.0,
+        "contamination_rate": 0.917,
+        "current_ranked_first": 0.833,
+        "contested_probes": 6,
+        "avg_units": 38.667,
+        "avg_context_tokens": 4389
+      },
+      "synthesis": {
+        "probes": 4,
+        "gold_recall": 0.917,
+        "must_contain_rate": 1.0,
+        "contamination_rate": null,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 34.75,
+        "avg_context_tokens": 4425
+      },
+      "temporal": {
+        "probes": 2,
+        "gold_recall": 0.667,
+        "must_contain_rate": 1.0,
+        "contamination_rate": null,
+        "current_ranked_first": null,
+        "contested_probes": 0,
+        "avg_units": 34.0,
+        "avg_context_tokens": 4232
+      }
+    }
+  },
+  "probes": [
+    {
+      "id": "Q-SUP-ADR-2026-052",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 29,
+      "context_chars": 17681,
+      "est_tokens": 4420,
+      "gold_docs": [
+        "ADR-2026-052"
+      ],
+      "gold_found": [
+        "ADR-2026-052"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "banned",
+        "Workload Identity Federation"
+      ],
+      "must_contain_hits": [
+        "banned",
+        "Workload Identity Federation"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "grandfathered",
+        "rotated every 90 days",
+        "permitted for workloads"
+      ],
+      "contamination_hits": [
+        "grandfathered",
+        "rotated every 90 days",
+        "permitted for workloads"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 132,
+      "superseded_offset": 908,
+      "current_ranked_first": true,
+      "tag_leaks": []
+    },
+    {
+      "id": "Q-SUP-ADR-2026-047",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 43,
+      "context_chars": 17862,
+      "est_tokens": 4465,
+      "gold_docs": [
+        "ADR-2026-047"
+      ],
+      "gold_found": [
+        "ADR-2026-047"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 3,
+      "must_contain": [
+        "Gateway API"
+      ],
+      "must_contain_hits": [
+        "Gateway API"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "ingress-nginx is the standard",
+        "opportunistically"
+      ],
+      "contamination_hits": [
+        "ingress-nginx is the standard",
+        "opportunistically"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 308,
+      "superseded_offset": 118,
+      "current_ranked_first": false,
+      "tag_leaks": [
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-02 and my defau"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-a (kube-agents fleet test)\n\nI am based in London and I work as a release engineer"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        }
+      ]
+    },
+    {
+      "id": "Q-SUP-ADR-2026-044",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 29,
+      "context_chars": 17297,
+      "est_tokens": 4324,
+      "gold_docs": [
+        "ADR-2026-044"
+      ],
+      "gold_found": [
+        "ADR-2026-044"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "seven years"
+      ],
+      "must_contain_hits": [
+        "seven years"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "90 days for audit",
+        "400 days"
+      ],
+      "contamination_hits": [
+        "400 days"
+      ],
+      "contamination_rate": 0.5,
+      "current_offset": 224,
+      "superseded_offset": 789,
+      "current_ranked_first": true,
+      "tag_leaks": [
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        }
+      ]
+    },
+    {
+      "id": "Q-SUP-ADR-2026-051",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 45,
+      "context_chars": 17830,
+      "est_tokens": 4457,
+      "gold_docs": [
+        "ADR-2026-051"
+      ],
+      "gold_found": [
+        "ADR-2026-051"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "Chainguard"
+      ],
+      "must_contain_hits": [
+        "Chainguard"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "debian-slim base image maintained",
+        "new services build on distroless"
+      ],
+      "contamination_hits": [
+        "debian-slim base image maintained",
+        "new services build on distroless"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 131,
+      "superseded_offset": 735,
+      "current_ranked_first": true,
+      "tag_leaks": [
+        {
+          "tag": "user:user45",
+          "text": "DM from user45 \u2014 personal note USR-045-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-sae1-05 and my defau"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-02 and my defau"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-09 and my def"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-07 and my defau"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-a (kube-agents fleet test)\n\nI am based in London and I work as a platform enginee"
+        }
+      ]
+    },
+    {
+      "id": "Q-SUP-ADR-2026-049",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 41,
+      "context_chars": 16701,
+      "est_tokens": 4175,
+      "gold_docs": [
+        "ADR-2026-049"
+      ],
+      "gold_found": [
+        "ADR-2026-049"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 3,
+      "must_contain": [
+        "Backup for GKE"
+      ],
+      "must_contain_hits": [
+        "Backup for GKE"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "Velero to a GCS nearline",
+        "Velero remains in the three"
+      ],
+      "contamination_hits": [
+        "Velero to a GCS nearline",
+        "Velero remains in the three"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 124,
+      "superseded_offset": 2100,
+      "current_ranked_first": true,
+      "tag_leaks": [
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-08. When "
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-04. When "
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-03 and my defa"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user21",
+          "text": "DM from user21 \u2014 personal note USR-021-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-03. When "
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-03. When"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-05. When"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-07. When"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        }
+      ]
+    },
+    {
+      "id": "Q-SUP-ADR-2026-046",
+      "class": "supersession",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 45,
+      "context_chars": 17973,
+      "est_tokens": 4493,
+      "gold_docs": [
+        "ADR-2026-046"
+      ],
+      "gold_found": [
+        "ADR-2026-046"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "Arm",
+        "multi-arch"
+      ],
+      "must_contain_hits": [
+        "Arm",
+        "multi-arch"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "docker runtime"
+      ],
+      "contamination_hits": [
+        "docker runtime"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 149,
+      "superseded_offset": 741,
+      "current_ranked_first": true,
+      "tag_leaks": [
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-01 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-09 and my defa"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-08 and my defa"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-04 and my defau"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-03 and my defau"
+        }
+      ]
+    },
+    {
+      "id": "Q-PROC-RB011",
+      "class": "procedural",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 24,
+      "context_chars": 17849,
+      "est_tokens": 4462,
+      "gold_docs": [
+        "RB-011"
+      ],
+      "gold_found": [
+        "RB-011"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "identify the writer",
+        "scale the offending controller to zero",
+        "eleven minutes"
+      ],
+      "must_contain_hits": [
+        "identify the writer",
+        "scale the offending controller to zero",
+        "eleven minutes"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [
+        "delete it"
+      ],
+      "contamination_hits": [
+        "delete it"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": 576,
+      "superseded_offset": 1061,
+      "current_ranked_first": true,
+      "tag_leaks": [
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-b (kube-agents fleet test)\n\nI want links to the runbook rather than the steps pas"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-b (kube-agents fleet test)\n\nI want links to the runbook rather than the steps pas"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-b (kube-agents fleet test)\n\nI want links to the runbook rather than the steps pas"
+        }
+      ]
+    },
+    {
+      "id": "Q-PROC-RB004",
+      "class": "procedural",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 20,
+      "context_chars": 16475,
+      "est_tokens": 4118,
+      "gold_docs": [
+        "RB-004"
+      ],
+      "gold_found": [
+        "RB-004"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "scratch cluster",
+        "scale the production workloads in the target namespaces to zero",
+        "incident commander"
+      ],
+      "must_contain_hits": [
+        "scratch cluster",
+        "scale the production workloads in the target namespaces to zero",
+        "incident commander"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 171,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        }
+      ]
+    },
+    {
+      "id": "Q-PROC-RB027",
+      "class": "procedural",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 23,
+      "context_chars": 17030,
+      "est_tokens": 4257,
+      "gold_docs": [
+        "RB-027"
+      ],
+      "gold_found": [
+        "RB-027"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "every pod in the namespace has a sidecar",
+        "seven days"
+      ],
+      "must_contain_hits": [
+        "every pod in the namespace has a sidecar",
+        "seven days"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 316,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        }
+      ]
+    },
+    {
+      "id": "Q-PROC-RB019",
+      "class": "procedural",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 20,
+      "context_chars": 17015,
+      "est_tokens": 4253,
+      "gold_docs": [
+        "RB-019"
+      ],
+      "gold_found": [
+        "RB-019"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "Revoke first",
+        "do not paste the credential"
+      ],
+      "must_contain_hits": [
+        "Revoke first",
+        "do not paste the credential"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 205,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a security enginee"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a security engi"
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a security engi"
+        },
+        {
+          "tag": "user:user46",
+          "text": "DM from user46 \u2014 personal note USR-046-a (kube-agents fleet test)\n\nI am based in Austin and I work as a security enginee"
+        }
+      ]
+    },
+    {
+      "id": "Q-SYN-001",
+      "class": "synthesis",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 41,
+      "context_chars": 17928,
+      "est_tokens": 4482,
+      "gold_docs": [
+        "PM-2025-041",
+        "EXC-001",
+        "ADR-2026-033",
+        "OWN-004"
+      ],
+      "gold_found": [
+        "PM-2025-041",
+        "EXC-001",
+        "ADR-2026-033",
+        "OWN-004"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "allowlist",
+        "partner"
+      ],
+      "must_contain_hits": [
+        "allowlist",
+        "partner"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 369,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-08 and my defau"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-a (kube-agents fleet test)\n\nI am based in Bengaluru and I work as a data platform"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-07 and my defau"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a network engineer"
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-c (kube-agents fleet test)\n\nI am on the European on-call rotation every third wee"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a SRE on the payme"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a network engin"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a SRE on the ca"
+        }
+      ]
+    },
+    {
+      "id": "Q-SYN-002",
+      "class": "synthesis",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 35,
+      "context_chars": 17940,
+      "est_tokens": 4485,
+      "gold_docs": [
+        "ADR-2026-046",
+        "PM-2025-028",
+        "GOT-002",
+        "EXC-006"
+      ],
+      "gold_found": [
+        "ADR-2026-046",
+        "PM-2025-028",
+        "GOT-002",
+        "EXC-006"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "multi-arch"
+      ],
+      "must_contain_hits": [
+        "multi-arch"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 192,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user20",
+          "text": "DM from user20 \u2014 personal note USR-020-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        }
+      ]
+    },
+    {
+      "id": "Q-SYN-003",
+      "class": "synthesis",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 30,
+      "context_chars": 17907,
+      "est_tokens": 4476,
+      "gold_docs": [
+        "EXC-002",
+        "MIG-002",
+        "ADR-2026-019",
+        "ADR-2026-058"
+      ],
+      "gold_found": [
+        "EXC-002",
+        "MIG-002",
+        "ADR-2026-019",
+        "ADR-2026-058"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "europe-west4",
+        "Spanner"
+      ],
+      "must_contain_hits": [
+        "europe-west4",
+        "Spanner"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 167,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        }
+      ]
+    },
+    {
+      "id": "Q-SYN-004",
+      "class": "synthesis",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 33,
+      "context_chars": 17042,
+      "est_tokens": 4260,
+      "gold_docs": [
+        "PM-2025-033",
+        "OWN-003",
+        "CONV-011"
+      ],
+      "gold_found": [
+        "PM-2025-033",
+        "OWN-003"
+      ],
+      "gold_recall": 0.6666666666666666,
+      "gold_miss_diagnosis": [
+        {
+          "doc": "CONV-011",
+          "verdict": "absent",
+          "coverage": 0.103,
+          "best_unit": "Meridian platform runbook RB-004 (kube-agents fleet test)\n\nRunbook RB-004: restoring a production cluster from backup using Backup for GKE. Prerequisite: you must have an incident commander's approval recorded before starting. A restore is "
+        }
+      ],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "dryrun"
+      ],
+      "must_contain_hits": [
+        "dryrun"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 1625,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user20",
+          "text": "DM from user20 \u2014 personal note USR-020-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        }
+      ]
+    },
+    {
+      "id": "Q-NDL-001",
+      "class": "needle",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 51,
+      "context_chars": 17898,
+      "est_tokens": 4474,
+      "gold_docs": [
+        "CAP-002"
+      ],
+      "gold_found": [
+        "CAP-002"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "us-east4",
+        "2,000"
+      ],
+      "must_contain_hits": [
+        "us-east4",
+        "2,000"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 217,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user21",
+          "text": "DM from user21 \u2014 personal note USR-021-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-03. When "
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-04. When "
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-06 and my def"
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-06. When "
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-b (kube-agents fleet test)\n\nI always want a dry-run diff first."
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-08. When"
+        }
+      ]
+    },
+    {
+      "id": "Q-NDL-002",
+      "class": "needle",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 66,
+      "context_chars": 17845,
+      "est_tokens": 4461,
+      "gold_docs": [
+        "EXC-007"
+      ],
+      "gold_found": [
+        "EXC-007"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "mfs-stg-usc1-01"
+      ],
+      "must_contain_hits": [
+        "mfs-stg-usc1-01"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 62,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-09. When "
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-08. When "
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user13",
+          "text": "DM from user13 \u2014 personal note USR-013-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-04. When "
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-08. When "
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-07. When "
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-04. When "
+        },
+        {
+          "tag": "user:user45",
+          "text": "DM from user45 \u2014 personal note USR-045-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-08. When"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-07. When "
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-03. Whe"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-05. When "
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-02. When "
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-06. When "
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-02. When "
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-03. Whe"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user33",
+          "text": "DM from user33 \u2014 personal note USR-033-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-06. When "
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-02. When "
+        },
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-aus1-01. When"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-04. When "
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-07. When"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-06. Whe"
+        },
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-09. Whe"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-sae1-08 and my defau"
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-03 and my defau"
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-05. When"
+        },
+        {
+          "tag": "user:user22",
+          "text": "DM from user22 \u2014 personal note USR-022-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-aus1-04. When"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-09 and my defau"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user21",
+          "text": "DM from user21 \u2014 personal note USR-021-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-03. When "
+        },
+        {
+          "tag": "user:user34",
+          "text": "DM from user34 \u2014 personal note USR-034-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-aus1-07. When"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-01. When"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-sae1-05 and my defau"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        }
+      ]
+    },
+    {
+      "id": "Q-NDL-003",
+      "class": "needle",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 37,
+      "context_chars": 17617,
+      "est_tokens": 4404,
+      "gold_docs": [
+        "EXC-008"
+      ],
+      "gold_found": [
+        "EXC-008"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 3,
+      "must_contain": [
+        "australia-southeast1"
+      ],
+      "must_contain_hits": [
+        "australia-southeast1"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 1000,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-07. When "
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user45",
+          "text": "DM from user45 \u2014 personal note USR-045-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-07. When "
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-08. When"
+        }
+      ]
+    },
+    {
+      "id": "Q-NDL-004",
+      "class": "needle",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 37,
+      "context_chars": 17434,
+      "est_tokens": 4358,
+      "gold_docs": [
+        "DEP-001"
+      ],
+      "gold_found": [
+        "DEP-001"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "2026-09-30"
+      ],
+      "must_contain_hits": [
+        "2026-09-30"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 118,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        }
+      ]
+    },
+    {
+      "id": "Q-AGG-001",
+      "class": "aggregation",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 24,
+      "context_chars": 17078,
+      "est_tokens": 4269,
+      "gold_docs": [
+        "CONV-002"
+      ],
+      "gold_found": [
+        "CONV-002"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 2,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": null,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": []
+    },
+    {
+      "id": "Q-AGG-002",
+      "class": "aggregation",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 53,
+      "context_chars": 17865,
+      "est_tokens": 4466,
+      "gold_docs": [],
+      "gold_found": [],
+      "gold_recall": null,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": null,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": null,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-a (kube-agents fleet test)\n\nI am based in London and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-a (kube-agents fleet test)\n\nI am based in Bengaluru and I work as a data platform"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a SRE on the ca"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a network engin"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-01 and my defa"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-07 and my defau"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-a (kube-agents fleet test)\n\nI am based in London and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-06 and my def"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-c (kube-agents fleet test)\n\nI am on the European on-call rotation every third wee"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a SRE on the payme"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-08 and my defau"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-a (kube-agents fleet test)\n\nI am based in Sydney and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user13",
+          "text": "DM from user13 \u2014 personal note USR-013-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a data platform en"
+        }
+      ]
+    },
+    {
+      "id": "Q-TMP-001",
+      "class": "temporal",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 36,
+      "context_chars": 17057,
+      "est_tokens": 4264,
+      "gold_docs": [
+        "ADR-2026-052",
+        "ADR-2026-049",
+        "MIG-002"
+      ],
+      "gold_found": [
+        "ADR-2026-049"
+      ],
+      "gold_recall": 0.3333333333333333,
+      "gold_miss_diagnosis": [
+        {
+          "doc": "ADR-2026-052",
+          "verdict": "partial",
+          "coverage": 0.262,
+          "best_unit": "Meridian platform adr ADR-2025-031 (kube-agents fleet test)\n\nADR-2025-031 (2025-06-02, revised). Decision: Workload Identity is mandatory for all new workloads. Existing service account keys are grandfathered until their owning team's next "
+        },
+        {
+          "doc": "MIG-002",
+          "verdict": "absent",
+          "coverage": 0.129,
+          "best_unit": "Meridian platform convention CONV-001 (kube-agents fleet test)\n\nFleet naming convention. Every Meridian cluster provisioned after the Atlas migration is named mfs-<env>-<region-short>-<nn>, where env is one of prod, stg, dev or sbx, region-"
+        }
+      ],
+      "first_gold_rank": 30,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": null,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user22",
+          "text": "DM from user22 \u2014 personal note USR-022-a (kube-agents fleet test)\n\nI am based in Austin and I work as a SRE on the regul"
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-c (kube-agents fleet test)\n\nI am on secondment to the reliability team until the "
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-a (kube-agents fleet test)\n\nI am based in London and I work as a release engineer"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        }
+      ]
+    },
+    {
+      "id": "Q-TMP-002",
+      "class": "temporal",
+      "scored_at": "context",
+      "as_user": "user07",
+      "units_returned": 32,
+      "context_chars": 16804,
+      "est_tokens": 4201,
+      "gold_docs": [
+        "MIG-002"
+      ],
+      "gold_found": [
+        "MIG-002"
+      ],
+      "gold_recall": 1.0,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": 1,
+      "must_contain": [
+        "atlas-3"
+      ],
+      "must_contain_hits": [
+        "atlas-3"
+      ],
+      "must_contain_rate": 1.0,
+      "must_not_contain": [],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": 137,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a network engineer"
+        }
+      ]
+    },
+    {
+      "id": "Q-ISO-001",
+      "class": "isolation",
+      "scored_at": "context",
+      "as_user": "probe-operator",
+      "units_returned": 100,
+      "context_chars": 15326,
+      "est_tokens": 3831,
+      "gold_docs": [],
+      "gold_found": [],
+      "gold_recall": null,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": null,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [
+        "mfs-stg-ase1-07",
+        "mfs-stg-sae1-05",
+        "notifications-vector-index"
+      ],
+      "contamination_hits": [
+        "mfs-stg-ase1-07",
+        "mfs-stg-sae1-05",
+        "notifications-vector-index"
+      ],
+      "contamination_rate": 1.0,
+      "current_offset": null,
+      "superseded_offset": 7036,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-a (kube-agents fleet test)\n\nI am based in Austin and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a data platform"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a SRE on the payme"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a platform engi"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-a (kube-agents fleet test)\n\nI am based in Bengaluru and I work as a data platform"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a data platform"
+        },
+        {
+          "tag": "user:user20",
+          "text": "DM from user20 \u2014 personal note USR-020-a (kube-agents fleet test)\n\nI am based in Toronto and I work as a data platform e"
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-a (kube-agents fleet test)\n\nI am based in New York and I work as a platform engin"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-a (kube-agents fleet test)\n\nI am based in London and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a network engineer"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-a (kube-agents fleet test)\n\nI am based in London and I work as a SRE on the perso"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a tenant lead o"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-a (kube-agents fleet test)\n\nI am based in Sydney and I work as a SRE on the fraud"
+        },
+        {
+          "tag": "user:user34",
+          "text": "DM from user34 \u2014 personal note USR-034-a (kube-agents fleet test)\n\nI am based in Austin and I work as a data platform en"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a platform engi"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-a (kube-agents fleet test)\n\nI am based in Toronto and I work as a SRE on the stre"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a security enginee"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a network engin"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-a (kube-agents fleet test)\n\nI am based in Toronto and I work as a platform engine"
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a network engin"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a security engi"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-a (kube-agents fleet test)\n\nI am based in Tokyo and I work as a data platform eng"
+        },
+        {
+          "tag": "user:user21",
+          "text": "DM from user21 \u2014 personal note USR-021-a (kube-agents fleet test)\n\nI am based in New York and I work as a network engine"
+        },
+        {
+          "tag": "user:user07",
+          "text": "DM from user07 \u2014 personal note USR-007-a (kube-agents fleet test)\n\nI am based in Sydney and I work as a network engineer"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a release engin"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a network engineer"
+        },
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-a (kube-agents fleet test)\n\nI am based in Sydney and I work as a release engineer"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-a (kube-agents fleet test)\n\nI am based in London and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-a (kube-agents fleet test)\n\nI am based in Tokyo and I work as a SRE on the featur"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-a (kube-agents fleet test)\n\nI am based in Tokyo and I work as a tenant lead on th"
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user33",
+          "text": "DM from user33 \u2014 personal note USR-033-a (kube-agents fleet test)\n\nI am based in New York and I work as a release engine"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-a (kube-agents fleet test)\n\nI am based in Bengaluru and I work as a release engin"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a security enginee"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user22",
+          "text": "DM from user22 \u2014 personal note USR-022-a (kube-agents fleet test)\n\nI am based in Austin and I work as a SRE on the regul"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-a (kube-agents fleet test)\n\nI am based in Sydney and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user46",
+          "text": "DM from user46 \u2014 personal note USR-046-a (kube-agents fleet test)\n\nI am based in Austin and I work as a security enginee"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user13",
+          "text": "DM from user13 \u2014 personal note USR-013-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a data platform en"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-a (kube-agents fleet test)\n\nI am based in Bengaluru and I work as a tenant lead o"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-a (kube-agents fleet test)\n\nI am based in Toronto and I work as a security engine"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-07. When "
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a release engineer"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user07",
+          "text": "DM from user07 \u2014 personal note USR-007-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user45",
+          "text": "DM from user45 \u2014 personal note USR-045-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a security engi"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-01 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user19",
+          "text": "DM from user19 \u2014 personal note USR-019-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-01 and my defau"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-a (kube-agents fleet test)\n\nI am based in London and I work as a release engineer"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user13",
+          "text": "DM from user13 \u2014 personal note USR-013-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-03. When"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user37",
+          "text": "DM from user37 \u2014 personal note USR-037-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-01. When "
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a security engi"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-b (kube-agents fleet test)\n\nI prefer a written summary before any live debugging "
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-01. When"
+        },
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-aus1-01. When"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-03 and my defau"
+        },
+        {
+          "tag": "user:user07",
+          "text": "DM from user07 \u2014 personal note USR-007-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user45",
+          "text": "DM from user45 \u2014 personal note USR-045-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-sae1-02 and my defau"
+        },
+        {
+          "tag": "user:user21",
+          "text": "DM from user21 \u2014 personal note USR-021-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-07. When"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-08. When"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-02 and my defau"
+        },
+        {
+          "tag": "user:user33",
+          "text": "DM from user33 \u2014 personal note USR-033-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-06 and my defau"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a SRE on the ca"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-b (kube-agents fleet test)\n\nI ask for the blast radius before any change is propo"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-02. When "
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-05. When "
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        }
+      ]
+    },
+    {
+      "id": "Q-ISO-002",
+      "class": "isolation",
+      "scored_at": "context",
+      "as_user": "probe-operator",
+      "units_returned": 77,
+      "context_chars": 17532,
+      "est_tokens": 4383,
+      "gold_docs": [],
+      "gold_found": [],
+      "gold_recall": null,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": null,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [
+        "mfs-stg-ase1-07",
+        "mfs-stg-sae1-05",
+        "search-vector-index"
+      ],
+      "contamination_hits": [
+        "mfs-stg-ase1-07"
+      ],
+      "contamination_rate": 0.3333333333333333,
+      "current_offset": null,
+      "superseded_offset": 7110,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-a (kube-agents fleet test)\n\nI am based in London and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-09 and my defa"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-05 and my defa"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-01 and my defa"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a SRE on the ca"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-03 and my defau"
+        },
+        {
+          "tag": "user:user13",
+          "text": "DM from user13 \u2014 personal note USR-013-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a data platform en"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-a (kube-agents fleet test)\n\nI am based in London and I work as a SRE on the perso"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-03 and my defa"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-08 and my defau"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a SRE on the payme"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a tenant lead o"
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-a (kube-agents fleet test)\n\nI am based in New York and I work as a platform engin"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-07 and my defau"
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-01 and my defa"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-09 and my def"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-02 and my defau"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a network engineer"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-06 and my def"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a security enginee"
+        },
+        {
+          "tag": "user:user27",
+          "text": "DM from user27 \u2014 personal note USR-027-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a data platform"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-a (kube-agents fleet test)\n\nI am based in London and I work as a tenant lead on t"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-08 and my defa"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-a (kube-agents fleet test)\n\nI am based in London and I work as a release engineer"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user34",
+          "text": "DM from user34 \u2014 personal note USR-034-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-07 and my defa"
+        },
+        {
+          "tag": "user:user46",
+          "text": "DM from user46 \u2014 personal note USR-046-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-01 and my defa"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-a (kube-agents fleet test)\n\nI am based in S\u00e3o Paulo and I work as a platform engi"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-01. When"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user22",
+          "text": "DM from user22 \u2014 personal note USR-022-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-04 and my defa"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-a (kube-agents fleet test)\n\nI am based in Toronto and I work as a SRE on the stre"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-07. When"
+        },
+        {
+          "tag": "user:user11",
+          "text": "DM from user11 \u2014 personal note USR-011-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-sae1-02 and my defau"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-a (kube-agents fleet test)\n\nI am based in Singapore and I work as a data platform"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a platform enginee"
+        },
+        {
+          "tag": "user:user03",
+          "text": "DM from user03 \u2014 personal note USR-003-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-a (kube-agents fleet test)\n\nI am based in Warsaw and I work as a release engineer"
+        }
+      ]
+    },
+    {
+      "id": "Q-NEG-001",
+      "class": "negative",
+      "scored_at": "answer",
+      "as_user": "user07",
+      "units_returned": 82,
+      "context_chars": 17856,
+      "est_tokens": 4464,
+      "gold_docs": [],
+      "gold_found": [],
+      "gold_recall": null,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": null,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [
+        "mfs-prod-euw1-99 is",
+        "mfs-prod-euw1-99 runs",
+        "mfs-prod-euw1-99 hosts"
+      ],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": null,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-09 and my defa"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-07 and my defa"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-06 and my defa"
+        },
+        {
+          "tag": "user:user06",
+          "text": "DM from user06 \u2014 personal note USR-006-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-04 and my defau"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user18",
+          "text": "DM from user18 \u2014 personal note USR-018-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-09. When"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-04 and my defa"
+        },
+        {
+          "tag": "user:user40",
+          "text": "DM from user40 \u2014 personal note USR-040-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-05 and my defa"
+        },
+        {
+          "tag": "user:user04",
+          "text": "DM from user04 \u2014 personal note USR-004-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-04. When"
+        },
+        {
+          "tag": "user:user50",
+          "text": "DM from user50 \u2014 personal note USR-050-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-01. When"
+        },
+        {
+          "tag": "user:user16",
+          "text": "DM from user16 \u2014 personal note USR-016-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw1-07. When"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-09 and my defau"
+        },
+        {
+          "tag": "user:user05",
+          "text": "DM from user05 \u2014 personal note USR-005-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-05 and my defau"
+        },
+        {
+          "tag": "user:user28",
+          "text": "DM from user28 \u2014 personal note USR-028-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw1-01 and my defa"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-02 and my defau"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-08. When "
+        },
+        {
+          "tag": "user:user32",
+          "text": "DM from user32 \u2014 personal note USR-032-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-05 and my defa"
+        },
+        {
+          "tag": "user:user22",
+          "text": "DM from user22 \u2014 personal note USR-022-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-04 and my defa"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-06 and my def"
+        },
+        {
+          "tag": "user:user17",
+          "text": "DM from user17 \u2014 personal note USR-017-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-euw4-08 and my defau"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-02. When "
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-08 and my defa"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-ane1-08 and my defa"
+        },
+        {
+          "tag": "user:user08",
+          "text": "DM from user08 \u2014 personal note USR-008-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user02",
+          "text": "DM from user02 \u2014 personal note USR-002-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-euw3-03 and my defa"
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-09 and my def"
+        },
+        {
+          "tag": "user:user30",
+          "text": "DM from user30 \u2014 personal note USR-030-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-03. When"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-a (kube-agents fleet test)\n\nI am based in Frankfurt and I work as a SRE on the ca"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-a (kube-agents fleet test)\n\nI am based in Dublin and I work as a network engineer"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-06. When "
+        },
+        {
+          "tag": "user:user43",
+          "text": "DM from user43 \u2014 personal note USR-043-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-ase1-07 and my defau"
+        },
+        {
+          "tag": "user:user14",
+          "text": "DM from user14 \u2014 personal note USR-014-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-05. When"
+        },
+        {
+          "tag": "user:user49",
+          "text": "DM from user49 \u2014 personal note USR-049-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-use4-04. When "
+        },
+        {
+          "tag": "user:user36",
+          "text": "DM from user36 \u2014 personal note USR-036-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-09. Whe"
+        },
+        {
+          "tag": "user:user42",
+          "text": "DM from user42 \u2014 personal note USR-042-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-euw3-06. When"
+        },
+        {
+          "tag": "user:user10",
+          "text": "DM from user10 \u2014 personal note USR-010-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-01 and my defa"
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-02 and my defa"
+        },
+        {
+          "tag": "user:user46",
+          "text": "DM from user46 \u2014 personal note USR-046-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-01 and my defa"
+        },
+        {
+          "tag": "user:user44",
+          "text": "DM from user44 \u2014 personal note USR-044-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-08. When"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-usw2-06 and my defau"
+        },
+        {
+          "tag": "user:user20",
+          "text": "DM from user20 \u2014 personal note USR-020-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-ane1-02. When"
+        },
+        {
+          "tag": "user:user33",
+          "text": "DM from user33 \u2014 personal note USR-033-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-asi1-06 and my defau"
+        },
+        {
+          "tag": "user:user25",
+          "text": "DM from user25 \u2014 personal note USR-025-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-07 and my defau"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-08. When"
+        },
+        {
+          "tag": "user:user01",
+          "text": "DM from user01 \u2014 personal note USR-001-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-stg-use4-01 and my defau"
+        },
+        {
+          "tag": "user:user09",
+          "text": "DM from user09 \u2014 personal note USR-009-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-asi1-09. When "
+        },
+        {
+          "tag": "user:user48",
+          "text": "DM from user48 \u2014 personal note USR-048-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-03. Whe"
+        },
+        {
+          "tag": "user:user24",
+          "text": "DM from user24 \u2014 personal note USR-024-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-nane1-06. Whe"
+        },
+        {
+          "tag": "user:user41",
+          "text": "DM from user41 \u2014 personal note USR-041-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-euw4-05. When "
+        },
+        {
+          "tag": "user:user34",
+          "text": "DM from user34 \u2014 personal note USR-034-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-aus1-07 and my defa"
+        },
+        {
+          "tag": "user:user12",
+          "text": "DM from user12 \u2014 personal note USR-012-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-nane1-03 and my def"
+        },
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-usw2-03. When "
+        },
+        {
+          "tag": "user:user35",
+          "text": "DM from user35 \u2014 personal note USR-035-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-08. When "
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-ase1-04. When "
+        },
+        {
+          "tag": "user:user38",
+          "text": "DM from user38 \u2014 personal note USR-038-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-prod-usc1-02. When"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-e (kube-agents fleet test)\n\nWhen I say 'my cluster' I mean mfs-stg-sae1-02. When "
+        }
+      ]
+    },
+    {
+      "id": "Q-NEG-002",
+      "class": "negative",
+      "scored_at": "answer",
+      "as_user": "user07",
+      "units_returned": 41,
+      "context_chars": 17936,
+      "est_tokens": 4484,
+      "gold_docs": [],
+      "gold_found": [],
+      "gold_recall": null,
+      "gold_miss_diagnosis": [],
+      "first_gold_rank": null,
+      "must_contain": [],
+      "must_contain_hits": [],
+      "must_contain_rate": null,
+      "must_not_contain": [
+        "ADR-2026-099 decided",
+        "ADR-2026-099 states",
+        "ADR-2026-099 supersedes"
+      ],
+      "contamination_hits": [],
+      "contamination_rate": null,
+      "current_offset": null,
+      "superseded_offset": null,
+      "current_ranked_first": null,
+      "tag_leaks": [
+        {
+          "tag": "user:user39",
+          "text": "DM from user39 \u2014 personal note USR-039-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user47",
+          "text": "DM from user47 \u2014 personal note USR-047-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user23",
+          "text": "DM from user23 \u2014 personal note USR-023-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user31",
+          "text": "DM from user31 \u2014 personal note USR-031-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user15",
+          "text": "DM from user15 \u2014 personal note USR-015-b (kube-agents fleet test)\n\nI prefer three options with trade-offs rather than on"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-c (kube-agents fleet test)\n\nI am on the European on-call rotation every third wee"
+        },
+        {
+          "tag": "user:user29",
+          "text": "DM from user29 \u2014 personal note USR-029-b (kube-agents fleet test)\n\nI read YAML faster than tables and prefer manifests i"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-d (kube-agents fleet test)\n\nMy day-to-day work is on mfs-prod-usc1-08 and my defa"
+        },
+        {
+          "tag": "user:user26",
+          "text": "DM from user26 \u2014 personal note USR-026-a (kube-agents fleet test)\n\nI am based in London and I work as a release engineer"
+        }
+      ]
+    }
+  ]
+}

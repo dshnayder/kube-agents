@@ -17,6 +17,23 @@ Honcho does have the primitive for it — the Hermes provider passes
 `runtime_user_peer_name` from `user_id`
 (`plugins/memory/honcho/__init__.py:477`) — it is just not wired up here.
 
+## Current state on kage-management: parked at zero
+
+The ladder has been run ([RESULTS.md](RESULTS.md)) and all four workloads are
+scaled to 0. The Postgres PVC is retained, so the seeded 1,664-document corpus
+is still there and a re-score costs one command:
+
+```sh
+kubectl -n kubeagents-system scale statefulset honcho-postgresql --replicas=1
+kubectl -n kubeagents-system scale deploy honcho-api honcho-redis --replicas=1
+kubectl -n kubeagents-system scale deploy honcho-deriver --replicas=1
+```
+
+They are parked rather than deleted because the namespace `ResourceQuota`
+(`platform-baseline-quota`, `limits.cpu=20`) cannot hold both Honcho and
+`hindsight-api` at its live 2 replicas. Bringing Honcho back means taking
+Hindsight down to 1 first.
+
 ## Deploy
 
 ```sh
@@ -86,15 +103,15 @@ ladder needs an explicit drain check before scoring rather than a fixed sleep.
 
 All confirmed live against this deployment, with correct semantic ranking:
 
-| surface                                   | returns                                    |
-| ----------------------------------------- | ------------------------------------------ |
-| `POST /v3/workspaces/{ws}/search`          | raw messages, hybrid semantic + keyword    |
-| `POST .../peers/{peer}/search`             | the same, scoped to one peer               |
-| `POST .../conclusions/list`                | derived conclusions, paginated             |
-| `POST .../conclusions/query`               | derived conclusions, semantic              |
-| `POST .../peers/{peer}/representation`     | the assembled representation, as markdown  |
-| `POST .../peers/{peer}/chat`               | dialectic — an LLM answer over the above   |
-| `GET  .../peers/{peer}/card`               | peer card; `null` until enough messages    |
+| surface                                | returns                                   |
+| -------------------------------------- | ----------------------------------------- |
+| `POST /v3/workspaces/{ws}/search`      | raw messages, hybrid semantic + keyword   |
+| `POST .../peers/{peer}/search`         | the same, scoped to one peer              |
+| `POST .../conclusions/list`            | derived conclusions, paginated            |
+| `POST .../conclusions/query`           | derived conclusions, semantic             |
+| `POST .../peers/{peer}/representation` | the assembled representation, as markdown |
+| `POST .../peers/{peer}/chat`           | dialectic — an LLM answer over the above  |
+| `GET  .../peers/{peer}/card`           | peer card; `null` until enough messages   |
 
 `conclusions/query` **requires** `observer` and `observed` inside a `filters`
 object; without them it 400s rather than searching unfiltered.
