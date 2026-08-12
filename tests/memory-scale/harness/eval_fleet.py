@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Score both memory providers against the same 26-probe answer key.
+"""Score the memory providers against the same 26-probe answer key.
 
 What is being compared
 ----------------------
 Not "the retrieval API" against "a file". The comparable unit is **what the
 model sees when it answers**: for Hindsight that is the recall result set, for
-`multiuser_memory` it is the entire `system_prompt_block()`. Both are scored by
-the same code against the same `queries.json`, so every number below is a
-property of the architecture rather than of the harness.
+`multiuser_memory` it is the entire `system_prompt_block()`, and for Honcho it
+is the budget-matched message search result set. All three are scored by the
+same code against the same `queries.json`, so every number below is a property
+of the architecture rather than of the harness.
+
+Honcho is scored with per-user isolation deliberately not implemented, so its
+two isolation probes are expected to fail; `--allow-leaks` records that without
+aborting the ladder. See `HonchoBackend` for why the message-search surface is
+the one scored.
 
 The four metrics, and what each one is worth
 --------------------------------------------
@@ -74,6 +80,14 @@ TOK_PER_CHAR = 0.25                # stated estimator; chars below are exact
 
 REF_FILE_PROVIDER = Path("/tmp/scaletest/multiuser_memory_ref.py")
 
+# Honcho returns whole documents, Hindsight returns short extracted
+# observations, so the two are held equal on context size rather than on result
+# count. 18,000 chars is 4,500 estimated tokens at TOK_PER_CHAR, which brackets
+# the 4,264-4,588 tok/turn Hindsight actually consumed at budget=mid across all
+# five rungs (see results/hindsight-r*.json).
+HONCHO_CHAR_BUDGET = 18_000
+HONCHO_WORKSPACE = "meridian"
+
 
 # --------------------------------------------------------------------------
 # backends: each returns the context string a model would see for one probe
@@ -110,6 +124,80 @@ class HindsightBackend:
         # The model sees the unit texts. Context lines are joined the way the
         # plugin renders them, so the character count is the real one.
         return "\n".join(r.get("text") or "" for r in results), results
+
+
+class HonchoBackend:
+    """Workspace-wide message search, budget-matched to Hindsight's `mid` recall.
+
+    Which surface, and why this one
+    -------------------------------
+    Honcho exposes several readable surfaces (raw message search, derived
+    conclusions, a peer representation, and a dialectic LLM answer). This scores
+    `POST /v3/workspaces/{ws}/search` — hybrid semantic + keyword over messages —
+    for two reasons. It is the path the Hermes provider's own `honcho_search`
+    tool calls, so it is the product behaviour rather than a capability demo.
+    And it is the only retrieval surface that needs no per-peer scoping:
+    `conclusions/query` **requires** `observer` and `observed` filters, and
+    supplying them would amount to implementing the per-user isolation this
+    experiment deliberately leaves out, which would quietly turn the isolation
+    probes into passes.
+
+    Read the recall numbers with the same caveat the file backend carries:
+    search returns messages **verbatim**, so document IDs always survive and
+    `gold_recall` is flattered relative to Hindsight, which paraphrases. The
+    comparison that survives that asymmetry is `contamination` and `ordering`.
+
+    Fairness is enforced on context size, not hit count
+    ---------------------------------------------------
+    Honcho returns whole documents where Hindsight returns short extracted
+    observations, so matching on number of results would hand Honcho several
+    times the context. Hits are taken in rank order until the character budget
+    is spent, which holds "what the model sees" — the comparable unit this
+    harness is built on — equal between the two.
+    """
+
+    name = "honcho"
+    SHARED_PEER = "meridian-platform"
+
+    def __init__(self, api_url: str, workspace: str, limit: int = 100,
+                 char_budget: int = HONCHO_CHAR_BUDGET):
+        self.api_url = api_url.rstrip("/")
+        self.workspace, self.limit, self.char_budget = workspace, limit, char_budget
+
+    def _call(self, path: str, body: dict, timeout: int = 180):
+        url = f"{self.api_url}/v3/workspaces/{self.workspace}{path}"
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=timeout).read() or "{}")
+        except urllib.error.HTTPError as e:
+            # Honcho reports every embedding failure as a token-limit error
+            # (src/utils/search.py:383-394 catches a bare ValueError), so the
+            # body is not to be trusted on a 4xx — say so rather than repeat it.
+            detail = e.read()[:300]
+            hint = ("  (a 'token limit' message here is unreliable — check the "
+                    "honcho-api pod log for the real cause)" if e.code == 422 else "")
+            raise RuntimeError(f"HTTP {e.code} on POST {path}: {detail!r}{hint}") from e
+
+    def context_for(self, query: str, user: str) -> tuple[str, list[dict]]:
+        resp = self._call("/search", {"query": query, "limit": self.limit})
+        hits = resp if isinstance(resp, list) else (resp.get("items") or [])
+
+        results, chars = [], 0
+        for h in hits:
+            text = h.get("content") or ""
+            if chars + len(text) > self.char_budget:
+                break                      # stop at the budget; do not reorder
+            chars += len(text) + 1
+            peer = h.get("peer_id") or ""
+            # Honcho has no tags. The peer a message belongs to *is* its scope,
+            # so it is translated into the tag vocabulary the isolation check
+            # already speaks — a cross-user hit therefore trips the same wire.
+            tag = SHARED_TAG if peer == self.SHARED_PEER else f"{USER_TAG_PREFIX}{peer}"
+            results.append({"text": text, "tags": [tag], "peer_id": peer})
+
+        return "\n".join(r["text"] for r in results), results
 
 
 class FileBackend:
@@ -384,7 +472,7 @@ def load_doc_text(corpus: Path) -> dict[str, str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--provider", choices=["hindsight", "file"], required=True)
+    ap.add_argument("--provider", choices=["hindsight", "file", "honcho"], required=True)
     ap.add_argument("--rung", required=True, help="ladder rung, for the output filename")
     ap.add_argument("--queries", default="/tmp/scaletest/v2/queries.json")
     ap.add_argument("--corpus", default="/tmp/scaletest/v2/corpus")
@@ -393,6 +481,15 @@ def main() -> int:
     ap.add_argument("--bank", default="kube-agents-memory")
     ap.add_argument("--budget", default=DEFAULT_BUDGET)
     ap.add_argument("--home", default="", help="file provider HERMES_HOME (file backend)")
+    ap.add_argument("--workspace", default=HONCHO_WORKSPACE, help="honcho workspace")
+    ap.add_argument("--honcho-limit", type=int, default=100,
+                    help="hits requested per search; Honcho caps this at 100")
+    ap.add_argument("--honcho-char-budget", type=int, default=HONCHO_CHAR_BUDGET)
+    ap.add_argument("--allow-leaks", action="store_true",
+                    help="record cross-user leaks but still exit 0. For backends "
+                         "where per-user isolation is knowingly not implemented "
+                         "(Honcho here), so the ladder completes instead of "
+                         "aborting on a failure that is the expected result.")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -402,6 +499,10 @@ def main() -> int:
     if a.provider == "hindsight":
         backend = HindsightBackend(a.api_url, a.bank, a.budget)
         label = f"hindsight (budget={a.budget}, tags_match={TAGS_MATCH}, types={RECALL_TYPES})"
+    elif a.provider == "honcho":
+        backend = HonchoBackend(a.api_url, a.workspace, a.honcho_limit, a.honcho_char_budget)
+        label = (f"honcho (workspace={a.workspace}, surface=message-search, "
+                 f"limit={a.honcho_limit}, char_budget={a.honcho_char_budget:,})")
     else:
         home = Path(a.home or f"/tmp/scaletest/v2/filestore/rung-{a.rung}")
         if not (home / "memories" / "MEMORY.md").is_file():
@@ -462,11 +563,22 @@ def main() -> int:
     out.write_text(json.dumps({
         "provider": backend.name, "label": label, "rung": a.rung,
         "default_user": a.user, "tok_per_char": TOK_PER_CHAR,
+        # So a reader of the JSON alone can tell a clean isolation result from
+        # one that was never going to pass.
+        "isolation_enforced": not a.allow_leaks,
         "summary": summary, "probes": rows,
     }, indent=2))
     print(f"\nwrote {out}")
 
     if o["total_tag_leaks"]:
+        if a.allow_leaks:
+            # Not softened into a pass: the count is printed, stored, and named
+            # as unimplemented isolation rather than as a clean run.
+            print(f"\nEXPECTED FAILURE: {o['total_tag_leaks']} cross-user tag leak(s). "
+                  f"--allow-leaks is set, so this exits 0; per-user isolation is not "
+                  f"implemented for this backend and these probes are expected to fail.",
+                  file=sys.stderr)
+            return 0
         print(f"\nFAIL: {o['total_tag_leaks']} cross-user tag leak(s)", file=sys.stderr)
         return 1
     return 0
