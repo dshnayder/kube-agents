@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **208** `.md`/`.mdx` documents outside the root-level
+The repository tracks **210** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -318,6 +318,8 @@ only what the title does not say.
 | `tests/e2e/README.md`                                  | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection).                                                         | Hybrid auth, Pub/Sub injection, CI setup                           | CI maintainers                                                                            |
 | `tests/memory-scale/README.md`                         | Component README | The A/B that chose the memory provider: a synthetic 500-cluster corpus put in front of the same agent through Hindsight and through the file-based provider, with the harness, fixtures and raw results.            | Corpus generator, rungs, gold recall, context cost, seed packing   | Anyone re-running the test or checking a number in `docs/designs/memory.md`               |
 | `tests/memory-scale/transcript/README.md`              | Component README | The raw evidence for that A/B: the probe protocol, the two corrections the run made to itself, the file arm's isolation and rollback log, and the per-probe scoring for all three runs.                             | Probe scoring, seed packing, isolation boundary, rollback          | Anyone checking a claim in `docs/designs/memory.md` against the transcript it came from   |
+| `tests/memory-scale/honcho/README.md`                  | Component README | Deploying Honcho as a third backend for the same harness: manifests, the LiteLLM wiring, the two misconfigurations that cost a debugging cycle, and which read surfaces were verified.                              | Honcho deployment, deriver, embedding config, verified surfaces    | Anyone re-running the Honcho arm or bringing the parked deployment back up                |
+| `tests/memory-scale/honcho/RESULTS.md`                 | Component README | Honcho scored on the same 26 probes at all five rungs: budget-matched context, contamination against Hindsight, settle time, and the size of the isolation failure.                                                 | Contamination, gold recall caveat, settle time, isolation leaks    | Anyone comparing Honcho against Hindsight or checking a number in that comparison         |
 
 ## 5. Keeping this map fresh
 
