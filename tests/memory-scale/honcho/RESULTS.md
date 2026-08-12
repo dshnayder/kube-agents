@@ -47,14 +47,19 @@ that gives file-based a mechanical 1.000.
 The harness docstring already states it for file-based; it applies identically
 here.
 
-The metrics that survive the asymmetry are contamination and ordering.
+The metric that survives the asymmetry is contamination. Ordering survives this
+one but is confounded by a different one — see
+[the two arms do not run the same retriever](#the-two-arms-do-not-run-the-same-retriever).
 
 ## What the run actually found
 
 ### Honcho ranks the current answer first, then ships the stale one anyway
 
-`current_ranked_first` is 0.857 for Honcho against 0.833 for Hindsight — the
-ranking is fine, marginally better. Contamination is where they part:
+`current_ranked_first` is 0.857 for Honcho against 0.833 for Hindsight. **Read
+that as a tie, not as an edge** — on 26 probes the gap is smaller than a single
+probe, and ordering is the one metric the retriever asymmetry below confounds
+directly. What the two systems do with the stale answer once ranked is where
+they part:
 
 | class            | honcho | hindsight |
 | ---------------- | -----: | --------: |
@@ -72,6 +77,44 @@ removes it — the cost being the paraphrasing that depresses its `gold_recall`.
 So the two systems fail in opposite directions, and the choice is between them:
 Hindsight loses citations to keep the context clean, Honcho keeps citations and
 hands the model a contradiction.
+
+### The two arms do not run the same retriever
+
+They were not made to. Neither system was moved off its shipped default,
+because neither really offers the choice: Hindsight bakes its models into the
+image to satisfy the no-Hugging-Face-egress requirement
+(`HF_HUB_OFFLINE=1`, and `HINDSIGHT_API_EMBEDDING*` is set nowhere in
+[`api.yaml`](../../../k8s-operator/config/integrations/hindsight/api.yaml)),
+and Honcho has no local embedding path at all.
+
+|             | Hindsight                                             | Honcho                           |
+| ----------- | ----------------------------------------------------- | -------------------------------- |
+| first stage | `BAAI/bge-small-en-v1.5`, 384-dim, CPU                | `gemini-embedding-2`, 1536-dim   |
+| final stage | cross-encoder rerank, 300 candidates, CPU, in-request | none — hybrid semantic + keyword |
+
+The asymmetry points **both** ways: Honcho has much the better embedding,
+Hindsight much the better final ranker. Which metrics that touches:
+
+- **Ordering — confounded.** `current_ranked_first` is exactly what these
+  stages determine, which is the second reason to read the 0.857/0.833 gap as
+  a tie.
+- **Contamination — not confounded.** Hindsight scores 0.000 on procedural
+  because the superseded content is not in its store; consolidation removed it
+  at write time, and no retriever can return what is absent. Nor does a better
+  embedding help Honcho here: a retired runbook version and its replacement are
+  near-duplicates, so "current" versus "superseded" is not a distinction any
+  bi-encoder draws. The result is architectural.
+- **Gold recall — not confounded**, but only because it is already swamped by
+  the citation-survival artefact above.
+- **Isolation — not confounded.** Workspace-wide search has no user predicate.
+  The embedding decides _which_ foreign messages come back, not whether they
+  do.
+
+What the run did **not** measure is the price of either choice: `tok/turn`
+counts context delivered to the model, so it excludes Honcho's per-query
+embedding API spend and Hindsight's 4-CPU in-request rerank alike, and no
+query latency was recorded on either side. The parity above is context-size
+parity, not cost parity.
 
 ### The isolation failure is far larger than the two isolation probes
 
@@ -162,6 +205,8 @@ nested and the seeder resumes, so each rung writes only its delta.
   path the Hermes `honcho_search` tool takes and the only one that needs no
   per-peer scoping. Conclusions and the dialectic answer are untested at scale;
   the dialectic answered the smoke probe correctly, which is one data point.
+- **Cost and latency.** Neither arm recorded query latency or the price of its
+  embedding stage — see the retriever asymmetry above.
 - **Answer-layer quality.** Two probes are marked `scored_at: answer` and are
   recorded but unrated at this layer, exactly as in the Hindsight run.
 - **Postgres availability.** Unchanged by this experiment. Honcho runs one
