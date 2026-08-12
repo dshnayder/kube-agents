@@ -150,6 +150,37 @@ stateful component rather than removing the first. Single-instance Postgres is a
 property of both, and of anything else Postgres-backed — an availability question
 answered by ordinary Postgres HA, not by the choice of memory provider.
 
+#### What survives if `honcho` gets the wrapper
+
+Every ground above is a property of `honcho`'s shape, so the obvious rebuttal is to
+build the wrapper and answer all of them at once. `honcho` was therefore self-hosted
+and run against the same 26 probes and the same 1,664-document corpus at an equal
+context budget —
+[full results](https://github.com/dshnayder/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md).
+Grant the wrapper, and one finding survives it.
+
+**Superseded content.** On the message-search surface the plugin's `honcho_search`
+uses, `honcho` put a retired value in front of the model on _every_ procedural probe
+at the largest rung — contamination 1.000 against `hindsight`'s 0.000. The cause is
+structural, not a tuning gap: consolidation deletes retired content at write time, so
+`hindsight` cannot return what is no longer there, while in `honcho` a retired runbook
+is still a message and still a legitimate hit. Scoping does not touch that, and a
+`dream` is not expected to either — dreams consolidate conclusions, and a conclusion
+does not unwrite the message that search reads. For a fleet agent this is the
+governing failure mode, because the wrong answer to "what is the current runbook" is
+a previously correct one.
+
+Two costs the a-priori argument did not predict point the same way: derivation is
+asynchronous, so a fact is not queryable for minutes after it is written, where
+`hindsight` pays that cost inline at write; and embedding every _query_ puts LiteLLM
+in the read path rather than only the write path.
+
+One result goes the other way, and it is a real gap rather than a rounding error.
+`honcho` returns messages verbatim, so a document identifier always survives into the
+context; `hindsight` paraphrases and drops the identifier in 37 of 82 units, which is
+why its measured gold recall understates what it actually retrieved. That argues for
+provenance metadata on `hindsight` units, not for a different store.
+
 ### `multiuser_memory`, the provider this displaces
 
 This repository already carried its own provider
