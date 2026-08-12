@@ -1,0 +1,87 @@
+# Honcho's database. Deliberately a separate instance from hindsight-postgresql
+# so the two providers can be measured without either disturbing the other's
+# data, and so the Hindsight bank survives this experiment untouched.
+apiVersion: v1
+kind: Service
+metadata:
+  name: honcho-postgresql
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: honcho-postgresql
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: database
+spec:
+  serviceName: honcho-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: honcho
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: honcho
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg15
+          # Matches Honcho's own docker-compose: the connection ceiling is a
+          # config line every Postgres-backed deployment needs.
+          args: ["postgres", "-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_USER
+              value: honcho
+            - name: POSTGRES_DB
+              value: honcho
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: honcho-db
+                  key: password
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "honcho", "-d", "honcho"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard-rwo
+        resources:
+          requests:
+            storage: 8Gi

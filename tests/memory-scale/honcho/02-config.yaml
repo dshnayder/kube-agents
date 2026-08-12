@@ -1,0 +1,137 @@
+# Honcho reads config.toml from its working directory (/app). Everything that
+# is not a credential lives here; DB and cache URLs come in as env vars, which
+# is how Honcho's own compose file does it.
+#
+# Every model points at the cluster's existing LiteLLM. Nothing new was added
+# to the LiteLLM config for this experiment — gemini-embedding-2 was already
+# served, and it honours the OpenAI `dimensions` parameter, which is what lets
+# VECTOR_DIMENSIONS below be anything other than its native 3072.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honcho-config
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+data:
+  config.toml: |
+    [app]
+    LOG_LEVEL = "INFO"
+    EMBED_MESSAGES = true
+    NAMESPACE = "honcho"
+
+    [auth]
+    USE_AUTH = false
+
+    [db]
+    SCHEMA = "public"
+    POOL_SIZE = 10
+    MAX_OVERFLOW = 20
+
+    [cache]
+    ENABLED = true
+
+    [vector_store]
+    TYPE = "pgvector"
+    NAMESPACE = "honcho"
+
+    # 1536 rather than gemini-embedding-2's native 3072: it halves the pgvector
+    # column width at no measured cost, and the dimension is frozen into the
+    # schema at first migration (src/models.py:35 builds Vector(_VECTOR_DIM) at
+    # import time), so it cannot be changed later without a rebuild.
+    [embedding]
+    VECTOR_DIMENSIONS = 1536
+    MAX_INPUT_TOKENS = 8192
+
+    [embedding.model_config]
+    transport = "openai"
+    model = "gemini-embedding-2"
+    # Force `dimensions=` onto every embedding request. The default "auto"
+    # (src/config.py:824-831) only sends it when VECTOR_DIMENSIONS appears in
+    # pydantic's model_fields_set, which depends on how the TOML source is
+    # merged; if it resolved to false, LiteLLM would return the model's native
+    # 3072 and _validate_embedding_dimensions would reject every embedding.
+    dimensions_mode = "always"
+    # Gemini's native batch ceiling is 100; the openai transport would
+    # otherwise assume OpenAI's 2048 and overflow the request.
+    max_batch_size = 100
+
+    [embedding.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    # The deriver is the workload under test: it reads messages and builds peer
+    # representations. FLUSH_ENABLED bypasses the batch-token gate so work is
+    # processed as it arrives rather than waiting up to
+    # REPRESENTATION_BATCH_MAX_AGE_SECONDS (1800) for a partial batch to age
+    # out. That favours Honcho on settle time and costs it nothing in quality.
+    [deriver]
+    ENABLED = true
+    WORKERS = 2
+    FLUSH_ENABLED = true
+    POLLING_SLEEP_INTERVAL_SECONDS = 1.0
+
+    [deriver.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    # Without this the model spends ~62 reasoning tokens to answer "ok".
+    # Measured against this LiteLLM before deploying.
+    thinking_effort = "minimal"
+
+    [deriver.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [peer_card]
+    ENABLED = true
+
+    [dialectic]
+    [dialectic.levels.minimal.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dialectic.levels.minimal.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [dialectic.levels.low.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dialectic.levels.low.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [dialectic.levels.medium.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dialectic.levels.medium.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [dialectic.levels.high.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dialectic.levels.high.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [dialectic.levels.max.model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dialectic.levels.max.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [summary.model_config]
+    transport = "openai"
+    model = "model-summary"
+    [summary.model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    # Dreams are Honcho's consolidation analogue. Left at the shipped defaults
+    # rather than tuned: MIN_HOURS_BETWEEN_DREAMS = 8 and IDLE_TIMEOUT_MINUTES
+    # = 60 mean they are unlikely to fire inside a ladder run, which is worth
+    # stating in the report rather than silently disabling.
+    [dream.deduction_model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dream.deduction_model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"
+
+    [dream.induction_model_config]
+    transport = "openai"
+    model = "model-gemini35flash"
+    [dream.induction_model_config.overrides]
+    base_url = "http://litellm.kubeagents-system.svc.cluster.local/v1"

@@ -1,0 +1,63 @@
+# Honcho's cache. Ephemeral on purpose: it holds no durable state, so an
+# emptyDir keeps the experiment's storage footprint to the one Postgres volume.
+apiVersion: v1
+kind: Service
+metadata:
+  name: honcho-redis
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: cache
+spec:
+  selector:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: cache
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: honcho-redis
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: honcho
+      app.kubernetes.io/component: cache
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: honcho
+        app.kubernetes.io/component: cache
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.2
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}

@@ -1,0 +1,58 @@
+# The deriver: polls the work queue and builds peer representations from
+# messages. This is the component that has no Hindsight equivalent, and the
+# reason a Honcho corpus is not queryable the instant seeding returns.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: honcho-deriver
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: deriver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: honcho
+      app.kubernetes.io/component: deriver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: honcho
+        app.kubernetes.io/component: deriver
+    spec:
+      containers:
+        - name: deriver
+          image: ghcr.io/plastic-labs/honcho:latest@sha256:93088e8d3f208b9ae670ffbd296f1bce7e11f64c58f25ca1379e075e8ce49f99
+          command: ["/app/.venv/bin/python", "-m", "src.deriver"]
+          env:
+            - name: DB_CONNECTION_URI
+              valueFrom:
+                secretKeyRef:
+                  name: honcho-db
+                  key: connection-uri
+            - name: CACHE_URL
+              value: redis://honcho-redis:6379/0?suppress=true
+            - name: CACHE_ENABLED
+              value: "true"
+            # LLM_ prefix required — see the comment in 03-api.yaml.
+            - name: LLM_OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: honcho-db
+                  key: llm-api-key
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.toml
+              subPath: config.toml
+      volumes:
+        - name: config
+          configMap:
+            name: honcho-config

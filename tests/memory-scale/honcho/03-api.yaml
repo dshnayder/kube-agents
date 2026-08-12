@@ -1,0 +1,94 @@
+# Honcho API. The entrypoint runs scripts/provision_db.py (alembic migrations)
+# before starting the server, so the first rollout creates the schema — which
+# is why EMBEDDING_VECTOR_DIMENSIONS in the ConfigMap must be correct before
+# this is applied.
+apiVersion: v1
+kind: Service
+metadata:
+  name: honcho-api
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: honcho-api
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: honcho
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: honcho
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: honcho
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: api
+          # rev a92fb1e, source version 3.0.12, built 2026-08-11. Pinned by
+          # digest: the published semver tags stop at v2.0.3 (July 2025), which
+          # predates the /v3 API the Hermes provider's SDK calls.
+          image: ghcr.io/plastic-labs/honcho:latest@sha256:93088e8d3f208b9ae670ffbd296f1bce7e11f64c58f25ca1379e075e8ce49f99
+          command: ["sh", "docker/entrypoint.sh"]
+          env:
+            - name: DB_CONNECTION_URI
+              valueFrom:
+                secretKeyRef:
+                  name: honcho-db
+                  key: connection-uri
+            - name: CACHE_URL
+              value: redis://honcho-redis:6379/0?suppress=true
+            - name: CACHE_ENABLED
+              value: "true"
+            # LiteLLM requires no auth in-cluster, but Honcho refuses to build
+            # an openai-transport client without a non-empty key. The name must
+            # carry the LLM_ prefix: the embedding client falls back to
+            # settings.LLM.OPENAI_API_KEY (src/config.py:529) and LLMSettings
+            # declares env_prefix="LLM_" (src/config.py:749), so a plain
+            # OPENAI_API_KEY is silently ignored.
+            - name: LLM_OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: honcho-db
+                  key: llm-api-key
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.toml
+              subPath: config.toml
+      volumes:
+        - name: config
+          configMap:
+            name: honcho-config
