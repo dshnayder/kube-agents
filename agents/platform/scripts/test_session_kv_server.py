@@ -200,19 +200,24 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
         ("GET", "/v1/alert-quota", None),
+        ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
     )
 
     def setUp(self):
         from fastapi.testclient import TestClient
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app)
-        # TestClient runs BackgroundTasks inline, and /inject's task shells out
-        # to `hermes send` and dials the gateway. This suite is about who is let
-        # through the door, not what happens after.
+        # TestClient runs BackgroundTasks inline, and the tasks behind /inject
+        # and /v1/cron-reports both shell out to `hermes send` and dial the
+        # gateway. This suite is about who is let through the door, not what
+        # happens after.
         self._trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self._trigger.start()
+        self._relay = patch.object(session_kv_server, "relay_cron_report")
+        self._relay.start()
 
     def tearDown(self):
+        self._relay.stop()
         self._trigger.stop()
         os.environ.pop("SESSION_KV_API_KEY", None)
 
@@ -641,6 +646,143 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertNotIn("<letter>", cta)
         self.assertIn("apply Option A", cta)
         self.assertIn("apply Option B", cta)
+
+
+class TestCronReportRelay(unittest.TestCase):
+    """POST /v1/cron-reports — the specialist reasons, the Chat Agent speaks."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # The temp database is shared across this file; a stale routing row for
+        # a derived session id would make the second test see the first's thread.
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM session_metadata")
+                conn.execute("DELETE FROM incidents")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def test_session_id_is_stable_within_a_day_and_rolls_over(self):
+        first = session_kv_server._cron_report_session_id("platform", "compliance-audit", "2026-08-13")
+        again = session_kv_server._cron_report_session_id("platform", "compliance-audit", "2026-08-13")
+        tomorrow = session_kv_server._cron_report_session_id("platform", "compliance-audit", "2026-08-14")
+        self.assertEqual(first, again, "two reports from one job on one day must share a session")
+        self.assertNotEqual(first, tomorrow, "the session must roll over so history cannot grow forever")
+        self.assertTrue(first.startswith("cron-platform-compliance-audit-"))
+
+    def test_session_id_sanitises_a_hostile_job_id(self):
+        # The id reaches a URL path and a SQLite key; nothing upstream validates it.
+        sid = session_kv_server._cron_report_session_id("platform", "../../etc/passwd", "2026-08-13")
+        self.assertNotIn("/", sid)
+        self.assertNotIn("..", sid)
+
+    def test_relay_runs_a_chat_agent_turn_and_posts_what_it_composed(self):
+        """The report goes through the Chat Agent; its wording is what reaches chat."""
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="Chat Agent framing") as turn, \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "compliance-audit", "profile": "platform", "report": "raw finding"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "accepted")
+
+        # The turn is handed the specialist's raw report...
+        self.assertEqual(turn.call_args.args[2], "raw finding")
+        # ...and what is posted is the Chat Agent's reply, not the raw report.
+        self.assertEqual(send.call_args.args[1], "Chat Agent framing")
+
+    def test_delivered_text_is_stored_for_thread_replies(self):
+        """This is what makes the Chat Agent context-aware about work it did not do.
+
+        incident_context looks the report up by (chat_id, thread_id) on every
+        inbound message and prepends it, so a reply in the thread arrives with
+        the finding attached.
+        """
+        import sqlite3
+
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed report"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
+            self.client.post("/v1/cron-reports", json={"job_id": "j1", "report": "raw"})
+
+        with sqlite3.connect(temp_db_path) as conn:
+            row = conn.execute("SELECT chat_id, report FROM incidents").fetchone()
+        self.assertEqual(row[0], "spaces/AAA")
+        self.assertEqual(row[1], "composed report")
+
+    def test_second_report_same_day_replies_into_the_first_thread(self):
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j2", "report": "first"})
+            self.client.post("/v1/cron-reports", json={"job_id": "j2", "report": "second"})
+
+        # First call has no thread to reply into; the second one does.
+        self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
+        self.assertEqual(send.call_args_list[1].args[2:], ("spaces/AAA", "spaces/AAA/threads/T1"))
+
+    def test_a_failed_relay_turn_still_delivers_the_report(self):
+        """A finding must not be lost because the front door was unavailable."""
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j3", "report": "unrelayed finding"})
+
+        self.assertEqual(send.call_args.args[1], "unrelayed finding")
+
+    def test_no_alert_quota_is_spent(self):
+        """A scheduled report is not an incident and must not consume the alert budget.
+
+        The whole reason this is its own route rather than a flag on /inject.
+        """
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
+            for _ in range(20):
+                self.client.post("/v1/cron-reports", json={"job_id": "j4", "report": "finding"})
+
+        with sqlite3.connect(temp_db_path) as conn:
+            spent = conn.execute("SELECT COUNT(*) FROM alert_quota").fetchone()[0]
+        self.assertEqual(spent, 0)
+
+    def test_missing_fields_and_oversized_reports_are_rejected(self):
+        self.assertEqual(self.client.post("/v1/cron-reports", json={"report": "x"}).status_code, 400)
+        self.assertEqual(self.client.post("/v1/cron-reports", json={"job_id": "j"}).status_code, 400)
+        over = "x" * (session_kv_server.CRON_REPORT_MAX_CHARS + 1)
+        self.assertEqual(
+            self.client.post("/v1/cron-reports", json={"job_id": "j", "report": over}).status_code, 413
+        )
+
+    def test_route_requires_the_api_key(self):
+        from fastapi.testclient import TestClient
+
+        unauthenticated = TestClient(session_kv_server.app)
+        response = unauthenticated.post("/v1/cron-reports", json={"job_id": "j", "report": "r"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_relay_instructions_forbid_re_investigation(self):
+        instructions = session_kv_server._build_relay_instructions("platform", "compliance-audit", "Audit")
+        self.assertIn("verbatim", instructions)
+        self.assertIn("must not re-investigate", instructions)
+        self.assertIn("do not delegate", instructions)
 
 
 if __name__ == "__main__":

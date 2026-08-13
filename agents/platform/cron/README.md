@@ -34,19 +34,46 @@ rosters both carrying one id is that audit running twice per schedule,
 concurrently with itself, writing its ledger issue twice. The per-job lock
 (`cron/.job-<id>.lock`) is per profile directory, so it does not stop this.
 
-## `deliver` is `"all"`, deliberately
+## `deliver` is never `"local"`
 
-Every enabled job here sets `deliver: "all"`. `cron/scheduler.py::_resolve_delivery_targets`
-returns an **empty target list** for `"local"` — the outcome is written to
-`last_output` and delivered nowhere. A watchdog whose run failed would then be
-indistinguishable from a quiet fleet. `"all"` expands at fire time to every
-platform with a configured home channel, so a failure is audible.
+Every enabled job here sets `deliver` to `"all"` or `"chat"`.
+`cron/scheduler.py::_resolve_delivery_targets` returns an **empty target list**
+for `"local"` — the outcome is written to `last_output` and delivered nowhere. A
+watchdog whose run failed would then be indistinguishable from a quiet fleet.
+Both audible values carry a failure: the scheduler builds one with
+`_summarize_cron_failure_for_delivery` and delivers it on the same leg.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
 `test_every_watchdog_declares_all_delivery` in
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this.
+
+## `deliver: "chat"` — reporting through the Chat Agent
+
+`"all"` gets the words into a channel. It does not make them answerable: the
+process that produced them has exited, and the Chat Agent — which is who the
+user replies to — never saw the finding. On a Google Chat install it does not
+even get the words there, because `profile_cron_tick.py` can only hand a child
+profile the Slack channel, so `"all"` resolves to nothing.
+
+`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
+it and thereby owns the thread the user replies in. It is a delivery mode, not a
+prompt contract: **the job's prompt says nothing about it**, because the
+scheduler applies `[SILENT]` and builds the failure summary before delivery is
+reached. The token is exclusive — a job on `"chat"` does not also post through
+`"all"` — and an unreachable relay falls back to `"all"` rather than dropping
+the report.
+
+The mode is a build-time patch to Hermes
+([`deploy/docker/patches/apply_cron_deliver_chat.py`](../../../deploy/docker/patches/apply_cron_deliver_chat.py)).
+The full rationale — why the Chat Agent composes but does not send, why the
+session is per job per day, why a mode rather than an instruction — is
+[`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
+
+`github-issue-resolver` is the only job here on `"chat"` today. The other seven
+are a one-field change away; they were left on `"all"` so the first rollout has
+one job to watch.
 
 ## `schedule.display` mirrors `schedule.expr`
 

@@ -103,7 +103,7 @@ Each job in `jobs.json` follows this schema:
 - **`skills`** — the skills the work needs. The scheduler prepends each one's content to the prompt, force-loading it ahead of the first turn rather than leaving the load to the model's discretion. The seven audits use `fleet-audit`; `github-issue-resolver` uses its namesake skill.
 - **`no_agent`** and **`script`** — a subprocess instead of an LLM turn, used by the four plumbing jobs on the Chat Agent's roster (`script` resolves in that profile's `scripts/`). The governance watchdogs omit both: they are model runs.
 - **`enabled`** — set to `false` to disable a job without deleting its entry.
-- **`deliver`** — where the run's outcome goes: `"all"` sends it to the configured target, `"local"` resolves to no target at all and drops it. All eight governance jobs use `"all"`, so a watchdog that has stopped working is visible rather than indistinguishable from a quiet fleet.
+- **`deliver`** — where the run's outcome goes: `"all"` sends it to the configured target, `"chat"` hands it to the Chat Agent to post (see [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md)), and `"local"` resolves to no target at all and drops it. No governance job uses `"local"`, so a watchdog that has stopped working is visible rather than indistinguishable from a quiet fleet — seven are on `"all"` and `github-issue-resolver` is on `"chat"`.
 
 ## Disabling a watchdog
 

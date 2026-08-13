@@ -600,6 +600,304 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     _start_agent_turn(api_url, session_id, agent_query, headers)
 
 
+# --------------------------------------------------------------------------
+# Scheduled-report relay: the specialist reasons, the Chat Agent speaks.
+#
+# A cron job on a specialist roster (platform, or a scaffolded cluster profile)
+# runs under its own HERMES_HOME, so it keeps its own skills, model and turn
+# budget. What it does not have is a voice: `deliver` on a named profile
+# resolves against that profile's home-channel config, and the Chat Agent — the
+# process that actually owns the conversation with the user — never learns the
+# finding happened.
+#
+# This relay closes that gap by separating who reasons (the specialist) from
+# who speaks (the Chat Agent). The specialist finishes its work and hands the
+# finished report here; the Chat Agent is given one turn to present it, and the
+# report plus the Chat Agent's framing land in the thread the user replies into.
+#
+# It deliberately does NOT reuse /sessions/{id}/inject. That route is an
+# incident path: it classifies severity, spends `alert_quota`, and hands the
+# agent the triage template. A scheduled report is neither an incident nor a
+# thing that should be silently dropped because a node storm spent the day's
+# Warning budget.
+# --------------------------------------------------------------------------
+
+_CRON_REPORT_SESSION_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+# A report is a chat message, not a document. The cap is generous enough for a
+# full audit summary and small enough that a job which accidentally cats a log
+# cannot push a megabyte through the model and into the channel.
+CRON_REPORT_MAX_CHARS = int(os.getenv("CRON_REPORT_MAX_CHARS", "12000") or "12000")
+
+
+def _cron_report_session_id(profile: str, job_id: str, day: str) -> str:
+    """Deterministic session id for one job's reports on one UTC day.
+
+    Session lifetime is a real trade-off and this picks the middle. One session
+    per *report* (what the event watcher does with `per-incident`) fragments a
+    daily watchdog into a new thread every tick, so a follow-up question lands
+    in a session that has seen exactly one message. One session per *job*, kept
+    forever, is the other failure: every turn replays the whole conversation
+    history, so a job on a five-minute schedule grows an unbounded prompt and
+    the cost of relaying report N is proportional to N.
+
+    Per job, per UTC day: consecutive reports from the same job share a thread
+    and the Chat Agent can say "this is the third time today", while the
+    history resets before it can grow without bound. Yesterday's thread does
+    not go dark when the day rolls over — `incident_context` resolves a reply
+    by (chat_id, thread_id) out of the `incidents` table, which is keyed on the
+    thread rather than on this id and lives for CLEANUP_TTL_DAYS.
+    """
+    slug = _CRON_REPORT_SESSION_RE.sub("-", f"{profile}-{job_id}").strip("-").lower()
+    return f"cron-{slug[:80]}-{day.replace('-', '')}"
+
+
+def _lookup_session_routing(session_id: str) -> tuple[str, str]:
+    """Read back (chat_id, thread_id) for a session, or ("", "") if unrouted."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return "", ""
+        meta = json.loads(row[0])
+        return str(meta.get("chat_id") or ""), str(meta.get("thread_id") or "")
+    except Exception as exc:
+        logger.error(f"Failed to read session routing for {session_id}: {exc}")
+        return "", ""
+
+
+def _ensure_session_row(session_id: str, profile: str, job_id: str) -> None:
+    """Create the local metadata row for a relay session if it is not there yet.
+
+    /sessions mints an id and inserts the row in one step, which suits the
+    watcher (every event is new) and not this path (the id is derived, and the
+    second report of the day must find the first one's routing). Insert-if-absent
+    keeps the row's `platform` marker meaningful on the first call without
+    overwriting the thread the first call registered.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        session_id,
+                        json.dumps(
+                            {
+                                "platform": "cron-report",
+                                "profile": profile,
+                                "job_id": job_id,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ),
+                    ),
+                )
+                cleanup_old_records(conn)
+    except Exception as exc:
+        logger.error(f"Failed to create relay session row for {session_id}: {exc}")
+
+
+def _store_incident_report(chat_id: str, thread_id: str, report: str) -> None:
+    """Persist the delivered text so a reply in this thread carries it back.
+
+    This is the half of the mechanism that makes the Chat Agent context-aware
+    about something it did not investigate. `incident_context`
+    (agents/platform/plugins/incident_context/__init__.py) is a
+    `pre_gateway_dispatch` hook: when a message arrives in a thread it finds
+    here, it prepends the stored text to the user's words before the agent sees
+    them. Written in-process rather than over `POST /v1/incidents` because this
+    is that endpoint's own server — a loopback HTTP call to ourselves inside a
+    background task would only add a way to fail.
+    """
+    if not (chat_id and thread_id):
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
+                    (chat_id, thread_id, report),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to store relayed report for thread {thread_id}: {exc}")
+
+
+def _send_to_chat(active_platform: str, message: str, chat_id: str = "", thread_id: str = "") -> str | None:
+    """Post `message`, into an existing thread when one is known.
+
+    Returns the thread id to route replies to, or None if the send failed.
+    Generalises _post_initial_alert's target handling: `hermes send --to` takes
+    `<platform>:<chat>:<thread>` for a threaded reply, which is the same target
+    shape send_notification builds in platform_mcp_server.py.
+    """
+    target = active_platform
+    threaded = bool(chat_id and thread_id)
+    if threaded:
+        target = f"{active_platform}:{chat_id}:{thread_id}"
+    try:
+        res = subprocess.run(
+            ["hermes", "send", "--json", "--to", target, message],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_run_env(),
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
+        return None
+    except Exception as exc:
+        logger.error(f"Failed to post relayed report to {target}: {exc}")
+        return None
+
+    # Replying into a known thread keeps that thread; only a fresh post has to
+    # derive one from the message id.
+    if threaded:
+        return thread_id
+    try:
+        msg_id = (json.loads(res.stdout) or {}).get("message_id", "")
+    except Exception as exc:
+        logger.error(f"Failed to parse message_id from hermes send: {exc}")
+        return None
+    if not msg_id:
+        return None
+    if active_platform == "google_chat" and "/messages/" in msg_id:
+        space_part, msg_part = msg_id.split("/messages/", 1)
+        return f"{space_part}/threads/{msg_part.split('.')[0]}"
+    return msg_id
+
+
+def _build_relay_instructions(profile: str, job_id: str, title: str) -> str:
+    """The ephemeral system prompt for the Chat Agent's relay turn.
+
+    Ephemeral matters: _handle_session_chat passes `system_message` through as
+    `ephemeral_system_prompt`, so it steers this turn without being replayed
+    into every later turn of the thread. The user's follow-up questions reach a
+    Chat Agent that remembers the report but not the order to repeat it.
+    """
+    label = title or job_id
+    return (
+        f"You are relaying a scheduled report. The {profile} agent ran its '{job_id}' "
+        f"job ({label}) on its own schedule, did the work, and produced the finding below. "
+        "You did not investigate it and must not re-investigate it now.\n\n"
+        "Reply with the report itself, preserved essentially verbatim — keep its wording, "
+        "its structure and its markdown. You may add at most one short sentence at the top "
+        "to orient the reader, and nothing at the bottom. Do not summarise it, do not "
+        "re-order it, do not add analysis or recommendations of your own, do not call any "
+        "tools, and do not delegate.\n\n"
+        "Your entire reply is posted to the user's chat channel as-is, so write it as the "
+        "message they will read — no preamble about relaying, no meta-commentary."
+    )
+
+
+def _run_relay_turn(api_url: str, session_id: str, report: str, instructions: str, headers: Dict[str, str]) -> str | None:
+    """Run one Chat Agent turn over the report and return what it composed.
+
+    Unlike _start_agent_turn this reads the response body. The Chat Agent has no
+    way to post to a chat platform out of band — its toolset is `mcp-router`,
+    `kanban` and `memory`, and `terminal` is on its denylist precisely so the
+    front door cannot reach the system — so it composes and this server sends.
+    The alternative, giving the Chat Agent a send tool, would widen exactly the
+    boundary agents/chat/config.yaml exists to hold.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/api/sessions/{session_id}/chat",
+            data=json.dumps({"message": report, "system_message": instructions}).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300.0) as resp:
+            if resp.status != 200:
+                logger.error(f"Relay turn failed for {session_id} (status {resp.status})")
+                return None
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.error(f"Relay turn failed for {session_id}: {exc}")
+        return None
+
+    content = ((body or {}).get("message") or {}).get("content") or ""
+    content = content.strip()
+    if not content:
+        logger.error(f"Relay turn for {session_id} returned an empty message")
+        return None
+    return content
+
+
+def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, report: str) -> None:
+    """Hand a specialist's finished report to the Chat Agent, then post its reply.
+
+    Ordering is deliberate. The turn runs before the send so that what reaches
+    chat is the Chat Agent's message rather than a placeholder it later talks
+    around; the routing registration and the incident store happen after the
+    send because both need the thread the send resolves. If the turn fails the
+    report is posted unrelayed — a scheduled finding that reached a real problem
+    should not be lost because the front door was busy.
+    """
+    active_platform = get_active_platform()
+    api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("API_SERVER_KEY", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    _ensure_session_row(session_id, profile, job_id)
+
+    if not _create_gateway_session(api_url, session_id, headers):
+        logger.error(f"Relay for {profile}/{job_id}: gateway session {session_id} unavailable")
+
+    message = _run_relay_turn(
+        api_url, session_id, report, _build_relay_instructions(profile, job_id, title), headers
+    )
+    if message is None:
+        # Degraded, and say so in the channel rather than in a log nobody reads:
+        # the report is the point, the Chat Agent's framing is the polish.
+        logger.warning(f"Relay for {profile}/{job_id}: posting the raw report, unrelayed")
+        message = report
+
+    chat_id, thread_id = _lookup_session_routing(session_id)
+    new_thread_id = _send_to_chat(active_platform, message, chat_id, thread_id)
+    if not new_thread_id:
+        logger.error(f"Relay for {profile}/{job_id}: report composed but not delivered")
+        return
+
+    if new_thread_id != thread_id:
+        _register_session_routing(session_id, active_platform, new_thread_id)
+        chat_id, thread_id = _lookup_session_routing(session_id)
+
+    _store_incident_report(chat_id, thread_id, message)
+    logger.info(f"Relayed {profile}/{job_id} report to {active_platform} thread {thread_id}")
+
+
+@app.post("/v1/cron-reports", dependencies=[Depends(verify_api_key)])
+def submit_cron_report(request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
+    """Accept a specialist's finished scheduled report for relay to chat."""
+    job_id = str(request_data.get("job_id") or "").strip()
+    report = str(request_data.get("report") or "").strip()
+    profile = str(request_data.get("profile") or "").strip() or "platform"
+    title = str(request_data.get("title") or "").strip()
+
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id field is required")
+    if not report:
+        raise HTTPException(status_code=400, detail="report field is required")
+    if len(report) > CRON_REPORT_MAX_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"report is {len(report)} chars, over the {CRON_REPORT_MAX_CHARS} limit",
+        )
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    session_id = _cron_report_session_id(profile, job_id, day)
+
+    # Same shape as /inject: the caller is an agent turn waiting on a tool
+    # result, and the relay costs a full model turn plus a chat round trip.
+    background_tasks.add_task(relay_cron_report, session_id, profile, job_id, title, report)
+    return {"status": "accepted", "session_id": session_id}
+
+
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""

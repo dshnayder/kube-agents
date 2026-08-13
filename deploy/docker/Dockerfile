@@ -289,6 +289,42 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
 
+# Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
+# Agent instead of posting it, so the finding lands in a thread that can answer
+# "why does that matter?".
+# Upstream resolves `deliver` to a chat platform and sends. On this install that
+# is where a watchdog's report goes to die: profile_cron_tick.py can only hand a
+# child profile the Slack home channel, so on Google Chat `deliver: "all"`
+# expands to an empty target list and the run records "no delivery target
+# resolved" while posting nowhere. Even where it does post, the report arrives
+# from a process that has exited -- the Chat Agent, which is who the user
+# replies to, never saw it.
+# A delivery MODE rather than a line in every job's prompt, because the prompt
+# only reaches jobs shipped in this image. A job the user asks for at runtime is
+# created through cronjob(action='create') and carries no such contract, which
+# is the case this has to cover: `deliver` is a field every creation path can
+# set, including the model's own tool call.
+# The applier proves the two anchors matched; it cannot prove the fork is
+# reached, and both ways it can fail are quiet -- an unpatched build posts
+# nowhere, exactly like a watchdog with nothing to say, and a broken fallback
+# loses the report into last_delivery_error. verify_cron_deliver_chat.py drives
+# the real patched _deliver_result against a loopback stand-in for the Session
+# KV server and asserts on what crossed the wire.
+# Must stay AFTER the cron_tick_lock_scope and cron_skip_ledger blocks: the
+# anchors were derived from the fully-patched cron/scheduler.py.
+# See the module docstring in deploy/docker/patches/cron_deliver_chat.py.
+COPY --chmod=0644 deploy/docker/patches/cron_deliver_chat.py /opt/hermes/tools/cron_deliver_chat.py
+COPY deploy/docker/patches/apply_cron_deliver_chat.py \
+     deploy/docker/patches/verify_cron_deliver_chat.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-deliver-chat/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-deliver-chat/apply_cron_deliver_chat.py /opt/hermes && \
+    grep -q "job = _ka_intercept_chat_delivery(job, content)" /opt/hermes/cron/scheduler.py && \
+    grep -q "from tools.cron_deliver_chat import" /opt/hermes/cron/scheduler.py && \
+    grep -q "_ka_wants_chat_delivery(user_deliver)" /opt/hermes/tools/cronjob_tools.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-deliver-chat/verify_cron_deliver_chat.py && \
+    rm -rf /tmp/cron-deliver-chat
+
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
 # three edits to the same twenty lines of gateway/kanban_watchers.py. Three

@@ -610,6 +610,67 @@ def send_notification(message: str, session_id: str = "") -> str:
     return "\n".join(results) if results else "ERROR: No target platform configured."
 
 
+@mcp.tool()
+def report_to_chat(report: str, job_id: str, title: str = "") -> str:
+    """
+    Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
+
+    You usually do NOT need this. A job created with deliver='chat' has its final
+    response relayed to the Chat Agent automatically, with nothing to call and
+    nothing to remember. Use this tool only when that is not enough: to report
+    partway through a long run, or to send something other than your final answer.
+
+    Having called it, return exactly `[SILENT]` so the same finding is not also
+    delivered as the run's result. The Chat Agent presents what you pass, so write
+    `report` as the finished message for a human reader, not as notes to yourself.
+
+    Prefer this over send_notification for scheduled work: send_notification posts
+    with no conversational context, so a user replying to it reaches an agent that
+    does not know what they are referring to.
+
+    Args:
+        report: The finished report, in markdown. This is what the user reads.
+        job_id: The id of the cron job producing this report (e.g. 'compliance-audit').
+        title: Optional human-readable job name, used to orient the reader.
+    """
+    import json
+    import urllib.request
+
+    report = (report or "").strip()
+    if not report:
+        return "ERROR: report is empty; nothing to deliver."
+    if not (job_id or "").strip():
+        return "ERROR: job_id is required so replies can be routed back to this job's thread."
+
+    # The profile is the specialist's identity here, and it is not the agent's to
+    # assert: taking it from HERMES_HOME means a scaffolded cluster profile reports
+    # under its own name without the prompt having to carry it. A named profile
+    # lives at <root>/profiles/<name>; anything else is the unprofiled home, where
+    # the directory name ("data") would be a misleading thing to label a report.
+    home = get_hermes_home()
+    profile = home.name if home.parent.name == "profiles" else "platform"
+
+    body = json.dumps(
+        {"job_id": job_id.strip(), "profile": profile, "title": (title or "").strip(), "report": report}
+    ).encode()
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8699/v1/cron-reports",
+            data=body,
+            headers=_session_kv_headers({"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return f"ERROR: Failed to hand the report to the chat relay: {exc}"
+
+    return (
+        f"SUCCESS: Report accepted for delivery to chat (session {payload.get('session_id', '?')}). "
+        "The Chat Agent posts it; do not also call send_notification for this report."
+    )
+
+
 def start_session_kv_server() -> None:
     """Start the session metadata HTTP resolver when the MCP server starts."""
     try:
