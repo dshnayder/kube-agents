@@ -223,13 +223,16 @@ tool_loop_guardrails:
 # belongs to the install and this file is baked into the image. It writes an empty
 # value for any provider that cannot be made read-only and scoped by tag — a
 # per-user file provider has no identity to key on here. The value below is what a
-# run without the operator gets.
+# run without the operator gets, and it is empty for that same reason: the default
+# store is the per-user file one, which a specialist cannot use, so a specialist
+# with nobody to ask reads its facts from the kanban card instead. An install that
+# chooses `hindsight` is what fills this in.
 #
 # See docs/designs/memory.md and agents/chat/config.yaml (the front door, where
 # writes do happen).
 memory:
   memory_enabled: false
-  provider: kube_agents_memory
+  provider: ""
   read_only: true
   user_profile_enabled: false
 

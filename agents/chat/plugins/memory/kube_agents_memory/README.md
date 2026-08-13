@@ -36,10 +36,11 @@ Hermes profile on the path, which is why they copy rather than import; both say 
 
 ## Choosing it
 
-This is the default provider, and it is what `install.sh --memory=hindsight` selects. It needs the
-in-cluster Hindsight API and its Postgres database, which provisioning step 13 deploys. For a small
-or personal install that will not run a database, [`multiuser_memory`](../multiuser_memory/README.md)
-is the alternative.
+`install.sh --memory=hindsight` selects this provider. It is opt-in rather than the default: it needs
+the in-cluster Hindsight API and its Postgres database, which provisioning step 13 deploys, and an
+install that says nothing about memory must not grow those. The default is
+[`multiuser_memory`](../multiuser_memory/README.md), which is what a small or personal install wants
+and what every install got before this provider existed.
 
 ```yaml
 spec:

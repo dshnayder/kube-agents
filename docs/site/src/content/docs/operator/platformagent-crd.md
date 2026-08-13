@@ -50,7 +50,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`. |
 | `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.     |
 | `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
-| `memory.provider`                              | string | Memory provider implementation. Default `kube_agents_memory`; `none` for none. See below.                                                                    |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                      |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
@@ -68,11 +68,11 @@ here; add the key to the agent Secret and restart the pod.
 `provider` picks which long-term memory implementation the agents load. Two ship in this repository,
 and the difference between them is the whole choice:
 
-| Value                            | Fits                       | What it costs to run                                      | What it gives                                            |
-| -------------------------------- | -------------------------- | --------------------------------------------------------- | -------------------------------------------------------- |
-| `kube_agents_memory` _(default)_ | enterprise deployments     | a Hindsight API server and a Postgres database in-cluster | ranked recall, per-user and shared scopes, consolidation |
-| `multiuser_memory`               | small or personal installs | nothing — a per-user Markdown file inside the pod         | verbatim recall of everything, no ranking or search      |
-| `none`                           | —                          | nothing                                                   | no provider; Hermes' built-in store only                 |
+| Value                          | Fits                       | What it costs to run                                      | What it gives                                            |
+| ------------------------------ | -------------------------- | --------------------------------------------------------- | -------------------------------------------------------- |
+| `multiuser_memory` _(default)_ | small or personal installs | nothing — a per-user Markdown file inside the pod         | verbatim recall of everything, no ranking or search      |
+| `kube_agents_memory`           | enterprise deployments     | a Hindsight API server and a Postgres database in-cluster | ranked recall, per-user and shared scopes, consolidation |
+| `none`                         | —                          | nothing                                                   | no provider; Hermes' built-in store only                 |
 
 The split is about how the store is read, not about how good it is. The file provider concatenates
 everything into the system prompt on every turn, so it is bounded by the context window; Hindsight

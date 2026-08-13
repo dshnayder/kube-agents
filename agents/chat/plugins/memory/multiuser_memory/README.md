@@ -7,8 +7,10 @@ so a `SIGKILL` mid-write cannot leave a half-file behind.
 It needs nothing outside the pod: no API server, no database, no embedding model, no LLM
 call on the write path. That is the whole reason it is still here — it is the answer for a
 **small or personal** install that wants the agent to remember things without also running
-Hindsight and its Postgres. An **enterprise** fleet wants `kube_agents_memory`, which is the
-default provider.
+Hindsight and its Postgres, and it is the **default provider**: it is what this repository
+shipped before `kube_agents_memory` existed, so an install or a CR that says nothing about
+memory keeps the store it already has instead of growing a database. An **enterprise** fleet
+opts up to `kube_agents_memory`.
 
 What it gives up in exchange is retrieval. There is no ranking and no search: every entry
 in the user's file is read into the prompt, so the cost grows with everything ever

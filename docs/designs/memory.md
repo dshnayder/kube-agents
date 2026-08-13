@@ -362,16 +362,30 @@ answered the same questions from a small fraction of it. Below the bound there i
 nothing to buy: a handful of clusters and a handful of people will not reach it,
 and a database there is cost without a benefit.
 
-**Memory is on by default, and `kube_agents_memory` is what it means.** An install
-that says nothing about memory gets ranked recall and the two workloads behind it;
-`--memory=file` steps down to the file store, and `--memory=off` retains nothing.
-The default runs the other way from the usual "opt in to the expensive thing"
-because the cheap thing here is not free: an agent that forgets every conversation
-makes the same person re-state the same context indefinitely, and that is the cost
-paid by every install that never found the flag. An install small enough to prefer
-the file store is the one in a position to say so. `kube_agents_memory` is also the
-provider named wherever there is no install to ask — the CRD default, `common.sh`,
-and both profiles' `config.yaml`.
+**Memory is on by default, and `multiuser_memory` is what it means.** An install
+that says nothing about memory gets the file store; `--memory=hindsight` steps up
+to ranked recall and the two workloads behind it, and `--memory=off` retains
+nothing. Two things decide the default, and they point the same way.
+
+The first is that the cheap thing here is not free. An agent that forgets every
+conversation makes the same person re-state the same context indefinitely, and
+that is the cost paid by every install that never found the flag — so the default
+is a store, not `off`.
+
+The second is backward compatibility, and it is what picks _which_ store. The file
+store is what this repository shipped before `kube_agents_memory` existed. Every
+place a default is taken is a place something older is being read: an upgrade
+re-running `install.sh` with no `--memory`, a CR written against the previous CRD
+schema and reconciled by a newer operator, a `vars.sh` from before
+`MEMORY_PROVIDER` was prompted for. Defaulting those to ranked recall would grow
+each of them an API server and a Postgres database nobody asked for, and would
+point the agent at a Hindsight service the install never deployed. Taking a
+default has to mean "keep what you have". An enterprise fleet that wants ranked
+recall is in a position to say so, and `--memory=hindsight` is how. Consequently
+`multiuser_memory` is the provider named wherever there is no install to ask — the
+CRD default, `common.sh`, and the Chat Agent's `config.yaml`. The specialist
+profile names no provider at all, because a file store has no gateway identity for
+a specialist to key on; see the overlay rule below.
 
 The choice is made once, at install, and then carried by the CR. Four places have
 to agree about it, and the reason they are listed together is that a disagreement
@@ -380,7 +394,7 @@ is either a database nobody asked for or a memory tool that never loads.
 
 | Where                                               | What it holds                                                                  |
 | --------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `install.sh --memory=hindsight\|file\|off`          | the question a human answers, also prompted interactively                      |
+| `install.sh --memory=file\|hindsight\|off`          | the question a human answers, also prompted interactively                      |
 | `MEMORY_PROVIDER` in `k8s-operator/scripts/vars.sh` | the answer, as a provider name; validated against `MEMORY_PROVIDER_CHOICES`    |
 | `spec.harness.memory.provider`                      | the answer, on the CR — the only copy the running system reads                 |
 | `MEMORY_PROVIDER` env on the pod                    | the same value, for the entrypoint, which runs before `config.yaml` is in play |
@@ -404,7 +418,7 @@ open.
 
 `off` maps to **`none`**, not to an empty string. Hermes spells "no provider" as
 `""`, but an empty string cannot survive the trip: an absent CR field takes the
-kubebuilder default, so `""` round-trips back to `kube_agents_memory`. The sentinel
+kubebuilder default, so `""` round-trips back to `multiuser_memory`. The sentinel
 is translated back to Hermes' spelling at the single point where `config.yaml` is
 rendered — `resolveMemoryProvider` in
 [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go).
@@ -991,7 +1005,7 @@ So the platform profile now reads shared memory and writes nothing
 ```yaml
 memory:
   memory_enabled: false
-  provider: kube_agents_memory
+  provider: ""
   read_only: true
   user_profile_enabled: false
 ```
@@ -1001,6 +1015,12 @@ memory:
 that lists it; the provider loads off `provider` alone. Leaving it false is what
 keeps the built-in tool inert — a null store, short-circuited before it touches disk
 — and so what makes the profile read-only in fact rather than only in the provider.
+
+The empty `provider` is the same rule as the overlay above, applied to the baked
+file: the default store is the per-user file one, which a specialist has no identity
+to key on, so an image running without the operator gives its specialists no
+provider at all. `--memory=hindsight` is what fills this key in, and it does so
+through the overlay rather than by editing the image.
 
 The specialist gets both forms of read, and they are not separable: enabling the
 provider gives Hermes something to `prefetch` from, and prefetch is the injection.

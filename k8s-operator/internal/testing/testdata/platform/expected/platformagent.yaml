@@ -370,7 +370,7 @@ data:
           HERMES_HOME: ${HERMES_HOME}
     memory:
       memory_enabled: false
-      provider: kube_agents_memory
+      provider: multiuser_memory
       user_profile_enabled: false
     model:
       api_key: none
@@ -418,7 +418,7 @@ data:
       backend: ddgs
   profile-platform.overlay.yaml: |
     memory:
-      provider: kube_agents_memory
+      provider: ""
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -668,7 +668,7 @@ spec:
             - name: HINDSIGHT_API_URL
               value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
             - name: MEMORY_PROVIDER
-              value: kube_agents_memory
+              value: multiuser_memory
             - name: AGENT_SHARED_STATE_SETUP
               value: owner
             - name: API_SERVER_MODEL_NAME

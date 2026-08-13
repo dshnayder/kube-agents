@@ -257,8 +257,8 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	if !strings.Contains(yamlContent, "memory_enabled: false") {
 		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "provider: kube_agents_memory") {
-		t.Errorf("expected provider: kube_agents_memory by default, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "provider: multiuser_memory") {
+		t.Errorf("expected provider: multiuser_memory by default, got:\n%s", yamlContent)
 	}
 	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
 		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+
@@ -3590,9 +3590,12 @@ func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	if len(parsed) != 1 {
 		t.Errorf("platform overlay must carry memory alone here, got %v", parsed)
 	}
+	// The default provider is the per-user file store, which a specialist has no
+	// identity to key on, so the overlay blanks it — the key is still written, and
+	// writing it is the point: it overrides whatever the image baked in.
 	memory, _ := parsed["memory"].(map[string]any)
-	if fmt.Sprint(memory["provider"]) != defaultMemoryProvider {
-		t.Errorf("provider = %v, want %q", memory["provider"], defaultMemoryProvider)
+	if fmt.Sprint(memory["provider"]) != "" {
+		t.Errorf("provider = %v, want %q", memory["provider"], "")
 	}
 }
 
@@ -3601,8 +3604,8 @@ func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 // blanks it rather than passing it through — see memoryOverlay.
 func TestBuildConfigMapDataPlatformOverlayFollowsProvider(t *testing.T) {
 	for _, tc := range []struct{ provider, want string }{
-		{"", defaultMemoryProvider},
-		{"kube_agents_memory", defaultMemoryProvider},
+		{"", ""},
+		{"kube_agents_memory", kubeAgentsMemoryProvider},
 		{"hindsight", "hindsight"},
 		{"multiuser_memory", ""},
 		{"none", ""},

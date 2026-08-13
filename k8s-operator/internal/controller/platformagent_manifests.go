@@ -460,8 +460,16 @@ func agentLimitsOverlay(limits *agentv1alpha1.AgentLimits) map[string]any {
 }
 
 // defaultMemoryProvider is the provider a PlatformAgent gets when its spec says
-// nothing. It is this repo's slim wrapper around the upstream `hindsight` plugin.
-const defaultMemoryProvider = "kube_agents_memory"
+// nothing. It is the per-user file store, which needs nothing running outside the
+// pod — the same store this operator gave an agent before the Hindsight-backed
+// wrapper existed, so a CR written against the older schema reconciles unchanged
+// rather than being pointed at a service the install never deployed. Keep in step
+// with the kubebuilder default on MemorySpec.Provider.
+const defaultMemoryProvider = "multiuser_memory"
+
+// kubeAgentsMemoryProvider is this repo's slim wrapper around the upstream
+// `hindsight` plugin. An install opts into it; nothing defaults to it.
+const kubeAgentsMemoryProvider = "kube_agents_memory"
 
 // memoryProviderNone is how the CR spells "no external memory provider — leave the
 // harness with its built-in store".
@@ -523,7 +531,7 @@ func memoryOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 // k8s-operator/scripts/common.sh, which decides whether to deploy it.
 func memoryProviderIsHindsightBacked(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case defaultMemoryProvider, "hindsight":
+	case kubeAgentsMemoryProvider, "hindsight":
 		return true
 	default:
 		return false

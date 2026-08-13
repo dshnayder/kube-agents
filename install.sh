@@ -71,7 +71,7 @@ PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
-PARAM_MEMORY="${MEMORY:-hindsight}"
+PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
@@ -108,18 +108,20 @@ Flags for AI Agents & Automation:
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
-  --memory=MODE                 Long-term agent memory: hindsight | file | off
-                                (default: hindsight)
-                                  hindsight ENTERPRISE deployments, and the default. Searchable,
-                                            ranked recall that stays affordable as the store
-                                            grows (kube_agents_memory, the default provider).
-                                            Deploys the Hindsight API and a Postgres
-                                            database into the cluster.
-                                  file      SMALL / PERSONAL deployments. Per-user Markdown
+  --memory=MODE                 Long-term agent memory: file | hindsight | off
+                                (default: file)
+                                  file      SMALL / PERSONAL deployments, and the default —
+                                            it is what every install got before the searchable
+                                            store existed, so an upgrade that says nothing
+                                            keeps the store it already has. Per-user Markdown
                                             files inside the pod (multiuser_memory). No extra
                                             services, but the whole store is loaded into the
                                             model's context every turn, so it stops scaling
                                             once there is more than a few pages of it.
+                                  hindsight ENTERPRISE deployments. Searchable, ranked recall
+                                            that stays affordable as the store grows
+                                            (kube_agents_memory). Deploys the Hindsight API
+                                            and a Postgres database into the cluster.
                                   off       nothing is retained between sessions. No memory
                                             provider, and no database to run.
   --image-tag=TAG               Validated immutable release tag or full commit SHA
@@ -736,7 +738,7 @@ write_json_report() {
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-false},
-  "memory_mode": "$(json_escape "${memory_mode:-hindsight}")",
+  "memory_mode": "$(json_escape "${memory_mode:-file}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "vars_file": "$(json_escape "${vars_file:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -1401,7 +1403,12 @@ main() {
   # harness keeps memory at all, and — when it does — whether that costs an
   # extra API server and Postgres database in the cluster. Nothing downstream
   # infers one from the other, so both are recorded.
-  local memory_mode="${PARAM_MEMORY:-hindsight}"
+  #
+  # `file` is the default because it is what every install got before the
+  # searchable store existed: an upgrade that says nothing about memory keeps
+  # the store it already has, and no install grows a Postgres database it never
+  # asked for. Enterprise deployments opt in with --memory=hindsight.
+  local memory_mode="${PARAM_MEMORY:-file}"
   if [[ ! "$memory_mode" =~ ^(off|file|hindsight)$ ]]; then
     print_error "--memory must be one of: off, file, hindsight."
     exit 1
@@ -1460,12 +1467,14 @@ main() {
     # whole on every turn, so it is bounded by the window; Hindsight retrieves only
     # what a question needs, at the price of an API server and a database.
     #
-    # The searchable store is listed first because prompt_menu's default answer is
-    # always option 1, and this is the one an install should get for saying nothing.
+    # The file store is listed first because prompt_menu's default answer is
+    # always option 1, and this is the one an install should get for saying
+    # nothing — it is what installs got before the searchable store existed, and
+    # it is the only option that adds no services to the cluster.
     local memory_choice=""
     prompt_menu "Should the agent remember things between conversations?" \
-      "Searchable store (Default) - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
-      "Files on the agent's own disk - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "Files on the agent's own disk (Default) - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "Searchable store - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
       "No - Nothing is retained once a session ends" \
       memory_choice
 
@@ -1473,8 +1482,8 @@ main() {
     # --memory=: an answer given at the prompt is the more recent instruction of
     # the two, and the permission-set and gVisor prompts above already work this way.
     case "$memory_choice" in
-      1) memory_mode="hindsight" ;;
-      2) memory_mode="file" ;;
+      1) memory_mode="file" ;;
+      2) memory_mode="hindsight" ;;
       3) memory_mode="off" ;;
     esac
   fi
@@ -1497,13 +1506,14 @@ main() {
   # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
   # in k8s-operator/scripts/common.sh.
   #
-  # `kube_agents_memory` is the default provider everywhere it is named with no
+  # `multiuser_memory` is the default provider everywhere it is named with no
   # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
-  # and `hindsight` is what an install that says nothing about memory gets.
+  # and `file` is what an install that says nothing about memory gets — the same
+  # store those installs already had before the searchable one existed.
   local memory_enabled="false"
-  local memory_provider="kube_agents_memory"
+  local memory_provider="multiuser_memory"
   case "$memory_mode" in
-    file) memory_provider="multiuser_memory" ;;
+    hindsight) memory_provider="kube_agents_memory" ;;
     off) memory_provider="none" ;;
   esac
 

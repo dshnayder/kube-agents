@@ -333,6 +333,10 @@ init_var_platform_agent_permission_set() {
 # rest are the external plugins Hermes ships — see `memory.provider` in its
 # hermes_cli/config.py.
 #
+# `multiuser_memory` is the default because it is what this repo shipped before
+# `kube_agents_memory` existed: re-running provisioning against an install that
+# never chose a provider must not silently grow it a Postgres database.
+#
 # `none` is this installer's spelling of "no external provider — keep Hermes'
 # built-in store". Hermes itself spells that as the empty string, but an empty
 # string cannot survive the trip through the CR: an absent field takes the CRD
@@ -342,7 +346,7 @@ init_var_platform_agent_permission_set() {
 MEMORY_PROVIDER_CHOICES="none kube_agents_memory multiuser_memory hindsight mem0 openviking holographic retaindb byterover"
 
 init_var_memory_provider() {
-  init_var "MEMORY_PROVIDER" "kube_agents_memory" \
+  init_var "MEMORY_PROVIDER" "multiuser_memory" \
     "Enter agent memory provider (${MEMORY_PROVIDER_CHOICES// /, })"
 
   MEMORY_PROVIDER=$(echo "$MEMORY_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
