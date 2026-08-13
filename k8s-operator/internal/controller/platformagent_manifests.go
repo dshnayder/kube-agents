@@ -157,17 +157,22 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 // happens at startup, so a live update without a restart would be a no-op that silently
 // lies.
 //
-// The default profile's entry is keyed like every other profile's, `profile-default.
-// overlay.yaml`, because that is what makes it reachable: docker-entrypoint.sh globs
-// $OVERLAY_DIR for that shape. It was previously keyed `config.yaml` and subPath-mounted
-// over $HERMES_HOME/config.yaml, which both failed to reach the agent (the entrypoint
-// force-copied the image's file over the mount) and made the live config read-only, so
-// nothing the agent itself writes there — `/sethome`'s home channel above all — could be
-// saved. See renderConfigYAML.
+// The default profile is the exception: its render does not ride in a
+// `profile-default.overlay.yaml` key and is not merged into the PVC at all. It is the
+// managed scope — mounted read-only at /etc/hermes and pinned by Hermes on every load.
+// See the managedScopeDir block for why, and renderConfigYAML for what it contains.
+//
+// Two earlier shapes failed. Keying it `config.yaml` and subPath-mounting it over
+// $HERMES_HOME/config.yaml never reached the agent (the entrypoint force-copied the
+// image's file over the mount) and made the live config read-only, so nothing the agent
+// writes there — `/sethome`'s home channel above all — could be saved. Merging it in at
+// startup fixed the writability but left every merged key mutable, so the agent could
+// still repoint its own model endpoint and keep that across restarts.
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
 	data := map[string]string{
-		profileOverlayKey(defaultProfileName): renderConfigYAML(agent, agentPlugins),
-		"leader_elect.py":                     leaderElectScript,
+		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
+		managedEnvKey:     renderManagedEnv(agent),
+		"leader_elect.py": leaderElectScript,
 	}
 
 	_, targeted := partitionPluginsByProfile(filterValidAgentPlugins(agentPlugins))
@@ -211,6 +216,71 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 		data[clusterProfileClassKey] = overlay
 	}
 	return data
+}
+
+// renderManagedEnv pins the platform settings that decide whether the agent can reach
+// chat at all, for the ones that have no config.yaml equivalent.
+//
+// The config layer alone would not hold them. load_gateway_config applies the managed
+// overlay early and then calls _apply_env_overrides LAST (gateway/config.py), so an env
+// var beats a pinned `platforms.*` leaf — and $HERMES_HOME/.env, which the agent can
+// write through save_env_value, is loaded with override=True and beats the container env
+// under it. Pinning here closes both: the managed .env is applied last of all, and
+// save_env_value refuses to write a key this file holds.
+//
+// Home channel is deliberately absent. It is the one platform setting the agent is meant
+// to own — /sethome writes it to config.yaml and mirrors it into the PVC .env, and that
+// mirror is what lets a user's choice outrank the CR's seed on the next start. Pinning it
+// here would break /sethome exactly the way the read-only mount did.
+//
+// Emitted even when empty: the volume projects this key by name, and a ConfigMap item
+// that names a missing key fails the mount and the pod never starts.
+func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+	integration := agent.Spec.Integration
+	if integration == nil {
+		return ""
+	}
+
+	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
+	// reshuffles on every reconcile would roll the pod for no reason.
+	var lines []string
+	add := func(key, value string) {
+		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+		add("GOOGLE_CHAT_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
+		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
+		add("GOOGLE_CHAT_ALLOWED_USERS", strings.Join(gchat.AllowedUsers, ","))
+		if allowAllUsers(gchat.AllowedUsers) {
+			add("GOOGLE_CHAT_ALLOW_ALL_USERS", "true")
+		}
+	}
+
+	if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+		add("SLACK_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		if allowAllUsers(slack.AllowedUsers) {
+			add("SLACK_ALLOW_ALL_USERS", "true")
+		} else {
+			add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
+		}
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// allowAllUsers reads an allowlist the way the env builder does: absent, or present but
+// holding a single empty string (which is what an unset CR list marshals to), means the
+// deployment did not restrict anyone.
+func allowAllUsers(users []string) bool {
+	if len(users) == 0 {
+		return true
+	}
+	return len(users) == 1 && users[0] == ""
 }
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
@@ -371,6 +441,47 @@ const (
 	profileOverlayDir = "/opt/agent-config"
 )
 
+// Managed scope: the front door's config is administrator-pinned rather than merged.
+//
+// Hermes reads a second config layer from a system directory and lets it WIN, per leaf
+// key, over $HERMES_HOME/config.yaml — see hermes_cli/managed_scope.py. Three things
+// enforce it: load_config deep-merges the managed dict on top of the user's
+// (hermes_cli/config.py), save_config strips every managed leaf before writing, and
+// set_config_value hard-rejects one by name. The gateway builds its own dict and calls
+// apply_managed_overlay explicitly (gateway/config.py).
+//
+// This replaces the three-way merge the default profile used to get at startup. That
+// merge had to guess which of the live file's values were the runtime's own edits and
+// which were stale operator settings, and its rule — runtime wins where the baseline has
+// not moved — meant a bad value the agent wrote for itself survived every restart. The
+// agent could repoint model.base_url at nothing and lose the ability to reason its way
+// back. Pinning inverts that: whatever lands in the PVC file, the operator's value is
+// what loads, so a restart always heals.
+//
+// $HERMES_HOME/config.yaml stays an ordinary writable file. Only the leaves rendered
+// into the managed file are frozen, and `platforms.<p>.home_channel` is deliberately not
+// one of them — /sethome has to keep working from chat.
+const (
+	// managedScopeDir is managed_scope.py's POSIX default. HERMES_MANAGED_DIR is set to
+	// it explicitly anyway, so the policy is visible in `kubectl get pod -o yaml`.
+	managedScopeDir = "/etc/hermes"
+
+	// managedConfigKey holds the render in the config ConfigMap. Deliberately NOT of the
+	// `profile-<name>.overlay.yaml` shape: that glob is what the entrypoint walks to find
+	// overlays to merge, and the whole point here is that this file is not merged.
+	managedConfigKey = "managed-config.yaml"
+
+	// managedEnvKey pins the platform credentials/endpoints that have no config.yaml
+	// equivalent. load_hermes_dotenv applies the managed .env LAST with override=True, so
+	// it beats both the PVC .env the agent can write and the container env below it, and
+	// save_env_value refuses to write a key it holds (hermes_cli/config.py).
+	managedEnvKey = "managed.env"
+
+	// managedVolumeName projects the two keys above into managedScopeDir under the names
+	// Hermes expects (config.yaml and .env).
+	managedVolumeName = "platform-agent-managed-vol"
+)
+
 // profileOverlayKey returns the ConfigMap key carrying the overlay for a profile.
 func profileOverlayKey(profile string) string {
 	return profileOverlayPrefix + profile + profileOverlaySuffix
@@ -379,9 +490,11 @@ func profileOverlayKey(profile string) string {
 // platformProfileName is the profile the Platform Agent runs as.
 const platformProfileName = "platform"
 
-// defaultProfileName is the front-door Chat Agent's profile. Unlike every other profile
-// it has no directory under $HERMES_HOME/profiles — its home IS $HERMES_HOME — but it
-// takes its config through the same `profile-<name>.overlay.yaml` key as the rest.
+// defaultProfileName is the front-door Chat Agent's profile. It is the odd one twice
+// over: it has no directory under $HERMES_HOME/profiles — its home IS $HERMES_HOME —
+// and it is the only profile whose operator settings do not arrive as a
+// `profile-<name>.overlay.yaml` merged into its config. They arrive as the managed
+// scope; see managedConfigKey.
 const defaultProfileName = "default"
 
 // defaultKanbanMaxInProgress bounds concurrent kanban workers when the CR does not.
@@ -698,33 +811,35 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
-// renderConfigYAML builds the default (Chat Agent) profile's config overlay.
+// renderConfigYAML builds the default (Chat Agent) profile's MANAGED config.
 //
-// It is emitted as `profile-default.overlay.yaml`, the same ConfigMap key shape every
-// other profile's overlay uses, and reaches the agent the same way: the ConfigMap is
-// mounted read-only at /opt/agent-config and docker-entrypoint.sh step 2d merges this
-// file onto the image's agents/chat/config.yaml.
+// Unlike every other profile, this rendering is not an overlay merged into the PVC. It
+// is emitted as the `managed-config.yaml` ConfigMap key, mounted read-only at
+// /etc/hermes/config.yaml, and Hermes overlays it leaf-by-leaf on top of the agent's own
+// $HERMES_HOME/config.yaml at every load — see the managedScopeDir block for the full
+// contract and the three enforcement points.
 //
-// MERGED, not mounted over. Two earlier arrangements failed and the merge is what
-// replaced them. Mounting this rendering over $HOME/config.yaml made the file read-only,
-// so the agent could no longer save its own settings there — `/sethome` returned EACCES —
-// and the entrypoint force-copied the image's config over the mount anyway, so none of
-// the keys below ever reached a running pod. Letting the mount simply win was not the
-// answer either: this is a whole-file rendering but it is not always a superset of the
-// image's config. platforms.google_chat.typing_status_text is only rendered when the CR
-// enables Google Chat, so on a Slack-only deployment an authoritative replacement would
-// drop a setting rather than add one.
+// WHAT THAT MEANS FOR THE KEYS BELOW: every leaf rendered here is authoritative AND
+// immutable at runtime. Keys this function says nothing about stay the image's, and
+// stay writable — which is what keeps `/sethome`, the monitoring install id and saved
+// slash-command preferences working. Two earlier arrangements failed:
 //
-// What "merged" means for the keys here: the operator wins every scalar it renders, the
-// image keeps every key the operator says nothing about, and list-valued keys UNION.
-// Union has no way to express a removal, which matters because the lists below are
-// duplicated in agents/chat/config.yaml — drop an entry from one copy only and the other
-// puts it straight back. TestRenderConfigYAMLListsMatchChatConfig fails the build when
-// the two drift, which is the only thing keeping that honest.
+//   - subPath-mounting this rendering over $HERMES_HOME/config.yaml. A subPath is a
+//     read-only mount POINT, so the agent could save nothing to its own config at all
+//     (`/sethome` returned EACCES); and the entrypoint force-copied the image's config
+//     over the mount anyway, so none of these keys reached a running pod.
+//   - merging it into the PVC file at startup. That fixed the writability but left every
+//     merged key mutable: an agent that repointed model.base_url at nothing kept that
+//     across restarts, because the merge treated the runtime's edit as the newer one.
 //
-// Runtime state — a home channel, an install id, saved preferences — survives the merge
-// because step 2d carries the live file's own edits across; see
-// deploy/shared/default_profile_config.py for the rules.
+// LISTS REPLACE, they do not union. The managed overlay is a leaf-level deep merge
+// (managed_scope.apply_managed_overlay -> _deep_merge) and a list is a leaf, so a list
+// rendered here wholly supplants the image's. The old startup merge unioned instead,
+// which meant an entry dropped from one copy was silently restored from the other; now
+// dropping it here DROPS it. The lists below are still duplicated in
+// agents/chat/config.yaml and TestRenderConfigYAMLListsMatchChatConfig still fails the
+// build when the two drift — under replacement that test is what stops this rendering
+// from quietly shrinking the front door's toolsets or plugins.
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
@@ -739,6 +854,16 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			Model    string `json:"model,omitempty"`
 			BaseURL  string `json:"base_url,omitempty"`
 			APIKey   string `json:"api_key,omitempty"`
+			// The wire protocol, rendered explicitly only so that it is PINNED:
+			// a key absent from this file is a key the managed scope does not
+			// hold, and `/model <x> --global` persists api_mode alongside the
+			// endpoint (hermes_cli/cli.py). Leaving it unpinned let a model
+			// switch write a Responses-API mode next to an immutable
+			// chat-completions base_url and keep it across restarts.
+			//
+			// No omitempty: an empty value here would drop the key and take the
+			// pin with it.
+			APIMode string `json:"api_mode"`
 		} `json:"model"`
 		Terminal struct {
 			Backend string `json:"backend"`
@@ -830,6 +955,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
 	cfg.Model.APIKey = "none"
+	// What `provider: custom` against a non-OpenAI base_url already resolves to
+	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this
+	// changes no behaviour — it only makes the value one the agent cannot rewrite.
+	cfg.Model.APIMode = "chat_completions"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
 
@@ -854,30 +983,29 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		"router": map[string]any{
 			"command": "/opt/hermes/.venv/bin/python3",
 			// Left as a placeholder rather than joined against cwd, and this is NOT
-			// cosmetic. Unlike every other profile, the default profile's config.yaml
-			// is not this render — it is agents/chat/config.yaml MERGED with this one
-			// (default_profile_config.py), and profile_overlay.merge unions lists.
-			// `args` is a command line, so a union is a concatenation: the moment the
-			// two declarations disagree the router is invoked with two script paths
-			// and python3 runs the FIRST one. path.Join(cwd, …) disagrees for exactly
-			// the case it was added to serve — a custom AgentHome, where the image's
-			// literal /opt/data/scripts/router_server.py sorts first and does not
-			// exist, because the entrypoint copied /opt/defaults into the custom home
+			// cosmetic. The image's agents/chat/config.yaml declares this same server,
+			// and that copy has to be correct on its own: the entrypoint seeds a fresh
+			// PVC from it, and the dashboard sidecar reads it before anything reconciles.
+			// path.Join(cwd, …) would make the two disagree for exactly the case it was
+			// added to serve — a custom AgentHome, where the image's literal
+			// /opt/data/scripts/router_server.py points at a directory the entrypoint
+			// never populated, because it copied /opt/defaults into the custom home
 			// instead. The router MCP then dies at startup and the Chat Agent has no
 			// specialist roster to delegate against.
 			//
-			// ${HERMES_HOME} keeps both sides byte-identical so the union collapses to
-			// one entry for any AgentHome, and each side is independently correct —
-			// which the image's copy has to be anyway, since the entrypoint seeds a
-			// fresh PVC from it before this render is merged in. The entrypoint
-			// exports HERMES_HOME=${PLATFORM_AGENT_HOME:-/opt/data} on line 5, the
+			// ${HERMES_HOME} keeps both sides byte-identical and independently correct
+			// for any AgentHome. It survives every expansion on the way in: the managed
+			// overlay expands ${VAR} against the PROCESS env only
+			// (managed_scope.apply_managed_overlay -> _expand_env_vars), the entrypoint
+			// exports HERMES_HOME=${PLATFORM_AGENT_HOME:-/opt/data} on line 5, and the
 			// operator sets PLATFORM_AGENT_HOME from the same AgentHome that produced
-			// cwd, and tools/mcp_tool.py `_interpolate_env_vars` resolves ${VAR}
-			// recursively through `args` — the sibling `env` below already relies on
-			// exactly that.
+			// cwd. tools/mcp_tool.py `_interpolate_env_vars` resolves anything left
+			// recursively through `args` — the sibling `env` below relies on that.
 			//
 			// TestRenderConfigYAMLListsMatchChatConfig compares every rendered list
 			// against the image's, under a custom AgentHome as well as the default.
+			// Under managed scope a list REPLACES rather than unions, so drift here no
+			// longer duplicates the script path — it silently substitutes one.
 			"args": []string{"${HERMES_HOME}/scripts/router_server.py"},
 			"env": map[string]string{
 				"HERMES_HOME": "${HERMES_HOME}",
@@ -1494,6 +1622,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: homeDir,
 		},
 		{
+			// managed_scope.py defaults to this path anyway. Set explicitly so the policy
+			// is visible in the pod spec, and so moving it later is a one-line change.
+			Name:  "HERMES_MANAGED_DIR",
+			Value: managedScopeDir,
+		},
+		{
 			Name:  "HOME",
 			Value: strings.TrimSuffix(homeDir, "/") + "/home",
 		},
@@ -1626,11 +1760,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 					Value: gchat.HomeChannel,
 				},
 			}...)
-			allowAll := len(gchat.AllowedUsers) == 0
-			if len(gchat.AllowedUsers) == 1 && gchat.AllowedUsers[0] == "" {
-				allowAll = true
-			}
-			if allowAll {
+			// Shared with renderManagedEnv: the managed .env pins this same answer, and
+			// the two disagreeing would leave the allowlist decided by load order.
+			if allowAllUsers(gchat.AllowedUsers) {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
 					Value: "true",
@@ -1642,8 +1774,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Name:  "SLACK_RELAY_URL",
 				Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
 			})
-			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")
-			if allowAllSlack {
+			if allowAllUsers(slack.AllowedUsers) {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "SLACK_ALLOW_ALL_USERS",
 					Value: "true",
@@ -1916,9 +2047,16 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 		// mount POINT, and this is the one file the running agent writes to — `/sethome`
 		// persisting a home channel, the monitoring policy minting an install id, saved
 		// slash-command preferences. Mounting it made every one of those fail with
-		// EACCES. The rendering reaches the agent through the read-only directory mount
-		// below instead, as `profile-default.overlay.yaml`, and docker-entrypoint.sh step
-		// 2d merges it into a real, writable file on the PVC.
+		// EACCES. The operator's rendering reaches the agent as the managed scope below
+		// instead, which wins at load without the file ever being written.
+		{
+			// Directory mount, never subPath: a subPath does not receive kubelet
+			// ConfigMap updates, and managed_scope.py caches on (mtime, size) — so as a
+			// directory a CR edit re-pins live, without a restart.
+			Name:      managedVolumeName,
+			MountPath: managedScopeDir,
+			ReadOnly:  true,
+		},
 		{
 			// Whole-ConfigMap directory mount so docker-entrypoint.sh can glob the
 			// per-profile overlays without the operator having to enumerate them as
@@ -2473,14 +2611,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			},
 			{
 				// The operator's whole-file rendering of the default profile's config,
-				// mounted AS config.yaml even though its ConfigMap key is the
-				// profile-default overlay: nothing else puts a config on the PVC for this
-				// container to find before the gateway's setup pass lands one there. The
-				// gateway takes the same rendering through the /opt/agent-config
-				// directory mount instead and merges it into a real, writable file on the
-				// PVC — mounting it over the gateway's config.yaml made that file
-				// read-only, which is why this subPath mount exists only here, on a
-				// container that never writes it. The dashboard used to write one itself,
+				// mounted AS config.yaml even though its ConfigMap key is the managed
+				// one: nothing else puts a config on the PVC for this container to find
+				// before the gateway's setup pass lands one there. The gateway takes the
+				// same rendering through the /etc/hermes managed-scope mount instead,
+				// which leaves its own config.yaml an ordinary writable file on the PVC —
+				// mounting it over the gateway's config.yaml made that file read-only,
+				// which is why this subPath mount exists only here, on a container that
+				// never writes it. The dashboard used to write one itself,
 				// as a side effect of running a setup pass it must no longer run; on a
 				// fresh PVC that leaves `hermes dashboard` starting against a HERMES_HOME
 				// with no config at all. An existing PVC hides this — it already carries
@@ -2495,9 +2633,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// against the kubelet's backoff. Making it an ordering rather than a race
 				// means moving the setup into an initContainer — see the KNOWN LIMIT note
 				// at step 1.5 of deploy/shared/docker-entrypoint.sh.
+				//
+				// Follows the render to its new key. The dashboard reads the same bytes
+				// it always did; only the key name moved when the default profile's
+				// config became the managed scope rather than an overlay to merge.
 				Name:      "platform-agent-config-vol",
 				MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-				SubPath:   profileOverlayKey(defaultProfileName),
+				SubPath:   managedConfigKey,
 			},
 			{
 				Name:      "system-metadata",
@@ -2618,6 +2760,30 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 						Name: agent.Name + "-config",
 					},
 					DefaultMode: ptr.To(int32(0755)),
+				},
+			},
+		},
+		{
+			// The same ConfigMap again, projected under the two names Hermes looks for in
+			// a managed scope. Item-projected rather than a whole-directory mount so
+			// /etc/hermes holds exactly config.yaml and .env — managed_scope.py reads
+			// only those, and the profile overlays and leader_elect.py alongside them in
+			// this ConfigMap have no business in an administrator policy directory.
+			//
+			// 0444: managed scope's v1 enforcement is filesystem permissions
+			// (managed_scope.py, docs/design/managed-scope.md §7). The mount is already
+			// ReadOnly; the mode makes the intent legible from the manifest.
+			Name: managedVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-config",
+					},
+					Items: []corev1.KeyToPath{
+						{Key: managedConfigKey, Path: "config.yaml"},
+						{Key: managedEnvKey, Path: ".env"},
+					},
+					DefaultMode: ptr.To(int32(0444)),
 				},
 			},
 		},

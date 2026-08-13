@@ -460,10 +460,10 @@ def get_platform_configmap_yaml() -> str:
 
     This used to live under a `config.yaml` key that was subPath-mounted straight over
     the agent's own config. That made the file read-only, so `/sethome` and every other
-    runtime write to it failed. It is an overlay like every other profile's now, merged
-    into the writable file at startup.
+    runtime write to it failed. It is the managed scope now — mounted read-only at
+    /etc/hermes and overlaid per leaf key, leaving the agent's own file writable.
     """
-    return get_overlay_yaml("profile-default.overlay.yaml")
+    return get_overlay_yaml("managed-config.yaml")
 
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:

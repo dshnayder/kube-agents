@@ -42,11 +42,12 @@ import (
 // The default profile's rendered config used to be a `config.yaml` key mounted
 // straight over the agent's own config.yaml. That made the file read-only, so every
 // runtime write to it failed — `/sethome` with an EACCES, `monitoring.install_id`
-// silently. It now ships as an overlay the entrypoint merges into that file at
-// startup, so the assertions below read the same rendered YAML under a different key.
+// silently. It now ships as the managed scope, mounted read-only at /etc/hermes and
+// overlaid by Hermes per leaf key, so the assertions below read the same rendered YAML
+// under a different key.
 func defaultProfileYAML(t *testing.T, cm *corev1.ConfigMap) string {
 	t.Helper()
-	key := profileOverlayKey(defaultProfileName)
+	key := managedConfigKey
 	content, ok := cm.Data[key]
 	if !ok {
 		t.Fatalf("%s missing from ConfigMap data, got keys %v", key, mapKeys(cm.Data))
@@ -2430,9 +2431,9 @@ func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
 			"and LiteLLM will reject every session it creates")
 	}
 
-	// The default profile's whole-file rendering is keyed like every other profile's
-	// overlay; there is no `config.yaml` key in the ConfigMap any more.
-	yamlContent := buildConfigMap(agent, nil).Data[profileOverlayKey(defaultProfileName)]
+	// The default profile's whole-file rendering is the managed-scope key; there is no
+	// `config.yaml` key in the ConfigMap any more.
+	yamlContent := buildConfigMap(agent, nil).Data[managedConfigKey]
 	if !strings.Contains(yamlContent, "model: "+got) {
 		t.Errorf("API_SERVER_MODEL_NAME=%s does not match the model in the generated profile config; "+
 			"the two must agree or API-created sessions request a model LiteLLM does not serve:\n%s",
@@ -2440,21 +2441,208 @@ func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
 	}
 }
 
+// chatAgent builds a PlatformAgent with both chat platforms enabled and an allowlist on
+// each, which is what the managed-scope assertions below need to distinguish a pinned
+// value from a defaulted one.
+func chatAgent() *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{
+			Enabled:          ptr.To(true),
+			ProjectID:        "proj",
+			SubscriptionName: "sub",
+			AllowedUsers:     []string{"users/alice"},
+			HomeChannel:      "spaces/SEEDED",
+		},
+		Slack: &agentv1alpha1.SlackSpec{
+			Enabled:         ptr.To(true),
+			AllowedUsers:    []string{"U123"},
+			HomeChannel:     "C0SEEDED",
+			HomeChannelName: "#seeded",
+		},
+	}
+	return a
+}
+
+// The whole point of issue #658: the front door's config.yaml must NOT be mounted, at
+// any key, over the agent's own file. A mount point is read-only, and `/sethome`,
+// `monitoring.install_id` and every saved slash-command preference are writes to that
+// exact path. The operator's rendering reaches the agent as the managed scope instead —
+// a separate directory Hermes overlays at load time.
+func TestRenderedConfigIsNotMountedOverTheAgentsOwn(t *testing.T) {
+	dep := buildDeployment(chatAgent(), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	for _, m := range gateway.VolumeMounts {
+		if m.MountPath == defaultAgentHome+"/config.yaml" {
+			t.Fatalf("the agent's config.yaml is a mount point again, so every runtime write to it "+
+				"fails (issue #658): %+v", m)
+		}
+	}
+}
+
+// The managed scope has to arrive as a DIRECTORY mount, and read-only.
+//
+// Not a subPath: a subPath mount never receives kubelet ConfigMap updates, so an
+// operator-side policy change would sit in the ConfigMap and never reach the running
+// pod. managed_scope.py caches on (mtime_ns, size) precisely so a directory mount can be
+// picked up in place.
+func TestManagedScopeIsADirectoryMount(t *testing.T) {
+	dep := buildDeployment(chatAgent(), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	var mount *corev1.VolumeMount
+	for i, m := range gateway.VolumeMounts {
+		if m.MountPath == managedScopeDir {
+			mount = &gateway.VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("no mount at %s, so hermes finds no managed scope and every pinned key is "+
+			"silently writable (managed scope fails open); mounts were %+v", managedScopeDir, gateway.VolumeMounts)
+	}
+	if mount.SubPath != "" {
+		t.Errorf("the managed scope is subPath-mounted (%q); the kubelet does not update a subPath, "+
+			"so a policy change would never reach a running pod", mount.SubPath)
+	}
+	if !mount.ReadOnly {
+		t.Error("the managed scope must be read-only: it is what the agent is not allowed to change")
+	}
+	if got, found := envValue(gateway, "HERMES_MANAGED_DIR"); !found || got != managedScopeDir {
+		t.Errorf("HERMES_MANAGED_DIR = %q (found=%v), want %q", got, found, managedScopeDir)
+	}
+
+	// Both keys have to be projected, and under the names hermes looks for.
+	var vol *corev1.Volume
+	for i, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == managedVolumeName {
+			vol = &dep.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if vol == nil || vol.ConfigMap == nil {
+		t.Fatalf("no ConfigMap volume %q backing the managed scope", managedVolumeName)
+	}
+	want := map[string]string{managedConfigKey: "config.yaml", managedEnvKey: ".env"}
+	got := map[string]string{}
+	for _, item := range vol.ConfigMap.Items {
+		got[item.Key] = item.Path
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("managed volume projects %v, want %v", got, want)
+	}
+}
+
+// What the managed config pins, and what it deliberately does not.
+//
+// `model` is pinned because the endpoint is LiteLLM's to decide: an agent that repoints
+// model.base_url at nothing loses the ability to reason its way back, and before the pin
+// that survived a restart. `toolsets` is pinned so the agent cannot grant itself tools.
+// `platforms.<p>.home_channel` is NOT pinned — that is what `/sethome` sets, and pinning
+// it is exactly the bug in #658.
+func TestManagedConfigPinsModelAndToolsetsButNotHomeChannel(t *testing.T) {
+	var cfg map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(chatAgent(), nil)[managedConfigKey]), &cfg); err != nil {
+		t.Fatalf("managed config does not parse as YAML, so hermes fails open and pins nothing: %v", err)
+	}
+
+	for _, key := range []string{"model", "toolsets", "platform_toolsets", "platforms"} {
+		if _, ok := cfg[key]; !ok {
+			t.Errorf("%q is absent from the managed config, so the agent can set it freely", key)
+		}
+	}
+	model, _ := cfg["model"].(map[string]any)
+	// api_mode belongs here with the endpoint: `/model <x> --global` persists the two
+	// together, so pinning base_url alone leaves a switch able to write a mismatched
+	// wire protocol next to it that survives a restart.
+	for _, leaf := range []string{"default", "provider", "base_url", "api_mode"} {
+		if _, ok := model[leaf]; !ok {
+			t.Errorf("model.%s is not pinned; the agent can repoint its own LLM endpoint", leaf)
+		}
+	}
+
+	platforms, _ := cfg["platforms"].(map[string]any)
+	for name := range platforms {
+		p, _ := platforms[name].(map[string]any)
+		if _, ok := p["home_channel"]; ok {
+			t.Errorf("platforms.%s.home_channel is pinned, so hermes strips it from every save and "+
+				"/sethome silently does nothing (issue #658)", name)
+		}
+	}
+}
+
+// The managed .env exists for one reason: gateway/config.py applies env overrides AFTER
+// the managed overlay, so a container env var beats a pinned `platforms.*` leaf. Pinning
+// the same answer in the .env — which load_hermes_dotenv applies last with override=True,
+// and which save_env_value refuses to overwrite — is what closes that inversion.
+//
+// The home-channel vars are excluded on purpose. They stay ordinary container env, which
+// the PVC .env (also override=True) beats, so the CR value seeds the home channel and
+// `/sethome` wins from then on.
+func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
+	env := renderManagedEnv(chatAgent())
+
+	for _, key := range []string{
+		"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME",
+		"GOOGLE_CHAT_ALLOWED_USERS", "SLACK_RELAY_URL", "SLACK_ALLOWED_USERS",
+	} {
+		if !strings.Contains(env, key+"=") {
+			t.Errorf("%s is not pinned, so the agent can write it to its own .env and take the "+
+				"front door off the air:\n%s", key, env)
+		}
+	}
+	for _, key := range []string{"GOOGLE_CHAT_HOME_CHANNEL", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME"} {
+		if strings.Contains(env, key+"=") {
+			t.Errorf("%s is pinned, so save_env_value rejects the write and /sethome cannot set a "+
+				"home channel (issue #658):\n%s", key, env)
+		}
+	}
+
+	// A deployment with no chat integration must produce no file rather than an empty
+	// one: an empty managed .env is harmless, but writing the key unconditionally makes
+	// the ConfigMap churn on unrelated reconciles.
+	if got := renderManagedEnv(newTestPlatformAgent()); got != "" {
+		t.Errorf("renderManagedEnv with no integration = %q, want empty", got)
+	}
+}
+
+// The managed .env and the container env must agree. Both are rendered from the same CR
+// but by different code, and the managed one is applied LAST with override=True — so a
+// disagreement is not a warning, it is the container env silently losing.
+func TestManagedEnvAgreesWithContainerEnv(t *testing.T) {
+	agent := chatAgent()
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
+		key, want, _ := strings.Cut(line, "=")
+		got, found := envValue(gateway, key)
+		if !found {
+			t.Errorf("%s is pinned in the managed .env but absent from the container env; the two "+
+				"renders have drifted", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %q in the container env but %q in the managed .env, which is applied "+
+				"last and wins", key, got, want)
+		}
+	}
+}
+
 // TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. The gateway takes the
-// operator's rendering through the /opt/agent-config directory mount and merges it into
-// a writable config.yaml on the PVC — but the dashboard skips that setup pass, so on a
-// new volume it would otherwise start with no config at all until the gateway's pass
-// lands one. The dashboard used to write one itself, as a side effect of running the
-// setup it must no longer run. The subPath is the profile-default overlay key: that is
-// the ConfigMap entry carrying the whole-file rendering (there is no `config.yaml` key
-// any more), mounted here under the name `hermes dashboard` expects.
+// operator's rendering through the /etc/hermes managed-scope mount and keeps its own
+// config.yaml writable on the PVC — but the dashboard skips the setup pass that seeds
+// that file, so on a new volume it would otherwise start with no config at all. The
+// dashboard used to write one itself, as a side effect of running the setup it must no
+// longer run. The subPath is the managed-config key: that is the ConfigMap entry
+// carrying the whole-file rendering (there is no `config.yaml` key any more), mounted
+// here under the name `hermes dashboard` expects.
 func TestDashboardReadsTheRenderedConfig(t *testing.T) {
 	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
 
 	for _, m := range dashboard.VolumeMounts {
 		if m.MountPath == "/opt/data/config.yaml" {
-			if m.Name != "platform-agent-config-vol" || m.SubPath != profileOverlayKey(defaultProfileName) {
+			if m.Name != "platform-agent-config-vol" || m.SubPath != managedConfigKey {
 				t.Fatalf("expected the rendered default-profile config from platform-agent-config-vol, got %+v", m)
 			}
 			return
@@ -3494,13 +3682,22 @@ func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
 		pluginWithProfile("stockout", "platform", ""),
 	})
 	// An untargeted plugin belongs to the default profile, whose whole rendered config
-	// is now itself an overlay.
-	def, ok := data["profile-default.overlay.yaml"]
+	// is the managed scope rather than an overlay.
+	def, ok := data[managedConfigKey]
 	if !ok {
-		t.Fatalf("the default profile's overlay is missing, got keys %v", mapKeys(data))
+		t.Fatalf("the default profile's managed config is missing, got keys %v", mapKeys(data))
 	}
 	if !strings.Contains(def, "adapter") {
-		t.Errorf("untargeted plugin must be enabled in the default overlay, got:\n%s", def)
+		t.Errorf("untargeted plugin must be enabled in the managed config, got:\n%s", def)
+	}
+	// The managed key must NOT match the entrypoint's `profile-*.overlay.yaml` glob:
+	// step 2.7 would then treat it as an overlay for a profile named "default" and try
+	// to merge the whole front-door config into a profile home.
+	if strings.HasPrefix(managedConfigKey, profileOverlayPrefix) {
+		t.Errorf("managedConfigKey %q collides with the overlay glob the entrypoint walks", managedConfigKey)
+	}
+	if _, ok := data[profileOverlayKey(defaultProfileName)]; ok {
+		t.Errorf("the default profile must no longer get an overlay, got keys %v", mapKeys(data))
 	}
 	// Key shape is a contract with docker-entrypoint.sh, which globs for it.
 	if _, ok := data["profile-platform.overlay.yaml"]; !ok {
@@ -3522,7 +3719,7 @@ func TestBuildConfigMapDataDefaultTargetCannotCollide(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("smuggled", defaultProfileName, ""),
 	})
-	def := data[profileOverlayKey(defaultProfileName)]
+	def := data[managedConfigKey]
 	if !strings.Contains(def, "model:") {
 		t.Errorf("a plugin naming the default profile replaced the rendered config with its own overlay:\n%s", def)
 	}
@@ -3568,10 +3765,11 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
 	for k := range data {
-		// Two overlays are unconditional: the default profile's carries the whole
-		// rendered config, and the platform profile's carries the memory provider,
-		// so for either it is absence, not presence, that would be the bug.
-		if k == profileOverlayKey(defaultProfileName) || k == profileOverlayKey(platformProfileName) {
+		// One overlay is unconditional: the platform profile's carries the memory
+		// provider, so for it absence, not presence, would be the bug. (The default
+		// profile has no overlay at all — its whole rendered config is the managed
+		// scope, under a key outside this prefix.)
+		if k == profileOverlayKey(platformProfileName) {
 			continue
 		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
@@ -3719,15 +3917,15 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
 	}
 
-	// And that render is what the ConfigMap publishes for the default profile. It is
-	// the only route those limits have to the pod: nothing else writes that key, and
-	// the entrypoint merges nothing else into the front door's config.
+	// And that render is what the ConfigMap publishes as the default profile's managed
+	// config. It is the only route those limits have to the pod: nothing else writes
+	// that key, and nothing merges anything else into the front door's config.
 	data := buildConfigMapData(agent, nil)
-	if got := data[profileOverlayKey(defaultProfileName)]; !strings.Contains(got, "max_turns: 120") {
-		t.Errorf("tuning.default did not reach the default profile's overlay, got:\n%s", got)
+	if got := data[managedConfigKey]; !strings.Contains(got, "max_turns: 120") {
+		t.Errorf("tuning.default did not reach the default profile's managed config, got:\n%s", got)
 	}
 	for k, v := range data {
-		if !strings.HasPrefix(k, profileOverlayPrefix) || k == profileOverlayKey(defaultProfileName) {
+		if !strings.HasPrefix(k, profileOverlayPrefix) {
 			continue
 		}
 		// The platform overlay is unconditional, but it carries the memory provider
@@ -3976,10 +4174,12 @@ func TestProfileOverlayKey(t *testing.T) {
 	if profileOverlayKey("cluster") == clusterProfileClassKey {
 		t.Error("per-profile and class overlay keys must not collide")
 	}
-	// The default profile is keyed by the same function as every other, so the
-	// entrypoint needs no special case to find it.
-	if got := profileOverlayKey(defaultProfileName); got != "profile-default.overlay.yaml" {
-		t.Errorf("profileOverlayKey(default) = %q", got)
+	// The default profile is the one the operator does NOT emit an overlay for — its
+	// render is the managed scope — and the managed key must stay clear of the glob the
+	// entrypoint walks, or step 2.7 would pick it up as an overlay for a profile named
+	// "default".
+	if strings.HasPrefix(managedConfigKey, profileOverlayPrefix) || strings.HasSuffix(managedConfigKey, ".overlay.yaml") {
+		t.Errorf("managedConfigKey = %q, which the entrypoint's overlay glob would match", managedConfigKey)
 	}
 }
 

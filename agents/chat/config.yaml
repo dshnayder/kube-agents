@@ -2,27 +2,31 @@
 #
 # This is the config.yaml for the front-door Chat Agent — the `default` Hermes
 # profile that receives all chat ingress. It is written to
-# /opt/chat-template/config.yaml at build time and is the BASE from which
-# docker-entrypoint.sh rebuilds the default profile home's config.yaml
-# ($HERMES_HOME/config.yaml) on every start.
+# /opt/chat-template/config.yaml at build time, and docker-entrypoint.sh seeds
+# the default profile home's config.yaml ($HERMES_HOME/config.yaml) from it on a
+# FRESH volume. After that the live file belongs to the running agent.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# THE LIVE FILE HAS THREE AUTHORS, and this is only one of them:
+# WHAT THE AGENT ACTUALLY LOADS IS THREE THINGS, and this is only one of them:
 #
-#   1. this file, the base;
-#   2. the operator's render (k8s-operator renderConfigYAML), delivered as the
-#      ConfigMap key profile-default.overlay.yaml and merged on top;
-#   3. the running agent, which writes to its own config — /sethome records the
-#      home channel, the monitoring policy mints monitoring.install_id.
+#   1. this file, the base, seeded onto the PVC on a fresh volume;
+#   2. the running agent's own writes to that PVC copy — /sethome records the
+#      home channel, the monitoring policy mints monitoring.install_id, slash
+#      commands save preferences;
+#   3. the operator's render (k8s-operator renderConfigYAML), mounted read-only
+#      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
+#      key, on top of 1+2 at every load.
 #
-# deploy/shared/default_profile_config.py reconciles the three with a three-way
-# merge: the operator wins any key it and the runtime both changed, the runtime
-# keeps its own edits everywhere else. The file is NOT mounted from the ConfigMap;
-# it was once, and that made it read-only, which is what made /sethome fail.
+# The managed scope wins, and it wins without touching the PVC: hermes merges it
+# in on load, strips its keys back out of anything the agent saves, and rejects
+# `hermes config set` against them. So the operator's model endpoint, platform
+# settings and toolsets are immutable at runtime while the file itself stays
+# writable. It was once subPath-mounted over $HERMES_HOME/config.yaml instead,
+# which made the file read-only — that is what made /sethome fail (issue #658).
 #
 # Keep this file and renderConfigYAML in sync in BOTH directions. Lists are
 # unioned, so an entry dropped from one side survives in the other — removing a
@@ -60,6 +64,10 @@ model:
   default: model-default
   base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
+  # The wire protocol a custom provider on this base_url resolves to anyway. Stated
+  # explicitly to match the operator's managed render, where its purpose is to pin the
+  # key so `/model … --global` cannot persist a different one.
+  api_mode: chat_completions
 
 # MCP Servers configuration. Routing/relay surface only.
 #

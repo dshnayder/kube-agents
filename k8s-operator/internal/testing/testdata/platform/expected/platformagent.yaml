@@ -312,7 +312,7 @@ status: {}
 apiVersion: v1
 data:
   leader_elect.py: <OMITTED_FOR_TESTS>
-  profile-default.overlay.yaml: |
+  managed-config.yaml: |
     agent:
       disabled_toolsets:
       - terminal
@@ -374,6 +374,7 @@ data:
       user_profile_enabled: false
     model:
       api_key: none
+      api_mode: chat_completions
       base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
       default: model-default
       model: model-default
@@ -416,6 +417,12 @@ data:
     - kanban
     web:
       backend: ddgs
+  managed.env: |
+    GOOGLE_CHAT_RELAY_URL=http://127.0.0.1:8765
+    GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
+    GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+    GOOGLE_CHAT_ALLOWED_USERS=
+    GOOGLE_CHAT_ALLOW_ALL_USERS=true
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
@@ -605,6 +612,8 @@ spec:
         - env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: HOME
               value: /opt/data/home
             - name: PLATFORM_AGENT_PLUGINS_DEBUG
@@ -697,6 +706,9 @@ spec:
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
             - mountPath: /opt/agent-config
               name: platform-agent-config-vol
               readOnly: true
@@ -744,7 +756,7 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
-              subPath: profile-default.overlay.yaml
+              subPath: managed-config.yaml
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
@@ -951,6 +963,15 @@ spec:
             defaultMode: 493
             name: platformagent-config
           name: platform-agent-config-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: managed-config.yaml
+                path: config.yaml
+              - key: managed.env
+                path: .env
+            name: platformagent-config
+          name: platform-agent-managed-vol
         - configMap:
             defaultMode: 420
             name: platformagent-fluent-bit-config
