@@ -78,6 +78,11 @@ CONFIGMAP_NAME: str = "platform-agent-config"
 # pluginProfileMountRoot in the operator.
 PLUGIN_MOUNT_ROOT: str = "/opt/agent-plugins"
 AGENT_HOME: str = "/opt/data"
+# Where the operator's render for the default profile lands in the pod. Hermes overlays
+# it per leaf key over AGENT_HOME/config.yaml at load; nothing copies it into that file,
+# so a probe looking for the render has to read it here. Mounted on the platform-agent
+# container, which is the one agent_exec execs into.
+MANAGED_CONFIG: str = "/etc/hermes/config.yaml"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
 # rather than on the bare unique string: the unique string is also merged into
@@ -644,21 +649,22 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     log("Verified allowed subtree 'approvals.e2e_test_setting' was merged into ConfigMap.")
 
     # 5a-ii. ...and that it reaches the agent. The ConfigMap is only half the journey:
-    # the default profile's render is now an overlay the entrypoint merges into the
-    # agent's own writable config.yaml, and every failure mode of that merge is silent.
-    # For most of this deployment's life the render never arrived at all — the entrypoint
-    # copied the image's config over the mount on every start — and no test noticed,
-    # because they all stopped at the ConfigMap.
+    # the render is projected into the pod as the managed scope and Hermes overlays it,
+    # leaf by leaf, over the agent's own config.yaml at load. Every failure mode of that
+    # projection is silent. For most of this deployment's life the render never arrived
+    # at all — the entrypoint copied the image's config over the mount on every start —
+    # and no test noticed, because they all stopped at the ConfigMap.
     live = agent_exec_until(
-        f"grep -q {unique_str} {AGENT_HOME}/config.yaml && echo MERGED || echo ABSENT",
+        f"grep -q {unique_str} {MANAGED_CONFIG} && echo MERGED || echo ABSENT",
         "MERGED",
     )
     assert "MERGED" in live, (
-        f"'{unique_str}' is in the ConfigMap but not in {AGENT_HOME}/config.yaml — the "
+        f"'{unique_str}' is in the ConfigMap but not in {MANAGED_CONFIG} — the "
         f"operator's render is not reaching the running agent: {live}"
     )
-    # And the file must still be writable, which is the whole reason it is merged rather
-    # than mounted: `/sethome` and monitoring.install_id write to it at runtime.
+    # And the agent's own config must still be writable, which is the whole reason the
+    # render lands beside it rather than on top of it: `/sethome` and monitoring.install_id
+    # write to it at runtime.
     writable = agent_exec_until(
         f"test -w {AGENT_HOME}/config.yaml && echo WRITABLE || echo READ-ONLY", "WRITABLE"
     )
@@ -666,7 +672,7 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
         f"{AGENT_HOME}/config.yaml must be writable — a read-only mount here is what made "
         f"`/sethome` fail with EACCES: {writable}"
     )
-    log(f"Verified the render reached a writable {AGENT_HOME}/config.yaml.")
+    log(f"Verified the render reached {MANAGED_CONFIG} and left {AGENT_HOME}/config.yaml writable.")
 
     # 5b. Verify disallowed config subtree is REJECTED / STRIPPED OUT
     assert "disallowed_test_subtree" not in cm_config and "forbidden_key" not in cm_config, "Disallowed config subtree should NOT be in ConfigMap!"
@@ -740,18 +746,19 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
     assert unique_str not in new_cm_config and "e2e_test_setting" not in new_cm_config, f"Config change '{unique_str}' is STILL in ConfigMap"
     log("Confirmed config change is no longer present in ConfigMap.")
 
-    # Withdrawal has to reach the agent too, and it is the harder half. The startup merge
-    # carries the runtime's own edits across restarts, so it has to tell "the operator
-    # stopped saying this" apart from "the agent wrote this itself" — get that wrong and a
-    # deleted plugin's config outlives the plugin, on a file nothing ever rewrites.
+    # Withdrawal has to reach the agent too, and it is the harder half. The overlay wins
+    # per leaf key at load, so a key the operator failed to drop from the render outlives
+    # the plugin no matter what the agent's own config.yaml says — and nothing in the pod
+    # ever rewrites the render. Step 6 already replaced the pod, so this reads the render
+    # the running agent actually loaded, not a stale projection.
     live = agent_exec_until(
-        f"grep -q e2e_test_setting {AGENT_HOME}/config.yaml && echo STILL-THERE || echo GONE",
+        f"grep -q e2e_test_setting {MANAGED_CONFIG} && echo STILL-THERE || echo GONE",
         "GONE",
     )
     assert "GONE" in live, (
-        f"approvals.e2e_test_setting outlived the plugin in {AGENT_HOME}/config.yaml: {live}"
+        f"approvals.e2e_test_setting outlived the plugin in {MANAGED_CONFIG}: {live}"
     )
-    log(f"Confirmed the withdrawn config is gone from {AGENT_HOME}/config.yaml.")
+    log(f"Confirmed the withdrawn config is gone from {MANAGED_CONFIG}.")
     log("STEP 8 SUCCESS: Config change removed.")
 
 
