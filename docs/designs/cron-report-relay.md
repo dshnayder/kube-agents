@@ -1,8 +1,8 @@
 # Scheduled-report relay: the specialist reasons, the Chat Agent speaks
 
-**Status:** implemented, and every job on
-[the Platform Agent's roster](../../agents/platform/cron/README.md) delivers this
-way. Not yet validated against a live cluster.
+**Status:** implemented and validated end to end on a live GKE cluster; every job
+on [the Platform Agent's roster](../../agents/platform/cron/README.md) delivers
+this way.
 
 ## The problem
 
