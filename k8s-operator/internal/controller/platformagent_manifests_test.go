@@ -2515,7 +2515,24 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 // but by different code, and the managed one is applied LAST with override=True — so a
 // disagreement is not a warning, it is the container env silently losing.
 func TestManagedEnvAgreesWithContainerEnv(t *testing.T) {
-	agent := chatAgent()
+	// Both answers to the access question. With an allowlist the allow-all keys render
+	// `false`, without one they render `true` and the allowlists render empty — and it is
+	// the second shape that never appears in the goldens, so nothing else compares its two
+	// renders to each other.
+	t.Run("allowlisted", func(t *testing.T) { assertManagedEnvAgrees(t, chatAgent()) })
+	t.Run("allow all", func(t *testing.T) {
+		agent := chatAgent()
+		agent.Spec.Integration.GoogleChat.AllowedUsers = nil
+		agent.Spec.Integration.Slack.AllowedUsers = nil
+		if !strings.Contains(renderManagedEnv(agent), "SLACK_ALLOW_ALL_USERS=true") {
+			t.Fatalf("an empty allowlist must pin allow-all as true, got:\n%s", renderManagedEnv(agent))
+		}
+		assertManagedEnvAgrees(t, agent)
+	})
+}
+
+func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	gateway := containerNamed(t, dep, "platform-agent")
 
