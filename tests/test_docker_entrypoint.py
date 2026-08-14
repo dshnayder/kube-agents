@@ -33,6 +33,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 import yaml
@@ -73,7 +75,15 @@ class SharedStateGateTest(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             home = pathlib.Path(tmp) / "data"
-            full_env = {"PATH": "/usr/bin:/bin", "PLATFORM_AGENT_HOME": str(home)}
+            full_env = {
+                "PATH": "/usr/bin:/bin",
+                "PLATFORM_AGENT_HOME": str(home),
+                # These cases are about the GATE, and none of them seeds a config.yaml,
+                # so every non-owner would otherwise sit in the wait below the gate for
+                # its full default. Zero keeps them measuring what they are named for;
+                # ConfigWaitTest owns the wait itself.
+                "AGENT_SHARED_STATE_WAIT_SECS": "0",
+            }
             full_env.update(env or {})
             proc = subprocess.run(
                 ["sh", str(_ENTRYPOINT), *(["echo"] if echo else []), *argv],
@@ -240,6 +250,130 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run([], echo=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup)
+
+
+class ConfigWaitTest(unittest.TestCase):
+    """The non-owner's bounded wait for the config.yaml the owner seeds.
+
+    This replaced a subPath mount. The operator used to project its render over
+    $HERMES_HOME/config.yaml in the dashboard container, which did guarantee a file was
+    there on a fresh volume — but a mount is not conditional, so it shadowed the PVC copy
+    on EVERY volume and the dashboard silently read a different config from the gateway's.
+    Waiting keeps the guarantee and drops the divergence, so what these tests hold is that
+    the wait actually waits, actually stops early, and never becomes a wedge.
+    """
+
+    def _run(self, *, seed_after=None, wait_secs=30, home_exists=True, timeout=None):
+        """Run the entrypoint as an explicit non-owner against a home with no config.
+
+        `seed_after`, in seconds, writes config.yaml from a timer thread — the owner
+        container arriving late, which is the whole case. Returns `(proc, elapsed)`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            if home_exists:
+                home.mkdir(parents=True)
+            config = home / "config.yaml"
+            timer = None
+            if seed_after is not None:
+                timer = threading.Timer(seed_after, lambda: config.write_text("model: {}\n"))
+                timer.start()
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "PLATFORM_AGENT_HOME": str(home),
+                        "AGENT_SHARED_STATE_SETUP": "skip",
+                        "AGENT_SHARED_STATE_WAIT_SECS": str(wait_secs),
+                    },
+                    timeout=timeout if timeout is not None else wait_secs + 60,
+                )
+            finally:
+                if timer is not None:
+                    timer.cancel()
+            return proc, time.monotonic() - started
+
+    def test_a_config_already_there_is_not_waited_for(self):
+        """The steady state — every restart on an existing volume — must not pause."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            home.mkdir(parents=True)
+            (home / "config.yaml").write_text("model: {}\n")
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_SETUP": "skip",
+                    # Long enough that waiting at all would blow the timeout below.
+                    "AGENT_SHARED_STATE_WAIT_SECS": "600",
+                },
+                timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_the_wait_ends_as_soon_as_the_config_appears(self):
+        """Not a fixed sleep. The owner's seed has to release it early."""
+        proc, elapsed = self._run(seed_after=2, wait_secs=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("waiting up to", proc.stderr)
+        self.assertIn("appeared after", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+        self.assertLess(
+            elapsed,
+            30,
+            "the wait polls for the file; taking the full budget with the file present "
+            f"means it is really a sleep. stderr was:\n{proc.stderr}",
+        )
+
+    def test_a_config_that_never_arrives_starts_the_process_anyway(self):
+        """Bounded, and it proceeds either way.
+
+        Exiting here would only buy a kubelet backoff loop — this container carries no
+        probes — and an owner that never runs is legitimate for a pre-populated volume.
+        """
+        proc, _ = self._run(wait_secs=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("still absent", proc.stderr)
+        self.assertIn(
+            "hermes dashboard",
+            proc.stdout,
+            "the timeout must hand over to the command regardless; a non-owner that never "
+            "starts is worse than one that starts early",
+        )
+
+    def test_a_non_numeric_budget_warns_and_falls_back(self):
+        """`set -e` is on, so an unguarded `-lt` on a typo would kill the container.
+
+        That is the exact outcome the branch exists to avoid, arriving through the knob
+        that configures avoiding it. Seeded from a timer so the 120s fallback the guard
+        installs is left early rather than waited out.
+        """
+        proc, _ = self._run(seed_after=1, wait_secs="two minutes", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("non-numeric", proc.stderr)
+        self.assertIn("waiting up to 120s", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_a_home_that_does_not_exist_yet_is_waited_through_not_crashed_on(self):
+        """The owner creates $TARGET_DIR itself, so on a fresh PVC it is absent, not empty.
+
+        `set -e` is on and the `cd` below this point is guarded for exactly this reason;
+        the wait must not become the thing that fails first.
+        """
+        proc, _ = self._run(wait_secs=2, home_exists=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
 
 
 def _extract_heredoc(marker):

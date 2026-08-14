@@ -648,6 +648,8 @@ spec:
           env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: HOME
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
@@ -677,9 +679,9 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: managed-config.yaml
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session

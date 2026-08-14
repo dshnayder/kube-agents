@@ -115,16 +115,53 @@ if ! agent_owns_shared_state "$@"; then
     fi
     # Starting before the owner has populated a fresh PVC is TOLERATED, not prevented.
     # Nothing orders containers within a pod, so on a brand-new volume `hermes dashboard`
-    # can reach its first read while $TARGET_DIR is still empty. Its config.yaml is the
-    # one thing always present — the operator mounts the rendered ConfigMap over that
-    # path, the same file it gives the gateway — but that config names
-    # scripts/router_server.py and a plugins.enabled list only the owner lands, moments
-    # later. The container carries no probes, so the failure mode is a restart or two
-    # against the kubelet's backoff until the tree appears, not a wedge.
+    # can reach its first read while $TARGET_DIR is still empty — no config.yaml at all,
+    # no scripts/router_server.py, no plugin links. So wait for the one file whose absence
+    # is not survivable, and only for it.
     #
-    # KNOWN LIMIT, deliberately accepted rather than fixed here: that ordering is the
-    # kubelet's to lose. Moving this setup into an initContainer — one carrying the plugin
-    # volumes and the overlay ConfigMap, running to completion, leaving every app
+    # This wait is what replaces a subPath mount. The operator used to project the
+    # rendered ConfigMap over $TARGET_DIR/config.yaml in the non-owner container, which
+    # guaranteed a file was there — but a mount is not conditional: it shadowed the PVC
+    # copy on every volume, forever, so this container silently read a DIFFERENT config
+    # from the gateway's, and narrowing the render narrowed this container's whole world
+    # with it. Waiting keeps the guarantee and drops the divergence: both containers now
+    # read the same PVC file with the same /etc/hermes managed scope over it.
+    #
+    # Bounded, and it proceeds either way. A non-owner that never comes up is worse than
+    # one that comes up early: with no probes on this container, exiting here would only
+    # buy a kubelet backoff loop, and the owner may legitimately never run at all in a
+    # deployment that mounts a pre-populated volume.
+    if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+        _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
+        # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
+        # — so a typo in a knob for waiting would kill the container outright, which is
+        # the one outcome this whole branch is written to avoid. Same treatment as an
+        # unrecognised AGENT_SHARED_STATE_SETUP above: say so, use the default.
+        case "$_wait_secs" in
+            "" | *[!0-9]*)
+                echo "[ENTRYPOINT] WARN: ignoring non-numeric AGENT_SHARED_STATE_WAIT_SECS='$_wait_secs'; using 120." >&2
+                _wait_secs=120
+                ;;
+        esac
+        echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
+        _waited=0
+        while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        if [ -f "$TARGET_DIR/config.yaml" ]; then
+            echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
+        else
+            echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+        fi
+        unset _wait_secs _waited
+    fi
+    #
+    # KNOWN LIMIT, deliberately accepted rather than fixed here: the REST of the tree is
+    # still a race — the wait above covers config.yaml only, and scripts/router_server.py
+    # and the plugin links still arrive whenever the owner gets to them. That ordering is
+    # the kubelet's to lose. Moving this setup into an initContainer — one carrying the
+    # plugin volumes and the overlay ConfigMap, running to completion, leaving every app
     # container on `skip` — is what would turn it into an ordering the pod spec states
     # instead of one it happens to get. It is only the WRITES below that have to belong to
     # one container; the reads merely have to survive being early.

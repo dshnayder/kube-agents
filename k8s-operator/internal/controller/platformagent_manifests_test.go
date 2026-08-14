@@ -436,8 +436,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 5 {
-			t.Errorf("expected 5 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 6 {
+			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -2560,28 +2560,62 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	}
 }
 
-// TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. The gateway takes the
-// operator's rendering through the /etc/hermes managed-scope mount and keeps its own
-// config.yaml writable on the PVC — but the dashboard skips the setup pass that seeds
-// that file, so on a new volume it would otherwise start with no config at all. The
-// dashboard used to write one itself, as a side effect of running the setup it must no
-// longer run. The subPath is the managed-config key: that is the ConfigMap entry
-// carrying the whole-file rendering (there is no `config.yaml` key any more), mounted
-// here under the name `hermes dashboard` expects.
-func TestDashboardReadsTheRenderedConfig(t *testing.T) {
+// TestDashboardLoadsTheSameConfigAsTheGateway is the regression for a divergence that
+// took a narrowing in a different function to expose. The dashboard used to subPath-mount
+// the operator's render over $HERMES_HOME/config.yaml, so that render was the ENTIRE
+// config this container loaded — a mount shadows the PVC copy, and unlike a merge it
+// cannot be conditional. That was survivable only while the render covered every key;
+// narrowing renderConfigYAML to the pinned subtrees cut the dashboard's world down to
+// them, silently, taking agent.disabled_toolsets with it.
+//
+// So the assertion is parity, not presence: whatever config sources the gateway has, the
+// dashboard has the same ones. Nothing may shadow the PVC file in either container, and
+// both must overlay the same managed scope. The fresh-volume guarantee the subPath used
+// to provide now lives in docker-entrypoint.sh's non-owner branch, which waits for
+// $TARGET_DIR/config.yaml before it execs.
+func TestDashboardLoadsTheSameConfigAsTheGateway(t *testing.T) {
 	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
+	gateway := containerNamed(t, dep, "platform-agent")
 
-	for _, m := range dashboard.VolumeMounts {
-		if m.MountPath == "/opt/data/config.yaml" {
-			if m.Name != "platform-agent-config-vol" || m.SubPath != managedConfigKey {
-				t.Fatalf("expected the rendered default-profile config from platform-agent-config-vol, got %+v", m)
+	configSources := func(c corev1.Container) (managed corev1.VolumeMount, home bool) {
+		t.Helper()
+		for _, m := range c.VolumeMounts {
+			switch {
+			case m.MountPath == "/opt/data/config.yaml":
+				t.Errorf("%s mounts something over $HERMES_HOME/config.yaml (%+v); that shadows the "+
+					"PVC file this container is supposed to read and is how the two diverged", c.Name, m)
+			case m.MountPath == managedScopeDir:
+				managed = m
+			case m.MountPath == "/opt/data":
+				home = true
 			}
-			return
 		}
+		return managed, home
 	}
-	t.Errorf("the dashboard has no config.yaml mount, so a fresh PVC starts it against an "+
-		"empty HERMES_HOME; mounts were %+v", dashboard.VolumeMounts)
+
+	dashManaged, dashHome := configSources(dashboard)
+	gwManaged, gwHome := configSources(gateway)
+
+	if !dashHome || !gwHome {
+		t.Errorf("both containers must mount the data volume at $HERMES_HOME (gateway=%t dashboard=%t)", gwHome, dashHome)
+	}
+	if dashManaged.Name == "" {
+		t.Fatalf("the dashboard has no %s mount, so it would read the agent's own writes unpinned; "+
+			"mounts were %+v", managedScopeDir, dashboard.VolumeMounts)
+	}
+	if dashManaged.Name != gwManaged.Name || !dashManaged.ReadOnly || !gwManaged.ReadOnly {
+		t.Errorf("the two containers must overlay the same read-only managed scope, got gateway=%+v dashboard=%+v", gwManaged, dashManaged)
+	}
+
+	// The mount alone is inert: managed_scope.py reads HERMES_MANAGED_DIR, and without it
+	// the files sit at /etc/hermes unread.
+	dashDir, ok := envValue(dashboard, "HERMES_MANAGED_DIR")
+	gwDir, _ := envValue(gateway, "HERMES_MANAGED_DIR")
+	if !ok || dashDir != gwDir {
+		t.Errorf("HERMES_MANAGED_DIR = %q on the dashboard but %q on the gateway; the mount is only "+
+			"read when this names it", dashDir, gwDir)
+	}
 }
 
 func TestRWOStoragePerReplica(t *testing.T) {

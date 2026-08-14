@@ -2333,6 +2333,15 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				Value: homeDir,
 			},
 			{
+				// Same value as the gateway's, and it has to be: this container loads the
+				// same PVC config.yaml, so it must have the same operator pins overlaid on
+				// top of it. Without this the dashboard would read the agent's own writes
+				// unpinned — including a model endpoint or a front-door allowlist the
+				// agent had changed for itself.
+				Name:  "HERMES_MANAGED_DIR",
+				Value: managedScopeDir,
+			},
+			{
 				Name:  "HOME",
 				Value: strings.TrimSuffix(homeDir, "/") + "/home",
 			},
@@ -2374,36 +2383,26 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: homeDir,
 			},
 			{
-				// The operator's whole-file rendering of the default profile's config,
-				// mounted AS config.yaml even though its ConfigMap key is the managed
-				// one: nothing else puts a config on the PVC for this container to find
-				// before the gateway's setup pass lands one there. The gateway takes the
-				// same rendering through the /etc/hermes managed-scope mount instead,
-				// which leaves its own config.yaml an ordinary writable file on the PVC —
-				// mounting it over the gateway's config.yaml made that file read-only,
-				// which is why this subPath mount exists only here, on a container that
-				// never writes it. The dashboard used to write one itself,
-				// as a side effect of running a setup pass it must no longer run; on a
-				// fresh PVC that leaves `hermes dashboard` starting against a HERMES_HOME
-				// with no config at all. An existing PVC hides this — it already carries
-				// the file — which is why a live-cluster check would not surface it.
+				// The gateway's arrangement exactly: the PVC's own config.yaml, with the
+				// managed scope overlaid at load. That equality is the point. This
+				// container used to subPath-mount the operator's render over
+				// $HERMES_HOME/config.yaml instead, to guarantee SOME config existed on a
+				// fresh volume before the gateway's setup pass seeded one — but a mount
+				// cannot be conditional. It shadowed the PVC copy on every volume, so the
+				// dashboard read a config the gateway never read, and narrowing
+				// renderConfigYAML to the pinned subtrees silently narrowed this
+				// container's entire config to them: no plugins.enabled, no kanban, no
+				// toolsets, and no agent.disabled_toolsets — the denylist that
+				// agents/chat/config.yaml calls the authoritative guarantee that the
+				// front door has no runtime tools of its own.
 				//
-				// This closes the config.yaml hole, not the ordering one behind it. The
-				// file is now always present, but it names scripts/router_server.py and a
-				// plugins.enabled list that still arrive only when the gateway's setup
-				// pass lands them, and nothing sequences the two containers. On a fresh
-				// volume the dashboard can therefore read a config that is ahead of the
-				// tree; with no probes on this container that costs a restart or two
-				// against the kubelet's backoff. Making it an ordering rather than a race
-				// means moving the setup into an initContainer — see the KNOWN LIMIT note
-				// at step 1.5 of deploy/shared/docker-entrypoint.sh.
-				//
-				// Follows the render to its new key. The dashboard reads the same bytes
-				// it always did; only the key name moved when the default profile's
-				// config became the managed scope rather than an overlay to merge.
-				Name:      "platform-agent-config-vol",
-				MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-				SubPath:   managedConfigKey,
+				// The presence guarantee moved to where it can be conditional: the
+				// non-owner branch at step 1.5 of deploy/shared/docker-entrypoint.sh waits
+				// (bounded) for $TARGET_DIR/config.yaml before exec'ing. Anything added to
+				// the render from here on reaches both containers or neither.
+				Name:      managedVolumeName,
+				MountPath: managedScopeDir,
+				ReadOnly:  true,
 			},
 			{
 				Name:      "system-metadata",
