@@ -3059,6 +3059,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
+				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
 			},
 		},
 	}
@@ -3092,6 +3093,15 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
 		t.Errorf("plugin must not be able to override AGENT_SHARED_STATE_SETUP, got %q",
 			env["AGENT_SHARED_STATE_SETUP"])
+	}
+	// HERMES_MANAGED_DIR is the switch for the entire pin layer, so it is operator-owned
+	// by the same append-after-the-merge means. A plugin that could point it at the
+	// writable PVC would not disable the pins loudly — the scope simply fails open, the
+	// pod stays green, and the agent's own writes to model.base_url and to the managed
+	// .env stop being overruled. Nothing downstream would report it.
+	if env["HERMES_MANAGED_DIR"] != managedScopeDir {
+		t.Errorf("plugin must not be able to override HERMES_MANAGED_DIR, got %q",
+			env["HERMES_MANAGED_DIR"])
 	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])

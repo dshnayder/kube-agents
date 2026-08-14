@@ -499,8 +499,6 @@ spec:
         - env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
-            - name: HERMES_MANAGED_DIR
-              value: /etc/hermes
             - name: HOME
               value: /opt/data/home
             - name: PLATFORM_AGENT_PLUGINS_DEBUG
@@ -545,6 +543,8 @@ spec:
               value: gke_example-project_us-central1-a_cluster-a
             - name: KUBE_DEFAULT_NAMESPACE
               value: kubeagents-system
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: CREDENTIAL_PROXY_URL
               value: http://127.0.0.1:8765
             - name: PATH

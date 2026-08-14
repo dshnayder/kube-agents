@@ -1388,12 +1388,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: homeDir,
 		},
 		{
-			// managed_scope.py defaults to this path anyway. Set explicitly so the policy
-			// is visible in the pod spec, and so moving it later is a one-line change.
-			Name:  "HERMES_MANAGED_DIR",
-			Value: managedScopeDir,
-		},
-		{
 			Name:  "HOME",
 			Value: strings.TrimSuffix(homeDir, "/") + "/home",
 		},
@@ -1588,6 +1582,23 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 
+	// APPENDED AFTER THE PLUGIN MERGE, for the same reason as CREDENTIAL_PROXY_URL below
+	// and AGENT_SHARED_STATE_SETUP in buildBaseContainers: extractAgentPluginEnvVars copies
+	// an AgentPlugin's spec.env verbatim with no allowlist, and mergeEnvVars replaces a
+	// same-named default in place. This variable is the switch for the whole pin layer, so
+	// it is the last one that may sit on the overridable side. A plugin naming it could
+	// repoint the managed scope at the writable PVC, and every pin would evaporate at once
+	// — model.base_url no longer overruled at load, save_config stripping nothing, and the
+	// managed .env (applied with override=True) becoming an agent-writable file, so a
+	// GOOGLE_CHAT_ALLOW_ALL_USERS=true written there would beat the CR's allowlist. The
+	// scope fails open by design, so none of that shows up as an unhealthy pod.
+	//
+	// managed_scope.py defaults to this same path. Set explicitly so the policy is visible
+	// in the pod spec, and so moving it later is a one-line change.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_MANAGED_DIR",
+		Value: managedScopeDir,
+	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
 		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),

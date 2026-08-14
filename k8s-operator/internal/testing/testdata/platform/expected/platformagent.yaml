@@ -535,8 +535,6 @@ spec:
         - env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
-            - name: HERMES_MANAGED_DIR
-              value: /etc/hermes
             - name: HOME
               value: /opt/data/home
             - name: PLATFORM_AGENT_PLUGINS_DEBUG
@@ -591,6 +589,8 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: CREDENTIAL_PROXY_URL
               value: http://127.0.0.1:8765
             - name: PATH
