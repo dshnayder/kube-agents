@@ -138,6 +138,7 @@ identifier appears, add its source here.
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |
 | Image-patch module names and the behaviour they add | the module's own docstring under `deploy/docker/patches/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
+| Bundled Hermes platform plugins the image installs (no patch) | the plugin's own `adapter.py` docstring under `deploy/docker/plugins/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | What pod start-up force-syncs from the image vs. preserves on the PV | `deploy/shared/docker-entrypoint.sh` |
 | Shared agent defaults (`approvals.*`, `security.*`) | `deploy/shared/defaults/config.yaml` and `renderConfigYAML()` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |

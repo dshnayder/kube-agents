@@ -53,27 +53,31 @@ scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
-user replies to — never saw the finding. On a Google Chat install it does not
-even get the words there, because `profile_cron_tick.py` can only hand a child
-profile the Slack channel, so `"all"` resolves to nothing.
+user replies to — never saw the finding. On a Google Chat install it did not
+even get the words there: `profile_cron_tick.py` can only hand a child profile
+the Slack channel, so before the relay existed `"all"` expanded to nothing at
+all. It expands to the relay now, which is why the jobs still on it are heard.
 
 `deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
 it and thereby owns the thread the user replies in. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
-reached. The token is exclusive — a job on `"chat"` does not also post through
-`"all"` — and an unreachable relay falls back to `"all"` rather than dropping
-the report.
+reached.
 
-The mode is a build-time patch to Hermes
-([`deploy/docker/patches/apply_cron_deliver_chat.py`](../../../deploy/docker/patches/apply_cron_deliver_chat.py)).
-The full rationale — why the Chat Agent composes but does not send, why the
-session is per job per day, why a mode rather than an instruction — is
+The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
+platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
+that Hermes registers like any other. So it is one target among several — a job
+on `"chat,slack"` relays _and_ posts, and an unreachable relay records
+`last_delivery_error` rather than falling back. Note that `"all"` now expands to
+include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
+`"all"` alone relays too. The full rationale — why the Chat Agent composes but
+does not send, why the session is per job per day, why a mode rather than an
+instruction, and what the plugin route costs — is
 [`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
 
-`github-issue-resolver` is the only job here on `"chat"` today. The other seven
-are a one-field change away; they were left on `"all"` so the first rollout has
-one job to watch.
+`github-issue-resolver` is the only job here that names `"chat"` today. The rest
+are on `"all"`, which reaches the relay by expansion; naming it is still the
+clearer entry, and they are a one-field change away.
 
 ## `schedule.display` mirrors `schedule.expr`
 

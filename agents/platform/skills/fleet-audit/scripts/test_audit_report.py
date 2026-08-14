@@ -1587,7 +1587,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """A watchdog whose run fails has to be audible.
 
         `"all"` sends the outcome to the configured target and `"chat"` hands it
-        to the Chat Agent (`deploy/docker/patches/cron_deliver_chat.py`); both
+        to the Chat Agent (`deploy/docker/plugins/chat/adapter.py`); both
         carry a failure, because the scheduler builds one into a message
         (`_summarize_cron_failure_for_delivery`) and delivers it on the same leg
         as a report. `"local"` resolves to no target at all

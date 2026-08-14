@@ -155,24 +155,67 @@ both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
 either.
 
-The switch is one edit in `_deliver_result`, applied at image build time by
-[`deploy/docker/patches/apply_cron_deliver_chat.py`](../../deploy/docker/patches/apply_cron_deliver_chat.py):
-before targets are resolved, a job whose `deliver` carries the `chat` token is
-relayed and the function returns. The token is exclusive — `"chat,slack"` relays
-and does not also post to Slack — because the point is one voice, and Hermes'
-own `_resolve_delivery_targets` would otherwise deliver the report twice.
+## How the switch is wired: `chat` is a platform
 
-`cronjob`'s `_local_delivery_notice` is patched in the same pass. Left alone it
-tells the agent its job "will not be delivered anywhere" and to recreate it with
-`deliver='all'` — advice addressed to a model that can act on it, and undo the
-mode.
+Nothing in Hermes is patched. Upstream already routes `deliver=<name>` through
+the platform registry, and `cron/scheduler.py::_plugin_cron_env_var` says so in
+its own words — a plugin that sets `cron_deliver_env_var` gets "cron delivery
+support without editing this module". So the relay ships as a bundled platform
+plugin, [`deploy/docker/plugins/chat/`](../../deploy/docker/plugins/chat/),
+copied into `plugins/platforms/chat/` where Hermes auto-registers it.
 
-**Failure falls back rather than swallowing.** If the relay is unreachable or
-answers non-2xx, the job is delivered with `deliver: "all"` instead: the report
-is worth more than the routing. The fallback rewrites a copy — `mark_job_run`
-persists the job dict, and a relay outage is not a roster edit. An unexpected
-exception takes the same path, because an escape here would be recorded as the
-_run_ having failed, which it did not.
+It is a platform with no inbound side. The only hook it implements is
+`standalone_sender_fn` — the one Hermes calls when cron runs in a separate
+process from the gateway, which is exactly what `profile_cron_tick.py` spawns.
+`adapter_factory` raises if anything ever tries to start it.
+
+`CHAT_HOME_CHANNEL` is the whole switch, and it is set in one place:
+`profile_cron_tick.py`, on the cron children it spawns. It gates enablement
+(through `is_connected`) and it is the `cron_deliver_env_var` the scheduler reads
+to resolve `deliver: "chat"` to a target. Unset — which is how the gateway
+process runs — the enablement pass leaves the platform disabled, no adapter is
+ever asked for, and `deliver: "chat"` resolves to nothing.
+
+The sender is handed the delivery text, not the job. It recovers the job's id and
+name from the header `_deliver_result` wraps every cron delivery in, and posts
+the report without it. That coupling is the one thing the plugin route
+cannot state in code it owns, so it is asserted at image build time:
+[`verify_chat_relay.py`](../../deploy/docker/plugins/verify_chat_relay.py) drives
+the real `_deliver_result` against a loopback stand-in for the Session KV server
+and asserts on what crossed the wire. Upstream changing the wrapper fails the
+build.
+
+### What this costs
+
+Being a real delivery target rather than an interception has consequences, and
+every one of them is visible to a job author:
+
+- **The token is not exclusive.** `deliver: "chat,slack"` relays _and_ posts to
+  Slack. A job that wants one voice names one target.
+- **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
+  expands to every platform with a configured home channel and the relay now has
+  one. On this install that is a fix rather than a cost — `all` previously
+  expanded to nothing for named profiles — but on a Slack install a job left on
+  `all` reports twice.
+- **A failed relay does not fall back.** It returns an error, which the scheduler
+  records in `last_delivery_error`; the report itself is still in the job's saved
+  output. Routing a failure to `all` would need the interception this design
+  gives up, and it would post the report to a channel the job did not choose.
+- **`cronjob(action='create')` calls a relayed job local-only.** `cronjob` runs
+  in the gateway, where the switch is off, and `_local_delivery_notice` decides
+  by asking whether the job resolves to a target _here_ — so a job the agent
+  creates at runtime with `deliver: "chat"` is created correctly and described
+  wrongly, with advice to use `deliver: "all"` instead. Taking `all` degrades to
+  the right behaviour rather than to silence (the child expands it to the
+  relay), which is why this is a wrong sentence and not a lost report. Both
+  branches are asserted in `verify_chat_relay.py` so the claim stays measured.
+
+The alternative was to set the switch process-wide and disable the platform in
+the root `config.yaml` (`_enabled_explicit` is honoured by the enablement pass).
+That fixes the notice and costs more than it buys: the file is runtime state the
+agent writes, not something the image owns, and with the switch on in the gateway
+every Chat Agent job on `deliver: "all"` starts recording "platform 'chat' not
+configured/enabled" against a delivery that in fact succeeded.
 
 `report_to_chat` stays, scoped to what the mode cannot do: reporting mid-run, or
 sending something other than the final response.

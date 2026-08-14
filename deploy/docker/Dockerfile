@@ -304,26 +304,26 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # created through cronjob(action='create') and carries no such contract, which
 # is the case this has to cover: `deliver` is a field every creation path can
 # set, including the model's own tool call.
-# The applier proves the two anchors matched; it cannot prove the fork is
-# reached, and both ways it can fail are quiet -- an unpatched build posts
-# nowhere, exactly like a watchdog with nothing to say, and a broken fallback
-# loses the report into last_delivery_error. verify_cron_deliver_chat.py drives
-# the real patched _deliver_result against a loopback stand-in for the Session
-# KV server and asserts on what crossed the wire.
-# Must stay AFTER the cron_tick_lock_scope and cron_skip_ledger blocks: the
-# anchors were derived from the fully-patched cron/scheduler.py.
-# See the module docstring in deploy/docker/patches/cron_deliver_chat.py.
-COPY --chmod=0644 deploy/docker/patches/cron_deliver_chat.py /opt/hermes/tools/cron_deliver_chat.py
-COPY deploy/docker/patches/apply_cron_deliver_chat.py \
-     deploy/docker/patches/verify_cron_deliver_chat.py \
-     deploy/docker/patches/patchlib.py \
-     /tmp/cron-deliver-chat/
-RUN /opt/hermes/.venv/bin/python3 /tmp/cron-deliver-chat/apply_cron_deliver_chat.py /opt/hermes && \
-    grep -q "job = _ka_intercept_chat_delivery(job, content)" /opt/hermes/cron/scheduler.py && \
-    grep -q "from tools.cron_deliver_chat import" /opt/hermes/cron/scheduler.py && \
-    grep -q "_ka_wants_chat_delivery(user_deliver)" /opt/hermes/tools/cronjob_tools.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-deliver-chat/verify_cron_deliver_chat.py && \
-    rm -rf /tmp/cron-deliver-chat
+# NOT a patch. Upstream already routes `deliver=<name>` through the platform
+# registry, and cron/scheduler.py::_plugin_cron_env_var says in its own words
+# that a plugin setting `cron_deliver_env_var` gets "cron delivery support
+# without editing this module". So this is a bundled platform plugin, dropped
+# into plugins/platforms/ where Hermes auto-registers it: zero lines of the
+# Hermes tree are modified and there is no anchor to go stale.
+# What replaces the patch's build-time failure is verify_chat_relay.py. The
+# plugin depends on four upstream behaviours and every one of them fails
+# QUIETLY -- a watchdog that reports nothing looks exactly like a watchdog with
+# nothing to report -- so the verifier drives the real _deliver_result against a
+# loopback stand-in for the Session KV server and asserts on what crossed the
+# wire. Its own docstring lists the four.
+# See the module docstring in deploy/docker/plugins/chat/adapter.py.
+COPY --chmod=0644 deploy/docker/plugins/chat/plugin.yaml \
+     deploy/docker/plugins/chat/__init__.py \
+     deploy/docker/plugins/chat/adapter.py \
+     /opt/hermes/plugins/platforms/chat/
+COPY deploy/docker/plugins/verify_chat_relay.py /tmp/chat-relay/
+RUN cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/chat-relay/verify_chat_relay.py && \
+    rm -rf /tmp/chat-relay
 
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
@@ -901,10 +901,10 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 # `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
 # The bytecode costs ~170MB of image.
 #
-# This must run AFTER every patch this stage applies to /opt/hermes: compileall
-# stamps each .pyc with its source's mtime and size, so bytecode written before a
-# patch would simply be discarded at import and we would be back to compiling on
-# every start. Python that later stages add is not covered here, and the two
+# This must run AFTER everything this stage writes into /opt/hermes — the patches
+# above and the bundled `chat` platform plugin alike: compileall stamps each .pyc
+# with its source's mtime and size, so bytecode written before the write would
+# simply be discarded at import and we would be back to compiling on every start. Python that later stages add is not covered here, and the two
 # cases go different ways. `agents/platform/plugins/` lands in /opt/hermes/plugins
 # in the `platform` stage, which runs a second pass of its own over the same tree
 # — everything compiled here is already up to date and skipped, so that pass costs
