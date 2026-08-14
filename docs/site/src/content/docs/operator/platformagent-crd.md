@@ -330,24 +330,38 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
 `platform`, and one `cluster-*` profile per managed cluster. The named profiles are each configured
 by an overlay merged into an image-built base at startup. The `default` profile is the exception: it
-gets no overlay at all, and takes the operator's settings as a read-only **managed scope** instead.
+takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
+read-only **managed scope** pinned over it.
 
-| Profile     | Delivery                                                                                                 | Who owns the file                         |
-| ----------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Image-built base, writable on the PVC + the whole rendered config pinned read-only at `/etc/hermes`      | Agent owns the file, operator the pins    |
-| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
-| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
+| Profile     | Delivery                                                                                                                                          | Who owns the file                         |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `default`   | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes` | Agent owns the file, operator the pins    |
+| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                              | Image owns the base, operator the overlay |
+| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                          | Image owns the base, operator the overlay |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
 a `profile-<name>` overlay for it as well. The class overlay merges first, so the per-profile file
 wins any conflict.
 
-**Why `default` is pinned rather than merged.** It is the only profile whose config the operator can
-fully own, so `renderConfigYAML` emits all of it rather than a few keys, and it is the one
-change-control boundary: the deployed front door matches CR-derived intent and cannot drift from a
-stale copy on the PVC or an image/operator version skew. (It is _not_ a security sandbox — see the
+**Why `default` is also pinned.** The pins are the one change-control boundary the front door has:
+the agent's own config file is writable, so without them a bad runtime edit survives a restart. (It
+is _not_ a security sandbox — see the
 [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety).)
+
+**What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
+profile in the pod, not just `default` — so it carries only what is identical for every profile
+_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode` and
+`display.platforms`. The reasoning is that as long as a human can reach the agent (`platforms`) and
+the agent can reason (`model`), anything else it breaks it can be talked into fixing.
+
+Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
+instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
+config subtrees, and `spec.harness.tuning`'s `default` limits and `maxInProgress`. Those are
+profile-shaped — pinning them machine-globally would hand the front door's settings to every
+specialist — and they are all recoverable by an agent that can still talk and still reason.
+Nothing the operator renders appears on both routes. What appears on neither, and so stays the
+image's alone, is each profile's toolsets, `mcp_servers` and `memory`.
 
 It is also the only profile whose config the _running agent_ writes to: `/sethome` records the home
 channel there, the monitoring policy mints `monitoring.install_id`, and slash commands save
@@ -378,10 +392,8 @@ let the agent overwrite — without that, a container env var would beat the pin
 
 One consequence is worth knowing before you edit `renderConfigYAML`: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than
-unioning with it. Dropping an entry from the render now drops it. The operator's
-`TestRenderConfigYAMLListsMatchChatConfig` fails when the render and
-[`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml)
-diverge, which is what keeps the two copies honest.
+unioning with it — for every profile at once. That is why the render emits no lists at all today,
+and why adding one is the change to think hardest about.
 
 **Why the others get overlays.** Their `config.yaml` is assembled at image build time by merging the
 shared defaults with that profile's own overlay, content the operator does not have; a `cluster-*`
@@ -403,18 +415,25 @@ however the CR is tuned.
 
 **Ordering.** The entrypoint force-syncs each profile's image-owned files first, then merges the
 overlays. The reverse order would silently erase every overlay on each restart. The `default`
-profile's `config.yaml` is the exception to the force-sync — it is rebuilt by the three-way merge
-above, because a force-sync is exactly what would throw the runtime's edits away.
+profile's `config.yaml` is the exception to the force-sync: it is the agent's own file, and a
+force-sync is exactly what would throw the runtime's edits away. It is instead seeded from the image
+on a fresh volume, and thereafter only back-filled — keys the image declares and the live file has
+lost are restored, keys it already holds are left alone. Its overlay is merged after that
+back-fill, so the operator's settings are not undone by it.
 
-**Merge semantics.** Maps merge recursively, lists union (so `plugins.enabled` accumulates), and
-scalars are replaced by the overlay. Precedence, lowest to highest: Hermes built-in default → the
-value committed in `agents/<persona>/config.yaml` → the operator overlay from the CR.
+**Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
+wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
+lists union, and scalars are replaced by the overlay; precedence, lowest to highest, is Hermes
+built-in default → the value committed in `agents/<persona>/config.yaml` → the operator overlay from
+the CR. In the **managed scope** the merge is per leaf key, so a list replaces rather than unions,
+and it wins over everything else because it is applied at every load rather than once at startup.
 
 **Two writers, two authorities.** Both `spec.harness.tuning` (operator policy) and an
 `AgentPlugin`'s `spec.config` (plugin-supplied) land in the same overlay file, but not with equal
-rights. A plugin's config is restricted to `approvals`, `platforms`, and `platform_toolsets`; the
-`agent` subtree holding the execution limits is dropped from plugin config and writable only by the
-operator. That is a coordination boundary rather than a security one — plugin code executes
+rights. A plugin's config is restricted to `approvals`, `platforms`, and `platform_toolsets`, and
+for an untargeted plugin only `platforms` reaches the machine-global managed scope — the rest goes
+to the front door's overlay. The `agent` subtree holding the execution limits is dropped from plugin
+config and writable only by the operator. That is a coordination boundary rather than a security one — plugin code executes
 in-process and could change these at runtime — but it keeps limits with board-wide consequences in
 one reviewable place.
 

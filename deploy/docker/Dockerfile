@@ -944,9 +944,10 @@ COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # 2 bulk-copies /opt/defaults onto the PVC with `cp -ru`, and this is the one file there
 # the running agent writes to — `/sethome`'s home channel, the monitoring install id,
 # saved slash-command preferences. An mtime-driven copy racing an image roll would
-# discard all of it. Step 2d copies this template onto a FRESH volume only; after that
-# the running agent is the file's sole writer, and the operator's settings reach it as a
-# read-only managed-scope overlay at /etc/hermes rather than by rewriting it.
+# discard all of it. Step 2d copies this template onto a FRESH volume only, and thereafter
+# only back-fills keys the live file has lost; the running agent is otherwise the file's
+# sole writer, and the operator's settings reach it as a read-only managed-scope overlay
+# at /etc/hermes rather than by rewriting it.
 COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
 RUN rm -f /opt/defaults/config.yaml
 

@@ -18,7 +18,6 @@ package controller
 
 import (
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -115,68 +114,30 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "api_key: none") {
 		t.Errorf("expected config to contain api_key: none, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "cwd: /custom/home") {
-		t.Errorf("expected config to contain custom home path, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "api_mode: chat_completions") {
+		t.Errorf("expected config to pin the wire protocol, got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "mcp_servers:") {
-		t.Errorf("expected config to contain mcp_servers, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "platform_toolsets:") {
-		t.Errorf("expected config to contain platform_toolsets, got:\n%s", yamlContent)
-	}
 	if !strings.Contains(yamlContent, "cron_mode: approve") {
 		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "backend: ddgs") {
-		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
-	}
-	// The default profile is the Chat Agent front door: router MCP (sync) + kanban
-	// (async delegation with chat progress). Both are its delegation surface.
-	if !strings.Contains(yamlContent, "mcp-router") {
-		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
-	}
-	// The router script path must still track AgentHome — the entrypoint copies
-	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the operator
-	// sets from this same AgentHome, so under a custom home the script is not at
-	// /opt/data — but it must do so at RUNTIME, via the placeholder the entrypoint
-	// and mcp_tool.py resolve. Baking the resolved path in here is what made this
-	// list disagree with agents/chat/config.yaml, and the startup merge unions
-	// `args` into a two-word command line whose first word does not exist.
-	if !strings.Contains(yamlContent, "${HERMES_HOME}/scripts/router_server.py") {
-		t.Errorf("expected router script left as a ${HERMES_HOME} placeholder, got:\n%s", yamlContent)
-	}
-	if strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
-		t.Errorf("router script path must not be resolved at render time, got:\n%s", yamlContent)
-	}
-	if strings.Contains(yamlContent, "/opt/data/scripts/router_server.py") {
-		t.Errorf("router script path must not be hardcoded to /opt/data, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "kanban") {
-		t.Errorf("expected default profile to enable the kanban toolset, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "dispatch_in_gateway: true") {
-		t.Errorf("expected kanban dispatch_in_gateway pinned on, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "auto_subscribe_on_create: true") {
-		t.Errorf("expected kanban auto_subscribe_on_create pinned on, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
-		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "wake_on_events:") {
-		t.Errorf("expected kanban wake_on_events to be rendered, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "disabled_toolsets:") {
-		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
-	}
-	// This rendered file is mounted over whatever the image shipped, so the
-	// matching key in agents/chat/config.yaml is not enough on its own — the
-	// value has to survive the render or the probe comes back on in the cluster.
-	if !strings.Contains(yamlContent, "environment_probe: false") {
-		t.Errorf("expected the Python-toolchain probe pinned off, got:\n%s", yamlContent)
+	// The managed scope is machine-global (see renderConfigYAML), so a key that
+	// describes ONE profile's tool surface must not appear in it: this same file is
+	// overlaid on the privileged platform profile and on every cluster agent, and a
+	// leaf replaces rather than merges. This is the regression guard for #658's
+	// follow-up — the front door's delegation surface belongs in the image's
+	// agents/chat/config.yaml, which only the default profile reads.
+	for _, forbidden := range []string{
+		"mcp_servers:", "platform_toolsets:", "toolsets:", "disabled_toolsets:",
+		"environment_probe:", "kanban:", "terminal:", "memory:", "plugins:",
+		"leader_election:", "web:",
+	} {
+		if strings.Contains(yamlContent, forbidden) {
+			t.Errorf("managed config must not carry profile-shaped key %q — it is overlaid "+
+				"on the platform and cluster profiles too, got:\n%s", forbidden, yamlContent)
+		}
 	}
 	// The front door must NOT hold privileged/runtime tools — those live in the
 	// separate platform/cluster profiles, not the default (chat) profile.
@@ -187,12 +148,17 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
-func TestBuildConfigMap_MemoryConfig(t *testing.T) {
+// The memory subtree is no longer rendered into the managed scope: it is
+// profile-shaped (the front door's per-user provider is exactly what a
+// kanban-spawned specialist must not get), and the scope is machine-global. The
+// front door takes it from agents/chat/config.yaml; the specialists take theirs
+// from the profile overlays, which TestBuildConfigMapDataPlatformOverlayFollowsProvider
+// covers. spec.harness.memory therefore no longer reaches the default profile —
+// tracked as follow-up work, together with the rest of the CR surface that used to
+// ride on this render.
+func TestManagedConfigCarriesNoMemorySubtree(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "memory-agent",
-			Namespace: "test-ns",
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: "memory-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Harness: &agentv1alpha1.HarnessSpec{
 				Memory: &agentv1alpha1.MemorySpec{
@@ -204,103 +170,13 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 		},
 	}
 
-	cm := buildConfigMap(agent, nil)
-	yamlContent := defaultProfileYAML(t, cm)
-	if !strings.Contains(yamlContent, "memory_enabled: true") {
-		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "provider: custom_memory") {
-		t.Errorf("expected config to contain provider: custom_memory, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "user_profile_enabled: true") {
-		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
-	}
-	// Turning the built-in store on must put `memory` back in the denylist. The
-	// toolset name is listed only to pass the memory-provider injection gate;
-	// leaving it enabled alongside a live built-in store would hand the front
-	// door a second, unscoped read/write memory tool.
-	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
-		t.Errorf("expected `memory` in disabled_toolsets when memory_enabled is true, got:\n%s", yamlContent)
-	}
-}
-
-// userProfileEnabled on its own is enough to make the built-in tool live: Hermes
-// builds the store when either flag is set and the tool has no per-target gate,
-// so USER.md alone still exposes a read/write surface over MEMORY.md too.
-func TestBuildConfigMap_UserProfileAloneClosesMemoryGate(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "profile-agent", Namespace: "test-ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Harness: &agentv1alpha1.HarnessSpec{
-				Memory: &agentv1alpha1.MemorySpec{
-					MemoryEnabled:      ptr.To(false),
-					UserProfileEnabled: ptr.To(true),
-				},
-			},
-		},
-	}
-
 	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
-	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
-		t.Errorf("expected `memory` in disabled_toolsets when only user_profile_enabled is true, got:\n%s", yamlContent)
-	}
-}
-
-// The default (no CR override) case: the built-in store stays off, so `memory`
-// must stay OUT of disabled_toolsets — otherwise the subtraction runs last, the
-// gate fails, and the memory provider loads but never reaches the model.
-func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
-	}
-
-	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
-	if !strings.Contains(yamlContent, "memory_enabled: false") {
-		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "provider: multiuser_memory") {
-		t.Errorf("expected provider: multiuser_memory by default, got:\n%s", yamlContent)
-	}
-	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
-		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+
-			"runs last and would silently kill the memory provider; got %v", disabled)
-	}
-}
-
-// disabledToolsets returns the `agent.disabled_toolsets` items from a rendered
-// config. Scoped extraction, not a substring match: `platform_toolsets` carries
-// a `- memory` entry of its own, and the two lists mean opposite things.
-//
-// sigs.k8s.io/yaml renders a sequence at the SAME indentation as its key, so the
-// list ends at the first line that is not a `- ` item at that indent or deeper:
-//
-//	disabled_toolsets:
-//	- file
-//	- terminal
-func disabledToolsets(t *testing.T, yamlContent string) []string {
-	t.Helper()
-	lines := strings.Split(yamlContent, "\n")
-	for i, line := range lines {
-		if strings.TrimSpace(line) != "disabled_toolsets:" {
-			continue
+	for _, forbidden := range []string{"memory:", "memory_enabled:", "user_profile_enabled:", "custom_memory"} {
+		if strings.Contains(yamlContent, forbidden) {
+			t.Errorf("managed config must not carry %q — it would overwrite every "+
+				"specialist profile's memory settings, got:\n%s", forbidden, yamlContent)
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " "))
-		var items []string
-		for _, next := range lines[i+1:] {
-			trimmed := strings.TrimSpace(next)
-			nextIndent := len(next) - len(strings.TrimLeft(next, " "))
-			if nextIndent < indent || !strings.HasPrefix(trimmed, "- ") {
-				break
-			}
-			items = append(items, strings.TrimPrefix(trimmed, "- "))
-		}
-		if len(items) == 0 {
-			t.Fatalf("disabled_toolsets parsed as empty — extractor is broken:\n%s", yamlContent)
-		}
-		return items
 	}
-	t.Fatalf("rendered config has no disabled_toolsets key:\n%s", yamlContent)
-	return nil
 }
 
 func TestDisplayMode(t *testing.T) {
@@ -814,8 +690,12 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
 		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
 	}
-	if _, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; ok {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS not to be set when allowed users is populated")
+	// Emitted with the real answer rather than omitted. Omitting it is what let a
+	// leftover GOOGLE_CHAT_ALLOW_ALL_USERS=true from an earlier, allowlist-free spec
+	// survive on the PVC's .env and beat the allowlist this CR sets — the authz check
+	// reads the per-platform allow-all before it reads any allowlist at all.
+	if got, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; !ok || got.Value != "false" {
+		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS=false when allowed users is populated, got %#v", got)
 	}
 	if envMap["API_SERVER_ENABLED"].Value != "true" {
 		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
@@ -1595,8 +1475,13 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if _, ok := envMap["SLACK_ALLOWED_USERS"]; ok {
-		t.Errorf("expected SLACK_ALLOWED_USERS not to be set when allowedUsers is empty")
+	// Emitted, and empty. The managed .env pins SLACK_ALLOWED_USERS on every reconcile so
+	// the agent cannot write its own; a container env that omits the key when the CR sets
+	// no allowlist would leave the two renders disagreeing about a key that decides who
+	// may talk to the agent.
+	v, ok := envMap["SLACK_ALLOWED_USERS"]
+	if !ok || v.Value != "" {
+		t.Errorf("expected SLACK_ALLOWED_USERS present and empty, got %q (present=%v)", v.Value, ok)
 	}
 	if envMap["SLACK_ALLOW_ALL_USERS"].Value != "true" {
 		t.Errorf("expected SLACK_ALLOW_ALL_USERS true, got %s", envMap["SLACK_ALLOW_ALL_USERS"].Value)
@@ -2295,13 +2180,14 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
 	}
 
-	cm := buildConfigMap(agent, nil)
-	yamlContent := defaultProfileYAML(t, cm)
-	if !strings.Contains(yamlContent, "leader_election:") || !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected leader_election enabled in config.yaml for replicas > 1, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "lease_name: custom-replicas-agent-leader") {
-		t.Errorf("expected lease_name custom-replicas-agent-leader, got:\n%s", yamlContent)
+	// Leadership is the Lease that leader_elect.py holds, not a config key: nothing in
+	// Hermes or in this repo reads a `leader_election` block out of config.yaml, and the
+	// operator drove it through the container env below all along. The render used to
+	// emit the block anyway; in a machine-global managed scope that put one profile's
+	// lease name on every profile in the pod for no reader at all.
+	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
+	if strings.Contains(yamlContent, "leader_election:") {
+		t.Errorf("managed config must not carry a leader_election block, got:\n%s", yamlContent)
 	}
 
 	container := dep.Spec.Template.Spec.Containers[0]
@@ -2534,20 +2420,34 @@ func TestManagedScopeIsADirectoryMount(t *testing.T) {
 
 // What the managed config pins, and what it deliberately does not.
 //
-// `model` is pinned because the endpoint is LiteLLM's to decide: an agent that repoints
-// model.base_url at nothing loses the ability to reason its way back, and before the pin
-// that survived a restart. `toolsets` is pinned so the agent cannot grant itself tools.
-// `platforms.<p>.home_channel` is NOT pinned — that is what `/sethome` sets, and pinning
-// it is exactly the bug in #658.
-func TestManagedConfigPinsModelAndToolsetsButNotHomeChannel(t *testing.T) {
+// The scope is machine-global — one /etc/hermes for every profile in the pod — so the only
+// things that belong in it are the ones identical for every profile AND beyond the agent's
+// own repair. `model` qualifies: an agent that repoints model.base_url at nothing loses the
+// ability to reason its way back, and before the pin that survived a restart. `platforms`
+// qualifies for the same reason at the other end — break the chat front door and there is
+// no channel left to be told to fix it.
+//
+// Toolsets do NOT qualify, though they were pinned once: an over-broad toolset is something
+// a human can still talk the agent out of, and the per-profile lists differ, so pinning them
+// gave every profile the front door's tools. They live in each profile's own image config.
+//
+// `platforms.<p>.home_channel` is not pinned either — that is what `/sethome` sets, and
+// pinning it is exactly the bug in #658.
+func TestManagedConfigPinsModelAndPlatformsButNotHomeChannel(t *testing.T) {
 	var cfg map[string]any
 	if err := yaml.Unmarshal([]byte(buildConfigMapData(chatAgent(), nil)[managedConfigKey]), &cfg); err != nil {
 		t.Fatalf("managed config does not parse as YAML, so hermes fails open and pins nothing: %v", err)
 	}
 
-	for _, key := range []string{"model", "toolsets", "platform_toolsets", "platforms"} {
+	for _, key := range []string{"model", "platforms"} {
 		if _, ok := cfg[key]; !ok {
 			t.Errorf("%q is absent from the managed config, so the agent can set it freely", key)
+		}
+	}
+	for _, key := range []string{"toolsets", "platform_toolsets"} {
+		if _, ok := cfg[key]; ok {
+			t.Errorf("%q is pinned machine-globally, so every profile in the pod gets the front "+
+				"door's tool list instead of its own", key)
 		}
 	}
 	model, _ := cfg["model"].(map[string]any)
@@ -2583,7 +2483,9 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 
 	for _, key := range []string{
 		"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-		"GOOGLE_CHAT_ALLOWED_USERS", "SLACK_RELAY_URL", "SLACK_ALLOWED_USERS",
+		"GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS",
+		"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS",
+		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
 	} {
 		if !strings.Contains(env, key+"=") {
 			t.Errorf("%s is not pinned, so the agent can write it to its own .env and take the "+
@@ -2613,9 +2515,18 @@ func TestManagedEnvAgreesWithContainerEnv(t *testing.T) {
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	gateway := containerNamed(t, dep, "platform-agent")
 
+	// The gateway-wide pair is pinned but never set as container env: an allowlist the
+	// operator does not configure has no value to place there, and the pin exists purely
+	// to occupy the key name so save_env_value refuses the agent's write. Absent from the
+	// container env is not a disagreement — only a different answer is.
+	pinnedOnly := map[string]bool{"GATEWAY_ALLOWED_USERS": true, "GATEWAY_ALLOW_ALL_USERS": true}
+
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
 		key, want, _ := strings.Cut(line, "=")
 		got, found := envValue(gateway, key)
+		if !found && pinnedOnly[key] {
+			continue
+		}
 		if !found {
 			t.Errorf("%s is pinned in the managed .env but absent from the container env; the two "+
 				"renders have drifted", key)
@@ -2861,46 +2772,50 @@ func TestBuildDeployment_AgentPluginImagePullPolicyOverride(t *testing.T) {
 	}
 }
 
-func TestRenderConfigYAML_AgentPluginAllowlist(t *testing.T) {
+// The managed render takes only a plugin's GATEWAY-scoped subtrees. It is one file for
+// every profile in the pod, so a profile-scoped subtree merged here would be applied to
+// all of them; those follow the plugin to its own overlay instead (pluginConfigForScope).
+// Subtrees outside the allowlist reach neither.
+func TestRenderConfigYAML_OnlyGatewayScopedPluginConfigMerges(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "allowlist-agent", Namespace: "test-ns"},
 	}
 
+	// No hyphen: the CRD's name pattern forbids one, and filterValidAgentPlugins drops
+	// a name it would have rejected — so a hyphenated fixture here would test nothing.
 	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "security-plugin"},
+		ObjectMeta: metav1.ObjectMeta{Name: "securityplugin"},
 		Spec: agentv1alpha1.AgentPluginSpec{
 			AgentRef: "allowlist-agent",
 			Image:    "gcr.io/sec:v1",
 			Config: `
-approvals:
-  mode: strict
-agent:
-  disabled_toolsets: []
+platforms:
+  pubsub:
+    enabled: true
+platform_toolsets:
+  cli:
+    - stockout
 logging:
   level: debug
 `,
 		},
 	}
 
-	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
-
-	// Allowed subtree "approvals" should be present
-	if !strings.Contains(renderedYAML, "mode: strict") && !strings.Contains(renderedYAML, "approvals:") {
-		t.Errorf("expected allowed subtree 'approvals' in rendered YAML, got:\n%s", renderedYAML)
-	}
-
-	// Disallowed subtrees "agent" (overriding disabled_toolsets) and "logging" should NOT be merged from plugin
-	var parsed map[string]interface{}
-	if err := yaml.Unmarshal([]byte(renderedYAML), &parsed); err != nil {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})), &parsed); err != nil {
 		t.Fatalf("failed to unmarshal rendered YAML: %v", err)
 	}
 
-	if loggingVal, ok := parsed["logging"]; ok {
-		if loggingMap, isMap := loggingVal.(map[string]interface{}); isMap {
-			if loggingMap["level"] == "debug" {
-				t.Errorf("plugin should not be allowed to override disallowed subtree 'logging'")
-			}
-		}
+	platforms, _ := parsed["platforms"].(map[string]any)
+	if _, ok := platforms["pubsub"]; !ok {
+		t.Errorf("gateway-scoped `platforms` must merge into the managed config, got %v", platforms)
+	}
+	if _, ok := parsed["platform_toolsets"]; ok {
+		t.Errorf("profile-scoped `platform_toolsets` must not reach the machine-global managed "+
+			"config — it belongs to the plugin's own profile, got %v", parsed["platform_toolsets"])
+	}
+	if _, ok := parsed["logging"]; ok {
+		t.Errorf("plugin should not be allowed to merge the disallowed subtree `logging`")
 	}
 }
 
@@ -2948,43 +2863,37 @@ func TestRenderConfigYAML_ExtraConfigAnnotationIgnored(t *testing.T) {
 	}
 }
 
-func TestRenderConfigYAML_DeduplicatePluginsEnabled(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "dedupe-agent", Namespace: "test-ns"},
+// plugins.enabled is the profile overlay's business now — the managed config names no
+// plugins at all. Two AgentPlugins whose names normalise onto the same identifier must
+// still produce one entry: Hermes imports the list in order and a repeat would load the
+// module twice, registering every hook twice with it.
+func TestProfileOverlayDeduplicatesPluginsEnabled(t *testing.T) {
+	// Normalizes onto built-in "session_store", twice.
+	p1 := pluginWithProfile("sessionstore", "platform", "")
+	p2 := pluginWithProfile("sessionstore", "platform", "")
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{p1, p2}, nil, nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
 	}
 
-	p1 := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "sessionstore"}, // Normalizes onto built-in "session_store"
-	}
-	p2 := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "sessionstore"}, // Duplicate
-	}
-
-	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{p1, p2})
-	var parsed map[string]interface{}
-	if err := yaml.Unmarshal([]byte(renderedYAML), &parsed); err != nil {
-		t.Fatalf("failed to unmarshal rendered YAML: %v", err)
-	}
-
-	pluginsVal, ok := parsed["plugins"].(map[string]interface{})
+	pluginsVal, ok := parsed["plugins"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected plugins key in rendered YAML")
+		t.Fatalf("expected plugins key in the overlay, got %v", parsed)
 	}
-
-	enabledSlice, isSlice := pluginsVal["enabled"].([]interface{})
+	enabledSlice, isSlice := pluginsVal["enabled"].([]any)
 	if !isSlice {
-		t.Fatalf("expected plugins.enabled to be a slice")
+		t.Fatalf("expected plugins.enabled to be a slice, got %T", pluginsVal["enabled"])
 	}
 
 	count := 0
 	for _, item := range enabledSlice {
-		if item == "session_store" {
+		if item == "sessionstore" {
 			count++
 		}
 	}
-
 	if count != 1 {
-		t.Errorf("expected 'session_store' to appear exactly once in plugins.enabled, got %d times", count)
+		t.Errorf("expected 'sessionstore' to appear exactly once in plugins.enabled, got %d times", count)
 	}
 }
 
@@ -3137,78 +3046,64 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 // TestRenderConfigYAML_AllowlistedSubtreeMergeIsAdditive documents that list merges under
 // an allowlisted subtree union rather than replace: a plugin can add a platform toolset
 // but cannot remove one the operator configured.
-func TestRenderConfigYAML_AllowlistedSubtreeMergeIsAdditive(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
-	}
+// A plugin adding to a gateway-scoped subtree must add, not replace. The operator writes
+// `platforms.google_chat` and `platforms.slack` there itself; a plugin contributing a
+// third adapter that clobbered the map would take chat ingress off the air.
+func TestRenderConfigYAML_GatewaySubtreeMergeIsAdditive(t *testing.T) {
 	plugin := &agentv1alpha1.AgentPlugin{
 		ObjectMeta: metav1.ObjectMeta{Name: "mergeplugin"},
 		Spec: agentv1alpha1.AgentPluginSpec{
-			AgentRef: "merge-agent",
+			AgentRef: "chat-agent",
 			Image:    "gcr.io/merge:v1",
 			Config: `
-platform_toolsets:
-  cli:
-    - stockout
+platforms:
+  pubsub:
+    enabled: true
 `,
 		},
 	}
 
-	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	rendered := renderConfigYAML(chatAgent(), []*agentv1alpha1.AgentPlugin{plugin})
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(rendered), &parsed); err != nil {
 		t.Fatalf("unmarshal rendered YAML: %v", err)
 	}
 
-	toolsets, ok := parsed["platform_toolsets"].(map[string]any)
+	platforms, ok := parsed["platforms"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected platform_toolsets map in rendered config")
+		t.Fatalf("expected platforms map in rendered config, got:\n%s", rendered)
 	}
-	cli, ok := toolsets["cli"].([]any)
-	if !ok {
-		t.Fatalf("expected platform_toolsets.cli list, got %T", toolsets["cli"])
-	}
-
-	got := map[string]bool{}
-	for _, v := range cli {
-		got[fmt.Sprint(v)] = true
-	}
-	// Operator-configured entries survive.
-	for _, want := range []string{"mcp-router", "kanban", "memory"} {
-		if !got[want] {
-			t.Errorf("expected operator toolset %q to survive the plugin merge, got %v", want, cli)
+	// Operator-configured adapters survive.
+	for _, want := range []string{"google_chat", "slack"} {
+		if _, ok := platforms[want]; !ok {
+			t.Errorf("expected operator adapter %q to survive the plugin merge, got %v", want, platforms)
 		}
 	}
-	// The plugin's addition is unioned in.
-	if !got["stockout"] {
-		t.Errorf("expected plugin-supplied toolset 'stockout' to be merged in, got %v", cli)
+	// The plugin's addition is merged in.
+	if _, ok := platforms["pubsub"]; !ok {
+		t.Errorf("expected plugin-supplied adapter 'pubsub' to be merged in, got %v", platforms)
 	}
 }
 
-func TestRenderConfigYAML_InvalidPluginNameIsSkipped(t *testing.T) {
+func TestInvalidPluginNameIsSkipped(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "skip-agent", Namespace: "test-ns"},
 	}
 	// A name stored before the CRD name rule existed must not reach plugins.enabled
 	// and must not produce a volume the kubelet cannot mount.
-	bad := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "legacy-hyphen"},
-		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "skip-agent", Image: "gcr.io/bad:v1"},
+	bad := pluginWithProfile("legacy-hyphen", "platform", "")
+	good := pluginWithProfile("goodplugin", "platform", "")
+	plugins := []*agentv1alpha1.AgentPlugin{bad, good}
+
+	overlay := buildConfigMapData(agent, plugins)[profileOverlayKey(platformProfileName)]
+	if strings.Contains(overlay, "legacy-hyphen") {
+		t.Errorf("expected invalid plugin name to be excluded from the profile overlay, got:\n%s", overlay)
 	}
-	good := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "goodplugin"},
-		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "skip-agent", Image: "gcr.io/good:v1"},
+	if !strings.Contains(overlay, "goodplugin") {
+		t.Errorf("expected valid plugin to be registered in plugins.enabled, got:\n%s", overlay)
 	}
 
-	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{bad, good})
-	if strings.Contains(rendered, "legacy-hyphen") {
-		t.Errorf("expected invalid plugin name to be excluded from config.yaml")
-	}
-	if !strings.Contains(rendered, "goodplugin") {
-		t.Errorf("expected valid plugin to be registered in plugins.enabled")
-	}
-
-	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{bad, good}, renderOptions{imageVolumeSupported: true})
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", plugins, renderOptions{imageVolumeSupported: true})
 	for _, v := range pod.Spec.Volumes {
 		if strings.Contains(v.Name, "legacy-hyphen") {
 			t.Errorf("expected no volume for the invalid plugin name, found %q", v.Name)
@@ -3225,45 +3120,41 @@ func TestRenderConfigYAML_InvalidPluginNameIsSkipped(t *testing.T) {
 	}
 }
 
-// TestRenderConfigYAML_ListOfMapsDoesNotPanic covers a plugin listing YAML mappings under
-// an allowlisted key the operator also populates as a list. The union used slices.Contains,
-// which compares with == and panics on two elements sharing an uncomparable dynamic type;
-// the panic is recovered by controller-runtime and retried, wedging the agent for good.
-func TestRenderConfigYAML_ListOfMapsDoesNotPanic(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
-	}
-	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "mapsplugin"},
-		Spec: agentv1alpha1.AgentPluginSpec{
-			AgentRef: "merge-agent",
-			Image:    "gcr.io/proj/p:v1",
-			Config: `
+// TestProfileOverlayListOfMapsDoesNotPanic covers two plugins listing YAML mappings under
+// the same allowlisted key. The union used slices.Contains, which compares with == and
+// panics on two elements sharing an uncomparable dynamic type; the panic is recovered by
+// controller-runtime and retried, wedging the agent for good.
+func TestProfileOverlayListOfMapsDoesNotPanic(t *testing.T) {
+	first := pluginWithProfile("mapsplugin", "platform", `
 platform_toolsets:
   cli:
     - {name: one}
     - {name: two}
-`,
-		},
-	}
+`)
+	second := pluginWithProfile("othermaps", "platform", `
+platform_toolsets:
+  cli:
+    - {name: two}
+    - {name: three}
+`)
 
-	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	rendered := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{first, second}, nil, nil)
 	if rendered == "" {
-		t.Fatalf("expected config to render")
+		t.Fatalf("expected the overlay to render")
 	}
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(rendered), &parsed); err != nil {
-		t.Fatalf("rendered config does not parse: %v", err)
+		t.Fatalf("rendered overlay does not parse: %v", err)
 	}
 	toolsets, _ := parsed["platform_toolsets"].(map[string]any)
 	cli, ok := toolsets["cli"].([]any)
 	if !ok {
 		t.Fatalf("expected platform_toolsets.cli to survive, got %T", toolsets["cli"])
 	}
-	// Operator entries survive and the mappings are appended once each.
-	if len(cli) != 5 {
-		t.Errorf("expected 3 operator toolsets plus 2 mappings, got %d: %v", len(cli), cli)
+	// {name: two} is contributed twice and unioned down to one entry.
+	if len(cli) != 3 {
+		t.Errorf("expected three distinct mappings, got %d: %v", len(cli), cli)
 	}
 }
 
@@ -3416,7 +3307,14 @@ func TestPartitionPluginsByProfile(t *testing.T) {
 // A targeted plugin must NOT be enabled in the default profile. Enabling it there too
 // would load a privileged skill plugin into the front door, the one agent deliberately
 // stripped of every tool.
-func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
+// The managed config names no plugins, targeted or not.
+//
+// It is machine-global, so a plugins.enabled written here would be imported by every
+// profile in the pod — and, because the managed merge REPLACES a list rather than
+// unioning it, would wipe each profile's own list on the way. Every plugin roster
+// therefore travels by overlay: `profile-<name>.overlay.yaml` for a targeted plugin,
+// `profile-default.overlay.yaml` for an untargeted one.
+func TestManagedConfigNamesNoPlugins(t *testing.T) {
 	plugins := []*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("adapter", "", ""),
 		pluginWithProfile("stockout", "platform", ""),
@@ -3425,55 +3323,34 @@ func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), plugins)), &parsed); err != nil {
 		t.Fatalf("unmarshal rendered YAML: %v", err)
 	}
-	section, _ := parsed["plugins"].(map[string]any)
-	enabled, _ := section["enabled"].([]any)
-	got := map[string]bool{}
-	for _, v := range enabled {
-		got[fmt.Sprint(v)] = true
+	if section, ok := parsed["plugins"]; ok {
+		t.Errorf("the machine-global managed config must carry no plugins block, got %v", section)
 	}
-	if !got["adapter"] {
-		t.Errorf("untargeted plugin 'adapter' should be enabled on the default profile, got %v", enabled)
+
+	// Each still reaches its own profile, and only its own.
+	data := buildConfigMapData(newTestPlatformAgent(), plugins)
+	front := data[profileOverlayKey(defaultProfileName)]
+	platform := data[profileOverlayKey(platformProfileName)]
+	if !strings.Contains(front, "adapter") {
+		t.Errorf("an AgentPlugin with no targetProfile must be enabled in the default "+
+			"profile's overlay, or it is mounted and never imported; got:\n%s", front)
 	}
-	if got["stockout"] {
-		t.Errorf("plugin targeting 'platform' must not be enabled on the default profile, got %v", enabled)
+	if strings.Contains(front, "stockout") {
+		t.Errorf("a plugin targeting `platform` must not be enabled on the front door, got:\n%s", front)
+	}
+	if !strings.Contains(platform, "stockout") {
+		t.Errorf("a plugin targeting `platform` must be enabled in that profile's overlay, got:\n%s", platform)
+	}
+	if strings.Contains(platform, "adapter") {
+		t.Errorf("an untargeted plugin must not be enabled on the platform profile, got:\n%s", platform)
 	}
 }
 
-// The default profile's plugins.enabled must name every plugin that acts on chat
-// ingress, and only plugins that resolve for it. Hermes resolves the list against the
-// bundled directory (/opt/hermes/plugins, scanned for every HERMES_HOME) and then the
-// profile's own plugins/, so agents/chat/defaults/plugins, the hermes_otel the Dockerfile
-// installs into /opt/defaults, and the bundled incident_context all count.
-// incident_context is the one worth pinning: the pod runs a single gateway, homed at this
-// profile, so dropping it here silences its pre_gateway_dispatch hook fleet-wide rather
-// than moving it to the platform specialist.
-func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
-	}
-	section, _ := parsed["plugins"].(map[string]any)
-	enabled, _ := section["enabled"].([]any)
-	got := make([]string, 0, len(enabled))
-	for _, v := range enabled {
-		got = append(got, fmt.Sprint(v))
-	}
-	// Same list, same order, as agents/chat/config.yaml's plugins.enabled.
-	want := []string{
-		"hermes_otel",
-		"session_store",
-		"session_otel_bridge",
-		"tool_call_audit",
-		"incident_context",
-		"bootstrap_onboarding",
-		"legacy_slash_commands",
-		"agent_roster",
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
-	}
-	// incident_context must also stay in the shadow-protection roster, which is a
-	// separate guarantee from being enabled above.
+// incident_context must stay in the shadow-protection roster. It is enabled by
+// agents/chat/config.yaml rather than by the operator, but the pod runs a single gateway
+// homed at that profile, so an AgentPlugin allowed to shadow the module would silence its
+// pre_gateway_dispatch hook fleet-wide.
+func TestIncidentContextStaysABuiltIn(t *testing.T) {
 	if !IsBuiltInPlugin("incident_context") {
 		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
 	}
@@ -3554,121 +3431,12 @@ func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 //
 // Order is not compared. The merge preserves the base's order and appends, so the
 // rendered order is not what reaches the pod anyway.
-func TestRenderConfigYAMLListsMatchChatConfig(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "agents", "chat", "config.yaml")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
-	}
-	var image map[string]any
-	if err := yaml.Unmarshal(raw, &image); err != nil {
-		t.Fatalf("unmarshaling %s: %v", path, err)
-	}
-
-	// Both homes, because a render that interpolates AgentHome into a list agrees with
-	// the image at the default and diverges everywhere else. mcp_servers.router.args did
-	// exactly that, and the single default-home case here said nothing about it.
-	custom := newTestPlatformAgent()
-	custom.Spec.Harness = &agentv1alpha1.HarnessSpec{
-		Hermes: &agentv1alpha1.HermesSpec{AgentHome: "/var/lib/kage"},
-	}
-	for _, tc := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
-	}{
-		{"default agentHome", newTestPlatformAgent()},
-		{"custom agentHome", custom},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// No tuning overrides: only the lists this render always emits are in play.
-			// Ones it emits solely because of spec.harness.tuning are the CR's business,
-			// not the image's, and are covered by the tuning tests.
-			var rendered map[string]any
-			if err := yaml.Unmarshal([]byte(renderConfigYAML(tc.agent, nil)), &rendered); err != nil {
-				t.Fatalf("unmarshaling rendered YAML: %v", err)
-			}
-
-			listPaths := sortedListPaths(rendered)
-			if len(listPaths) == 0 {
-				t.Fatalf("no lists found in the rendered config — the walk is broken, not the render")
-			}
-			compared := 0
-			for _, at := range listPaths {
-				want, ok := lookup(image, at)
-				if !ok {
-					// The image says nothing about it, so there is nothing to union with.
-					continue
-				}
-				wantList, ok := want.([]any)
-				if !ok {
-					t.Errorf("%s is a list in the render but %T in %s", strings.Join(at, "."), want, path)
-					continue
-				}
-				compared++
-				if a, b := sortedStrings(t, listAt(t, rendered, at)), sortedStrings(t, wantList); !slices.Equal(a, b) {
-					t.Errorf("%s differs between the render and agents/chat/config.yaml:\n  rendered: %v\n  image:    %v\n"+
-						"the startup merge unions these, so the image's extras survive whatever this render omits. "+
-						"For an `args` list that is worse than a survival: it is a command line, so the union "+
-						"concatenates and the process runs the first entry.",
-						strings.Join(at, "."), a, b)
-				}
-			}
-			if compared == 0 {
-				t.Errorf("no list was compared against %s — a rename would make this test vacuous", path)
-			}
-		})
-	}
-}
-
-// sortedListPaths returns every path in `m` whose value is a list, deepest-last, in a
-// stable order so failures read the same way on every run.
-func sortedListPaths(m map[string]any) [][]string {
-	var out [][]string
-	var walk func(any, []string)
-	walk = func(v any, at []string) {
-		switch t := v.(type) {
-		case map[string]any:
-			for _, k := range slices.Sorted(maps.Keys(t)) {
-				walk(t[k], append(append([]string{}, at...), k))
-			}
-		case []any:
-			out = append(out, at)
-		}
-	}
-	walk(m, nil)
-	return out
-}
-
-func lookup(m map[string]any, path []string) (any, bool) {
-	var cur any = m
-	for _, key := range path {
-		asMap, ok := cur.(map[string]any)
-		if !ok {
-			return nil, false
-		}
-		if cur, ok = asMap[key]; !ok {
-			return nil, false
-		}
-	}
-	return cur, true
-}
-
-func listAt(t *testing.T, m map[string]any, path []string) []any {
-	t.Helper()
-	v, _ := lookup(m, path)
-	list, _ := v.([]any)
-	return list
-}
-
-func sortedStrings(t *testing.T, list []any) []string {
-	t.Helper()
-	out := make([]string, 0, len(list))
-	for _, v := range list {
-		out = append(out, fmt.Sprint(v))
-	}
-	sort.Strings(out)
-	return out
-}
+// The render used to be compared list-by-list against agents/chat/config.yaml, because
+// the deleted startup merge unioned the two and a divergence silently concatenated (an
+// `args` list that way runs the wrong binary). It no longer emits any list the image also
+// declares: everything list-shaped — toolsets, plugins.enabled, mcp_servers, kanban — is
+// the image's alone now, and the managed scope replaces rather than unions. There is
+// nothing left for that comparison to compare.
 
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
 	if got := renderProfileOverlayYAML(nil, nil, nil); got != "" {
@@ -3681,23 +3449,19 @@ func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
 		pluginWithProfile("adapter", "", ""),
 		pluginWithProfile("stockout", "platform", ""),
 	})
-	// An untargeted plugin belongs to the default profile, whose whole rendered config
-	// is the managed scope rather than an overlay.
-	def, ok := data[managedConfigKey]
-	if !ok {
+	if _, ok := data[managedConfigKey]; !ok {
 		t.Fatalf("the default profile's managed config is missing, got keys %v", mapKeys(data))
 	}
-	if !strings.Contains(def, "adapter") {
-		t.Errorf("untargeted plugin must be enabled in the managed config, got:\n%s", def)
+	// An untargeted plugin belongs to the default profile, which takes it by overlay —
+	// the managed scope names no plugins (TestManagedConfigNamesNoPlugins).
+	if def, ok := data[profileOverlayKey(defaultProfileName)]; !ok || !strings.Contains(def, "adapter") {
+		t.Errorf("expected profile-default.overlay.yaml to enable the untargeted plugin, got keys %v", mapKeys(data))
 	}
 	// The managed key must NOT match the entrypoint's `profile-*.overlay.yaml` glob:
 	// step 2.7 would then treat it as an overlay for a profile named "default" and try
 	// to merge the whole front-door config into a profile home.
 	if strings.HasPrefix(managedConfigKey, profileOverlayPrefix) {
 		t.Errorf("managedConfigKey %q collides with the overlay glob the entrypoint walks", managedConfigKey)
-	}
-	if _, ok := data[profileOverlayKey(defaultProfileName)]; ok {
-		t.Errorf("the default profile must no longer get an overlay, got keys %v", mapKeys(data))
 	}
 	// Key shape is a contract with docker-entrypoint.sh, which globs for it.
 	if _, ok := data["profile-platform.overlay.yaml"]; !ok {
@@ -3764,12 +3528,19 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 // that overlay says nothing beyond the provider.
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
+
+	// An untuned CR with no plugins at all writes no default overlay: an empty one would
+	// make the entrypoint rewrite the agent's own config.yaml on every start.
+	if got, ok := buildConfigMapData(newTestPlatformAgent(), nil)[profileOverlayKey(defaultProfileName)]; ok {
+		t.Errorf("expected no default overlay with nothing to say, got:\n%s", got)
+	}
+
 	for k := range data {
-		// One overlay is unconditional: the platform profile's carries the memory
-		// provider, so for it absence, not presence, would be the bug. (The default
-		// profile has no overlay at all — its whole rendered config is the managed
-		// scope, under a key outside this prefix.)
-		if k == profileOverlayKey(platformProfileName) {
+		// Two are expected here. The platform profile's overlay is unconditional — it
+		// carries the memory provider, so for it absence, not presence, would be the
+		// bug — and the default profile's carries the untargeted plugin above, which
+		// has nowhere else to be enabled.
+		if k == profileOverlayKey(platformProfileName) || k == profileOverlayKey(defaultProfileName) {
 			continue
 		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
@@ -3832,9 +3603,17 @@ func TestBuildConfigMapDataPlatformOverlayFollowsProvider(t *testing.T) {
 }
 
 // `none` is the only way to say "no external provider": an empty field takes the CRD
-// default, so the sentinel has to survive as far as the rendered config and become the
-// empty string Hermes itself uses.
-func TestRenderConfigYAMLProviderNoneMeansNoProvider(t *testing.T) {
+// default, so the sentinel has to survive resolution and become the empty string Hermes
+// itself uses.
+//
+// Asserted on MEMORY_PROVIDER rather than on a rendered config, because that env var is
+// now the only place the front door's answer appears. The managed scope carries no
+// `memory` block at all — it is machine-global, and a per-user file store is exactly the
+// kind of setting that must not be handed to every specialist — so the front door's
+// provider is the image's (agents/chat/config.yaml). The entrypoint reads this variable
+// to decide whether to run the one-way MEMORY.md import, and there "" is a real answer
+// distinct from the variable being absent.
+func TestMemoryProviderNoneMeansNoProvider(t *testing.T) {
 	for _, tc := range []struct{ provider, want string }{
 		{"", defaultMemoryProvider},
 		{"none", ""},
@@ -3849,17 +3628,20 @@ func TestRenderConfigYAMLProviderNoneMeansNoProvider(t *testing.T) {
 		}
 		agent.Spec.Harness.Memory = &agentv1alpha1.MemorySpec{Provider: tc.provider}
 
-		var parsed map[string]any
-		if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
-			t.Fatalf("provider %q: unmarshal rendered YAML: %v", tc.provider, err)
+		dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{})
+		found := false
+		for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+			if env.Name != "MEMORY_PROVIDER" {
+				continue
+			}
+			found = true
+			if env.Value != tc.want {
+				t.Errorf("provider %q: MEMORY_PROVIDER = %q, want %q", tc.provider, env.Value, tc.want)
+			}
 		}
-		memory, _ := parsed["memory"].(map[string]any)
-		got := ""
-		if memory["provider"] != nil {
-			got = fmt.Sprint(memory["provider"])
-		}
-		if got != tc.want {
-			t.Errorf("provider %q: rendered provider = %q, want %q", tc.provider, got, tc.want)
+		if !found {
+			t.Errorf("provider %q: MEMORY_PROVIDER was not set at all; the entrypoint cannot "+
+				"distinguish \"no provider\" from \"nothing said\"", tc.provider)
 		}
 	}
 }
@@ -3900,16 +3682,29 @@ func TestBuildConfigMapDataTuningOnlyOverlay(t *testing.T) {
 	}
 }
 
-// tuning.default reaches the rendered config, which ships as the default profile's
-// overlay.
-func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
+// tuning.default reaches the front door through its overlay, and nothing else.
+//
+// It cannot go in the managed scope: that scope is machine-global, so one profile's turn
+// budget would become every profile's. The overlay is merged into the agent's own
+// config.yaml at startup instead, which is also why it must not leak into any other
+// profile's overlay — those carry tuning.platform and tuning.cluster.
+func TestDefaultTuningReachesTheDefaultOverlayOnly(t *testing.T) {
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Default: limits(30, 120)})
 
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+	var managed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &managed); err != nil {
 		t.Fatalf("unmarshal rendered YAML: %v", err)
 	}
-	agentSection, _ := parsed["agent"].(map[string]any)
+	if section, ok := managed["agent"]; ok {
+		t.Errorf("the machine-global managed config must carry no per-profile `agent` limits, got %v", section)
+	}
+
+	data := buildConfigMapData(agent, nil)
+	var overlay map[string]any
+	if err := yaml.Unmarshal([]byte(data[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
+		t.Fatalf("unmarshal default overlay: %v", err)
+	}
+	agentSection, _ := overlay["agent"].(map[string]any)
 	if fmt.Sprint(agentSection["api_max_retries"]) != "30" {
 		t.Errorf("api_max_retries = %v, want 30", agentSection["api_max_retries"])
 	}
@@ -3917,143 +3712,131 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
 	}
 
-	// And that render is what the ConfigMap publishes as the default profile's managed
-	// config. It is the only route those limits have to the pod: nothing else writes
-	// that key, and nothing merges anything else into the front door's config.
-	data := buildConfigMapData(agent, nil)
-	if got := data[managedConfigKey]; !strings.Contains(got, "max_turns: 120") {
-		t.Errorf("tuning.default did not reach the default profile's managed config, got:\n%s", got)
-	}
 	for k, v := range data {
-		if !strings.HasPrefix(k, profileOverlayPrefix) {
+		if k == profileOverlayKey(defaultProfileName) {
 			continue
 		}
-		// The platform overlay is unconditional, but it carries the memory provider
-		// and nothing from tuning; only a max_turns leaking into it is a failure.
-		if k == profileOverlayKey(platformProfileName) && !strings.Contains(v, "max_turns") {
-			continue
+		if strings.HasPrefix(k, profileOverlayPrefix) && strings.Contains(v, "max_turns") {
+			t.Errorf("tuning.default must not leak into another profile's overlay, got key %q:\n%s", k, v)
 		}
-		t.Errorf("tuning.default must not produce any other profile's overlay, got key %q", k)
+	}
+}
+
+// spec.harness.tuning.maxInProgress travels the same road, and only when the CR sets it:
+// an unset one must leave agents/chat/config.yaml's cap in force rather than have the
+// operator restate the same number on every reconcile.
+func TestMaxInProgressReachesTheDefaultOverlay(t *testing.T) {
+	if got := buildConfigMapData(newTestPlatformAgent(), nil)[profileOverlayKey(defaultProfileName)]; strings.Contains(got, "max_in_progress") {
+		t.Errorf("an untuned CR must not render a cap, got:\n%s", got)
+	}
+
+	eight := 8
+	if eight == defaultKanbanMaxInProgress {
+		t.Fatalf("test value %d must differ from the image's default to prove the override", eight)
+	}
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
+
+	var overlay map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
+		t.Fatalf("unmarshal default overlay: %v", err)
+	}
+	kanban, _ := overlay["kanban"].(map[string]any)
+	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
+		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
+	}
+
+	// Raising the cap and lowering it must both work — a one-sided test would pass even
+	// if the render silently took the minimum of the CR and the image's default.
+	one := 1
+	lowered := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(lowered, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
+		t.Fatalf("unmarshal default overlay: %v", err)
+	}
+	kanban, _ = overlay["kanban"].(map[string]any)
+	if fmt.Sprint(kanban["max_in_progress"]) != "1" {
+		t.Errorf("max_in_progress = %v, want 1", kanban["max_in_progress"])
 	}
 }
 
 // Unset tuning must leave Hermes' own per-run limits alone. The operator pins no
 // execution limits of its own: what a fleet needs depends on its model quota and on
 // what its agents do, so an untuned deployment gets vanilla Hermes behaviour.
-//
-// Dispatch concurrency is the exception and is asserted separately below.
 func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Platform: limits(8, 200)})
 	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v", err)
 	}
 	agentSection, _ := parsed["agent"].(map[string]any)
+	if fmt.Sprint(agentSection["max_turns"]) != "200" {
+		t.Errorf("tuned max_turns = %v, want 200", agentSection["max_turns"])
+	}
+
+	var untuned map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(newTestPlatformAgent(), nil)[profileOverlayKey(platformProfileName)]), &untuned); err != nil {
+		t.Fatalf("unmarshal untuned platform overlay: %v", err)
+	}
+	untunedAgent, _ := untuned["agent"].(map[string]any)
 	for _, key := range []string{"api_max_retries", "max_turns"} {
-		if v, ok := agentSection[key]; ok {
+		if v, ok := untunedAgent[key]; ok {
 			t.Errorf("%s must be omitted without tuning so Hermes' default applies, got %v", key, v)
 		}
 	}
 }
 
-// Dispatch concurrency is capped even without tuning. Upstream leaves it unbounded,
-// which lets a burst of queued cards spawn one full agent process per card until the
-// cgroup OOM killer takes them — a failure that produces no container restart and no
-// Kubernetes event, only a stranded card. The untuned deployment must not be exposed
-// to that, so the render always carries a number.
-func TestRenderConfigYAMLDefaultsMaxInProgress(t *testing.T) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
-	}
-	kanban, _ := parsed["kanban"].(map[string]any)
-	got, ok := kanban["max_in_progress"]
-	if !ok {
-		t.Fatalf("max_in_progress must be rendered without tuning, got kanban block %v", kanban)
-	}
-	if fmt.Sprint(got) != fmt.Sprint(defaultKanbanMaxInProgress) {
-		t.Errorf("max_in_progress = %v, want %d", got, defaultKanbanMaxInProgress)
-	}
-	// A rendered 0 would be worse than no key at all: Hermes ignores anything below 1,
-	// so the ConfigMap would read as a capped board while behaving as an unbounded one.
-	if fmt.Sprint(got) == "0" {
-		t.Error("max_in_progress must never render as 0 — Hermes ignores it and the board runs uncapped")
-	}
-}
-
-// ...and the CR overrides the operator's default outright.
-func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
-	one := 1
-	if one == defaultKanbanMaxInProgress {
-		t.Fatalf("test value %d must differ from the default to prove the override", one)
-	}
-	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
-
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
-	}
-	kanban, _ := parsed["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "1" {
-		t.Errorf("max_in_progress = %v, want 1", kanban["max_in_progress"])
-	}
-	// The rest of the kanban block must survive the opt-in.
-	if fmt.Sprint(kanban["dispatch_interval_seconds"]) != "5" {
-		t.Errorf("dispatch_interval_seconds = %v, want 5", kanban["dispatch_interval_seconds"])
-	}
-}
-
-// The front door is woken for a follow-up turn only by terminal events it can
-// actually act on. `completed` is not one of them: the notifier has already
-// delivered the worker's summary to the thread, so waking on it buys a model
-// turn that paraphrases a message the user is looking at (5.9s / 32,460 input
-// tokens, measured on t_c31a1f00). The failure kinds deliver a bare status line
-// and do need a decision, so they must stay.
+// Dispatch concurrency is capped, and the cap is the image's.
 //
-// The key is only honoured because deploy/docker/patches/kanban_notifier.py
-// patches it in — upstream Hermes hardcodes the set. If that patch is ever
-// dropped, this config becomes inert rather than wrong, but the pairing is why
-// both sides are asserted.
-func TestDefaultProfileWakesOnFailuresOnly(t *testing.T) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
+// Upstream leaves it unbounded, which lets a burst of queued cards spawn one full agent
+// process per card until the cgroup OOM killer takes them — a failure that produces no
+// container restart and no Kubernetes event, only a stranded card. The operator used to
+// render the cap; it no longer can (the managed scope is machine-global and kanban is
+// profile-shaped), so agents/chat/config.yaml carries the untuned default and this test
+// is what keeps it there. spec.harness.tuning.maxInProgress overrides it through the
+// default profile's overlay — see TestMaxInProgressReachesTheDefaultOverlay — and this
+// number must stay equal to defaultKanbanMaxInProgress, which that test compares against.
+//
+// wake_on_events is asserted here too. The front door is woken for a follow-up turn only
+// by terminal events it can act on; `completed` is not one of them, because the notifier
+// has already delivered the worker's summary to the thread, so waking on it buys a model
+// turn that paraphrases a message the user is looking at (5.9s / 32,460 input tokens,
+// measured on t_c31a1f00). The key is only honoured because
+// deploy/docker/patches/kanban_notifier.py patches it in — upstream hardcodes the set.
+func TestChatConfigCapsTheBoardAndWakesOnFailuresOnly(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
 	}
-	kanban, _ := parsed["kanban"].(map[string]any)
-	raw, ok := kanban["wake_on_events"].([]any)
+	var image map[string]any
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	kanban, _ := image["kanban"].(map[string]any)
+
+	cap, ok := kanban["max_in_progress"]
+	if !ok {
+		t.Fatalf("%s must cap max_in_progress — nothing else does now; got kanban block %v", path, kanban)
+	}
+	// A 0 would be worse than no key at all: Hermes ignores anything below 1, so the
+	// file would read as a capped board while behaving as an unbounded one.
+	if n, isInt := cap.(int); !isInt || n < 1 {
+		t.Errorf("max_in_progress = %v, want a positive integer", cap)
+	} else if n != defaultKanbanMaxInProgress {
+		t.Errorf("%s caps the board at %d but the operator's defaultKanbanMaxInProgress is %d; "+
+			"the two are the same number by contract", path, n, defaultKanbanMaxInProgress)
+	}
+
+	raw2, ok := kanban["wake_on_events"].([]any)
 	if !ok {
 		t.Fatalf("wake_on_events = %v (%T), want a list", kanban["wake_on_events"], kanban["wake_on_events"])
 	}
-
-	got := make([]string, 0, len(raw))
-	for _, v := range raw {
+	got := make([]string, 0, len(raw2))
+	for _, v := range raw2 {
 		got = append(got, fmt.Sprint(v))
 	}
 	want := []string{"gave_up", "crashed", "timed_out", "blocked"}
 	if !slices.Equal(got, want) {
 		t.Errorf("wake_on_events = %v, want %v", got, want)
-	}
-	for _, kind := range got {
-		if kind == "completed" {
-			t.Error("wake_on_events must not contain `completed`: the notifier has " +
-				"already delivered that summary, so the woken turn is pure overhead")
-		}
-	}
-}
-
-// Raising the cap must work too — the default is a floor for the untuned case, not a
-// ceiling. A one-sided override test would pass even if the render silently took the
-// minimum of the two.
-func TestRenderConfigYAMLMaxInProgressRaisedAboveDefault(t *testing.T) {
-	eight := 8
-	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
-
-	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
-		t.Fatalf("unmarshal rendered YAML: %v", err)
-	}
-	kanban, _ := parsed["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
-		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
 	}
 }
 

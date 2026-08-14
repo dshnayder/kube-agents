@@ -312,9 +312,9 @@ fi
 # Where the operator mounts its per-profile overlay ConfigMap (the operator's
 # profileOverlayDir), and the script that consumes what it holds. Resolved here rather
 # than at step 2.7, its only consumer, so the two paths sit next to the step 2d comment
-# that explains why the DEFAULT profile is no longer one of them: it takes the operator's
-# settings from the managed scope at $HERMES_MANAGED_DIR instead, and the operator emits
-# no profile-default.overlay.yaml.
+# on how the default profile's config is assembled: the image seeds it, this overlay
+# merges the operator's mutable settings into it, and the managed scope at
+# $HERMES_MANAGED_DIR pins the immutable ones over the top at load time.
 #
 # Prefer the IMAGE copy of the script over the PVC copy. Step 2 syncs /opt/defaults with
 # `cp -ru`, which skips a destination that looks newer — the same trap step 2a documents
@@ -325,13 +325,15 @@ OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
 [ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
 
 # 2d. Seed the default profile's config.yaml, and check that the managed scope carrying
-# the operator's settings actually arrived.
+# the operator's pins actually arrived.
 #
-# The operator's rendering does NOT come through this file. It is mounted read-only at
-# $HERMES_MANAGED_DIR (/etc/hermes) as Hermes' managed scope, and Hermes overlays it, per
-# leaf key, on top of whatever config.yaml holds — on every load, in both the CLI
+# The pins do NOT come through this file. They are mounted read-only at
+# $HERMES_MANAGED_DIR (/etc/hermes) as Hermes' managed scope, and Hermes overlays them,
+# per leaf key, on top of whatever config.yaml holds — on every load, in both the CLI
 # (hermes_cli/config.py) and the gateway (gateway/config.py). So $TARGET_DIR/config.yaml
-# is the agent's own writable file and nothing here needs to merge into it.
+# stays the agent's own writable file and nothing HERE has to merge into it. Step 2.7
+# does merge the operator's mutable settings into it, from profile-default.overlay.yaml,
+# and it runs after this step for the reason given there.
 #
 # Two earlier shapes did need to, and both were worse:
 #
@@ -359,19 +361,92 @@ CHAT_TEMPLATE_CONFIG="/opt/chat-template/config.yaml"
 if [ ! -f "$TARGET_DIR/config.yaml" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
     cp "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" \
         || echo "WARN: could not seed $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG" >&2
+elif [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
+    # Existing volume: FILL what the file does not say, and change nothing it does.
+    #
+    # Two things hollow out the live file, and neither is a bug in the agent. Hermes'
+    # save_config strips every leaf the managed scope holds before writing (config.py,
+    # `_strip_dotted_keys(config, managed_keys)`), so one `/sethome` turns a pinned
+    # `model:` block into `model: {}` on disk. And a release that STOPS pinning a leaf —
+    # this one narrows the managed render to the model, the chat platforms and the cron
+    # approval mode — hands that leaf back to a file the previous release already emptied
+    # of it. The pod then runs on Hermes' built-in defaults for everything the image
+    # template was supposed to supply, with green health checks and no error anywhere.
+    #
+    # Fill-only, so it cannot become the thing it is repairing: a key the file already
+    # holds is left exactly as the agent last wrote it, including one the agent set to
+    # an empty string or an empty list on purpose. Only ABSENT keys are added, at any
+    # depth, which is why `model: {}` is repaired while `model: {default: other}` is not
+    # touched. That is what keeps a `/sethome` home channel, the monitoring install id
+    # and saved slash-command preferences across restarts — the property the deleted
+    # three-way merge kept getting wrong in the other direction.
+    "$INSTALL_DIR/.venv/bin/python3" - "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" <<'PYEOF' || echo "WARN: could not backfill $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG; the agent may be running on Hermes defaults for keys the image template owns" >&2
+import os
+import sys
+
+import yaml
+
+template_path, live_path = sys.argv[1], sys.argv[2]
+
+with open(template_path) as fh:
+    template = yaml.safe_load(fh) or {}
+with open(live_path) as fh:
+    live = yaml.safe_load(fh) or {}
+
+if not isinstance(template, dict) or not isinstance(live, dict):
+    print("[ENTRYPOINT] config backfill skipped: not a mapping", file=sys.stderr)
+    raise SystemExit(0)
+
+added = []
+
+
+def fill(src, dst, path):
+    for key, value in src.items():
+        if key not in dst:
+            dst[key] = value
+            added.append(".".join(path + [key]))
+        elif isinstance(value, dict) and isinstance(dst[key], dict):
+            # Recurse only where BOTH sides are mappings. Where the live file holds a
+            # scalar or a list the agent has spoken, and a merge would overrule it.
+            fill(value, dst[key], path + [key])
+
+
+fill(template, live, [])
+
+if added:
+    # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
+    # over a plain PVC file is a rename, and the reader either sees all of the old file
+    # or all of the new one. (The subPath mount that made this impossible is gone —
+    # see the note above.)
+    tmp_path = live_path + ".backfill.tmp"
+    with open(tmp_path, "w") as fh:
+        yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
+    os.replace(tmp_path, live_path)
+    print(f"[ENTRYPOINT] config backfill: restored {len(added)} key(s) the live file did not hold: {', '.join(added)}")
+PYEOF
 fi
 
 # Managed scope fails OPEN by design: a missing directory, or a config.yaml that does not
 # parse, is logged by hermes and otherwise ignored so a bad policy file can never brick
 # startup (managed_scope.py). That is the right default for Hermes and the wrong one for
-# us — here it would mean the model endpoint, the platform settings and the toolsets are
-# all silently unpinned, on a pod whose health checks stay green. So assert it, loudly.
+# us — here it would mean the model endpoint and the chat platform settings are silently
+# unpinned, on a pod whose health checks stay green. So assert it, loudly.
 #
 # Report, never exit: an agent that comes up unpinned is still an agent that answers, and
 # failing the container would trade a degraded front door for no front door at all.
-MANAGED_DIR="${HERMES_MANAGED_DIR:-/etc/hermes}"
-if [ ! -f "$MANAGED_DIR/config.yaml" ]; then
-    echo "WARN: no managed config at $MANAGED_DIR/config.yaml — the operator's settings (model endpoint, platforms, toolsets) are NOT pinned and the agent can overwrite them" >&2
+#
+# Gated on HERMES_MANAGED_DIR being SET, not on the default path existing. The operator
+# sets it on the one container it mounts the scope into; an image started any other way —
+# compose, a plain manifest, `docker run`, the kustomize bases — has no managed scope by
+# design and is not misconfigured for lacking one. Warning there would make the alarm
+# routine, which is the only way to lose the one case it exists for: an operator-managed
+# pod whose mount did not arrive. The env var is set by the Deployment, so it survives
+# exactly the failure being watched for.
+MANAGED_DIR="${HERMES_MANAGED_DIR:-}"
+if [ -z "$MANAGED_DIR" ]; then
+    :
+elif [ ! -f "$MANAGED_DIR/config.yaml" ]; then
+    echo "WARN: no managed config at $MANAGED_DIR/config.yaml — the operator's settings (model endpoint, chat platforms) are NOT pinned and the agent can overwrite them" >&2
 elif ! "$INSTALL_DIR/.venv/bin/python3" -c '
 import sys
 from hermes_cli import managed_scope
@@ -381,16 +456,17 @@ if not keys:
     sys.exit(1)
 # Named individually rather than just counted. A non-empty key set only proves the file
 # parsed; these are the leaves the pin exists for — the model endpoint the agent reasons
-# through, and the toolsets that bound what it can do to the cluster. The platform
-# settings are checked by their presence in the managed .env instead, since which ones
-# are rendered depends on what the CR enables.
-for expected in ("model.default", "model.base_url", "toolsets"):
+# through, and the wire protocol that has to keep matching it. Everything else the render
+# emits is conditional on what the CR enables: the chat platform settings are checked by
+# their presence in the managed .env instead, and a deployment with no chat integration
+# at all legitimately renders neither.
+for expected in ("model.default", "model.base_url", "model.api_mode"):
     if expected not in keys:
         print(f"managed scope is live but does not pin {expected}", file=sys.stderr)
         sys.exit(1)
 print(f"managed scope: {len(keys)} pinned config keys from {managed_scope.get_managed_dir()}")
 '; then
-    echo "WARN: $MANAGED_DIR/config.yaml did not load as a managed scope (unparseable, or missing the model/toolset keys) — hermes fails open, so the agent is running UNPINNED" >&2
+    echo "WARN: $MANAGED_DIR/config.yaml did not load as a managed scope (unparseable, or missing the model keys) — hermes fails open, so the agent is running UNPINNED" >&2
 fi
 
 # The image's own copy of the scaffolder, never the volume's. Step 2 seeds
@@ -860,8 +936,8 @@ fi
 # this step exists to prevent, and the symptom surfaces far away — as "Unknown skill(s)"
 # in a worker, or as an agent that improvises without the skill it was told to use.
 #
-# $OVERLAY_DIR and $OVERLAY_SCRIPT are resolved above step 2d, next to the comment that
-# explains why the default profile is not among the profiles this step reconciles.
+# $OVERLAY_DIR and $OVERLAY_SCRIPT are resolved above step 2d. The default profile is
+# reconciled here too, but separately — see the block after the loop.
 #
 # Gated on $OVERLAY_DIR existing, not merely on the script existing. Only the agent
 # container mounts platform-agent-config-vol; in the dashboard sidecar the directory is
@@ -882,6 +958,26 @@ if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
             || echo "WARN: overlay sync failed for profile '$name'; settings it carries will not apply" >&2
     done
 
+    # The front door, which the loop above cannot reach: it has no directory under
+    # profiles/, its home IS $TARGET_DIR, so it is passed by name.
+    #
+    # Guarded on there being something to do. apply_overlay rewrites config.yaml
+    # unconditionally — through yaml.safe_dump, which sorts the keys and drops every
+    # comment — and this is the one profile config a human reads and the agent writes.
+    # With no overlay rendered and none previously applied, that rewrite would churn the
+    # file on every start for no change at all. When either exists the rewrite is the
+    # point: applying, or undoing a withdrawn overlay.
+    #
+    # Runs AFTER step 2d, which seeds a fresh volume from the image and back-fills lost
+    # keys. Reversing the two would merge the overlay into a config the seed then
+    # replaced.
+    DEFAULT_OVERLAY="$OVERLAY_DIR/profile-default.overlay.yaml"
+    if [ -f "$DEFAULT_OVERLAY" ] || [ -f "$TARGET_DIR/.operator-overlay.json" ]; then
+        "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$TARGET_DIR" \
+            --profile-name default --overlay-dir "$OVERLAY_DIR" \
+            || echo "WARN: overlay sync failed for the default profile; AgentPlugins with no targetProfile will not load" >&2
+    fi
+
     # Warn when an overlay names a profile that does not exist. The operator cannot
     # validate spec.targetProfile — profiles are scaffolded here at startup, not by the
     # operator — so this is the only place a typo becomes visible. A `cluster-*` name is
@@ -894,9 +990,8 @@ if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
         [ -d "$TARGET_DIR/profiles/$name" ] && continue
         case "$name" in
             # The default profile IS $TARGET_DIR and has no entry under profiles/, so the
-            # directory test above can never find it. The operator no longer emits this
-            # overlay at all — the default profile takes its settings from the managed
-            # scope — but the case stays so a leftover one is not reported as a typo.
+            # directory test above can never find it. It is reconciled by name just
+            # above; this case only keeps it out of the typo warning.
             default)   continue ;;
             cluster-*) echo "NOTE: overlay $base names cluster profile '$name', which is not scaffolded yet; it applies when that cluster is onboarded" >&2 ;;
             *)         echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2 ;;
