@@ -53,10 +53,9 @@ scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
-user replies to — never saw the finding. On a Google Chat install it did not
-even get the words there: `profile_cron_tick.py` can only hand a child profile
-the Slack channel, so before the relay existed `"all"` expanded to nothing at
-all. It expands to the relay now, so a job left on `"all"` is at least heard.
+user replies to — never saw the finding. `"all"` now expands to include the
+relay as well as the channel, so a job left on it is heard twice rather than
+not at all.
 
 `deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
 it and thereby owns the thread the user replies in. It is a delivery mode, not a

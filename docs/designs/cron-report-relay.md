@@ -12,21 +12,19 @@ A watchdog on a named profile runs with the right brain and no voice.
 keeps that profile's persona, skills, model and turn budget — which is the whole
 reason the watchdogs live on the Platform Agent's roster rather than as kanban
 cards. What it does not get is a way to say anything useful to the person who
-cares. Two separate gaps:
+cares.
 
-1. **Delivery.** `deliver: "all"` expands at fire time to every platform with a
-   configured home channel, and `profile_cron_tick.py` only knows how to hand a
-   child profile the Slack channel (`HOME_TARGET_ENV_KEYS` names
-   `SLACK_HOME_CHANNEL` and nothing else). On a Google Chat install the child
-   resolves `deliver=all` to an empty target list and records "no delivery
-   target resolved" while posting nowhere.
-2. **Context.** Even where delivery works, the report arrives as a monologue
-   from a process that has now exited. A user who replies "why does that
-   matter?" is talking to the Chat Agent, which never saw the finding.
+The report arrives as a monologue from a process that has now exited. A user who
+replies "why does that matter?" is talking to the Chat Agent, which never saw the
+finding, and there is nothing it can do but apologise.
 
-The second gap is the interesting one, because it does not go away by fixing the
-first. Handing the specialist a Google Chat channel id would make the message
-appear and still leave the follow-up unanswerable.
+Getting the words into a channel _at all_ was a second and separate gap, now
+closed: `HOME_TARGET_ENV_KEYS` in `profile_cron_tick.py` named the Slack keys and
+nothing else, so on a Google Chat install the child resolved `deliver: "all"` to
+an empty target list and posted nowhere. It names both platforms now, and
+`home_target_env`'s docstring is where that story lives. Closing it does not
+close this one: a channel id makes the message appear and still leaves the
+follow-up unanswerable.
 
 ## The shape of the fix
 
@@ -193,11 +191,13 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. On a Google Chat install that is a fix rather than a cost — `all`
-  previously expanded to nothing for named profiles — but on a Slack install a
-  job left on `all` reports twice, once into the channel and once through the
-  Chat Agent. So the whole Platform Agent roster names `"chat"` rather than
-  relying on the expansion. No migration was needed to get there: `deliver` is
+  one. A job left on `all` therefore reports twice — once flat into the channel
+  and once through the Chat Agent — on either platform, now that
+  `home_target_env` restores the Google Chat channel too. So the whole Platform
+  Agent roster names `"chat"` rather than relying on the expansion, which is
+  also the only way to say "relay, and do not also post flat" at all: the token
+  is additive, so there is no value that subtracts a target from `all`.
+  No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
   rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`
   says which merge and why the default profile is the exception). What that
