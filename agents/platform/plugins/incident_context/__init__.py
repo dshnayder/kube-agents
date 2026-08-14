@@ -25,9 +25,16 @@ def on_inbound(*, event, **_):
         return None
     report = _lookup(src.chat_id, src.thread_id)
     if not report:
-        return None  # not an incident thread -> leave the message untouched
+        return None  # nothing stored for this thread -> leave the message untouched
+    # Deliberately not "k8s incident report". The `incidents` table has two
+    # writers -- the event watcher, which does store incidents, and the cron
+    # report relay, which stores a scheduled report from a job where nothing
+    # broke. Naming the wrong one costs a real answer: told a smoke-test report
+    # was an incident, the agent opened its reply by correcting the framing
+    # ("It's not an incident report - nothing broke") before answering what was
+    # asked. The table name is history; this string is read by a model.
     new_text = (
-        "[Prior k8s incident report posted in this thread - use it to interpret the reply below]\n"
+        "[Prior report posted in this thread - use it to interpret the reply below]\n"
         f"{report}\n\n"
         f"[User reply in thread]: {event.text}"
     )
