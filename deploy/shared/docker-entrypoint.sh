@@ -119,13 +119,26 @@ if ! agent_owns_shared_state "$@"; then
     # no scripts/router_server.py, no plugin links. So wait for the one file whose absence
     # is not survivable, and only for it.
     #
-    # This wait is what replaces a subPath mount. The operator used to project the
-    # rendered ConfigMap over $TARGET_DIR/config.yaml in the non-owner container, which
-    # guaranteed a file was there — but a mount is not conditional: it shadowed the PVC
-    # copy on every volume, forever, so this container silently read a DIFFERENT config
-    # from the gateway's, and narrowing the render narrowed this container's whole world
-    # with it. Waiting keeps the guarantee and drops the divergence: both containers now
-    # read the same PVC file with the same /etc/hermes managed scope over it.
+    # BELT AND BRACES, not the load-bearing guarantee — say so plainly, because an
+    # earlier revision of this comment claimed otherwise and it was wrong. Upstream's
+    # stage2 hook seeds $HERMES_HOME/config.yaml from cli-config.yaml.example before this
+    # script gets control, in THIS container as much as in the owner's, so in the shipped
+    # image the file is already there and the loop below never runs a single iteration.
+    # It is kept for the case that stops being true: nothing in this repo owns stage2's
+    # seeding, an upstream that stops doing it would otherwise reintroduce the empty-read
+    # silently, and an unexecuted `while` costs nothing to carry.
+    #
+    # What this REPLACED is a subPath mount. The operator used to project the rendered
+    # ConfigMap over $TARGET_DIR/config.yaml in the non-owner container. That guaranteed
+    # a file, but a mount is not conditional: it shadowed the PVC copy on every volume,
+    # so this container read a DIFFERENT config from the gateway's and narrowing the
+    # render narrowed this container's whole world with it. It did not even shadow
+    # RELIABLY — the bind lives in this container's mount namespace, and the owner
+    # replacing config.yaml atomically from its own namespace destroys it outright (the
+    # rename does not even get EBUSY, having no bind of its own at that path), so the
+    # sidecar read the render until the owner's first write and the PVC file after it.
+    # Both containers now read the same PVC file with the same /etc/hermes managed scope
+    # over it, which is the property that actually matters here.
     #
     # Bounded, and it proceeds either way. A non-owner that never comes up is worse than
     # one that comes up early: with no probes on this container, exiting here would only
@@ -400,10 +413,50 @@ OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
 # and losing the live file to it would discard the runtime's own state.
 CHAT_TEMPLATE_CONFIG="/opt/chat-template/config.yaml"
 
+# A FRESH VOLUME IS NOT AN ABSENT FILE. Upstream's stage2 hook runs before this script
+# and seeds $HERMES_HOME/config.yaml from Hermes' own cli-config.yaml.example
+# (docker/stage2-hook.sh, `seed_one "config.yaml" "cli-config.yaml.example"`), so by the
+# time control reaches here the file always exists — on a brand-new PVC as much as on a
+# ten-week-old one. Testing `! -f` therefore tested for a state that never occurs, and
+# the whole fresh-volume path below was dead code.
+#
+# What that cost is not subtle, and only a fresh volume shows it: the back-fill is
+# FILL-ONLY, so every key the example already spells out keeps ITS value, forever. A new
+# install came up on upstream defaults for terminal, browser, code_execution, delegation,
+# telemetry, database and streaming — none of which the image template had any way to
+# correct, because they were present, not missing. Measured on a live cluster: 26
+# top-level keys and 6488 bytes of upstream example where the template asks for 9 keys,
+# with the template's contribution reduced to the 12 keys the example happened to omit.
+#
+# So detect the example itself. stage2 copies it verbatim and only chowns/chmods after,
+# so a byte-compare against the file it copied FROM is exact at this moment, and it is
+# the one moment that matters. It cannot false-positive on a real install: Hermes
+# rewrites the file on first save, the managed-scope strip empties `model:`, and this
+# very step back-fills into it — any of which ends the equality. And if a future Hermes
+# templates the example on the way in and the compare stops matching, this degrades to
+# the back-fill below, which is exactly today's behaviour: no worse, just not better.
+#
+# A function, and not three lines inline, so the tests can lift it out and run it against
+# real files the way they already lift the back-fill program out of its heredoc — the
+# branch it feeds sits in the owner-only path, which no unit test can reach.
+# $1 = the live config.yaml, $2 = the example stage2 seeds from.
+config_is_pristine_upstream_example() {
+    [ -f "$1" ] && [ -f "$2" ] && cmp -s "$2" "$1"
+}
+
 # Fresh volume: lay the image's copy down before anything can read it, so neither the
 # gateway nor the dashboard sidecar comes up against a missing config, falls back to
 # Hermes' built-in defaults, and saves those over the top.
 if [ ! -f "$TARGET_DIR/config.yaml" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
+    cp "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" \
+        || echo "WARN: could not seed $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG" >&2
+elif [ -f "$CHAT_TEMPLATE_CONFIG" ] \
+    && config_is_pristine_upstream_example \
+        "$TARGET_DIR/config.yaml" "$INSTALL_DIR/cli-config.yaml.example"; then
+    # Fresh volume, stage2 having got here first. Overwrite rather than fill: nothing in
+    # that file is a runtime edit — no agent has run yet — so there is nothing to
+    # preserve, and filling into it is precisely what leaves the upstream defaults live.
+    echo "[ENTRYPOINT] config.yaml is upstream's untouched cli-config.yaml.example (fresh volume); replacing it with the image template." >&2
     cp "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" \
         || echo "WARN: could not seed $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG" >&2
 elif [ -f "$CHAT_TEMPLATE_CONFIG" ]; then

@@ -255,12 +255,13 @@ class SharedStateGateTest(unittest.TestCase):
 class ConfigWaitTest(unittest.TestCase):
     """The non-owner's bounded wait for the config.yaml the owner seeds.
 
-    This replaced a subPath mount. The operator used to project its render over
-    $HERMES_HOME/config.yaml in the dashboard container, which did guarantee a file was
-    there on a fresh volume — but a mount is not conditional, so it shadowed the PVC copy
-    on EVERY volume and the dashboard silently read a different config from the gateway's.
-    Waiting keeps the guarantee and drops the divergence, so what these tests hold is that
-    the wait actually waits, actually stops early, and never becomes a wedge.
+    This replaced a subPath mount that shadowed the PVC copy on every volume, so the
+    dashboard read a different config from the gateway's. In the shipped image the wait
+    is belt and braces rather than the guarantee: upstream's stage2 hook seeds
+    config.yaml from cli-config.yaml.example before the entrypoint runs, so the loop
+    never iterates there. It is carried for an upstream that stops doing that, which is
+    exactly why it needs tests of its own — nothing in the running system would notice
+    if it broke. What they hold is that it waits, stops early, and never becomes a wedge.
     """
 
     def _run(self, *, seed_after=None, wait_secs=30, home_exists=True, timeout=None):
@@ -435,6 +436,92 @@ def _extract_heredoc(marker):
         if lines[end] == marker:
             return "\n".join(lines[start:end]) + "\n"
     raise AssertionError(f"<<'{marker}' is never closed in {_ENTRYPOINT}")
+
+
+def _extract_shell_function(name):
+    """Return the text of a `name() { ... }` function from the entrypoint.
+
+    Same bargain as `_extract_heredoc`: run the shipped definition, never a copy of it.
+    Relies on the script's own formatting — opener line, body, a `}` in column zero —
+    which `sh -n` and the repo's shell style already enforce.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    openers = [i for i, line in enumerate(lines) if line.startswith(f"{name}() {{")]
+    if len(openers) != 1:
+        raise AssertionError(f"expected one {name}() in {_ENTRYPOINT}, found {len(openers)}")
+    start = openers[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == "}":
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
+
+
+class FreshVolumeDetectionTest(unittest.TestCase):
+    """A fresh volume is not an absent file, and getting that wrong cost a whole install.
+
+    Upstream's stage2 hook seeds $HERMES_HOME/config.yaml from cli-config.yaml.example
+    before this script runs, so `[ ! -f config.yaml ]` never fires and step 2d took the
+    FILL-ONLY path into upstream's example. Fill-only cannot overrule a key that is
+    present, so a new install kept upstream's terminal, browser, code_execution,
+    delegation and telemetry defaults permanently — 26 top-level keys of example where
+    the template asks for 9. Measured on a live cluster, not deduced.
+
+    So the trigger is the example itself, byte-for-byte. These tests pin both halves:
+    that a pristine example is recognised, and that anything the agent has touched is
+    not — the second being the one that would turn this into the config-destroying
+    force-copy the whole PR exists to avoid.
+    """
+
+    _FUNC = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._FUNC = _extract_shell_function("config_is_pristine_upstream_example")
+
+    def _is_pristine(self, live, example):
+        """Run the shipped function over two real files; True iff it exits 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            live_path = pathlib.Path(tmp) / "config.yaml"
+            example_path = pathlib.Path(tmp) / "cli-config.yaml.example"
+            if live is not None:
+                live_path.write_text(live, encoding="utf-8")
+            if example is not None:
+                example_path.write_text(example, encoding="utf-8")
+            proc = subprocess.run(
+                ["sh", "-c", self._FUNC + f'\nconfig_is_pristine_upstream_example "{live_path}" "{example_path}"'],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return proc.returncode == 0
+
+    def test_the_untouched_example_is_recognised(self):
+        """What stage2 leaves on a brand-new PVC: a verbatim copy."""
+        example = "model:\n  provider: anthropic\nterminal:\n  enabled: true\n"
+        self.assertTrue(self._is_pristine(example, example))
+
+    def test_a_config_the_agent_has_written_is_not(self):
+        """One `/sethome` is enough to end the equality, and must be."""
+        example = "model:\n  provider: anthropic\nterminal:\n  enabled: true\n"
+        live = "model: {}\nterminal:\n  enabled: true\nplatforms:\n  slack:\n    home_channel: C123\n"
+        self.assertFalse(self._is_pristine(live, example))
+
+    def test_a_one_byte_difference_is_enough(self):
+        """A byte compare, not a fuzzy one: near-miss must fall through to the back-fill."""
+        example = "model:\n  provider: anthropic\n"
+        self.assertFalse(self._is_pristine(example + "\n", example))
+
+    def test_a_missing_example_is_not_pristine(self):
+        """An image without the example must take the back-fill path, not overwrite.
+
+        This is the forward-compatibility case: if upstream moves or renames the file,
+        the answer has to be "leave the live config alone", never "replace it".
+        """
+        self.assertFalse(self._is_pristine("model: {}\n", None))
+
+    def test_a_missing_live_config_is_not_pristine(self):
+        """That case belongs to the seed branch above it, which needs no comparison."""
+        self.assertFalse(self._is_pristine(None, "model: {}\n"))
 
 
 class ConfigBackfillTest(unittest.TestCase):
