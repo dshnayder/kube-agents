@@ -4,22 +4,35 @@
 # profile that receives all chat ingress. It is written to
 # /opt/chat-template/config.yaml at build time, and docker-entrypoint.sh seeds
 # the default profile home's config.yaml ($HERMES_HOME/config.yaml) from it on a
-# FRESH volume. After that the live file belongs to the running agent.
+# FRESH volume. After that the live file belongs to the running agent, with one
+# exception: step 2d back-fills, at every start, any key the live file does not
+# hold at all — the repair for a `save_config` that stripped a then-pinned leaf,
+# or a release that stopped pinning one. So ADDING a key here does reach an
+# existing install on its next roll; CHANGING one does not, because the live file
+# already holds it and the back-fill never overrules a value the agent has. A
+# changed value reaches a deployed agent only through the operator — the managed
+# scope or the overlay in (3) and (4) below — or by hand.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# WHAT THE AGENT ACTUALLY LOADS IS THREE THINGS, and this is only one of them:
+# WHAT THE AGENT ACTUALLY LOADS IS FOUR THINGS, and this is only one of them:
 #
-#   1. this file, the base, seeded onto the PVC on a fresh volume;
+#   1. this file, the base, seeded onto the PVC on a fresh volume and back-filled
+#      into it thereafter;
 #   2. the running agent's own writes to that PVC copy — /sethome records the
 #      home channel, the monitoring policy mints monitoring.install_id, slash
 #      commands save preferences;
-#   3. the operator's render (k8s-operator renderConfigYAML), mounted read-only
+#   3. the operator's overlay for this profile (renderDefaultProfileOverlayYAML,
+#      ConfigMap key profile-default.overlay.yaml), merged INTO the PVC copy by
+#      entrypoint step 2.7 at startup. It carries the operator settings that stay
+#      mutable afterwards — an untargeted AgentPlugin's enablement and its
+#      non-gateway config, and spec.harness.tuning;
+#   4. the operator's render (k8s-operator renderConfigYAML), mounted read-only
 #      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
-#      key, on top of 1+2 at every load.
+#      key, on top of 1+2+3 at every load.
 #
 # The managed scope wins, and it wins without touching the PVC: hermes merges it
 # in on load, strips its keys back out of anything the agent saves, and rejects
@@ -28,7 +41,11 @@
 # once subPath-mounted over $HERMES_HOME/config.yaml instead, which made the file
 # read-only — that is what made /sethome fail (issue #658).
 #
-# The two do not overlap, and must not. /etc/hermes is MACHINE-GLOBAL — one file
+# (3) and (4) do not overlap, and must not — a key the operator both pins and
+# merges would be written to the PVC and then overruled on load, so withdrawing
+# it from the CR would change nothing anyone could see.
+#
+# /etc/hermes is MACHINE-GLOBAL — one file
 # for every profile in the pod, not just this one — so it carries only what is
 # identical for every profile AND beyond the agent's own repair: `model`,
 # `platforms`, `approvals.cron_mode`, `display.platforms`. Everything

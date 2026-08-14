@@ -26,14 +26,32 @@ re-checking this against a real container wants scripts/ or profiles/platform/pr
 instead, which only the gated steps below create.
 """
 
+import ast
 import os
 import pathlib
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
-_ENTRYPOINT = (
-    pathlib.Path(__file__).resolve().parents[1] / "deploy" / "shared" / "docker-entrypoint.sh"
+import yaml
+
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+_ENTRYPOINT = _REPO / "deploy" / "shared" / "docker-entrypoint.sh"
+_CHAT_TEMPLATE = _REPO / "agents" / "chat" / "config.yaml"
+# The operator's rendered ConfigMap, as the manifests golden records it. It is the only
+# place in this repository where the entrypoint's expectation of the render can be
+# checked against the render itself — the two are written in different languages.
+_MANIFEST_GOLDEN = (
+    _REPO
+    / "k8s-operator"
+    / "internal"
+    / "testing"
+    / "testdata"
+    / "platform"
+    / "expected"
+    / "platformagent.yaml"
 )
 
 # The gate announces its decision on stderr in both directions. Asserting on that rather
@@ -222,6 +240,191 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run([], echo=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup)
+
+
+def _extract_heredoc(marker):
+    """Return the body of the entrypoint's `<<'MARKER'` heredoc.
+
+    Step 2d's back-fill is a Python program embedded in the shell script, so the only
+    way to test the program that actually ships is to lift it back out. Copying it into
+    this file instead would be worse than no test: the copy would keep passing after the
+    original diverged from it.
+
+    Insists on exactly one opener. A second heredoc with the same marker would make this
+    silently test whichever came first.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    openers = [i for i, line in enumerate(lines) if f"<<'{marker}'" in line]
+    if len(openers) != 1:
+        raise AssertionError(f"expected one <<'{marker}' in {_ENTRYPOINT}, found {len(openers)}")
+    start = openers[0] + 1
+    for end in range(start, len(lines)):
+        if lines[end] == marker:
+            return "\n".join(lines[start:end]) + "\n"
+    raise AssertionError(f"<<'{marker}' is never closed in {_ENTRYPOINT}")
+
+
+class ConfigBackfillTest(unittest.TestCase):
+    """Step 2d fills keys the live config.yaml has lost, and must change nothing else.
+
+    Two things hollow the PVC file out, and both are ordinary: hermes' `save_config`
+    strips every leaf the managed scope holds before writing, so one `/sethome` leaves
+    `model: {}` on disk; and a release that stops pinning a leaf hands it back to a file
+    the previous release already emptied of it. The pod then runs on hermes' built-in
+    defaults with green health checks — the failure this step exists to prevent.
+
+    The back-fill is the only thing in the entrypoint that rewrites a file the running
+    agent owns, so both halves matter: what it restores, and what it refuses to touch.
+    Overruling one value the agent wrote for itself would make it the three-way merge
+    this PR deleted, whose rule kept a bad value alive across every restart (#658).
+    """
+
+    _PROGRAM = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._PROGRAM = _extract_heredoc("PYEOF")
+
+    def _fill(self, template, live):
+        """Run the real program over two files, returning `(proc, reloaded_live)`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            template_path = pathlib.Path(tmp) / "template.yaml"
+            live_path = pathlib.Path(tmp) / "live.yaml"
+            template_path.write_text(
+                template if isinstance(template, str) else yaml.safe_dump(template),
+                encoding="utf-8",
+            )
+            live_path.write_text(
+                live if isinstance(live, str) else yaml.safe_dump(live), encoding="utf-8"
+            )
+            before = live_path.read_bytes()
+            proc = subprocess.run(
+                [sys.executable, "-c", self._PROGRAM, str(template_path), str(live_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            after = live_path.read_bytes()
+            return proc, yaml.safe_load(after), before == after
+
+    def test_a_key_the_live_file_lost_is_restored(self):
+        """`model: {}` is what a save leaves behind; the template's block goes back in."""
+        proc, live, _ = self._fill(
+            {"model": {"base_url": "http://litellm/v1", "api_mode": "chat_completions"}},
+            {"model": {}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["model"]["base_url"], "http://litellm/v1")
+        self.assertEqual(live["model"]["api_mode"], "chat_completions")
+        self.assertIn("model.base_url", proc.stdout)
+
+    def test_a_value_the_agent_wrote_is_never_overruled(self):
+        """Including one deliberately set empty — absence is the only trigger."""
+        proc, live, _ = self._fill(
+            {"platforms": {"slack": {"home_channel": "C-TEMPLATE", "rich_blocks": True}}},
+            {"platforms": {"slack": {"home_channel": "", "rich_blocks": False}}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            live["platforms"]["slack"]["home_channel"],
+            "",
+            "an empty home channel is a value the agent set, not a missing key: "
+            "restoring the template's over it is the /sethome bug of #658",
+        )
+        self.assertIs(live["platforms"]["slack"]["rich_blocks"], False)
+
+    def test_a_live_scalar_is_not_descended_into(self):
+        """Where the live file holds a scalar and the template a mapping, the agent wins."""
+        proc, live, _ = self._fill({"memory": {"provider": "hindsight"}}, {"memory": "none"})
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["memory"], "none")
+
+    def test_nothing_missing_leaves_the_file_byte_identical(self):
+        """No rewrite when there is nothing to add — that is what keeps the comments."""
+        live = "# the agent's own file\nmodel:\n  base_url: http://litellm/v1\n"
+        proc, _, unchanged = self._fill({"model": {"base_url": "http://other/v1"}}, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged, f"the file was rewritten with nothing to add: {proc.stdout}")
+
+    def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
+        """A corrupt config must not take the container down; step 2d only reports."""
+        proc, live, unchanged = self._fill({"model": {"base_url": "http://litellm/v1"}}, "- a\n- b")
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertEqual(live, ["a", "b"])
+        self.assertIn("skipped", proc.stderr)
+
+    def test_the_shipped_template_repairs_a_hollowed_config(self):
+        """The real files, in the shape the cluster produced: `model: {}` plus /sethome."""
+        template = yaml.safe_load(_CHAT_TEMPLATE.read_text(encoding="utf-8"))
+        proc, live, _ = self._fill(
+            template,
+            {
+                "model": {},
+                "platforms": {"google_chat": {"home_channel": "spaces/AAQA"}},
+                "monitoring": {"install_id": "abc123"},
+            },
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["model"], template["model"])
+        self.assertEqual(
+            live["platforms"]["google_chat"]["home_channel"],
+            "spaces/AAQA",
+            "the back-fill overwrote the home channel /sethome set — the one thing #658 "
+            "is about keeping",
+        )
+        self.assertEqual(live["monitoring"]["install_id"], "abc123")
+        for key in ("toolsets", "platform_toolsets", "kanban", "agent"):
+            self.assertIn(key, live, f"{key} was lost to the managed strip and not restored")
+
+
+class ManagedScopeAssertionTest(unittest.TestCase):
+    """Step 2d's other half: the check that the operator's pins actually arrived.
+
+    Hermes' managed scope fails OPEN — an absent or unparseable file is ignored — which
+    for us means the model endpoint is silently writable on a pod whose health checks
+    stay green. The entrypoint names the leaves it expects rather than counting them,
+    and a typo in one of those names makes the check pass vacuously. Nothing else in
+    this repository compares that list to what the operator emits: one side is shell,
+    the other Go.
+    """
+
+    def test_the_expected_keys_are_keys_the_operator_actually_pins(self):
+        script = _ENTRYPOINT.read_text(encoding="utf-8")
+        match = re.search(r"for expected in \(([^)]*)\):", script)
+        self.assertIsNotNone(
+            match, "step 2d no longer names the leaves it expects; this test guards that list"
+        )
+        expected = ast.literal_eval(f"({match.group(1)})")
+        self.assertTrue(expected, "an empty expectation would make the check pass vacuously")
+
+        managed = None
+        for doc in yaml.safe_load_all(_MANIFEST_GOLDEN.read_text(encoding="utf-8")):
+            if doc and doc.get("kind") == "ConfigMap" and "managed-config.yaml" in (
+                doc.get("data") or {}
+            ):
+                managed = yaml.safe_load(doc["data"]["managed-config.yaml"])
+        self.assertIsNotNone(managed, f"no managed-config.yaml in {_MANIFEST_GOLDEN}")
+
+        for dotted in expected:
+            node = managed
+            for part in dotted.split("."):
+                self.assertIsInstance(
+                    node, dict, f"step 2d expects {dotted}, which the render does not nest that way"
+                )
+                self.assertIn(
+                    part,
+                    node,
+                    f"step 2d warns unless the managed scope pins {dotted}, but the operator "
+                    f"does not render it — every boot would log 'running UNPINNED'",
+                )
+                node = node[part]
 
 
 def _extract_shell_function(name):

@@ -2499,9 +2499,13 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		}
 	}
 
-	// A deployment with no chat integration must produce no file rather than an empty
-	// one: an empty managed .env is harmless, but writing the key unconditionally makes
-	// the ConfigMap churn on unrelated reconciles.
+	// A deployment with no chat integration pins nothing, so the render is empty — but
+	// buildConfigMapData still writes the key, and must: the managed volume projects it
+	// by name, and a ConfigMap item naming a missing key fails the mount and the pod
+	// never starts (see renderManagedEnv's doc comment). What is asserted here is the
+	// CONTENT, not the key's presence: an agent with no chat integration has no platform
+	// credential worth freezing, and a pin invented for one would only be a key the agent
+	// is refused permission to set.
 	if got := renderManagedEnv(newTestPlatformAgent()); got != "" {
 		t.Errorf("renderManagedEnv with no integration = %q, want empty", got)
 	}
