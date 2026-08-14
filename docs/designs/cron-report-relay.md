@@ -1,9 +1,8 @@
 # Scheduled-report relay: the specialist reasons, the Chat Agent speaks
 
-**Status:** implemented. Rolled out to one pilot watchdog
-(`github-issue-resolver`); the remaining seven jobs on
-[the Platform Agent's roster](../../agents/platform/cron/README.md) still deliver
-through the scheduler, and converting each is a one-field edit.
+**Status:** implemented, and every job on
+[the Platform Agent's roster](../../agents/platform/cron/README.md) delivers this
+way. Not yet validated against a live cluster.
 
 ## The problem
 
