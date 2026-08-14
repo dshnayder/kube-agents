@@ -131,7 +131,15 @@ if ! agent_owns_shared_state "$@"; then
     # one that comes up early: with no probes on this container, exiting here would only
     # buy a kubelet backoff loop, and the owner may legitimately never run at all in a
     # deployment that mounts a pre-populated volume.
-    if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+    #
+    # Gated on HERMES_MANAGED_DIR being SET, for the same reason the managed-scope
+    # assertion below is: it is the one marker of an operator-managed pod. The wait is
+    # only ever paid off by a SECOND container in the same pod, and the operator's
+    # Deployment is the only thing that creates one. Started any other way — compose, a
+    # plain manifest, `docker run`, the kustomize bases, a test harness — a missing
+    # config.yaml means nobody is coming to write it, and pausing would turn a fast
+    # failure into a two-minute one for no possible gain.
+    if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ ! -f "$TARGET_DIR/config.yaml" ]; then
         _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
         # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
         # — so a typo in a knob for waiting would kill the container outright, which is

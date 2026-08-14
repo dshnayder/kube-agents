@@ -289,6 +289,12 @@ class ConfigWaitTest(unittest.TestCase):
                         "PLATFORM_AGENT_HOME": str(home),
                         "AGENT_SHARED_STATE_SETUP": "skip",
                         "AGENT_SHARED_STATE_WAIT_SECS": str(wait_secs),
+                        # The wait is gated on this: it marks an operator-managed pod,
+                        # the only arrangement where a second container is coming to
+                        # seed the file. Without it here every test below would pass by
+                        # never reaching the code it names. The path is never read —
+                        # this branch execs long before the managed-scope assertion.
+                        "HERMES_MANAGED_DIR": "/etc/hermes",
                     },
                     timeout=timeout if timeout is not None else wait_secs + 60,
                 )
@@ -313,6 +319,9 @@ class ConfigWaitTest(unittest.TestCase):
                     "AGENT_SHARED_STATE_SETUP": "skip",
                     # Long enough that waiting at all would blow the timeout below.
                     "AGENT_SHARED_STATE_WAIT_SECS": "600",
+                    # Set, so that what skips the wait here is the file being present
+                    # and not the operator gate — that gate has its own test.
+                    "HERMES_MANAGED_DIR": "/etc/hermes",
                 },
                 timeout=30,
             )
@@ -373,6 +382,36 @@ class ConfigWaitTest(unittest.TestCase):
         """
         proc, _ = self._run(wait_secs=2, home_exists=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_a_start_outside_the_operator_does_not_wait_at_all(self):
+        """No HERMES_MANAGED_DIR means no second container, so nobody is coming.
+
+        compose, a plain manifest, `docker run`, the kustomize bases, a test harness: a
+        missing config.yaml there is a fact, not a race, and pausing on it turns a fast
+        failure into a two-minute one for no possible gain. This is not hypothetical —
+        it is how the first cut of this wait hung deploy/docker's startup-contract tests,
+        which run the entrypoint as `sh -c pwd` against an empty temp home.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            home.mkdir(parents=True)
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_SETUP": "skip",
+                    # Deliberately no HERMES_MANAGED_DIR. The budget is long enough that
+                    # waiting at all would blow the timeout below.
+                    "AGENT_SHARED_STATE_WAIT_SECS": "600",
+                },
+                timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
         self.assertIn("hermes dashboard", proc.stdout)
 
 
