@@ -194,9 +194,16 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. On this install that is a fix rather than a cost — `all` previously
-  expanded to nothing for named profiles — but on a Slack install a job left on
-  `all` reports twice.
+  one. On a Google Chat install that is a fix rather than a cost — `all`
+  previously expanded to nothing for named profiles — but on a Slack install a
+  job left on `all` reports twice, once into the channel and once through the
+  Chat Agent. So the whole Platform Agent roster names `"chat"` rather than
+  relying on the expansion. No migration was needed to get there: `deliver` is
+  an image-owned key on a named profile, so the entrypoint's existing cron merge
+  rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`
+  says which merge and why the default profile is the exception). What that
+  cannot reach is a job the agent creates at runtime, which is why `AGENTS.md`
+  tells it to pass `deliver='chat'`.
 - **A failed relay does not fall back.** It returns an error, which the scheduler
   records in `last_delivery_error`; the report itself is still in the job's saved
   output. Routing a failure to `all` would need the interception this design
