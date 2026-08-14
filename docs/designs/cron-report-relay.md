@@ -173,6 +173,15 @@ to resolve `deliver: "chat"` to a target. Unset — which is how the gateway
 process runs — the enablement pass leaves the platform disabled, no adapter is
 ever asked for, and `deliver: "chat"` resolves to nothing.
 
+One thing a plugin manifest is not is documentation. `optional_env` is folded
+into `OPTIONAL_ENV_VARS` under the default `category: "messaging"`, and the
+subprocess scrub blocklist blocks that bucket whole — so a variable named there
+is stripped from every child `build_subprocess_env` spawns, `profile-cron-tick`
+included. Declaring `SESSION_KV_API_KEY` made the relay revoke its own
+credential: the pod had the key, the gateway had it, and the cron child that
+needed it did not. `chat/plugin.yaml` carries the rule and the two names left
+out because of it.
+
 The sender is handed the delivery text, not the job. It recovers the job's id and
 name from the header `_deliver_result` wraps every cron delivery in, and posts
 the report without it. That coupling is the one thing the plugin route

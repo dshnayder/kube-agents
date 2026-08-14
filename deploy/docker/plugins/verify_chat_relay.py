@@ -10,10 +10,14 @@ Why this exists
 ---------------
 
 The plugin edits nothing, so there is no patch anchor to fail loudly when
-upstream moves. What it does instead is depend on four upstream behaviours, and
+upstream moves. What it does instead is depend on five upstream behaviours, and
 every one of them fails QUIETLY — a watchdog that reports nothing looks exactly
 like a watchdog with nothing to report:
 
+0. ``build_subprocess_env`` lets a cron child inherit ``SESSION_KV_API_KEY``.
+   The scrub blocklist is assembled from ``OPTIONAL_ENV_VARS``, which every
+   plugin manifest contributes to, so this plugin can revoke its own
+   credential by naming it — see the comment block in ``chat/plugin.yaml``.
 1. ``_plugin_cron_env_var`` accepts a plugin platform as a ``deliver=`` target
    when it registers ``cron_deliver_env_var``.
 2. ``Platform._missing_`` admits a bundled plugin platform by directory name.
@@ -22,8 +26,13 @@ like a watchdog with nothing to report:
    no in-process gateway, and ``_deliver_result`` wraps the report in a header
    this plugin has to read the job id back out of.
 
-Any of those four changing turns delivery off. Asserting them here turns that
+Any of those five changing turns delivery off. Asserting them here turns that
 into a failed image build.
+
+Check 0 is the one this file originally missed, and the omission was structural
+rather than an oversight: every other check sets its variables directly in this
+process, so none of them crosses the spawn boundary where the scrub happens.
+It cost a live delivery failure to find.
 """
 
 from __future__ import annotations
@@ -110,6 +119,26 @@ def main() -> None:
 
     from cron.scheduler import _deliver_result, _is_known_delivery_platform
     from cron.scheduler import _resolve_delivery_targets, _expand_routing_tokens
+
+    # 0. A cron child inherits the relay's credential.
+    #
+    #    `profile-cron-tick` is a no_agent script job, so `_run_job_script`
+    #    builds its environment with `build_subprocess_env()` — the same call
+    #    asserted here — and `profile_cron_tick.py` then hands that environment
+    #    to the child that actually runs the job. Anything the scrub drops here
+    #    is gone by the time the relay looks for it, and the only symptom is a
+    #    `last_delivery_error` on a job whose pod has the variable set.
+    #
+    #    Asserted against the real function rather than against the blocklist
+    #    set, because the set is one of several ways a name can be dropped.
+    from tools.environments.local import build_subprocess_env
+
+    for name in ("SESSION_KV_API_KEY", "CRON_REPORT_RELAY_URL"):
+        child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
+        check(
+            child_env.get(name) == "sentinel",
+            f"a cron child inherits {name} rather than having it scrubbed",
+        )
 
     # 1. The registry accepts the plugin as a cron delivery platform.
     check(
