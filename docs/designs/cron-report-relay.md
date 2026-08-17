@@ -148,22 +148,35 @@ and the first follow-up typed into it is answered in the main space — and star
 a second session besides. The reply after that works, because by then the user's
 own first message is in the count.
 
-The hook closes it, because it holds the evidence the counter is missing. On a
-by-thread miss it reads `thread.name` off the raw Chat payload — the thread the
-user actually typed into, which the adapter dropped — and looks that up. A stored
-report means the bot opened this thread and the user has deliberately replied
-inside it, which is the condition the counter exists to detect. The hook then
-assigns `source.thread_id`, which puts the thread into the session key and into
-the outbound send's metadata, and the reply that goes out registers the thread on
-the adapter's way past. Nothing else overrides the adapter: with no report for the
-thread the heuristic stands, and groups never reach the branch because their
-`thread_id` survives.
+The hook recovers the **context**, and only the context. On a by-thread miss it
+reads `thread.name` off the raw Chat payload — the thread the user actually typed
+into, which the adapter dropped — and looks that up. A stored report means the bot
+opened this thread and the user has deliberately replied inside it, so the agent
+gets the report it is being asked about instead of a bare sentence. With no report
+for the thread the adapter's heuristic stands untouched, and groups never reach
+the branch because their `thread_id` survives.
 
-This is a workaround for a Hermes bug, not the fix. The adapter's in-process
-sender already seeds that counter on outbound; its out-of-process sender
-(`_standalone_send`) does not, and bringing the two to parity would fix every
-bot-opened thread rather than the ones this repository happens to have a report
-row for.
+**Routing is not fixable from a plugin, and the hook deliberately does not try.**
+Writing the thread back onto `event.source` looks like the fix and is not one:
+`pre_gateway_dispatch` is the earliest inbound hook Hermes has, and it fires
+inside `_message_handler`, which `gateway/platforms/base.py` calls only _after_ it
+has snapshotted the outbound routing off that same source
+(`_thread_metadata_for_source(event.source, …)`, ~30 lines earlier in the same
+task); every send in that turn reuses the snapshot. Measured live on 2026-08-17:
+the hook re-attached the thread and the report reached the agent, and the reply
+still went to the space. The assignment would also split the conversation, keying
+the session to a thread whose messages are visibly not in one. So the first
+follow-up is answered _correctly_ but in the main space; the reply after that
+threads normally, because by then the user's own first message is in the count.
+
+The fix belongs in the adapter, where routing is decided before the event is
+handed up. Its in-process sender (`_create_message`) already seeds the counter on
+outbound, with a comment naming this exact symptom; its out-of-process sender
+(`_standalone_send`, the path `hermes send` takes) does not. Bringing the two to
+parity fixes every bot-opened thread rather than the ones this repository happens
+to hold a report row for — and it has to be paired with a reload-on-mtime in
+`_ThreadCountStore.incr`, because that store rewrites the whole dict from memory
+and would otherwise erase a peer process's write.
 
 ## Session lifetime: one per job, per UTC day
 

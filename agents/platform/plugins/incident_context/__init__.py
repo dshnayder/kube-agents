@@ -30,7 +30,7 @@ def on_inbound(*, event, **_):
     thread_id = getattr(src, "thread_id", None)
     report = _lookup(chat_id, thread_id) if thread_id else None
     if not report:
-        report = _recover_bot_thread(src, platform, chat_id, thread_id, _raw_thread(event))
+        report = _recover_bot_thread(platform, chat_id, thread_id, _raw_thread(event))
     if report:
         # Deliberately not "k8s incident report". The `incidents` table has two
         # writers -- the event watcher, which does store incidents, and the cron
@@ -75,8 +75,8 @@ def _raw_thread(event):
         return None
     return thread.get("name") or None
 
-def _recover_bot_thread(src, platform, chat_id, thread_id, raw_thread):
-    """Re-attach the thread a relayed report created, and return that report.
+def _recover_bot_thread(platform, chat_id, thread_id, raw_thread):
+    """Return the report posted in the thread the user is replying inside.
 
     Google Chat opens a thread around *every* top-level message, so an inbound
     payload cannot say whether the user posted at top level or replied inside a
@@ -99,14 +99,19 @@ def _recover_bot_thread(src, platform, chat_id, thread_id, raw_thread):
     the counter was trying to detect. Nothing else here overrides the adapter:
     with no report for the thread this returns None and the heuristic stands.
 
-    Assigning `src.thread_id` is what moves the answer. `SessionSource` is a
-    plain dataclass and the gateway keeps the same instance across the
-    `dataclasses.replace(event, text=...)` it does for a rewrite, so downstream
-    reads see the assignment: the session key gains the thread (`gateway/session.py`)
-    and the outbound send carries `metadata={"thread_id": ...}`, which is the
-    first thing google_chat's `_resolve_thread_id` looks at. The reply that then
-    goes out through the adapter registers the thread on the way, so every later
-    message in it routes without any help from here.
+    Context only: this recovers what the agent *reads*, not where it replies.
+    The answer still goes to the main space, and no plugin can change that.
+    `pre_gateway_dispatch` is the earliest hook there is, and it fires inside
+    `_message_handler` -- which the platform base class calls only after it has
+    already snapshotted the outbound routing off this same source
+    (`_thread_metadata_for_source(event.source, ...)`, ~30 lines earlier in the
+    same task in `gateway/platforms/base.py`). Assigning `src.thread_id` here
+    reaches nothing that sends. Measured on 2026-08-17 20:17 UTC: the hook
+    re-attached the thread, the report reached the agent, the reply went to the
+    space anyway. It would also split the conversation, keying the session to a
+    thread whose messages are visibly not in one, so it is deliberately not done.
+    Routing has to be decided in the adapter, before the event is handed up --
+    the design doc records what that fix is.
 
     Groups need none of this -- the adapter always keeps their thread_id, so
     `raw_thread` matches what the source already carries and this is a no-op.
@@ -116,9 +121,9 @@ def _recover_bot_thread(src, platform, chat_id, thread_id, raw_thread):
     report = _lookup(chat_id, raw_thread)
     if not report:
         return None
-    src.thread_id = raw_thread
     logger.info(
-        "Re-attached bot-created thread %s in %s; the reply would have gone to the space",
+        "Recovered the report for bot-created thread %s in %s (context only -- "
+        "the reply routes to the space until the adapter is fixed)",
         raw_thread, chat_id,
     )
     return report

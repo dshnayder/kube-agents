@@ -124,15 +124,22 @@ class BotThreadRecoveryTest(unittest.TestCase):
         self.assertIn("the deploy-smoke report", result["text"])
         self.assertIn("[User reply in thread]", result["text"])
 
-    def test_the_thread_is_re_attached_so_the_answer_goes_back_into_it(self):
-        """The routing half. Without this the text is right and the reply is not."""
-        event, _ = self.call(self.RELAY)
-        self.assertEqual(event.source.thread_id, self.RELAY)
+    def test_the_source_is_not_re_pointed_at_the_thread(self):
+        """Context only, on purpose.
 
-    def test_an_ordinary_top_level_message_is_not_re_attached(self):
-        """Chat wraps these in a thread too, and the adapter is right about them."""
-        event, result = self.call("spaces/AAA/threads/some-auto-thread")
+        Writing the thread back onto the source looks like the routing fix and
+        is not one: the base class snapshots outbound routing off this source
+        before it ever calls the handler this hook runs in, so the reply goes to
+        the space regardless (measured live). All the assignment would achieve is
+        keying the session to a thread the conversation is visibly not in.
+        """
+        event, result = self.call(self.RELAY)
+        self.assertIn("the deploy-smoke report", result["text"])
         self.assertIsNone(event.source.thread_id)
+
+    def test_an_ordinary_top_level_message_gets_no_report(self):
+        """Chat wraps these in a thread too, and the adapter is right about them."""
+        _, result = self.call("spaces/AAA/threads/some-auto-thread")
         self.assertIn("No report is attached", result["text"])
 
     def test_slack_is_left_to_its_own_threading(self):
