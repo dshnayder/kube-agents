@@ -903,6 +903,37 @@ class TestRecentReportsIndex(unittest.TestCase):
         self.assertEqual(len(self._fetch()), session_kv_server.RECENT_REPORTS_LIMIT)
         self.assertEqual(len(self._fetch("chat_id=spaces/AAA&limit=3")), 3)
 
+    def test_a_users_own_session_does_not_erase_the_label(self):
+        """Found live: every thread anyone had replied in came back unlabelled.
+
+        Replying in a thread writes a second session_metadata row against the
+        same thread_id — a google_chat user session, with no job to name. It is
+        written after the relay's row, so the label lookup has to choose rather
+        than take the last one it happens to scan.
+        """
+        import sqlite3
+
+        self._report("T1", job_id="deploy-smoke", title="Deploy verification")
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "20260817_174509_15a5ad0c",
+                        json.dumps(
+                            {
+                                "platform": "google_chat",
+                                "chat_id": "spaces/AAA",
+                                "thread_id": "T1",
+                            }
+                        ),
+                    ),
+                )
+
+        (report,) = self._fetch()
+        self.assertEqual(report["job_id"], "deploy-smoke")
+        self.assertEqual(report["title"], "Deploy verification")
+
     def test_a_report_with_no_relay_session_still_appears(self):
         """`send_notification` writes incidents with no session row to name them."""
         self._report("T-watcher")

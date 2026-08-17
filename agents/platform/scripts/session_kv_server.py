@@ -1106,7 +1106,12 @@ def list_recent_reports(chat_id: str, hours: int = 0, limit: int = 0) -> Dict[st
             except Exception:
                 continue
             thread = str(meta.get("thread_id") or "")
-            if thread:
+            # A thread accumulates session rows: the relay's, and then one per
+            # user who replies in it. Only the relay's row can name the job,
+            # and the user rows are written later, so a plain last-wins scan
+            # drops the label from exactly the threads someone is engaging
+            # with — which is every thread this index is for.
+            if thread and meta.get("job_id"):
                 labels[thread] = meta
 
     reports = [
