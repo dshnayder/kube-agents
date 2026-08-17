@@ -199,6 +199,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
+        ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
         ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
     )
@@ -783,6 +784,132 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertIn("verbatim", instructions)
         self.assertIn("must not re-investigate", instructions)
         self.assertIn("do not delegate", instructions)
+
+    def test_the_job_title_reaches_the_index(self):
+        """`title` is stored for one reader: /v1/incidents/recent."""
+        import sqlite3
+
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
+            self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "j3", "report": "raw", "title": "Deploy verification"},
+            )
+
+        with sqlite3.connect(temp_db_path) as conn:
+            (blob,) = conn.execute("SELECT metadata FROM session_metadata").fetchone()
+        self.assertEqual(json.loads(blob).get("title"), "Deploy verification")
+
+
+class TestRecentReportsIndex(unittest.TestCase):
+    """GET /v1/incidents/recent — what the agent gets when the thread key misses.
+
+    A Google Chat reply typed into the main compose box carries no thread_id,
+    and a top-level Slack channel message carries its own ts, so by-thread
+    necessarily 404s on both. The reports are still in the channel above; this
+    route is how the agent learns they exist and asks which one is meant
+    instead of answering about the wrong one.
+    """
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM session_metadata")
+                conn.execute("DELETE FROM incidents")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _report(self, thread_id, age_hours=0, job_id=None, title="", profile="platform"):
+        """One delivered report, optionally aged, with or without a relay session."""
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO incidents (chat_id, thread_id, report, created_at) "
+                    "VALUES (?, ?, ?, datetime('now', ?))",
+                    ("spaces/AAA", thread_id, "the report body", f"-{age_hours} hours"),
+                )
+                if job_id:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                        (
+                            f"cron-platform-{job_id}",
+                            json.dumps(
+                                {
+                                    "platform": "cron-report",
+                                    "profile": profile,
+                                    "job_id": job_id,
+                                    "title": title,
+                                    "chat_id": "spaces/AAA",
+                                    "thread_id": thread_id,
+                                }
+                            ),
+                        ),
+                    )
+
+    def _fetch(self, query="chat_id=spaces/AAA"):
+        response = self.client.get(f"/v1/incidents/recent?{query}")
+        self.assertEqual(response.status_code, 200)
+        return response.json()["reports"]
+
+    def test_empty_when_nothing_was_posted_here(self):
+        self._report("T1", job_id="compliance-audit")
+        self.assertEqual(self._fetch("chat_id=spaces/OTHER"), [])
+
+    def test_reports_are_labelled_from_their_relay_session(self):
+        self._report("T1", job_id="deploy-smoke", title="Deploy verification")
+        (report,) = self._fetch()
+        self.assertEqual(report["job_id"], "deploy-smoke")
+        self.assertEqual(report["title"], "Deploy verification")
+        self.assertEqual(report["profile"], "platform")
+        self.assertEqual(report["thread_id"], "T1")
+
+    def test_no_report_text_is_returned(self):
+        """The invariant, not an implementation detail.
+
+        The caller prepends this to every unthreaded message in the space, and
+        `_store_incident_report` persists the relay's composed output rather
+        than the specialist's finding — so a preview line would carry
+        model-written text into all of them.
+        """
+        self._report("T1", job_id="deploy-smoke")
+        (report,) = self._fetch()
+        self.assertNotIn("report", report)
+        self.assertNotIn("the report body", json.dumps(report))
+
+    def test_newest_first(self):
+        self._report("T-old", age_hours=5, job_id="older")
+        self._report("T-new", age_hours=1, job_id="newer")
+        self.assertEqual([r["job_id"] for r in self._fetch()], ["newer", "older"])
+
+    def test_reports_outside_the_window_are_left_out(self):
+        """Retention is 14 days; this block is prepended to ordinary chatter."""
+        self._report("T-today", age_hours=2, job_id="today")
+        self._report("T-lastweek", age_hours=24 * 7, job_id="last-week")
+        self.assertEqual([r["job_id"] for r in self._fetch()], ["today"])
+
+    def test_the_row_cap_holds(self):
+        for i in range(12):
+            self._report(f"T{i}", age_hours=i, job_id=f"job-{i}")
+        self.assertEqual(len(self._fetch()), session_kv_server.RECENT_REPORTS_LIMIT)
+        self.assertEqual(len(self._fetch("chat_id=spaces/AAA&limit=3")), 3)
+
+    def test_a_report_with_no_relay_session_still_appears(self):
+        """`send_notification` writes incidents with no session row to name them."""
+        self._report("T-watcher")
+        (report,) = self._fetch()
+        self.assertEqual(report["thread_id"], "T-watcher")
+        self.assertEqual(report["job_id"], "")
+        self.assertEqual(report["profile"], "")
 
 
 if __name__ == "__main__":

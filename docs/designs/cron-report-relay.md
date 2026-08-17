@@ -103,6 +103,38 @@ The relay writes that row itself rather than calling `POST /v1/incidents` over
 loopback — it is that endpoint's own server, so an HTTP call to itself inside a
 background task would only add a way to fail.
 
+## When the follow-up arrives outside the thread
+
+Context comes from the thread, so a follow-up that does not carry the thread gets
+none. That is not a corner case on either platform. A Google Chat reply typed
+into the main compose box arrives with no `thread_id` at all; a top-level Slack
+channel message arrives carrying its own `ts`, which matches no stored report.
+Both leave the agent reading a bare sentence while the reports sit in the channel
+above it — and it does not degrade to "I lack context". It binds to the nearest
+antecedent in its own history and answers confidently about the wrong report.
+
+`GET /v1/incidents/recent` is the floor under that. On a by-thread miss the hook
+asks what was posted in this chat lately and prepends an index — job id, title,
+profile, timestamp — telling the agent that these exist, that it does not have
+them, and to ask which one is meant. Turning a wrong answer into a question is
+the whole of the goal; retrieving the named report is not part of it.
+
+Two properties are load-bearing:
+
+- **Labels only, never report text.** `_store_incident_report` persists the
+  relay's composed output rather than the specialist's finding, and this block is
+  prepended to every unthreaded message in the space. A preview line would carry
+  model-written text into all of them. `job_id`, `title` and `profile` are fields
+  the Session KV server wrote itself.
+- **Bounded on both axes.** A window shorter than `CLEANUP_TTL_DAYS`
+  (`SESSION_KV_RECENT_REPORTS_HOURS`, default 24) and a row cap
+  (`SESSION_KV_RECENT_REPORTS_LIMIT`, default 8), so the injected block costs the
+  same whatever the reports weigh — a fortnight of an eight-job roster would
+  otherwise tax ordinary chatter with a hundred lines.
+
+The by-thread path is untouched: a threaded reply that finds its report behaves
+exactly as before, and the index only runs where the hook previously did nothing.
+
 ## Session lifetime: one per job, per UTC day
 
 One session per _report_ — what the watcher's `per-incident` mode does — gives a

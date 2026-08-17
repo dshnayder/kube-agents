@@ -44,6 +44,15 @@ app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 
+# Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
+# its caller prepends the result to messages that carry no report of their own,
+# which on a busy channel is most of them: a window shorter than
+# CLEANUP_TTL_DAYS (a fortnight of an eight-job roster is ~100 lines of tax on
+# ordinary chatter) and a row cap, so the injected block costs the same whatever
+# the reports themselves weigh.
+RECENT_REPORTS_WINDOW_HOURS = int(os.getenv("SESSION_KV_RECENT_REPORTS_HOURS", "24"))
+RECENT_REPORTS_LIMIT = int(os.getenv("SESSION_KV_RECENT_REPORTS_LIMIT", "8"))
+
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
 # authenticate nothing. See docs/credential-isolation-design.md.
@@ -675,7 +684,7 @@ def _lookup_session_routing(session_id: str) -> tuple[str, str]:
         return "", ""
 
 
-def _ensure_session_row(session_id: str, profile: str, job_id: str) -> None:
+def _ensure_session_row(session_id: str, profile: str, job_id: str, title: str = "") -> None:
     """Create the local metadata row for a relay session if it is not there yet.
 
     /sessions mints an id and inserts the row in one step, which suits the
@@ -683,6 +692,9 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str) -> None:
     second report of the day must find the first one's routing). Insert-if-absent
     keeps the row's `platform` marker meaningful on the first call without
     overwriting the thread the first call registered.
+
+    `title` is stored for one reader: the index `/v1/incidents/recent` builds,
+    where a job id alone often does not say what the job looked at.
     """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -696,6 +708,7 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str) -> None:
                                 "platform": "cron-report",
                                 "profile": profile,
                                 "job_id": job_id,
+                                "title": title,
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                             }
                         ),
@@ -849,7 +862,7 @@ def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, re
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    _ensure_session_row(session_id, profile, job_id)
+    _ensure_session_row(session_id, profile, job_id, title)
 
     if not _create_gateway_session(api_url, session_id, headers):
         logger.error(f"Relay for {profile}/{job_id}: gateway session {session_id} unavailable")
@@ -1048,6 +1061,65 @@ def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
     if not row:
         raise HTTPException(status_code=404, detail="no incident for thread")
     return {"chat_id": chat_id, "thread_id": thread_id, "report": row[0]}
+
+
+@app.get("/v1/incidents/recent", dependencies=[Depends(verify_api_key)])
+def list_recent_reports(chat_id: str, hours: int = 0, limit: int = 0) -> Dict[str, Any]:
+    """Label-only index of the reports posted in one chat, newest first.
+
+    For messages that arrive with no report of their own — a Google Chat reply
+    typed into the main compose box, or any top-level Slack channel message —
+    where the by-thread lookup necessarily misses but the reports are sitting
+    in the channel above, unreachable. Naming them is enough for the agent to
+    ask which one instead of answering about the wrong one.
+
+    It returns no report text, deliberately. `_store_incident_report` persists
+    the relay's composed output rather than the specialist's finding, so a
+    preview line would carry model-written text into every ordinary message in
+    the space. `job_id`, `title` and `profile` are fields this server wrote
+    itself.
+
+    `incidents` is the source of truth for "a report was posted here";
+    `session_metadata` only supplies the label. A row written by the
+    `send_notification` path has no relay session and so no job to name, and
+    still belongs in the index.
+    """
+    hours = hours or RECENT_REPORTS_WINDOW_HOURS
+    limit = limit or RECENT_REPORTS_LIMIT
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        rows = conn.execute(
+            "SELECT thread_id, created_at FROM incidents "
+            "WHERE chat_id = ? AND created_at >= datetime('now', ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (chat_id, f"-{int(hours)} hours", int(limit)),
+        ).fetchall()
+        if not rows:
+            return {"chat_id": chat_id, "reports": []}
+        # thread_id lives inside session_metadata's JSON blob, so the join
+        # happens here rather than in SQL: no json1 dependency, no unindexed
+        # json_extract, and the scan is bounded by the same retention that
+        # bounds `incidents`.
+        labels: Dict[str, Dict[str, Any]] = {}
+        for (blob,) in conn.execute("SELECT metadata FROM session_metadata"):
+            try:
+                meta = json.loads(blob)
+            except Exception:
+                continue
+            thread = str(meta.get("thread_id") or "")
+            if thread:
+                labels[thread] = meta
+
+    reports = [
+        {
+            "thread_id": thread_id,
+            "created_at": created_at,
+            "job_id": str(labels.get(thread_id, {}).get("job_id") or ""),
+            "title": str(labels.get(thread_id, {}).get("title") or ""),
+            "profile": str(labels.get(thread_id, {}).get("profile") or ""),
+        }
+        for thread_id, created_at in rows
+    ]
+    return {"chat_id": chat_id, "reports": reports}
 
 
 @app.get("/v1/alert-quota", dependencies=[Depends(verify_api_key)])
