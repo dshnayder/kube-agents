@@ -103,6 +103,42 @@ The relay writes that row itself rather than calling `POST /v1/incidents` over
 loopback — it is that endpoint's own server, so an HTTP call to itself inside a
 background task would only add a way to fail.
 
+## The report is untrusted input
+
+Before this change a scheduled report was inert text posted into a channel: it
+entered no agent's context. Now it is the message of a real Chat Agent turn, and
+the stored copy is spliced into every later threaded reply — so what a report says
+matters in a way it did not before.
+
+The text is not the specialist's own words alone. `github-issue-resolver` triages
+issues written by any outside account, so issue titles and bodies reach the report
+body verbatim; the fleet audits quote object names, event messages and log lines.
+And the receiving profile is the delegation surface rather than a bystander: its
+`kanban` toolset, with `dispatch_in_gateway: true`, can file work for specialists
+that hold `terminal`, `gcloud` and `kubectl`.
+
+Both hops are framed, and deliberately not the same way, because only one of them
+is reproduced for a human to read:
+
+- **The relay turn.** The framing goes in the ephemeral system prompt — the
+  trusted channel, read before the report — which names the user message as
+  untrusted data, says to relay it and never act on it, and enumerates the asks
+  to ignore. The body itself is touched as little as possible: only chat-template
+  control tokens (`<|im_start|>` and friends) are blunted, because the Chat Agent
+  reproduces this text essentially verbatim into the user's channel and a report
+  about system components can legitimately contain a `### System:` heading.
+- **The replay into a later reply.** `incident_context` never shows its output to
+  a human, so it can be blunt: the stored report is wrapped in an
+  `<untrusted_report>` fence under a `[SECURITY NOTICE: …]` header, stripped of the
+  tokens that could close the fence or forge a second notice, and followed by the
+  user's own words under a label saying that line alone is theirs.
+
+The pattern is not new here —
+[`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)'s
+`_sanitize_log_text` already fences pod diagnostics the same way. The token list
+is duplicated in the plugin rather than imported because a gateway plugin is
+loaded by file path and cannot reach the platform agent's scripts.
+
 ## When the follow-up arrives outside the thread
 
 Context comes from the thread, so a follow-up that does not carry the thread gets
@@ -135,7 +171,7 @@ Two properties are load-bearing:
 The by-thread path is untouched: a threaded reply that finds its report behaves
 exactly as before, and the index only runs where the hook previously did nothing.
 
-## The first reply into a report's thread
+## The first reply into a report's thread (Google Chat DMs only)
 
 Google Chat opens a thread around every top-level message, so an inbound payload
 cannot say whether the user posted at top level or replied inside a real thread.
@@ -147,6 +183,14 @@ different process, so a report thread stands at zero however long it sits there
 and the first follow-up typed into it is answered in the main space — and starts
 a second session besides. The reply after that works, because by then the user's
 own first message is in the count.
+
+**DMs only.** The heuristic is one arm of an `if chat_type == "dm"` in the
+adapter's `_build_message_event`; the group arm keeps `thread_name` as the
+session thread and caches it for outbound unconditionally, with the comment "For
+groups, threads ARE meaningful conversational containers … always isolate AND
+always reply in-thread." A space or group DM therefore never reaches the counting
+branch and never misroutes. Slack is unaffected for a different reason: it sends a
+real `thread_ts`, so there is nothing to infer.
 
 The hook recovers the **context**, and only the context. On a by-thread miss it
 reads `thread.name` off the raw Chat payload — the thread the user actually typed
@@ -169,14 +213,18 @@ the session to a thread whose messages are visibly not in one. So the first
 follow-up is answered _correctly_ but in the main space; the reply after that
 threads normally, because by then the user's own first message is in the count.
 
-The fix belongs in the adapter, where routing is decided before the event is
-handed up. Its in-process sender (`_create_message`) already seeds the counter on
-outbound, with a comment naming this exact symptom; its out-of-process sender
-(`_standalone_send`, the path `hermes send` takes) does not. Bringing the two to
-parity fixes every bot-opened thread rather than the ones this repository happens
-to hold a report row for — and it has to be paired with a reload-on-mtime in
-`_ThreadCountStore.incr`, because that store rewrites the whole dict from memory
-and would otherwise erase a peer process's write.
+**The misrouted first reply is an open issue, deferred rather than solved.** It is
+out of scope for this change — it is an upstream Hermes defect, not something the
+relay introduced — but it should be fixed, and the fix is known. It belongs in the
+adapter, where routing is decided before the event is handed up: the in-process
+sender (`_create_message`) already seeds the counter on outbound, with a comment
+naming this exact symptom, and the out-of-process sender (`_standalone_send`, the
+path `hermes send` takes) does not. Bringing the two to parity fixes every
+bot-opened thread rather than the ones this repository happens to hold a report
+row for — paired with a reload-on-mtime in `_ThreadCountStore.incr`, since that
+store rewrites the whole dict from memory and would otherwise erase a peer
+process's write. Until then the cost is one message in the wrong place per report
+thread, carrying a correct answer.
 
 ## Session lifetime: one per job, per UTC day
 
@@ -287,10 +335,18 @@ every one of them is visible to a job author:
   says which merge and why the default profile is the exception). What that
   cannot reach is a job the agent creates at runtime, which is why `AGENTS.md`
   tells it to pass `deliver='chat'`.
-- **A failed relay does not fall back.** It returns an error, which the scheduler
-  records in `last_delivery_error`; the report itself is still in the job's saved
-  output. Routing a failure to `all` would need the interception this design
-  gives up, and it would post the report to a channel the job did not choose.
+- **A failed relay does not fall back, and does not go quiet either.**
+  `POST /v1/cron-reports` relays synchronously and answers with the outcome, so
+  every leg — the Chat Agent turn, `hermes send`, the message id it has to parse
+  back — reaches the scheduler as an error it records in `last_delivery_error`,
+  naming the leg that broke; the report itself is still in the job's saved output.
+  That is the whole reason the route blocks rather than accepting into a
+  background task: answering `accepted` first would make each of those failures
+  invisible, leaving the run written down as delivered with nothing in the
+  channel, which is exactly the state
+  [`deliver` exists to prevent](../../agents/platform/cron/README.md). Routing a
+  failure to `all` would need the interception this design gives up, and it would
+  post the report to a channel the job did not choose.
 - **`cronjob(action='create')` calls a relayed job local-only.** `cronjob` runs
   in the gateway, where the switch is off, and `_local_delivery_notice` decides
   by asking whether the job resolves to a target _here_ — so a job the agent

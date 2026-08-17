@@ -23,8 +23,9 @@ import adapter as mod
 class RecordingRelay:
     """A stdlib HTTP server standing in for the Session KV server."""
 
-    def __init__(self, status: int = 202) -> None:
+    def __init__(self, status: int = 200, body: bytes = b"{}") -> None:
         self.status = status
+        self.body = body
         self.requests: list[dict] = []
         server_self = self
 
@@ -41,8 +42,9 @@ class RecordingRelay:
                 )
                 self.send_response(server_self.status)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(server_self.body)))
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(server_self.body)
 
             def log_message(self, *_args) -> None:
                 """Keep the test output clean."""
@@ -251,6 +253,49 @@ class TestStandaloneSend(unittest.TestCase):
             result = asyncio.run(mod.standalone_send(None, "c", "r"))
         self.assertIsInstance(result, dict)
         self.assertTrue(result.get("success") or result.get("error"))
+
+    def test_a_failure_names_the_leg_that_broke(self):
+        """The route relays synchronously, so its verdict is the delivery result.
+
+        A bare "HTTP 502" in `last_delivery_error` says a watchdog went quiet and
+        nothing about why; the route's `detail` names the leg.
+        """
+        detail = b'{"detail":"chat relay failed: composed but not delivered to google_chat"}'
+        with RecordingRelay(status=502, body=detail) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertIn("502", result["error"])
+        self.assertIn("composed but not delivered to google_chat", result["error"])
+
+    def test_an_unparseable_error_body_still_reports_the_status(self):
+        for body in (b"", b"<html>gateway timeout</html>", b'{"detail":null}', b'{"detail":"  "}'):
+            with self.subTest(body=body):
+                with RecordingRelay(status=502, body=body) as relay:
+                    with patch.dict(
+                        os.environ,
+                        {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+                    ):
+                        result = asyncio.run(mod.standalone_send(None, "c", "r"))
+                self.assertEqual(result["error"], "chat relay answered HTTP 502")
+
+    def test_a_long_detail_is_bounded(self):
+        """It is stored per job run, so it cannot be a whole report."""
+        detail = json.dumps({"detail": "x" * 5000}).encode()
+        with RecordingRelay(status=502, body=detail) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertLess(len(result["error"]), 300)
+
+    def test_the_timeout_outlasts_a_chat_agent_turn(self):
+        """Time out before the route answers and a delivered report is recorded
+        as a failure. `_run_relay_turn` allows the turn itself 300s."""
+        self.assertGreater(mod.RELAY_TIMEOUT_SECONDS, 300.0)
 
     def test_the_default_route_is_the_loopback_session_kv_server(self):
         with patch.dict(os.environ, {}, clear=True):

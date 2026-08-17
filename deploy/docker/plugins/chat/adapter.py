@@ -89,9 +89,12 @@ RELAY_URL_ENV = "CRON_REPORT_RELAY_URL"
 #: Every route on the Session KV server except ``/healthz`` needs this.
 API_KEY_ENV = "SESSION_KV_API_KEY"
 
-#: The route hands the relay to a background task and answers immediately, so
-#: this bounds a connect/accept stall, not a Chat Agent turn.
-RELAY_TIMEOUT_SECONDS = 10.0
+#: The route relays synchronously and answers with the outcome, so this has to
+#: cover a whole Chat Agent turn plus the chat round trip -- not just a connect
+#: stall. Sized above ``_run_relay_turn``'s own 300s so the server's verdict is
+#: what the scheduler records; time out first and a delivered report would be
+#: written down as a failure.
+RELAY_TIMEOUT_SECONDS = 360.0
 
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
@@ -142,6 +145,22 @@ def relay_url() -> str:
     return (os.getenv(RELAY_URL_ENV, "") or "").strip() or DEFAULT_RELAY_URL
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """FastAPI's ``detail`` off an error response, as ``": <detail>"`` or ``""``.
+
+    Best effort by design: the body is read once, may be empty or not JSON, and
+    is never allowed to turn a delivery failure into an exception. Bounded
+    because it becomes ``last_delivery_error``, which is stored per job run.
+    """
+    try:
+        detail = (json.loads(exc.read().decode("utf-8", "replace")) or {}).get("detail")
+    except Exception:
+        return ""
+    if not isinstance(detail, str) or not detail.strip():
+        return ""
+    return f": {detail.strip()[:200]}"
+
+
 def _post(url: str, payload: dict, api_key: str) -> Optional[str]:
     """POST *payload* as JSON. ``None`` on success, else why it failed.
 
@@ -167,7 +186,10 @@ def _post(url: str, payload: dict, api_key: str) -> Optional[str]:
             if status >= 300:
                 return f"chat relay answered HTTP {status}"
     except urllib.error.HTTPError as exc:
-        return f"chat relay answered HTTP {exc.code}"
+        # The route names the failing leg in `detail` ("composed but not
+        # delivered to google_chat"), which is the difference between a
+        # last_delivery_error someone can act on and a bare status code.
+        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}"
     except Exception as exc:  # URLError, socket timeout, malformed URL
         return f"chat relay unreachable: {type(exc).__name__}: {exc}"
     return None
