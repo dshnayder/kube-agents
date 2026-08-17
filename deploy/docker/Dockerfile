@@ -311,11 +311,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # into plugins/platforms/ where Hermes auto-registers it: zero lines of the
 # Hermes tree are modified and there is no anchor to go stale.
 # What replaces the patch's build-time failure is verify_chat_relay.py. The
-# plugin depends on four upstream behaviours and every one of them fails
-# QUIETLY -- a watchdog that reports nothing looks exactly like a watchdog with
-# nothing to report -- so the verifier drives the real _deliver_result against a
-# loopback stand-in for the Session KV server and asserts on what crossed the
-# wire. Its own docstring lists the four.
+# plugin depends on a handful of upstream behaviours and every one of them
+# fails QUIETLY -- a watchdog that reports nothing looks exactly like a watchdog
+# with nothing to report -- so the verifier drives the real _deliver_result
+# against a loopback stand-in for the Session KV server and asserts on what
+# crossed the wire. Its own docstring enumerates them.
 # See the module docstring in deploy/docker/plugins/chat/adapter.py.
 COPY --chmod=0644 deploy/docker/plugins/chat/plugin.yaml \
      deploy/docker/plugins/chat/__init__.py \
