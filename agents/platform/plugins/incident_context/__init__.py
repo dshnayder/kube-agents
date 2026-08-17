@@ -66,13 +66,14 @@ _TOKENS = (
 def _reply_text(report, user_text):
     """Frame the stored report as data and hand the user's words the last say.
 
-    A relayed report is not trusted input. `github-issue-resolver` triages issues
-    written by any outside account, and the fleet audits quote object names,
-    event messages and log lines; all of that reaches the report body. This hook
-    then splices it into the user's own authenticated turn, ahead of their words,
-    on a profile whose `kanban` toolset can file work for specialists that hold
-    `terminal`, `gcloud` and `kubectl`. Unfenced, a line of a GitHub issue body is
-    indistinguishable from an instruction the user typed.
+    A relayed report is not trusted input. Every audit on the roster carries
+    `evidence.excerpt` -- literal `kubectl ... -o yaml` output, trimmed to the
+    lines that prove a finding -- so object names, labels, annotations and event
+    text written by whoever deploys into the fleet reach the report body verbatim.
+    This hook then splices that into the user's own authenticated turn, ahead of
+    their words, on a profile whose `kanban` toolset can file work for specialists
+    that hold `terminal`, `gcloud` and `kubectl`. Unfenced, a line lifted out of
+    some namespace's annotations is indistinguishable from one the user typed.
 
     So the report is fenced, labelled untrusted, and stripped of the tokens that
     could close the fence -- the pattern `_sanitize_log_text` already applies to

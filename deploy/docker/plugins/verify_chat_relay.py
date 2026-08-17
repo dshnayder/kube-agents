@@ -101,8 +101,8 @@ def check(condition: bool, message: str) -> None:
 
 def job(deliver: str) -> dict:
     return {
-        "id": "github-issue-resolver",
-        "name": "GitHub issue resolver",
+        "id": "github-repo-watcher",
+        "name": "GitHub Repo Watcher",
         "deliver": deliver,
     }
 
@@ -173,11 +173,11 @@ def main() -> None:
         )
         body = sent["body"]
         check(
-            body.get("job_id") == "github-issue-resolver",
+            body.get("job_id") == "github-repo-watcher",
             f"the job id survived the cron wrapper (got {body.get('job_id')!r})",
         )
         check(
-            body.get("title") == "GitHub issue resolver",
+            body.get("title") == "GitHub Repo Watcher",
             f"the job name survived the cron wrapper (got {body.get('title')!r})",
         )
         check(

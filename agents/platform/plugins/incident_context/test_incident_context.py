@@ -167,8 +167,8 @@ class BotThreadRecoveryTest(unittest.TestCase):
 class UntrustedReportFramingTest(unittest.TestCase):
     """The stored report is third-party text spliced into an authenticated turn.
 
-    `github-issue-resolver` relays issue bodies written by outside accounts, and
-    the fleet audits quote object names and log lines. The receiving profile can
+    Every audit quotes `evidence.excerpt` -- raw `kubectl -o yaml` lifted from
+    workloads other teams deploy. The receiving profile can
     file kanban work for specialists holding `terminal`, `gcloud` and `kubectl`,
     so an unfenced report line is indistinguishable from something the user typed.
     """

@@ -80,11 +80,11 @@ def wrapped(title: str, job_id: str, body: str) -> str:
 class TestParseCronWrapper(unittest.TestCase):
     def test_the_wrapper_yields_id_title_and_a_clean_report(self):
         job_id, title, report = mod.parse_cron_wrapper(
-            wrapped("GitHub issue resolver", "github-issue-resolver", "two issues triaged")
+            wrapped("GitHub Repo Watcher", "github-repo-watcher", "the issues sweep failed")
         )
-        self.assertEqual(job_id, "github-issue-resolver")
-        self.assertEqual(title, "GitHub issue resolver")
-        self.assertEqual(report, "two issues triaged")
+        self.assertEqual(job_id, "github-repo-watcher")
+        self.assertEqual(title, "GitHub Repo Watcher")
+        self.assertEqual(report, "the issues sweep failed")
 
     def test_a_multi_line_report_keeps_its_shape(self):
         body = "## Findings\n\n- one\n- two\n\n```\ncode\n```"
@@ -150,7 +150,7 @@ class TestIsConnected(unittest.TestCase):
 
 
 class TestStandaloneSend(unittest.TestCase):
-    MESSAGE = wrapped("GitHub issue resolver", "github-issue-resolver", "two issues triaged")
+    MESSAGE = wrapped("GitHub Repo Watcher", "github-repo-watcher", "the issues sweep failed")
 
     def test_a_report_reaches_the_route_with_its_key(self):
         with RecordingRelay() as relay:
@@ -173,10 +173,10 @@ class TestStandaloneSend(unittest.TestCase):
             self.assertEqual(
                 sent["body"],
                 {
-                    "job_id": "github-issue-resolver",
+                    "job_id": "github-repo-watcher",
                     "profile": "platform",
-                    "title": "GitHub issue resolver",
-                    "report": "two issues triaged",
+                    "title": "GitHub Repo Watcher",
+                    "report": "the issues sweep failed",
                 },
             )
 

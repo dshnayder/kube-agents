@@ -110,9 +110,12 @@ entered no agent's context. Now it is the message of a real Chat Agent turn, and
 the stored copy is spliced into every later threaded reply — so what a report says
 matters in a way it did not before.
 
-The text is not the specialist's own words alone. `github-issue-resolver` triages
-issues written by any outside account, so issue titles and bodies reach the report
-body verbatim; the fleet audits quote object names, event messages and log lines.
+The text is not the specialist's own words alone. Every audit on the roster is
+required to back each finding with an `evidence.excerpt` — literal
+`kubectl … -o yaml` output, trimmed to the lines that prove it
+([`obtainability_audit_sop.md`](../../agents/platform/governance/obtainability_audit_sop.md),
+"Evidence discipline") — so object names, labels, annotations and event text
+written by whoever deploys into the fleet reach the report body verbatim.
 And the receiving profile is the delegation surface rather than a bystander: its
 `kanban` toolset, with `dispatch_in_gateway: true`, can file work for specialists
 that hold `terminal`, `gcloud` and `kubectl`.

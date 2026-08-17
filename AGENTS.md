@@ -10,9 +10,9 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
+- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, IaC parity, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
@@ -23,6 +23,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus provisioning scripts.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
 - `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
+- `images.json`: Inventory of every container image an install pulls, with its upstream reference
+  and pin. Read by `make mirror-images`, the provisioning scripts, and the docs generator.
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 
@@ -101,6 +103,7 @@ adding a paragraph, check whether the topic already has an owner:
 | End-state architecture                                   | `docs/architecture/`                         |
 | Per-feature design rationale                             | `docs/designs/`                              |
 | What each provisioning script does                       | `k8s-operator/scripts/README.md`             |
+| Which container images an install pulls, and their pins  | `images.json`                                |
 | The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
@@ -108,9 +111,9 @@ adding a paragraph, check whether the topic already has an owner:
 Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
-  catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
-  then run `make docs-generate`.
+  catalogue, the provisioning steps, and the container-image inventory are generated into
+  `<!-- BEGIN GENERATED -->` regions by `scripts/generate_docs.py`, which also writes
+  `docs/family-roster.txt` whole. Edit the source, then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -135,7 +138,10 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 - Keep changes scoped to the request.
 - Do not commit unrelated formatting changes.
 - Maintain the structure and intent of the agent configuration files.
-- Use Conventional Commits for commit messages.
+- **Conventional Commits & PR Title Enforcement:** All PR titles and commit messages must strictly adhere to the Conventional Commits specification (`type(optional-scope): description`):
+  - **Permitted Types:** `feat` (new user-facing capability), `fix` (bug fix), `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+  - **Breaking Changes:** Mark with `!` before the colon (e.g. `feat!:`, `fix(operator)!:`) or a `BREAKING CHANGE:` footer.
+  - **Release Preparation:** Standardized PR titles ensure consistent commit history and establish the Conventional Commit metadata required for the automated SemVer release pipeline. AI agents must ensure the proposed PR title prefix accurately reflects the changes in the branch diff and confirm classification with the author before opening a PR.
 - Push PR branches to a fork, not to the upstream repository.
 - **Pin GitHub Actions to a full commit SHA.** Every third-party `uses:` in
   `.github/workflows/` must reference a 40-character commit SHA with the human-readable
@@ -197,6 +203,17 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
     that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
     section is not an answer.
+- **IaC parity review when a PR touches more than one install surface's territory:**
+  the provisioning scripts (`k8s-operator/scripts/`, `k8s-operator/config/`), the
+  Terraform modules, and the Helm chart each express the same install, and nothing in
+  the languages keeps them together. `make iac-parity-check`
+  (`scripts/check_iac_parity.py`) enforces the scalar subset — image tags, IAM role
+  bundles, identifiers, KMS and backup defaults — and CI runs it. Run the
+  `review-iac-parity` skill (`.agents/skills/review-iac-parity/SKILL.md`) for the
+  structural drift no scalar comparison catches: a resource only one surface creates,
+  a knob only one surface can express. The scripts and `k8s-operator/config/` are the
+  source of truth; deliberate divergences are listed in both the skill and the
+  script's docstring, and adding one means editing both.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
@@ -239,6 +256,17 @@ members, and collaborators only) — that pass is the strict one, only what the 
 while `/review all` re-reads at the width of the automatic first review and includes findings it
 believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
 outranks both.
+
+**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
+run alongside its review — `success` when it found nothing, `neutral` when it did — and
+`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
+anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
+clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
+a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
+completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
+assign a reviewer immediately — the override for a finding you have answered but disagree with, or
+for a review that never arrived. Nothing here changes who is picked; that is still the config file.
 
 **How to read it.** A 👀 reaction means the review started; a posted review means it finished.
 Across #630–#699 the 👀 landed within seconds of the trigger, and the review a median of **9
