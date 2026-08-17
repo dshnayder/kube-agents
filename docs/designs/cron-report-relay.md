@@ -135,6 +135,36 @@ Two properties are load-bearing:
 The by-thread path is untouched: a threaded reply that finds its report behaves
 exactly as before, and the index only runs where the hook previously did nothing.
 
+## The first reply into a report's thread
+
+Google Chat opens a thread around every top-level message, so an inbound payload
+cannot say whether the user posted at top level or replied inside a real thread.
+Its adapter settles that by counting inbound messages per thread: a thread it has
+never seen one in is read as main flow, and the bot answers in the space rather
+than in the thread. Both writers of that counter live in the gateway process. A
+relayed report is posted by `hermes send` from the Session KV server, which is a
+different process, so a report thread stands at zero however long it sits there
+and the first follow-up typed into it is answered in the main space — and starts
+a second session besides. The reply after that works, because by then the user's
+own first message is in the count.
+
+The hook closes it, because it holds the evidence the counter is missing. On a
+by-thread miss it reads `thread.name` off the raw Chat payload — the thread the
+user actually typed into, which the adapter dropped — and looks that up. A stored
+report means the bot opened this thread and the user has deliberately replied
+inside it, which is the condition the counter exists to detect. The hook then
+assigns `source.thread_id`, which puts the thread into the session key and into
+the outbound send's metadata, and the reply that goes out registers the thread on
+the adapter's way past. Nothing else overrides the adapter: with no report for the
+thread the heuristic stands, and groups never reach the branch because their
+`thread_id` survives.
+
+This is a workaround for a Hermes bug, not the fix. The adapter's in-process
+sender already seeds that counter on outbound; its out-of-process sender
+(`_standalone_send`) does not, and bringing the two to parity would fix every
+bot-opened thread rather than the ones this repository happens to have a report
+row for.
+
 ## Session lifetime: one per job, per UTC day
 
 One session per _report_ — what the watcher's `per-incident` mode does — gives a

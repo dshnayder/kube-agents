@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import urllib.request
 from urllib.parse import urlencode
 
 SESSION_KV_URL = "http://127.0.0.1:8699"
+
+logger = logging.getLogger(__name__)
 
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", on_inbound)
@@ -11,9 +14,7 @@ def register(ctx):
 def on_inbound(*, event, **_):
     src = event.source
     platform = getattr(src.platform, "value", str(src.platform))
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info("platform=%s, chat_id=%s, thread_id=%s", platform, getattr(src, 'chat_id', None), getattr(src, 'thread_id', None))
+    logger.debug("platform=%s, chat_id=%s, thread_id=%s", platform, getattr(src, 'chat_id', None), getattr(src, 'thread_id', None))
     chat_id = getattr(src, "chat_id", None)
     if platform not in ("google_chat", "slack") or not chat_id:
         return None
@@ -28,6 +29,8 @@ def on_inbound(*, event, **_):
         return None
     thread_id = getattr(src, "thread_id", None)
     report = _lookup(chat_id, thread_id) if thread_id else None
+    if not report:
+        report = _recover_bot_thread(src, platform, chat_id, thread_id, _raw_thread(event))
     if report:
         # Deliberately not "k8s incident report". The `incidents` table has two
         # writers -- the event watcher, which does store incidents, and the cron
@@ -55,6 +58,70 @@ def on_inbound(*, event, **_):
     if not recent:
         return None  # nothing posted here lately -> leave the message untouched
     return {"action": "rewrite", "text": _index_text(recent, event.text)}
+
+def _raw_thread(event):
+    """The thread Google Chat says this message is in, before the adapter's edit.
+
+    `raw_message` is the Chat API message resource the adapter parsed, so
+    `thread.name` here is the thread the user actually typed into even when the
+    normalized source says None. Any other platform's raw message is a different
+    shape and simply misses; the caller gates on google_chat regardless.
+    """
+    raw = getattr(event, "raw_message", None)
+    if not isinstance(raw, dict):
+        return None
+    thread = raw.get("thread")
+    if not isinstance(thread, dict):
+        return None
+    return thread.get("name") or None
+
+def _recover_bot_thread(src, platform, chat_id, thread_id, raw_thread):
+    """Re-attach the thread a relayed report created, and return that report.
+
+    Google Chat opens a thread around *every* top-level message, so an inbound
+    payload cannot say whether the user posted at top level or replied inside a
+    real thread. The adapter settles it by counting: a thread it has never seen
+    an inbound message in is treated as "main flow", and the bot answers at top
+    level rather than in the thread (`plugins/platforms/google_chat/adapter.py`,
+    the `_ThreadCountStore` heuristic). The counter is fed from two places, and a
+    relayed report reaches neither -- the report is posted by `hermes send` from
+    the Session KV server, a different process from the gateway, so it never
+    passes through the adapter's outbound path. A report thread therefore stands
+    at zero however long it sits there, and the first reply typed into it is read
+    as a new top-level message: the answer lands in the space, detached from the
+    question, and starts a second session besides. The reply after that works,
+    because by then the counter has the user's own first message in it. That is
+    the shape of the bug -- only ever the first follow-up, only in a DM.
+
+    A stored report keyed to `raw_thread` is the missing evidence. The relay
+    writes that row when it posts, so a hit means the bot opened this thread and
+    the user has deliberately replied inside it -- which is exactly the condition
+    the counter was trying to detect. Nothing else here overrides the adapter:
+    with no report for the thread this returns None and the heuristic stands.
+
+    Assigning `src.thread_id` is what moves the answer. `SessionSource` is a
+    plain dataclass and the gateway keeps the same instance across the
+    `dataclasses.replace(event, text=...)` it does for a rewrite, so downstream
+    reads see the assignment: the session key gains the thread (`gateway/session.py`)
+    and the outbound send carries `metadata={"thread_id": ...}`, which is the
+    first thing google_chat's `_resolve_thread_id` looks at. The reply that then
+    goes out through the adapter registers the thread on the way, so every later
+    message in it routes without any help from here.
+
+    Groups need none of this -- the adapter always keeps their thread_id, so
+    `raw_thread` matches what the source already carries and this is a no-op.
+    """
+    if platform != "google_chat" or not raw_thread or raw_thread == thread_id:
+        return None
+    report = _lookup(chat_id, raw_thread)
+    if not report:
+        return None
+    src.thread_id = raw_thread
+    logger.info(
+        "Re-attached bot-created thread %s in %s; the reply would have gone to the space",
+        raw_thread, chat_id,
+    )
+    return report
 
 def _index_text(reports, text):
     """Render the index. Labels only -- never a line of report text.

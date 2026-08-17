@@ -30,9 +30,15 @@ class _Source:
 
 
 class _Event:
-    def __init__(self, text="what is this report about?", **kwargs):
+    def __init__(self, text="what is this report about?", raw_message=None, **kwargs):
         self.text = text
+        self.raw_message = raw_message
         self.source = _Source(**kwargs)
+
+
+def _chat_payload(thread_name):
+    """The shape google_chat's adapter keeps on `raw_message` (trimmed)."""
+    return {"name": "spaces/AAA/messages/T1.abc", "thread": {"name": thread_name}}
 
 
 class IndexFallbackTest(unittest.TestCase):
@@ -80,6 +86,75 @@ class IndexFallbackTest(unittest.TestCase):
             result = ic.on_inbound(event=_Event(thread_id="spaces/AAA/threads/T1"))
         self.assertIn("the full report", result["text"])
         index.assert_not_called()
+
+
+class BotThreadRecoveryTest(unittest.TestCase):
+    """The first follow-up typed into a thread the relay created.
+
+    Google Chat's adapter classifies that thread as main flow -- it counts
+    inbound messages to tell a real thread from the one Chat auto-creates around
+    every top-level message, and a relayed report is posted out-of-process, so it
+    never reaches the counter. Left alone, the answer goes to the space. The
+    stored report is the evidence that the bot opened the thread.
+    """
+
+    RELAY = "spaces/AAA/threads/L-Tqzpbc7YI"
+
+    def setUp(self):
+        self.stored = {self.RELAY: "the deploy-smoke report"}
+        self.calls = []
+
+        def lookup(chat_id, thread_id):
+            self.calls.append(thread_id)
+            return self.stored.get(thread_id)
+
+        patcher = patch.object(ic, "_lookup", side_effect=lookup)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        recent = patch.object(ic, "_lookup_recent", return_value=[{"job_id": "deploy-smoke"}])
+        recent.start()
+        self.addCleanup(recent.stop)
+
+    def call(self, thread_name, **kwargs):
+        event = _Event(raw_message=_chat_payload(thread_name), **kwargs)
+        return event, ic.on_inbound(event=event)
+
+    def test_the_report_is_found_through_the_raw_payload(self):
+        _, result = self.call(self.RELAY)
+        self.assertIn("the deploy-smoke report", result["text"])
+        self.assertIn("[User reply in thread]", result["text"])
+
+    def test_the_thread_is_re_attached_so_the_answer_goes_back_into_it(self):
+        """The routing half. Without this the text is right and the reply is not."""
+        event, _ = self.call(self.RELAY)
+        self.assertEqual(event.source.thread_id, self.RELAY)
+
+    def test_an_ordinary_top_level_message_is_not_re_attached(self):
+        """Chat wraps these in a thread too, and the adapter is right about them."""
+        event, result = self.call("spaces/AAA/threads/some-auto-thread")
+        self.assertIsNone(event.source.thread_id)
+        self.assertIn("No report is attached", result["text"])
+
+    def test_slack_is_left_to_its_own_threading(self):
+        """Slack carries a real thread_ts; there is nothing to recover."""
+        event, _ = self.call(
+            self.RELAY, platform="slack", chat_id="C123", thread_id="1755440416.001"
+        )
+        self.assertEqual(event.source.thread_id, "1755440416.001")
+
+    def test_a_thread_the_source_already_carries_is_looked_up_once(self):
+        """Groups keep thread_id, so recovery must not fire a second request."""
+        event, result = self.call(self.RELAY, thread_id=self.RELAY)
+        self.assertIn("the deploy-smoke report", result["text"])
+        self.assertEqual(self.calls, [self.RELAY])
+
+    def test_a_raw_message_that_is_not_a_chat_payload_is_survivable(self):
+        for raw in (None, "a string", 7, {}, {"thread": None}, {"thread": {}}, {"thread": "T1"}):
+            with self.subTest(raw=raw):
+                event = _Event(raw_message=raw)
+                result = ic.on_inbound(event=event)
+                self.assertIn("No report is attached", result["text"])
+                self.assertIsNone(event.source.thread_id)
 
 
 class IndexRenderingTest(unittest.TestCase):
