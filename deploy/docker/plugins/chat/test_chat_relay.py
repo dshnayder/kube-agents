@@ -293,8 +293,8 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertLess(len(result["error"]), 300)
 
     def test_a_composed_delivery_is_a_plain_success(self):
-        """The route says `relay: "composed"` on the healthy path."""
-        body = b'{"status":"ok","relay":"composed","session_id":"s1"}'
+        """The route says `relay: "ok"` on the healthy path."""
+        body = b'{"status":"delivered","relay":"ok","session_id":"s1"}'
         with RecordingRelay(body=body) as relay:
             with patch.dict(
                 os.environ,
@@ -311,7 +311,7 @@ class TestStandaloneSend(unittest.TestCase):
         the only place a run record can carry it — so a front door that has been
         down all week must not produce run records identical to healthy ones.
         """
-        body = b'{"status":"ok","relay":"degraded","session_id":"s1"}'
+        body = b'{"status":"delivered","relay":"degraded","session_id":"s1"}'
         with RecordingRelay(body=body) as relay:
             with patch.dict(
                 os.environ,
@@ -324,7 +324,7 @@ class TestStandaloneSend(unittest.TestCase):
     def test_the_degraded_string_says_the_report_did_arrive(self):
         """Otherwise `cronjob list` reads as "nothing was sent" and invites a
         re-run, which would post the same finding to the channel twice."""
-        body = b'{"status":"ok","relay":"degraded"}'
+        body = b'{"status":"delivered","relay":"degraded"}'
         with RecordingRelay(body=body) as relay:
             with patch.dict(
                 os.environ,
@@ -349,7 +349,7 @@ class TestStandaloneSend(unittest.TestCase):
 
     def test_a_verdict_never_turns_a_failure_into_a_success(self):
         """A non-2xx body is not read for a verdict — the status decides."""
-        body = b'{"relay":"composed"}'
+        body = b'{"relay":"ok"}'
         with RecordingRelay(status=502, body=body) as relay:
             with patch.dict(
                 os.environ,

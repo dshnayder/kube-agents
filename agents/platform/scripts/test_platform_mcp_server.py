@@ -827,8 +827,9 @@ class TestReportToChat(unittest.TestCase):
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
     @patch("urllib.request.urlopen")
     def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
+        """`ok` is what the route sends when the Chat Agent framed the report."""
         mock_urlopen.return_value = self._urlopen(
-            b'{"status": "delivered", "relay": "composed", "session_id": "s1"}'
+            b'{"status": "delivered", "relay": "ok", "session_id": "s1"}'
         )
         result = report_to_chat("finding", job_id="j1")
         self.assertIn("SUCCESS", result)
