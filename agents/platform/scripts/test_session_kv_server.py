@@ -243,7 +243,10 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # happens after.
         self._trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self._trigger.start()
-        self._relay = patch.object(session_kv_server, "relay_cron_report")
+        # (error, degraded) — an unconfigured MagicMock would not unpack.
+        self._relay = patch.object(
+            session_kv_server, "relay_cron_report", return_value=(None, False)
+        )
         self._relay.start()
 
     def tearDown(self):
@@ -730,6 +733,72 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertNotRegex(authorize, r"\*\*Option [A-Z]")
 
 
+class TestGatewayApiToken(unittest.TestCase):
+    """Which `API_SERVER_KEY` the loopback callers send.
+
+    Regression test for a live failure: the operator puts the non-secret
+    sentinel `cluster-internal-trusted` in the container environment, Hermes
+    prefers `$HERMES_HOME/.env` and rewrites the key there on every boot, and so
+    every caller that trusted `os.environ` got 401 on every run.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dotenv = os.path.join(self._tmp.name, ".env")
+        self._patch = patch.object(session_kv_server, "DOTENV_PATH", self.dotenv)
+        self._patch.start()
+        self._prior = os.environ.get("API_SERVER_KEY")
+        os.environ["API_SERVER_KEY"] = "cluster-internal-trusted"
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+        if self._prior is None:
+            os.environ.pop("API_SERVER_KEY", None)
+        else:
+            os.environ["API_SERVER_KEY"] = self._prior
+
+    def _write(self, text):
+        with open(self.dotenv, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_dotenv_key_wins_over_the_environment_sentinel(self):
+        self._write("SOMETHING_ELSE=x\nAPI_SERVER_KEY=the-real-one\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "the-real-one")
+
+    def test_quotes_and_whitespace_are_stripped(self):
+        """Hermes writes the value quoted; sending the quotes is a 401."""
+        self._write('API_SERVER_KEY="the-real-one"\n')
+        self.assertEqual(session_kv_server._gateway_api_token(), "the-real-one")
+        self._write("API_SERVER_KEY = 'the-real-one' \n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "the-real-one")
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        self._write("\n# API_SERVER_KEY=commented-out\n\nAPI_SERVER_KEY=live\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "live")
+
+    def test_it_falls_back_to_the_environment_when_the_file_says_nothing(self):
+        # A deployment where nothing rewrites the key: the operator's value is
+        # both what is there and what is correct.
+        self._write("GOOGLE_CHAT_HOME_CHANNEL=spaces/AAA\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "cluster-internal-trusted")
+
+    def test_an_empty_value_does_not_shadow_the_environment(self):
+        self._write("API_SERVER_KEY=\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "cluster-internal-trusted")
+
+    def test_a_missing_file_is_not_an_error(self):
+        self.assertFalse(os.path.exists(self.dotenv))
+        self.assertEqual(session_kv_server._gateway_api_token(), "cluster-internal-trusted")
+
+    def test_it_is_read_per_call_not_cached(self):
+        """`.env` is rewritten seconds *after* this process starts."""
+        self._write("API_SERVER_KEY=first\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "first")
+        self._write("API_SERVER_KEY=rotated\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "rotated")
+
+
 class TestCronReportRelay(unittest.TestCase):
     """POST /v1/cron-reports — the specialist reasons, the Chat Agent speaks."""
 
@@ -822,7 +891,48 @@ class TestCronReportRelay(unittest.TestCase):
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
             self.client.post("/v1/cron-reports", json={"job_id": "j3", "report": "unrelayed finding"})
 
-        self.assertEqual(send.call_args.args[1], "unrelayed finding")
+        self.assertIn("unrelayed finding", send.call_args.args[1])
+
+    def test_a_failed_relay_turn_says_so_in_the_channel(self):
+        """Nobody reads the pod log; the reader of the message is who needs to know.
+
+        Seven consecutive relay failures on this job class went unnoticed because
+        the raw report looks like a report.
+        """
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "j3", "profile": "platform", "report": "unrelayed finding"},
+            )
+
+        posted = send.call_args.args[1]
+        self.assertTrue(posted.startswith("[unrelayed]"), posted[:60])
+        self.assertIn("platform/j3", posted)
+
+    def test_a_failed_relay_turn_is_reported_as_degraded_not_as_success(self):
+        """`relay` is what a scheduler can see without reading logs."""
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
+            degraded = self.client.post("/v1/cron-reports", json={"job_id": "j9", "report": "x"})
+
+        # Still 200 -- the report is in the channel -- but not indistinguishable
+        # from a clean run.
+        self.assertEqual(degraded.status_code, 200)
+        self.assertEqual(degraded.json()["status"], "delivered")
+        self.assertEqual(degraded.json()["relay"], "degraded")
+
+        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
+            ok = self.client.post("/v1/cron-reports", json={"job_id": "j9", "report": "x"})
+
+        self.assertEqual(ok.json()["relay"], "ok")
 
     def test_a_send_failure_is_answered_as_a_failure(self):
         """The invariant `deliver` exists to protect: a broken watchdog is audible.

@@ -85,6 +85,39 @@ The relay instruction goes in `system_message`, which the gateway applies as an
 later turn of the thread, so a follow-up reaches a Chat Agent that remembers the
 report and not the order to repeat it.
 
+### Which key the loopback call presents
+
+Not `os.environ["API_SERVER_KEY"]`, which is what every other in-pod caller of
+the gateway uses and what this one used until the first live run. Three things
+disagree about that name, and the environment loses:
+
+- The operator sets it to the literal `cluster-internal-trusted`, a **non-secret
+  loopback sentinel** — `platformagent_manifests.go` says so in a comment. The
+  premise is that the listener is loopback-only and the envoy credential-proxy
+  sidecar authenticates outside callers against `API_SERVER_EXTERNAL_KEY` before
+  swapping the sentinel in.
+- Hermes does not honour that premise from inside the pod. It prefers
+  `$HERMES_HOME/.env` over the process environment, deliberately, so that a key
+  rotation in that file is not shadowed by a stale export inherited from a parent
+  process.
+- Its Docker stage2 hook writes a freshly generated strong key into that file on
+  every boot when the file does not already carry one.
+
+So the gateway accepts a value the loopback caller never sees, and the sentinel
+401s. Measured on `kage-management`: seven consecutive `github-repo-watcher` relay
+turns rejected inside one pod's first two hours, each one degrading to an
+unrelayed raw report that the scheduler still recorded as delivered.
+
+`_gateway_api_token()` reads `.env` first and falls back to the environment, so a
+deployment where nothing rewrites the key is unaffected. It reads per call rather
+than caching at import, because `.env` is rewritten seconds _after_ this process
+starts. The other direction — writing the sentinel into `.env` so the two agree —
+was tried and is not available: the API server then declines to bind at all.
+
+This is not specific to the relay. Every in-pod caller that trusts the
+environment has the same 401, `trigger_agent_troubleshooter` included, which is
+why both call sites moved.
+
 ## Why context works without an append-only endpoint
 
 There is no way to put a message into a Hermes session's history without running
@@ -371,9 +404,15 @@ every one of them is visible to a job author:
   tells it to pass `deliver='chat'`.
 - **A failed relay does not fall back, and does not go quiet either.**
   `POST /v1/cron-reports` relays synchronously and answers with the outcome, so
-  every leg — the Chat Agent turn, `hermes send`, the message id it has to parse
-  back — reaches the scheduler as an error it records in `last_delivery_error`,
-  naming the leg that broke; the report itself is still in the job's saved output.
+  every leg — `hermes send` and the message id it has to parse back — reaches the
+  scheduler as an error it records in `last_delivery_error`, naming the leg that
+  broke; the report itself is still in the job's saved output.
+  A failed **Chat Agent turn** is the one leg that is not an error, because the
+  finding still belongs in the channel — but it is not a clean run either, and
+  saying so only in a log is how the seven consecutive failures above went
+  unnoticed. So the degradation is stated twice: the posted message is prefixed
+  `[unrelayed]`, naming the profile and job, and the response body carries
+  `"relay": "degraded"` next to `"status": "delivered"`.
   That is the whole reason the route blocks rather than accepting into a
   background task: answering `accepted` first would make each of those failures
   invisible, leaving the run written down as delivered with nothing in the

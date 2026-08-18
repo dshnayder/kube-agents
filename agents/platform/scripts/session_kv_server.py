@@ -64,6 +64,55 @@ RECENT_REPORTS_LIMIT = int(os.getenv("SESSION_KV_RECENT_REPORTS_LIMIT", "8"))
 # name the variable an operator is being told to set.
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 
+# The gateway's own bearer, which is a different value from the sentinel above.
+GATEWAY_AUTH_ENV = "API_SERVER_KEY"
+
+
+def _gateway_api_token() -> str:
+    """Resolve the bearer the gateway API server will actually accept.
+
+    `os.environ["API_SERVER_KEY"]` is not it, and trusting it is why the relay
+    turn never ran in this deployment. The operator sets that name to the
+    non-secret loopback sentinel `cluster-internal-trusted`
+    (`k8s-operator/internal/controller/platformagent_manifests.go`), on the
+    premise that the listener is loopback-only and the envoy sidecar
+    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes does
+    not honour that premise from this side: it prefers `$HERMES_HOME/.env` over
+    the process environment (`hermes_cli/auth.py` — "Prefer ~/.hermes/.env over
+    os.environ so a deliberate key rotation ... isn't shadowed by a stale shell
+    export"), and its Docker stage2 hook writes a freshly generated strong key
+    into that file whenever it does not already carry one. The sentinel is
+    therefore overridden on every boot, by a value this process never sees, and
+    every loopback caller that trusts the environment gets 401.
+
+    Measured on kage-management 2026-08-18: seven consecutive `github-repo-watcher`
+    relay turns rejected in one pod's first two hours, each degrading to an
+    unrelayed raw report that the scheduler still recorded as delivered. Writing
+    the sentinel into `.env` to force agreement is not an alternative — the API
+    server then declines to bind at all.
+
+    Read per call rather than cached at import: `.env` is rewritten a few seconds
+    *after* this process starts, so an import-time read returns the last boot's
+    key.
+    """
+    try:
+        with open(DOTENV_PATH, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                if name.strip() != GATEWAY_AUTH_ENV:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                if value:
+                    return value
+    except OSError:
+        # No .env, or unreadable: the environment is all there is, and on a
+        # deployment where nothing rewrites the key it is also correct.
+        pass
+    return os.environ.get(GATEWAY_AUTH_ENV, "")
+
 
 def _expected_api_key() -> str:
     # Read per request rather than at import: the value arrives from the pod
@@ -615,7 +664,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("API_SERVER_KEY", "")
+    token = _gateway_api_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -913,12 +962,41 @@ def _run_relay_turn(api_url: str, session_id: str, report: str, instructions: st
     return content
 
 
-def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, report: str) -> str | None:
+def _unrelayed_notice(profile: str, job_id: str) -> str:
+    """The line that admits, in the channel, that nobody composed this.
+
+    Deliberately plain text. It is prepended to a message that goes to whichever
+    platform is active, and Slack and Google Chat disagree about markup, so a
+    bracketed prefix is the one form that renders the same in both and is still
+    greppable in a scrollback.
+    """
+    return (
+        f"[unrelayed] The Chat Agent could not be reached, so this is the raw "
+        f"report from {profile}/{job_id} rather than a composed summary.\n\n"
+    )
+
+
+def relay_cron_report(
+    session_id: str, profile: str, job_id: str, title: str, report: str
+) -> tuple[str | None, bool]:
     """Hand a specialist's finished report to the Chat Agent, then post its reply.
 
-    Returns None when the report reached chat, else a short description of what
-    went wrong. The caller turns that into a non-2xx, and the string ends up in
-    the job's `last_delivery_error` — see :func:`submit_cron_report`.
+    Returns `(error, degraded)`. `error` is None when the report reached chat,
+    else a short description of what went wrong; the caller turns that into a
+    non-2xx and the string ends up in the job's `last_delivery_error` — see
+    :func:`submit_cron_report`.
+
+    `degraded` is the half that a boolean-or-nothing return used to swallow. The
+    Chat Agent's turn can fail while the send still succeeds, and posting the raw
+    report is the right call there — a scheduled finding that reached a real
+    problem should not be lost because the front door was busy. But "delivered"
+    and "delivered, unrelayed" are not the same outcome, and reporting them
+    identically is how seven consecutive `github-repo-watcher` relay failures sat
+    unnoticed on kage-management while every run recorded a clean delivery
+    (2026-08-18; see :func:`_gateway_api_token` for the cause). So the
+    degradation is now said twice: once in the channel, via
+    :func:`_unrelayed_notice`, and once in this return value, which the caller
+    puts in the response body.
 
     Ordering is deliberate. The turn runs before the send so that what reaches
     chat is the Chat Agent's message rather than a placeholder it later talks
@@ -930,7 +1008,7 @@ def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, re
     active_platform = get_active_platform()
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("API_SERVER_KEY", "")
+    token = _gateway_api_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -942,17 +1020,18 @@ def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, re
     message = _run_relay_turn(
         api_url, session_id, report, _build_relay_instructions(profile, job_id, title), headers
     )
-    if message is None:
+    degraded = message is None
+    if degraded:
         # Degraded, and say so in the channel rather than in a log nobody reads:
         # the report is the point, the Chat Agent's framing is the polish.
         logger.warning(f"Relay for {profile}/{job_id}: posting the raw report, unrelayed")
-        message = report
+        message = _unrelayed_notice(profile, job_id) + report
 
     chat_id, thread_id = _lookup_session_routing(session_id)
     new_thread_id = _send_to_chat(active_platform, message, chat_id, thread_id)
     if not new_thread_id:
         logger.error(f"Relay for {profile}/{job_id}: report composed but not delivered")
-        return f"composed but not delivered to {active_platform}"
+        return f"composed but not delivered to {active_platform}", degraded
 
     if new_thread_id != thread_id:
         _register_session_routing(session_id, active_platform, new_thread_id)
@@ -960,7 +1039,7 @@ def relay_cron_report(session_id: str, profile: str, job_id: str, title: str, re
 
     _store_incident_report(chat_id, thread_id, message)
     logger.info(f"Relayed {profile}/{job_id} report to {active_platform} thread {thread_id}")
-    return None
+    return None, degraded
 
 
 @app.post("/v1/cron-reports", dependencies=[Depends(verify_api_key)])
@@ -1004,13 +1083,20 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     session_id = _cron_report_session_id(profile, job_id, day)
 
     try:
-        error = relay_cron_report(session_id, profile, job_id, title, report)
+        error, degraded = relay_cron_report(session_id, profile, job_id, title, report)
     except Exception as exc:  # never leak a stack trace into last_delivery_error
         logger.exception(f"Relay for {profile}/{job_id} raised")
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
-    return {"status": "delivered", "session_id": session_id}
+    # 200, because the report is in the channel and the run did its job. `relay`
+    # is what tells the scheduler which of the two deliveries it got, so a job
+    # whose front door has been down all week is visible without reading logs.
+    return {
+        "status": "delivered",
+        "session_id": session_id,
+        "relay": "degraded" if degraded else "ok",
+    }
 
 
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
