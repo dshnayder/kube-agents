@@ -21,10 +21,11 @@ stock Hindsight provider is in `client.py`; anything the model reads is in
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -97,6 +98,10 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._personal_disabled_reason: str = ""
         self._session_id: str = ""
         self._read_only: bool = False
+        # Per-method keyword allowlists for _call, resolved once from the stock
+        # provider actually loaded. None means "takes **kwargs, forward it all".
+        self._accepts: Dict[str, Optional[FrozenSet[str]]] = {}
+        self._reported_drops: set = set()
 
     @property
     def name(self) -> str:
@@ -196,6 +201,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     # Automatic capture is personal, and only when the speaker is known. Shared
     # knowledge is read by everyone, so it never absorbs a conversation wholesale
     # — it takes explicit writes through memory_retain(scope="shared").
+    #
+    # The ``**kwargs`` here is deliberate and load-bearing: the harness reads it
+    # as consent to send the completed turn's ``messages`` list, which is worth
+    # having the day the stock provider can use it. What it must not do is arrive
+    # unfiltered at a provider that cannot — see _forwardable.
 
     def sync_turn(self, user_content: str, assistant_content: str, **kwargs: Any) -> None:
         if self._user_tag and not self._read_only:
@@ -347,8 +357,80 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     def _call(self, method: str, *a: Any, **kw: Any):
         if self._hindsight is None:
             return None
-        try:
-            return getattr(self._hindsight, method)(*a, **kw)
-        except Exception as e:
-            logger.debug("%s: %s failed: %s", PROVIDER_NAME, method, e)
+        target = getattr(self._hindsight, method, None)
+        if target is None:
+            logger.warning("%s: the stock provider has no %s()", PROVIDER_NAME, method)
             return "" if method == "prefetch" else None
+        try:
+            return target(*a, **self._forwardable(method, target, kw))
+        except Exception:
+            # WARNING, not DEBUG. Everything reached from here is a memory read
+            # or write, and there is no route by which one of them failing is
+            # routine. #784 spent every attributed turn between 2026-08-13 and
+            # 2026-08-18 raising a TypeError into this handler and writing
+            # nothing, and a DEBUG line kept it out of agent.log, errors.log and
+            # Cloud Logging alike. The symptom that did surface — a bank that
+            # stays small — is indistinguishable from the retain mission doing
+            # its job, so the log line is the only thing that can tell them
+            # apart.
+            logger.warning("%s: %s failed", PROVIDER_NAME, method, exc_info=True)
+            return "" if method == "prefetch" else None
+
+    def _forwardable(self, method: str, target: Any, kw: Dict[str, Any]) -> Dict[str, Any]:
+        """Narrow ``kw`` to the keywords the stock provider's ``method`` accepts.
+
+        This wrapper sits between two signatures it does not own. The harness
+        decides what to pass by inspecting *ours* (``memory_manager``'s
+        ``_provider_sync_accepts_messages`` reads any ``**kwargs`` as "send
+        everything"), and the stock provider decides what it will take. When the
+        base image moves, those two disagree and the call raises before it does
+        any work.
+
+        Filtering is the only fix that holds in both directions. Restating the
+        target's parameters here would re-arm the same failure on the next bump
+        — the mistake #780 removed from the Slack relay's ``register()`` shim —
+        while forwarding blind is what broke this path to begin with (#784).
+        Read the target instead: unknown keywords are dropped rather than
+        raising, and a keyword the target *does* learn about later starts being
+        forwarded with no change here.
+        """
+        if not kw:
+            return kw
+        if method not in self._accepts:
+            try:
+                params = inspect.signature(target).parameters.values()
+            except (TypeError, ValueError):
+                # Unintrospectable (a C function, an exotic callable). Forwarding
+                # blind is what the wrapper did everywhere before this, so it is
+                # no worse, and the handler above now says so if it fails.
+                self._accepts[method] = None
+            else:
+                if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+                    self._accepts[method] = None
+                else:
+                    self._accepts[method] = frozenset(
+                        p.name
+                        for p in params
+                        if p.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY,
+                        )
+                    )
+        accepted = self._accepts[method]
+        if accepted is None:
+            return kw
+        dropped = sorted(k for k in kw if k not in accepted)
+        if dropped and method not in self._reported_drops:
+            # Once per method per process, at INFO. Every turn drops the same
+            # keyword, so a line per call would be noise; a line per process is
+            # what makes the condition findable in agent.log without waiting for
+            # someone to query Postgres and notice the bank is empty.
+            self._reported_drops.add(method)
+            logger.info(
+                "%s: %s() does not accept %s — dropping it from every forward",
+                PROVIDER_NAME,
+                method,
+                ", ".join(dropped),
+            )
+        return {k: v for k, v in kw.items() if k in accepted}
