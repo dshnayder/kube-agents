@@ -120,6 +120,27 @@ SYSTEM_PROMPT_READ_ONLY = (
     + MEMORY_ABSENCE_RULE
 )
 
+# What earns a place in the shared corpus, phrased as the test the model has to
+# apply at the moment it decides. Discoverability, not who said it: the corpus
+# is worth reading only for what a session cannot establish for itself.
+#
+# The two exclusions are the ones that would do damage. Live state read back
+# from a cluster is true when written and silently false afterwards — nothing
+# here expires (memory_ttl_curator.py is on no schedule), so a stale claim
+# outlives the thing it described. And a conclusion drawn this session, recorded
+# as a fact, comes back through recall as something the corpus "knows"; restated
+# with more confidence each time, its proof count rises on nothing but its own
+# echo. The same reasoning keeps specialists read-only — see the memory block in
+# agents/platform/config.yaml.
+SHARED_SCOPE_TEST = (
+    "Store only what a future session could not find out for itself: a decision "
+    "and the reasoning behind it, who owns what, a standing constraint, a gotcha "
+    "that contradicts what the system appears to say. Not the current state of a "
+    "cluster — query that instead, or the memory is wrong the moment it changes "
+    "— and not a conclusion you reached this session, which belongs in your "
+    "answer. Every user can read shared memory."
+)
+
 
 def system_prompt_block(*, read_only: bool, user_tag: str, disabled_reason: str) -> str:
     """The memory section of the system prompt, in the variant this session gets."""
@@ -131,13 +152,21 @@ def system_prompt_block(*, read_only: bool, user_tag: str, disabled_reason: str)
     return f"{SYSTEM_PROMPT_HEADER}\n{SYSTEM_PROMPT_BODY}"
 
 
-def tool_schemas(*, read_only: bool) -> List[Dict[str, Any]]:
-    """The three memory tools, minus the write tool on a read-only profile.
+def tool_schemas(*, read_only: bool, has_identity: bool = True) -> List[Dict[str, Any]]:
+    """The three memory tools, in the variant this session gets.
 
     A read-only profile is not shown the write tool at all. Advertising it and
     refusing the call would spend a turn and read as a transient failure worth
     retrying; the absent schema is unambiguous. The refusal in
     ``handle_tool_call`` stays as the backstop.
+
+    ``has_identity`` is false for cron runs and the k8s event watcher. Those
+    sessions can write — shared is the one scope they have — but the schema used
+    to talk them out of it: it named 'personal' as the default, which is the
+    scope they cannot use, and gated 'shared' on a fact "the user states", when
+    there is no user in the room. Both halves were written for the DM case and
+    read as not-applicable everywhere else. In three months not one unattended
+    session has ever called this tool.
     """
     scope_read = {
         "type": "string",
@@ -147,23 +176,39 @@ def tool_schemas(*, read_only: bool) -> List[Dict[str, Any]]:
             "(facts everyone sees), or 'both'. Defaults to 'both'."
         ),
     }
-    scope_write = {
-        "type": "string",
-        "enum": ["personal", "shared"],
-        "description": (
-            "Where to store it. 'personal' is private to this user and is the "
-            "default. Use 'shared' ONLY for a fact the user states as true for "
-            "the whole team or organisation — every user can read it."
-        ),
-    }
+    if has_identity:
+        scope_write = {
+            "type": "string",
+            "enum": ["personal", "shared"],
+            "description": (
+                "Where to store it. 'personal' is private to this user and is "
+                "the default. Use 'shared' for something the whole team needs. "
+                + SHARED_SCOPE_TEST
+            ),
+        }
+    else:
+        scope_write = {
+            "type": "string",
+            "enum": ["shared"],
+            "description": (
+                "Where to store it. 'shared' is the default and the only option "
+                "here: this session carries no user identity, so there is no "
+                "personal memory to write to. " + SHARED_SCOPE_TEST
+            ),
+        }
+    capture_note = (
+        "Routine facts are captured automatically at the end of a session; use "
+        "this when the fact is needed sooner or the user asks you to remember it."
+        if has_identity else
+        "Nothing is captured automatically in a session with no user identity, "
+        "so this tool is the only way anything you learn here is kept."
+    )
     retain: List[Dict[str, Any]] = [] if read_only else [
         {
             "name": "memory_retain",
             "description": (
-                "Store a durable fact in long-term memory immediately. Routine "
-                "facts are captured automatically at the end of a session; use "
-                "this when the fact is needed sooner or the user asks you to "
-                "remember it."
+                "Store a durable fact in long-term memory immediately. "
+                + capture_note
             ),
             "parameters": {
                 "type": "object",

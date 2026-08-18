@@ -218,7 +218,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     # -- tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return tool_schemas(read_only=self._read_only)
+        return tool_schemas(read_only=self._read_only, has_identity=bool(self._user_tag))
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         if self._hindsight is None:
@@ -238,7 +238,16 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 "your result instead; recording it is the front-door agent's job.",
                 status="read_only",
             )
-        scope = str(args.get("scope") or ("personal" if is_write else "both")).strip().lower()
+        # A write with no scope defaults to the one this session can actually
+        # use. It used to default to 'personal' unconditionally, which in a
+        # session with no identity is the single scope guaranteed to be refused
+        # two lines below — so an unattended agent's first write always failed,
+        # and none of them ever tried twice. Shared is not a fallback here: it
+        # is the only writable scope such a session has.
+        default_scope = "both"
+        if is_write:
+            default_scope = "personal" if self._user_tag else "shared"
+        scope = str(args.get("scope") or default_scope).strip().lower()
         if scope not in SCOPES or (is_write and scope == "both"):
             return tool_error(
                 f"Invalid scope {scope!r} for {tool_name}. "
