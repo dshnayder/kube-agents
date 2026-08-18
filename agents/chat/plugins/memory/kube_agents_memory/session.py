@@ -1,19 +1,25 @@
 """The provider itself: one session's identity, and what it may read and write.
 
-A session resolves to exactly one of three states, decided in `initialize` and
+A session resolves to exactly one of four states, decided in `initialize` and
 fixed for its lifetime:
 
 * **attributed** — a DM from a known user. Personal and shared memory, read and
   write, automatic capture on.
-* **shared-only** — a multi-party thread, or a session with no identity at all.
-  Shared memory only; nothing is captured automatically, because nothing can be
-  attributed.
+* **unattributable** — a multi-party thread. There are people here, and their
+  personal memory exists; this session just cannot tell which of them is
+  speaking, so it may not touch any of it.
+* **unattended** — cron, the k8s event watcher. No person is in the
+  conversation at all, so there is no personal memory in play to get wrong.
 * **read-only** — a specialist profile. Shared memory, reads only, no write tool
   advertised.
 
-`_user_tag` is the whole of that state on the read/write paths: empty means no
-personal memory, and every branch that could cross users is written to fail
-closed on it rather than to succeed conditionally.
+`_user_tag` decides what may be *read and written*: empty means no personal
+memory, and every branch that could cross users is written to fail closed on it
+rather than to succeed conditionally. It is empty in the middle two states
+alike, and they must not be collapsed anywhere a *default* is chosen — an
+unqualified write is a guess about intent, and the safe guess in a room full of
+people is the opposite of the safe guess in an empty one. `_unattended` is the
+flag that keeps them apart; see `handle_tool_call`.
 
 Identity handling and tool dispatch live here. Anything that reaches into the
 stock Hindsight provider is in `client.py`; anything the model reads is in
@@ -96,6 +102,9 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._hindsight: Optional[MemoryProvider] = None
         self._user_tag: str = ""
         self._personal_disabled_reason: str = ""
+        # True only when there is no person in the conversation at all. Not the
+        # same as `not self._user_tag`, which is also true of a group thread.
+        self._unattended: bool = False
         self._session_id: str = ""
         self._read_only: bool = False
         # Per-method keyword allowlists for _call, resolved once from the stock
@@ -119,6 +128,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._hindsight = None
         self._user_tag = ""
         self._personal_disabled_reason = ""
+        self._unattended = False
         self._read_only = memory_is_read_only()
 
         user_id = sanitize_user_id(kwargs.get("user_id") or "")
@@ -150,6 +160,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             )
         elif not user_id:
             self._personal_disabled_reason = NO_IDENTITY_NOTICE
+            self._unattended = True
             logger.info("%s: personal memory disabled for session %s (no user identity)",
                         PROVIDER_NAME, session_id)
         else:
@@ -218,7 +229,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     # -- tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return tool_schemas(read_only=self._read_only, has_identity=bool(self._user_tag))
+        return tool_schemas(
+            read_only=self._read_only,
+            has_identity=bool(self._user_tag),
+            unattended=self._unattended,
+        )
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         if self._hindsight is None:
@@ -238,15 +253,26 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 "your result instead; recording it is the front-door agent's job.",
                 status="read_only",
             )
-        # A write with no scope defaults to the one this session can actually
-        # use. It used to default to 'personal' unconditionally, which in a
-        # session with no identity is the single scope guaranteed to be refused
-        # two lines below — so an unattended agent's first write always failed,
-        # and none of them ever tried twice. Shared is not a fallback here: it
-        # is the only writable scope such a session has.
+        # A write with no scope is the model declining to state intent, so the
+        # default has to be the safe reading of that silence — and the safe
+        # reading is not the same in every session.
+        #
+        # 'personal' held for all of them, which in an *unattended* session is
+        # the single scope guaranteed to be refused a few lines below: cron and
+        # the k8s event watcher may write, but only to shared, so their first
+        # write always failed and none of them ever tried twice. There, shared
+        # is not a fallback — it is the only writable scope in the room.
+        #
+        # In a group thread the opposite holds, and it is `_unattended` rather
+        # than `_user_tag` that tells the two apart. A space is full of named
+        # people whose personal memory exists and is merely unreachable from
+        # here; defaulting an unqualified write to shared would publish one
+        # participant's stated fact to the whole organisation, silently. So it
+        # keeps defaulting to personal and keeps hitting the refusal below,
+        # which is the behaviour SOUL.md calls a safety property.
         default_scope = "both"
         if is_write:
-            default_scope = "personal" if self._user_tag else "shared"
+            default_scope = "shared" if self._unattended else "personal"
         scope = str(args.get("scope") or default_scope).strip().lower()
         if scope not in SCOPES or (is_write and scope == "both"):
             return tool_error(

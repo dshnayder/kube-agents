@@ -12,9 +12,11 @@ Nothing here grants a new capability. It stops the schema and the default from
 contradicting the permission the session already has, so the tests are about
 what an unattended agent is *shown* and what its first, unqualified call does.
 
-The attributed case is asserted alongside every unattended one: a change that
-quietly made DMs default to shared would leak one person's facts to everyone,
-which is a worse bug than the one being fixed.
+Two other populations are asserted alongside every unattended one, because a
+change that widened to either would leak one person's facts to everyone — a
+worse bug than the one being fixed. The attributed DM is the obvious one. The
+group thread is the trap: it has no ``_user_tag`` either, so anything keyed on
+that alone treats a room full of named people as an empty room.
 
 Standalone: plain asserts, no pytest. See ``test_recall_reporting.py`` for how
 to run it.
@@ -35,18 +37,34 @@ sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 
 from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
+    SHARED_SESSION_NOTICE,
     SHARED_TAG,
     KubeAgentsMemoryProvider,
 )
 from kube_agents_memory.prompts import tool_schemas  # noqa: E402
 
 
-def provider(*, user_tag=""):
-    """A writable provider, attributed or not, over a recording client."""
+def provider(*, user_tag="", unattended=None):
+    """A writable provider in one of the three live states, over a stub client.
+
+    ``unattended`` defaults to "whatever matches ``user_tag``" so the common two
+    cases stay one argument; pass ``unattended=False`` with no tag to build the
+    group thread, which is the state that has no identity and is still full of
+    people.
+    """
+    if unattended is None:
+        unattended = not user_tag
+    assert not (user_tag and unattended), "an attributed session is not unattended"
     p = KubeAgentsMemoryProvider()
     p._read_only = False
     p._user_tag = user_tag
-    p._personal_disabled_reason = "" if user_tag else NO_IDENTITY_NOTICE
+    p._unattended = unattended
+    if user_tag:
+        p._personal_disabled_reason = ""
+    else:
+        p._personal_disabled_reason = (
+            NO_IDENTITY_NOTICE if unattended else SHARED_SESSION_NOTICE
+        )
     retained = {}
 
     class StubClient:
@@ -97,6 +115,45 @@ def test_an_attributed_write_with_no_scope_is_still_personal():
     assert retained["items"][0]["tags"] == ["user:alice"], retained
 
 
+def test_an_unqualified_write_in_a_group_thread_is_refused_not_published():
+    """The mirror image of the headline test, and the reason it is keyed on
+    `_unattended` rather than on `_user_tag` being empty.
+
+    A space has no user tag and is not empty: every fact in it belongs to one
+    of several named people. Defaulting the write to shared here would take
+    "remember I'm on call next week" from one participant and publish it to
+    every user of the install, with nothing said out loud about it.
+    """
+    p, retained = provider(unattended=False)
+    r = json.loads(p.handle_tool_call("memory_retain", {
+        "content": "Dmitry is on call for networking next week.",
+    }))
+    assert "error" in r, r
+    assert r["error"] == SHARED_SESSION_NOTICE, r
+    assert not retained, retained
+
+
+def test_a_group_thread_can_still_write_shared_when_it_says_so():
+    """Refusing the default must not amount to refusing the scope. A team-wide
+    fact stated in a space is exactly what a deliberate shared write is for."""
+    p, retained = provider(unattended=False)
+    r = json.loads(p.handle_tool_call("memory_retain", {
+        "content": "Releases are cut on Tuesdays.", "scope": "shared",
+    }))
+    assert r.get("result") == "Stored in shared memory.", r
+    assert retained["items"][0]["tags"] == [SHARED_TAG], retained
+
+
+def test_a_group_thread_keeps_personal_in_its_schema():
+    """Dropping 'personal' from the enum would remove the only way to say "this
+    is one person's" — and with it the refusal that keeps the fact unpublished.
+    The space is told, in the description, that personal is the default."""
+    scope = _write_scope(provider(unattended=False)[0])
+    assert scope["enum"] == ["personal", "shared"], scope
+    assert "no user identity" not in scope["description"], scope
+    assert "nobody is present" not in scope["description"], scope
+
+
 def test_asking_for_personal_without_an_identity_still_fails_loudly():
     """Defaulting to shared must not become 'silently reroute a personal write'.
 
@@ -121,10 +178,10 @@ def test_the_unattended_schema_offers_shared_and_only_shared():
     assert _write_scope(provider(user_tag="user:alice")[0])["enum"] == ["personal", "shared"]
 
 
-def test_both_variants_carry_the_test_for_what_belongs():
+def test_every_variant_carries_the_test_for_what_belongs():
     """The old wording ('a fact the user states') excluded the unattended case
-    by construction. Whatever replaces it has to reach both."""
-    for p in (provider()[0], provider(user_tag="user:alice")[0]):
+    by construction. Whatever replaces it has to reach all three."""
+    for p in (provider()[0], provider(unattended=False)[0], provider(user_tag="user:alice")[0]):
         d = _write_scope(p)["description"]
         assert "could not find out for itself" in d, d
         # The two exclusions are the point; a description that keeps only the
@@ -133,23 +190,35 @@ def test_both_variants_carry_the_test_for_what_belongs():
         assert "conclusion you reached this session" in d, d
 
 
-def test_an_unattended_session_is_not_told_capture_is_automatic():
-    """It is not, for this session — `_auto_retain` is off with no identity, so
-    the DM wording ('captured automatically at the end of a session') is a
-    false reassurance exactly where the tool is the only route in."""
-    def retain_description(p):
-        return next(s for s in p.get_tool_schemas() if s["name"] == "memory_retain")["description"]
+def _retain_description(p):
+    return next(s for s in p.get_tool_schemas() if s["name"] == "memory_retain")["description"]
 
-    unattended = retain_description(provider()[0])
+
+def test_a_session_with_no_identity_is_not_told_capture_is_automatic():
+    """It is not, for either of them — `_auto_retain` is off without a user tag,
+    so the DM wording ('captured automatically at the end of a session') is a
+    false reassurance in both. What follows it has to differ, though: the tool
+    is the only route in for cron, and the last thing a space needs is
+    encouragement to record what a named person just said."""
+    unattended = _retain_description(provider()[0])
     assert "only way anything you learn here is kept" in unattended, unattended
     assert "captured automatically at the end of a session" not in unattended, unattended
-    assert "captured automatically" in retain_description(provider(user_tag="user:alice")[0])
+
+    space = _retain_description(provider(unattended=False)[0])
+    assert "only way anything you learn here is kept" not in space, space
+    assert "belongs to the whole team" in space, space
+
+    assert "captured automatically" in _retain_description(provider(user_tag="user:alice")[0])
 
 
-def test_a_read_only_profile_is_unaffected_either_way():
+def test_a_read_only_profile_is_unaffected_in_every_state():
     """Specialists stay barred; none of this reaches them."""
-    for has_identity in (True, False):
-        names = [s["name"] for s in tool_schemas(read_only=True, has_identity=has_identity)]
+    for has_identity, unattended in ((True, False), (False, True), (False, False)):
+        names = [
+            s["name"] for s in tool_schemas(
+                read_only=True, has_identity=has_identity, unattended=unattended,
+            )
+        ]
         assert "memory_retain" not in names, names
 
 

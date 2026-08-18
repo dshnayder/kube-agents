@@ -152,7 +152,9 @@ def system_prompt_block(*, read_only: bool, user_tag: str, disabled_reason: str)
     return f"{SYSTEM_PROMPT_HEADER}\n{SYSTEM_PROMPT_BODY}"
 
 
-def tool_schemas(*, read_only: bool, has_identity: bool = True) -> List[Dict[str, Any]]:
+def tool_schemas(
+    *, read_only: bool, has_identity: bool = True, unattended: bool = False,
+) -> List[Dict[str, Any]]:
     """The three memory tools, in the variant this session gets.
 
     A read-only profile is not shown the write tool at all. Advertising it and
@@ -160,13 +162,25 @@ def tool_schemas(*, read_only: bool, has_identity: bool = True) -> List[Dict[str
     retrying; the absent schema is unambiguous. The refusal in
     ``handle_tool_call`` stays as the backstop.
 
-    ``has_identity`` is false for cron runs and the k8s event watcher. Those
-    sessions can write — shared is the one scope they have — but the schema used
-    to talk them out of it: it named 'personal' as the default, which is the
-    scope they cannot use, and gated 'shared' on a fact "the user states", when
-    there is no user in the room. Both halves were written for the DM case and
-    read as not-applicable everywhere else. In three months not one unattended
-    session has ever called this tool.
+    The other two flags are not the same question, which is why they are not one
+    flag. ``has_identity`` asks whether *this* session's writes can be attributed
+    to a person, and so whether automatic capture is running. ``unattended`` asks
+    whether there is a person here at all.
+
+    Only ``unattended`` narrows the write scope. Cron and the k8s event watcher
+    can write — shared is the one scope they have — but the schema used to talk
+    them out of it: it named 'personal' as the default, which is the scope they
+    cannot use, and gated 'shared' on a fact "the user states", when there is no
+    user in the room. Both halves were written for the DM case and read as
+    not-applicable everywhere else. In three months not one unattended session
+    has ever called this tool.
+
+    A group thread has no identity either, and gets the full enum anyway. Its
+    participants have personal memory; this session simply cannot say which of
+    them is speaking. Dropping 'personal' from the enum would leave a model that
+    means "this belongs to one person" with no way to say so — and it is that
+    call, refused out loud by ``handle_tool_call``, that stops the fact from
+    being written to the whole organisation instead.
     """
     scope_read = {
         "type": "string",
@@ -176,7 +190,17 @@ def tool_schemas(*, read_only: bool, has_identity: bool = True) -> List[Dict[str
             "(facts everyone sees), or 'both'. Defaults to 'both'."
         ),
     }
-    if has_identity:
+    if unattended:
+        scope_write = {
+            "type": "string",
+            "enum": ["shared"],
+            "description": (
+                "Where to store it. 'shared' is the default and the only option "
+                "here: nobody is present in this session, so there is no "
+                "personal memory to write to. " + SHARED_SCOPE_TEST
+            ),
+        }
+    else:
         scope_write = {
             "type": "string",
             "enum": ["personal", "shared"],
@@ -186,23 +210,28 @@ def tool_schemas(*, read_only: bool, has_identity: bool = True) -> List[Dict[str
                 + SHARED_SCOPE_TEST
             ),
         }
+    if has_identity:
+        capture_note = (
+            "Routine facts are captured automatically at the end of a session; "
+            "use this when the fact is needed sooner or the user asks you to "
+            "remember it."
+        )
+    elif unattended:
+        capture_note = (
+            "Nothing is captured automatically when nobody is present, so this "
+            "tool is the only way anything you learn here is kept."
+        )
     else:
-        scope_write = {
-            "type": "string",
-            "enum": ["shared"],
-            "description": (
-                "Where to store it. 'shared' is the default and the only option "
-                "here: this session carries no user identity, so there is no "
-                "personal memory to write to. " + SHARED_SCOPE_TEST
-            ),
-        }
-    capture_note = (
-        "Routine facts are captured automatically at the end of a session; use "
-        "this when the fact is needed sooner or the user asks you to remember it."
-        if has_identity else
-        "Nothing is captured automatically in a session with no user identity, "
-        "so this tool is the only way anything you learn here is kept."
-    )
+        # A group thread. Automatic capture is off because it writes personal
+        # and the speaker cannot be identified — which is a reason to reach for
+        # this tool less, not more: most of what is said here is one
+        # participant's, and this tool can only write to everyone.
+        capture_note = (
+            "Nothing is captured automatically here, because the speaker cannot "
+            "be identified in a group thread and personal memory is switched "
+            "off. That is not a reason to record what someone said — only a "
+            "fact that belongs to the whole team belongs in a write from here."
+        )
     retain: List[Dict[str, Any]] = [] if read_only else [
         {
             "name": "memory_retain",
