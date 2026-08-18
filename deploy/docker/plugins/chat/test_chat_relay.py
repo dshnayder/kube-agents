@@ -292,6 +292,82 @@ class TestStandaloneSend(unittest.TestCase):
                 result = asyncio.run(mod.standalone_send(None, "c", "r"))
         self.assertLess(len(result["error"]), 300)
 
+    def test_a_composed_delivery_is_a_plain_success(self):
+        """The route says `relay: "composed"` on the healthy path."""
+        body = b'{"status":"ok","relay":"composed","session_id":"s1"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", self.MESSAGE))
+        self.assertTrue(result.get("success"), result)
+        self.assertNotIn("error", result)
+
+    def test_a_degraded_relay_is_recorded_as_a_delivery_error(self):
+        """200 plus `relay: "degraded"` means posted raw, not composed.
+
+        `error` is the only field the scheduler reads, and `last_delivery_error`
+        the only place a run record can carry it — so a front door that has been
+        down all week must not produce run records identical to healthy ones.
+        """
+        body = b'{"status":"ok","relay":"degraded","session_id":"s1"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", self.MESSAGE))
+        self.assertNotIn("success", result)
+        self.assertIn("degraded", result["error"])
+
+    def test_the_degraded_string_says_the_report_did_arrive(self):
+        """Otherwise `cronjob list` reads as "nothing was sent" and invites a
+        re-run, which would post the same finding to the channel twice."""
+        body = b'{"status":"ok","relay":"degraded"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        error = result["error"]
+        self.assertIn("was posted", error)
+        self.assertIn("do not re-run", error.lower())
+
+    def test_a_2xx_that_says_nothing_about_the_relay_is_a_success(self):
+        """An older route, or one that answered before the field existed."""
+        for body in (b"{}", b"", b"<html>ok</html>", b'{"relay":null}', b"[]"):
+            with self.subTest(body=body):
+                with RecordingRelay(body=body) as relay:
+                    with patch.dict(
+                        os.environ,
+                        {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+                    ):
+                        result = asyncio.run(mod.standalone_send(None, "c", "r"))
+                self.assertTrue(result.get("success"), result)
+
+    def test_a_verdict_never_turns_a_failure_into_a_success(self):
+        """A non-2xx body is not read for a verdict — the status decides."""
+        body = b'{"relay":"composed"}'
+        with RecordingRelay(status=502, body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertIn("502", result["error"])
+
+    def test_post_returns_an_error_and_a_verdict(self):
+        """Every path out of `_post` is a 2-tuple; the callers unpack it."""
+        with RecordingRelay(body=b'{"relay":"degraded"}') as relay:
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(mod._post(relay.url, {}, "k"), (None, "degraded"))
+        with patch.dict(os.environ, {}, clear=True):
+            error, verdict = mod._post("not-a-url", {}, "k")
+        self.assertIsNotNone(error)
+        self.assertEqual(verdict, "")
+
     def test_the_timeout_outlasts_a_chat_agent_turn(self):
         """Time out before the route answers and a delivered report is recorded
         as a failure. `_run_relay_turn` allows the turn itself 300s."""

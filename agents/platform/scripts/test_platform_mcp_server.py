@@ -786,6 +786,54 @@ class TestReportToChat(unittest.TestCase):
         # its final response on ERROR, so this string is load-bearing.
         self.assertIn("ERROR", report_to_chat("finding", job_id="j1"))
 
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_the_wait_outlasts_the_relay_it_is_waiting_on(self, mock_urlopen):
+        """The route relays synchronously — it runs a whole Chat Agent turn, with
+        its own 300s ceiling, before it answers.
+
+        Timing out first is not a harmless retry: nothing cancels the server, so
+        the report is posted anyway while this tool returns an ERROR the job
+        prompt tells the agent to recover from by returning the report as its
+        final response — which on a `deliver: "chat"` job relays it a second
+        time. The bound must therefore sit above the work, not above a connect
+        stall.
+        """
+        mock_urlopen.return_value = self._urlopen()
+        report_to_chat("finding", job_id="j1")
+        self.assertGreater(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 300.0)
+        self.assertEqual(
+            mock_urlopen.call_args.kwargs.get("timeout"),
+            platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS,
+        )
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_degraded_relay_is_not_reported_as_a_clean_success(self, mock_urlopen):
+        """The route answers 200 for a composed delivery and for a degraded one,
+        and says which in `relay`. Reading it is the difference between the agent
+        knowing its raw text went out and it believing the Chat Agent framed it.
+        """
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "degraded", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("degraded", result)
+        # Delivered, so the recovery path the job prompt describes must not fire:
+        # returning the report as the final response would post it twice.
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "composed", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("SUCCESS", result)
+        self.assertNotIn("degraded", result)
+
 
 class TestSanitizationAndMutationRemoval(unittest.TestCase):
 

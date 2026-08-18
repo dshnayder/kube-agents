@@ -161,8 +161,22 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     return f": {detail.strip()[:200]}"
 
 
-def _post(url: str, payload: dict, api_key: str) -> Optional[str]:
-    """POST *payload* as JSON. ``None`` on success, else why it failed.
+def _relay_verdict(response) -> str:
+    """The route's ``relay`` field off a 2xx body, or ``""`` if it did not say.
+
+    Best effort, like :func:`_http_error_detail`: the body is read once and a
+    delivery that worked is never turned into an exception by failing to parse
+    the receipt for it. ``""`` therefore means "no verdict", not "composed" —
+    the caller treats only an explicit ``degraded`` as degraded.
+    """
+    try:
+        return str((json.loads(response.read().decode("utf-8", "replace")) or {}).get("relay") or "")
+    except Exception:
+        return ""
+
+
+def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], str]:
+    """POST *payload* as JSON. ``(None, verdict)`` on success, else ``(why, "")``.
 
     Blocking, and called through :func:`asyncio.to_thread`. ``urllib`` rather
     than ``httpx`` keeps this module stdlib-only, so its tests run wherever the
@@ -184,15 +198,15 @@ def _post(url: str, payload: dict, api_key: str) -> Optional[str]:
         with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", None) or response.getcode()
             if status >= 300:
-                return f"chat relay answered HTTP {status}"
+                return f"chat relay answered HTTP {status}", ""
+            return None, _relay_verdict(response)
     except urllib.error.HTTPError as exc:
         # The route names the failing leg in `detail` ("composed but not
         # delivered to google_chat"), which is the difference between a
         # last_delivery_error someone can act on and a bare status code.
-        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}"
+        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}", ""
     except Exception as exc:  # URLError, socket timeout, malformed URL
-        return f"chat relay unreachable: {type(exc).__name__}: {exc}"
-    return None
+        return f"chat relay unreachable: {type(exc).__name__}: {exc}", ""
 
 
 async def standalone_send(
@@ -239,9 +253,31 @@ async def standalone_send(
         "title": title,
         "report": report,
     }
-    error = await asyncio.to_thread(_post, relay_url(), payload, api_key)
+    error, verdict = await asyncio.to_thread(_post, relay_url(), payload, api_key)
     if error:
         return {"error": error}
+
+    if verdict == "degraded":
+        # The route answered 200 and the report is in the channel, so this is
+        # not a lost delivery — but the Chat Agent turn failed and what landed
+        # is the raw text under an `[unrelayed]` marker. `error` is the only
+        # field of this dict the scheduler reads, and `last_delivery_error` is
+        # the only place a run record can carry the fact, so the verdict goes
+        # there rather than into a log line nobody greps. The string says
+        # plainly that the report did arrive, because `cronjob list` showing a
+        # delivery error is otherwise read as "nothing was sent" and invites a
+        # re-run that would post the same finding twice.
+        #
+        # Not doing this is what the relay was built to stop, one layer out: a
+        # front door that has been down all week would otherwise produce run
+        # records byte-identical to healthy ones.
+        message = (
+            "chat relay degraded: the report was posted but the Chat Agent turn "
+            "failed, so the channel has the raw text marked [unrelayed] rather "
+            "than a composed message. Delivered — do not re-run to resend."
+        )
+        logger.warning("chat relay: %s (job_id=%s)", message, job_id or "?")
+        return {"error": message}
 
     logger.info(
         "chat relay: report handed to the Chat Agent (job_id=%s)", job_id or "?"

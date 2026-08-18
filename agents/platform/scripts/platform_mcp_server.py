@@ -21,6 +21,24 @@ from gke_endpoint import dns_endpoint_args
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
+# How long `report_to_chat` waits on /v1/cron-reports. That route relays
+# synchronously — it creates the session, runs a whole Chat Agent turn (its own
+# 300s ceiling) and blocks on `hermes send` before answering — so this has to
+# outlast the work, not just a connect stall. Deliberately the same 360s the
+# delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
+# deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
+# ordering: the server's verdict must be what the caller records.
+#
+# Timing out first is not a harmless retry. Nothing cancels the server — a sync
+# FastAPI endpoint runs to completion in the threadpool whether or not the
+# client is still connected — so the report is composed, posted and stored
+# regardless, while this tool returns an ERROR the job prompt tells the agent to
+# recover from by returning the report as its final response. On a
+# `deliver: "chat"` job that final response relays a second time and the user
+# reads the same finding twice. The measured relay is ~9s; the old 10s bound
+# left that one second of headroom.
+CRON_REPORT_TIMEOUT_SECONDS = 360.0
+
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
 
@@ -795,11 +813,21 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
             headers=_session_kv_headers({"Content-Type": "application/json"}),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
+        with urllib.request.urlopen(req, timeout=CRON_REPORT_TIMEOUT_SECONDS) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         return f"ERROR: Failed to hand the report to the chat relay: {exc}"
 
+    # The route answers 200 for both a composed delivery and a degraded one, and
+    # says which in `relay`. Reading it here is the difference between the agent
+    # knowing its report went out raw and it believing the Chat Agent framed it.
+    if payload.get("relay") == "degraded":
+        return (
+            f"SUCCESS (degraded): the report was posted to chat (session "
+            f"{payload.get('session_id', '?')}) but the Chat Agent turn failed, so the user "
+            "sees your raw text marked [unrelayed] rather than a composed message. It is "
+            "delivered — do not send it again — and there is nothing for you to retry."
+        )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {payload.get('session_id', '?')}). "
         "The Chat Agent posts it; do not also call send_notification for this report."

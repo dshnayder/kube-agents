@@ -708,6 +708,60 @@ _CRON_REPORT_SESSION_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 # cannot push a megabyte through the model and into the channel.
 CRON_REPORT_MAX_CHARS = int(os.getenv("CRON_REPORT_MAX_CHARS", "12000") or "12000")
 
+# `job_id` and `title` are labels, and a label is one short line. The bound is
+# not decoration: unlike `report`, these two are stored on the session row and
+# replayed by `incident_context._index_text` into *every* unthreaded message in
+# the space for the next 24 hours, so an unbounded one is paid for once per
+# message rather than once. 200 fits the longest real title on the roster
+# ("Security & RBAC Posture Audit") many times over.
+CRON_REPORT_MAX_LABEL_CHARS = 200
+
+# Newlines and the tokens that could open a role or forge a fence. Labels get a
+# stricter scrub than the report body does: the body is reproduced into the
+# user's channel, so `_defang_report` deliberately leaves markdown-shaped text
+# alone, but a label is never prose and has no such claim on being preserved.
+_LABEL_NEWLINE_RE = re.compile(r"[\r\n\t]+")
+_LABEL_TOKEN_RE = re.compile(
+    r"<\|(?:im_start|im_end|endoftext|system|user|assistant)\|>"
+    r"|</?untrusted_report>"
+    r"|\[/?INST\]"
+    r"|\[SECURITY NOTICE:"
+    r"|###\s*(?:System|Instruction):",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_label(value: str) -> str:
+    """Flatten and bound a caller-supplied `job_id` or `title`.
+
+    These arrive on the same request body as `report` and were treated as if the
+    server had written them. It has not: `report_to_chat` takes both straight
+    from the specialist model's tool arguments, and that model has just read the
+    `evidence.excerpt` text this whole design is defended against — literal
+    `kubectl ... -o yaml` from workloads other teams deploy. A job created at
+    runtime through `cronjob(action='create')` carries whatever name the request
+    produced.
+
+    They reach two channels the design designates as trusted, which is why the
+    scrub happens here at the boundary rather than at each of them:
+
+    - :func:`_build_relay_instructions` interpolates both into the *ephemeral
+      system prompt*, in its first sentence, above the `[SECURITY NOTICE: ...]`
+      block that frames the report as untrusted. That prompt is the "other half"
+      of the defence `_defang_report` describes.
+    - `_ensure_session_row` stores them, `list_recent_reports` serves them back
+      as "fields this server wrote itself", and `incident_context._index_text`
+      renders them unfenced ahead of the user's own words.
+
+    Newlines go first: they are what turns a label into forged structure inside
+    a prompt that is otherwise one sentence.
+    """
+    flattened = _LABEL_NEWLINE_RE.sub(" ", value or "").strip()
+    neutralised = _LABEL_TOKEN_RE.sub("[token]", flattened)
+    if len(neutralised) > CRON_REPORT_MAX_LABEL_CHARS:
+        neutralised = neutralised[:CRON_REPORT_MAX_LABEL_CHARS].rstrip() + "…"
+    return neutralised
+
 
 def _cron_report_session_id(profile: str, job_id: str, day: str) -> str:
     """Deterministic session id for one job's reports on one UTC day.
@@ -1064,10 +1118,13 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     work by then and delivery is the last thing it does. The relay plugin's
     timeout (`RELAY_TIMEOUT_SECONDS`) is sized for that.
     """
-    job_id = str(request_data.get("job_id") or "").strip()
+    # Labels are scrubbed before anything reads them — they reach the relay
+    # turn's system prompt and the 24-hour report index, both of which treat
+    # their input as trusted. See :func:`_sanitize_label`.
+    job_id = _sanitize_label(str(request_data.get("job_id") or ""))
     report = str(request_data.get("report") or "").strip()
-    profile = str(request_data.get("profile") or "").strip() or "platform"
-    title = str(request_data.get("title") or "").strip()
+    profile = _sanitize_label(str(request_data.get("profile") or "")) or "platform"
+    title = _sanitize_label(str(request_data.get("title") or ""))
 
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id field is required")

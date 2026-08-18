@@ -184,9 +184,10 @@ experimental
 [`platformFrontDoor`](../site/src/content/docs/operator/platformagent-crd.md)
 flag re-homes the gateway onto the platform profile.
 
-Mechanically the relay is unaffected: it is one more turn on one more gateway,
-the session is created the same way, and `hermes send` still does the posting.
-Two things do change, and both are worth stating rather than discovering.
+Mechanically the relay route is unaffected: it is one more turn on one more
+gateway, the session is created the same way, and `hermes send` still does the
+posting. What changes is whether anything reaches the route at all, and who is
+composing when it does. Three things, all worth stating rather than discovering.
 
 - **The composer is no longer the locked-down one.** The Chat Agent's
   `platform_toolsets.api_server` is `mcp-router`, `kanban` and `memory`; the
@@ -197,14 +198,32 @@ Two things do change, and both are worth stating rather than discovering.
   could reach for was a kanban card. Nothing above stops working, but the
   framing is carrying more weight, and "who reasons" and "who speaks" become the
   same agent.
-- **One known-wrong sentence stops being wrong.** `cronjob(action='create')`
-  describes a runtime-created relayed job as local-only because it runs in the
-  gateway, where `chat` is not an enabled platform. With the front door on the
-  gateway _is_ the platform profile, which does enable it.
+- **The ticker moves, and the relay loses its supply.** The `--profile` flag
+  re-points `HERMES_HOME` before anything imports, and Hermes' cron ticker binds
+  to whatever home its own process has. So the gateway starts
+  ticking the platform store directly — the governance roster fires without
+  `profile-cron-tick` in front of it — while `profile-cron-tick` itself, which
+  is an entry in the `default` profile's `cron/jobs.json`, is in a store nothing
+  ticks any more. It is the only thing that ever sets `CHAT_HOME_CHANNEL`, so
+  with it stopped no process in the install has it. `_resolve_delivery_targets`
+  then returns `[]` for every `deliver: "chat"` job — the branch
+  `verify_chat_relay.py` check 8 asserts — and each governance report is
+  composed at full audit cost and posted nowhere, exactly the silence
+  `home_target_env` describes for `deliver: "all"`. Every _other_ named profile
+  goes dark with it, for the same reason and independently of this design.
+- **One known-wrong sentence stays wrong.** `cronjob(action='create')` describes
+  a runtime-created relayed job as local-only because it runs in the gateway,
+  where `chat` is not an enabled platform. The flag does not change that:
+  enablement is a property of the _process_, not the profile — `is_connected`
+  reads `CHAT_HOME_CHANNEL` out of the environment, and the gateway is
+  deliberately the one process that never has it, whichever profile it wears.
 
-The flag ships default-off and unsupported, so this is recorded as an
-interaction rather than handled in code: making the relay branch on the gateway
-profile would couple it to a switch that may not graduate.
+The flag ships default-off and unsupported, so these are recorded as
+interactions rather than handled in code: making the relay branch on the gateway
+profile would couple it to a switch that may not graduate. The stopped ticker is
+the one that would have to be answered before the flag could graduate, and the
+fix is not in the relay: it is to keep ticking the profiles the gateway no
+longer homes to.
 
 ## When the follow-up arrives outside the thread
 
