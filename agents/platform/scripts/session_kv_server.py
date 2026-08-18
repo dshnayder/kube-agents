@@ -875,6 +875,17 @@ def _run_relay_turn(api_url: str, session_id: str, report: str, instructions: st
     front door cannot reach the system — so it composes and this server sends.
     The alternative, giving the Chat Agent a send tool, would widen exactly the
     boundary agents/chat/config.yaml exists to hold.
+
+    That premise is a property of *which profile the gateway runs as*, not of
+    this function: the POST goes to whatever `PLATFORM_API_URL` answers. The
+    experimental `platformFrontDoor` flag re-homes the gateway onto the platform
+    profile, whose `platform_toolsets.api_server` is `mcp-platform_control`,
+    `mcp-gke` and `mcp-developer_knowledge`, and whose lockdown is deliberately
+    not copied across. The relay still works there — it is one more turn on one
+    more gateway — but the agent composing it then holds fleet tools while
+    reading untrusted report text, so the framing in `_build_relay_instructions`
+    is carrying more weight than it does by default. See
+    `docs/designs/cron-report-relay.md`, "Under `platformFrontDoor`".
     """
     try:
         req = urllib.request.Request(

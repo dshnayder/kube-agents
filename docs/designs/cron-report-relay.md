@@ -142,6 +142,37 @@ The pattern is not new here —
 is duplicated in the plugin rather than imported because a gateway plugin is
 loaded by file path and cannot reach the platform agent's scripts.
 
+### Under `platformFrontDoor`
+
+The separation this design rests on — the specialist reasons, the Chat Agent
+speaks — is a property of _which profile the gateway runs as_, not of the relay.
+`_run_relay_turn` POSTs to whatever `PLATFORM_API_URL` answers, and the
+experimental
+[`platformFrontDoor`](../site/src/content/docs/operator/platformagent-crd.md)
+flag re-homes the gateway onto the platform profile.
+
+Mechanically the relay is unaffected: it is one more turn on one more gateway,
+the session is created the same way, and `hermes send` still does the posting.
+Two things do change, and both are worth stating rather than discovering.
+
+- **The composer is no longer the locked-down one.** The Chat Agent's
+  `platform_toolsets.api_server` is `mcp-router`, `kanban` and `memory`; the
+  platform profile's is `mcp-platform_control`, `mcp-gke` and
+  `mcp-developer_knowledge`, and the flag's own documentation says the lockdown
+  is deliberately not copied across. So the agent reading the untrusted report
+  holds fleet tools directly, where by default the worst an injected instruction
+  could reach for was a kanban card. Nothing above stops working, but the
+  framing is carrying more weight, and "who reasons" and "who speaks" become the
+  same agent.
+- **One known-wrong sentence stops being wrong.** `cronjob(action='create')`
+  describes a runtime-created relayed job as local-only because it runs in the
+  gateway, where `chat` is not an enabled platform. With the front door on the
+  gateway _is_ the platform profile, which does enable it.
+
+The flag ships default-off and unsupported, so this is recorded as an
+interaction rather than handled in code: making the relay branch on the gateway
+profile would couple it to a switch that may not graduate.
+
 ## When the follow-up arrives outside the thread
 
 Context comes from the thread, so a follow-up that does not carry the thread gets
