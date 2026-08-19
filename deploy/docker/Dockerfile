@@ -360,13 +360,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # against a loopback stand-in for the Session KV server and asserts on what
 # crossed the wire. Its own docstring enumerates them.
 # See the module docstring in deploy/docker/plugins/chat/adapter.py.
+#
+# The verifier rides in on the plugin's own COPY and is deleted by the RUN that
+# executes it, rather than being staged into /tmp of its own: one COPY for the
+# four, not two for three and one, because `credential-proxy` builds FROM this
+# chain and the budget at the top of this file is the binding constraint. It
+# resolves the plugin through `os.getcwd()`, so /opt/hermes is still the cwd it
+# needs and nothing about the check changes -- only where the file sits for the
+# one layer it exists.
 COPY --chmod=0644 deploy/docker/plugins/chat/plugin.yaml \
      deploy/docker/plugins/chat/__init__.py \
      deploy/docker/plugins/chat/adapter.py \
+     deploy/docker/plugins/verify_chat_relay.py \
      /opt/hermes/plugins/platforms/chat/
-COPY deploy/docker/plugins/verify_chat_relay.py /tmp/chat-relay/
-RUN cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/chat-relay/verify_chat_relay.py && \
-    rm -rf /tmp/chat-relay
+RUN cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 plugins/platforms/chat/verify_chat_relay.py && \
+    rm -f plugins/platforms/chat/verify_chat_relay.py
 
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
@@ -1115,8 +1124,9 @@ RUN rm -f /opt/defaults/config.yaml
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
-COPY agents/chat/scripts/ /opt/defaults/scripts/
-COPY agents/platform/scripts/ /opt/defaults/scripts/
+# One COPY for the two, for the same destination-sharing reason as the three
+# below.
+COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 # One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
 # chain is bounded at 128 layers — see the layer-budget note at the top of the file.
 # They share a destination anyway.
@@ -1195,8 +1205,9 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
 # directory records ownership: kube_agents_memory needs the user identity that
 # only chat ingress carries, so it lives with the Chat Agent.
-COPY agents/platform/plugins/ /opt/hermes/plugins/
-COPY agents/chat/plugins/ /opt/hermes/plugins/
+# One COPY for the two: they share a destination, and the chain is bounded at
+# 128 layers — see the layer-budget note at the top of the file.
+COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config
