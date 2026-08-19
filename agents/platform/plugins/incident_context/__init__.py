@@ -9,6 +9,24 @@ SESSION_KV_URL = "http://127.0.0.1:8699"
 
 logger = logging.getLogger(__name__)
 
+# The leading bot mention Slack prepends when the user @-mentions the bot on the
+# same line ("<@U123> /hermes sethome"). Mirrors `_LEADING_MENTION_RE` in
+# agents/chat/defaults/plugins/legacy_slash_commands/plugin.py, which strips it
+# before matching the command; duplicated rather than imported because a gateway
+# plugin is loaded by file path and cannot reach another plugin's module.
+#
+# The two must agree. This hook's job is to step aside for anything the other one
+# would treat as a command, so its idea of "starts with a slash" has to be the
+# same idea — see the guard in `on_inbound`.
+_LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
+
+
+def _is_slash_command(text):
+    """Whether `legacy_slash_commands` would see a command at the front of *text*."""
+    stripped = _LEADING_MENTION_RE.sub("", (text or "").strip(), count=1)
+    return stripped.lstrip().startswith("/")
+
+
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", on_inbound)
 
@@ -26,7 +44,14 @@ def on_inbound(*, event, **_):
     # unwrap never matches and the gateway reads the whole thing as prose. The
     # user gets a paragraph of last week's incident instead of their command,
     # inside the one thread where they are most likely to be running one.
-    if (getattr(event, "text", "") or "").lstrip().startswith("/"):
+    #
+    # The mention has to come off first. Slack prepends `<@U123>` whenever the
+    # user @-mentions the bot on the same line, `legacy_slash_commands` strips it
+    # before matching, and a raw `startswith("/")` therefore misses exactly the
+    # form people type in a channel -- where, since the index fallback below
+    # fires on any message in a space with a report in it, this hook now has an
+    # opinion about every message rather than only threaded replies.
+    if _is_slash_command(getattr(event, "text", "")):
         return None
     thread_id = getattr(src, "thread_id", None)
     report = _lookup(chat_id, thread_id) if thread_id else None

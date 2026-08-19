@@ -231,6 +231,33 @@ async def standalone_send(
     The error strings become ``last_delivery_error``, so they name the condition
     and never the key.
     """
+    job_id, title, report = parse_cron_wrapper(message)
+
+    # A silent tick is a success, not a delivery. `github-repo-watcher` runs
+    # every ten minutes and prints nothing on a clean sweep -- "Empty means a
+    # clean, quiet tick and the scheduler posts nothing" (github_scan_gate.py)
+    # -- and the relay route rejects an empty `report` with HTTP 400, which
+    # would land in `last_delivery_error` 144 times a day on a watchdog that is
+    # working as intended, inverting the audibility this whole change is for.
+    #
+    # Upstream stops it twice before it gets here: a no_agent job with empty
+    # stdout returns SILENT_MARKER rather than its output, and `should_deliver`
+    # is `bool(deliver_content.strip())`, so `_deliver_result` is never called.
+    # Both are pinned by verify_chat_relay.py, because both are quiet. This is
+    # the third stop, and it is the sibling's: `slack_relay_patch.py` guards the
+    # identical case for the identical reason. A sender that behaves differently
+    # from its sibling on the same input is a difference someone eventually has
+    # to debug.
+    #
+    # Ahead of the credential check on purpose. There is nothing to send, so a
+    # missing key is not this tick's problem, and reporting one would be the
+    # same error-every-ten-minutes by another name.
+    if not report.strip():
+        logger.info(
+            "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
+        )
+        return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_report"}
+
     api_key = (os.getenv(API_KEY_ENV, "") or "").strip()
     if not api_key:
         return {
@@ -240,7 +267,6 @@ async def standalone_send(
             )
         }
 
-    job_id, title, report = parse_cron_wrapper(message)
     if not job_id:
         logger.warning(
             "chat relay: no cron wrapper on this delivery — relaying without a "

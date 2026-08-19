@@ -211,6 +211,25 @@ def main() -> None:
             "deliver=local still delivers nowhere",
         )
 
+        # 6b. Neither does a silent tick. `github-repo-watcher` is a no_agent
+        #     script on */10 that prints nothing on a clean sweep, and the route
+        #     rejects an empty report with HTTP 400 — so without this the fleet's
+        #     quietest watchdog would record a delivery error 144 times a day,
+        #     which is the audibility invariant inverted. Driven through the real
+        #     _deliver_result, wrapper and all, because the wrapper is what makes
+        #     an empty report non-empty on the wire.
+        before = len(relay.requests)
+        error = _deliver_result(job("chat"), "")
+        check(
+            error is None and len(relay.requests) == before,
+            f"an empty report is a silent tick, not a delivery (got {error!r})",
+        )
+        check(
+            _deliver_result(job("chat"), "   \n\t ") is None
+            and len(relay.requests) == before,
+            "whitespace is silence too",
+        )
+
     # 7. A relay that answers 500 is a reported delivery error, not an exception
     #    and not a false success.
     with Relay(status=500) as broken:
@@ -238,6 +257,27 @@ def main() -> None:
     check(
         notice is not None and "local-only" in notice,
         "where the relay is off, cronjob still calls a relayed job local-only",
+    )
+
+    # 9. Check 6b proves the sender's own guard holds. This pins the two
+    #    upstream stops in front of it, which are the reason that guard is
+    #    belt-and-braces rather than the only thing standing between a quiet
+    #    watchdog and a delivery error every ten minutes: run_job returns
+    #    SILENT_MARKER instead of an empty no_agent job's stdout, and its caller
+    #    delivers only when `deliver_content.strip()` is truthy. Neither is a
+    #    function this can call, so what is asserted is the primitive they are
+    #    built from — if it disappears or stops recognising the marker, the
+    #    build fails here rather than the fleet finding out ten minutes at a
+    #    time.
+    from cron.scheduler import SILENT_MARKER, _is_cron_silence_response
+
+    check(
+        _is_cron_silence_response(SILENT_MARKER),
+        "an empty no_agent tick's SILENT_MARKER is still recognised as silence",
+    )
+    check(
+        not _is_cron_silence_response("the issues sweep failed"),
+        "a real report is not mistaken for silence",
     )
 
     print("\nverify_chat_relay: all checks passed")

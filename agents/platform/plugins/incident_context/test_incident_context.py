@@ -304,6 +304,35 @@ class GuardTest(unittest.TestCase):
         self.assertIsNone(self.call(text="  /hermes sethome", thread_id="spaces/AAA/threads/T1"))
         self.assertIsNone(self.call(text="/hermes sethome"))
 
+    def test_a_mention_prefixed_slash_command_is_left_alone(self):
+        """The form people actually type in a channel.
+
+        Slack prepends `<@U123>` when the bot is @-mentioned on the same line,
+        and `legacy_slash_commands` strips it before matching — so this hook has
+        to strip it too, or it rewrites the very command it means to step aside
+        for. It runs first, and the first to rewrite decides what the second
+        sees.
+        """
+        for text in (
+            "<@U123ABC> /hermes sethome",
+            "<@W0A1B2C3> /hermes sethome",
+            "<@BSOMEBOT>/hermes sethome",
+            "  <@U123ABC>   /hermes sethome",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self.call(text=text, platform="slack"))
+
+    def test_a_mention_without_a_command_is_still_rewritten(self):
+        """Stripping the mention must not turn every @-mention into a no-op."""
+        result = self.call(text="<@U123ABC> what happened overnight?", platform="slack")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "rewrite")
+
+    def test_a_slash_in_the_middle_of_prose_is_not_a_command(self):
+        result = self.call(text="did the a/b rollout finish?")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "rewrite")
+
 
 class FailOpenTest(unittest.TestCase):
     """A Session KV server that is down must never eat a user's message."""

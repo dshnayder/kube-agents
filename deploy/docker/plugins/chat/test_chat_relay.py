@@ -203,6 +203,43 @@ class TestStandaloneSend(unittest.TestCase):
             self.assertEqual(relay.requests[0]["body"]["report"], "bare report")
             self.assertEqual(relay.requests[0]["body"]["job_id"], "")
 
+    def test_an_empty_report_is_a_silent_tick(self):
+        """`github-repo-watcher` prints nothing on a clean sweep, 144 times a day."""
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(
+                    mod.standalone_send(
+                        None, "c", wrapped("GitHub Repo Watcher", "ghw", "")
+                    )
+                )
+            self.assertTrue(result.get("success"), result)
+            self.assertEqual(result.get("skipped"), "empty_report")
+            self.assertEqual(relay.requests, [], "nothing should have been sent")
+
+    def test_a_whitespace_report_is_silence_too(self):
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "   \n\t "))
+            self.assertEqual(result.get("skipped"), "empty_report")
+            self.assertEqual(relay.requests, [])
+
+    def test_silence_is_not_a_missing_key(self):
+        """A quiet tick has nothing to authenticate, so an unset key is not its problem.
+
+        Otherwise the guard would just trade one every-ten-minutes
+        ``last_delivery_error`` for another.
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            result = asyncio.run(mod.standalone_send(None, "c", ""))
+        self.assertTrue(result.get("success"), result)
+        self.assertNotIn("error", result)
+
     def test_no_key_is_refused_before_the_request(self):
         with RecordingRelay() as relay:
             with patch.dict(
