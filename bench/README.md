@@ -11,7 +11,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   producing assertions.
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
-- `baselines/` — checked-in screening evidence, one JSON file per case, keyed on the five software versions a score depends on. See [baselines/README.md](baselines/README.md).
+- `baselines/` — checked-in screening evidence, one append-only JSONL file per case, one screening campaign per line, each keyed on the five software versions a score depends on. See [baselines/README.md](baselines/README.md).
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).

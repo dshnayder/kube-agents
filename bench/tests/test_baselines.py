@@ -26,8 +26,11 @@ The load-bearing properties, in rough order of what they cost if wrong:
    stale: `setupId` and `scoringVersion` are devops-bench's own, and it
    changes them when the thing they name changes. The captured fixtures are
    what proves those fields exist and where.
-4. **Records accumulate.** A model bump appends a key rather than rewriting
-   every file, which is what keeps a checked-in store's churn tolerable.
+4. **The store is append-only JSONL and nothing is ever rewritten.** A
+   re-screen adds a line; the older lines stay and are the case's history.
+   Reading is last-line-wins at the current key. That is what keeps a
+   checked-in store's churn tolerable and its conflicts rare, and it is what
+   makes "was this case always this flaky?" an answerable question.
 """
 
 from __future__ import annotations
@@ -65,9 +68,14 @@ KEY = VersionKey(
 
 
 def write_store(root: Path, case: str, records: list[dict]) -> Path:
+    """One `<case>.jsonl`, one record per line, in the order given.
+
+    Oldest first, because that is the order appends produce.
+    """
     root.mkdir(parents=True, exist_ok=True)
-    (root / f"{case}.json").write_text(
-        json.dumps({"case": case, "records": records}, indent=2), encoding="utf-8"
+    lines = [json.dumps({"case": case, **rec}) for rec in records]
+    (root / f"{case}.jsonl").write_text(
+        "".join(f"{line}\n" for line in lines), encoding="utf-8"
     )
     return root
 
@@ -100,6 +108,7 @@ def test_the_store_ships_empty():
     day this lands the collapse rule cannot fire and the aggregate is
     advisory. `BOOTSTRAP_ADMITTED` is the bridge, not a checked-in record.
     """
+    assert sorted(p.name for p in BASELINES.glob("*.jsonl")) == []
     assert sorted(p.name for p in BASELINES.glob("*.json")) == ["VERSIONS.json"]
 
 
@@ -219,25 +228,110 @@ def test_records_accumulate_and_only_the_current_key_matches(tmp_path):
     assert store.record_for("planted-pdb", KEY).passes == 19
 
 
+def test_the_newest_line_at_a_key_wins(tmp_path):
+    """A re-screen is an append, so the last line describes the software now.
+
+    The earlier line is history, not a candidate. Getting this backwards would
+    pin every case to whatever it scored the first time it was ever screened.
+    """
+    store = BaselineStore.load(
+        write_store(
+            tmp_path,
+            "planted-pdb",
+            [record(passes=19), record(passes=12)],
+        )
+    )
+    assert store.record_for("planted-pdb", KEY).passes == 12
+
+
+def test_a_re_screen_can_de_admit_without_deleting_the_evidence(tmp_path):
+    """The append-only store's whole point, stated as behaviour.
+
+    A case that got worse is de-admitted by adding a line, and the line that
+    admitted it is still there to show it was not always like this.
+    """
+    root = write_store(tmp_path, "planted-pdb", [record(passes=19), record(passes=10)])
+    store = BaselineStore.load(root)
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    assert admitted is False
+    assert "10/20" in why
+    assert [r.passes for r in store.history_for("planted-pdb")] == [19, 10]
+
+
+def test_history_spans_every_key_oldest_first(tmp_path):
+    """History is per case, not per key: the point is the trend across bumps."""
+    import dataclasses
+
+    old = dataclasses.replace(KEY, setup_id="gemini-3-0-pro-kubeagents-mcp")
+    store = BaselineStore.load(
+        write_store(tmp_path, "planted-pdb", [record(old, passes=20), record(passes=19)])
+    )
+    history = store.history_for("planted-pdb")
+    assert [r.key.setup_id for r in history] == [old.setup_id, KEY.setup_id]
+
+
+def test_history_of_an_unknown_case_is_empty(tmp_path):
+    assert BaselineStore.load(tmp_path).history_for("nope") == []
+
+
+def test_blank_lines_are_tolerated(tmp_path):
+    """An append that raced a trailing newline must not red the presubmit."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"case": "planted-pdb", **record()})
+    (tmp_path / "planted-pdb.jsonl").write_text(f"\n{line}\n\n", encoding="utf-8")
+    assert BaselineStore.load(tmp_path).record_for("planted-pdb", KEY).passes == 19
+
+
 def test_a_filename_that_disagrees_with_its_case_is_fatal(tmp_path):
     """The filename is the join key, and so is the task directory name.
 
     If they can disagree, a case scores against another case's evidence.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "planted-pdb.json").write_text(
-        json.dumps({"case": "something-else", "records": []}), encoding="utf-8"
+    (tmp_path / "planted-pdb.jsonl").write_text(
+        json.dumps({"case": "something-else", **record()}) + "\n", encoding="utf-8"
     )
     with pytest.raises(ValueError, match="the filename is the join key"):
         BaselineStore.load(tmp_path)
 
 
-@pytest.mark.parametrize(
-    "doc", ["not json", "[]", '{"case": "c"}', '{"case": "c", "records": [1]}']
-)
-def test_a_malformed_case_file_is_fatal(tmp_path, doc):
-    (tmp_path / "c.json").write_text(doc, encoding="utf-8")
+@pytest.mark.parametrize("doc", ["not json", "[]", "1", '"c"', "null"])
+def test_a_malformed_line_is_fatal(tmp_path, doc):
+    (tmp_path / "c.jsonl").write_text(f"{doc}\n", encoding="utf-8")
     with pytest.raises(ValueError):
+        BaselineStore.load(tmp_path)
+
+
+def test_a_malformed_line_names_its_line_number(tmp_path):
+    """A 40-line file needs to say which append broke it, not just that one did."""
+    good = json.dumps({"case": "c", **record()})
+    (tmp_path / "c.jsonl").write_text(f"{good}\n{good}\nnot json\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"c\.jsonl:3"):
+        BaselineStore.load(tmp_path)
+
+
+def test_one_bad_line_does_not_admit_the_case_on_the_good_ones(tmp_path):
+    """Fail loudly rather than score against a partially-read file.
+
+    Half a store reads as evidence, and evidence is what arms the collapse
+    rule against every open pull request.
+    """
+    good = json.dumps({"case": "c", **record()})
+    (tmp_path / "c.jsonl").write_text(f"{good}\n{{oops\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        BaselineStore.load(tmp_path)
+
+
+def test_a_leftover_pre_jsonl_file_is_refused(tmp_path):
+    """Skipping it would read as "never screened" and silently de-admit.
+
+    The store changed format; a file left in the old one is a migration that
+    did not finish, and that has to be said out loud.
+    """
+    (tmp_path / "planted-pdb.json").write_text(
+        json.dumps({"case": "planted-pdb", "records": [record()]}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="planted-pdb.jsonl"):
         BaselineStore.load(tmp_path)
 
 

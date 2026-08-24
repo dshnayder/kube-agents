@@ -24,7 +24,7 @@ THE CASE ID IS THE DIRECTORY NAME. Twelve of the thirteen task files declare
 ``id:``, ``gpu-stress-test-diagnosis`` declares ``task_id:`` instead, and
 devops-bench itself joins on neither: it writes ``folder`` into
 ``results.json`` and ``taskFolder`` into ``rows.json``, both the directory
-name. So the directory is the join key into ``bench/baselines/<id>.json`` and
+name. So the directory is the join key into ``bench/baselines/<id>.jsonl`` and
 into the record, and a declared id is treated as an assertion about it rather
 than as the identity. :func:`load_case` raises when the two disagree, which is
 the only way the baseline file, the task directory and the record can be kept

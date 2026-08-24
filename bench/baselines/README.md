@@ -11,38 +11,54 @@ rung 4 cannot fire and the aggregate is advisory. `BOOTSTRAP_ADMITTED` in
 
 ## Layout
 
-| File             | What it is                                                |
-| ---------------- | --------------------------------------------------------- |
-| `VERSIONS.json`  | The two hand-declared halves of the version key           |
-| `<case-id>.json` | One file per case, named for its `bench/tasks/` directory |
+| File              | What it is                                                |
+| ----------------- | --------------------------------------------------------- |
+| `VERSIONS.json`   | The two hand-declared halves of the version key           |
+| `<case-id>.jsonl` | One file per case, named for its `bench/tasks/` directory |
 
-`<case-id>.json` is a list of records, each filed under the version key it was
-measured at:
+Each line of `<case-id>.jsonl` is one screening campaign, filed under the
+version key it was measured at. Newlines are shown here for the page's sake;
+in the file a record is one line.
 
 ```json
 {
   "case": "obtainability-planted-pdb",
-  "records": [
-    {
-      "key": {
-        "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
-        "scoring_version": "v1",
-        "judge_model": "gemini-3.1-pro-preview",
-        "fleet": 1,
-        "verifiers": 1
-      },
-      "recorded_at": "2026-08-25T00:00:00Z",
-      "commit": "<the main sha the screening ran on>",
-      "runs": 20,
-      "passes": 19,
-      "judged": { "OutcomeValidity": { "mean": 0.81, "n": 20 } }
-    }
-  ]
+  "recorded_at": "2026-08-25T00:00:00Z",
+  "commit": "<the main sha the screening ran on>",
+  "key": {
+    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "scoring_version": "v1",
+    "judge_model": "gemini-3.1-pro-preview",
+    "fleet": 1,
+    "verifiers": 1
+  },
+  "runs": 20,
+  "passes": 19,
+  "judged": { "OutcomeValidity": { "mean": 0.81, "n": 20 } }
 }
 ```
 
-Records **accumulate**. A model bump appends a key rather than rewriting every
-file, which is what keeps the tree churn tolerable under a checked-in store.
+**The file is append-only, and that is the point.** Nothing here is ever
+rewritten: a re-screen adds a line and every earlier line stays. So the file is
+the case's history rather than its current state, which buys three things a
+rewritten blob does not. Re-screening after a model bump is a one-line diff a
+reviewer can read. The old numbers stay available to answer "did this case get
+less reliable, or was it always like this" — the question that decides whether
+a case is worth keeping. And two appends conflict far less often than two
+rewrites of the same object, which is what lets a checked-in store survive
+more than a handful of cases.
+
+Reading is bottom-up: **the newest line at the current key wins**, and the
+lines above it are history. Note the corollary — a case is de-admitted by
+appending a line that says so, never by deleting the line that admitted it.
+
+Only runs on `main` append. A pull request's own run is graded against this
+store and never writes to it, so a case cannot move the baseline it is about to
+be judged against.
+
+A leftover `<case-id>.json` from the pre-JSONL format is an **error**, not a
+file to skip: skipping it would read as "never screened" and silently de-admit
+the case rather than telling anyone the format changed.
 
 ## The version key
 
@@ -89,6 +105,12 @@ measured on — and a new one is appended once re-screened.
 
 ## Regenerating
 
-The screener that runs a case N times against `main` and writes its record is
-PR 2. Until then these files are written by hand from a deliberate run, with
-`commit` naming the `main` SHA it ran on.
+The screener that runs a case N times against `main` and appends its line is
+PR 2. Until then a line is added by hand from a deliberate run, with `commit`
+naming the `main` SHA it ran on.
+
+Whoever writes it — the screener or a person — the operation is an append, and
+the review question is the same: does this one new line say what the run
+found? Never edit or drop a line that is already there. If a past record is
+wrong rather than merely old, correct it in a commit that says so, because it
+is the only way the history stops meaning what it says.

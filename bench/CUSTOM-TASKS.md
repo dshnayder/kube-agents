@@ -272,7 +272,7 @@ Things the loader will hold you to:
 - **`id` also accepts `task_id`,** and `prompt` also accepts `goal` or `input`, for older specs.
 - **The directory name is the case identity,** and `bench-gate` refuses a task whose `id` disagrees
   with it. devops-bench joins on the folder — it writes `folder:` into the record and `taskFolder:`
-  into `rows.json` — and `baselines/<id>.json` joins on the same string, so a task that answers to
+  into `rows.json` — and `baselines/<id>.jsonl` joins on the same string, so a task that answers to
   two names would score against another case's evidence.
 
 Placeholders are substituted in the prompt, the expected output, and the verification spec:

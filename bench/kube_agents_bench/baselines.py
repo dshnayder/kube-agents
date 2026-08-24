@@ -21,6 +21,21 @@ against main's. Neither question can be answered from the pull request's own
 run, so the answers are screened once and checked in under
 ``bench/baselines/``.
 
+THE STORE IS APPEND-ONLY JSONL, one ``<case-id>.jsonl`` per case, one screening
+campaign per line. Nothing is ever rewritten: a re-screen appends a line and
+the older lines stay, so the file is the case's history and not just its
+current state. That matters for three reasons. Re-screening after a model bump
+becomes a one-line diff a reviewer can actually read, instead of a rewritten
+blob. The old numbers stay available to answer "did this case get less
+reliable, or was it always like this" — which is the question that decides
+whether a case is worth keeping. And an append conflicts with a concurrent
+append far less often than two rewrites of the same object conflict, which is
+what makes a checked-in store survive more than a handful of cases.
+
+Only runs on ``main`` append. A pull request's own run is graded against the
+store and never writes to it, so a case cannot move the baseline it is about
+to be judged against.
+
 ADMISSION IS COMPUTED, NEVER DECLARED. A case is admitted because the store
 holds screening evidence for it at the CURRENT version key, not because a task
 file says so. Three consequences, all of them the point: a pull request author
@@ -211,11 +226,11 @@ class BaselineRecord:
 
 
 class BaselineStore:
-    """``bench/baselines/<case-id>.json``, one file per case.
+    """``bench/baselines/<case-id>.jsonl``, one file per case.
 
-    Records ACCUMULATE inside a file rather than being overwritten, so a model
-    bump appends a key instead of rewriting every file in the tree. That is
-    what keeps the churn tolerable under the checked-in choice.
+    One screening campaign per line, in the order they were run. Lines are
+    only ever appended, so a file read bottom-up is the case's history from
+    newest to oldest.
     """
 
     def __init__(self, records: dict[str, list[BaselineRecord]]):
@@ -223,7 +238,7 @@ class BaselineStore:
 
     @classmethod
     def load(cls, directory: str | Path) -> BaselineStore:
-        """Read every ``<case>.json`` in ``directory``.
+        """Read every ``<case>.jsonl`` in ``directory``.
 
         A missing directory is an empty store, not an error: that is the state
         this ships in, and it is the state a fresh checkout is in before
@@ -233,28 +248,41 @@ class BaselineStore:
         records: dict[str, list[BaselineRecord]] = {}
         if not root.is_dir():
             return cls(records)
-        for path in sorted(root.glob("*.json")):
-            if path.name == "VERSIONS.json":
-                continue
-            try:
-                doc = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise ValueError(f"{path}: not valid JSON: {exc}") from exc
-            if not isinstance(doc, dict):
-                raise ValueError(f"{path}: expected a JSON object")
-            case_id = str(doc.get("case") or path.stem)
-            if case_id != path.stem:
+
+        # A leftover `<case>.json` is refused rather than ignored. Skipping it
+        # would read as "this case has never been screened", which silently
+        # de-admits the case instead of telling anyone the file is in the old
+        # format.
+        for stray in sorted(root.glob("*.json")):
+            if stray.name != "VERSIONS.json":
                 raise ValueError(
-                    f"{path}: declares case {case_id!r} but is filed as "
-                    f"{path.stem!r}; the filename is the join key"
+                    f"{stray}: the store is JSONL now; rename it to "
+                    f"{stray.stem}.jsonl, one record per line"
                 )
-            entries = doc.get("records")
-            if not isinstance(entries, list):
-                raise ValueError(f"{path}: 'records' must be a list")
-            parsed = []
-            for entry in entries:
+
+        for path in sorted(root.glob("*.jsonl")):
+            parsed: list[BaselineRecord] = []
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"{path}: cannot read: {exc}") from exc
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                # Blank lines are tolerated: an append that raced a trailing
+                # newline should not take the presubmit down.
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{line_no}: not valid JSON: {exc}") from exc
                 if not isinstance(entry, dict):
-                    raise ValueError(f"{path}: every record must be an object")
+                    raise ValueError(f"{path}:{line_no}: expected a JSON object")
+                case_id = str(entry.get("case") or path.stem)
+                if case_id != path.stem:
+                    raise ValueError(
+                        f"{path}:{line_no}: declares case {case_id!r} but is filed "
+                        f"as {path.stem!r}; the filename is the join key"
+                    )
                 parsed.append(
                     BaselineRecord(
                         key=VersionKey.from_dict(entry.get("key") or {}),
@@ -265,17 +293,26 @@ class BaselineStore:
                         judged=entry.get("judged"),
                     )
                 )
-            records[case_id] = parsed
+            records[path.stem] = parsed
         return cls(records)
 
     def record_for(self, case_id: str, key: VersionKey | None) -> BaselineRecord | None:
-        """The screening record for this case at this exact key, or None."""
+        """The NEWEST screening record for this case at this exact key.
+
+        Last line wins. Re-screening at a key that already has evidence is an
+        append, so the most recent campaign is the one that describes the
+        software as it stands; the earlier lines are history, not candidates.
+        """
         if key is None:
             return None
-        for record in self._records.get(case_id, []):
+        for record in reversed(self._records.get(case_id, [])):
             if record.key == key:
                 return record
         return None
+
+    def history_for(self, case_id: str) -> list[BaselineRecord]:
+        """Every record for a case, oldest first, across all version keys."""
+        return list(self._records.get(case_id, []))
 
     def is_admitted(
         self,
