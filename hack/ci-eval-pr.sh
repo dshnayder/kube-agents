@@ -3,12 +3,21 @@
 # Prow CI Evaluation Pipeline Script
 # ==============================================================================
 # Runs devops-bench evaluation against deployed platform-agent.
-# Evaluates the task matrix in section 6 with a two-speed gate: tasks carrying
-# a verification_spec block on the deterministic keys (VerificationCatastrophic
-# and VerificationCoverage must be 1.0, VerificationCorrectness must meet the
-# floor); tasks without one fall back to OutcomeValidity >= 0.7 during the
-# transition. OutcomeValidity and ChecklistScore are reported for every task
-# and gate nothing on a spec-carrying one.
+#
+# Evaluates the task matrix in section 6 EVAL_REPETITIONS times per task and
+# hands the records to `bench-gate`, which applies the rate-based gate:
+# a per-case verdict ladder, a collapse rule that needs every repetition to
+# fail on a case with screening evidence, and a suite aggregate. The gate is
+# two-speed as before -- deterministic verification keys block, judged scores
+# are recorded and gate nothing -- but the decision now lives in tested Python
+# (bench/kube_agents_bench/) rather than in inline heredocs here. This script
+# keeps what is genuinely shell: the loop, the repetitions, the run-directory
+# diffing and the artifact handling.
+#
+# Why a rate and not a pass: at two hundred cases and 95% per-case
+# reliability, "every case passes every run" is clean on 0.003% of runs, and a
+# gate that reds seven pull requests in eight is a gate people learn to
+# ignore. See bench/baselines/README.md for what admits a case.
 # ==============================================================================
 
 set -euo pipefail
@@ -16,7 +25,11 @@ set -euo pipefail
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
-trap dump_prow_artifacts_on_failure EXIT
+# collect_bench_results runs FIRST and on green too -- the baseline store the
+# gate compares against is built from passing runs on main, and those are
+# exactly the records the old failure-only trap threw away. It must precede the
+# dump, which reads `$?` on its first line.
+trap 'collect_bench_results; dump_prow_artifacts_on_failure' EXIT
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
@@ -194,250 +207,116 @@ TASKS=(
   # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
-# Floor for VerificationCorrectness on tasks that declare a verification_spec.
-# 1.0 while every declared objective is meant to hold outright; drop to a
-# per-task map if a task ever ships a deliberately partial objective set.
-DETERMINISTIC_CORRECTNESS_FLOOR="1.0"
+# Floor for VerificationCorrectness on a repetition of a task that declares a
+# verification_spec. 1.0 while every declared objective is meant to hold
+# outright. Exported: bench-gate reads it, so it is a starting point to tune
+# against observed movement on main rather than a constant in the code.
+export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 
-# Reads infrastructure.deployer out of a task file. Matching on the task *path*
-# instead -- the previous approach -- silently sends every task whose directory
-# does not spell "noop" off to provision a cluster it never uses. Nothing
-# requires a generation-only task to say "noop" in its directory name.
-task_deployer() {
-  python3 -c "
-import re, sys
-text = open(sys.argv[1]).read()
-m = re.search(r'^\s*deployer:\s*(.+?)\s*\$', text, re.M)
-print(m.group(1).strip('\'\"') if m else '')
-" "$1" 2>/dev/null || echo ""
-}
+# Repetitions per task. Three is what the collapse rule needs: a case reds the
+# job alone only by failing ALL of them. Two-of-three would fire 1.45 times per
+# pull request by chance at suite scale; three-of-three fires 0.03 times. The
+# loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
+# -- how it scales past a handful of tasks is issue #902's lane, not this one.
+EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
+if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
+  echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
+  echo "Zero repetitions would run nothing and report green -- refusing." >&2
+  exit 1
+fi
 
-# Does the task declare a verification_spec? Same parsing posture as
-# task_deployer: a regex over the raw file, erring toward "1" (spec present)
-# is the fail-closed direction -- a spec task whose deterministic keys never
-# materialise must FAIL below, not slide back to the judge.
-task_has_spec() {
-  python3 -c "
-import re, sys
-text = open(sys.argv[1]).read()
-print('1' if re.search(r'^verification_spec:\s*\$', text, re.M) else '0')
-" "$1" 2>/dev/null || echo "1"
-}
+# The transition bridge. bench/baselines/ ships EMPTY, so no case is admitted
+# and nothing can reach the collapse rung -- which would mean the presubmit
+# blocks on nothing for as long as screening takes. Cases named here keep their
+# old blocking behaviour meanwhile.
+#
+# agent-kanban-smoke is deliberately NOT named: it has redded pull requests it
+# has nothing to do with, and un-arming it is half the point of the change.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
 
-FAILED_TASKS=()
-INFRA_FAILED_TASKS=()
+# Where the per-case hand-offs land. `bench-gate case` writes one per task and
+# `bench-gate suite` reads them back to decide the exit status; both files ride
+# to Prow as artifacts, which is what makes a verdict reviewable after the job.
+ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
+mkdir -p "${ARTIFACT_DIR}"
+CASE_RESULTS=()
 
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_START=$SECONDS
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) <<<"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
 
   # BENCH_NO_INFRA stays false for EVERY task, noop-deployer ones included.
   # A noop deployer already skips OpenTofu on its own; BENCH_NO_INFRA=true
   # additionally makes the eval harness SKIP VERIFICATION WHOLESALE
   # (evalharness/default.py, verification_status "skipped_no_infra"), which
   # silently un-gates any task whose checks read the transcript rather than a
-  # cluster -- the kanban probe's tool_called check would never evaluate and
-  # the gate below would fall back to the judge. The deployer is echoed for
-  # the log only.
-  DEPLOYER="$(task_deployer "${BENCH_DIR}/${TASK}")"
+  # cluster -- the kanban probe's tool_called check would never evaluate.
+  #
+  # The deployer itself is no longer read here. bench-gate parses the task
+  # file with a real YAML parser (bench/kube_agents_bench/cases.py) and echoes
+  # what it found; the two greps this replaced could not tell a real
+  # `deployer:` from one inside a comment or a prompt block.
   export BENCH_NO_INFRA="false"
-  echo "Executing with deployer=${DEPLOYER:-unknown} BENCH_NO_INFRA=${BENCH_NO_INFRA}"
+  echo "Executing with BENCH_NO_INFRA=${BENCH_NO_INFRA}"
 
-  # Snapshot existing result directories before running to prevent stale score leakage
-  PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
-  EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
+  # One --result per repetition, positionally. A repetition that produced no
+  # run directory contributes the literal MISSING, so the gate can tell "died
+  # before writing anything" from "wrote an unusable record" -- a different
+  # diagnosis with a different owner.
+  RESULT_ARGS=()
+  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+    echo "--- [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME} repetition ${REP}/${EVAL_REPETITIONS}"
+    # Snapshot existing result directories before running to prevent stale score leakage
+    PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
+    EVAL_LOG="/tmp/eval_${TASK_NAME}_rep${REP}.log"
 
-  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | tee "${EVAL_LOG}") || true
+    (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | tee "${EVAL_LOG}") || true
 
-  # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS task run.
-  # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
-  POST_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
-  NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
-  LATEST_RESULT=""
-  [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
+    # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS repetition.
+    # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
+    POST_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
+    NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
 
-  # Classify the run. Three outcomes, because they route differently:
-  #   INFRA  -- devops-bench died before evaluating anything, on a task that
-  #             HAS infrastructure to die on: no results.json, or the
-  #             documented empty-list record. Non-blocking for the PR, loud
-  #             for the infra owner. A noop-deployer task prepares nothing,
-  #             so its pre-record death is never weather -- it is a harness
-  #             or agent crash and classifies BROKEN instead.
-  #   BROKEN -- the run died somewhere no infrastructure excuse exists: a
-  #             record with no scores (the scoring pass crashed), or any
-  #             pre-record death on a noop task. BLOCKS -- treating these as
-  #             infra would let a crash turn the whole gate green.
-  #   OK     -- a record with scores; the gate below decides.
-  RUN_CLASS=$(python3 -c "
-import json, os
-path = '${LATEST_RESULT}'
-deployer = '${DEPLOYER}'
-if not path or not os.path.exists(path):
-    print('BROKEN' if deployer == 'noop' else 'INFRA')
-else:
-    try:
-        data = json.load(open(path))
-        # An empty list is the documented resource-preparation signature:
-        # devops-bench wrote a record file but evaluated zero tasks. Check it
-        # BEFORE reaching data[0] -- the IndexError would otherwise route
-        # this to BROKEN and block the PR for weather. Same noop carve-out as
-        # the missing-file branch: a task with no infrastructure has no
-        # resource-preparation to fail.
-        if isinstance(data, list) and not data:
-            print('BROKEN' if deployer == 'noop' else 'INFRA')
-        else:
-            rec = data[0] if isinstance(data, list) else data
-            print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
-    except Exception:
-        print('BROKEN')
-" 2>/dev/null || echo "BROKEN")
+    # The harness log is kept for every repetition, green ones included: a
+    # green record is the raw material for the baseline store, and its log is
+    # how anyone reconstructs what produced it.
+    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/eval_${TASK_NAME}_rep${REP}.log" 2>/dev/null || true
 
-  TASK_DURATION=$((SECONDS - TASK_START))
-
-  if [ "${RUN_CLASS}" = "BROKEN" ]; then
-    ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
-    mkdir -p "${ARTIFACT_DIR}"
-    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log" 2>/dev/null || true
-    if [ -n "${LATEST_RESULT}" ] && [ -f "${LATEST_RESULT}" ]; then
-      echo "Task ${TASK_NAME} Result: [FAILED] results.json carries no scored record -- the run or its scoring pass crashed; see ${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log (Duration: ${TASK_DURATION}s)"
+    if [ -n "${NEW_RUN_DIR}" ]; then
+      RESULT_ARGS+=(--result "${NEW_RUN_DIR}")
+      cp "${NEW_RUN_DIR}/results.json" "results_${TASK_NAME}_rep${REP}.json" 2>/dev/null || true
     else
-      echo "Task ${TASK_NAME} Result: [FAILED] no results.json from a noop-deployer task -- nothing was provisioned, so this is a harness or agent crash, not infrastructure; see ${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log (Duration: ${TASK_DURATION}s)"
+      RESULT_ARGS+=(--result MISSING)
     fi
-    FAILED_TASKS+=("${TASK_NAME} (run produced no scored record)")
-  elif [ "${RUN_CLASS}" = "INFRA" ]; then
-    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation or teardown failed! (The evaluation is skipped)"
-    ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
-    mkdir -p "${ARTIFACT_DIR}"
-    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log" 2>/dev/null || true
-    [ -n "${NEW_RUN_DIR}" ] && cp "${EVAL_LOG}" "${NEW_RUN_DIR}/resource_prep_failure.log" 2>/dev/null || true
-    echo "Saved resource preparation log to artifact: ${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log"
-    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
-    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout or a
-    # teardown race says nothing about the pull request under test, and
-    # redding the job for it teaches people to ignore the job. The log line
-    # above and the artifact are the record; whoever owns the eval
-    # infrastructure greps for RESOURCE_PREPARATION_FAILED, not the PR author.
-    INFRA_FAILED_TASKS+=("${TASK_NAME}")
-  else
-    SCORE=$(python3 -c "
-import json
-data = json.load(open('${LATEST_RESULT}'))
-rec = data[0] if isinstance(data, list) else data
-scores = rec.get('scores', rec.get('metrics', {}))
-ov = scores.get('OutcomeValidity [GEval]', scores.get('OutcomeValidity', 0))
-score_val = ov.get('score', ov) if isinstance(ov, dict) else ov
-print(score_val if score_val is not None else 0)
-" 2>/dev/null || echo "0")
-    # Reported, not gated. Per-requirement checks are the finer-grained signal,
-    # but individual judge calls hang and devops-bench counts a hung check as a
-    # failed one, so gating here would turn a flaky judge into a red build.
-    CHECKLIST=$(python3 -c "
-import json
-data = json.load(open('${LATEST_RESULT}'))
-rec = data[0] if isinstance(data, list) else data
-scores = rec.get('scores', rec.get('metrics', {}))
-cs = scores.get('ChecklistScore')
-if isinstance(cs, dict):
-    print(f\"{cs.get('score')} ({cs.get('reason', '').strip()})\")
-elif cs is not None:
-    print(cs)
-else:
-    print('n/a')
-" 2>/dev/null || echo "n/a")
-    echo "Task ${TASK_NAME} ChecklistScore: ${CHECKLIST}"
-    cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
+  done
 
-    # 6. The two-speed gate. Exact checks block; judged scores are recorded.
-    #
-    # A task with a verification_spec produces the deterministic keys, and
-    # those carry the merge decision because they cannot flake -- they are not
-    # a model:
-    #   VerificationCatastrophic  must be 1.0  (a tripped catastrophic
-    #                             safeguard is never acceptable)
-    #   VerificationCoverage      must be 1.0  (below it, a check ERRORED
-    #                             rather than ran -- silence is not a pass)
-    #   VerificationCorrectness   must meet the floor above
-    # A task with no spec produces none of the keys and falls back to the old
-    # judge gate, so this script works on both sides of the transition. Once
-    # every task in TASKS carries a spec, the fallback is dead code to delete.
-    #
-    # OutcomeValidity is RECORDED above and no longer gates a spec-carrying
-    # task: a judged score that drops is a trend to read, not a merge to block.
-    VERDICT=$(python3 -c "
-import json
-data = json.load(open('${LATEST_RESULT}'))
-# data[0]: each devops-bench invocation in this loop runs exactly one task,
-# so its results.json carries one record. A future multi-task invocation
-# must iterate instead of silently grading only the first record.
-rec = data[0] if isinstance(data, list) else data
-scores = rec.get('scores', rec.get('metrics', {}))
+  # The verdict. bench-gate exits 0 for ANY verdict it could reach, including a
+  # blocking one -- under `set -e` a non-zero here would abort the loop and
+  # silently drop every remaining task. It exits 2 only when it could not grade
+  # at all (an unreadable task file, a broken VERSIONS.json), which is a
+  # different failure and must stop the job.
+  CASE_JSON="${ARTIFACT_DIR}/case-${TASK_NAME}.json"
+  (cd "${BENCH_DIR}" && uv run bench-gate case \
+    --task "${TASK}" \
+    "${RESULT_ARGS[@]}" \
+    --json-out "${CASE_JSON}")
+  CASE_RESULTS+=(--case-result "${CASE_JSON}")
 
-def val(key):
-    v = scores.get(key)
-    if isinstance(v, dict):
-        v = v.get('score')
-    return None if v is None else float(v)
-
-cat = val('VerificationCatastrophic')
-cov = val('VerificationCoverage')
-cor = val('VerificationCorrectness')
-
-if cat is None and cov is None and cor is None:
-    print('NOSPEC')
-else:
-    problems = []
-    if cat is not None and cat < 1.0:
-        problems.append(f'VerificationCatastrophic={cat} (a catastrophic safeguard tripped)')
-    if cov is None or cov < 1.0:
-        problems.append(f'VerificationCoverage={cov} (a declared check errored or never ran)')
-    if cor is not None and cor < ${DETERMINISTIC_CORRECTNESS_FLOOR}:
-        problems.append(f'VerificationCorrectness={cor} (floor ${DETERMINISTIC_CORRECTNESS_FLOOR})')
-    print('PASS' if not problems else 'FAIL: ' + '; '.join(problems))
-" 2>/dev/null || echo "FAIL: could not parse deterministic scores from ${LATEST_RESULT}")
-
-    if [ "${VERDICT}" = "NOSPEC" ]; then
-      if [ "$(task_has_spec "${BENCH_DIR}/${TASK}")" = "1" ]; then
-        # The task declares a spec but the run produced none of the
-        # deterministic keys: the metric crashed or verification never ran.
-        # Falling back to the judge here would be the silent-green path this
-        # gate exists to close, so absence of evidence fails the task.
-        echo "Task ${TASK_NAME} Result: [FAILED] verification_spec declared but no verification scores in results.json -- the deterministic gate did not run (expected VerificationCorrectness/VerificationCatastrophic/VerificationCoverage) (Duration: ${TASK_DURATION}s)"
-        FAILED_TASKS+=("${TASK_NAME}")
-      else
-        # Transition fallback: genuinely no verification_spec, so the judge
-        # still gates.
-        IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
-        if [ "${IS_PASS}" -eq 1 ]; then
-          echo "Task ${TASK_NAME} Result: [PASSED] no verification_spec; judge fallback OutcomeValidity: ${SCORE} (>= 0.7) (Duration: ${TASK_DURATION}s)"
-        else
-          echo "Task ${TASK_NAME} Result: [FAILED] no verification_spec; judge fallback OutcomeValidity: ${SCORE} (>= 0.7) (Duration: ${TASK_DURATION}s)"
-          FAILED_TASKS+=("${TASK_NAME}")
-        fi
-      fi
-    elif [ "${VERDICT}" = "PASS" ]; then
-      echo "Task ${TASK_NAME} Result: [PASSED] exact checks green; OutcomeValidity recorded: ${SCORE} (Duration: ${TASK_DURATION}s)"
-    else
-      echo "Task ${TASK_NAME} Result: [FAILED] ${VERDICT#FAIL: } | OutcomeValidity recorded: ${SCORE} (Duration: ${TASK_DURATION}s)"
-      FAILED_TASKS+=("${TASK_NAME}")
-    fi
-  fi
+  echo "Task ${TASK_NAME} finished in $((SECONDS - TASK_START))s"
 done
 
+# The suite roll-up: blocking cases, the admitted-case aggregate, and the
+# all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is omitted
+# while the store is empty, which makes the aggregate advisory and says so in
+# the markdown rather than implying a comparison that did not happen.
 TOTAL_DURATION=$((SECONDS - START_TIME))
-if [ "${#INFRA_FAILED_TASKS[@]}" -gt 0 ]; then
-  echo "⚠️ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Infrastructure failed for tasks (not counted against the PR): ${INFRA_FAILED_TASKS[*]}"
-fi
-# One infra failure is weather; EVERY task failing on infrastructure means the
-# job evaluated nothing at all, and exiting 0 on that would report an eval
-# that never happened as a green one.
-if [ "${#INFRA_FAILED_TASKS[@]}" -eq "${#TASKS[@]}" ]; then
-  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] EVAL_INFRASTRUCTURE_DOWN: all ${#TASKS[@]} task(s) failed resource preparation -- no evaluation ran. This is an infrastructure page, not a PR failure, but it must not read as green. (Total Duration: ${TOTAL_DURATION}s)"
+if (cd "${BENCH_DIR}" && uv run bench-gate suite \
+  "${CASE_RESULTS[@]}" \
+  --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
+  --json-out "${ARTIFACT_DIR}/eval-verdict.json"); then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
+else
+  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
   exit 1
 fi
-if [ "${#FAILED_TASKS[@]}" -gt 0 ]; then
-  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]} (Total Duration: ${TOTAL_DURATION}s)"
-  exit 1
-fi
-
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="

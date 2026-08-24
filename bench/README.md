@@ -9,10 +9,12 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
+- `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
+- `baselines/` — checked-in screening evidence, one JSON file per case, keyed on the five software versions a score depends on. See [baselines/README.md](baselines/README.md).
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
-- `tests/` — offline tests against a local HTTP stub.
+- `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
 
 To add a task or plug in a different agent, see
 [CUSTOM-TASKS.md](CUSTOM-TASKS.md).
@@ -29,6 +31,26 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
 ```
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. Drop `--no-infra` for tasks that provision infrastructure, and see `--help` for the rest.
+
+## The gate
+
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it: the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
+
+```bash
+uv run bench-gate case --task ./tasks/<id>/task.yaml \
+  --result <run-dir> --result MISSING --result <run-dir> \
+  --json-out case-<id>.json          # exit 0 with a verdict, 2 if it could not grade
+uv run bench-gate suite --case-result case-<id>.json --markdown-out verdict.md
+                                     # exit 0 green, 1 red
+```
+
+The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record that is not a real agent run reds the job outright; a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something.
+
+That evidence is what `baselines/` holds, and admission is computed from it rather than declared in `task.yaml` — a case cannot admit itself in the same diff that makes it pass. A case with no record at the current version key is reported unadmitted, and one whose record was measured on different software is reported _stale_ rather than silently compared against.
+
+Two speeds, deliberately: the deterministic `Verification*` scores gate, and the judged scores are recorded but never block. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three.
+
+Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists).
 
 ## Portal CUJ evaluations
 
@@ -115,4 +137,4 @@ uv sync
 uv run pytest tests
 ```
 
-No cluster or `kubectl` required — the suite drives the full request → parse → `AgentResult` path against a local stub.
+No cluster or `kubectl` required — the suite drives the full request → parse → `AgentResult` path against a local stub, and grades the gate against run records captured from a live cluster and then mutated. Every gate failure mode is a mutation of a real record rather than a hand-written dict, so a test cannot agree with the scorer about a field devops-bench does not actually emit; `tests/fixtures/runs/README.md` records where the captures came from.
