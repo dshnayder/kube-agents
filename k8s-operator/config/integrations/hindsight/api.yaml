@@ -88,6 +88,24 @@ spec:
             # this is a placeholder rather than a credential.
             - name: HINDSIGHT_API_LLM_API_KEY
               value: none
+            # Omit `temperature` from every LLM call rather than send a value.
+            # Hindsight otherwise sends one on each fact extraction, and a model
+            # that refuses an explicit temperature answers 400 — which arrives
+            # as "500 Fact extraction failed" and stores nothing, so memory is
+            # silently inert for the whole install rather than degraded. Recent
+            # frontier models increasingly refuse it, and which ones do is not
+            # something this chart can know: the model is whatever the installer
+            # chose. "none" is Hindsight's own sentinel for the case, and it
+            # resolves through to all four operations (retain, reflect,
+            # consolidation, verification) since none override it here.
+            #
+            # The cost is that extraction samples at the model's default instead
+            # of Hindsight's 0.1. That is also where a gateway-side parameter
+            # drop would have left it, and this way the setting sits on the one
+            # component that needs it rather than in a LiteLLM config every
+            # agent request passes through.
+            - name: HINDSIGHT_API_LLM_TEMPERATURE
+              value: none
             # Passwordless by design; see the comment on POSTGRES_HOST_AUTH_METHOD
             # in postgresql.yaml. Nothing here is a secret, so nothing here needs
             # a Secret.

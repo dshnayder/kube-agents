@@ -470,6 +470,14 @@ It adds exactly two workloads to `kubeagents-system`.
   model `model-default`), so routing and cost attribution stay in one place. The
   API key is the literal string `none`, matching how the agents authenticate;
   it is a placeholder the client library insists on, not a credential.
+  `HINDSIGHT_API_LLM_TEMPERATURE=none` omits `temperature` from those calls.
+  Hindsight would otherwise send one, and a model that refuses an explicit
+  temperature answers 400 — which reaches the agent as
+  `500 Fact extraction failed`, so memory records nothing at all rather than
+  recording it badly. Which models refuse it is not knowable here, since the
+  model is whatever the installer chose. The gateway is the wrong place to fix
+  this: dropping the parameter there edits a config every agent request passes
+  through in order to accommodate one caller.
 - Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root, no privilege escalation, all
   capabilities dropped. The CPU numbers are sized for model inference rather than for
   serving HTTP, though measurement says the headroom goes unused —
