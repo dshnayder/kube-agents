@@ -168,6 +168,11 @@ class TestReadOnlyProfile(unittest.TestCase):
         # The two exclusions travel with it, or the channel becomes a pipe for stale
         # cluster state — see SHARED_SCOPE_TEST for the same pair.
         self.assertIn("live state", block, block)
+        self.assertIn("conclusion about the task in hand", block, block)
+        # A run with no card still has the result block; the prompt must not make
+        # the card the only route, or a cron finding has nowhere to go.
+        self.assertIn("Worth remembering", block, block)
+        self.assertIn("no card", block, block)
 
     def test_read_only_defaults_off_and_is_read_from_the_profile_config(self):
         """A profile that says nothing keeps its write tools; a broken config too."""

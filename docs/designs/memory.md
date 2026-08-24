@@ -1178,6 +1178,20 @@ None of this is new machinery. `memory_candidates` is an ordinary key in an
 already free-form `metadata` dict, alongside `pr_url` and `proposed_patch`; what
 changed is prose — the three personas and `SYSTEM_PROMPT_READ_ONLY`.
 
+Three limits follow from that, and prose cannot lift any of them. A fan-in card is
+created by the Platform Agent, not the Chat Agent, and nothing links it back to the
+card the user is looking at, so a nomination collected there is reachable only if
+someone names the fan-in card — a `kanban_show` on the id the Chat Agent knows
+returns nothing, which is indistinguishable from nobody having nominated anything.
+The fan-in context serialises each prerequisite's `metadata` with a per-field cap
+and sorted keys, so `memory_candidates` sorts after a large `findings` payload and
+can be truncated away silently. And a nomination copied **verbatim** is a faithful
+relay of text the specialist read somewhere — a pod annotation, an issue comment —
+which the person approving "remember that" is reading as a fact rather than
+auditing as a string. The control is a person, and a person is the right control
+for whether something is worth keeping, not for whether it was authored in good
+faith.
+
 ### Where the connection settings come from
 
 They come from two places, split by whether the value is the same in every
