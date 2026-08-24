@@ -475,9 +475,21 @@ It adds exactly two workloads to `kubeagents-system`.
   temperature answers 400 — which reaches the agent as
   `500 Fact extraction failed`, so memory records nothing at all rather than
   recording it badly. Which models refuse it is not knowable here, since the
-  model is whatever the installer chose. The gateway is the wrong place to fix
-  this: dropping the parameter there edits a config every agent request passes
-  through in order to accommodate one caller.
+  model is whatever the installer chose. It applies to all four operations,
+  which is deliberate — any of them sending a temperature draws the same 400 —
+  and each therefore falls back from a tuned value to the model's default:
+  retain from 0.1, reflect from 0.9, consolidation and verification from 0.0.
+  Consolidation writes the observations recall reads, so its dedup and delta
+  passes stop being pinned; `HINDSIGHT_API_LLM_TEMPERATURE_RETAIN` narrows the
+  omission to fact extraction where a model tolerates the rest.
+  The gateway is the wrong place to fix this. `litellm_settings` is the only
+  gateway-wide place to put it, and neither switch there does the job:
+  `drop_params` drops what LiteLLM believes the provider rejects, and it
+  believes Vertex Claude accepts `temperature`; `additional_drop_params` set
+  there was measured against a live install and the retain still returned 400,
+  because LiteLLM honours it in a model entry's `litellm_params` rather than
+  globally. Per-model it would work, at the price of editing a config every
+  agent request passes through in order to accommodate one caller.
 - Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root, no privilege escalation, all
   capabilities dropped. The CPU numbers are sized for model inference rather than for
   serving HTTP, though measurement says the headroom goes unused —

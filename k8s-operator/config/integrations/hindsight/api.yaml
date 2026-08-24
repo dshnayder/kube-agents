@@ -95,15 +95,27 @@ spec:
             # silently inert for the whole install rather than degraded. Recent
             # frontier models increasingly refuse it, and which ones do is not
             # something this chart can know: the model is whatever the installer
-            # chose. "none" is Hindsight's own sentinel for the case, and it
-            # resolves through to all four operations (retain, reflect,
-            # consolidation, verification) since none override it here.
+            # chose. "none" is Hindsight's own sentinel for the case (one of
+            # "", none, default, off, unset — config.py), and it resolves
+            # through to all four operations, since _resolve_operation_temperature
+            # reads the per-operation variable, then this one, then the default,
+            # and nothing here sets a per-operation one.
             #
-            # The cost is that extraction samples at the model's default instead
-            # of Hindsight's 0.1. That is also where a gateway-side parameter
-            # drop would have left it, and this way the setting sits on the one
-            # component that needs it rather than in a LiteLLM config every
-            # agent request passes through.
+            # All four is the point rather than an accident: any of them sending
+            # a temperature draws the same 400. It is also the cost. Each drops
+            # from a tuned value to whatever the model defaults to — retain from
+            # 0.1, reflect from 0.9, and consolidation and verification from 0.0.
+            # Consolidation is the one to watch: it writes the observations
+            # recall reads (docs/designs/memory.md, "Recall reads observations,
+            # not facts"), so its dedup and delta passes become nondeterministic
+            # where they were pinned. Narrower is possible if only fact
+            # extraction turns out to 400 on a given model —
+            # HINDSIGHT_API_LLM_TEMPERATURE_RETAIN takes the same sentinel and
+            # leaves the other three tuned.
+            #
+            # A gateway-side parameter drop would have landed in the same place,
+            # and this way the setting sits on the one component that needs it
+            # rather than in a LiteLLM config every agent request passes through.
             - name: HINDSIGHT_API_LLM_TEMPERATURE
               value: none
             # Passwordless by design; see the comment on POSTGRES_HOST_AUTH_METHOD

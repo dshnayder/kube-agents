@@ -4164,8 +4164,9 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// 10. Hindsight memory API in the agent namespace (Service and container port 8888).
 	//     Unconditional, like rules 4, 5 and 9: the selector matches nothing on an
 	//     install without --memory=hindsight. Without it every memory_retain and
-	//     memory_recall from the gateway times out — invisibly on a cluster that does
-	//     not enforce NetworkPolicy, which is how it went unnoticed.
+	//     memory_recall from the gateway times out. A cluster that does not enforce
+	//     NetworkPolicy at all connects anyway, which is why the missing rule went
+	//     unnoticed: the install it breaks is the one that enforces the policy.
 	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{
 			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8888))},
