@@ -28,6 +28,10 @@ the JSON hand-off -- so those are what this module pins. In particular:
    scripts grep build logs for it.
 4. **The environment carries every threshold**, since all of them are meant
    to be tuned against observed movement on main.
+5. **`record` is the only writer, and only on main.** It refuses with
+   `PULL_NUMBER` set, so a pull request cannot move the baseline it is judged
+   against even if the shell guard is edited away. It also never reds: a merge
+   to main must not fail over bookkeeping.
 """
 
 from __future__ import annotations
@@ -64,6 +68,11 @@ def _clean_env(monkeypatch):
         "EVAL_AGGREGATE_MARGIN",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
+        "EVAL_JUDGED_MARGIN",
+        "EVAL_JUDGED_METRICS",
+        "PULL_NUMBER",
+        "PULL_BASE_SHA",
+        "GIT_COMMIT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -401,3 +410,303 @@ def test_case_and_suite_compose_over_the_real_fixtures(kanban_task, tmp_path, mo
     green = tmp_path / "case-green.json"
     run_case(kanban_task, [FIXTURE_RUNS / n for n in GREEN_RUNS], green)
     assert main(["suite", "--case-result", str(green)]) == 0
+
+
+# --------------------------------------------------------------------------
+# `bench-gate record` -- the producer. Everything the gate compares against
+# comes from lines this wrote, so without it the store is empty forever.
+# --------------------------------------------------------------------------
+
+
+def store_with(tmp_path: Path, *lines: dict) -> Path:
+    """A baseline store directory, seeded with whole JSONL lines."""
+    root = tmp_path / "baselines"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "VERSIONS.json").write_text(
+        json.dumps({"fleet": 1, "verifiers": 1}), encoding="utf-8"
+    )
+    for line in lines:
+        path = root / f"{line['case']}.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    return root
+
+
+def baseline_line(case: str, *, runs: int, passes: int, judged=None, at="2026-08-01T00:00:00Z"):
+    doc = {"case": case, "recorded_at": at, "key": KEY, "runs": runs, "passes": passes}
+    if judged:
+        doc["judged"] = judged
+    return doc
+
+
+def run_record(store: Path, *case_files: Path, extra=()) -> int:
+    argv = ["record", "--baseline-dir", str(store)]
+    for f in case_files:
+        argv += ["--case-result", str(f)]
+    return main([*argv, *extra])
+
+
+def graded_case(kanban_task, runs, out: Path, store: Path, *extra) -> dict:
+    """Grade a real case against a real store, the way the shell does."""
+    argv = ["case", "--task", str(kanban_task), "--baseline-dir", str(store)]
+    for r in runs:
+        argv += ["--result", str(r)]
+    assert main([*argv, "--json-out", str(out), *extra]) == 0
+    return payload(out)
+
+
+def test_record_appends_a_line_the_store_can_read_back(
+    kanban_task, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    store = store_with(tmp_path)
+    out = tmp_path / "case.json"
+    graded_case(kanban_task, [FIXTURE_RUNS / n for n in GREEN_RUNS], out, store)
+
+    assert run_record(store, out) == 0
+    line = json.loads((store / "agent-kanban-smoke.jsonl").read_text().strip())
+    assert line["case"] == "agent-kanban-smoke"
+    assert (line["runs"], line["passes"]) == (2, 2)
+    assert line["key"] == KEY
+    assert line["judged"]["OutcomeValidity"] == {"mean": 1.0, "n": 2}
+
+
+def test_record_writes_what_a_red_run_found(kanban_task, tmp_path, monkeypatch):
+    """Unconditional on the verdict, and this is the important half.
+
+    A red run on main is exactly the evidence that de-admits a case that has
+    stopped working. A store that only ever recorded good days would drift its
+    bar upward until nothing could clear it and nothing could fall below it.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    store = store_with(tmp_path)
+    out = tmp_path / "case.json"
+    graded_case(kanban_task, [FIXTURE_RUNS / n for n in RED_RUNS], out, store)
+
+    assert run_record(store, out) == 0
+    line = json.loads((store / "agent-kanban-smoke.jsonl").read_text().strip())
+    assert (line["runs"], line["passes"]) == (3, 0)
+
+
+def test_record_refuses_to_run_on_a_pull_request(tmp_path, monkeypatch, capsys):
+    """The invariant, enforced where one line of shell cannot undo it: a pull
+    request reads the baseline it is judged against and never moves it."""
+    monkeypatch.setenv("PULL_NUMBER", "925")
+    store = store_with(tmp_path)
+    assert run_record(store, case_file(tmp_path, "a")) == 2
+    assert "only runs on main" in capsys.readouterr().err
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_force_is_the_escape_hatch_for_local_screening(tmp_path, monkeypatch):
+    monkeypatch.setenv("PULL_NUMBER", "925")
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    assert run_record(store, doc, extra=["--force"]) == 0
+    assert (store / "a.jsonl").is_file()
+
+
+def test_record_skips_a_case_with_no_version_key(tmp_path, capsys):
+    """No readable record in any repetition. Filing it under a partial key
+    would create a bucket no real run can ever match."""
+    store = store_with(tmp_path)
+    assert run_record(store, case_file(tmp_path, "a", reps=[{"outcome": "pass"}])) == 0
+    assert "no version key" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_skips_a_case_that_produced_no_pass_or_fail(tmp_path, capsys):
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY,
+        reps=[{"outcome": "infra"}, {"outcome": "blocked"}],
+    )
+    assert run_record(store, doc) == 0
+    assert "no repetition produced a pass or a fail" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_keeps_blocked_and_infra_out_of_the_rate_but_in_the_line(tmp_path):
+    """Dropping them silently would make a case that half-crashes look
+    perfectly reliable in its own history."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY,
+        reps=[{"outcome": "pass"}, {"outcome": "blocked"}, {"outcome": "infra"}],
+    )
+    assert run_record(store, doc) == 0
+    line = json.loads((store / "a.jsonl").read_text().strip())
+    assert (line["runs"], line["passes"]) == (1, 1)
+    assert (line["blocked"], line["infra"]) == (1, 1)
+
+
+def test_record_stamps_the_commit_from_prow(tmp_path, monkeypatch):
+    monkeypatch.setenv("PULL_BASE_SHA", "deadbee")
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    assert run_record(store, doc) == 0
+    assert json.loads((store / "a.jsonl").read_text().strip())["commit"] == "deadbee"
+
+
+def test_record_copies_its_lines_somewhere_prow_can_collect_them(tmp_path):
+    """The store lives in git and the job cannot push, so the appended file
+    dies with the workspace. The artefact is how the evidence survives."""
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    lines_out = tmp_path / "artifacts" / "baseline-append.jsonl"
+    assert run_record(store, doc, extra=["--lines-out", str(lines_out)]) == 0
+    assert json.loads(lines_out.read_text().strip())["case"] == "a"
+
+
+def test_record_says_so_when_a_run_produced_nothing_worth_keeping(tmp_path, capsys):
+    store = store_with(tmp_path)
+    assert run_record(store) == 0
+    assert "produced no evidence" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# The loop closing: collect, then compare.
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_store_collects_and_then_admits(kanban_task, tmp_path, monkeypatch):
+    """The requirement, end to end through the CLI.
+
+    Nothing here is a deliberate screening campaign -- it is seven ordinary
+    postsubmit runs at the default three repetitions. If pooling were removed
+    this test hangs at "collecting" forever, which is the state the store
+    would really have shipped in.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    store = store_with(tmp_path)
+    out = tmp_path / "case.json"
+    greens = [FIXTURE_RUNS / n for n in (GREEN_RUNS + GREEN_RUNS[:1])]
+
+    doc = graded_case(kanban_task, greens, out, store)
+    assert doc["admitted"] is False
+    assert "no screening evidence" in doc["admission_reason"]
+
+    for i in range(6):
+        assert run_record(store, out, extra=["--recorded-at", f"2026-08-0{i + 1}T00:00:00Z"]) == 0
+        doc = graded_case(kanban_task, greens, out, store)
+        assert doc["admitted"] is False, f"admitted after only {i + 1} run(s)"
+        assert "collecting" in doc["admission_reason"]
+
+    assert run_record(store, out, extra=["--recorded-at", "2026-08-07T00:00:00Z"]) == 0
+    doc = graded_case(kanban_task, greens, out, store)
+    assert doc["admitted"] is True
+    assert "21/21" in doc["admission_reason"]
+
+
+def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
+    kanban_task, tmp_path, monkeypatch, capsys
+):
+    """The rule was built and never armed: `--baseline-rate` was a flag the
+    shell did not pass, so main's side of the comparison was always None."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    store = store_with(
+        tmp_path, *[
+            baseline_line("agent-kanban-smoke", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z")
+            for i in range(7)
+        ]
+    )
+    out = tmp_path / "case.json"
+    graded_case(kanban_task, [FIXTURE_RUNS / n for n in GREEN_RUNS], out, store)
+
+    assert main(["suite", "--case-result", str(out), "--baseline-dir", str(store)]) == 0
+    printed = capsys.readouterr().out
+    assert "main: 100.0%" in printed
+    assert "advisory" not in printed
+
+
+def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path):
+    store = store_with(
+        tmp_path, baseline_line("a", runs=20, passes=20)
+    )
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
+    assert main(["suite", "--case-result", str(doc), "--baseline-dir", str(store)]) == 1
+
+
+def test_an_explicit_baseline_rate_still_overrides_the_store(tmp_path):
+    store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--baseline-rate", "0.1",
+    ]) == 0
+
+
+def test_an_unadmitted_case_contributes_nothing_to_either_side(tmp_path):
+    """It failed everything and main passed everything, and the suite is still
+    green: an unscreened case's rate is not yet a number worth comparing, and
+    that has to hold on BOTH sides or the comparison is between two different
+    populations of cases.
+    """
+    store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
+    doc = case_file(tmp_path, "a", version_key=KEY, admitted=False, passes=0, scored=4)
+    out = tmp_path / "suite.json"
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--json-out", str(out),
+    ]) == 0
+    verdict = json.loads(out.read_text(encoding="utf-8"))
+    assert verdict["pass_rate"] is None and verdict["baseline_rate"] is None
+
+
+def test_a_bootstrap_admitted_case_has_no_baseline_to_compare_against(
+    tmp_path, capsys
+):
+    """Admitted by fiat, not by evidence. It arms rung 4 and contributes
+    nothing to main's side of the aggregate -- the fix is to screen it."""
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=0, scored=3)
+    assert main(["suite", "--case-result", str(doc), "--baseline-dir", str(store)]) == 0
+    assert "advisory" in capsys.readouterr().out
+
+
+def test_rung_6_arms_itself_once_the_store_has_judged_evidence(
+    kanban_task, tmp_path, monkeypatch, make_run
+):
+    """The comparator wires all the way through the CLI, and is quiet until
+    there is something to compare against."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+
+    def sour(rec):
+        rec["scores"]["OutcomeValidity"]["score"] = 0.1
+
+    runs = [make_run(mutate=sour) for _ in range(3)]
+    out = tmp_path / "case.json"
+
+    empty = store_with(tmp_path / "empty")
+    assert graded_case(kanban_task, runs, out, empty)["blocking"] is False
+
+    seeded = store_with(
+        tmp_path / "seeded",
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+    )
+    doc = graded_case(kanban_task, runs, out, seeded)
+    assert doc["rung"] == 6 and doc["blocking"] is True
+    assert doc["baseline_judged"]["OutcomeValidity"] == 1.0
+
+
+def test_a_corrupt_store_is_never_read_as_an_empty_one(kanban_task, tmp_path, capsys):
+    """Empty means "nothing admitted, aggregate advisory", which is a
+    legitimate green. A corrupt file reaching that state would disarm the gate
+    on the day somebody fat-fingers a line."""
+    store = store_with(tmp_path)
+    (store / "agent-kanban-smoke.jsonl").write_text("{ not json\n", encoding="utf-8")
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out) == 0  # shipped store
+    assert main([
+        "case", "--task", str(kanban_task), "--baseline-dir", str(store),
+        "--result", str(FIXTURE_RUNS / GREEN_RUNS[0]),
+    ]) == 2
+    assert main(["suite", "--case-result", str(out), "--baseline-dir", str(store)]) == 1

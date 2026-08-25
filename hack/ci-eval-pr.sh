@@ -225,10 +225,27 @@ if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   exit 1
 fi
 
+# How far a judged mean may fall below main's before rung 6 fires. 0.5 is
+# arithmetic on the measured spread, not a preference: three repetitions of one
+# unchanged task scored OutcomeValidity 0.9, 1.0 and 0.2 -- a standard deviation
+# near 0.44, so the standard error of a three-repetition mean is about 0.25. One
+# standard error would red roughly one unchanged pull request in six; two reds
+# about one in fifty, the same order the collapse rule was sized to.
+#
+# So say plainly what this buys: at this width rung 6 catches a COLLAPSE in
+# judged quality and cannot see drift, because at three repetitions drift and
+# noise are the same picture. Tightening it needs more repetitions or a less
+# variable metric, not a smaller number here.
+export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
+
 # The transition bridge. bench/baselines/ ships EMPTY, so no case is admitted
 # and nothing can reach the collapse rung -- which would mean the presubmit
 # blocks on nothing for as long as screening takes. Cases named here keep their
 # old blocking behaviour meanwhile.
+#
+# It is a bridge and not a destination: a bootstrap-admitted case has no
+# measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
+# nothing to main's side of the aggregate. Screening replaces it.
 #
 # agent-kanban-smoke is deliberately NOT named: it has redded pull requests it
 # has nothing to do with, and un-arming it is half the point of the change.
@@ -306,10 +323,34 @@ for TASK in "${TASKS[@]}"; do
   echo "Task ${TASK_NAME} finished in $((SECONDS - TASK_START))s"
 done
 
+# Baseline collection, and it runs BEFORE the verdict on purpose: the suite
+# step exits 1 on a red, which under `set -e` would skip everything after it.
+# A red run on main is precisely the evidence that de-admits a case that has
+# stopped working, so it is the one run that must not go unrecorded.
+#
+# Only a postsubmit appends. `bench-gate record` refuses a second time if
+# PULL_NUMBER is set, because a guard that lives only in shell is one careless
+# edit away from letting a pull request move the baseline it is judged against.
+#
+# The store lives in git and this job has no push credential, so the append
+# dies with the workspace; --lines-out is what survives, as a Prow artefact
+# somebody lands in a follow-up. Wiring that push is its own change.
+if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
+  # Never fatal. Bookkeeping must not be the reason a merge to main reds.
+  (cd "${BENCH_DIR}" && uv run bench-gate record \
+    "${CASE_RESULTS[@]}" \
+    --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
+    echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
+else
+  echo "Not a postsubmit run: the baseline store is read, never written."
+fi
+
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the
-# all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is omitted
-# while the store is empty, which makes the aggregate advisory and says so in
-# the markdown rather than implying a comparison that did not happen.
+# all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
+# the rate is computed from the store, per admitted case at its own version
+# key. While the store holds nothing the aggregate stays advisory and the
+# markdown says so, rather than implying a comparison that did not happen.
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \

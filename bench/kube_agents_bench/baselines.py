@@ -36,6 +36,18 @@ Only runs on ``main`` append. A pull request's own run is graded against the
 store and never writes to it, so a case cannot move the baseline it is about
 to be judged against.
 
+EVIDENCE ACCUMULATES; IT IS NOT ONE CAMPAIGN. The admission bar wants twenty
+runs and an ordinary run of the presubmit is three repetitions, so a rule that
+read only the newest line could never admit anything the routine job produced
+— the store would ship empty and stay empty. :meth:`BaselineStore.evidence_for`
+therefore pools the NEWEST lines at the current key until it holds ``min_runs``
+runs. One deliberate twenty-run screening campaign satisfies that in a single
+line; seven ordinary merges to ``main`` satisfy it in seven. Pooling stops at
+the bar rather than reading the whole file, which is what gives recency for
+free: a case that starts failing has its old passing lines pushed out of the
+window by the new failing ones, and de-admits itself without anyone editing
+the store.
+
 ADMISSION IS COMPUTED, NEVER DECLARED. A case is admitted because the store
 holds screening evidence for it at the CURRENT version key, not because a task
 file says so. Three consequences, all of them the point: a pull request author
@@ -70,17 +82,21 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 __all__ = [
     "AdmissionBar",
+    "BaselineEvidence",
     "BaselineRecord",
     "BaselineStore",
     "VersionKey",
     "Versions",
+    "append_record",
     "load_versions",
+    "utc_now",
 ]
 
 #: Screening evidence must be at least this fraction of passing runs. 19/20.
@@ -202,9 +218,59 @@ class VersionKey:
         )
 
 
+def utc_now() -> str:
+    """The ``recorded_at`` stamp, to the second. UTC, always."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _pool_judged(sources: list[dict[str, Any] | None]) -> dict[str, dict[str, Any]]:
+    """Combine per-record judged blocks into one mean per metric.
+
+    Weighted by each block's own ``n``, so twenty runs of evidence outweigh
+    three. A block missing a usable mean or a positive n is dropped rather
+    than counted as zero, for the same reason ``score_value`` returns None on
+    an absent key: an unmeasured metric is not a metric that scored nothing.
+    """
+    totals: dict[str, list[float]] = {}
+    for block in sources:
+        if not isinstance(block, dict):
+            continue
+        for metric, blob in block.items():
+            if not isinstance(blob, dict):
+                continue
+            mean = _as_float(blob.get("mean"))
+            count = _as_float(blob.get("n"))
+            if mean is None or count is None or count <= 0:
+                continue
+            acc = totals.setdefault(str(metric), [0.0, 0.0])
+            acc[0] += mean * count
+            acc[1] += count
+    return {
+        metric: {"mean": total / count, "n": int(count)}
+        for metric, (total, count) in totals.items()
+        if count
+    }
+
+
 @dataclass(frozen=True)
 class BaselineRecord:
-    """One screening result: how a case behaved on main at one version key."""
+    """One screening result: how a case behaved on main at one version key.
+
+    ``runs`` counts SCORED repetitions only -- the ones that produced a pass or
+    a fail. Repetitions that rungs 1-3 blocked, or that died on infrastructure,
+    are counted separately in :attr:`blocked` and :attr:`infra` and kept out of
+    the rate. They belong in the file because dropping them silently would make
+    a case that half-crashes look perfectly reliable, and out of the rate
+    because rungs 1-3 block absolutely whether or not a case is admitted, so
+    admission has no need to model them.
+    """
 
     key: VersionKey
     runs: int
@@ -212,6 +278,8 @@ class BaselineRecord:
     recorded_at: str | None = None
     commit: str | None = None
     judged: dict[str, Any] | None = None
+    blocked: int = 0
+    infra: int = 0
 
     @property
     def rate(self) -> float | None:
@@ -223,6 +291,98 @@ class BaselineRecord:
             and self.rate is not None
             and self.rate >= bar.rate
         )
+
+    def to_dict(self, case_id: str) -> dict[str, Any]:
+        """The JSON object this record is written as. One line, in this order.
+
+        Field order is chosen for the reviewer, not for the parser: a diff
+        that adds a line should read as "this case, on this day, at this key,
+        went this well" from left to right.
+        """
+        doc: dict[str, Any] = {
+            "case": case_id,
+            "recorded_at": self.recorded_at or utc_now(),
+        }
+        if self.commit:
+            doc["commit"] = self.commit
+        doc["key"] = self.key.to_dict()
+        doc["runs"] = self.runs
+        doc["passes"] = self.passes
+        if self.blocked:
+            doc["blocked"] = self.blocked
+        if self.infra:
+            doc["infra"] = self.infra
+        if self.judged:
+            doc["judged"] = self.judged
+        return doc
+
+
+@dataclass(frozen=True)
+class BaselineEvidence:
+    """Several records at one key, pooled into the answer admission needs."""
+
+    key: VersionKey
+    runs: int
+    passes: int
+    #: How many appended lines went into the pool.
+    lines: int
+    judged: dict[str, dict[str, Any]] = field(default_factory=dict)
+    newest_at: str | None = None
+    oldest_at: str | None = None
+
+    @property
+    def rate(self) -> float | None:
+        return (self.passes / self.runs) if self.runs else None
+
+    @property
+    def judged_means(self) -> dict[str, float]:
+        """Just the means, which is what rung 6 compares against."""
+        return {
+            metric: float(blob["mean"])
+            for metric, blob in self.judged.items()
+            if isinstance(blob, dict) and blob.get("mean") is not None
+        }
+
+    def admits(self, bar: AdmissionBar) -> bool:
+        return (
+            self.runs >= bar.min_runs
+            and self.rate is not None
+            and self.rate >= bar.rate
+        )
+
+
+def append_record(
+    directory: str | Path, case_id: str, record: BaselineRecord
+) -> tuple[Path, str]:
+    """Append one screening line to ``<case-id>.jsonl``. The only writer here.
+
+    Returns the file written and the exact line appended, so a caller can
+    echo it into a build log or a Prow artifact without re-reading the file.
+
+    Deliberately a module function and not a :class:`BaselineStore` method. The
+    store is a read snapshot taken at load time; giving it a write method would
+    invite the idea that the in-memory object is the authority, when the file
+    on disk is, and another process may have appended to it since.
+    """
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{case_id}.jsonl"
+    line = json.dumps(record.to_dict(case_id))
+
+    # A file whose last line has no newline would swallow the next append into
+    # it, turning two records into one unparseable one. Cheap to prevent, and
+    # the only way it can happen -- a half-written append -- is exactly the
+    # case where nobody is watching.
+    prefix = ""
+    if path.exists() and path.stat().st_size:
+        with path.open("rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                prefix = "\n"
+
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(prefix + line + "\n")
+    return path, line
 
 
 class BaselineStore:
@@ -291,6 +451,8 @@ class BaselineStore:
                         recorded_at=entry.get("recorded_at"),
                         commit=entry.get("commit"),
                         judged=entry.get("judged"),
+                        blocked=int(entry.get("blocked") or 0),
+                        infra=int(entry.get("infra") or 0),
                     )
                 )
             records[path.stem] = parsed
@@ -314,6 +476,50 @@ class BaselineStore:
         """Every record for a case, oldest first, across all version keys."""
         return list(self._records.get(case_id, []))
 
+    def evidence_for(
+        self,
+        case_id: str,
+        key: VersionKey | None,
+        *,
+        min_runs: int = DEFAULT_ADMISSION_MIN_RUNS,
+    ) -> BaselineEvidence | None:
+        """Pool the newest lines at this key until ``min_runs`` runs are held.
+
+        Returns None when there is nothing at this key -- which is the state
+        every case is in before it has been screened, and is reported as
+        "collecting" rather than as a failure.
+
+        Whole lines only. Stopping mid-line to hit ``min_runs`` exactly would
+        mean inventing a sub-record that was never measured, so a pool of
+        three-repetition lines overshoots to 21 runs rather than pretending to
+        20. The overshoot is evidence, so counting it is honest; the point of
+        the bound is to keep old lines from propping up a case that has since
+        got worse, and one extra line does not do that.
+        """
+        if key is None:
+            return None
+        matching = [r for r in self._records.get(case_id, []) if r.key == key]
+        if not matching:
+            return None
+
+        pooled: list[BaselineRecord] = []
+        runs = 0
+        for record in reversed(matching):
+            pooled.append(record)
+            runs += record.runs
+            if runs >= min_runs:
+                break
+
+        return BaselineEvidence(
+            key=key,
+            runs=runs,
+            passes=sum(r.passes for r in pooled),
+            lines=len(pooled),
+            judged=_pool_judged([r.judged for r in pooled]),
+            newest_at=pooled[0].recorded_at,
+            oldest_at=pooled[-1].recorded_at,
+        )
+
     def is_admitted(
         self,
         case_id: str,
@@ -336,8 +542,8 @@ class BaselineStore:
             return True, "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
         if key is None:
             return False, "the run carries no version key, so no baseline matches it"
-        record = self.record_for(case_id, key)
-        if record is None:
+        evidence = self.evidence_for(case_id, key, min_runs=bar.min_runs)
+        if evidence is None:
             known = len(self._records.get(case_id, []))
             if known:
                 return False, (
@@ -347,12 +553,23 @@ class BaselineStore:
                     f"{key.verifiers}) -- re-screen before this case can collapse"
                 )
             return False, "no screening evidence for this case yet"
-        if record.admits(bar):
+        span = f"{evidence.lines} recorded run(s)"
+        if evidence.admits(bar):
             return True, (
-                f"admitted on {record.passes}/{record.runs} screening runs "
-                f"(bar {bar.rate:.0%} over {bar.min_runs})"
+                f"admitted on {evidence.passes}/{evidence.runs} screening runs "
+                f"across {span} (bar {bar.rate:.0%} over {bar.min_runs})"
+            )
+        if evidence.runs < bar.min_runs:
+            # Not a failure -- this is the store filling up. Said in its own
+            # words so a build log distinguishes "we have not measured this
+            # yet" from "we measured it and it is not reliable enough", which
+            # are the same boolean and completely different problems.
+            return False, (
+                f"collecting: {evidence.passes}/{evidence.runs} runs recorded at "
+                f"this key across {span}, {bar.min_runs - evidence.runs} more "
+                f"needed before this case can collapse"
             )
         return False, (
-            f"screened at {record.passes}/{record.runs}, below the bar of "
-            f"{bar.rate:.0%} over {bar.min_runs} runs"
+            f"screened at {evidence.passes}/{evidence.runs} across {span}, below "
+            f"the bar of {bar.rate:.0%} over {bar.min_runs} runs"
         )

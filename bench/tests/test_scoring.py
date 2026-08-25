@@ -44,10 +44,12 @@ import pytest
 
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
+    DEFAULT_JUDGED_MARGIN,
     MISSING,
     Rung,
     grade_case,
     grade_suite,
+    judged_means,
     load_run,
     score_value,
 )
@@ -720,3 +722,227 @@ def test_the_case_hand_off_round_trips(noop_spec):
     assert payload["passes"] == 0 and payload["scored"] == 3
     assert len(payload["reps"]) == 3
     assert grade_suite([payload]).green is False
+
+
+# --------------------------------------------------------------------------
+# Rung 6: judged quality fell below main's.
+#
+# The only rung that can fire on a case where every deterministic check
+# passed, and the only one whose comparator lives outside the run. It is
+# admission-scoped, per the testing strategy: admission scopes the two quality
+# rungs, 4 and 6, and nothing else.
+# --------------------------------------------------------------------------
+
+
+def depress_the_judge(value: float):
+    """Lower OutcomeValidity while leaving every deterministic score alone.
+
+    This is the mutation the rung exists for: the agent still passes its
+    checks, and the judge thinks it did the job worse. Nothing else in the
+    ladder can see that.
+    """
+
+    def _mutate(rec):
+        rec["scores"]["OutcomeValidity"]["score"] = value
+
+    return _mutate
+
+
+MAIN_IS_PERFECT = {"OutcomeValidity": 1.0}
+
+
+def test_rung_6_fires_when_the_judge_drops_below_main_by_more_than_the_margin(
+    noop_spec, make_run
+):
+    runs = [make_run(mutate=depress_the_judge(0.3)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is Rung.JUDGED_REGRESSION
+    assert verdict.blocking is True
+    assert "OutcomeValidity 0.30 against main's 1.00" in verdict.reason
+
+
+def test_rung_6_fires_even_though_every_deterministic_check_passed(
+    noop_spec, make_run
+):
+    """The whole point. Without this rung, "it passed but got worse" has
+    nowhere in the ladder to be said."""
+    runs = [make_run(mutate=depress_the_judge(0.2)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert all(r.outcome == "pass" for r in verdict.reps)
+    assert verdict.rung is Rung.JUDGED_REGRESSION
+
+
+def test_rung_6_tolerates_a_drop_inside_the_margin(noop_spec, make_run):
+    """The margin is two standard errors of a three-repetition mean, derived
+    from the captured spread -- not a preference."""
+    runs = [make_run(mutate=depress_the_judge(0.6)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is Rung.GREEN
+
+
+def test_the_default_margin_absorbs_the_measured_judge_spread(noop_spec, make_run):
+    """The three captured reds scored 0.9, 1.0 and 0.2 -- mean 0.70. Against a
+    baseline of 1.0 that is a 0.30 drop, and it must NOT red on its own.
+
+    If this test starts failing because the margin was tightened, the
+    tightening is wrong: it reds pull requests that changed nothing. Buy the
+    tighter margin with more repetitions, not a smaller number.
+    """
+    assert DEFAULT_JUDGED_MARGIN >= 0.5
+    scores = [0.9, 1.0, 0.2]
+    runs = [make_run(mutate=depress_the_judge(s)) for s in scores]
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged={"OutcomeValidity": max(scores)},
+    )
+    assert verdict.rung is Rung.GREEN
+
+
+def test_rung_6_is_silent_with_no_baseline_at_all(noop_spec, make_run):
+    """The shipping state, and the requirement: collect first, compare later.
+
+    An empty store must not be readable as "main scored zero".
+    """
+    runs = [make_run(mutate=depress_the_judge(0.0)) for _ in range(3)]
+    for baseline in (None, {}):
+        verdict = grade_case(
+            noop_spec, runs, admitted=True, baseline_judged=baseline
+        )
+        assert verdict.rung is Rung.GREEN
+
+
+def test_rung_6_is_silent_on_a_metric_main_never_recorded(noop_spec, make_run):
+    """Omitted-is-not-zero, one more time. A baseline that carries
+    ToolInvocation and not OutcomeValidity says nothing about OutcomeValidity.
+    """
+    runs = [make_run(mutate=depress_the_judge(0.0)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged={"ToolInvocation": 1.0}
+    )
+    assert verdict.rung is Rung.GREEN
+
+
+def test_rung_6_only_gates_the_metrics_it_was_asked_to(noop_spec, make_run):
+    """ToolInvocation and OutcomeScore are recorded and reported, not gated.
+
+    Every extra gated metric is another independent chance to red a pull
+    request on judge noise.
+    """
+    # A tight margin here, to isolate WHICH metric is gated from HOW FAR it
+    # may move; the default margin is exercised on its own above.
+    runs = [make_run(mutate=depress_the_judge(1.0)) for _ in range(3)]
+    baseline = {"OutcomeValidity": 1.0, "ToolInvocation": 1.0}
+    # The captured greens score ToolInvocation 0.5, half a point under this
+    # baseline -- and it is not a gated metric, so nothing fires.
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=baseline, judged_margin=0.1
+    )
+    assert verdict.rung is Rung.GREEN
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged=baseline,
+        judged_margin=0.1,
+        judged_metrics=("ToolInvocation",),
+    )
+    assert verdict.rung is Rung.JUDGED_REGRESSION
+
+
+def test_rung_6_needs_admission(noop_spec, make_run):
+    """A case nobody has screened has no measured baseline to have regressed
+    from, and unadmitted cases must not red the job."""
+    runs = [make_run(mutate=depress_the_judge(0.0)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec, runs, admitted=False, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is Rung.GREEN
+
+
+def test_rung_6_is_not_called_on_partial_evidence(tofu_spec, make_run):
+    """Same reason collapse is not: a mean over the repetitions that happened
+    to survive is not the mean of the ones that were asked for."""
+    verdict = grade_case(
+        tofu_spec,
+        [make_run(mutate=depress_the_judge(0.0)), MISSING, MISSING],
+        admitted=True,
+        baseline_judged=MAIN_IS_PERFECT,
+    )
+    assert verdict.rung is not Rung.JUDGED_REGRESSION
+
+
+def test_rung_6_skips_an_expected_fail_case(expected_fail_spec, make_run):
+    """A case declared to fail scoring badly is not news."""
+    runs = [
+        make_run(mutate=lambda r: (make_it_fail(r), depress_the_judge(0.0)(r)))
+        for _ in range(3)
+    ]
+    verdict = grade_case(
+        expected_fail_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is not Rung.JUDGED_REGRESSION
+
+
+def test_collapse_outranks_rung_6(noop_spec, make_run):
+    """A case that failed every check AND scored worse reports the checks.
+
+    "It failed all three repetitions" is the actionable half; a judge's
+    opinion of a run that failed outright adds nothing.
+    """
+    runs = [
+        make_run(mutate=lambda r: (make_it_fail(r), depress_the_judge(0.0)(r)))
+        for _ in range(3)
+    ]
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is Rung.COLLAPSE
+
+
+def test_rung_2_outranks_rung_6(noop_spec, make_run):
+    runs = [make_run(mutate=depress_the_judge(0.0)) for _ in range(2)]
+    runs.append(make_run(mutate=lambda r: (error_a_check(r), depress_the_judge(0.0)(r))))
+    verdict = grade_case(
+        noop_spec, runs, admitted=True, baseline_judged=MAIN_IS_PERFECT
+    )
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+
+
+# --------------------------------------------------------------------------
+# judged_means: what gets appended to the store, and what rung 6 reads back.
+# --------------------------------------------------------------------------
+
+
+def test_judged_means_average_the_scored_repetitions(noop_spec):
+    verdict = grade_case(noop_spec, [FIXTURE_RUNS / n for n in RED_RUNS], admitted=False)
+    means = judged_means(verdict.reps)
+    # 0.9, 1.0 and 0.2, the three captured judgements of one unchanged task.
+    assert means["OutcomeValidity"]["mean"] == pytest.approx(0.7)
+    assert means["OutcomeValidity"]["n"] == 3
+
+
+def test_judged_means_exclude_repetitions_the_ladder_never_scored(
+    tofu_spec, make_run
+):
+    """A judge that scored a run the harness never completed scored an
+    artefact, and averaging it in would put that artefact into the baseline."""
+    runs = [make_run(mutate=depress_the_judge(0.4)), MISSING]
+    verdict = grade_case(tofu_spec, runs, admitted=False)
+    means = judged_means(verdict.reps)
+    assert means["OutcomeValidity"] == {"mean": pytest.approx(0.4), "n": 1}
+
+
+def test_judged_means_ride_in_the_hand_off(noop_spec):
+    """`bench-gate record` reads this off the payload rather than re-opening
+    the run directories, which may be gone by then."""
+    verdict = grade_case(noop_spec, [FIXTURE_RUNS / n for n in GREEN_RUNS], admitted=False)
+    payload = verdict.to_dict()
+    assert payload["judged_means"]["OutcomeValidity"] == {"mean": 1.0, "n": 2}

@@ -28,9 +28,15 @@ The load-bearing properties, in rough order of what they cost if wrong:
    what proves those fields exist and where.
 4. **The store is append-only JSONL and nothing is ever rewritten.** A
    re-screen adds a line; the older lines stay and are the case's history.
-   Reading is last-line-wins at the current key. That is what keeps a
-   checked-in store's churn tolerable and its conflicts rare, and it is what
-   makes "was this case always this flaky?" an answerable question.
+   That is what keeps a checked-in store's churn tolerable and its conflicts
+   rare, and it is what makes "was this case always this flaky?" an
+   answerable question.
+5. **Evidence accumulates, newest first, up to the bar.** An ordinary run is
+   three repetitions and the bar is twenty runs, so a rule reading only the
+   newest line could never admit anything the routine job produced. Pooling
+   is what lets the store fill itself; stopping at the bar is what lets a
+   case that has got worse push its own good history out of the window and
+   de-admit itself.
 """
 
 from __future__ import annotations
@@ -48,7 +54,9 @@ from kube_agents_bench.baselines import (
     BaselineStore,
     VersionKey,
     Versions,
+    append_record,
     load_versions,
+    utc_now,
 )
 from kube_agents_bench.scoring import load_run
 
@@ -80,14 +88,24 @@ def write_store(root: Path, case: str, records: list[dict]) -> Path:
     return root
 
 
-def record(key: VersionKey = KEY, *, runs: int = 20, passes: int = 19) -> dict:
-    return {
+def record(
+    key: VersionKey = KEY,
+    *,
+    runs: int = 20,
+    passes: int = 19,
+    judged: dict | None = None,
+    recorded_at: str = "2026-08-25T00:00:00Z",
+) -> dict:
+    doc = {
         "key": key.to_dict(),
-        "recorded_at": "2026-08-25T00:00:00Z",
+        "recorded_at": recorded_at,
         "commit": "d3be984d",
         "runs": runs,
         "passes": passes,
     }
+    if judged is not None:
+        doc["judged"] = judged
+    return doc
 
 
 # --------------------------------------------------------------------------
@@ -435,3 +453,247 @@ def test_bootstrap_does_not_leak_to_unnamed_cases(tmp_path):
         bootstrap=frozenset({"gpu-stress-test-diagnosis"}),
     )
     assert admitted is False
+
+
+# --------------------------------------------------------------------------
+# Accumulating evidence. An ordinary run is three repetitions; the bar is
+# twenty runs. Without pooling the store could never fill itself.
+# --------------------------------------------------------------------------
+
+
+def three(passes: int, *, at: str, judged: dict | None = None) -> dict:
+    """One ordinary run's worth of evidence: three repetitions."""
+    return record(runs=3, passes=passes, judged=judged, recorded_at=at)
+
+
+def test_seven_ordinary_runs_add_up_to_an_admission(tmp_path):
+    """The requirement in one test: no baseline, then collect, then compare.
+
+    Nothing here is a deliberate screening campaign. Seven merges to main at
+    the default three repetitions each is what an untouched repository
+    produces on its own, and it has to be enough, or the store ships empty
+    and stays that way.
+    """
+    lines = [three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(7)]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+
+    evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
+    assert (evidence.runs, evidence.passes, evidence.lines) == (21, 21, 7)
+    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())[0] is True
+
+
+def test_a_single_twenty_run_campaign_still_admits_on_its_own(tmp_path):
+    """Pooling generalises the old rule; it does not replace it.
+
+    A deliberate twenty-run screening run is one line and must remain one
+    line's worth of reading.
+    """
+    store = BaselineStore.load(
+        write_store(tmp_path, "planted-pdb", [record(runs=20, passes=19)])
+    )
+    evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
+    assert evidence.lines == 1
+    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())[0] is True
+
+
+def test_pooling_stops_at_the_bar_rather_than_reading_the_whole_file(tmp_path):
+    """The window is what gives recency for free.
+
+    Reading every line would let a case's distant past keep it admitted
+    forever. Reading only enough lines to clear the bar means new evidence
+    displaces old evidence, which is the only mechanism that de-admits a case
+    without anyone editing the store.
+    """
+    lines = [three(3, at=f"2026-07-{i + 1:02d}T00:00:00Z") for i in range(20)]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
+    assert evidence.lines == 7 and evidence.runs == 21
+
+
+def test_whole_lines_only_even_when_that_overshoots_the_bar(tmp_path):
+    """21, not 20. Trimming a line to hit the bar exactly would invent a
+    sub-record that was never measured."""
+    lines = [three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(7)]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    assert store.evidence_for("planted-pdb", KEY, min_runs=20).runs == 21
+
+
+def test_a_case_that_gets_worse_de_admits_itself(tmp_path):
+    """No deletion, no edit, no human. Seven bad runs displace seven good ones."""
+    good = [three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(7)]
+    bad = [three(0, at=f"2026-09-{i + 1:02d}T00:00:00Z") for i in range(7)]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", good + bad))
+
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    assert admitted is False
+    assert "0/21" in why and "below the bar" in why
+    # And every one of the fourteen lines is still on disk.
+    assert len(store.history_for("planted-pdb")) == 14
+
+
+def test_partial_evidence_reports_collecting_not_failure(tmp_path):
+    """The two are the same boolean and completely different problems.
+
+    "We have not measured this yet" must not read as "we measured it and it
+    is not good enough", or the build log tells people to fix a case that is
+    working fine.
+    """
+    lines = [three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(2)]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    assert admitted is False
+    assert "collecting" in why and "14 more needed" in why
+    assert "below the bar" not in why
+
+
+def test_evidence_ignores_lines_at_another_key(tmp_path):
+    other = VersionKey(
+        setup_id="some-other-setup",
+        scoring_version="v1",
+        judge_model="gemini-3.1-pro-preview",
+        fleet=1,
+        verifiers=1,
+    )
+    lines = [record(other, runs=20, passes=20)] + [
+        three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(2)
+    ]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    assert store.evidence_for("planted-pdb", KEY, min_runs=20).runs == 6
+    assert store.evidence_for("planted-pdb", other, min_runs=20).runs == 20
+
+
+def test_evidence_at_an_unknown_key_is_none_not_an_empty_pool(tmp_path):
+    """None is "never measured here"; a zero-run pool would read as "measured
+    it, got nothing", which is a different and much worse claim."""
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", [record()]))
+    other = VersionKey("x", "v1", "j", 1, 1)
+    assert store.evidence_for("planted-pdb", other, min_runs=20) is None
+    assert store.evidence_for("nobody", KEY, min_runs=20) is None
+    assert store.evidence_for("planted-pdb", None, min_runs=20) is None
+
+
+# --------------------------------------------------------------------------
+# Pooled judged means -- rung 6's comparator.
+# --------------------------------------------------------------------------
+
+
+def test_judged_means_are_weighted_by_their_own_n(tmp_path):
+    """Twenty runs of evidence must outweigh three.
+
+    An unweighted average of the two means would let one short run swing the
+    number rung 6 compares against by as much as a whole screening campaign.
+    """
+    lines = [
+        record(runs=20, passes=20, judged={"OutcomeValidity": {"mean": 1.0, "n": 20}},
+               recorded_at="2026-08-01T00:00:00Z"),
+        three(3, at="2026-08-02T00:00:00Z",
+              judged={"OutcomeValidity": {"mean": 0.0, "n": 3}}),
+    ]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
+    # The 3-run line is newest, so it is pooled first; the 20-run line follows
+    # and clears the bar. 20/23, not the 0.5 an unweighted mean would give.
+    assert evidence.judged_means["OutcomeValidity"] == pytest.approx(20 / 23)
+    assert evidence.judged["OutcomeValidity"]["n"] == 23
+
+
+def test_a_metric_missing_from_one_line_is_not_counted_as_zero(tmp_path):
+    """Omitted-is-not-zero, the same rule the scores themselves follow."""
+    lines = [
+        record(runs=20, passes=20, recorded_at="2026-08-01T00:00:00Z"),
+        three(3, at="2026-08-02T00:00:00Z",
+              judged={"OutcomeValidity": {"mean": 0.8, "n": 3}}),
+    ]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
+    assert evidence.judged_means["OutcomeValidity"] == pytest.approx(0.8)
+    assert evidence.judged["OutcomeValidity"]["n"] == 3
+
+
+def test_a_judged_block_with_no_runs_behind_it_is_dropped(tmp_path):
+    lines = [three(3, at="2026-08-02T00:00:00Z",
+                   judged={"OutcomeValidity": {"mean": 0.8, "n": 0}})]
+    store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
+    assert store.evidence_for("planted-pdb", KEY, min_runs=20).judged_means == {}
+
+
+# --------------------------------------------------------------------------
+# append_record -- the producer. Without it nothing above ever has data.
+# --------------------------------------------------------------------------
+
+
+def a_record(**kw) -> BaselineRecord:
+    base = dict(key=KEY, runs=3, passes=3, recorded_at="2026-08-25T00:00:00Z",
+                commit="abc1234")
+    base.update(kw)
+    return BaselineRecord(**base)
+
+
+def test_an_append_round_trips_through_the_loader(tmp_path):
+    append_record(tmp_path, "planted-pdb", a_record())
+    store = BaselineStore.load(tmp_path)
+    [got] = store.history_for("planted-pdb")
+    assert (got.key, got.runs, got.passes, got.commit) == (KEY, 3, 3, "abc1234")
+
+
+def test_appending_never_touches_the_line_before_it(tmp_path):
+    for i in range(3):
+        append_record(tmp_path, "planted-pdb",
+                      a_record(passes=i, recorded_at=f"2026-08-2{i}T00:00:00Z"))
+    text = (tmp_path / "planted-pdb.jsonl").read_text(encoding="utf-8")
+    assert [json.loads(line)["passes"] for line in text.splitlines()] == [0, 1, 2]
+
+
+def test_an_append_to_a_file_with_no_trailing_newline_does_not_join_lines(tmp_path):
+    """A half-written append would otherwise fuse two records into one that
+    parses as neither -- and the one time it happens is the time nobody is
+    watching."""
+    path = tmp_path / "planted-pdb.jsonl"
+    path.write_text(json.dumps({"case": "planted-pdb", **record()}), encoding="utf-8")
+    append_record(tmp_path, "planted-pdb", a_record())
+    assert len(BaselineStore.load(tmp_path).history_for("planted-pdb")) == 2
+
+
+def test_an_append_creates_the_store_directory(tmp_path):
+    target = tmp_path / "does" / "not" / "exist"
+    append_record(target, "planted-pdb", a_record())
+    assert (target / "planted-pdb.jsonl").is_file()
+
+
+def test_the_written_line_carries_the_case_id_the_filename_promises(tmp_path):
+    """The filename is the join key, and the loader refuses a line that
+    disagrees with it. The writer must not be able to produce one."""
+    _, line = append_record(tmp_path, "planted-pdb", a_record())
+    assert json.loads(line)["case"] == "planted-pdb"
+    BaselineStore.load(tmp_path)  # would raise if the two disagreed
+
+
+def test_zero_counts_are_left_out_of_the_line(tmp_path):
+    """A line is read by people. `blocked: 0` on every record is noise that
+    makes the one non-zero occurrence harder to spot."""
+    _, line = append_record(tmp_path, "planted-pdb", a_record())
+    doc = json.loads(line)
+    assert "blocked" not in doc and "infra" not in doc
+    _, line = append_record(tmp_path, "planted-pdb", a_record(blocked=1, infra=2))
+    doc = json.loads(line)
+    assert doc["blocked"] == 1 and doc["infra"] == 2
+
+
+def test_a_record_with_no_stamp_gets_one(tmp_path):
+    _, line = append_record(tmp_path, "planted-pdb", a_record(recorded_at=None))
+    assert json.loads(line)["recorded_at"].endswith("Z")
+
+
+def test_the_stamp_is_utc_to_the_second():
+    stamp = utc_now()
+    assert stamp.endswith("Z") and len(stamp) == len("2026-08-25T00:00:00Z")
+
+
+def test_blocked_and_infra_counts_stay_out_of_the_rate(tmp_path):
+    """Rungs 1-3 block absolutely, admitted or not, so admission has no need
+    to model them -- but dropping them silently would make a case that
+    half-crashes look perfectly reliable in its own history."""
+    append_record(tmp_path, "planted-pdb", a_record(runs=2, passes=2, blocked=1))
+    [got] = BaselineStore.load(tmp_path).history_for("planted-pdb")
+    assert (got.runs, got.passes, got.blocked) == (2, 2, 1)
+    assert got.rate == 1.0

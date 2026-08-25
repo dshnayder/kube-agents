@@ -11,7 +11,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   producing assertions.
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
-- `baselines/` — checked-in screening evidence, one append-only JSONL file per case, one screening campaign per line, each keyed on the five software versions a score depends on. See [baselines/README.md](baselines/README.md).
+- `baselines/` — checked-in screening evidence, one append-only JSONL file per case, one batch of runs per line, each keyed on the five software versions a score depends on. Written by runs on `main`, read by every pull request. See [baselines/README.md](baselines/README.md).
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
@@ -42,15 +42,18 @@ uv run bench-gate case --task ./tasks/<id>/task.yaml \
   --json-out case-<id>.json          # exit 0 with a verdict, 2 if it could not grade
 uv run bench-gate suite --case-result case-<id>.json --markdown-out verdict.md
                                      # exit 0 green, 1 red
+uv run bench-gate record --case-result case-<id>.json   # main only; appends evidence
 ```
 
 The gate is rate-based, not all-must-pass: at a few hundred cases and realistic per-case reliability, "every case green" is a state the suite reaches on a vanishing fraction of runs, and a gate that reds most pull requests gets switched off. So a case is graded on a ladder — a forbidden action, a declared check that never ran, or a record that is not a real agent run reds the job outright; a case that merely _fails_ reds it only by failing **every** repetition, and only once the baseline store holds screening evidence that the case is reliable enough to mean something.
 
 That evidence is what `baselines/` holds, and admission is computed from it rather than declared in `task.yaml` — a case cannot admit itself in the same diff that makes it pass. A case with no record at the current version key is reported unadmitted, and one whose record was measured on different software is reported _stale_ rather than silently compared against.
 
-Two speeds, deliberately: the deterministic `Verification*` scores gate, and the judged scores are recorded but never block. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three.
+**The loop closes through `record`.** Everything a pull request is compared against comes from lines that a run on `main` appended, so the store fills itself: each postsubmit appends its own three repetitions, the reader pools the newest lines at a key until it holds 20 runs, and a case is admitted once that pooled evidence clears the bar — about seven merges from empty. The window is what makes de-admission automatic too: a case that starts failing pushes its own passing history out and stops being able to red the job. `record` refuses to run with `PULL_NUMBER` set, and the shell only calls it on a postsubmit.
 
-Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists).
+Two speeds, deliberately: the deterministic `Verification*` scores decide whether a repetition passed, and no judged score can fail a repetition on its own. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three. The judge is given exactly one job (rung 6): catching a **collapse** in judged quality against main's mean at the same version key, at a margin of two standard errors of that measured spread. At three repetitions it cannot see drift, and widening it is a matter of more repetitions or a less variable metric, not a smaller number.
+
+Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists).
 
 ## Portal CUJ evaluations
 

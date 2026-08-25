@@ -28,16 +28,20 @@ of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 — without them "most runs passed" could be assembled out of runs that never
 happened.
 
-WHAT THIS MODULE DOES NOT DO. It never reads the judged scores as a gate.
-``OutcomeValidity`` is recorded and reported as a trend, and the reason is
-measured rather than assumed: three identical runs of ``agent-kanban-smoke``
-scored 0.9, 1.0 and 0.2 while ``VerificationCorrectness`` held at 0.5 on all
-three. Gating on the judge would have redded one of those three for nothing.
+HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
+absolute threshold, and the reason is measured rather than assumed: three
+identical runs of ``agent-kanban-smoke`` scored 0.9, 1.0 and 0.2 while
+``VerificationCorrectness`` held at 0.5 on all three. A fixed cut would have
+redded one of those three for nothing. What rung 6 does instead is compare a
+judged mean against the SAME metric's mean on ``main``, for an admitted case
+only, with a margin wide enough to absorb that spread -- see
+:data:`DEFAULT_JUDGED_MARGIN`, which is derived from it.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -47,6 +51,8 @@ from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
     "CaseVerdict",
+    "DEFAULT_JUDGED_MARGIN",
+    "DEFAULT_JUDGED_METRICS",
     "MISSING",
     "Rung",
     "RepResult",
@@ -54,6 +60,7 @@ __all__ = [
     "SuiteVerdict",
     "grade_case",
     "grade_suite",
+    "judged_means",
     "load_run",
     "score_value",
 ]
@@ -72,6 +79,30 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: means the run itself died -- NOT that the agent got the task wrong. Our
 #: three red fixtures all carry ``"success"``.
 _STATUS_SUCCESS = "success"
+
+#: Judged metrics rung 6 compares against main. ``OutcomeValidity`` alone by
+#: default -- it is the one the presubmit already used as its judged fallback,
+#: and every extra metric is another independent chance to red a pull request
+#: on judge noise. ``ToolInvocation`` and ``OutcomeScore`` are still recorded
+#: and still land in the baseline; they are reported, not gated.
+DEFAULT_JUDGED_METRICS: tuple[str, ...] = ("OutcomeValidity",)
+
+#: How far a judged mean may fall below main's before rung 6 fires.
+#:
+#: 0.5 is not a preference, it is arithmetic on the captured spread. Three
+#: repetitions of ONE UNCHANGED task scored 0.9, 1.0 and 0.2 -- a standard
+#: deviation near 0.44, so the standard error of a three-repetition mean is
+#: about 0.25. A one-standard-error margin would therefore red roughly one
+#: unchanged pull request in six; two standard errors reds about one in fifty,
+#: which is the same order as the collapse rule was sized to.
+#:
+#: Say plainly what that buys and what it does not. At this width rung 6
+#: catches a COLLAPSE in judged quality and cannot see drift, because at three
+#: repetitions drift and noise are the same picture. The way to detect drift is
+#: more repetitions or a less variable judged metric -- not a smaller number
+#: here, which only converts judge noise into red pull requests and teaches
+#: people to ignore the rung.
+DEFAULT_JUDGED_MARGIN = 0.5
 
 
 class Rung(IntEnum):
@@ -484,6 +515,33 @@ def classify_rep(
     )
 
 
+def judged_means(reps: list[RepResult]) -> dict[str, dict[str, Any]]:
+    """Mean of each judged metric over the SCORED repetitions.
+
+    The shape matches a baseline record's ``judged`` block -- ``{"mean": ...,
+    "n": ...}`` per metric -- because this is what gets appended to the store
+    and what rung 6 later reads back out of it. Keeping one shape means the
+    number a pull request is judged against was computed the same way as the
+    number it is judged with.
+
+    Blocked and infrastructure repetitions are excluded. A judge that scored a
+    run the harness never completed is scoring an artefact.
+    """
+    totals: dict[str, list[float]] = {}
+    for rep in reps:
+        if not rep.scored:
+            continue
+        for metric, value in rep.judged.items():
+            acc = totals.setdefault(metric, [0.0, 0.0])
+            acc[0] += value
+            acc[1] += 1
+    return {
+        metric: {"mean": total / count, "n": int(count)}
+        for metric, (total, count) in totals.items()
+        if count
+    }
+
+
 @dataclass
 class CaseVerdict:
     """A case's verdict across all its repetitions."""
@@ -526,6 +584,9 @@ class CaseVerdict:
             "passes": self.passes,
             "scored": len(self.scored_reps),
             "pass_rate": self.pass_rate,
+            # What a `bench-gate record` run on main appends as this case's
+            # judged block, and what rung 6 compared against on a pull request.
+            "judged_means": judged_means(self.reps),
             "reps": [
                 {
                     "index": r.index,
@@ -551,6 +612,9 @@ def grade_case(
     *,
     admitted: bool,
     correctness_floor: float = DEFAULT_CORRECTNESS_FLOOR,
+    baseline_judged: dict[str, float] | None = None,
+    judged_margin: float = DEFAULT_JUDGED_MARGIN,
+    judged_metrics: Sequence[str] = DEFAULT_JUDGED_METRICS,
 ) -> CaseVerdict:
     """Run the ladder over one case's repetitions.
 
@@ -558,6 +622,11 @@ def grade_case(
     from the task file -- see :mod:`kube_agents_bench.baselines`. An unadmitted
     case cannot reach rung 4, so a brand-new case that simply does not work yet
     reports its failures without redding the job.
+
+    ``baseline_judged`` is main's mean per judged metric at the current version
+    key, or None when the store has nothing to compare against yet. None makes
+    rung 6 a no-op, which is the state everything ships in: the gate collects
+    evidence first and only starts comparing once it has some.
     """
     reps = [
         classify_rep(spec, d, i + 1, correctness_floor=correctness_floor)
@@ -634,8 +703,36 @@ def grade_case(
             "repetitions -- flip the marker in this diff",
         )
 
-    # --- Rung 6 (judged regression) is advisory until the baseline store has
-    # evidence to compare against; grade_suite reports the trend.
+    # --- Rung 6. Judged quality fell below main's at the same version key.
+    #
+    # Admission-scoped, per the testing strategy: admission scopes the two
+    # quality rungs, 4 and 6, and nothing else. Skipped for an expected-fail
+    # case, whose judged score dropping is not news, and skipped on partial
+    # evidence for the same reason collapse is -- a mean over the repetitions
+    # that happened to survive is not the mean of the ones that were asked for.
+    #
+    # This rung does its own work: a case can pass every deterministic check
+    # and still land here, which is the only place in the ladder where "it
+    # technically passed but got worse" is sayable.
+    if admitted and not spec.expected_fail and complete and baseline_judged:
+        means = judged_means(reps)
+        drops = []
+        for metric in judged_metrics:
+            was = baseline_judged.get(metric)
+            now = means.get(metric, {}).get("mean")
+            if was is None or now is None:
+                continue
+            if now < was - judged_margin:
+                drops.append(
+                    f"{metric} {now:.2f} against main's {was:.2f} "
+                    f"(margin {judged_margin:.2f})"
+                )
+        if drops:
+            return verdict(
+                Rung.JUDGED_REGRESSION,
+                True,
+                "judged quality regressed against main: " + "; ".join(drops),
+            )
 
     if spec.expected_fail:
         return verdict(
@@ -648,7 +745,11 @@ def grade_case(
         return verdict(Rung.GREEN, False, f"passed all {len(scored)} repetitions")
     reason = f"passed {passes} of {len(scored)} repetitions"
     if not admitted:
-        reason += " (not admitted: no screening evidence, so it cannot collapse)"
+        # Why it is not admitted lives in the store, not here -- it may be
+        # unscreened, still collecting, stale at this key, or screened and
+        # below the bar. The caller prints that on its own line; naming a
+        # cause here would be a guess, and was wrong for three of the four.
+        reason += " (not admitted, so it cannot collapse)"
     return verdict(Rung.GREEN, False, reason)
 
 
