@@ -251,6 +251,19 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 # has nothing to do with, and un-arming it is half the point of the change.
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
 
+# Where the evidence itself lives. Unset means bench/baselines/ in the
+# checkout: hermetic, no credential, no network -- and no way for this job to
+# commit what it measured, since it has no push credential. Set to
+# gs://<bucket>/<prefix> and each batch becomes one immutable object under a
+# roles/storage.objectCreator grant, which is what actually closes the loop on
+# main. VERSIONS.json stays in git either way; --baseline-dir still finds it.
+#
+# It defaults to unset because the bucket does not exist yet. Turning this on
+# is a one-line change here once it does, and until then the store fills only
+# by hand from the --lines-out artefact below.
+# See docs/designs/eval-baseline-storage.md.
+export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
+
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and
 # `bench-gate suite` reads them back to decide the exit status; both files ride
 # to Prow as artifacts, which is what makes a verdict reviewable after the job.
@@ -332,9 +345,10 @@ done
 # PULL_NUMBER is set, because a guard that lives only in shell is one careless
 # edit away from letting a pull request move the baseline it is judged against.
 #
-# The store lives in git and this job has no push credential, so the append
-# dies with the workspace; --lines-out is what survives, as a Prow artefact
-# somebody lands in a follow-up. Wiring that push is its own change.
+# With EVAL_BASELINE_STORE pointing at a bucket the append lands and the loop
+# closes. Unset, the store is the git checkout and this job has no push
+# credential, so the append dies with the workspace; --lines-out is what
+# survives, as a Prow artefact somebody lands by hand in the meantime.
 if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.

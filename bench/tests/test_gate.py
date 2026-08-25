@@ -41,10 +41,12 @@ from pathlib import Path
 
 import pytest
 
+from kube_agents_bench import evidence_store
 from kube_agents_bench.gate import main
 from kube_agents_bench.scoring import MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS, read_fixture, write_run
+from test_evidence_store import FakeGcloud
 
 BASELINES = Path(__file__).resolve().parents[1] / "baselines"
 JUDGE = "gemini-3.1-pro-preview"
@@ -73,6 +75,10 @@ def _clean_env(monkeypatch):
         "PULL_NUMBER",
         "PULL_BASE_SHA",
         "GIT_COMMIT",
+        "EVAL_BASELINE_STORE",
+        "EVAL_BASELINE_MAX_OBJECTS",
+        "BUILD_ID",
+        "PROW_JOB_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -710,3 +716,146 @@ def test_a_corrupt_store_is_never_read_as_an_empty_one(kanban_task, tmp_path, ca
         "--result", str(FIXTURE_RUNS / GREEN_RUNS[0]),
     ]) == 2
     assert main(["suite", "--case-result", str(out), "--baseline-dir", str(store)]) == 1
+
+
+# --------------------------------------------------------------------------
+# Where the evidence lives. The gate's logic is backend-blind by construction:
+# everything below exercises the same ladder against `gs://` instead of a
+# directory, and the only thing that changes is the banner when a read is
+# degraded or capped.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def gcloud(monkeypatch):
+    """A `gcloud storage` that talks to a dict instead of the network."""
+    fake = FakeGcloud()
+    monkeypatch.setattr(evidence_store.subprocess, "run", fake)
+    return fake
+
+
+def seed_gcs(fake: FakeGcloud, *lines: dict, prefix: str = "gs://b/evidence") -> str:
+    for i, line in enumerate(lines, start=1):
+        stamp = line["recorded_at"].replace(":", "-")
+        fake.objects[f"{prefix}/{line['case']}/{stamp}-{i}.jsonl"] = json.dumps(line) + "\n"
+    return prefix
+
+
+def test_the_environment_can_move_the_evidence_off_disk(
+    kanban_task, tmp_path, monkeypatch, gcloud
+):
+    """`EVAL_BASELINE_STORE` selects the store; `--baseline-dir` keeps holding
+    VERSIONS.json. That split is the point: the fleet and verifiers integers
+    are reviewed configuration, not measured data."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    seed_gcs(
+        gcloud,
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+    )
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+
+    out = tmp_path / "case.json"
+    doc = graded_case(kanban_task, [FIXTURE_RUNS / n for n in RED_RUNS], out, store_with(tmp_path))
+    # 21 runs of screening evidence at the current key, all passing: admitted
+    # from GCS exactly as it would have been from a directory, and collapsed.
+    assert doc["admitted"] is True and doc["rung"] == 4
+
+
+def test_the_flag_beats_the_environment(kanban_task, tmp_path, monkeypatch, gcloud):
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/wrong")
+    store = store_with(tmp_path)
+    out = tmp_path / "case.json"
+    assert run_case(
+        kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out,
+        "--baseline-store", str(store),
+    ) == 0
+    assert gcloud.calls == []  # never went near GCS
+
+
+def test_record_writes_an_object_the_gate_reads_back(kanban_task, tmp_path, monkeypatch, gcloud):
+    """The loop closes over GCS too, which is the only reason the backend
+    exists: on main the postsubmit has no push credential, so a checked-in
+    store has no writer."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    versions = store_with(tmp_path)
+    out = tmp_path / "case.json"
+    graded_case(kanban_task, [FIXTURE_RUNS / n for n in GREEN_RUNS], out, versions)
+
+    assert run_record(versions, out) == 0
+    (url,) = list(gcloud.objects)
+    assert url.startswith("gs://b/evidence/agent-kanban-smoke/")
+    written = json.loads(gcloud.objects[url])
+    assert (written["runs"], written["passes"]) == (2, 2)
+
+
+def test_an_unreachable_store_degrades_rather_than_reds(
+    kanban_task, tmp_path, monkeypatch, gcloud, capsys
+):
+    """A blip must not red every pull request in the repo. That failure mode
+    is what gets a gate switched off, which costs more than the coverage the
+    gate was buying."""
+    gcloud.fail = "ERROR: (gcloud.storage.ls) 503 Backend Error"
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [FIXTURE_RUNS / n for n in GREEN_RUNS], out) == 0
+    err = capsys.readouterr().err
+    assert "baseline store gs://b/evidence unreachable" in err
+    assert "nothing can be admitted" in err
+    assert payload(out)["admitted"] is False
+
+
+def test_the_degraded_read_is_written_into_the_verdict_not_only_the_log(
+    tmp_path, monkeypatch, gcloud
+):
+    """A green nobody knows was measured against nothing is the one outcome
+    worse than a red."""
+    gcloud.fail = "ERROR: (gcloud.storage.ls) 503 Backend Error"
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=3, scored=3)
+    md = tmp_path / "verdict.md"
+    assert main(["suite", "--case-result", str(doc), "--markdown-out", str(md)]) == 0
+    text = md.read_text(encoding="utf-8")
+    assert "WARNING — baseline unavailable" in text
+    assert "weaker than a normal one" in text
+
+
+def test_a_corrupt_object_is_still_fatal(kanban_task, tmp_path, monkeypatch, gcloud):
+    """Unreachable degrades; bytes that arrived and will not parse do not.
+    Reading a corrupt store as an empty one silently disarms the gate."""
+    gcloud.objects["gs://b/evidence/agent-kanban-smoke/2026-08-01T00-00-00Z-1.jsonl"] = (
+        "{ not json\n"
+    )
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    assert main([
+        "case", "--task", str(kanban_task), "--baseline-dir", str(store_with(tmp_path)),
+        "--result", str(FIXTURE_RUNS / GREEN_RUNS[0]),
+    ]) == 2
+
+
+def test_a_capped_read_says_so_in_the_verdict(tmp_path, monkeypatch, gcloud):
+    """The cap never binds at realistic history depths, but a cap that is
+    silent reads as "I considered everything" when it did not."""
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    monkeypatch.setenv("EVAL_BASELINE_MAX_OBJECTS", "2")
+    seed_gcs(
+        gcloud,
+        *[
+            baseline_line("a", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z")
+            for i in range(5)
+        ],
+    )
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=3, scored=3)
+    md = tmp_path / "verdict.md"
+    assert main(["suite", "--case-result", str(doc), "--markdown-out", str(md)]) == 0
+    text = md.read_text(encoding="utf-8")
+    assert "NOTE — truncated read" in text
+    assert "`a`: the 3 oldest" in text

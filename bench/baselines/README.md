@@ -101,6 +101,51 @@ A leftover `<case-id>.json` from the pre-JSONL format is an **error**, not a
 file to skip: skipping it would read as "never screened" and silently de-admit
 the case rather than telling anyone the format changed.
 
+## Where the store lives
+
+Two backends, one record format, identical semantics. `EVAL_BASELINE_STORE`
+(or `--baseline-store`) selects one; unset, everything above happens in this
+directory.
+
+| Value             | Backend | Layout                                           |
+| ----------------- | ------- | ------------------------------------------------ |
+| unset, or a path  | Local   | `<dir>/<case-id>.jsonl`, appended to in place    |
+| `gs://bucket/pfx` | GCS     | `<pfx>/<case-id>/<recorded_at>-<build-id>.jsonl` |
+
+The local backend is the default and stays the default: the store travels with
+the checkout, so running the gate needs no credential and no network, and every
+unit test is hermetic.
+
+GCS is the intended production home for one reason — on the local backend
+something has to _commit_ the file, and the postsubmit that measures the
+evidence has no push credential. On GCS each batch is a new immutable object,
+never an append to an existing one, because the grant this is built for is
+`roles/storage.objectCreator`: create yes, overwrite and delete no. Append-only
+becomes an IAM guarantee rather than a convention, which is stronger than git,
+where a force-push can rewrite history. Object names begin with an ISO-8601 UTC
+stamp so a lexical sort is chronological.
+
+`VERSIONS.json` stays here in git either way. `--baseline-dir` still points at
+this directory even when evidence has moved to GCS, and the split is
+deliberate: `fleet` and `verifiers` are hand-declared, reviewed configuration,
+not measured data, and configuration belongs where it gets reviewed.
+
+A GCS read pulls at most `EVAL_BASELINE_MAX_OBJECTS` (default 200, roughly 600
+runs) of a case's newest objects. It never binds at realistic history depths;
+when it does, the verdict says which case was capped and by how much, because a
+silent cap reads as "I considered everything" when it did not.
+
+A store that cannot be **reached** — no `gcloud`, a timeout, a 403, a 503 —
+degrades to advisory with a banner in the verdict, rather than redding the job.
+Nothing is admitted, so collapse and rung 6 do not evaluate and the aggregate
+means nothing. That is a real loosening of the gate during an outage, and it is
+still the right way round: a blip that reds every pull request is the failure
+mode that gets a gate switched off. Bytes that arrived and will not parse are a
+different thing and remain fatal.
+
+Full rationale, including the approaches that were rejected:
+`docs/designs/eval-baseline-storage.md`.
+
 ## The version key
 
 Three of the five components are read off the run rather than declared, so
@@ -173,10 +218,11 @@ uv run bench-gate record \
 It refuses to run with `PULL_NUMBER` set. It is also unconditional on the
 verdict, deliberately — see above.
 
-The store lives in git and the postsubmit has no push credential, so its append
-dies with the workspace; `--lines-out` writes the same lines as a Prow artefact
-for somebody to land. Automating that push is its own change, with its own
-credential argument.
+With `EVAL_BASELINE_STORE` pointing at a bucket the append lands and the loop
+closes. Against the default local store it does not: the store lives in git,
+the postsubmit has no push credential, and the append dies with the workspace.
+`--lines-out` writes the same lines as a Prow artefact for somebody to land by
+hand, which is a stopgap for the interval before the bucket exists.
 
 Whoever writes a line — the recorder or a person — the operation is an append, and
 the review question is the same: does this one new line say what the run

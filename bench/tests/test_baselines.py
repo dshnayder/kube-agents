@@ -309,7 +309,7 @@ def test_a_filename_that_disagrees_with_its_case_is_fatal(tmp_path):
     (tmp_path / "planted-pdb.jsonl").write_text(
         json.dumps({"case": "something-else", **record()}) + "\n", encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="the filename is the join key"):
+    with pytest.raises(ValueError, match="the location is the join key"):
         BaselineStore.load(tmp_path)
 
 

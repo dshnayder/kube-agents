@@ -87,6 +87,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .evidence_store import EvidenceSource, StoreUnreachable, is_gcs, open_backend
+
+__all__ = [
+    "StoreUnreachable",
+    "is_gcs",
+]
+
 __all__ = [
     "AdmissionBar",
     "BaselineEvidence",
@@ -352,37 +359,62 @@ class BaselineEvidence:
 
 
 def append_record(
-    directory: str | Path, case_id: str, record: BaselineRecord
-) -> tuple[Path, str]:
-    """Append one screening line to ``<case-id>.jsonl``. The only writer here.
+    location: str | Path, case_id: str, record: BaselineRecord
+) -> tuple[str, str]:
+    """Append one screening line. The only writer here.
 
-    Returns the file written and the exact line appended, so a caller can
-    echo it into a build log or a Prow artifact without re-reading the file.
+    ``location`` is a directory, or ``gs://bucket/prefix`` for the GCS backend.
+    Returns where it was written and the exact line, so a caller can echo it
+    into a build log or a Prow artifact without re-reading the store.
 
     Deliberately a module function and not a :class:`BaselineStore` method. The
     store is a read snapshot taken at load time; giving it a write method would
-    invite the idea that the in-memory object is the authority, when the file
-    on disk is, and another process may have appended to it since.
+    invite the idea that the in-memory object is the authority, when the store
+    is, and another process may have appended to it since.
     """
-    root = Path(directory)
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{case_id}.jsonl"
     line = json.dumps(record.to_dict(case_id))
+    return open_backend(location).append(case_id, line), line
 
-    # A file whose last line has no newline would swallow the next append into
-    # it, turning two records into one unparseable one. Cheap to prevent, and
-    # the only way it can happen -- a half-written append -- is exactly the
-    # case where nobody is watching.
-    prefix = ""
-    if path.exists() and path.stat().st_size:
-        with path.open("rb") as fh:
-            fh.seek(-1, os.SEEK_END)
-            if fh.read(1) != b"\n":
-                prefix = "\n"
 
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(prefix + line + "\n")
-    return path, line
+def _parse_source(source: EvidenceSource) -> list[BaselineRecord]:
+    """Parse one case's raw lines into records, oldest first.
+
+    Errors name the source and the line index within it. On GCS a source is a
+    whole case prefix rather than a single object, so the index is a position
+    in the concatenation, not an object name -- close enough to find the bad
+    line, and the alternative is one subprocess per object.
+    """
+    parsed: list[BaselineRecord] = []
+    for line_no, line in enumerate(source.text.splitlines(), start=1):
+        # Blank lines are tolerated: an append that raced a trailing newline
+        # should not take the presubmit down.
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f"{source.label}:{line_no}: not valid JSON: {exc}") from exc
+        if not isinstance(entry, dict):
+            raise ValueError(f"{source.label}:{line_no}: expected a JSON object")
+        case_id = str(entry.get("case") or source.case_id)
+        if case_id != source.case_id:
+            raise ValueError(
+                f"{source.label}:{line_no}: declares case {case_id!r} but is filed "
+                f"as {source.case_id!r}; the location is the join key"
+            )
+        parsed.append(
+            BaselineRecord(
+                key=VersionKey.from_dict(entry.get("key") or {}),
+                runs=int(entry.get("runs") or 0),
+                passes=int(entry.get("passes") or 0),
+                recorded_at=entry.get("recorded_at"),
+                commit=entry.get("commit"),
+                judged=entry.get("judged"),
+                blocked=int(entry.get("blocked") or 0),
+                infra=int(entry.get("infra") or 0),
+            )
+        )
+    return parsed
 
 
 class BaselineStore:
@@ -395,68 +427,29 @@ class BaselineStore:
 
     def __init__(self, records: dict[str, list[BaselineRecord]]):
         self._records = records
+        #: case id -> how many of its oldest objects the read left out. Empty
+        #: on the local backend, and empty on GCS until the cap actually binds.
+        self.truncated: dict[str, int] = {}
 
     @classmethod
-    def load(cls, directory: str | Path) -> BaselineStore:
-        """Read every ``<case>.jsonl`` in ``directory``.
+    def load(cls, location: str | Path) -> BaselineStore:
+        """Read every case's evidence from ``location``.
 
-        A missing directory is an empty store, not an error: that is the state
-        this ships in, and it is the state a fresh checkout is in before
-        anything has been screened.
+        A directory, or ``gs://bucket/prefix``. A missing directory or an empty
+        prefix is an empty store, not an error: that is the state this ships in
+        and the state a fresh checkout is in before anything has been screened.
+
+        Raises :class:`ValueError` on bytes that will not parse and
+        :class:`StoreUnreachable` when the store could not be read at all. The
+        gate treats those very differently -- see :mod:`.evidence_store`.
         """
-        root = Path(directory)
+        backend = open_backend(location)
         records: dict[str, list[BaselineRecord]] = {}
-        if not root.is_dir():
-            return cls(records)
-
-        # A leftover `<case>.json` is refused rather than ignored. Skipping it
-        # would read as "this case has never been screened", which silently
-        # de-admits the case instead of telling anyone the file is in the old
-        # format.
-        for stray in sorted(root.glob("*.json")):
-            if stray.name != "VERSIONS.json":
-                raise ValueError(
-                    f"{stray}: the store is JSONL now; rename it to "
-                    f"{stray.stem}.jsonl, one record per line"
-                )
-
-        for path in sorted(root.glob("*.jsonl")):
-            parsed: list[BaselineRecord] = []
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise ValueError(f"{path}: cannot read: {exc}") from exc
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                # Blank lines are tolerated: an append that raced a trailing
-                # newline should not take the presubmit down.
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError as exc:
-                    raise ValueError(f"{path}:{line_no}: not valid JSON: {exc}") from exc
-                if not isinstance(entry, dict):
-                    raise ValueError(f"{path}:{line_no}: expected a JSON object")
-                case_id = str(entry.get("case") or path.stem)
-                if case_id != path.stem:
-                    raise ValueError(
-                        f"{path}:{line_no}: declares case {case_id!r} but is filed "
-                        f"as {path.stem!r}; the filename is the join key"
-                    )
-                parsed.append(
-                    BaselineRecord(
-                        key=VersionKey.from_dict(entry.get("key") or {}),
-                        runs=int(entry.get("runs") or 0),
-                        passes=int(entry.get("passes") or 0),
-                        recorded_at=entry.get("recorded_at"),
-                        commit=entry.get("commit"),
-                        judged=entry.get("judged"),
-                        blocked=int(entry.get("blocked") or 0),
-                        infra=int(entry.get("infra") or 0),
-                    )
-                )
-            records[path.stem] = parsed
-        return cls(records)
+        for source in backend.sources():
+            records[source.case_id] = _parse_source(source)
+        store = cls(records)
+        store.truncated = dict(getattr(backend, "truncated", {}) or {})
+        return store
 
     def record_for(self, case_id: str, key: VersionKey | None) -> BaselineRecord | None:
         """The NEWEST screening record for this case at this exact key.

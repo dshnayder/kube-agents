@@ -51,6 +51,7 @@ from kube_agents_bench.baselines import (
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
+    StoreUnreachable,
     VersionKey,
     append_record,
     load_versions,
@@ -90,18 +91,43 @@ def _judged_metrics() -> tuple[str, ...]:
     return parts or DEFAULT_JUDGED_METRICS
 
 
-def _load_store(directory: str) -> BaselineStore | str:
-    """The store, or the one-line reason it could not be read.
+def _store_location(args: argparse.Namespace) -> str:
+    """Where the evidence lives. A directory, or ``gs://bucket/prefix``.
 
-    A store that will not parse is never treated as an empty store. Empty means
-    "nothing is admitted and the aggregate is advisory", which is a legitimate
-    green; a corrupt file reaching that same state would silently disarm the
-    gate on the day someone fat-fingers a line.
+    ``--baseline-dir`` still holds VERSIONS.json even when evidence has moved
+    to GCS, and that split is deliberate: the fleet and verifiers integers are
+    hand-declared, reviewed configuration, not measured data, and configuration
+    belongs where it gets reviewed.
+    """
+    return (
+        getattr(args, "baseline_store", None)
+        or os.environ.get("EVAL_BASELINE_STORE")
+        or args.baseline_dir
+    )
+
+
+def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
+    """``(store, fatal_reason, degraded_reason)`` -- exactly one of the last two.
+
+    Three failure classes, deliberately not treated alike.
+
+    Bytes that arrived and will not parse are FATAL. A store that will not
+    parse is never read as an empty store: empty means "nothing admitted, the
+    aggregate is advisory", which is a legitimate green, and a corrupt file
+    reaching that state would silently disarm the gate.
+
+    A store that cannot be REACHED degrades to advisory with a banner. The
+    trade is real and worth stating: a sustained outage quietly loosens the
+    gate. It is still the right way round, because a network blip redding every
+    pull request is the exact failure mode that gets a gate switched off, and
+    that is what this whole design exists to avoid.
     """
     try:
-        return BaselineStore.load(directory)
+        return BaselineStore.load(location), None, None
     except ValueError as exc:
-        return str(exc)
+        return None, str(exc), None
+    except StoreUnreachable as exc:
+        return BaselineStore({}), None, f"{location} unreachable: {exc}"
 
 
 def _bootstrap_admitted() -> frozenset[str]:
@@ -180,10 +206,13 @@ def _cmd_case(args: argparse.Namespace) -> int:
         )
         break
 
-    store = _load_store(args.baseline_dir)
-    if isinstance(store, str):
-        print(f"Task {spec.case_id} Result: [FAILED] {store}", file=sys.stderr)
+    store, fatal, degraded = _load_store(_store_location(args))
+    if fatal or store is None:
+        print(f"Task {spec.case_id} Result: [FAILED] {fatal}", file=sys.stderr)
         return 2
+    if degraded:
+        print(f"WARNING: baseline store {degraded}", file=sys.stderr)
+        print("WARNING: grading with no baseline; nothing can be admitted.", file=sys.stderr)
 
     bar = AdmissionBar.from_env()
     admitted, admission_reason = store.is_admitted(
@@ -334,9 +363,9 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         print(f"::error::{cases}", file=sys.stderr)
         return 1
 
-    store = _load_store(args.baseline_dir)
-    if isinstance(store, str):
-        print(f"::error::{store}", file=sys.stderr)
+    store, fatal, degraded = _load_store(_store_location(args))
+    if fatal or store is None:
+        print(f"::error::{fatal}", file=sys.stderr)
         return 1
 
     # An explicit --baseline-rate wins, for a local run or a what-if. Otherwise
@@ -353,6 +382,25 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     )
 
     text = _markdown(verdict, cases)
+    # The banner goes in the markdown, not only in the log. A degraded read
+    # silently loosens the gate, and the one thing that must not happen is a
+    # green nobody knows was measured against nothing.
+    banners = []
+    if degraded:
+        banners.append(
+            f"> **WARNING — baseline unavailable.** {degraded}\n>\n"
+            "> Nothing could be admitted, so collapse and judged-regression were "
+            "not evaluated and the aggregate below is advisory. This verdict is "
+            "weaker than a normal one."
+        )
+    for case_id, dropped in sorted(getattr(store, "truncated", {}).items()):
+        banners.append(
+            f"> **NOTE — truncated read.** `{case_id}`: the {dropped} oldest "
+            "record(s) were not read. Admission uses the newest evidence, so "
+            "this does not change the verdict."
+        )
+    if banners:
+        text = "\n\n".join(banners) + "\n\n" + text
     print(text)
     if args.markdown_out:
         out = Path(args.markdown_out)
@@ -440,8 +488,8 @@ def _cmd_record(args: argparse.Namespace) -> int:
             continue
         case_id, record = outcome
         try:
-            path, line = append_record(args.baseline_dir, case_id, record)
-        except OSError as exc:
+            path, line = append_record(_store_location(args), case_id, record)
+        except (OSError, StoreUnreachable) as exc:
             print(f"::error::cannot append to the baseline store: {exc}", file=sys.stderr)
             return 2
         written.append(line)
@@ -492,7 +540,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     case.add_argument(
         "--baseline-dir",
         default=_DEFAULT_BASELINE_DIR,
-        help="the checked-in baseline store (default: %(default)s)",
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    case.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
     )
     case.add_argument(
         "--judge-model",
@@ -528,13 +583,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     suite.add_argument(
         "--baseline-dir",
         default=_DEFAULT_BASELINE_DIR,
-        help="the checked-in baseline store (default: %(default)s)",
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    suite.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
     )
     suite.add_argument(
         "--baseline-rate",
         type=float,
         default=None,
-        help="override main's pass rate; computed from --baseline-dir if omitted",
+        help="override main's pass rate; computed from the store if omitted",
     )
     suite.add_argument(
         "--margin",
@@ -558,7 +620,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     record.add_argument(
         "--baseline-dir",
         default=_DEFAULT_BASELINE_DIR,
-        help="the checked-in baseline store (default: %(default)s)",
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    record.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
     )
     record.add_argument(
         "--commit",
