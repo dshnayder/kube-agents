@@ -120,21 +120,52 @@ This layout exists to fit the **`roles/storage.objectCreator`** grant, which can
 but cannot overwrite or delete existing ones. That makes append-only an IAM guarantee rather than a
 convention — strictly stronger than what git gives, where a force-push can rewrite history.
 
+**Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
+no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
+in IAM terms needs `storage.objects.delete`, which is precisely the permission whose absence was
+the argument for GCS over git in the first place. It also races: two postsubmits that read the same
+object and both write back silently lose one batch, with no error anywhere. `compose` does not
+rescue it either, because composing into the existing name is still an overwrite of that name (and
+it caps at 32 sources per call, with composite objects accumulating components toward a hard
+ceiling).
+
+**The sharding is invisible to every reader, and that is not luck.** JSONL is closed under
+concatenation: the meaning of a set of lines does not depend on how they were split across files.
+So the local backend's one-file-per-case and the GCS backend's one-object-per-batch produce
+byte-identical input to the parser, BigQuery's external table over `*/*.jsonl` sees one table
+regardless of the split, and `evidence_for()`'s pooling never learns that objects exist. The format
+is doing the work that an append would otherwise have to.
+
 `VERSIONS.json` deliberately stays in git even when evidence lives in GCS. It is hand-declared,
 reviewed configuration — the `fleet` and `verifiers` integers a contributor bumps on purpose — not
 measured data. Config belongs where it gets reviewed.
 
 ### Reading is capped, and says so
 
-The reader lists a case's objects, takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200), and
-concatenates those. 200 objects is roughly 600 runs, two orders of magnitude past the 20 the
-admission bar wants, so the cap never binds in practice — but it bounds a read that would otherwise
-grow without limit, and when it does bind the gate logs that it truncated. A cap that is silent
-reads as "I considered everything" when it did not.
+The reader lists the whole prefix once, groups the object names by case, takes each case's newest
+`EVAL_BASELINE_MAX_OBJECTS` (default 200), and concatenates those in one `cat`. 200 objects is
+roughly 600 runs, two orders of magnitude past the 20 the admission bar wants, so the cap never
+binds in practice — but it bounds a read that would otherwise grow without limit, and when it does
+bind the gate says which case was capped and by how much. A cap that is silent reads as "I
+considered everything" when it did not.
 
-One honest consequence: if the version key goes A → B → A, a revert's evidence at key A could in
-principle sit outside the window and read as "no evidence". That under-admits, which is the safe
-direction, and it is rare enough to accept rather than engineer around.
+**The cap bounds the fetch, not the listing**, and that is the one place the per-batch layout has a
+cost. Listing is O(every object ever written), because the reader cannot know which names are
+newest without seeing them. At today's scale — a handful of active cases, one batch per case per
+merge — that is a few hundred objects a year and invisible. It stops being invisible somewhere
+around a hundred thousand objects, which is roughly 200 cases at several merges a day for a year.
+The fix at that point is a date partition in the name (`<case>/<YYYY-MM>/<stamp>-<build>.jsonl`) and
+listing months backwards until the window fills; it is deliberately not built now, because it buys
+nothing today and the migration is a rename of new objects only. Tracked under
+[Open items](#open-items).
+
+Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
+minimum object size, and both the listing and the per-object fetches are fractions of a cent per
+run.
+
+One honest consequence of the window: if the version key goes A → B → A, a revert's evidence at key
+A could in principle sit outside the window and read as "no evidence". That under-admits, which is
+the safe direction, and it is rare enough to accept rather than engineer around.
 
 ### When the store is unreachable
 
@@ -412,6 +443,9 @@ not leave the project.
 - No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
   `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
+- The GCS listing is unbounded while the fetch is capped. Partition object names by month when the
+  store passes roughly a hundred thousand objects; see
+  [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - Every threshold here is a starting point. The way to tune them is to run the suite against `main`
