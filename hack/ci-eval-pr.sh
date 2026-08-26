@@ -547,9 +547,14 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
 # Three tasks at three repetitions is nine devops-bench invocations, where the
-# presubmit's budget was sized for two. GoogleCloudPlatform/oss-test-infra#2667
-# raises that timeout 85m -> 150m and MUST LAND FIRST: with three here and 85m
-# there, the job times out instead of reporting a verdict.
+# presubmit's budget was sized for two. Measured on job 2092688725648609280
+# (three cases, one repetition, 52.2min): 14.4min of Boskos lease, image build
+# and deploy paid once, then 21.1 / 14.1 / 2.5min per invocation. Only the
+# 37.8min of invocations scales, so nine of them is ~128min.
+#
+# GoogleCloudPlatform/oss-test-infra#2667 took that budget 85m -> 150m and has
+# merged. #2669 takes it 150m -> 240m and MUST LAND FIRST: 150m against a
+# ~128min run is 1.17x, which one slow gpu-stress-test-diagnosis erases.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a

@@ -1003,13 +1003,27 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 ## Open items
 
 - **The presubmit's timeout has to be raised before this merges, not after.** `85m` was sized when
-  the job made two `devops-bench` invocations and averaged ~43min. Three active cases at the
-  default three repetitions is nine, which puts the expected run near 78min, so merging this
-  against the current budget turns a verdict into a timeout.
-  [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) raises it
-  to `150m` — the same ~2x-the-expected-run ratio `85m` held. That number is an estimate and is
-  flagged as one in both places; #951 has since stopped `gpu-stress-test-diagnosis` creating a
-  cluster per invocation, so it is likely pessimistic.
+  the job made two `devops-bench` invocations and averaged ~43min.
+  [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) has taken
+  it to `150m`, which is **still not enough**;
+  [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) takes it to
+  `240m` and is the one that gates this pull request.
+
+  The expected run is measured now rather than estimated. Job `2092688725648609280` ran all three
+  cases at one repetition and went green in 52.2min: 14.4min of Boskos lease, image build and
+  deploy paid once, then 21.1 / 14.1 / 2.5min for the three invocations (agent latency 1102s / 800s
+  / 89s). Only the per-invocation 37.8min scales with `EVAL_REPETITIONS`, so three repetitions is
+  `14.4 + 3 × 37.8` ≈ **128min**, and `150m` against that is 1.17× rather than the ~2× this job has
+  always been sized at.
+
+  Two things the earlier estimate got wrong, recorded because they are the reason the number moved
+  twice: fixed setup is less than half the ~33min assumed, and a repetition costs ~12.6min rather
+  than ~5min. #951 stopping `gpu-stress-test-diagnosis` from creating its own cluster per
+  invocation did **not** make this pessimistic — that case is still the most expensive of the
+  three, and what it spends is agent time, not provisioning. 128min is one sample and agent latency
+  is its most variable term, so it wants revisiting in either direction once several runs at three
+  repetitions exist.
+
 - The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
   dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a
   single `roles/owner` holds it — for three things, all in that project and none of them optional:
