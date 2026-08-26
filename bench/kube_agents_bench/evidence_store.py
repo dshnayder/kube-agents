@@ -9,7 +9,7 @@ checkout, so a developer running the gate needs no credential and no network,
 and every unit test is hermetic. It is also how the format is documented.
 
 GCS is the intended production home, for one reason: on the local backend
-something has to *commit* the file, and the postsubmit that measures the
+something has to *commit* the file, and the CI job that measures the
 evidence has no push credential. Every way of giving it one -- a bot with write
 access to ``main``, a pull request per merge, a weekly batched pull request --
 was worse than the problem. See ``docs/designs/eval-scorer.md``.

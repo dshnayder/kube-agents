@@ -580,7 +580,7 @@ def test_an_empty_store_collects_and_then_admits(kanban_task, tmp_path, monkeypa
     """The requirement, end to end through the CLI.
 
     Nothing here is a deliberate screening campaign -- it is seven ordinary
-    postsubmit runs at the default three repetitions. If pooling were removed
+    recorder runs at the default three repetitions. If pooling were removed
     this test hangs at "collecting" forever, which is the state the store
     would really have shipped in.
     """
@@ -787,7 +787,7 @@ def test_the_flag_beats_the_environment(kanban_task, tmp_path, monkeypatch, gclo
 
 def test_record_writes_an_object_the_gate_reads_back(kanban_task, tmp_path, monkeypatch, gcloud):
     """The loop closes over GCS too, which is the only reason the backend
-    exists: on main the postsubmit has no push credential, so a checked-in
+    exists: on main the recorder has no push credential, so a checked-in
     store has no writer."""
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)
     monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")

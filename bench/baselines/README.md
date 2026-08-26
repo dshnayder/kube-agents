@@ -6,7 +6,7 @@ has proved it passes reliably; judged regression (rung 6), which compares this
 pull request's judge scores against main's at the same version key; and the
 suite aggregate, which compares pass rates.
 
-**This store ships empty, and it fills itself.** Every postsubmit run on `main`
+**This store ships empty, and it fills itself.** Every nightly run on `main`
 appends what it measured (`bench-gate record`), and a case is admitted once its
 accumulated evidence clears the bar. Until then nothing is admitted: rung 4
 cannot fire, rung 6 has nothing to compare against, and the aggregate is
@@ -22,7 +22,7 @@ keep blocking meanwhile.
 | `<case-id>.jsonl` | One file per case, named for its `bench/tasks/` directory |
 
 Each line of `<case-id>.jsonl` is **one batch of runs** — a deliberate 20-run
-screening campaign, or the three repetitions an ordinary postsubmit produced —
+screening campaign, or the ten repetitions an ordinary nightly produced —
 filed under the version key it was measured at. Newlines are shown here for the
 page's sake; in the file a record is one line.
 
@@ -66,12 +66,12 @@ a case is worth keeping. And two appends conflict far less often than two
 rewrites of the same object, which is what lets a checked-in store survive
 more than a handful of cases.
 
-**Reading is bottom-up and cumulative.** The bar wants 20 runs and an ordinary
-postsubmit is 3 repetitions, so a rule that read only the newest line could
+**Reading is bottom-up and cumulative.** The bar wants 20 runs and one job run
+is a handful of repetitions, so a rule that read only the newest line could
 never admit anything the routine job produces — the store would ship empty and
 stay empty. Instead the reader walks the lines at the current key newest-first
 and pools them until it holds 20 runs. One 20-run campaign is therefore one
-line, seven ordinary postsubmits are seven, and both admit.
+line, two ordinary nightlies at 10 repetitions are two, and both admit.
 
 Whole lines only: pooling overshoots to 21 rather than trimming a line to land
 on 20 exactly, because trimming would invent a sub-record nobody measured.
@@ -88,7 +88,7 @@ nothing could fall back below it.
 
 Only runs on `main` append. A pull request's own run is graded against this
 store and never writes to it, so a case cannot move the baseline it is about to
-be judged against. That is enforced twice — the postsubmit condition in
+be judged against. That is enforced twice — the `JOB_TYPE` condition in
 `hack/ci-eval-pr.sh`, and a refusal inside `bench-gate record` itself when
 `PULL_NUMBER` is set — because a guard living only in shell is one careless
 edit away from being gone.
@@ -117,7 +117,7 @@ the checkout, so running the gate needs no credential and no network, and every
 unit test is hermetic.
 
 GCS is the intended production home for one reason — on the local backend
-something has to _commit_ the file, and the postsubmit that measures the
+something has to _commit_ the file, and the CI job that measures the
 evidence has no push credential. On GCS each batch is a new immutable object,
 never an append to an existing one, because the grant this is built for is
 `roles/storage.objectCreator`: create yes, overwrite and delete no. Append-only
@@ -127,7 +127,7 @@ stamp so a lexical sort is chronological.
 
 Reading needs a second role. The backend lists and `cat`s, which is
 `storage.objects.list` and `storage.objects.get` — `roles/storage.objectViewer`,
-which `objectCreator` does not include. A postsubmit needs both; a presubmit
+which `objectCreator` does not include. The recorder needs both; a presubmit
 needs only `objectViewer`, because a pull request is graded against the store
 and never writes to it. Neither role carries `storage.objects.delete`.
 
@@ -229,8 +229,8 @@ measured on — and a new one is appended once re-screened.
 
 ## Regenerating
 
-Ordinarily nobody does: the postsubmit appends a line every time it runs on
-`main`, and 20 runs of evidence arrive after seven merges. To fill the store
+Ordinarily nobody does: the nightly appends a line every time it runs on
+`main`, and 20 runs of evidence arrive after two nights. To fill the store
 faster — a new case, or every case after a version bump — run the suite N times
 on a `main` checkout and record each one:
 
@@ -246,7 +246,7 @@ verdict, deliberately — see above.
 
 With `EVAL_BASELINE_STORE` pointing at a bucket the append lands and the loop
 closes. Against the default local store it does not: the store lives in git,
-the postsubmit has no push credential, and the append dies with the workspace.
+the recorder has no push credential, and the append dies with the workspace.
 `--lines-out` writes the same lines as a Prow artefact for somebody to land by
 hand, which is a stopgap for the interval before the bucket exists.
 

@@ -341,15 +341,30 @@ done
 # A red run on main is precisely the evidence that de-admits a case that has
 # stopped working, so it is the one run that must not go unrecorded.
 #
-# Only a postsubmit appends. `bench-gate record` refuses a second time if
+# Only a run on main appends: the nightly periodic today, and a postsubmit if
+# one is ever added back. `bench-gate record` refuses a second time if
 # PULL_NUMBER is set, because a guard that lives only in shell is one careless
 # edit away from letting a pull request move the baseline it is judged against.
+#
+# JOB_TYPE is matched against both because the recorder moved from per-merge to
+# nightly. At ~10 merges a day a postsubmit paid ~40 minutes of cluster
+# provisioning for three samples of each case, and provisioning -- not the eval
+# -- is what the job spends its time on. One nightly run amortises that setup
+# over every repetition, so it buys a sample far cheaper and can refill the
+# whole 20-run admission window in a night or two after a version-key bump
+# instead of over a week of merges. Neither job type is a pull request, which
+# is the property that actually matters here; PULL_NUMBER below is what
+# enforces it. See docs/designs/eval-scorer.md#the-job-that-writes-it.
 #
 # With EVAL_BASELINE_STORE pointing at a bucket the append lands and the loop
 # closes. Unset, the store is the git checkout and this job has no push
 # credential, so the append dies with the workspace; --lines-out is what
 # survives, as a Prow artefact somebody lands by hand in the meantime.
-if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ -z "${PULL_NUMBER:-}" ]; then
+case "${JOB_TYPE:-}" in
+  postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
+  *) EVAL_IS_MAIN_RUN="false" ;;
+esac
+if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
   (cd "${BENCH_DIR}" && uv run bench-gate record \
@@ -357,7 +372,7 @@ if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ -z "${PULL_NUMBER:-}" ]; then
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 else
-  echo "Not a postsubmit run: the baseline store is read, never written."
+  echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi
 
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the

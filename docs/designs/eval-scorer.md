@@ -5,7 +5,8 @@
 > covered by `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been
 > validated end to end against a real bucket in a personal dev project (see
 > [What has been validated, and where](#what-has-been-validated-and-where)), but the production
-> bucket and its IAM grants do not exist yet, and no postsubmit job writes to it. The dashboard's
+> bucket and its IAM grants do not exist yet, and the nightly job that writes to it is still a
+> draft pull request in `oss-test-infra`. The dashboard's
 > table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
 > what is not built is the Looker Studio front end over them.
 
@@ -117,7 +118,7 @@ movement.
 ## What is stored
 
 One JSON object per line, one line per **batch of runs** — a deliberate screening campaign, or the
-three repetitions an ordinary postsubmit produced.
+ten repetitions an ordinary nightly produced.
 
 ```json
 {
@@ -179,7 +180,7 @@ and every unit test stays hermetic and offline.
 ### Why GCS is the intended home
 
 The local backend puts the store in git, which was the original choice. It has one structural
-problem: **something has to commit it.** The postsubmit that measures the evidence has no push
+problem: **something has to commit it.** The CI job that measures the evidence has no push
 credential, so either a bot gets write access to `main` — a new and fairly broad trust grant — or a
 human lands machine-generated count lines by hand, forever.
 
@@ -249,14 +250,14 @@ The backend shells out to three `gcloud storage` verbs, and they do not all fall
 | `bench-gate case` / `suite` — read | `cat`          | `storage.objects.get`    | `roles/storage.objectViewer`  |
 | `bench-gate record` — append       | `cp - gs://…`  | `storage.objects.create` | `roles/storage.objectCreator` |
 
-So the **postsubmit** needs both roles on the bucket; `objectCreator` alone cannot read back what
+So the **nightly recorder** needs both roles on the bucket; `objectCreator` alone cannot read back what
 it wrote. Neither role carries `storage.objects.delete`, which is the property the whole layout
 depends on, so the pair is still strictly weaker than `roles/storage.objectUser` or
 `roles/storage.admin` — ask for the two named roles, not the convenient one.
 
 **The presubmit needs `objectViewer` only.** A pull request is graded against the store and must
-never write to it. That is already enforced twice in software — the `JOB_TYPE = postsubmit`
-condition in `hack/ci-eval-pr.sh` and a refusal inside `bench-gate record` when `PULL_NUMBER` is
+never write to it. That is already enforced twice in software — the
+`JOB_TYPE ∈ {periodic, postsubmit}` condition in `hack/ci-eval-pr.sh` and a refusal inside `bench-gate record` when `PULL_NUMBER` is
 set — and if the two job types can run as different service accounts, withholding
 `objectCreator` from the presubmit's makes it structural rather than conventional. That is the
 strongest of the three guards, because it survives a careless edit to either of the others.
@@ -277,7 +278,7 @@ own.
 ```bash
 BUCKET=kube-agents-evals-bench          # globally unique
 PROJECT=kube-agents-evals
-POST_SA=<postsubmit-sa>@${PROJECT}.iam.gserviceaccount.com
+NIGHTLY_SA=<nightly-recorder-sa>@${PROJECT}.iam.gserviceaccount.com
 PRE_SA=<presubmit-sa>@${PROJECT}.iam.gserviceaccount.com
 
 # No lifecycle rule and no versioning, deliberately: nothing may delete evidence,
@@ -289,11 +290,11 @@ gcloud storage buckets create "gs://${BUCKET}" \
   --uniform-bucket-level-access \
   --public-access-prevention
 
-# The postsubmit reads and appends.
+# The nightly recorder reads and appends.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${POST_SA}" --role=roles/storage.objectViewer
+  --member="serviceAccount:${NIGHTLY_SA}" --role=roles/storage.objectViewer
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${POST_SA}" --role=roles/storage.objectCreator
+  --member="serviceAccount:${NIGHTLY_SA}" --role=roles/storage.objectCreator
 
 # The presubmit only reads. Withholding objectCreator is the guard that survives
 # a careless edit to hack/ci-eval-pr.sh.
@@ -305,7 +306,7 @@ To scope a grant to the prefix rather than the whole bucket, add a condition:
 
 ```bash
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${POST_SA}" \
+  --member="serviceAccount:${NIGHTLY_SA}" \
   --role=roles/storage.objectCreator \
   --condition='title=evidence-prefix-only,expression=resource.name.startsWith("projects/_/buckets/'"${BUCKET}"'/objects/evidence/")'
 ```
@@ -347,18 +348,18 @@ The backend has been exercised end to end against a real bucket
 | `objectViewer` + `objectCreator` can list, read and create  | all three verbs succeed                                           |
 | **Overwrite is refused**                                    | `does not have storage.objects.delete access`; object left intact |
 | `objectViewer` alone cannot write                           | `does not have storage.objects.create`                            |
-| Ten postsubmit appends accumulate to admission              | `admitted on 20/20 screening runs across 10 recorded run(s)`      |
+| Ten recorded appends accumulate to admission                | `admitted on 20/20 screening runs across 10 recorded run(s)`      |
 | An admitted case that fails every repetition reds the suite | rung 4 collapse, `suite` exits 1                                  |
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
 
-What remains unvalidated is the part no local run can reach: the postsubmit Prow job, which does
-not exist yet.
+What remains unvalidated is the part no local run can reach: the nightly Prow job, which is still a
+draft pull request against `oss-test-infra`.
 
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
 in IAM terms needs `storage.objects.delete`, which is precisely the permission whose absence was
-the argument for GCS over git in the first place. It also races: two postsubmits that read the same
+the argument for GCS over git in the first place. It also races: two recorder runs that read the same
 object and both write back silently lose one batch, with no error anywhere. `compose` does not
 rescue it either, because composing into the existing name is still an overwrite of that name (and
 it caps at 32 sources per call, with composite objects accumulating components toward a hard
@@ -405,10 +406,10 @@ directories.
 **The cap bounds the fetch, not the listing.** Listing is O(every object ever written under the
 prefix), because the reader cannot know which names are newest without seeing them. The key
 partition largely settles this on its own: a prefix stops growing when the key changes, and a
-long-lived key at three merges a day is on the order of a thousand objects. What remains unbounded
-is the _total_ across all historical keys, which grows only as fast as the software versions do. At
-today's scale — a handful of active cases, one batch per case per merge — that is a few hundred
-objects a year and invisible. If it ever stops being invisible, the fix is to scope the listing to
+long-lived key at one recorded batch a night is on the order of a few hundred objects a year. What
+remains unbounded is the _total_ across all historical keys, which grows only as fast as the
+software versions do. At today's scale — a handful of active cases, one batch per case per night —
+that is invisible. If it ever stops being invisible, the fix is to scope the listing to
 the key being read rather than the whole prefix, which the layout now makes a one-line change; see
 [Open items](#open-items).
 
@@ -445,17 +446,17 @@ needs no credential, no network and no new infrastructure; every unit test is he
 and `git bisect` answer "what did the gate believe at commit X" exactly; and a re-screen after a
 model bump is a diff a human reviews.
 
-It fails on one question: **who writes it.** The job that measures the evidence is a postsubmit
+It fails on one question: **who writes it.** The job that measures the evidence is a CI job
 with no push credential, and every way of giving it one was worse than the problem:
 
-| Option                             | Why it was rejected                                                                                                                                                                                                                                                             |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bot pushes to `main` on each merge | Needs write access to a protected branch, which is a broad and permanent grant for the sake of appending `{"runs": 3, "passes": 3}`. It also breaks the property that `main` only changes through reviewed pull requests, and two concurrent postsubmits race on the same file. |
-| Bot opens a pull request per merge | About seven pull requests a week of pure noise, each triggering CI. To be useful they would need auto-merge, which is the same trust grant by a longer route.                                                                                                                   |
-| Periodic job lands a batched PR    | The least bad, and still a bot with PR rights. Worse, evidence sits unlanded for up to a week — including the failing lines that should have de-admitted a broken case, so the gate keeps blocking on a case it already has the evidence to release.                            |
+| Option                             | Why it was rejected                                                                                                                                                                                                                                                               |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bot pushes to `main` on each merge | Needs write access to a protected branch, which is a broad and permanent grant for the sake of appending `{"runs": 3, "passes": 3}`. It also breaks the property that `main` only changes through reviewed pull requests, and two concurrent recorder runs race on the same file. |
+| Bot opens a pull request per merge | About seven pull requests a week of pure noise, each triggering CI. To be useful they would need auto-merge, which is the same trust grant by a longer route.                                                                                                                     |
+| Periodic job lands a batched PR    | The least bad, and still a bot with PR rights. Worse, evidence sits unlanded for up to a week — including the failing lines that should have de-admitted a broken case, so the gate keeps blocking on a case it already has the evidence to release.                              |
 
 Two smaller problems compound it. **When to update was never clean**: the natural moment is "every
-postsubmit", which is precisely the moment that needs the credential. And **repo churn** — every
+recorded run", which is precisely the moment that needs the credential. And **repo churn** — every
 eval merge would touch a dozen `bench/baselines/*.jsonl` files, so `git blame` on the tree fills
 with machine-generated count lines and the diff of a real change gets harder to read.
 
@@ -529,7 +530,7 @@ stale baseline — and a lint for it is still owed.
 There is **no counter and no stored admission flag.** The evidence is the count, and it is
 recomputed on every read.
 
-1. Every postsubmit run on `main` appends one line per case (`bench-gate record`).
+1. Every nightly run on `main` appends one line per case (`bench-gate record`).
 2. On any later run, `BaselineStore.evidence_for()` keeps only the lines whose `key` matches the
    **current** key, walks them newest-first, and sums `runs` and `passes` until it holds
    `EVAL_ADMISSION_MIN_RUNS` (default 20).
@@ -541,8 +542,9 @@ returning a different answer once the file crossed a threshold.
 
 **Runs, not lines.** #899 specifies "20 runs against `main`, at least 19 passing", and it fixes the
 unit elsewhere in the same table: "an admitted case that fails **all three of its runs**". A run is
-one execution. Three repetitions per postsubmit therefore means about **seven merges** from empty
-to admitted, not twenty.
+one execution. Ten repetitions a night therefore means **two nights** from empty to admitted, not
+twenty. That ratio is the whole reason the recorder went nightly: at the presubmit's three
+repetitions it would have been seven merges, and a version-key bump de-admits every case at once.
 
 **Whole lines only.** Pooling overshoots to 21 runs rather than trimming a line to land on 20
 exactly, because trimming would invent a sub-record nobody measured.
@@ -551,7 +553,7 @@ exactly, because trimming would invent a sub-record nobody measured.
 de-admits a case that has stopped working. A store that recorded only good days would drift its own
 bar upward until nothing could clear it and nothing could fall back below it.
 
-**A pull request never writes.** Enforced twice: the `JOB_TYPE = postsubmit` condition in
+**A pull request never writes.** Enforced twice: the `JOB_TYPE ∈ {periodic, postsubmit}` condition in
 `hack/ci-eval-pr.sh`, and an independent refusal inside `bench-gate record` when `PULL_NUMBER` is
 set. A guard living only in shell is one careless edit from being gone.
 
@@ -567,111 +569,144 @@ does.
 
 ### The job that writes it
 
-This is the piece that does not exist yet, and nothing appends until it does. It is a change to
+This is the piece that is written but not landed, and nothing appends until it lands. It is a change to
 **`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
 `hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not to this repo, which is why no amount of
 work here can close the loop. What it has to be:
 
-| Requirement                                               | Why                                                                                                                         |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| A **postsubmit** on `main`, not a periodic                | The evidence must be attributable to a commit; `record` stamps each line with the `main` SHA it ran on.                     |
-| Sets `JOB_TYPE=postsubmit`, leaves `PULL_NUMBER` unset    | Both guards key on exactly this. Prow sets them; anything hand-rolled must match.                                           |
-| Sets `EVAL_BASELINE_STORE` to the bucket                  | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                      |
-| Runs as an SA with `objectCreator` **and** `objectViewer` | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                              |
-| **Not** `optional: true`, and not merge-blocking either   | It runs after the merge, so it cannot block one. It should page someone when it fails, or the store silently stops filling. |
-| Same `EVAL_REPETITIONS` as the presubmit                  | The baseline must be measured the way the thing compared against it is measured.                                            |
+| Requirement                                                   | Why                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would. |
+| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                  |
+| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                 |
+| Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night would tag its build `pr-local-latest` and lose which commit produced the evidence.                                                     |
+| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                         |
+| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                           |
+| **Not** the same `EVAL_REPETITIONS` as the presubmit          | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken.                                                                                                                       |
 
-Cost is the reason this is not simply "run it on every merge and forget it": at 3 repetitions per
-case, a postsubmit is the same spend as a presubmit, on every merge, forever. If that proves too
-expensive the lever is repetitions or a cron-style sampling of merges — **not** filtering which
-merges count, which would reintroduce exactly the selection bias that recording unconditionally
-exists to avoid.
+**Why nightly and not per-merge.** This was specified as a postsubmit and the arithmetic overturned
+it. `main` takes about ten merges a day — 310 in the thirty days to 2026-08-26 — and the job
+averages ~43 minutes, of which the eval is only about a fifth. Leasing a project, building images
+and standing up a cluster dominate, so a postsubmit pays that setup again on every merge to buy
+three samples of each case: roughly seven project-hours a day out of the pool's seventy-two,
+serialised at `max_concurrency: 1`, which queues weekday bursts for hours.
+
+A nightly run amortises one setup over every repetition. It is cheaper per sample, and faster where
+it matters: admission needs twenty runs at the current version key, so a model or fleet bump
+de-admits every case at once, and refilling that window takes a night or two rather than a week of
+merges.
+
+This is the lever this section already named — "repetitions or a cron-style sampling of merges" —
+and not the one it ruled out. Filtering merges by changed path stays ruled out: it would bias the
+evidence toward whichever changes are cheap to run, which is the selection bias that recording
+unconditionally exists to avoid. Sampling every night is unbiased with respect to what changed.
+
+**Why the repetition counts may differ.** An earlier version of this table required the periodic to
+match the presubmit's `EVAL_REPETITIONS`, on the grounds that "the baseline must be measured the way
+the thing compared against it is measured." That is wrong as stated, and worth correcting because it
+would forfeit the whole gain above. The store holds a pass **rate**. A rate over ten runs and a rate
+over three estimate the same quantity, the second just more noisily. What has to match is how a
+single run is produced — same task, agent, judge, and five-version key — not how many were taken.
+More repetitions on the recording side is strictly better evidence.
 
 #### The job definition
 
 It exists, as a draft:
 [`GoogleCloudPlatform/oss-test-infra#2665`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665),
-adding `prow/prowjobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml`. It is held draft until
-this pull request merges and the bucket and its two IAM grants exist. The YAML is not reproduced
-here — a copy in a second repository is a copy that goes stale, and the shape below is the part
-that matters.
+adding `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`. It is held draft until this
+pull request merges and the bucket and its two IAM grants exist. The YAML is not reproduced here — a
+copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
 
-**Its script body is the presubmit's, byte-for-byte, plus sixteen lines** — the two exports above
-and their comments, and nothing removed. That is a deliberate choice over factoring, and the reason
-is the same one that governs the version key: the two jobs must agree on how a run is produced, or
-the baseline is not a baseline for the thing compared against it. A copy that is obviously a copy
-fails loudly under `diff`; a subtly different harness does not. It does duplicate ~140 lines of
-Boskos lease, heartbeat and cleanup logic, and the right fix is to move that harness into `hack/`
-in this repository so both jobs call one script. That is follow-up work, tracked on the pull
-request.
+**Its script body is the presubmit's, byte-for-byte, plus three exports** — `EVAL_BASELINE_STORE`,
+`EVAL_REPETITIONS` and `PULL_PULL_SHA`, with their comments, and nothing removed. That is a
+deliberate choice over factoring: the two jobs must agree on how a single run is produced, and a
+copy that is obviously a copy fails loudly under `diff` where a subtly different harness does not.
+It duplicates ~140 lines of Boskos lease, heartbeat and cleanup logic, and the right fix is to move
+that harness into `hack/` in this repository so both jobs call one script. That is follow-up work,
+tracked on the pull request.
 
-Three things the first draft of this section got wrong, corrected against the real presubmit:
+Four things earlier drafts of this section got wrong, corrected against the real presubmit and the
+merge-rate data:
 
-- **`max_concurrency: 1` is about pool fairness, not safety.** Boskos leasing is live — pool
+- **It should not be a postsubmit at all** — see the arithmetic above. This section specified one
+  for six revisions before anyone costed it.
+- **`max_concurrency: 1` is about scheduling, not safety.** Boskos leasing is live — pool
   `kube-agents-evals-project`, three projects, and the presubmit runs at `max_concurrency: 3` to
-  keep it saturated. Concurrent runs cannot corrupt each other. The postsubmit holds at 1 so a
-  merge storm cannot starve pull requests of all three projects.
+  keep it saturated. Concurrent runs cannot corrupt each other. The nightly holds at 1 so a run that
+  overruns its night cannot overlap the next.
 - **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
-  merge" flag; a postsubmit runs after the merge it would have gated. The substantive point stands
-  and is now carried by the TestGrid alert instead: a silently failing postsubmit stops the store
-  filling, and an empty store reads as a legitimate green to every presubmit. Nothing degrades
-  visibly, so alerting is a requirement, not a nicety.
+  merge" flag, and a periodic gates nothing. The substantive point is carried by the TestGrid alert
+  instead: a silently failing recorder stops the store filling, and an empty store reads as a
+  legitimate green to every presubmit, because an unadmitted case cannot fire the quality rungs.
+  Nothing degrades visibly, so alerting is a requirement, not a nicety.
 - **The cluster is `build-kube-agents`**, the image is pinned (`kubekins-e2e:latest-1.32`), secrets
   are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
   run.
 
-Two decisions are left open for the reviewer there, both stated on the pull request: whether the
-job should carry the presubmit's `skip_if_only_changed` regex (cost, against sampling bias — every
-merge at an unchanged version key is another sample toward the twenty runs admission needs), and
-whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants.
+Two numbers in it are starting points rather than measurements, and both are flagged in the file:
+`EVAL_REPETITIONS: 10` and `timeout: 4h`. The binding constraint on both is that
+`gpu-stress-test-diagnosis` re-applies its OpenTofu GPU stack on **every** repetition, so the cost
+per repetition is not the ~90s of agent time the fixtures show. Tune them from the first few runs.
+
+One decision is left open for the reviewer there: whether the shared `prowjob-default-sa` or a
+dedicated identity should hold the bucket grants.
 
 The shape, with the harness elided:
 
 ```yaml
 # GoogleCloudPlatform/oss-test-infra:
-#   prow/prowjobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml
-postsubmits:
-  gke-labs/kube-agents:
-    - name: post-kube-agents-eval-baseline
-      annotations:
-        testgrid-dashboards: googleoss-kube-agents
-        testgrid-tab-name: postsubmit-eval-baseline
-        testgrid-alert-email: <owner alias>
-        testgrid-num-failures-to-alert: "2"
-      branches:
-        - ^main$
-      # Deliberately NOT skip_if_only_changed: every merge at an unchanged
-      # version key is another sample toward the twenty runs admission needs,
-      # and skipping by changed path biases the sample. Reviewer's call.
-      always_run: true
-      # Pool fairness, not safety -- Boskos leasing makes concurrency safe.
-      # A merge storm must not starve pull requests of all three projects.
-      max_concurrency: 1
-      cluster: build-kube-agents
-      decorate: true
-      decoration_config:
-        timeout: 85m
-        grace_period: 5m
-      spec:
-        serviceAccountName: prowjob-default-sa
-        containers:
-          - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:latest-1.32
-            command: [/bin/bash, -c]
-            args:
-              - |
-                # ... the presubmit's Boskos lease / heartbeat / cleanup
-                # harness and run_step ladder, lifted verbatim ...
+#   prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml
+periodics:
+  - name: periodic-kube-agents-eval-baseline
+    # 07:00 UTC is 03:00 Toronto on daylight time, 02:00 on standard time --
+    # overnight year-round without a second entry, and clear of the repo's
+    # 02:00 UTC GitHub Actions nightly.
+    cron: "0 7 * * *"
+    # A periodic has no ref of its own. base_ref is a branch, not a pin: Prow
+    # resolves it at trigger time, so every run is main's latest commit.
+    extra_refs:
+      - org: gke-labs
+        repo: kube-agents
+        base_ref: main
+    annotations:
+      testgrid-dashboards: googleoss-kube-agents
+      testgrid-tab-name: nightly-eval-baseline
+      testgrid-alert-email: <owner alias>
+      testgrid-num-failures-to-alert: "2"
+    # Scheduling, not safety -- Boskos leasing makes concurrency safe. This is
+    # so a run that overruns its night cannot overlap the next.
+    max_concurrency: 1
+    cluster: build-kube-agents
+    decorate: true
+    decoration_config:
+      # Both this and EVAL_REPETITIONS are starting points; tune from real runs.
+      timeout: 4h
+      grace_period: 10m
+    spec:
+      serviceAccountName: prowjob-default-sa
+      containers:
+        - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:latest-1.32
+          command: [/bin/bash, -c]
+          args:
+            - |
+              # ... the presubmit's Boskos lease / heartbeat / cleanup
+              # harness and run_step ladder, lifted verbatim ...
 
-                # The one line that makes this job a baseline recorder.
-                # Unset, bench-gate record appends into the git checkout and
-                # the append dies with the workspace -- which is exactly what
-                # happens on the presubmit, and why the store never filled.
-                export EVAL_BASELINE_STORE="gs://kube-agents-evals-bench/evidence"
-                # Must track the presubmit's effective value.
-                export EVAL_REPETITIONS="3"
+              # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
+              # the literal "latest", so every night would tag its build
+              # pr-local-latest and no line would record the commit it measured.
+              # extra_refs has already checked out main's head.
+              export PULL_PULL_SHA="$(git rev-parse HEAD)"
+              # The one line that makes this job a baseline recorder.
+              # Unset, bench-gate record appends into the git checkout and
+              # the append dies with the workspace -- which is exactly what
+              # happens on the presubmit, and why the store never filled.
+              export EVAL_BASELINE_STORE="gs://kube-agents-evals-bench/evidence"
+              # Deliberately not the presubmit's 3 -- see above.
+              export EVAL_REPETITIONS="10"
 ```
 
-`JOB_TYPE=postsubmit` and an unset `PULL_NUMBER` are supplied by Prow itself, which is why neither
+`JOB_TYPE=periodic` and an unset `PULL_NUMBER` are supplied by Prow itself, which is why neither
 appears above — both guards in `hack/ci-eval-pr.sh` and `bench-gate record` key on exactly what the
 decorator sets, so nothing here needs to assert them and nothing should override them.
 
@@ -685,7 +720,7 @@ construction. The `gcloud` is in [Provisioning it](#provisioning-it).
 The complication is that both jobs currently run as `prowjob-default-sa`. Granting creator to that
 shared identity gives it to the presubmit too, and the cleanest defence-in-depth — presubmit gets
 `objectViewer` only, so "a pull request never writes" survives a careless edit to the shell —
-requires a **dedicated service account for the postsubmit**. That is worth doing and is not free:
+requires a **dedicated service account for the nightly**. That is worth doing and is not free:
 it is a new KSA, a new GSA and a Workload Identity binding in `build-kube-agents`, which is
 infrastructure this repository does not own. Until it exists, "a pull request never writes" rests
 on the two guards in the code — `JOB_TYPE` and `PULL_NUMBER` — rather than on IAM. Flagged for the
@@ -711,7 +746,7 @@ is silent — a legitimate green, not a broken gate.
 Three resets, all of which happen without deleting anything.
 
 **Version bump (automatic).** Any of the five components changing means zero lines match the
-current key, so every case drops to unadmitted and re-screens itself over the next ~7 merges. Old
+current key, so every case drops to unadmitted and re-screens itself over the next two nights. Old
 lines stay — they are still true about the software they were measured on.
 
 **Degradation (automatic).** A case that starts failing has its passing lines pushed out of the
@@ -872,14 +907,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The bucket and its grants do not exist; `kube-agents-evals` IAM is owned elsewhere. Until then
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).
-- No postsubmit Prow job exists yet for `hack/ci-eval-pr.sh` (job config lives in
+- No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
   `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
   admitted. It is written and open as a draft —
   [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665), see
   [The job that writes it](#the-job-that-writes-it) — held until this pull request merges and the
-  bucket exists. Two questions are open on it: what it costs (a presubmit's spend on every merge,
-  forever, which is whoever owns the CI budget's call and may want the presubmit's
-  `skip_if_only_changed`), and whether it gets a dedicated service account.
+  bucket exists. Three things are open on it: `EVAL_REPETITIONS: 10` and `timeout: 4h` are
+  starting points rather than measurements and want tuning from the first real runs; the
+  `testgrid-alert-email` is a placeholder that must not merge as-is; and whether it gets a
+  dedicated service account rather than the shared `prowjob-default-sa`.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
