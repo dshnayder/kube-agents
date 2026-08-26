@@ -153,6 +153,39 @@ This layout exists to fit the **`roles/storage.objectCreator`** grant, which can
 but cannot overwrite or delete existing ones. That makes append-only an IAM guarantee rather than a
 convention — strictly stronger than what git gives, where a force-push can rewrite history.
 
+### What the job's service account needs
+
+The backend shells out to three `gcloud storage` verbs, and they do not all fall under one role:
+
+| Path                               | Verb           | Permission               | Role                          |
+| ---------------------------------- | -------------- | ------------------------ | ----------------------------- |
+| `bench-gate case` / `suite` — read | `ls gs://…/**` | `storage.objects.list`   | `roles/storage.objectViewer`  |
+| `bench-gate case` / `suite` — read | `cat`          | `storage.objects.get`    | `roles/storage.objectViewer`  |
+| `bench-gate record` — append       | `cp - gs://…`  | `storage.objects.create` | `roles/storage.objectCreator` |
+
+So the **postsubmit** needs both roles on the bucket; `objectCreator` alone cannot read back what
+it wrote. Neither role carries `storage.objects.delete`, which is the property the whole layout
+depends on, so the pair is still strictly weaker than `roles/storage.objectUser` or
+`roles/storage.admin` — ask for the two named roles, not the convenient one.
+
+**The presubmit needs `objectViewer` only.** A pull request is graded against the store and must
+never write to it. That is already enforced twice in software — the `JOB_TYPE = postsubmit`
+condition in `hack/ci-eval-pr.sh` and a refusal inside `bench-gate record` when `PULL_NUMBER` is
+set — and if the two job types can run as different service accounts, withholding
+`objectCreator` from the presubmit's makes it structural rather than conventional. That is the
+strongest of the three guards, because it survives a careless edit to either of the others.
+
+Both roles can be scoped to the prefix with an IAM condition on
+`resource.name.startsWith("projects/_/buckets/<bucket>/objects/<prefix>/")`, so the bucket can hold
+other things the eval job cannot touch.
+
+Two bucket settings matter as much as the roles. **Uniform bucket-level access** should be on, so
+IAM is the only access path and per-object ACLs cannot quietly widen it. And the bucket must carry
+**no lifecycle deletion rule**: an expiry rule would delete evidence out from under admitted cases
+and de-admit them for a storage-policy reason nobody would think to look for. That is one of the
+four arguments against the Prow artifact bucket, and it applies just as much to a bucket of our
+own.
+
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
 in IAM terms needs `storage.objects.delete`, which is precisely the permission whose absence was
@@ -497,8 +530,9 @@ not leave the project.
 
 ## Open items
 
-- The bucket and its `objectCreator` grant do not exist; `kube-agents-evals` IAM is owned
-  elsewhere. Until then the GCS backend is dormant and the local backend is the default.
+- The bucket and its grants do not exist; `kube-agents-evals` IAM is owned elsewhere. Until then
+  the GCS backend is dormant and the local backend is the default. See
+  [What the job's service account needs](#what-the-jobs-service-account-needs).
 - No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
   `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.

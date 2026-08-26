@@ -125,6 +125,12 @@ becomes an IAM guarantee rather than a convention, which is stronger than git,
 where a force-push can rewrite history. Object names begin with an ISO-8601 UTC
 stamp so a lexical sort is chronological.
 
+Reading needs a second role. The backend lists and `cat`s, which is
+`storage.objects.list` and `storage.objects.get` — `roles/storage.objectViewer`,
+which `objectCreator` does not include. A postsubmit needs both; a presubmit
+needs only `objectViewer`, because a pull request is graded against the store
+and never writes to it. Neither role carries `storage.objects.delete`.
+
 `<key…>` is the record's own version key spelled out as directories —
 `<setup-id>/<judge-model>/<sv>-f<n>-v<n>` — so an object files itself under the
 software it was measured on:
