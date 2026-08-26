@@ -587,94 +587,109 @@ expensive the lever is repetitions or a cron-style sampling of merges — **not*
 merges count, which would reintroduce exactly the selection bias that recording unconditionally
 exists to avoid.
 
-#### Draft job definition
+#### The job definition
 
-A starting point for the `oss-test-infra` pull request, not a copy of anything that runs. The
-values marked `# TODO` are the ones this repo cannot know — the presubmit's own definition lives in
-that repository and should be the template, since the two jobs must agree on image, cluster,
-service account and secret wiring or the baseline is measured on a different setup than the thing
-compared against it.
+It exists, as a draft:
+[`GoogleCloudPlatform/oss-test-infra#2665`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665),
+adding `prow/prowjobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml`. It is held draft until
+this pull request merges and the bucket and its two IAM grants exist. The YAML is not reproduced
+here — a copy in a second repository is a copy that goes stale, and the shape below is the part
+that matters.
+
+**Its script body is the presubmit's, byte-for-byte, plus sixteen lines** — the two exports above
+and their comments, and nothing removed. That is a deliberate choice over factoring, and the reason
+is the same one that governs the version key: the two jobs must agree on how a run is produced, or
+the baseline is not a baseline for the thing compared against it. A copy that is obviously a copy
+fails loudly under `diff`; a subtly different harness does not. It does duplicate ~140 lines of
+Boskos lease, heartbeat and cleanup logic, and the right fix is to move that harness into `hack/`
+in this repository so both jobs call one script. That is follow-up work, tracked on the pull
+request.
+
+Three things the first draft of this section got wrong, corrected against the real presubmit:
+
+- **`max_concurrency: 1` is about pool fairness, not safety.** Boskos leasing is live — pool
+  `kube-agents-evals-project`, three projects, and the presubmit runs at `max_concurrency: 3` to
+  keep it saturated. Concurrent runs cannot corrupt each other. The postsubmit holds at 1 so a
+  merge storm cannot starve pull requests of all three projects.
+- **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
+  merge" flag; a postsubmit runs after the merge it would have gated. The substantive point stands
+  and is now carried by the TestGrid alert instead: a silently failing postsubmit stops the store
+  filling, and an empty store reads as a legitimate green to every presubmit. Nothing degrades
+  visibly, so alerting is a requirement, not a nicety.
+- **The cluster is `build-kube-agents`**, the image is pinned (`kubekins-e2e:latest-1.32`), secrets
+  are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
+  run.
+
+Two decisions are left open for the reviewer there, both stated on the pull request: whether the
+job should carry the presubmit's `skip_if_only_changed` regex (cost, against sampling bias — every
+merge at an unchanged version key is another sample toward the twenty runs admission needs), and
+whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants.
+
+The shape, with the harness elided:
 
 ```yaml
-# oss-test-infra: config/jobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml
+# GoogleCloudPlatform/oss-test-infra:
+#   prow/prowjobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml
 postsubmits:
   gke-labs/kube-agents:
     - name: post-kube-agents-eval-baseline
-      # Every merge to main. This job IS the baseline: skipping merges would
-      # bias the evidence toward whatever kind of change happens to be cheap
-      # to run, which is the one thing recording-unconditionally exists to
-      # prevent.
+      annotations:
+        testgrid-dashboards: googleoss-kube-agents
+        testgrid-tab-name: postsubmit-eval-baseline
+        testgrid-alert-email: <owner alias>
+        testgrid-num-failures-to-alert: "2"
       branches:
         - ^main$
-      # MUST stay 1 until #637 (Boskos one-project-per-run leasing) lands.
-      # Every run installs cluster-wide singletons -- CRDs, webhooks,
-      # ClusterRoles -- onto the shared platform-agent-host cluster, so two
-      # concurrent runs corrupt each other regardless of the per-run task
-      # cluster names being unique.
+      # Deliberately NOT skip_if_only_changed: every merge at an unchanged
+      # version key is another sample toward the twenty runs admission needs,
+      # and skipping by changed path biases the sample. Reviewer's call.
+      always_run: true
+      # Pool fairness, not safety -- Boskos leasing makes concurrency safe.
+      # A merge storm must not starve pull requests of all three projects.
       max_concurrency: 1
-      # A merge cannot be blocked by a job that runs after it. This flag only
-      # controls whether the result is advertised; it must NOT be read as
-      # "failures are ignorable". A silently failing postsubmit stops the
-      # store filling, and an empty store reads as a legitimate green -- the
-      # gate loses its teeth with no signal at all. Alerting on this job is a
-      # requirement, not a nicety.
-      optional: false
-      # Deploy + 2 tasks x 3 repetitions + teardown. Observed per-run cost is
-      # 46-133s of agent time alone, before cluster provisioning.
+      cluster: build-kube-agents
       decorate: true
       decoration_config:
-        timeout: 3h
-        grace_period: 15m
-      # TODO: match the presubmit exactly.
-      cluster: default
-      labels:
-        preset-service-account: "true"
-        # TODO: the preset that mounts GEMINI_API_KEY, as the presubmit uses.
-        preset-kube-agents-gemini-key: "true"
+        timeout: 85m
+        grace_period: 5m
       spec:
-        serviceAccountName: kube-agents-eval-postsubmit # TODO: create; see below
+        serviceAccountName: prowjob-default-sa
         containers:
-          - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:latest # TODO: match presubmit
-            command:
-              - runner.sh
+          - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:latest-1.32
+            command: [/bin/bash, -c]
             args:
-              - bash
-              - -c
               - |
-                set -euo pipefail
-                hack/ci-deploy.sh
-                hack/ci-eval-pr.sh
-                hack/ci-teardown.sh
-            env:
-              # The one line that closes the loop. Unset, bench-gate record
-              # appends into the git checkout and the append dies with the
-              # workspace.
-              - name: EVAL_BASELINE_STORE
-                value: gs://kube-agents-evals-bench/evidence
-              # Must match the presubmit: a baseline measured at a different
-              # repetition count is not a baseline for it.
-              - name: EVAL_REPETITIONS
-                value: "3"
-              # Static until Boskos leasing lands; ci-env.sh defaults to this
-              # anyway, set explicitly so the job is self-describing.
-              - name: PROJECT_ID
-                value: kube-agents-evals
-            resources:
-              requests:
-                cpu: "2"
-                memory: 4Gi
+                # ... the presubmit's Boskos lease / heartbeat / cleanup
+                # harness and run_step ladder, lifted verbatim ...
+
+                # The one line that makes this job a baseline recorder.
+                # Unset, bench-gate record appends into the git checkout and
+                # the append dies with the workspace -- which is exactly what
+                # happens on the presubmit, and why the store never filled.
+                export EVAL_BASELINE_STORE="gs://kube-agents-evals-bench/evidence"
+                # Must track the presubmit's effective value.
+                export EVAL_REPETITIONS="3"
 ```
 
 `JOB_TYPE=postsubmit` and an unset `PULL_NUMBER` are supplied by Prow itself, which is why neither
 appears above — both guards in `hack/ci-eval-pr.sh` and `bench-gate record` key on exactly what the
 decorator sets, so nothing here needs to assert them and nothing should override them.
 
-The service account is the piece with a real prerequisite. It needs Workload Identity binding to a
-GSA holding **both** `roles/storage.objectCreator` and `roles/storage.objectViewer` on the bucket —
-creator to append, viewer because the job also reads the store to compute its own verdict. The
-`gcloud` for that is in [Provisioning it](#provisioning-it); the presubmit's service account gets
-`objectViewer` only, and withholding creator there is what makes "a pull request never writes"
-survive a careless edit to the shell.
+The service account is the piece with a real prerequisite, and the one genuinely unresolved
+question here. The job needs Workload Identity binding to a GSA holding **both**
+`roles/storage.objectCreator` and `roles/storage.objectViewer` on the bucket — creator to append,
+viewer because the job also reads the store to compute its own verdict. Neither role includes the
+other, and neither carries `storage.objects.delete`, so the evidence is append-only by
+construction. The `gcloud` is in [Provisioning it](#provisioning-it).
+
+The complication is that both jobs currently run as `prowjob-default-sa`. Granting creator to that
+shared identity gives it to the presubmit too, and the cleanest defence-in-depth — presubmit gets
+`objectViewer` only, so "a pull request never writes" survives a careless edit to the shell —
+requires a **dedicated service account for the postsubmit**. That is worth doing and is not free:
+it is a new KSA, a new GSA and a Workload Identity binding in `build-kube-agents`, which is
+infrastructure this repository does not own. Until it exists, "a pull request never writes" rests
+on the two guards in the code — `JOB_TYPE` and `PULL_NUMBER` — rather than on IAM. Flagged for the
+reviewer on the `oss-test-infra` pull request; the `TODO` in the YAML marks the spot.
 
 ### The four pre-admission states
 
@@ -857,11 +872,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The bucket and its grants do not exist; `kube-agents-evals` IAM is owned elsewhere. Until then
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).
-- No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
+- No postsubmit Prow job exists yet for `hack/ci-eval-pr.sh` (job config lives in
   `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
-  admitted. A draft definition is in [The job that writes it](#the-job-that-writes-it); its `TODO`
-  values need the presubmit's own definition as a template, and what it costs — a presubmit's spend
-  on every merge, forever — is an open question for whoever owns the CI budget.
+  admitted. It is written and open as a draft —
+  [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665), see
+  [The job that writes it](#the-job-that-writes-it) — held until this pull request merges and the
+  bucket exists. Two questions are open on it: what it costs (a presubmit's spend on every merge,
+  forever, which is whoever owns the CI budget's call and may want the presubmit's
+  `skip_if_only_changed`), and whether it gets a dedicated service account.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
