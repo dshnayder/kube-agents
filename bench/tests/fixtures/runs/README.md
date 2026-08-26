@@ -18,6 +18,22 @@ Every failure-mode fixture the tests need is **derived in the test** by
 mutating a copy of one of these, so there is exactly one place where a real
 record's shape is asserted.
 
+They are also **inputs to the tests of the scorer, not inputs to the gate**.
+Nothing in `kube_agents_bench/` reads this directory; `hack/ci-eval-pr.sh` hands
+`bench-gate` the run directories devops-bench just wrote. A fixture's
+`VerificationCorrectness: 0.5` is not a claim about how the agent scores today —
+it is a vehicle for asserting that 0.5 is below the floor. So these do not go
+stale when the agent improves, and they are never updated because a pull request
+changed the results.
+
+**What they do not do.** They are frozen, so they cannot detect that
+devops-bench changed its output. A key renamed upstream leaves every test here
+green — the capture still carries the old name — and surfaces as a rung-3 block
+on the first live run. The parse layer's real test is that first live run;
+`test_every_captured_run_reads_as_a_live_record` only pins `load_run` against
+this sample. Re-capture when the `devops-bench` SHA in `bench/pyproject.toml`
+moves, which is the event that can change the schema.
+
 ## Provenance
 
 Captured 2026-08-24 against a live management-cluster install from a cloudtop

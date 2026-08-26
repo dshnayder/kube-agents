@@ -201,8 +201,12 @@ def test_an_unparseable_score_is_none():
 def test_every_captured_run_reads_as_a_live_record(name):
     """The fixtures are what the ladder's field names were derived from.
 
-    If a devops-bench bump renames any of these, this fails here rather than
-    silently downgrading every run to a rung-3 block in CI.
+    What this pins is ``load_run`` against the recorded sample: a refactor that
+    drops or renames a field mapping fails here. It does **not** catch a
+    devops-bench bump, and an earlier version of this docstring claimed it did.
+    The fixture is frozen, so a key renamed upstream leaves this green -- the
+    capture still carries the old name -- and surfaces as a rung-3 block on the
+    first live run instead. See the fixtures README.
     """
     record = load_run(FIXTURE_RUNS / name)
     assert record is not None
