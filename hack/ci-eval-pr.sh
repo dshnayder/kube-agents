@@ -613,10 +613,24 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
 # roles/storage.objectCreator grant, which is what actually closes the loop on
 # main. VERSIONS.json stays in git either way; --baseline-dir still finds it.
 #
-# It defaults to unset because the bucket does not exist yet. Turning this on
-# is a one-line change here once it does, and until then the store fills only
-# by hand from the --lines-out artefact below.
-# See docs/designs/eval-scorer.md.
+# READ AND WRITE BOTH GO THROUGH THIS ONE VARIABLE, so turning the store on is
+# TWO Prow exports, not one, and forgetting the second is silent:
+#
+#   nightly periodic -- set it, with objectViewer AND objectCreator. Appends.
+#   presubmit        -- set it, with objectViewer ONLY. Reads.
+#
+# A presubmit that leaves it unset reads the empty checked-in directory, finds
+# no case admitted, and reports a legitimate green with rungs 4 and 6 and the
+# aggregate all inert -- the rate-based half of the gate, silently absent.
+# Withholding objectCreator there is what makes "a pull request cannot write
+# the baseline it is judged against" structural rather than conventional; see
+# docs/designs/eval-scorer.md#what-the-jobs-service-account-needs.
+#
+# It defaults to unset because the bucket does not exist yet. Pointing at a
+# bucket that is not there is not fatal -- an unreachable store degrades to
+# advisory with a banner -- but it is a banner on every run, so both exports
+# wait for the bucket. Until then the store fills only by hand from the
+# --lines-out artefact below.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and

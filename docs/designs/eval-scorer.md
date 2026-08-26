@@ -931,6 +931,16 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The bucket and its grants do not exist; `kube-agents-evals` IAM is owned elsewhere. Until then
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).
+- **Switching the store on is two Prow exports, not one, and the presubmit's is the one that gets
+  forgotten.** `EVAL_BASELINE_STORE` is the single variable for both directions: the nightly sets
+  it and appends (`objectViewer` + `objectCreator`), and the presubmit must set it too and only
+  read (`objectViewer`). A presubmit that leaves it unset reads the empty checked-in directory,
+  finds nothing admitted, and reports a **legitimate green** with rung 4, rung 6 and the aggregate
+  all inert — the rate-based half of this design, silently absent, with no signal that it is
+  missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
+  looks like a working gate. Neither export exists yet: the presubmit sets nothing, and
+  [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665) adds it to
+  the nightly only. Both wait on the bucket.
 - No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
   `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
   admitted. It is written and open as a draft —
