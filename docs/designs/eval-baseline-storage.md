@@ -2,8 +2,11 @@
 
 > **STATUS — design of record; partially implemented.** The record format, the version key,
 > admission, reset and rung 6 are implemented in `bench/kube_agents_bench/` and covered by
-> `bench/tests/`. The GCS backend is implemented and defaults **off**; the bucket and its IAM
-> grant do not exist yet, and the dashboard is described here but not built.
+> `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been validated end
+> to end against a real bucket in a personal dev project (see
+> [What has been validated, and where](#what-has-been-validated-and-where)), but the production
+> bucket and its IAM grants do not exist yet, no postsubmit job writes to it, and the dashboard is
+> described here but not built.
 
 **Scope:** Where the eval scorer's results are stored, how a baseline is established, compared
 against and reset, and how a quality-over-time dashboard would read the same data.
@@ -185,6 +188,89 @@ IAM is the only access path and per-object ACLs cannot quietly widen it. And the
 and de-admit them for a storage-policy reason nobody would think to look for. That is one of the
 four arguments against the Prow artifact bucket, and it applies just as much to a bucket of our
 own.
+
+### Provisioning it
+
+```bash
+BUCKET=kube-agents-evals-bench          # globally unique
+PROJECT=kube-agents-evals
+POST_SA=<postsubmit-sa>@${PROJECT}.iam.gserviceaccount.com
+PRE_SA=<presubmit-sa>@${PROJECT}.iam.gserviceaccount.com
+
+# No lifecycle rule and no versioning, deliberately: nothing may delete evidence,
+# and nothing can overwrite it, so there are no versions to keep.
+gcloud storage buckets create "gs://${BUCKET}" \
+  --project="${PROJECT}" \
+  --location=us-central1 \
+  --default-storage-class=STANDARD \
+  --uniform-bucket-level-access \
+  --public-access-prevention
+
+# The postsubmit reads and appends.
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${POST_SA}" --role=roles/storage.objectViewer
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${POST_SA}" --role=roles/storage.objectCreator
+
+# The presubmit only reads. Withholding objectCreator is the guard that survives
+# a careless edit to hack/ci-eval-pr.sh.
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${PRE_SA}" --role=roles/storage.objectViewer
+```
+
+To scope a grant to the prefix rather than the whole bucket, add a condition:
+
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${POST_SA}" \
+  --role=roles/storage.objectCreator \
+  --condition='title=evidence-prefix-only,expression=resource.name.startsWith("projects/_/buckets/'"${BUCKET}"'/objects/evidence/")'
+```
+
+Then point the job at it — `hack/ci-eval-pr.sh` defaults the variable to empty, so this is the
+one-line change that turns the backend on:
+
+```bash
+export EVAL_BASELINE_STORE="gs://${BUCKET}/evidence"
+```
+
+Verify the grant is the one intended, rather than trusting the role names:
+
+```bash
+gcloud storage buckets get-iam-policy "gs://${BUCKET}" --format=json
+
+# Overwrite must be refused. This is the guarantee the whole layout rests on.
+OBJ="gs://${BUCKET}/evidence/<some-existing-object>.jsonl"
+echo '{"tampered":true}' | gcloud storage cp - "${OBJ}" \
+  --impersonate-service-account="${POST_SA}"
+# expected: does not have storage.objects.delete access to the ... object
+```
+
+That last check is worth running rather than assuming, and the error text is the reason why: GCS
+implements an overwrite as a delete plus a create, so it is `storage.objects.delete` that gets
+refused — the permission neither role grants.
+
+### What has been validated, and where
+
+The backend has been exercised end to end against a real bucket
+(`gs://dshnayder-gke-dev-evals-bench`, in a personal dev project, standing in for the one
+`kube-agents-evals` will own). Confirmed live rather than against the test suite's fake `gcloud`:
+
+| Claim                                                       | Result                                                            |
+| ----------------------------------------------------------- | ----------------------------------------------------------------- |
+| An empty prefix reads as an empty store, not an outage      | `[]`, no error                                                    |
+| Objects file themselves under the version key               | path as specified above                                           |
+| A `verifiers` bump starts a new directory, freezing the old | `…/v1-f1-v1/` and `…/v1-f1-v2/` side by side                      |
+| `objectViewer` + `objectCreator` can list, read and create  | all three verbs succeed                                           |
+| **Overwrite is refused**                                    | `does not have storage.objects.delete access`; object left intact |
+| `objectViewer` alone cannot write                           | `does not have storage.objects.create`                            |
+| Ten postsubmit appends accumulate to admission              | `admitted on 20/20 screening runs across 10 recorded run(s)`      |
+| An admitted case that fails every repetition reds the suite | rung 4 collapse, `suite` exits 1                                  |
+| A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
+| A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
+
+What remains unvalidated is the part no local run can reach: the postsubmit Prow job, which does
+not exist yet.
 
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
