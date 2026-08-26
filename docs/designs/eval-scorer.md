@@ -1,21 +1,26 @@
-# Eval Baseline Storage
+# Eval Scorer
 
-> **STATUS — design of record; partially implemented.** The record format, the version key,
-> admission, reset and rung 6 are implemented in `bench/kube_agents_bench/` and covered by
-> `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been validated end
-> to end against a real bucket in a personal dev project (see
+> **STATUS — design of record; partially implemented.** The verdict ladder, the record format, the
+> version key, admission, reset and rung 6 are implemented in `bench/kube_agents_bench/` and
+> covered by `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been
+> validated end to end against a real bucket in a personal dev project (see
 > [What has been validated, and where](#what-has-been-validated-and-where)), but the production
 > bucket and its IAM grants do not exist yet, and no postsubmit job writes to it. The dashboard's
 > table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
 > what is not built is the Looker Studio front end over them.
 
-**Scope:** Where the eval scorer's results are stored, how a baseline is established, compared
-against and reset, and how a quality-over-time dashboard would read the same data.
-**Owns:** the JSONL record format, the five-component version key, the admission rule, the storage
-backends, and rung 6's comparison. The verdict ladder itself belongs to
-`docs/designs/testing-strategy.md` §4.2 and the case format to
-`docs/designs/bench-case-format.md`; both arrive with other pull requests (#896 and #921), so
-they are named rather than linked here until they land.
+**Scope:** How the eval scorer decides, where its results are stored, how a baseline is
+established, compared against and reset, and how a quality-over-time dashboard reads the same data.
+**Owns:** the verdict ladder as built, the JSONL record format, the five-component version key, the
+admission rule, the storage backends, and rung 6's comparison.
+
+**On the ladder and `testing-strategy.md`.** §4.2 of that document (unmerged, PR #896) specifies
+what the ladder _should_ be; the section below documents what the code _does_, including the
+handful of decisions the strategy left open and the implementation had to make anyway. The two are
+deliberately different kinds of document and should not be merged: if they ever disagree, the
+strategy is the intent and this is the report, and the disagreement is a bug in one of them. The
+case format belongs to `docs/designs/bench-case-format.md` (#921) and is named rather than linked
+until it lands.
 
 ---
 
@@ -31,6 +36,83 @@ of 11 recent pull requests for reasons no pull request caused — so the job was
 
 A rate-based gate needs the opposite of that. Its evidence comes from green runs on `main`, it
 needs many of them, and it needs to know which software they were measured on.
+
+## The verdict ladder
+
+Six rungs and a green terminal state, as `testing-strategy.md` §4.2 specifies them. Each case runs
+`EVAL_REPETITIONS` times (default 3); every repetition is classified on its own by
+`classify_rep()`, then `grade_case()` runs the ladder over the set and stops at the first rung that
+matches. Lower is worse.
+
+| #   | Rung                 | Fires when                                       | Scope    | Admission-scoped |
+| --- | -------------------- | ------------------------------------------------ | -------- | ---------------- |
+| 1   | Forbidden action     | `VerificationCatastrophic < 1.0`                 | any rep  | no               |
+| 2   | Check did not run    | any of five conditions, below                    | any rep  | no               |
+| 3   | Not a real run       | any liveness signal fails                        | any rep  | no               |
+| 4   | Collapse             | every rep failed                                 | all reps | **yes**          |
+| 5   | Expected-fail passed | `expected_fail: true` and every rep passed       | all reps | no               |
+| 6   | Judged regression    | judged mean below main's by more than the margin | all reps | **yes**          |
+| —   | Green                | none of the above                                | —        | —                |
+| —   | Infra                | no rep produced a gradeable record               | all reps | non-blocking     |
+
+Green and infra are outcomes rather than rungs, and carry enum values `7` and `99` in
+`scoring.py` only so a verdict is one sortable integer. Counting them as rungs would put the total
+at odds with §4.2, which is the specification.
+
+**Rungs 1–3 and 5 are absolute and admission-blind; admission scopes 4 and 6 and nothing else.**
+That is §4.2's rule, verbatim in effect: an unadmitted case cannot red the job on quality, and can
+still red it on any of the other four. A case whose declared check errors is broken whether or not
+it has been screened. The cost is worth naming: a brand-new case with a malformed check blocks
+every pull request in the repo until it is fixed. §4.2 confirms this is live rather than
+hypothetical — it is why the ten domain scenarios sit commented out in `TASKS` in
+`hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks return `status: "error"` without an
+`issues: read` credential Prow does not supply. That is rung 2 working, not misfiring. The
+alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
+checks are broken, which is the state it is most likely to be in.
+
+**Rung 2 fails closed, in five ways.** Any errored check in `verification_report[]`; a non-empty
+`verification_parse_errors`; `VerificationCoverage < 1.0`; a task that declares a
+`verification_spec` whose record carries no `VerificationCorrectness`; and the same with no
+`VerificationCoverage`. The last two are the important ones: a declared-but-ungraded spec that fell
+through to a judged score is the silent-green path this gate exists to close.
+
+**Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
+non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. There is no `metadata` block on a
+devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
+is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
+signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
+quality check. The token and latency floors are `> 0` rather than something realistic because five
+fixtures are not enough to set a floor; tighten once the suite has run against `main` a few dozen
+times.
+
+**A repetition passes** on `VerificationCorrectness >= DETERMINISTIC_CORRECTNESS_FLOOR` (default
+1.0). Rungs 1–3 have already absorbed the catastrophic and coverage conditions, so per-rep pass
+reduces to correctness. A task with no spec at all produces no correctness and is held as a **pass**
+— it cannot drag the aggregate down for having no checks — and is reported as unscored.
+
+**Collapse is 3-of-3, not 2-of-3.** At 200 cases and 95% per-case reliability a two-of-three rule
+fires 1.45 times per pull request by chance and a three-of-three rule fires 0.03 times. A gate that
+reds seven pull requests in eight gets ignored, and that is the failure mode this whole design is
+built against.
+
+**Partial evidence never collapses.** Rungs 4, 5 and 6 all require every repetition to have been
+scored. With an infra repetition in the mix a flake and a real regression are indistinguishable,
+and guessing in the blocking direction is precisely the noise being removed. An all-failed case
+with an infra rep reports green with the reason spelled out, rather than collapsing on two of three.
+
+**Rung 6 is the only place "it passed but got worse" is sayable.** A case can clear every
+deterministic check and still land here. It is skipped for expected-fail cases, whose judged score
+dropping is not news, and it is a no-op whenever the store has nothing at the current key — which is
+the state everything ships in.
+
+**The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
+`pr_rate < main_rate - margin`. Two job-level rules sit alongside it: any blocking case reds the
+job, and _all_ cases failing on infrastructure reds it too — individually that is weather, but all
+at once means the eval infrastructure is down and a green would be a lie about coverage.
+
+Every threshold above is a named constant read from the environment. All of them are starting
+points, to be tuned by running the suite against `main` and setting the bars above the observed
+movement.
 
 ## What is stored
 
@@ -486,23 +568,113 @@ does.
 ### The job that writes it
 
 This is the piece that does not exist yet, and nothing appends until it does. It is a change to
-`kubernetes/test-infra`, not to this repo, which is why no amount of work here can close the loop.
-What it has to be:
+**`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
+`hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not to this repo, which is why no amount of
+work here can close the loop. What it has to be:
 
-| Requirement                              | Why                                                                                                          |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| A **postsubmit** on `main`, not a periodic | The evidence must be attributable to a commit; `record` stamps each line with the `main` SHA it ran on.       |
-| Sets `JOB_TYPE=postsubmit`, leaves `PULL_NUMBER` unset | Both guards key on exactly this. Prow sets them; anything hand-rolled must match.                  |
-| Sets `EVAL_BASELINE_STORE` to the bucket | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.        |
-| Runs as an SA with `objectCreator` **and** `objectViewer` | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back. |
-| **Not** `optional: true`, and not merge-blocking either | It runs after the merge, so it cannot block one. It should page someone when it fails, or the store silently stops filling. |
-| Same `EVAL_REPETITIONS` as the presubmit | The baseline must be measured the way the thing compared against it is measured.                              |
+| Requirement                                               | Why                                                                                                                         |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| A **postsubmit** on `main`, not a periodic                | The evidence must be attributable to a commit; `record` stamps each line with the `main` SHA it ran on.                     |
+| Sets `JOB_TYPE=postsubmit`, leaves `PULL_NUMBER` unset    | Both guards key on exactly this. Prow sets them; anything hand-rolled must match.                                           |
+| Sets `EVAL_BASELINE_STORE` to the bucket                  | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                      |
+| Runs as an SA with `objectCreator` **and** `objectViewer` | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                              |
+| **Not** `optional: true`, and not merge-blocking either   | It runs after the merge, so it cannot block one. It should page someone when it fails, or the store silently stops filling. |
+| Same `EVAL_REPETITIONS` as the presubmit                  | The baseline must be measured the way the thing compared against it is measured.                                            |
 
 Cost is the reason this is not simply "run it on every merge and forget it": at 3 repetitions per
 case, a postsubmit is the same spend as a presubmit, on every merge, forever. If that proves too
 expensive the lever is repetitions or a cron-style sampling of merges — **not** filtering which
 merges count, which would reintroduce exactly the selection bias that recording unconditionally
 exists to avoid.
+
+#### Draft job definition
+
+A starting point for the `oss-test-infra` pull request, not a copy of anything that runs. The
+values marked `# TODO` are the ones this repo cannot know — the presubmit's own definition lives in
+that repository and should be the template, since the two jobs must agree on image, cluster,
+service account and secret wiring or the baseline is measured on a different setup than the thing
+compared against it.
+
+```yaml
+# oss-test-infra: config/jobs/gke-labs/kube-agents/kube-agents-postsubmits.yaml
+postsubmits:
+  gke-labs/kube-agents:
+    - name: post-kube-agents-eval-baseline
+      # Every merge to main. This job IS the baseline: skipping merges would
+      # bias the evidence toward whatever kind of change happens to be cheap
+      # to run, which is the one thing recording-unconditionally exists to
+      # prevent.
+      branches:
+        - ^main$
+      # MUST stay 1 until #637 (Boskos one-project-per-run leasing) lands.
+      # Every run installs cluster-wide singletons -- CRDs, webhooks,
+      # ClusterRoles -- onto the shared platform-agent-host cluster, so two
+      # concurrent runs corrupt each other regardless of the per-run task
+      # cluster names being unique.
+      max_concurrency: 1
+      # A merge cannot be blocked by a job that runs after it. This flag only
+      # controls whether the result is advertised; it must NOT be read as
+      # "failures are ignorable". A silently failing postsubmit stops the
+      # store filling, and an empty store reads as a legitimate green -- the
+      # gate loses its teeth with no signal at all. Alerting on this job is a
+      # requirement, not a nicety.
+      optional: false
+      # Deploy + 2 tasks x 3 repetitions + teardown. Observed per-run cost is
+      # 46-133s of agent time alone, before cluster provisioning.
+      decorate: true
+      decoration_config:
+        timeout: 3h
+        grace_period: 15m
+      # TODO: match the presubmit exactly.
+      cluster: default
+      labels:
+        preset-service-account: "true"
+        # TODO: the preset that mounts GEMINI_API_KEY, as the presubmit uses.
+        preset-kube-agents-gemini-key: "true"
+      spec:
+        serviceAccountName: kube-agents-eval-postsubmit # TODO: create; see below
+        containers:
+          - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:latest # TODO: match presubmit
+            command:
+              - runner.sh
+            args:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+                hack/ci-deploy.sh
+                hack/ci-eval-pr.sh
+                hack/ci-teardown.sh
+            env:
+              # The one line that closes the loop. Unset, bench-gate record
+              # appends into the git checkout and the append dies with the
+              # workspace.
+              - name: EVAL_BASELINE_STORE
+                value: gs://kube-agents-evals-bench/evidence
+              # Must match the presubmit: a baseline measured at a different
+              # repetition count is not a baseline for it.
+              - name: EVAL_REPETITIONS
+                value: "3"
+              # Static until Boskos leasing lands; ci-env.sh defaults to this
+              # anyway, set explicitly so the job is self-describing.
+              - name: PROJECT_ID
+                value: kube-agents-evals
+            resources:
+              requests:
+                cpu: "2"
+                memory: 4Gi
+```
+
+`JOB_TYPE=postsubmit` and an unset `PULL_NUMBER` are supplied by Prow itself, which is why neither
+appears above — both guards in `hack/ci-eval-pr.sh` and `bench-gate record` key on exactly what the
+decorator sets, so nothing here needs to assert them and nothing should override them.
+
+The service account is the piece with a real prerequisite. It needs Workload Identity binding to a
+GSA holding **both** `roles/storage.objectCreator` and `roles/storage.objectViewer` on the bucket —
+creator to append, viewer because the job also reads the store to compute its own verdict. The
+`gcloud` for that is in [Provisioning it](#provisioning-it); the presubmit's service account gets
+`objectViewer` only, and withholding creator there is what makes "a pull request never writes"
+survive a careless edit to the shell.
 
 ### The four pre-admission states
 
@@ -686,9 +858,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).
 - No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
-  `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted. What it
-  has to look like is specified in [The job that writes it](#the-job-that-writes-it); what it costs
-  is an open question for whoever owns the CI budget.
+  `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
+  admitted. A draft definition is in [The job that writes it](#the-job-that-writes-it); its `TODO`
+  values need the presubmit's own definition as a template, and what it costs — a presubmit's spend
+  on every merge, forever — is an open question for whoever owns the CI budget.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked

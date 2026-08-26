@@ -12,7 +12,7 @@ GCS is the intended production home, for one reason: on the local backend
 something has to *commit* the file, and the postsubmit that measures the
 evidence has no push credential. Every way of giving it one -- a bot with write
 access to ``main``, a pull request per merge, a weekly batched pull request --
-was worse than the problem. See ``docs/designs/eval-baseline-storage.md``.
+was worse than the problem. See ``docs/designs/eval-scorer.md``.
 
 The GCS layout is one immutable object per batch, filed under its version key::
 

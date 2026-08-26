@@ -261,7 +261,7 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
 # It defaults to unset because the bucket does not exist yet. Turning this on
 # is a one-line change here once it does, and until then the store fills only
 # by hand from the --lines-out artefact below.
-# See docs/designs/eval-baseline-storage.md.
+# See docs/designs/eval-scorer.md.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and

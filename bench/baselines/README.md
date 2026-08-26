@@ -170,7 +170,7 @@ mode that gets a gate switched off. Bytes that arrived and will not parse are a
 different thing and remain fatal.
 
 Full rationale, including the approaches that were rejected:
-`docs/designs/eval-baseline-storage.md`.
+`docs/designs/eval-scorer.md`.
 
 ## The version key
 
