@@ -5,8 +5,9 @@
 > `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been validated end
 > to end against a real bucket in a personal dev project (see
 > [What has been validated, and where](#what-has-been-validated-and-where)), but the production
-> bucket and its IAM grants do not exist yet, no postsubmit job writes to it, and the dashboard is
-> described here but not built.
+> bucket and its IAM grants do not exist yet, and no postsubmit job writes to it. The dashboard's
+> table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
+> what is not built is the Looker Studio front end over them.
 
 **Scope:** Where the eval scorer's results are stored, how a baseline is established, compared
 against and reset, and how a quality-over-time dashboard would read the same data.
@@ -574,6 +575,19 @@ the judge is trusted with exactly one thing, sized off its own measured noise.
 The store is already the right shape for one: append-only, timestamped, dimension-tagged, and never
 rewritten. Nothing further needs to be produced by CI.
 
+It is **built and runnable**, not just described: `bench/dashboard/external-table.json` and
+`bench/dashboard/dashboard.sql` create the table and all six views below, and both have been
+executed against a real bucket. Substitute the project and bucket and run:
+
+```bash
+PROJECT=kube-agents-evals
+bq --project_id=$PROJECT mk --dataset --location=us-central1 $PROJECT:eval_baselines
+bq --project_id=$PROJECT mk --table \
+  --external_table_definition=bench/dashboard/external-table.json \
+  $PROJECT:eval_baselines.evidence
+bq --project_id=$PROJECT query --use_legacy_sql=false < bench/dashboard/dashboard.sql
+```
+
 **Ingest.** Point BigQuery at the bucket as an external table over
 `gs://<bucket>/<prefix>/*.jsonl` with `format = NEWLINE_DELIMITED_JSON`. No ETL job, no schedule,
 no second copy — new objects appear in query results as soon as they are written. Promote to a
@@ -584,21 +598,46 @@ The key directories need no configuration: BigQuery's single `*` in a source URI
 deliberately **not** enabled — the segments are bare values rather than `key=value`, and every
 dimension they encode is already a column on each row.
 
+**Declare the schema; do not autodetect it.** This one is not a preference — `"autodetect": true`
+produces a table that is quietly missing columns. `blocked` and `infra` are omitted when zero and a
+judged metric is absent when the run did not produce it, so autodetect infers the shape from
+whichever fields happen to appear in its sample and leaves out the rest. Querying `blocked` then
+fails with `Unrecognized name: blocked` instead of returning zero, and a metric added later is
+unqueryable until the table is recreated. The record format's absent-never-zero rule is deliberate
+and correct; the consequence is that the **schema** has to be the thing that knows the full shape.
+`bench/dashboard/external-table.json` declares it. Autodetect also types `recorded_at` as `STRING`
+rather than `TIMESTAMP`, which silently breaks every date function downstream.
+
 **Model.** Each line is already a fact row. The `key` object supplies the dimensions
 (`setup_id`, `judge_model`, `scoring_version`, `fleet`, `verifiers`), `case` and `commit` the
 grain, `recorded_at` the time axis. Read those from the row, never from the object path: the path
 is an index and the record is the truth.
 
-**Views worth having, in rough priority:**
+**The views**, all defined in `bench/dashboard/dashboard.sql`:
 
-| View                     | Reads                                        | Answers                                         |
-| ------------------------ | -------------------------------------------- | ----------------------------------------------- |
-| Pass rate over time      | `SUM(passes)/SUM(runs)` per case per week    | Is the agent getting better or worse?           |
-| Judged mean over time    | `SUM(mean*n)/SUM(n)` per metric              | Is quality drifting below what rung 6 can see?  |
-| Admission state timeline | Rolling 20-run window per case               | Which cases can actually block, and since when? |
-| Flake rate               | Batches where `0 < passes < runs`            | Which cases are unreliable rather than broken?  |
-| Infra health             | `SUM(blocked+infra)/SUM(runs+blocked+infra)` | Is the harness or the fleet the real problem?   |
-| Time to admit            | First line to first admitted read, per key   | How long is the gate advisory after a bump?     |
+| View                | Answers                                                  |
+| ------------------- | -------------------------------------------------------- |
+| `pass_rate_weekly`  | Is the agent getting better or worse?                    |
+| `judged_weekly`     | Is quality drifting below what rung 6 can see?           |
+| `flakiness`         | Which cases are unreliable rather than broken?           |
+| `infra_health`      | Is the harness or the fleet the real problem?            |
+| `admission_state`   | Which cases can actually block a pull request right now? |
+| `drift_under_green` | Which cases pass every run while quality slides?         |
+
+`admission_state` deliberately mirrors what `baselines.py` computes at gate time — pool newest-first
+at one key until the run bar is met, whole batches only — so the dashboard and the gate cannot
+disagree about which cases are live. Reading it after a version bump shows every case falling back
+to unadmitted until it is re-screened, which is the behaviour most likely to be reported as a bug.
+
+`drift_under_green` is the one that justifies building this at all: it selects cases with a
+**perfect pass rate** whose judged mean is lower at the end of the window than at the start. The
+gate is green on every one of them by construction.
+
+**Presentation.** Point Looker Studio at the dataset: _Create → Data source → BigQuery →_ the
+`eval_baselines` views, then a time-series chart per view with `week` on the axis. Set
+`version_key` as the **series breakdown** rather than a filter, so a model bump renders as a new
+line beginning rather than a step in an existing one. A static HTML page regenerated by a periodic
+job is the fallback if the data should not leave the project.
 
 **Annotate the version key.** Every chart should break or band at a key change. A quality series
 plotted across a model bump is two different experiments drawn as one line, and it will be read as
@@ -609,10 +648,6 @@ is stored on every row rather than inferred.
 runs, so its standard error is small enough to show a 0.05 slide that a three-repetition margin of
 0.5 will never catch. The dashboard is therefore not a nicety — it is where drift detection
 actually lives, with rung 6 as the collapse alarm underneath it.
-
-**Presentation.** Looker Studio over the BigQuery view is the lowest-effort path and needs no
-service to run. A static HTML page regenerated by a periodic job is the fallback if the data should
-not leave the project.
 
 ## Open items
 
