@@ -545,7 +545,25 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request by chance at suite scale; three-of-three fires 0.03 times. The
 # loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
-EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
+#
+# !!! TEMPORARY: 1, NOT 3. REVERT BEFORE THIS PULL REQUEST MERGES. !!!
+#
+# The first CI run of this refactor has to answer "is it behaviour-preserving
+# against the old gate", and at three repetitions it would not get the chance
+# to: the presubmit's timeout is 85m, sized when the job ran TWO tasks once
+# each and averaged ~43m. #939 has since activated a third case, so three
+# repetitions is nine devops-bench invocations where the budget was set for
+# two -- the run would time out and prove nothing about the scorer. One
+# repetition is also the only configuration directly comparable to the old
+# one-run-per-task gate.
+#
+# At 1 the collapse rung degenerates to "the single run failed", which is
+# strictly more trigger-happy than the rule this change exists to introduce.
+# That is tolerable only because the job is optional: true and the store is
+# empty, so the sole case that can collapse is the one BOOTSTRAP_ADMITTED
+# names. Restore 3 -- and raise the timeout in
+# GoogleCloudPlatform/oss-test-infra to match -- before merge.
+EVAL_REPETITIONS="${EVAL_REPETITIONS:-1}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
