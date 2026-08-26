@@ -473,6 +473,37 @@ bar upward until nothing could clear it and nothing could fall back below it.
 `hack/ci-eval-pr.sh`, and an independent refusal inside `bench-gate record` when `PULL_NUMBER` is
 set. A guard living only in shell is one careless edit from being gone.
 
+Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
+self-admission: a case that wrote its own evidence could be admitted by the very diff that makes it
+pass. The broader reason is that **a branch is not `main`.** The baseline answers "how does this
+case behave on the merge target", and a branch's runs are a measurement of the branch — its
+half-finished refactor, its deliberately-broken fixture, its expected-fail case that has not been
+flipped yet. Those are all legitimate states for a branch and none of them are evidence about
+`main`. So the filter is not a quality judgement about branches, which is why there is no notion of
+a "good enough" branch that may contribute: the merge is what makes a run count, and nothing else
+does.
+
+### The job that writes it
+
+This is the piece that does not exist yet, and nothing appends until it does. It is a change to
+`kubernetes/test-infra`, not to this repo, which is why no amount of work here can close the loop.
+What it has to be:
+
+| Requirement                              | Why                                                                                                          |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| A **postsubmit** on `main`, not a periodic | The evidence must be attributable to a commit; `record` stamps each line with the `main` SHA it ran on.       |
+| Sets `JOB_TYPE=postsubmit`, leaves `PULL_NUMBER` unset | Both guards key on exactly this. Prow sets them; anything hand-rolled must match.                  |
+| Sets `EVAL_BASELINE_STORE` to the bucket | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.        |
+| Runs as an SA with `objectCreator` **and** `objectViewer` | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back. |
+| **Not** `optional: true`, and not merge-blocking either | It runs after the merge, so it cannot block one. It should page someone when it fails, or the store silently stops filling. |
+| Same `EVAL_REPETITIONS` as the presubmit | The baseline must be measured the way the thing compared against it is measured.                              |
+
+Cost is the reason this is not simply "run it on every merge and forget it": at 3 repetitions per
+case, a postsubmit is the same spend as a presubmit, on every merge, forever. If that proves too
+expensive the lever is repetitions or a cron-style sampling of merges — **not** filtering which
+merges count, which would reintroduce exactly the selection bias that recording unconditionally
+exists to avoid.
+
 ### The four pre-admission states
 
 Reported distinctly, because only one of them is a problem with the case:
@@ -655,7 +686,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).
 - No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
-  `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted.
+  `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted. What it
+  has to look like is specified in [The job that writes it](#the-job-that-writes-it); what it costs
+  is an open question for whoever owns the CI budget.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
