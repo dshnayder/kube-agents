@@ -80,10 +80,10 @@ It is also what makes a dashboard possible at all; see [Dashboard](#dashboard).
 Two backends, one record format, identical semantics. The scorer reads an ordered list of records
 per case and never touches a file directly.
 
-| Backend         | Location                 | Layout                                 |
-| --------------- | ------------------------ | -------------------------------------- |
-| Local (default) | `bench/baselines/`       | one appendable `<case>.jsonl` per case |
-| GCS             | `gs://<bucket>/<prefix>` | one immutable object per batch         |
+| Backend         | Location                 | Layout                                                      |
+| --------------- | ------------------------ | ----------------------------------------------------------- |
+| Local (default) | `bench/baselines/`       | one appendable `<case>.jsonl` per case                      |
+| GCS             | `gs://<bucket>/<prefix>` | one immutable object per batch, filed under its version key |
 
 Selected by `--baseline-store`, then `$EVAL_BASELINE_STORE`, then `--baseline-dir` — in that
 precedence. A value starting `gs://` picks GCS; anything else is a directory path. All three
@@ -109,12 +109,45 @@ test-infra, whose policy can change without anyone here hearing about it.
 ### GCS layout
 
 ```
-gs://<bucket>/<prefix>/<case-id>/<recorded_at>-<build-id>.jsonl
+gs://<bucket>/<prefix>/<case-id>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>/<recorded_at>-<build-id>.jsonl
+```
+
+For example:
+
+```
+gs://kube-agents-evals-bench/evidence/
+  agent-kanban-smoke/
+    gemini-3-1-pro-preview-kubeagents-mcp/
+      gemini-3.1-pro-preview/
+        v1-f1-v1/
+          2026-08-01T02-03-04Z-12345.jsonl
 ```
 
 One object per batch, never appended to. Object names begin with an ISO-8601 UTC timestamp, so
 lexical sort is chronological and the reader gets newest-first ordering for free. The build id
-suffix keeps two batches in the same second from colliding.
+suffix keeps two batches in the same second from colliding. Any character that is not
+alphanumeric, `-`, `_` or `.` is flattened to `-` in every segment, so a model spelled
+`vendor/model:tag` cannot add a path level; dots survive, because the judge model is spelled with
+them and the point of this layout is that a human can read it.
+
+**The key is in the path** because evidence is only ever pooled within one key —
+`evidence_for()` discards every line measured on different software. Filing by key means a prefix
+stops growing the moment the key changes: a model bump freezes the old directory forever and
+starts a new one, so no single prefix grows without bound while the software moves. That is the
+whole reason for the nesting, and it is why the partition is the **whole** key rather than the
+judge model alone — partitioning on one component would leave a `setup_id` or `verifiers` bump
+still piling into the same directory.
+
+It also makes the store navigable, which a content hash would not: `ls` on a case shows which
+setups have been screened, and `*/gemini-3.1-pro-preview/**` finds every case a given judge
+scored, neither of which a hash would answer without opening a record.
+
+**The path is an index, never the truth.** Every record carries its own `key` and the reader
+filters on that, not on where the object sat. A name that disagrees with its contents loses, which
+is the only safe way round for something a future writer could get wrong. A record with no key at
+all is filed under `<case-id>/unkeyed/` rather than dropped — `bench-gate record` already skips
+those, so this is the belt to that braces: the writer must never be the reason a merge to `main`
+loses data.
 
 This layout exists to fit the **`roles/storage.objectCreator`** grant, which can create new objects
 but cannot overwrite or delete existing ones. That makes append-only an IAM guarantee rather than a
@@ -139,7 +172,7 @@ one line; a writer that emitted several would read back unchanged.
 **The sharding is invisible to every reader, and that is not luck.** JSONL is closed under
 concatenation: the meaning of a set of lines does not depend on how they were split across files.
 So the local backend's one-file-per-case and the GCS backend's one-object-per-batch produce
-byte-identical input to the parser, BigQuery's external table over `*/*.jsonl` sees one table
+byte-identical input to the parser, BigQuery's external table over `<prefix>/*.jsonl` sees one table
 regardless of the split, and `evidence_for()`'s pooling never learns that objects exist. The format
 is doing the work that an append would otherwise have to.
 
@@ -149,30 +182,43 @@ measured data. Config belongs where it gets reviewed.
 
 ### Reading is capped, and says so
 
-The reader lists the whole prefix once, groups the object names by case, takes each case's newest
-`EVAL_BASELINE_MAX_OBJECTS` (default 200), and concatenates those in one `cat`. 200 objects is
-roughly 600 runs, two orders of magnitude past the 20 the admission bar wants, so the cap never
-binds in practice — but it bounds a read that would otherwise grow without limit, and when it does
-bind the gate says which case was capped and by how much. A cap that is silent reads as "I
-considered everything" when it did not.
+The reader lists the whole prefix once, groups the object names by case and then by key directory,
+takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
+what survives in one `cat`. 200 objects is roughly 600 runs, two orders of magnitude past the 20
+the admission bar wants, so the cap never binds in practice — but it bounds a read that would
+otherwise grow without limit as one key accumulates years of history, and when it does bind the
+gate says which case was capped and by how much. A cap that is silent reads as "I considered
+everything" when it did not.
 
-**The cap bounds the fetch, not the listing**, and that is the one place the per-batch layout has a
-cost. Listing is O(every object ever written), because the reader cannot know which names are
-newest without seeing them. At today's scale — a handful of active cases, one batch per case per
-merge — that is a few hundred objects a year and invisible. It stops being invisible somewhere
-around a hundred thousand objects, which is roughly 200 cases at several merges a day for a year.
-The fix at that point is a date partition in the name (`<case>/<YYYY-MM>/<stamp>-<build>.jsonl`) and
-listing months backwards until the window fills; it is deliberately not built now, because it buys
-nothing today and the migration is a rename of new objects only. Tracked under
+**Per key, not per case, and that distinction is load-bearing.** Capping a case as a whole would
+sort its key directories against each other, so an alphabetically early _current_ key could be
+dropped to keep a _superseded_ one — silently de-admitting a case that has in fact been screened.
+There is a test that fails if the cap is moved back up to the case level.
+
+Ordering survives the nesting for the same reason: a key deterministically determines its
+directory, so all of one key's records land in one directory and sort by stamp within it, and
+`evidence_for()` filters to a single key before it walks. It never sees the interleaving between
+directories.
+
+**The cap bounds the fetch, not the listing.** Listing is O(every object ever written under the
+prefix), because the reader cannot know which names are newest without seeing them. The key
+partition largely settles this on its own: a prefix stops growing when the key changes, and a
+long-lived key at three merges a day is on the order of a thousand objects. What remains unbounded
+is the _total_ across all historical keys, which grows only as fast as the software versions do. At
+today's scale — a handful of active cases, one batch per case per merge — that is a few hundred
+objects a year and invisible. If it ever stops being invisible, the fix is to scope the listing to
+the key being read rather than the whole prefix, which the layout now makes a one-line change; see
 [Open items](#open-items).
 
 Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
 run.
 
-One honest consequence of the window: if the version key goes A → B → A, a revert's evidence at key
-A could in principle sit outside the window and read as "no evidence". That under-admits, which is
-the safe direction, and it is rare enough to accept rather than engineer around.
+The key partition also retires a caveat this section used to carry. Under a flat layout and a
+per-case window, a version key that went A → B → A could push the revert's own evidence at key A
+out of the window, so a genuinely screened case would read as "no evidence" and be de-admitted.
+With one directory per key and a per-key cap, key B's volume cannot displace key A's records at
+all: the revert lands back in A's directory and finds its own history intact.
 
 ### When the store is unreachable
 
@@ -410,13 +456,19 @@ The store is already the right shape for one: append-only, timestamped, dimensio
 rewritten. Nothing further needs to be produced by CI.
 
 **Ingest.** Point BigQuery at the bucket as an external table over
-`gs://<bucket>/<prefix>/*/*.jsonl` with `format = NEWLINE_DELIMITED_JSON`. No ETL job, no schedule,
+`gs://<bucket>/<prefix>/*.jsonl` with `format = NEWLINE_DELIMITED_JSON`. No ETL job, no schedule,
 no second copy — new objects appear in query results as soon as they are written. Promote to a
 native table with a scheduled load only if query cost ever justifies it.
 
+The key directories need no configuration: BigQuery's single `*` in a source URI matches across
+`/`, so one wildcard covers the whole tree however deep it is filed. Hive partitioning is
+deliberately **not** enabled — the segments are bare values rather than `key=value`, and every
+dimension they encode is already a column on each row.
+
 **Model.** Each line is already a fact row. The `key` object supplies the dimensions
 (`setup_id`, `judge_model`, `scoring_version`, `fleet`, `verifiers`), `case` and `commit` the
-grain, `recorded_at` the time axis.
+grain, `recorded_at` the time axis. Read those from the row, never from the object path: the path
+is an index and the record is the truth.
 
 **Views worth having, in rough priority:**
 
@@ -450,8 +502,11 @@ not leave the project.
 - No postsubmit Prow job exists for `hack/ci-eval-pr.sh` (job config lives in
   `kubernetes/test-infra`). Without one, nothing ever appends and no case is ever admitted.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
-- The GCS listing is unbounded while the fetch is capped. Partition object names by month when the
-  store passes roughly a hundred thousand objects; see
+- The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
+  filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
+  for and `bench-gate suite` reads many cases at potentially different keys. Scoping the listing to
+  the key means threading it through both, which the layout now makes worth doing but which buys
+  nothing at today's volumes; see
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.

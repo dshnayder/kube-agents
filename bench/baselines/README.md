@@ -107,10 +107,10 @@ Two backends, one record format, identical semantics. `EVAL_BASELINE_STORE`
 (or `--baseline-store`) selects one; unset, everything above happens in this
 directory.
 
-| Value             | Backend | Layout                                           |
-| ----------------- | ------- | ------------------------------------------------ |
-| unset, or a path  | Local   | `<dir>/<case-id>.jsonl`, appended to in place    |
-| `gs://bucket/pfx` | GCS     | `<pfx>/<case-id>/<recorded_at>-<build-id>.jsonl` |
+| Value             | Backend | Layout                                                  |
+| ----------------- | ------- | ------------------------------------------------------- |
+| unset, or a path  | Local   | `<dir>/<case-id>.jsonl`, appended to in place           |
+| `gs://bucket/pfx` | GCS     | `<pfx>/<case-id>/<key…>/<recorded_at>-<build-id>.jsonl` |
 
 The local backend is the default and stays the default: the store travels with
 the checkout, so running the gate needs no credential and no network, and every
@@ -125,15 +125,35 @@ becomes an IAM guarantee rather than a convention, which is stronger than git,
 where a force-push can rewrite history. Object names begin with an ISO-8601 UTC
 stamp so a lexical sort is chronological.
 
+`<key…>` is the record's own version key spelled out as directories —
+`<setup-id>/<judge-model>/<sv>-f<n>-v<n>` — so an object files itself under the
+software it was measured on:
+
+```
+gs://kube-agents-evals-bench/evidence/agent-kanban-smoke/
+  gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/
+    2026-08-01T02-03-04Z-12345.jsonl
+```
+
+Evidence is only ever pooled within one key, so filing by key means a prefix
+stops growing the moment the key changes: a model bump freezes the old directory
+and starts a new one. It also makes the store navigable — listing a case shows
+which setups have been screened. **The path is an index, never the truth**: the
+reader filters on the `key` inside each record, so a name that disagrees with
+its contents loses.
+
 `VERSIONS.json` stays here in git either way. `--baseline-dir` still points at
 this directory even when evidence has moved to GCS, and the split is
 deliberate: `fleet` and `verifiers` are hand-declared, reviewed configuration,
 not measured data, and configuration belongs where it gets reviewed.
 
 A GCS read pulls at most `EVAL_BASELINE_MAX_OBJECTS` (default 200, roughly 600
-runs) of a case's newest objects. It never binds at realistic history depths;
-when it does, the verdict says which case was capped and by how much, because a
-silent cap reads as "I considered everything" when it did not.
+runs) of the newest objects **per case per key**. Per key, not per case: capping
+a case as a whole would sort its key directories against each other and could
+drop the current key's evidence to keep a superseded key's, silently de-admitting
+the case. It never binds at realistic history depths; when it does, the verdict
+says which case was capped and by how much, because a silent cap reads as "I
+considered everything" when it did not.
 
 A store that cannot be **reached** — no `gcloud`, a timeout, a 403, a 503 —
 degrades to advisory with a banner in the verdict, rather than redding the job.

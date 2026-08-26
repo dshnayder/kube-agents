@@ -102,8 +102,29 @@ def gcloud(monkeypatch):
     return fake
 
 
-def line(case: str, runs: int = 3, passes: int = 3, at: str = "2026-08-01T00:00:00Z") -> str:
-    return json.dumps({"case": case, "runs": runs, "passes": passes, "recorded_at": at})
+KEY = {
+    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "scoring_version": "v1",
+    "judge_model": "gemini-3.1-pro-preview",
+    "fleet": 1,
+    "verifiers": 1,
+}
+
+#: The three directories KEY spells out, as the layout writes them.
+KEY_DIR = "gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1"
+
+
+def line(
+    case: str,
+    runs: int = 3,
+    passes: int = 3,
+    at: str = "2026-08-01T00:00:00Z",
+    key: dict | None = None,
+) -> str:
+    doc = {"case": case, "runs": runs, "passes": passes, "recorded_at": at}
+    if key is not None:
+        doc["key"] = key
+    return json.dumps(doc)
 
 
 # --------------------------------------------------------------------------
@@ -260,19 +281,53 @@ def test_a_trailing_slash_in_the_location_does_not_double_up(gcloud):
 # --------------------------------------------------------------------------
 
 
-def test_the_object_name_carries_the_record_stamp_and_the_build(gcloud, monkeypatch):
+def test_the_path_spells_out_the_version_key(gcloud, monkeypatch):
+    """Readable on purpose: `ls` on a case answers which setups were screened,
+    and `*/<judge>/**` answers which cases a judge scored."""
     monkeypatch.setenv("BUILD_ID", "12345")
-    url = GcsBackend("gs://b/e").append("case-a", line("case-a", at="2026-08-01T02:03:04Z"))
-    assert url == "gs://b/e/case-a/2026-08-01T02-03-04Z-12345.jsonl"
+    url = GcsBackend("gs://b/e").append(
+        "case-a", line("case-a", at="2026-08-01T02:03:04Z", key=KEY)
+    )
+    assert url == f"gs://b/e/case-a/{KEY_DIR}/2026-08-01T02-03-04Z-12345.jsonl"
     assert gcloud.objects[url].endswith("\n")
+
+
+def test_the_judge_model_keeps_its_dots(gcloud):
+    """The whole point of this layout over a hash is that a human reads it."""
+    url = GcsBackend("gs://b/e").append("case-a", line("case-a", key=KEY))
+    assert "/gemini-3.1-pro-preview/" in url
+
+
+def test_a_key_change_starts_a_new_directory_and_freezes_the_old(gcloud):
+    """This is what stops any one prefix growing without bound: a model bump
+    files somewhere else and the superseded directory never grows again."""
+    backend = GcsBackend("gs://b/e")
+    backend.append("case-a", line("case-a", key=KEY))
+    backend.append("case-a", line("case-a", key={**KEY, "judge_model": "gemini-4"}))
+    dirs = {u.rsplit("/", 1)[0] for u in gcloud.objects}
+    assert len(dirs) == 2
+
+
+def test_a_component_that_could_add_a_path_level_is_flattened(gcloud):
+    url = GcsBackend("gs://b/e").append(
+        "case-a", line("case-a", key={**KEY, "setup_id": "vendor/model:tag"})
+    )
+    assert "/vendor-model-tag/" in url
+
+
+def test_a_record_with_no_key_is_filed_rather_than_dropped(gcloud):
+    """`record` skips unkeyed cases already; the writer must not be the reason
+    a merge to main loses data if that ever stops being true."""
+    url = GcsBackend("gs://b/e").append("case-a", line("case-a"))
+    assert "/case-a/unkeyed/" in url
 
 
 def test_two_batches_in_the_same_second_do_not_collide(gcloud, monkeypatch):
     stamp = "2026-08-01T02:03:04Z"
     monkeypatch.setenv("BUILD_ID", "111")
-    first = GcsBackend("gs://b/e").append("case-a", line("case-a", at=stamp))
+    first = GcsBackend("gs://b/e").append("case-a", line("case-a", at=stamp, key=KEY))
     monkeypatch.setenv("BUILD_ID", "222")
-    second = GcsBackend("gs://b/e").append("case-a", line("case-a", at=stamp))
+    second = GcsBackend("gs://b/e").append("case-a", line("case-a", at=stamp, key=KEY))
     assert first != second
     assert len(gcloud.objects) == 2
 
@@ -292,7 +347,76 @@ def test_a_failed_write_is_unreachable_not_silence(gcloud):
 
 def test_what_was_written_reads_back(gcloud):
     backend = GcsBackend("gs://b/e")
-    backend.append("case-a", line("case-a", at="2026-08-01T00:00:00Z"))
-    backend.append("case-a", line("case-a", passes=2, at="2026-08-02T00:00:00Z"))
+    backend.append("case-a", line("case-a", at="2026-08-01T00:00:00Z", key=KEY))
+    backend.append("case-a", line("case-a", passes=2, at="2026-08-02T00:00:00Z", key=KEY))
     (source,) = GcsBackend("gs://b/e").sources()
     assert [json.loads(ln)["passes"] for ln in source.text.strip().splitlines()] == [3, 2]
+
+
+# --------------------------------------------------------------------------
+# gcs backend: reading a key-partitioned store
+# --------------------------------------------------------------------------
+
+
+def nested(case: str, key_dir: str, day: int, passes: int = 3) -> tuple[str, str]:
+    stamp = f"2026-08-{day:02d}T00-00-00Z"
+    url = f"gs://b/e/{case}/{key_dir}/{stamp}-{day}.jsonl"
+    return url, line(case, passes=passes, at=stamp) + "\n"
+
+
+def test_the_case_is_the_first_segment_whatever_the_depth(gcloud):
+    gcloud.objects = dict(
+        [nested("case-a", KEY_DIR, 1), nested("case-b", KEY_DIR, 1)]
+    )
+    assert [s.case_id for s in GcsBackend("gs://b/e").sources()] == ["case-a", "case-b"]
+
+
+def test_a_flat_object_still_reads(gcloud):
+    """The layout gained depth while the store was empty, so nothing needs
+    migrating -- but a reader that could only handle one shape would make the
+    next layout change a migration, and this one costs a line."""
+    gcloud.objects = {
+        "gs://b/e/case-a/2026-08-01T00-00-00Z-1.jsonl": line("case-a") + "\n"
+    }
+    (source,) = GcsBackend("gs://b/e").sources()
+    assert source.case_id == "case-a"
+
+
+def test_records_stay_chronological_within_a_key(gcloud):
+    gcloud.objects = dict(
+        nested("case-a", KEY_DIR, day, passes=day) for day in (9, 10, 1)
+    )
+    (source,) = GcsBackend("gs://b/e").sources()
+    passes = [json.loads(ln)["passes"] for ln in source.text.strip().splitlines()]
+    assert passes == [1, 9, 10]
+
+
+def test_the_cap_applies_per_key_not_per_case(gcloud):
+    """The bug this exists to prevent: capping a case as a whole sorts its key
+    directories against each other, so an alphabetically-early CURRENT key gets
+    dropped to keep a superseded one, and the case silently de-admits."""
+    old = "aaa-setup/judge/v1-f1-v1"
+    new = "zzz-setup/judge/v1-f1-v1"
+    objects = {}
+    for day in range(1, 6):
+        for key_dir in (old, new):
+            url, text = nested("case-a", key_dir, day)
+            objects[url] = text
+    gcloud.objects = objects
+
+    backend = GcsBackend("gs://b/e", max_objects=2)
+    (source,) = backend.sources()
+    urls_read = [c for c in gcloud.calls if c[2] == "cat"][0][3:]
+    assert sum(1 for u in urls_read if old in u) == 2
+    assert sum(1 for u in urls_read if new in u) == 2
+    assert backend.truncated == {"case-a": 6}
+
+
+def test_an_uncapped_multi_key_case_reports_no_truncation(gcloud):
+    gcloud.objects = dict(
+        [nested("case-a", "s1/j/v1-f1-v1", 1), nested("case-a", "s2/j/v1-f1-v1", 1)]
+    )
+    backend = GcsBackend("gs://b/e")
+    (source,) = backend.sources()
+    assert backend.truncated == {}
+    assert len(source.text.strip().splitlines()) == 2

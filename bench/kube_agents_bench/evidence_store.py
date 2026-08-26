@@ -14,9 +14,9 @@ evidence has no push credential. Every way of giving it one -- a bot with write
 access to ``main``, a pull request per merge, a weekly batched pull request --
 was worse than the problem. See ``docs/designs/eval-baseline-storage.md``.
 
-The GCS layout is one immutable object per batch::
+The GCS layout is one immutable object per batch, filed under its version key::
 
-    gs://<bucket>/<prefix>/<case-id>/<recorded_at>-<build-id>.jsonl
+    gs://<bucket>/<prefix>/<case-id>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>/<stamp>-<build>.jsonl
 
 never appended to, because the grant this is built for is
 ``roles/storage.objectCreator`` -- create yes, overwrite and delete no. That
@@ -24,6 +24,20 @@ makes append-only an IAM guarantee rather than a convention, which is strictly
 stronger than git, where a force-push can rewrite history. Object names begin
 with an ISO-8601 UTC stamp so lexical order is chronological and the reader
 gets newest-first for free.
+
+THE KEY IS IN THE PATH because evidence is only ever pooled within one key --
+``evidence_for()`` discards every line measured on different software. Filing
+by key means a prefix stops growing the moment the key changes: a model bump
+freezes the old directory forever and starts a new one, so no single prefix
+grows without bound while the software moves. It also makes the store
+navigable, which a hash would not: listing a case shows which setups have been
+screened, and ``*/gemini-3.1-pro-preview/**`` finds every case a given judge
+scored.
+
+THE PATH IS AN INDEX, NEVER THE TRUTH. Every record carries its own ``key`` and
+the reader filters on that, not on where the object sat. A name that disagrees
+with its contents loses, which is the only safe way round for something a
+future writer could get wrong.
 
 ``gcloud storage`` is shelled out to rather than importing
 ``google-cloud-storage``. The bench package has no GCP dependency today and
@@ -33,17 +47,22 @@ this runs.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-#: How many of a case's newest objects a GCS read will pull.
+#: How many of the newest objects a GCS read will pull, per case *per key*.
+#:
+#: Per key, not per case, and that matters: capping a case as a whole would
+#: sort its keys' directories against each other and could drop the current
+#: key's evidence to keep a superseded key's, silently de-admitting the case.
 #:
 #: 200 objects is roughly 600 runs at three repetitions -- two orders of
 #: magnitude past the twenty the admission bar wants -- so this never binds in
 #: practice. It is here to bound a read that would otherwise grow without limit
-#: as a case accumulates years of history. When it does bind, the reader says
+#: as a key accumulates years of history. When it does bind, the reader says
 #: so: a cap that is silent reads as "I considered everything" when it did not.
 DEFAULT_MAX_OBJECTS = 200
 
@@ -73,6 +92,39 @@ class EvidenceSource:
 
 def is_gcs(location: str | Path) -> bool:
     return str(location).startswith("gs://")
+
+
+def _sanitize(text: str) -> str:
+    """One path segment. Anything that could add a level or confuse a shell goes.
+
+    Dots survive, because the judge model is spelled with them and the point of
+    this layout is that a human can read it.
+    """
+    return "".join(c if c.isalnum() or c in "-_." else "-" for c in str(text))
+
+
+def _key_segments(key: dict | None) -> list[str]:
+    """The version key as directories: setup, judge, then the three integers.
+
+    Readable on purpose. `ls` on a case shows which setups were screened, and
+    `*/<judge>/**` finds every case a judge scored -- neither of which a hash
+    would answer without opening a record.
+
+    A record with no key is filed under ``unkeyed/`` rather than dropped.
+    ``bench-gate record`` already skips those, so this is the belt to that
+    braces: the writer must never be the reason a merge to main loses data.
+    """
+    if not key:
+        return ["unkeyed"]
+    versions = (
+        f"{key.get('scoring_version') or 'unknown'}"
+        f"-f{key.get('fleet')}-v{key.get('verifiers')}"
+    )
+    return [
+        _sanitize(key.get("setup_id") or "unknown-setup"),
+        _sanitize(key.get("judge_model") or "unknown-judge"),
+        _sanitize(versions),
+    ]
 
 
 def max_objects_from_env() -> int:
@@ -215,42 +267,62 @@ class GcsBackend:
         ]
 
     def sources(self) -> list[EvidenceSource]:
-        by_case: dict[str, list[str]] = {}
+        """Every case's objects, grouped by case and ordered chronologically.
+
+        The case is the first segment under the prefix, whatever the depth
+        below it, so this reads the key-partitioned layout and the flat one
+        the same way.
+
+        Ordering survives the nesting because a key determines its directory:
+        all of one key's records land in one directory and sort by stamp
+        within it. ``evidence_for()`` filters to a single key before it walks,
+        so it never sees the interleaving between directories.
+        """
+        by_case: dict[str, dict[str, list[str]]] = {}
         for url in self._list():
-            # gs://bucket/prefix/<case>/<stamp>-<build>.jsonl
-            parts = url.rsplit("/", 2)
-            if len(parts) != 3:
+            if not url.startswith(self.location + "/"):
                 continue
-            by_case.setdefault(parts[1], []).append(url)
+            relative = url[len(self.location) + 1 :]
+            if "/" not in relative:  # an object sitting directly under the prefix
+                continue
+            case_id = relative.split("/", 1)[0]
+            parent = url.rsplit("/", 1)[0]
+            by_case.setdefault(case_id, {}).setdefault(parent, []).append(url)
 
         found: list[EvidenceSource] = []
-        for case_id, urls in sorted(by_case.items()):
-            urls.sort()  # names start with an ISO stamp, so this is chronological
-            if len(urls) > self.max_objects:
-                self.truncated[case_id] = len(urls) - self.max_objects
-                urls = urls[-self.max_objects :]
+        for case_id, groups in sorted(by_case.items()):
+            urls: list[str] = []
+            for _, group in sorted(groups.items()):
+                group.sort()  # names start with an ISO stamp: chronological
+                if len(group) > self.max_objects:
+                    dropped = len(group) - self.max_objects
+                    self.truncated[case_id] = self.truncated.get(case_id, 0) + dropped
+                    group = group[-self.max_objects :]
+                urls.extend(group)
             text = self._run(["cat", *urls])
-            found.append(
-                EvidenceSource(case_id, f"{self.location}/{case_id}/", text)
-            )
+            found.append(EvidenceSource(case_id, f"{self.location}/{case_id}/", text))
         return found
 
     def append(self, case_id: str, line: str) -> str:
         """Write one new object. Never overwrites, by construction and by IAM.
 
-        The name is taken from the record's own ``recorded_at`` so the object
-        sorts into place chronologically, with the build id to keep two batches
-        in the same second from colliding.
+        The directory comes from the record's own version key and the name from
+        its own ``recorded_at``, so the object files itself under the software
+        it was measured on and sorts into place chronologically. The build id
+        keeps two batches in the same second from colliding.
         """
-        import json
-
-        stamp = "unknown"
+        doc: dict = {}
         try:
-            stamp = str(json.loads(line).get("recorded_at") or "unknown")
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                doc = parsed
         except ValueError:
             pass
+
+        stamp = str(doc.get("recorded_at") or "unknown")
         build = os.environ.get("BUILD_ID") or os.environ.get("PROW_JOB_ID") or "local"
-        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in f"{stamp}-{build}")
-        url = f"{self.location}/{case_id}/{safe}.jsonl"
+        name = _sanitize(f"{stamp}-{build}")
+        parts = [self.location, _sanitize(case_id), *_key_segments(doc.get("key"))]
+        url = "/".join([*parts, f"{name}.jsonl"])
         self._run(["cp", "-", url], stdin=line + "\n")
         return url

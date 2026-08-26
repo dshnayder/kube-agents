@@ -46,6 +46,7 @@ from kube_agents_bench.gate import main
 from kube_agents_bench.scoring import MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS, read_fixture, write_run
+from kube_agents_bench.evidence_store import _key_segments
 from test_evidence_store import FakeGcloud
 
 BASELINES = Path(__file__).resolve().parents[1] / "baselines"
@@ -735,9 +736,13 @@ def gcloud(monkeypatch):
 
 
 def seed_gcs(fake: FakeGcloud, *lines: dict, prefix: str = "gs://b/evidence") -> str:
+    """Seed the bucket the way `bench-gate record` would: nested under the key."""
     for i, line in enumerate(lines, start=1):
         stamp = line["recorded_at"].replace(":", "-")
-        fake.objects[f"{prefix}/{line['case']}/{stamp}-{i}.jsonl"] = json.dumps(line) + "\n"
+        key_dir = "/".join(_key_segments(line.get("key")))
+        fake.objects[f"{prefix}/{line['case']}/{key_dir}/{stamp}-{i}.jsonl"] = (
+            json.dumps(line) + "\n"
+        )
     return prefix
 
 
