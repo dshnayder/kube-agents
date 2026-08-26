@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -133,6 +133,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
+	$(wildcard agentplugins/*/tests/test_*.py) \
+	$(wildcard agentplugins/lib/tests/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
@@ -148,6 +150,16 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+e2e-tests: ## Run the live E2E promotion test suite against the target GKE cluster.
+	@./scripts/release/execute_e2e_tests.sh
+
+test-e2e: e2e-tests ## Alias for e2e-tests.
+
+test-e2e-deps: ## Install dependencies required to run the E2E test suite.
+	@python3 -m pip install -r tests/e2e/requirements.txt
+
+e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
@@ -200,7 +212,7 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 	@failed=""; \
 	for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
-		(cd $$dir && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
+		(cd $$dir && PYTHONPATH="$(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform:$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
 	done; \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
@@ -310,6 +322,19 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
+
+# A broken bench case otherwise costs a full presubmit to discover: provision,
+# deploy, run the agent, score, read the log. Most of the ways a task.yaml is
+# broken are static -- an unknown domain slug, a fixture role the seeded fleet
+# never planted, a check with no assertion, a case in no TASKS entry -- so they
+# fail here in a second instead. The same rules gate in CI through
+# scripts/test_task_registration.py; this target is the fast path to them.
+bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/validate_bench_cases.py
 
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).

@@ -31,13 +31,22 @@
 #   scenario_reasons()   echoes a JSON fragment of rejectedMigs/napFailureReasons
 #                        (optional) — this is what steers the diagnosis
 #   scenario_notes()     echoes free text shown after the run (optional)
+#   scenario_preflight() checks this scenario's own prerequisites (optional) — runs at
+#                        the end of preflight(), so before clear_dedup or any workload
+#                        exists. Put a `die` here rather than in a hook: the hooks above
+#                        first run once the run has already mutated both clusters.
 #
-# Each hook runs in a subshell, and scenario_manifest runs more than once per invocation,
-# so nothing a hook assigns reaches the next one. A hook that resolves something at run
-# time must wrap the resolver in scenario_memo (below) or it will resolve repeatedly, and
-# may not resolve the same way twice.
+# Each of the three output hooks runs in a subshell, and scenario_manifest runs more than
+# once per invocation, so nothing they assign reaches the next one. A hook that resolves
+# something at run time must wrap the resolver in scenario_memo (below) or it will resolve
+# repeatedly, and may not resolve the same way twice. scenario_preflight is the exception:
+# preflight() calls it directly, so what it assigns does persist -- which is why it is the
+# right place for a check whose answer the run depends on.
 
 set -euo pipefail
+
+# Enforce system python for gcloud to prevent google-auth AttributeError crashes in CI
+export CLOUDSDK_PYTHON="${CLOUDSDK_PYTHON:-/usr/bin/python3}"
 
 # --------------------------------------------------------------------- settings
 #
@@ -296,6 +305,12 @@ preflight() {
     gcloud pubsub topics describe "$TOPIC" --project="$PROJECT_ID" >/dev/null 2>&1 \
         || die "Pub/Sub topic ${TOPIC} not found in ${PROJECT_ID}"
     ok "topic ${TOPIC} exists"
+
+    # Last, so a scenario's own prerequisite is reported after the shared ones it
+    # depends on -- and still before clear_dedup wipes the registry.
+    if declare -F scenario_preflight >/dev/null; then
+        scenario_preflight
+    fi
 }
 
 # The adapter dedups on cluster + namespace + controller for 24h. Re-running a
@@ -420,11 +435,16 @@ _manifest_part() {
     scenario_manifest | python3 -c '
 import sys, yaml
 want = sys.argv[1]
-INFRA = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-sel = [d for d in docs if (d.get("kind") in INFRA) == (want == "infra")]
+infra_kinds = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+sel = []
+for doc in docs:
+    is_infra = doc.get("kind") in infra_kinds
+    if is_infra == (want == "infra"):
+        sel.append(doc)
 if sel:
-    print(yaml.safe_dump_all(sel, sort_keys=False), end="")
+    print(yaml.safe_dump_all(sel, sort_keys=False))
 ' "$1"
 }
 
@@ -450,10 +470,15 @@ emit_manifest() {
             printf -- '---\n'
             printf '%s\n' "$work" | python3 -c '
 import sys, yaml
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-for d in docs:
-    d.setdefault("metadata", {})["namespace"] = sys.argv[1]
-print(yaml.safe_dump_all(docs, sort_keys=False), end="")
+ns = sys.argv[1]
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+for doc in docs:
+    meta = doc.setdefault("metadata", {})
+    if isinstance(meta, dict):
+        meta["namespace"] = ns
+if docs:
+    print(yaml.safe_dump_all(docs, sort_keys=False))
 ' "$WORKLOAD_NAMESPACE"
         }
     } > >(if [ "$out" = "-" ]; then cat; else cat > "$out"; fi)

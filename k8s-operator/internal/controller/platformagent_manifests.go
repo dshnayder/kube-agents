@@ -60,7 +60,8 @@ const (
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
 	// only kubelet's port-forward can reach.
-	dashboardPort = 9119
+	dashboardPort        = 9119
+	tmpScratchVolumeName = "tmp-scratch"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -150,12 +151,17 @@ const credentialProxyPolicyJSON = `{
   "rules": [
     {"id":"gcp.access-token-disclosure","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+print-(?:access|identity)-token\\b"},
     {"id":"gcp.config-helper-disclosure","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+config\\b(?:\\s+\\S+)*?\\s+config-helper\\b"},
-    {"id":"github.token-disclosure","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+token\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+status\\b(?:\\s+\\S+)*?\\s+--show-token\\b"},
+    {"id":"github.token-disclosure","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+token\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+status\\b(?:\\s+\\S+)*?\\s+(?:--show-token|-t)\\b"},
     {"id":"kubernetes.token-disclosure","pattern":"\\bkubectl\\b(?:\\s+\\S+)*?\\s+create\\b(?:\\s+\\S+)*?\\s+token\\b|\\bkubectl\\b(?:\\s+\\S+)*?\\s+config\\b(?:\\s+\\S+)*?\\s+view\\b(?:\\s+\\S+)*?\\s+--raw\\b"},
     {"id":"git.credential-disclosure","pattern":"\\bgit\\b(?:\\s+\\S+)*?\\s+credential\\b(?:\\s+\\S+)*?\\s+fill\\b"},
     {"id":"gcp.credential-replacement","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|activate-service-account)\\b"},
     {"id":"github.credential-replacement","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|refresh|switch|logout)\\b"},
-    {"id":"tool.self-modification","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+components\\b(?:\\s+\\S+)*?\\s+(?:install|update|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?\\s+(?:install|upgrade|remove)\\b"}
+    {"id":"tool.self-modification","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+components\\b(?:\\s+\\S+)*?\\s+(?:install|update|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?\\s+(?:install|upgrade|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+(?:alias|config)\\b(?:\\s+\\S+)*?\\s+(?:set|import|delete)\\b"},
+    {"id":"github.merge","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+merge\\b"},
+    {"id":"github.assent","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+review\\b(?:\\s+\\S+)*?\\s+(?:--approve|-a)\\b"},
+    {"id":"github.api-mutation","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-X|--method)(?:\\s+|=)(?:POST|PUT|PATCH|DELETE)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-f|-F|--field|--raw-field|--input)\\b"},
+    {"id":"github.pipeline-trigger","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:workflow|run)\\b(?:\\s+\\S+)*?\\s+(?:run|rerun|cancel|enable|disable|delete)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+release\\b(?:\\s+\\S+)*?\\s+(?:create|delete|upload|edit)\\b"},
+    {"id":"github.repo-administration","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:secret|variable)\\b(?:\\s+\\S+)*?\\s+(?:set|delete|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+repo\\b(?:\\s+\\S+)*?\\s+(?:delete|archive|edit)\\b"}
   ]
 }`
 
@@ -1605,6 +1611,12 @@ type renderOptions struct {
 	// otlpEndpoint is the resolved OpenTelemetry collector base URL. Empty means the GKE
 	// managed collector, so the zero value is the historical behaviour.
 	otlpEndpoint string
+	// otlpDisabled reports that discovery established this cluster has no collector and
+	// nothing configured one (otlpSourceNone). The agent is then wired with
+	// OTEL_SDK_DISABLED=true and no endpoint. A separate field rather than an empty
+	// otlpEndpoint because empty already means the managed collector, and the two
+	// outcomes need opposite manifests.
+	otlpDisabled bool
 }
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
@@ -1717,7 +1729,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 	)
 
-	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace, opts.otlpEndpoint)...)
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace, opts.otlpEndpoint, opts.otlpDisabled)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeEnvVars(envVars, safeSandboxEnvOverrides(agent.Spec.Deployment.Env))
 	}
@@ -1928,7 +1940,48 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
-	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
+
+	// The credential proxy is a NATIVE SIDECAR -- an init container carrying
+	// restartPolicy: Always -- and not an ordinary container.
+	//
+	// It owns port 8643, which the Service targets, and it shares a network
+	// namespace with the agent sandbox. As an ordinary container the two started
+	// in parallel and raced for the bind. The agent wins that race whenever it
+	// wants to: bind 0.0.0.0:8643 from the sandbox and the proxy dies with
+	// EADDRINUSE into CrashLoopBackOff, leaving the agent holding the port the
+	// Service routes to. Reproduced on a live cluster on 10 August.
+	//
+	// A native sidecar starts before any app container, so the proxy is running
+	// before the sandbox process exists and the race stops being one the agent
+	// can win by starting first.
+	//
+	// Note what the kubelet actually waits for: the sidecar having STARTED, plus
+	// its startupProbe if it declares one. This container declares only a
+	// readinessProbe, which gates pod readiness and gates nothing about app
+	// container startup -- so the guarantee is ordering of process creation, not
+	// "Envoy has bound 8643". That is a much smaller window than two containers
+	// racing from the same instant, and it is not zero. Give this container a
+	// startupProbe on 8643 if the remaining window ever matters.
+	//
+	// This is also the ordering the pod needs for its own sake: every credentialed
+	// call the agent makes goes through this proxy, so an agent that starts first
+	// is an agent whose early tool calls fail.
+	//
+	// Requires Kubernetes 1.29+. SidecarContainers is beta and on by default there;
+	// it went GA in 1.33 and was alpha (off) in 1.28. 1.29 is the floor because that
+	// is where restartPolicy on an init container starts being honoured without a
+	// feature gate.
+	//
+	// On 1.28 the install fails fast rather than degrading: dropDisabledFields
+	// strips restartPolicy, which leaves an ordinary init container still
+	// declaring the readinessProbe buildCredentialProxySidecar sets, and
+	// validateInitContainers does not permit probes without restartPolicy:
+	// Always. So the API server rejects the pod template and the operator's
+	// apply fails -- nothing is created, nothing hangs, and there is no window
+	// where the proxy is running without sidecar semantics.
+	// charts/kube-agents/Chart.yaml pins the same floor, so Helm refuses the
+	// install before it gets that far.
+	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2148,6 +2201,80 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 			MountPath: path.Dir(sessionKVDBPath),
 			SubPath:   "session",
 		},
+		{
+			// The one writable path outside the PVC, and the reason
+			// readOnlyRootFilesystem is survivable here: docker-entrypoint.sh runs
+			// four hermes invocations with HOME=/tmp before the agent starts, and
+			// the image is otherwise root-owned against a runtime UID of 10000.
+			Name:      tmpScratchVolumeName,
+			MountPath: "/tmp",
+		},
+	}
+}
+
+// dropTmpScratchIfClaimed removes the operator's /tmp mount when the CR already mounts
+// something there via storages or extraVolumeMounts.
+//
+// Those are appended to the defaults without deduplication, and the API server rejects a
+// Pod spec with two mounts on one mountPath. So without this the /tmp mount added above
+// would not merely be redundant on such a CR, it would make the Deployment unappliable and
+// stop reconciliation dead — on an upgrade, for a field the user set before /tmp was a
+// path the operator had any opinion about. Mounting scratch space at /tmp is exactly what
+// someone would have done while the root filesystem was still writable and there was no
+// other writable path outside the PVC, which is what makes this worth handling rather than
+// rejecting.
+//
+// The user's mount wins, deliberately: it is the one that predates this, and overriding it
+// would be a silent behaviour change on upgrade. If they mounted something read-only there
+// the agent will fail to start — but it would have failed the same way before this change,
+// since the entrypoint has always needed a writable /tmp.
+//
+// Narrow on purpose: it detects the collision by cleaned mountPath but removes the default
+// by volume name, and only ever for /tmp. The general form — drop every default whose
+// cleaned path a user mount claims — is the same amount of code and would cover the next
+// default the operator adds. It would also silently drop the data PVC mount if a CR set
+// homeDir to a path the defaults use, turning a Deployment the API server rejects outright
+// into an agent that comes up with no persistent home. A rejected Deployment is the better
+// failure of the two, so the generalisation waits for a second path that actually needs it.
+func dropTmpScratchIfClaimed(defaults, userMounts []corev1.VolumeMount) []corev1.VolumeMount {
+	claimed := false
+	for _, m := range userMounts {
+		if path.Clean(m.MountPath) == "/tmp" {
+			claimed = true
+			break
+		}
+	}
+	if !claimed {
+		return defaults
+	}
+	kept := make([]corev1.VolumeMount, 0, len(defaults))
+	for _, m := range defaults {
+		if m.Name != tmpScratchVolumeName {
+			kept = append(kept, m)
+		}
+	}
+	return kept
+}
+
+// hardenedSecurityContext is the container hardening every container the operator builds
+// carries: no privilege escalation, no capabilities, and a root filesystem the process
+// cannot write to.
+//
+// One helper rather than a literal per container, because the alternative has already
+// failed. The same three fields were written out five times, and three of the five had
+// silently drifted to two of them — the read-only root was on the credential sidecar and
+// the cleanup init container and on neither agent container nor the log shipper, which is
+// the gap this function was introduced to close (RUNTIME-007). Nothing failed while that
+// was true. A container added from here on gets the block by construction, and
+// TestEveryContainerHasAHardenedSecurityContext fails if one is built without it.
+//
+// Anything a container needs on top — a different user, a writable path — belongs on that
+// container, not here. This is the floor, not the whole context.
+func hardenedSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(false),
+		ReadOnlyRootFilesystem:   ptr.To(true),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 }
 
@@ -2171,12 +2298,8 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
   /workspace/home/.netrc \
   /workspace/home/.npmrc \
   /workspace/home/.pypirc`},
-		VolumeMounts: []corev1.VolumeMount{{Name: "platform-agent-data-vol", MountPath: "/workspace"}},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(true),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
+		VolumeMounts:    []corev1.VolumeMount{{Name: "platform-agent-data-vol", MountPath: "/workspace"}},
+		SecurityContext: hardenedSecurityContext(),
 		Resources: corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("200m"),
@@ -2220,6 +2343,26 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 		return *harness.EventWatcher.Enabled
 	}
 	return true
+}
+
+// asNativeSidecar converts a container into a Kubernetes native sidecar: an init
+// container that never exits and that the kubelet keeps running for the life of
+// the pod.
+//
+// The distinction that matters here is ordering. App containers do not start
+// until every native sidecar has started, which is what lets the credential
+// proxy claim its ports before the agent sandbox exists to contest them. See
+// buildPodTemplateSpec for what "has started" does and does not guarantee.
+//
+// A native sidecar also needs a restart policy of its own. Without it the
+// kubelet treats the container as an ordinary init container and waits for it to
+// exit, which a long-running proxy never does. For this container the failure
+// arrives earlier than that: it declares a readinessProbe, which an init
+// container may not have unless it is restartable, so the API server rejects the
+// pod template rather than admitting one that would stall.
+func asNativeSidecar(c corev1.Container) corev1.Container {
+	c.RestartPolicy = ptr.To(corev1.ContainerRestartPolicyAlways)
+	return c
 }
 
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
@@ -2293,9 +2436,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
+		SecurityContext: hardenedSecurityContext(),
 	}
 }
 
@@ -2661,13 +2802,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	resources := resolveResources(agent.Spec.Deployment)
 
-	volumeMounts := buildDefaultVolumeMounts(homeDir)
+	var userVolumeMounts []corev1.VolumeMount
 	if len(storages) > 0 {
-		volumeMounts = append(volumeMounts, buildCustomStorageVolumeMounts(storages)...)
+		userVolumeMounts = append(userVolumeMounts, buildCustomStorageVolumeMounts(storages)...)
 	}
 	if len(extraVolumeMounts) > 0 {
-		volumeMounts = append(volumeMounts, extraVolumeMounts...)
+		userVolumeMounts = append(userVolumeMounts, extraVolumeMounts...)
 	}
+	volumeMounts := append(dropTmpScratchIfClaimed(buildDefaultVolumeMounts(homeDir), userVolumeMounts), userVolumeMounts...)
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
@@ -2781,14 +2923,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:   agentAPIProbe(10, 60),
-			ReadinessProbe: agentAPIProbe(15, 3),
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
+			StartupProbe:    agentAPIProbe(10, 60),
+			ReadinessProbe:  agentAPIProbe(15, 3),
+			SecurityContext: hardenedSecurityContext(),
 		},
 	}
 
@@ -2875,6 +3012,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: path.Dir(sessionKVDBPath),
 				SubPath:   "session",
 			},
+			{
+				// Same emptyDir the gateway gets. Sharing it is not a new channel:
+				// these two containers already run the same image against the same
+				// data PVC, so they are one trust domain either way.
+				Name:      tmpScratchVolumeName,
+				MountPath: "/tmp",
+			},
 		}
 
 		// What keeps this container out of the shared tree is AGENT_SHARED_STATE_SETUP
@@ -2903,7 +3047,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 					corev1.ResourceMemory: resource.MustParse("2Gi"),
 				},
 			},
-			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
+			// Through the same guard as the gateway's list above. extraVolumeMounts
+			// reaches both containers, so a CR claiming /tmp collides here too.
+			VolumeMounts: append(dropTmpScratchIfClaimed(dashboardVolumeMounts, extraVolumeMounts), extraVolumeMounts...),
 			// What this buys is not what a probe on a serving container buys. The
 			// Service's :9119 endpoint is unreachable over the pod network either
 			// way (see dashboardPort), so nothing is being kept out of rotation.
@@ -2956,12 +3102,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				TimeoutSeconds:      5,
 				FailureThreshold:    3,
 			},
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
+			SecurityContext: hardenedSecurityContext(),
 		})
 	}
 
@@ -3007,12 +3148,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: "/fluent-bit/state",
 			},
 		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
+		// Read-only root and no /tmp, the only container here with neither. The config
+		// above buffers in memory (Mem_Buf_Limit, no storage.path), keeps its tail DB on
+		// the fluent-bit-state volume and outputs to stdout, so it writes nothing to the
+		// root filesystem. Handing it the agent's tmp-scratch would only give an
+		// LLM-driven container a path into the log shipper.
+		SecurityContext: hardenedSecurityContext(),
 	})
 
 	// The k8s-event-watcher is not a container of its own. It runs inside
@@ -3102,6 +3243,31 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 						Name: agent.Name + "-settings",
 					},
 					DefaultMode: ptr.To(int32(0644)),
+				},
+			},
+		},
+		{
+			// Bounded, like every other scratch emptyDir here. Without a
+			// sizeLimit a runaway write fills the node's ephemeral storage and the
+			// kubelet evicts whoever it decides is the worst offender, which need
+			// not be this pod. With one, the eviction is this pod, for a stated
+			// reason, at a predictable threshold. Note that it is an eviction
+			// either way: enforcing the limit as an in-container ENOSPC needs the
+			// alpha LocalStorageCapacityIsolationFSQuotaMonitoring gate, which GKE
+			// does not enable. 2Gi matches credential-proxy-tmp, the closest
+			// analogue.
+			//
+			// Declared unconditionally, while dropTmpScratchIfClaimed can remove the
+			// mount from both containers -- so a CR that claims /tmp itself leaves
+			// this volume in the pod with nothing mounting it. That is legal and
+			// inert: the kubelet creates an empty directory and no container sees it.
+			// Making the declaration conditional would mean deciding it here from
+			// state that lives in the mount builders, which buys a tidier pod spec
+			// for a coupling that is easier to get wrong than this is to explain.
+			Name: tmpScratchVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: ptr.To(resource.MustParse("2Gi")),
 				},
 			},
 		},
@@ -3646,7 +3812,10 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+//
+// otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
+// collector, so there is no export to allow and the collector egress rule is left out.
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
@@ -3846,8 +4015,13 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
-	// 8. GKE Managed OpenTelemetry Collector (Trace Export)
-	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" {
+	// 8. GKE Managed OpenTelemetry Collector (Trace Export). Skipped when the agent is
+	// exporting nothing: there is no endpoint to reach, so the rule would grant egress
+	// for traffic that is never sent. Usually the collector's namespace does not exist
+	// either, though not always — a collector Service exposing only gRPC 4317 is rejected
+	// by otlpHTTPEndpointForService and also resolves to None, and there the namespace is
+	// real. The rule is dropped in both cases, because neither one exports.
+	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" && !otlpDisabled {
 		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4317))},

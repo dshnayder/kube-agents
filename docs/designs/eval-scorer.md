@@ -15,13 +15,15 @@ established, compared against and reset, and how a quality-over-time dashboard r
 **Owns:** the verdict ladder as built, the JSONL record format, the five-component version key, the
 admission rule, the storage backends, and rung 6's comparison.
 
-**On the ladder and `testing-strategy.md`.** §4.2 of that document (unmerged, PR #896) specifies
+**On the ladder and [`testing-strategy.md`](testing-strategy.md).** §4.2 of that document specifies
 what the ladder _should_ be; the section below documents what the code _does_, including the
 handful of decisions the strategy left open and the implementation had to make anyway. The two are
 deliberately different kinds of document and should not be merged: if they ever disagree, the
 strategy is the intent and this is the report, and the disagreement is a bug in one of them. The
-case format belongs to `docs/designs/bench-case-format.md` (#921) and is named rather than linked
-until it lands.
+case format belongs to [`bench-case-format.md`](bench-case-format.md), which #921 landed; where the
+two touch, that document is the contract and `bench-gate` is one of its consumers. It rejects
+`task_id:` for a case in this repository, while `bench-gate` still accepts it as an alias for
+other people's corpora — lenient reader, strict validator, deliberately.
 
 ---
 
@@ -600,6 +602,20 @@ This is the lever this section already named — "repetitions or a cron-style sa
 and not the one it ruled out. Filtering merges by changed path stays ruled out: it would bias the
 evidence toward whichever changes are cheap to run, which is the selection bias that recording
 unconditionally exists to avoid. Sampling every night is unbiased with respect to what changed.
+
+**Those numbers predate two changes that landed while this was in review, and both want
+re-measuring before the repetition count is tuned.** #951 gave `gpu-stress-test-diagnosis` the
+seeded fleet's slot-c cluster instead of creating one per run, so the marginal cost of a repetition
+is now an OpenTofu apply of the GPU node pool rather than a cluster create — materially cheaper,
+which argues for _more_ repetitions a night, not fewer. #939 activated a third case
+(`cluster-agent-crashloop-debug`), which pushes the other way. The `~43 minutes / a fifth` split
+was measured before either, and #947's per-phase profiling — also merged here, and now emitted per
+repetition — is what should replace the estimate with a measurement on the first few nightlies.
+
+What none of that changes is the shape of the argument. A per-merge job still pays the _job-level_
+setup — Boskos lease, image build, deploy to `platform-agent-host` — 310 times a month to buy three
+samples, and that setup is unaffected by cluster reuse inside a task. Cheaper repetitions make
+batching them better, not worse.
 
 **Why the repetition counts may differ.** An earlier version of this table required the periodic to
 match the presubmit's `EVAL_REPETITIONS`, on the grounds that "the baseline must be measured the way
