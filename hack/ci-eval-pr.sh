@@ -714,10 +714,10 @@ for TASK in "${TASKS[@]}"; do
     analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME} rep ${REP}" "${REP_RESULT}"
 
     # No inline RUN_CLASS here any more. INFRA / BROKEN / OK classification --
-    # including the noop carve-out and the documented empty-list record -- moved
-    # into `bench-gate case`, which has to make the same call per repetition and
-    # must not disagree with a second copy of the rule living in shell.
-
+    # including the noop carve-out, the documented empty-list record and #959's
+    # KUBE_AGENTS_INFRA_FAILURE transport marker -- moved into `bench-gate
+    # case`, which has to make the same call per repetition and must not
+    # disagree with a second copy of the rule living in shell.
     if [ -n "${NEW_RUN_DIR}" ]; then
       RESULT_ARGS+=(--result "${NEW_RUN_DIR}")
       cp "${NEW_RUN_DIR}/results.json" "results_${TASK_NAME}_rep${REP}.json" 2>/dev/null || true

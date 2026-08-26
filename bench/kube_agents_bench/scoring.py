@@ -104,6 +104,20 @@ DEFAULT_JUDGED_METRICS: tuple[str, ...] = ("OutcomeValidity",)
 #: people to ignore the rung.
 DEFAULT_JUDGED_MARGIN = 0.5
 
+#: The marker :mod:`kube_agents_bench.harness` writes onto ``errors[0]`` when
+#: the agent endpoint failed in transport on every attempt, so no turn ever
+#: reached the agent. Such a record IS scored -- the judge grades the empty
+#: output and returns 0.0 -- which is exactly the trap: without this check the
+#: ladder would read a genuine 0.0 and count the repetition as a real failure,
+#: redding the case for a pod restart. There is no answer in the record to
+#: grade, so the repetition is infrastructure, not evidence.
+#:
+#: The literal is duplicated rather than imported because importing the harness
+#: would drag ``devops_bench`` into the scorer, which otherwise reads records as
+#: plain JSON. ``test_scoring.py`` asserts the two strings agree, so the
+#: duplication cannot drift silently.
+INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
 
 class Rung(IntEnum):
     """The verdict ladder, evaluated in order, stopping at the first match.
@@ -429,6 +443,21 @@ def classify_rep(
             f"{what} on a {NOOP_DEPLOYER}-deployer task, which provisions nothing: "
             "this is a harness or agent crash, not infrastructure",
             Rung.CHECK_DID_NOT_RUN,
+        )
+
+    # Before the has_scores test, because a transport-failed record carries
+    # both: the harness marks the error AND the judge still scores the empty
+    # output. No noop carve-out either, unlike the missing-record branch above.
+    # That branch INFERS infrastructure from an absent record, which a task
+    # provisioning nothing cannot honestly claim; this one is the harness
+    # stating what happened, and an unreachable agent endpoint is
+    # infrastructure whatever the task's deployer builds.
+    if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
+        return rep(
+            "infra",
+            "the harness exhausted its retries without reaching the agent "
+            f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
+            "answer in it to grade",
         )
 
     if not record.has_scores:

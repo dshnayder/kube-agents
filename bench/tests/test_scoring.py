@@ -45,6 +45,7 @@ import pytest
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
+    INFRA_FAILURE_MARKER,
     MISSING,
     Rung,
     grade_case,
@@ -590,6 +591,60 @@ def test_the_empty_list_record_blocks_on_a_noop_task(noop_spec, tmp_path):
     run = write_run(tmp_path / "empty", payload)
     verdict = grade_case(noop_spec, [run], admitted=True)
     assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_the_transport_marker_is_infrastructure_not_a_failed_repetition(tofu_spec, make_run):
+    """#959's case: the agent was never reached, but the record is still scored.
+
+    The judge grades the empty output and returns a real 0.0, so without the
+    marker check this reads as a legitimately failing repetition and reds the
+    case for a pod restart.
+    """
+    def unreachable(rec):
+        rec["errors"] = [f"{INFRA_FAILURE_MARKER}: 502 from the agent endpoint on every attempt"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=unreachable)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert INFRA_FAILURE_MARKER in verdict.reps[0].reason
+
+
+def test_the_transport_marker_has_no_noop_carve_out(noop_spec, make_run):
+    """Unlike a missing record, this one is the harness stating what happened.
+
+    An unreachable endpoint is infrastructure whatever the task provisions, so
+    the carve-out that makes a missing record block on `noop` must not apply.
+    """
+    run = make_run(mutate=lambda rec: rec.update(errors=[INFRA_FAILURE_MARKER]))
+    verdict = grade_case(noop_spec, [run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+
+
+def test_an_ordinary_error_is_still_graded(noop_spec, make_run):
+    """Only the marker excuses a run. A 4xx, a 500, or any real answer is graded."""
+    def failed(rec):
+        rec["errors"] = ["HTTP 500 from the agent endpoint"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=failed)
+    verdict = grade_case(noop_spec, [run, run, run], admitted=True)
+    assert verdict.rung is not Rung.INFRA
+    assert verdict.passes == 0
+
+
+def test_the_marker_literal_matches_the_harness():
+    """The string is the contract between two files that must not drift.
+
+    scoring.py re-declares it rather than importing the harness, which would
+    drag `devops_bench` into a module that otherwise reads plain JSON.
+    """
+    from kube_agents_bench.harness import INFRA_FAILURE_MARKER as harness_marker
+
+    assert INFRA_FAILURE_MARKER == harness_marker
 
 
 def test_infra_repetitions_are_excluded_from_the_rate(tofu_spec, make_run):
