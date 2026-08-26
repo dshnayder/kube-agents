@@ -920,6 +920,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
+- **The presubmit's timeout has to be raised before this merges, not after.** `85m` was sized when
+  the job made two `devops-bench` invocations and averaged ~43min. Three active cases at the
+  default three repetitions is nine, which puts the expected run near 78min, so merging this
+  against the current budget turns a verdict into a timeout.
+  [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) raises it
+  to `150m` — the same ~2x-the-expected-run ratio `85m` held. That number is an estimate and is
+  flagged as one in both places; #951 has since stopped `gpu-stress-test-diagnosis` creating a
+  cluster per invocation, so it is likely pessimistic.
 - The bucket and its grants do not exist; `kube-agents-evals` IAM is owned elsewhere. Until then
   the GCS backend is dormant and the local backend is the default. See
   [What the job's service account needs](#what-the-jobs-service-account-needs).

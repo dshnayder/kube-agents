@@ -546,24 +546,17 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
-# !!! TEMPORARY: 1, NOT 3. REVERT BEFORE THIS PULL REQUEST MERGES. !!!
+# Three tasks at three repetitions is nine devops-bench invocations, where the
+# presubmit's budget was sized for two. GoogleCloudPlatform/oss-test-infra#2667
+# raises that timeout 85m -> 150m and MUST LAND FIRST: with three here and 85m
+# there, the job times out instead of reporting a verdict.
 #
-# The first CI run of this refactor has to answer "is it behaviour-preserving
-# against the old gate", and at three repetitions it would not get the chance
-# to: the presubmit's timeout is 85m, sized when the job ran TWO tasks once
-# each and averaged ~43m. #939 has since activated a third case, so three
-# repetitions is nine devops-bench invocations where the budget was set for
-# two -- the run would time out and prove nothing about the scorer. One
-# repetition is also the only configuration directly comparable to the old
-# one-run-per-task gate.
-#
-# At 1 the collapse rung degenerates to "the single run failed", which is
-# strictly more trigger-happy than the rule this change exists to introduce.
-# That is tolerable only because the job is optional: true and the store is
-# empty, so the sole case that can collapse is the one BOOTSTRAP_ADMITTED
-# names. Restore 3 -- and raise the timeout in
-# GoogleCloudPlatform/oss-test-infra to match -- before merge.
-EVAL_REPETITIONS="${EVAL_REPETITIONS:-1}"
+# Setting this to 1 is how the refactor gets a run directly comparable to the
+# old one-run-per-task gate, and it is a legitimate thing to do by hand on a
+# pull request. It is not a legitimate default: at 1 the collapse rung
+# degenerates to "the single run failed", which is exactly the trigger-happy
+# rule this change exists to replace.
+EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
