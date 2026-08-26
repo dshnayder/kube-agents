@@ -15,8 +15,9 @@
 """Shared fixtures for the scoring tests.
 
 EVERY failure mode is a MUTATION OF A REAL RECORD, never a hand-written dict.
-The five directories under ``fixtures/runs/`` are verbatim devops-bench output
-(see their README for provenance), and the helpers here copy one and change
+The five directories under ``fixtures/runs/`` are captured devops-bench output
+(see their README for provenance and the one redacted field), and the helpers
+here copy one and change
 exactly the field under test. That discipline is not stylistic: the first draft
 of the ladder gated rung 3 on ``metadata.session_id``, a key a devops-bench
 record does not have, and hand-written fixtures would have agreed with it

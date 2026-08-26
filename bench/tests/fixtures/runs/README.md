@@ -1,12 +1,18 @@
 # Captured run fixtures
 
-Five real devops-bench run directories, kept verbatim. #899 asks for exactly
-this — "capture a handful of real `results.json` records now and treat them as
-fixtures" — because the record's shape is not documented anywhere and guessing
-at it is how a scorer ends up keying on a field that does not exist. It did:
-the first draft of the ladder bound rung 3's liveness check to
-`metadata.session_id`, and there is no `metadata` key on a devops-bench record
-at all.
+Five real devops-bench run directories, kept as captured but for one redaction
+(below). #899 asks for exactly this — "capture a handful of real `results.json`
+records now and treat them as fixtures" — because the record's shape is not
+documented anywhere and guessing at it is how a scorer ends up keying on a
+field that does not exist. It did: the first draft of the ladder bound rung 3's
+liveness check to `metadata.session_id`, and there is no `metadata` key on a
+devops-bench record at all.
+
+These are test **inputs**, not test results. Nothing here is an artefact the
+suite produces; they are recorded upstream output that the suite consumes, in
+the same sense as a checked-in sample payload. Regenerating them is not a
+`make` target — it needs a live cluster, a cloudtop runner and a paid judge, so
+the offline `bench-tests` job could never do it. That is why they are in git.
 
 Every failure-mode fixture the tests need is **derived in the test** by
 mutating a copy of one of these, so there is exactly one place where a real
@@ -14,8 +20,23 @@ record's shape is asserted.
 
 ## Provenance
 
-Captured 2026-08-24 against the live `kage-management` install from a cloudtop
+Captured 2026-08-24 against a live management-cluster install from a cloudtop
 runner, at `b35543c`, with devops-bench pinned at `4670d76`.
+
+**One field is redacted.** `kanban_red_1`'s `output` was a 2,252-character
+agent report that had delegated to the platform agent and pasted back a fleet
+inventory — project name, cluster names, node counts, control-plane version,
+console links. It is replaced by a short placeholder. Nothing else in any of
+the five is altered.
+
+The redaction is safe because `output` is one of the 21 keys on the record that
+no scorer code reads: the ladder reads `scores`, `status`, `trajectory`,
+`tokens`, `latency`, `verification_report` and `verification_parse_errors`, and
+nothing else. The placeholder is deliberately **non-empty** and deliberately
+does **not** contain the phrase `devops-bench smoke probe`, so it stays
+consistent with that record's `report-states-the-probe-title: fail`, and so
+`test_rung_3_ignores_an_empty_output` — which blanks `output` and asserts the
+case still greens — keeps testing a real transition instead of a no-op.
 
 | Directory        | `runId`                      | Task                 | Correctness | `OutcomeValidity` |
 | ---------------- | ---------------------------- | -------------------- | ----------- | ----------------- |
