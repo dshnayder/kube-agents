@@ -129,6 +129,13 @@ rescue it either, because composing into the existing name is still an overwrite
 it caps at 32 sources per call, with composite objects accumulating components toward a hard
 ceiling).
 
+In practice that means each GCS object holds **exactly one record** — one `bench-gate record` call
+for one case, which is that job's repetitions. It is still JSONL rather than a JSON document, and
+the distinction is load-bearing rather than pedantic: the reader concatenates objects and parses
+per line, so the trailing newline every object ends with is what makes the next one safe to append
+to the stream, and BigQuery's external table is `NEWLINE_DELIMITED_JSON`. Nothing caps an object at
+one line; a writer that emitted several would read back unchanged.
+
 **The sharding is invisible to every reader, and that is not luck.** JSONL is closed under
 concatenation: the meaning of a set of lines does not depend on how they were split across files.
 So the local backend's one-file-per-case and the GCS backend's one-object-per-batch produce
