@@ -684,6 +684,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # and the reason it is not already negative is that #951 and seeded-cluster
 # reuse cut gpu-stress-test-diagnosis from 21.1min to 244s.
 #
+# It is deliberately NOT being raised a third time here: work to cut the eval's
+# runtime is in flight separately, and if it lands the headroom returns without
+# another pull request against another repository. If it has not landed by the
+# time 1.20x is observed to bite, 300m is the follow-up.
+#
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
 # separate pull request can replace, and this number has now been invalidated

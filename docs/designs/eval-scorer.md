@@ -1002,8 +1002,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
-- **The presubmit's timeout — at `240m`, and now the one number here that most likely needs raising
-  again.** `85m` was sized when the job made two `devops-bench` invocations and averaged ~43min.
+- **The presubmit's timeout — at `240m`, held there on purpose, and the thinnest number here.**
+  `85m` was sized when the job made two `devops-bench` invocations and averaged ~43min.
   [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) took it to
   `150m` off an estimate and
   [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) took it to
@@ -1031,6 +1031,12 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   prerequisite rather than a follow-up. **`240m` is now 1.20×**, against the ~2× this job carried for
   a year and the 1.40× #2669 itself argued for. It is not already negative only because #951 and
   seeded-cluster reuse cut `gpu-stress-test-diagnosis` from 21.1min to 244s.
+
+  **It is not being raised a third time yet, and that is a decision rather than an oversight.** Work
+  to cut the eval's runtime is in flight separately; if it lands, the headroom returns without
+  another pull request against another repository, and a `300m` ceiling raised in the meantime would
+  outlive the reason for it. The cost of waiting is bounded — the ceiling only costs anything on a
+  run that has already hung — and `300m` (1.5×) is the follow-up if 1.20× is observed to bite first.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull
