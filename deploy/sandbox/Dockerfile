@@ -94,6 +94,34 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # needing one goes through the wrapped CLIs, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
 
+# A real git, deliberately off PATH.
+#
+# `git` on PATH here is and stays the credential-proxy shim: the sandbox holds
+# no GitHub token, so anything that talks to a remote runs in the broker. What
+# this binary is for is the other half of the version-control skill — a
+# repository that arrived as a bundle, unpacked into the sandbox, with no
+# remote and no credential anywhere near it. `git log`, `git show`, `git blame`
+# and `ls-files --stage` against that clone are questions about objects the
+# sandbox already holds, and running them here rather than in the broker is
+# what keeps a repository's own history out of the container that holds the
+# token. See docs/designs/version-control-abstraction.md.
+#
+# /opt/vcs/libexec rather than /usr/bin, and the guard further down is why the
+# distinction is load-bearing: `command -v git` must keep finding the shim and
+# nothing else, so the front-end moves somewhere PATH does not reach and
+# /usr/lib/git-core — git's compiled-in exec path, not a PATH directory — is
+# re-pointed at it. The server-side helpers go entirely; this git never serves
+# anything.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/vcs/libexec && \
+    mv /usr/bin/git /opt/vcs/libexec/git && \
+    ln -sf /opt/vcs/libexec/git /usr/lib/git-core/git && \
+    rm -f /usr/bin/git-receive-pack /usr/bin/git-shell \
+          /usr/bin/git-upload-archive /usr/bin/git-upload-pack && \
+    /opt/vcs/libexec/git --version
+
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for
 # public-key auth. '*' means "no password login is possible", which is what is
@@ -345,6 +373,11 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # sandbox that no network policy would see. /opt/credential-proxy/bin is not on
 # the build PATH — profile.d puts it there at login — so `command -v` here can
 # only be finding a native binary.
+#
+# git is in this list even though the layer above installs one, and that is the
+# check on that layer rather than an exception to it: the binary was moved to
+# /opt/vcs/libexec, which no PATH names, so a build that leaves a git anywhere
+# a bare `git` would resolve to fails here.
 RUN mkdir -p /opt/credential-proxy/bin && \
     for binary in gcloud kubectl gh git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \

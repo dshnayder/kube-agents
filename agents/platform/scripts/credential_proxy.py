@@ -32,6 +32,7 @@ from typing import Any
 
 import command_policy
 import content_workspace
+import vcs_broker
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -1149,6 +1150,57 @@ class CommandExecutor:
             )
         return completed
 
+    def execute_forge_cli(self, argv: list[str]) -> subprocess.CompletedProcess:
+        """Run the broker's forge CLI, from a directory that holds no repository.
+
+        The counterpart of `execute_workspace_git` for the collaboration verbs,
+        and it exists for the same reason: `_execute` is where the credential
+        environment is assembled, and a second copy of that assembly would drift
+        from the first.
+
+        The working directory is the content root, deliberately. `gh` shells out
+        to git and infers a repository from whatever `.git/config` it can find
+        above the cwd, so running it inside one of the scratch clones would let
+        a config that came from a repository decide what the credentialed
+        process does. `gh api` is always given an explicit path, so it needs no
+        repository at all.
+
+        Not reachable from `/v1/exec`. The argv is composed in `vcs_broker`, the
+        subcommand is always `api`, and the only caller-supplied strings in it
+        are validated fields.
+        """
+        self.content_root.mkdir(parents=True, exist_ok=True)
+        result = self._execute(argv, cwd=str(self.content_root))
+        return subprocess.CompletedProcess(
+            argv, result.exit_code, result.stdout, result.stderr
+        )
+
+    def refresh_github_credential(self, repository: str) -> None:
+        """Mint a current installation token for `repository`, or raise.
+
+        The same helper `/v1/github/refresh` runs, called directly rather than
+        over loopback. Before this, the sandbox had to know that a GitHub token
+        expires and POST the refresh itself — which is forge knowledge in the
+        one container that is supposed to have none of it.
+        """
+        if not is_valid_repository(repository):
+            raise ValueError("repository must be owner/name")
+        result = self.execute_internal(
+            ["/opt/defaults/scripts/github_token_refresh.py", repository]
+        )
+        if result.exit_code != 0:
+            # Logged here and not returned: the detail crosses back into the
+            # sandbox otherwise, and it is the one place a broker outage is
+            # diagnosable. Redacted before it is bounded, so a token cut in half
+            # by the slice is not what survives.
+            detail = redact_credentials(result.stderr.strip())
+            LOGGER.warning(
+                "GitHub credential refresh exited %d%s",
+                result.exit_code,
+                f": {detail[:1000]}" if detail else "",
+            )
+            raise RuntimeError("GitHub credential refresh failed")
+
     def _lease_holder(self, candidate: Path) -> Path | None:
         """The nearest ancestor of `candidate` that holds a lease marker."""
         for directory in (candidate, *candidate.parents):
@@ -1589,6 +1641,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     workspace_store: content_workspace.ContentWorkspaceStore | None = None
+    # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
+    # not shadow the module inside a method, but it reads as though it does.
+    vcs: vcs_broker.VcsBroker | None = None
     workspace_lock: threading.Lock = threading.Lock()
 
     def do_GET(self) -> None:  # noqa: N802
@@ -1634,6 +1689,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/workspace/"):
             self._handle_workspace_post()
+            return
+        if self.path.startswith("/v1/vcs/"):
+            self._handle_vcs_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -1846,6 +1904,70 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
         return payload
+
+    def _handle_vcs_post(self) -> None:
+        """The version-control routes: `POST /v1/vcs/<verb>`.
+
+        A separate namespace from `/v1/workspace/*` rather than more verbs on
+        it, because they are different protocols. A workspace is opened, held
+        by a handle across several calls, and closed; every route here stands
+        alone and leaves nothing behind. Sharing the prefix would put a `handle`
+        argument on routes that have none.
+
+        The same lock, though. Both write scratch trees under the broker's
+        content root, and a `publish` is a sequence of git invocations that
+        assumes nothing moved underneath it.
+        """
+        if self.vcs is None:
+            self._json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "version control is not enabled on this broker",
+                    "code": "VCS_DISABLED",
+                },
+            )
+            return
+        # Hyphens and underscores reach the same route. A caller that guessed
+        # the punctuation wrong should not get a 404 that reads like the verb
+        # does not exist.
+        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        route = vcs_broker.route_table(self.vcs).get(verb)
+        if route is None:
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        try:
+            with self.workspace_lock:
+                result = route(payload)
+        except content_workspace.WorkspaceError as exc:
+            self._json(HTTPStatus(exc.status), {"error": str(exc), **exc.fields})
+            return
+        except subprocess.CalledProcessError as exc:
+            # git's stderr can carry the remote URL with a credential in it, so
+            # it goes to the log through the same redactor the exec path uses
+            # and never into the response.
+            LOGGER.warning(
+                "vcs %s failed rc=%s: %s",
+                verb,
+                exc.returncode,
+                redact_credentials(str(exc.stderr or "")[:2000]),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
+            )
+            return
+        except Exception as exc:
+            LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
+            )
+            return
+        self._json(HTTPStatus.OK, result)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: open, read, list, grep, commit, push, close.
@@ -2102,6 +2224,15 @@ def serve(args: argparse.Namespace) -> None:
             timeout_seconds=args.timeout_seconds,
         )
         LOGGER.info("content workspaces enabled root=%s", executor.content_root)
+    if vcs_broker.vcs_enabled():
+        CredentialProxyHandler.vcs = vcs_broker.VcsBroker(
+            executor.content_root / "vcs",
+            git_runner=executor.execute_workspace_git,
+            cli_runner=executor.execute_forge_cli,
+            refresh=executor.refresh_github_credential,
+            timeout_seconds=args.timeout_seconds,
+        )
+        LOGGER.info("vcs routes enabled root=%s", executor.content_root / "vcs")
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)

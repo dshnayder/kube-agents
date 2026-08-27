@@ -1046,6 +1046,94 @@ class CloseTest(StoreTestCase):
             self.store.read({"handle": handle, "path": "README.md"})
 
 
+class FileModeTest(StoreTestCase):
+    """The executable bit, which content passing otherwise drops on the floor."""
+
+    def _mode(self, root, path):
+        entry = self._git(root, "ls-tree", "HEAD", "--", path).stdout
+        return entry.split()[0] if entry else ""
+
+    def test_a_requested_mode_reaches_the_tree_entry(self):
+        handle = self.open_workspace()["handle"]
+        self.store.commit(
+            {
+                "handle": handle,
+                "branch": "fix/exec",
+                "message": "add a script",
+                "changes": [
+                    {
+                        "path": "scripts/run.sh",
+                        "contentBase64": b64("#!/bin/sh\necho hi\n"),
+                        "mode": "100755",
+                    },
+                    {"path": "notes.md", "contentBase64": b64("hi\n")},
+                ],
+            }
+        )
+        root = self.store._workspaces[handle].root
+        self.assertEqual(self._mode(root, "scripts/run.sh"), "100755")
+        self.assertEqual(self._mode(root, "notes.md"), "100644")
+
+    def test_an_unstated_mode_does_not_demote_an_existing_script(self):
+        handle = self.open_workspace()["handle"]
+        base = {"handle": handle, "branch": "fix/exec", "message": "m"}
+        self.store.commit(
+            {
+                **base,
+                "changes": [
+                    {
+                        "path": "scripts/run.sh",
+                        "contentBase64": b64("#!/bin/sh\necho one\n"),
+                        "mode": "100755",
+                    }
+                ],
+            }
+        )
+        # Pushed between the two, and not for the push's sake: `commit` starts
+        # from `origin/<branch>` only when that ref exists, and from
+        # `origin/main` otherwise. Without this the second commit restarts from
+        # the base, the first commit is discarded, and the file is created
+        # fresh at 0644 -- which would make this test pass or fail for a reason
+        # that has nothing to do with modes.
+        self.store.push({"handle": handle, "branch": "fix/exec"})
+        self.store.commit(
+            {
+                **base,
+                "message": "edit the body only",
+                "changes": [
+                    {
+                        "path": "scripts/run.sh",
+                        "contentBase64": b64("#!/bin/sh\necho two\n"),
+                    }
+                ],
+            }
+        )
+        root = self.store._workspaces[handle].root
+        self.assertEqual(self._mode(root, "scripts/run.sh"), "100755")
+
+    def test_a_mode_git_does_not_record_is_refused_before_anything_is_written(self):
+        handle = self.open_workspace()["handle"]
+        root = self.store._workspaces[handle].root
+        for mode in ("104755", "0755", 493, "100755 ", "100644\n"):
+            with self.subTest(mode=mode), self.assertRaises(WorkspaceError):
+                self.store.commit(
+                    {
+                        "handle": handle,
+                        "branch": "fix/exec",
+                        "message": "m",
+                        "changes": [
+                            {"path": "ok.yaml", "contentBase64": b64("a: 1\n")},
+                            {
+                                "path": "scripts/run.sh",
+                                "contentBase64": b64("x\n"),
+                                "mode": mode,
+                            },
+                        ],
+                    }
+                )
+            self.assertFalse((root / "ok.yaml").exists())
+
+
 class ResponseShapeTest(StoreTestCase):
     def test_no_response_carries_a_filesystem_path(self):
         """The invariant, written as something a test can check.

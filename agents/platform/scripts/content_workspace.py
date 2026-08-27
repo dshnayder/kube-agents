@@ -79,6 +79,19 @@ DEFAULT_MAX_MATCH_CHARS = 512
 # written the objects by the time this is measured.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 
+# A bundle is history rather than a tree, so it is not bounded by the same
+# number as a commit payload: the whole point of asking for one is the commits
+# `read` cannot express. It still needs a ceiling, because the response is
+# base64 in a single JSON body and a repository whose history does not fit
+# should say so rather than exhaust the reader.
+DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+
+# The two modes git records for a blob. Not a number the caller picks: git
+# stores no other permission bits, and a caller allowed to name an arbitrary
+# mode is a caller who will eventually name a setuid one and be surprised that
+# it does not survive the commit.
+_FILE_MODES = {"100644": 0o644, "100755": 0o755}
+
 # A handle is 128 bits from os.urandom and lives only in this process's memory.
 # The agent cannot fabricate one, which is the property the `.lease` file it
 # replaces never had -- that was a file on a shared volume, and creating it
@@ -237,6 +250,9 @@ class ContentWorkspaceStore:
         )
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
+        )
+        self.max_bundle_bytes = _positive_int(
+            "CREDENTIAL_PROXY_MAX_BUNDLE_BYTES", DEFAULT_MAX_BUNDLE_BYTES
         )
         self.timeout_seconds = timeout_seconds
         self._environment = dict(environment or {})
@@ -760,6 +776,17 @@ class ContentWorkspaceStore:
             if entry.get("delete") is True:
                 validated.append({"path": path, "delete": True})
                 continue
+            # The executable bit, because content passing otherwise silently
+            # drops it: every file this writes lands 0644, and a CI hook or a
+            # `scripts/` entry point committed 0644 is one the pipeline will
+            # not run. The caller states the mode or gets git's default; it
+            # does not get to invent a third value.
+            mode = entry.get("mode")
+            if mode is not None and mode not in _FILE_MODES:
+                raise WorkspaceError(
+                    f"{path} asks for mode {mode!r}; git records only "
+                    f"{' or '.join(sorted(_FILE_MODES))}"
+                )
             encoded = entry.get("contentBase64")
             if not isinstance(encoded, str):
                 raise WorkspaceError(
@@ -784,7 +811,7 @@ class ContentWorkspaceStore:
                     "ceiling",
                     status=413,
                 )
-            validated.append({"path": path, "content": data})
+            validated.append({"path": path, "content": data, "mode": mode})
         return validated
 
     def _apply(self, workspace: _Workspace, changes: list[dict[str, Any]]) -> None:
@@ -810,6 +837,11 @@ class ContentWorkspaceStore:
                 target.unlink()
             parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(change["content"])
+            # Only when asked. An unstated mode leaves an existing file's bit
+            # alone, so rewriting the body of a script that was already
+            # executable does not quietly demote it.
+            if change.get("mode"):
+                os.chmod(target, _FILE_MODES[change["mode"]])
 
     def push(self, payload: dict[str, Any]) -> dict[str, Any]:
         workspace = self._resolve(payload.get("handle"))

@@ -310,6 +310,7 @@ class Workspace:
         message: str,
         changes: dict[str, bytes | None],
         expected_base_sha: str | None = None,
+        modes: dict[str, str] | None = None,
     ) -> dict:
         """`changes` maps a repository-relative path to bytes, or to None to delete.
 
@@ -317,18 +318,24 @@ class Workspace:
         refuse with 409 when the base branch has moved under a file this commit
         also writes. Leaving it out means last-writer-wins against whatever
         landed in the meantime.
+
+        `modes` names `100755` for the paths that must land executable. Without
+        it every file this writes is 0644, which is how a `scripts/` entry point
+        arrives on the remote unrunnable.
         """
+        modes = modes or {}
         entries = []
         for path, content in changes.items():
             if content is None:
                 entries.append({"path": path, "delete": True})
             else:
-                entries.append(
-                    {
-                        "path": path,
-                        "contentBase64": base64.b64encode(content).decode("ascii"),
-                    }
-                )
+                entry = {
+                    "path": path,
+                    "contentBase64": base64.b64encode(content).decode("ascii"),
+                }
+                if path in modes:
+                    entry["mode"] = modes[path]
+                entries.append(entry)
         payload = {
             "handle": self.handle,
             "branch": branch,
@@ -404,6 +411,35 @@ def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
         except (ValueError, TypeError):
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
         if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
+            raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
+        raise WorkspaceRequestError(exc.code, answer) from exc
+
+
+def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
+    """One `POST /v1/vcs/<verb>`.
+
+    Separate from `_workspace_call` rather than a parameter on it. The two
+    namespaces are different protocols that happen to share a transport:
+    `/v1/workspace/*` is handle-oriented and stateful across a session, while
+    every `/v1/vcs/*` call stands alone. Folding them together would put a
+    `handle` argument on routes that have none and invite a caller to hold one.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            answer = json.load(exc)
+        except (ValueError, TypeError):
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        if answer.get("code") == "VCS_DISABLED":
             raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
         raise WorkspaceRequestError(exc.code, answer) from exc
 
