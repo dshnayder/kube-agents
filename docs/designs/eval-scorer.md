@@ -1002,12 +1002,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
-- **The presubmit's timeout has to be raised before this merges, not after.** `85m` was sized when
-  the job made two `devops-bench` invocations and averaged ~43min.
-  [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) has taken
-  it to `150m`, which is **still not enough**;
-  [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) takes it to
-  `240m` and is the one that gates this pull request.
+- **The presubmit's timeout — settled at `240m`, and the one number here worth re-checking.** `85m`
+  was sized when the job made two `devops-bench` invocations and averaged ~43min.
+  [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) took it to
+  `150m` off an estimate and
+  [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) took it to
+  `240m` off the measurement below; both have merged and the Prow `job-config` has rolled, which is
+  what unblocked this pull request. The arithmetic stays recorded because the budget is now 1.4×
+  rather than the 2× this job carried for a year, so the next person to add a case needs to know
+  where the headroom went.
 
   The expected run is measured rather than estimated, and the measurement was redone after #956
   took the task matrix from three active cases to **ten**. Build `2092820036916875264` — the run
@@ -1021,10 +1024,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   | 1    | 10          | 68.9min  | 2.18× | 3.48× |
   | 3    | 30          | 172min   | 0.87× | 1.40× |
 
-  `150m` is therefore not a tight budget but a guaranteed timeout, which is what makes #2669 a
-  blocker rather than a precaution. `240m` is 1.40×, thinner than the ~2× this job has historically
-  carried; it is not thinner still only because seeded-cluster reuse cut `gpu-stress-test-diagnosis`
-  from 21.1min to 244s.
+  `150m` was therefore not a tight budget but a guaranteed timeout, which is what made #2669 a
+  prerequisite rather than a follow-up. `240m` is 1.40×, thinner than the ~2× this job has
+  historically carried; it is not thinner still only because seeded-cluster reuse cut
+  `gpu-stress-test-diagnosis` from 21.1min to 244s.
 
   Recorded because the number has moved twice and both moves were the same mistake — extrapolating
   from a matrix that then changed underneath: the original ~78min estimate assumed ~33min of fixed

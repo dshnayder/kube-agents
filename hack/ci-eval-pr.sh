@@ -616,12 +616,14 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #
 # Only the 51.6min scales, so three repetitions is 17.3 + 3 x 51.6 = ~172min.
 #
-# GoogleCloudPlatform/oss-test-infra#2667 took that budget 85m -> 150m and has
-# merged. #2669 takes it 150m -> 240m and MUST LAND FIRST -- 150m against a
-# ~172min run is 0.87x, a guaranteed timeout rather than a tight one. 240m is
-# 1.40x, which is thinner than the ~2x this job has always been sized at, and
-# the reason it is not thinner still is that #951 and seeded-cluster reuse cut
-# gpu-stress-test-diagnosis from 21.1min to 244s.
+# The budget was raised to match, in two steps, both merged: oss-test-infra
+# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
+# the measurement above. 150m against a ~172min run is 0.87x -- a guaranteed
+# timeout, not a tight one -- which is why the second step was a prerequisite
+# for this file and not a follow-up. 240m is 1.40x, thinner than the ~2x this
+# job has always been sized at, and the reason it is not thinner still is that
+# #951 and seeded-cluster reuse cut gpu-stress-test-diagnosis from 21.1min to
+# 244s.
 #
 # The variance to watch is consistency-authorized-networks-probe: budgeted at
 # 150-350s like its five sibling probes, it took 1039s on the only run that
