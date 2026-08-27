@@ -664,29 +664,39 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
-# TEN tasks at three repetitions is THIRTY devops-bench invocations, where the
-# presubmit's budget was sized for two. Measured on build 2092820036916875264,
-# which is the run #956 merged on -- all ten tasks at one repetition, 68.9min
-# wall:
+# THIRTEEN tasks at three repetitions is THIRTY-NINE devops-bench invocations,
+# where the presubmit's budget was sized for two. Measured, not estimated, from
+# two builds:
 #
 #   fixed: Boskos lease, image build (710s), deploy, teardown   17.3min
-#   the ten invocations                                         51.6min
+#   the ten invocations #956 activated                          51.6min
+#     (build 2092820036916875264, the run #956 merged on)
+#   the three #982 activated: 190s + 142s + 220s                 9.2min
+#     (build 2092719124550520832, quoted in the TASKS array above)
 #
-# Only the 51.6min scales, so three repetitions is 17.3 + 3 x 51.6 = ~172min.
+# Only the 60.8min of invocations scales, so one repetition is ~78min and three
+# is 17.3 + 3 x 60.8 = ~200min.
 #
-# The budget was raised to match, in two steps, both merged: oss-test-infra
-# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
-# the measurement above. 150m against a ~172min run is 0.87x -- a guaranteed
-# timeout, not a tight one -- which is why the second step was a prerequisite
-# for this file and not a follow-up. 240m is 1.40x, thinner than the ~2x this
-# job has always been sized at, and the reason it is not thinner still is that
-# #951 and seeded-cluster reuse cut gpu-stress-test-diagnosis from 21.1min to
-# 244s.
+# The budget has been raised twice to keep up, both merged: oss-test-infra #2667
+# took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off the
+# ten-task measurement. 240m against ~200min is 1.20x. That is thin -- this job
+# carried ~2x for a year, and the ten-task arithmetic #2669 argued was 1.40x --
+# and the reason it is not already negative is that #951 and seeded-cluster
+# reuse cut gpu-stress-test-diagnosis from 21.1min to 244s.
+#
+# READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
+# repository, so every activation here silently spends headroom that only a
+# separate pull request can replace, and this number has now been invalidated
+# three times by a matrix that grew after it was computed (#956, then #982).
+# At 1.20x the next activation of any average-cost case takes it under 1.0.
+# Activating a case and raising the budget are one change in two repositories,
+# not a change and a follow-up.
 #
 # The variance to watch is consistency-authorized-networks-probe: budgeted at
 # 150-350s like its five sibling probes, it took 1039s on the only run that
-# exists. If that is its normal cost rather than one bad sample, the probe set
-# is a third more expensive than #956 sized it for.
+# exists. Three repetitions of that one case is ~52min of the ~200min total. If
+# 1039s is its normal cost rather than one bad sample, the probe set is a third
+# more expensive than #956 sized it for and 1.20x does not survive it.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a

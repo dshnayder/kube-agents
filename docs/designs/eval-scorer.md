@@ -1002,41 +1002,47 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
-- **The presubmit's timeout — settled at `240m`, and the one number here worth re-checking.** `85m`
-  was sized when the job made two `devops-bench` invocations and averaged ~43min.
+- **The presubmit's timeout — at `240m`, and now the one number here that most likely needs raising
+  again.** `85m` was sized when the job made two `devops-bench` invocations and averaged ~43min.
   [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) took it to
   `150m` off an estimate and
   [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) took it to
-  `240m` off the measurement below; both have merged and the Prow `job-config` has rolled, which is
-  what unblocked this pull request. The arithmetic stays recorded because the budget is now 1.4×
-  rather than the 2× this job carried for a year, so the next person to add a case needs to know
-  where the headroom went.
+  `240m` off a ten-task measurement; both have merged and the Prow `job-config` has rolled, which is
+  what unblocked this pull request.
 
-  The expected run is measured rather than estimated, and the measurement was redone after #956
-  took the task matrix from three active cases to **ten**. Build `2092820036916875264` — the run
-  #956 merged on — executed all ten at one repetition in 68.9min wall: 17.3min of Boskos lease,
-  image build (710s), deploy and teardown, plus 51.6min across the ten invocations. Only the
-  invocations scale with `EVAL_REPETITIONS`, so three repetitions is thirty invocations at
-  `17.3 + 3 × 51.6` ≈ **172min**.
+  The expected run is measured rather than estimated, and it has now been measured twice because the
+  matrix grew underneath it twice — #956 took the active cases from three to **ten**, and #982 took
+  them to **thirteen**:
+
+  | source | invocations | measured                                        | build                 |
+  | ------ | ----------- | ----------------------------------------------- | --------------------- |
+  | fixed  | —           | 17.3min (Boskos, image build, deploy, teardown) | `2092820036916875264` |
+  | #956   | 10          | 51.6min                                         | `2092820036916875264` |
+  | #982   | 3           | 9.2min (190s + 142s + 220s)                     | `2092719124550520832` |
+
+  Only the 60.8min of invocations scales with `EVAL_REPETITIONS`:
 
   | reps | invocations | expected | 150m  | 240m  |
   | ---- | ----------- | -------- | ----- | ----- |
-  | 1    | 10          | 68.9min  | 2.18× | 3.48× |
-  | 3    | 30          | 172min   | 0.87× | 1.40× |
+  | 1    | 13          | 78min    | 1.92× | 3.07× |
+  | 3    | 39          | 200min   | 0.75× | 1.20× |
 
   `150m` was therefore not a tight budget but a guaranteed timeout, which is what made #2669 a
-  prerequisite rather than a follow-up. `240m` is 1.40×, thinner than the ~2× this job has
-  historically carried; it is not thinner still only because seeded-cluster reuse cut
-  `gpu-stress-test-diagnosis` from 21.1min to 244s.
+  prerequisite rather than a follow-up. **`240m` is now 1.20×**, against the ~2× this job carried for
+  a year and the 1.40× #2669 itself argued for. It is not already negative only because #951 and
+  seeded-cluster reuse cut `gpu-stress-test-diagnosis` from 21.1min to 244s.
 
-  Recorded because the number has moved twice and both moves were the same mistake — extrapolating
-  from a matrix that then changed underneath: the original ~78min estimate assumed ~33min of fixed
-  setup and ~5min per invocation (real: 17.3min and ~5.2min, so the per-invocation figure was right
-  all along and the count of invocations was not), and the 128min figure that replaced it assumed
-  three cases when ten had just landed. One term is worth watching in either direction:
-  `consistency-authorized-networks-probe` cost **1039s** on the only run that exists, against the
-  150–350s #956 budgeted for each of its six probes. If that is typical rather than one bad sample,
-  the probe set is a third more expensive than its design assumed and 240m gets thin.
+  The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
+  in another repository**, so activating a case here spends headroom that only a separate pull
+  request can replace, and nothing in this repository fails when it runs out. Three successive
+  numbers have been invalidated the same way. Activating a case and raising the budget should be one
+  change in two repositories, not a change and a follow-up — the comment above `EVAL_REPETITIONS` in
+  `hack/ci-eval-pr.sh` says so where someone about to uncomment a line will read it.
+
+  One term is worth watching in either direction: `consistency-authorized-networks-probe` cost
+  **1039s** on the only run that exists, against the 150–350s #956 budgeted for each of its six
+  probes. Three repetitions of that single case is ~52min of the ~200min total. If 1039s is typical
+  rather than one bad sample, 1.20× does not survive it.
 
 - The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
   dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a
