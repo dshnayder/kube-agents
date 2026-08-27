@@ -883,6 +883,50 @@ func TestContentWorkspacesReachTheColocatedProxyOnly(t *testing.T) {
 	}
 }
 
+func TestVersionControlRoutesReachTheProxyAtEitherPlacement(t *testing.T) {
+	// The opposite of the test above, deliberately. Content passing names paths
+	// in a tree the two containers share, so it needs them in one pod; the vcs
+	// routes move history as a bundle in an HTTP body and name nothing on a
+	// volume. Gating them on co-location would make the one access design that
+	// survives the broker moving into its own pod unavailable in exactly that
+	// topology -- see the field comment on ShellSandboxSpec.VersionControl.
+	env := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == "CREDENTIAL_PROXY_VCS" {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+
+	off := colocatedTestAgent()
+	for _, colocated := range []bool{true, false} {
+		if _, ok := env(buildCredentialProxyContainer(off, colocated)); ok {
+			t.Errorf("colocated=%v: the vcs routes must be off unless asked for", colocated)
+		}
+	}
+
+	on := colocatedTestAgent()
+	on.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(true)
+	for _, colocated := range []bool{true, false} {
+		value, ok := env(buildCredentialProxyContainer(on, colocated))
+		if !ok || value != "1" {
+			t.Errorf("colocated=%v: CREDENTIAL_PROXY_VCS = %q present=%v, want \"1\"",
+				colocated, value, ok)
+		}
+	}
+
+	// Independent of contentWorkspaces in both directions: an install may arm
+	// either alone, and the two answer the same problem differently.
+	if _, ok := env(buildCredentialProxyContainer(func() *agentv1alpha1.PlatformAgent {
+		a := colocatedTestAgent()
+		a.Spec.Harness.Experimental.ShellSandbox.ContentWorkspaces = ptr.To(true)
+		return a
+	}(), true)); ok {
+		t.Error("contentWorkspaces alone must not arm the vcs routes")
+	}
+}
+
 func TestColocatedTokenProjectionIsAudienceScoped(t *testing.T) {
 	agent := colocatedTestAgent()
 	volumes := buildCredentialProxyRuntimeVolumes(agent)

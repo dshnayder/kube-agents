@@ -235,6 +235,27 @@ type ShellSandboxSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	ContentWorkspaces *bool `json:"contentWorkspaces,omitempty"`
+
+	// VersionControl arms the broker's /v1/vcs/* routes, which the
+	// version-control skill speaks. History moves between the sandbox and the
+	// broker as a git bundle in both directions: the sandbox unpacks it into a
+	// working copy with no remote and answers every question about the past with
+	// its own git, and sends revisions back the same way. The broker fetches,
+	// checks and pushes without ever checking the incoming objects out.
+	//
+	// This is the third answer to the same problem ContentWorkspaces addresses,
+	// and it is armed separately because it gives back what that one takes away.
+	// Content passing answers from one commit, so there is no log, no annotate,
+	// no earlier revision of a file and no file mode; measured against real
+	// questions, an agent on those routes reached those answers by leaving the
+	// protocol for `gh api`. Bundles carry history at full fidelity without
+	// putting a repository's own config, hooks or remotes beside the credential.
+	//
+	// Off by default and independent of ContentWorkspaces, so an install can arm
+	// either, both, or neither. See docs/designs/version-control-abstraction.md.
+	// +kubebuilder:default=false
+	// +optional
+	VersionControl *bool `json:"versionControl,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service

@@ -260,6 +260,17 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated
 		// process over the Service, and one listener serves both.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_LISTEN_ADDRESS", Value: "0.0.0.0"},
 	)
+	if shellSandboxVersionControl(agent) {
+		// Set at either placement, unlike every other flag in this function, and
+		// the difference is the point. The /v1/vcs/* routes move history as a
+		// bundle in an HTTP body; they name no path on a shared volume and read
+		// nothing the caller wrote to one, so there is nothing about them that
+		// needs the two containers to be in the same pod. Gating them on
+		// co-location the way contentWorkspaces is gated would make the one
+		// access design that survives the broker moving into its own pod
+		// unavailable in exactly that topology.
+		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_VCS", Value: "1"})
+	}
 	volumeMounts := buildCredentialProxyVolumeMounts()
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},

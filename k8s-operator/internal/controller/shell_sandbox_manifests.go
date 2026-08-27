@@ -265,6 +265,17 @@ func shellSandboxContentWorkspaces(agent *agentv1alpha1.PlatformAgent) bool {
 	return spec != nil && spec.ContentWorkspaces != nil && *spec.ContentWorkspaces
 }
 
+// shellSandboxVersionControl reports whether the broker should serve the
+// /v1/vcs/* routes the version-control skill speaks.
+//
+// Read separately from contentWorkspaces rather than folded into it: the two
+// are different answers to the same problem and an install may want either
+// alone. See the field comment on ShellSandboxSpec.VersionControl.
+func shellSandboxVersionControl(agent *agentv1alpha1.PlatformAgent) bool {
+	spec := shellSandboxSpec(agent)
+	return spec != nil && spec.VersionControl != nil && *spec.VersionControl
+}
+
 // shellSandboxName is the name of every object in this file: the StatefulSet, its
 // governing Service, and the NetworkPolicy. One name, because they are one thing,
 // and because the DNS record the agent dials is built from it.
