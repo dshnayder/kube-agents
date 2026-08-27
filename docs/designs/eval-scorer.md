@@ -1009,20 +1009,31 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) takes it to
   `240m` and is the one that gates this pull request.
 
-  The expected run is measured now rather than estimated. Job `2092688725648609280` ran all three
-  cases at one repetition and went green in 52.2min: 14.4min of Boskos lease, image build and
-  deploy paid once, then 21.1 / 14.1 / 2.5min for the three invocations (agent latency 1102s / 800s
-  / 89s). Only the per-invocation 37.8min scales with `EVAL_REPETITIONS`, so three repetitions is
-  `14.4 + 3 × 37.8` ≈ **128min**, and `150m` against that is 1.17× rather than the ~2× this job has
-  always been sized at.
+  The expected run is measured rather than estimated, and the measurement was redone after #956
+  took the task matrix from three active cases to **ten**. Build `2092820036916875264` — the run
+  #956 merged on — executed all ten at one repetition in 68.9min wall: 17.3min of Boskos lease,
+  image build (710s), deploy and teardown, plus 51.6min across the ten invocations. Only the
+  invocations scale with `EVAL_REPETITIONS`, so three repetitions is thirty invocations at
+  `17.3 + 3 × 51.6` ≈ **172min**.
 
-  Two things the earlier estimate got wrong, recorded because they are the reason the number moved
-  twice: fixed setup is less than half the ~33min assumed, and a repetition costs ~12.6min rather
-  than ~5min. #951 stopping `gpu-stress-test-diagnosis` from creating its own cluster per
-  invocation did **not** make this pessimistic — that case is still the most expensive of the
-  three, and what it spends is agent time, not provisioning. 128min is one sample and agent latency
-  is its most variable term, so it wants revisiting in either direction once several runs at three
-  repetitions exist.
+  | reps | invocations | expected | 150m  | 240m  |
+  | ---- | ----------- | -------- | ----- | ----- |
+  | 1    | 10          | 68.9min  | 2.18× | 3.48× |
+  | 3    | 30          | 172min   | 0.87× | 1.40× |
+
+  `150m` is therefore not a tight budget but a guaranteed timeout, which is what makes #2669 a
+  blocker rather than a precaution. `240m` is 1.40×, thinner than the ~2× this job has historically
+  carried; it is not thinner still only because seeded-cluster reuse cut `gpu-stress-test-diagnosis`
+  from 21.1min to 244s.
+
+  Recorded because the number has moved twice and both moves were the same mistake — extrapolating
+  from a matrix that then changed underneath: the original ~78min estimate assumed ~33min of fixed
+  setup and ~5min per invocation (real: 17.3min and ~5.2min, so the per-invocation figure was right
+  all along and the count of invocations was not), and the 128min figure that replaced it assumed
+  three cases when ten had just landed. One term is worth watching in either direction:
+  `consistency-authorized-networks-probe` cost **1039s** on the only run that exists, against the
+  150–350s #956 budgeted for each of its six probes. If that is typical rather than one bad sample,
+  the probe set is a third more expensive than its design assumed and 240m gets thin.
 
 - The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
   dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a

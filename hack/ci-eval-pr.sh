@@ -606,15 +606,27 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
-# Three tasks at three repetitions is nine devops-bench invocations, where the
-# presubmit's budget was sized for two. Measured on job 2092688725648609280
-# (three cases, one repetition, 52.2min): 14.4min of Boskos lease, image build
-# and deploy paid once, then 21.1 / 14.1 / 2.5min per invocation. Only the
-# 37.8min of invocations scales, so nine of them is ~128min.
+# TEN tasks at three repetitions is THIRTY devops-bench invocations, where the
+# presubmit's budget was sized for two. Measured on build 2092820036916875264,
+# which is the run #956 merged on -- all ten tasks at one repetition, 68.9min
+# wall:
+#
+#   fixed: Boskos lease, image build (710s), deploy, teardown   17.3min
+#   the ten invocations                                         51.6min
+#
+# Only the 51.6min scales, so three repetitions is 17.3 + 3 x 51.6 = ~172min.
 #
 # GoogleCloudPlatform/oss-test-infra#2667 took that budget 85m -> 150m and has
-# merged. #2669 takes it 150m -> 240m and MUST LAND FIRST: 150m against a
-# ~128min run is 1.17x, which one slow gpu-stress-test-diagnosis erases.
+# merged. #2669 takes it 150m -> 240m and MUST LAND FIRST -- 150m against a
+# ~172min run is 0.87x, a guaranteed timeout rather than a tight one. 240m is
+# 1.40x, which is thinner than the ~2x this job has always been sized at, and
+# the reason it is not thinner still is that #951 and seeded-cluster reuse cut
+# gpu-stress-test-diagnosis from 21.1min to 244s.
+#
+# The variance to watch is consistency-authorized-networks-probe: budgeted at
+# 150-350s like its five sibling probes, it took 1039s on the only run that
+# exists. If that is its normal cost rather than one bad sample, the probe set
+# is a third more expensive than #956 sized it for.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
