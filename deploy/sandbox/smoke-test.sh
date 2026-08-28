@@ -37,7 +37,7 @@ PASS=0
 FAIL=0
 
 cleanup() {
-  docker rm -f "$NAME" "$NAME-nourl" "$NAME-badsshd" >/dev/null 2>&1
+  docker rm -f "$NAME" "$NAME-nourl" "$NAME-badsshd" "$NAME-vcs" >/dev/null 2>&1
   docker volume rm -f "$DATA_VOL" "$SSHD_VOL" >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -426,7 +426,10 @@ check_absent "and does not land in the home every card shares" "/home/agent" \
 "${SSH[@]}" "rm -rf $KWS /opt/data/kanban/boards /opt/data/kanban/workspaces/scratchpad /opt/data/other" >/dev/null 2>&1
 
 echo
-echo "== 5. credential-proxy wrappers =="
+echo "== 5. credential-proxy wrappers (version control off) =="
+# This container is started without CREDENTIAL_PROXY_VCS, so all four names are
+# the shim. Section 9 starts a second one with the abstraction armed, where
+# `git` is the local binary instead and `gh` does not resolve at all.
 for cli in kubectl gcloud gh git; do
   check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
     "$("${SSH[@]}" "command -v $cli" 2>&1)"
@@ -497,6 +500,68 @@ out=$(docker run --rm -v "$WORK/keys:/etc/ssh-authorized:ro" \
   -e $'CREDENTIAL_PROXY_URL=http://x\nPermitRootLogin yes' "$IMAGE" 2>&1)
 check "refuses the value" "contains a newline, quote or backslash" "$out"
 check_absent "and does not start sshd with it" "ready; starting" "$out"
+
+echo
+echo "== 9. CREDENTIAL_PROXY_VCS moves git off the shim and removes gh =="
+# The bug this section exists for: the first build of the version-control
+# abstraction did the PATH prepend in /etc/profile.d alone. `kubectl exec --
+# bash -l` and every check in section 5 saw the right thing, while the ssh
+# session Hermes actually uses -- not a login shell, so no /etc/profile -- kept
+# resolving `git` and `gh` to the credential shim with the feature reported as
+# armed. A live install ran that way and the routes were bypassed, so both
+# session types are asserted here and neither is allowed to stand in for the
+# other.
+VCSPORT=$((PORT + 1))
+docker rm -f "$NAME-vcs" >/dev/null 2>&1
+docker run -d --name "$NAME-vcs" -p "$VCSPORT:2222" \
+  -v "$WORK/keys:/etc/ssh-authorized:ro" \
+  -e CREDENTIAL_PROXY_URL=http://127.0.0.1:9999 \
+  -e CREDENTIAL_PROXY_VCS=1 \
+  "$IMAGE" >/dev/null
+for _ in $(seq 30); do
+  ssh-keyscan -p "$VCSPORT" -t ed25519 127.0.0.1 >/dev/null 2>&1 && break
+  sleep 1
+done
+VCSSSH=(ssh -i "$WORK/id" -p "$VCSPORT" -o IdentitiesOnly=yes
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=5 agent@127.0.0.1)
+check "the flag reaches a non-login session at all" "1" \
+  "$("${VCSSSH[@]}" 'echo "$CREDENTIAL_PROXY_VCS"' 2>&1)"
+check "git is the local one in a non-login session" "/opt/vcs/bin/git" \
+  "$("${VCSSSH[@]}" 'command -v git' 2>&1)"
+check "git is the local one in a login session too" "/opt/vcs/bin/git" \
+  "$("${VCSSSH[@]}" "bash -l -c 'command -v git'" 2>&1)"
+# `gh` is asserted by absence, not by which path wins. The entrypoint deletes
+# the shim's copy when the abstraction is armed, and nothing else in this image
+# provides one, so both session types must come up empty -- a check on PATH
+# order would pass against a build that merely shadowed it.
+check "gh resolves nowhere in a non-login session" "rc=1" \
+  "$("${VCSSSH[@]}" 'command -v gh >/dev/null 2>&1; echo rc=$?' 2>&1)"
+check "gh resolves nowhere in a login session either" "rc=1" \
+  "$("${VCSSSH[@]}" "bash -l -c 'command -v gh >/dev/null 2>&1; echo rc=\$?'" 2>&1)"
+check_absent "and the credential shim's gh is gone from disk" "credential-proxy-exec" \
+  "$("${VCSSSH[@]}" 'readlink /opt/credential-proxy/bin/gh 2>&1 || true' 2>&1)"
+for cli in kubectl gcloud; do
+  # No credential-free equivalent exists, so these stay the shim either way.
+  check "$cli is still the shim" "/opt/credential-proxy/bin/$cli" \
+    "$("${VCSSSH[@]}" "command -v $cli" 2>&1)"
+done
+check "the local git is a real git" "git version" \
+  "$("${VCSSSH[@]}" 'git --version' 2>&1)"
+# The message, not the exit status: example.invalid resolves nowhere, so an
+# https ls-remote fails on an image that still ships git-remote-https too, and a
+# check on failure alone would pass there. "not a git command" is git's external
+# dispatch failing to find the helper -- the shape it prints when
+# /usr/lib/git-core/git exists, which it does here. The Dockerfile guard asserts
+# the same thing at build time; this asserts it of the image that was actually
+# pulled, over the transport the agent uses.
+check "and cannot reach a network" "is not a git command" \
+  "$("${VCSSSH[@]}" 'git ls-remote https://example.invalid/x.git' 2>&1)"
+# The other half of the check above: a git broken outright also fails to reach
+# a network, and would pass it. This is what says the disarming was surgical.
+check "but still reads a local repository" "rc=0" \
+  "$("${VCSSSH[@]}" 'git init -q /tmp/sm && git ls-remote file:///tmp/sm >/dev/null; echo rc=$?' 2>&1 | tail -1)"
+docker rm -f "$NAME-vcs" >/dev/null 2>&1
 
 echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |

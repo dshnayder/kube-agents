@@ -196,12 +196,52 @@ done
 #    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+# The version-control abstraction decides which of the image's two gits owns the
+# name `git`, and it has to be decided here for the reason the block above gives
+# about CREDENTIAL_PROXY_URL. /etc/profile.d/vcs-path.sh makes the same prepend
+# for a login shell, which is what `kubectl exec -- bash -l` and the smoke test
+# get; it cannot be the only place, because `ssh sandbox git log` is not a login
+# shell and this SetEnv line is the whole of its PATH. The first build of the
+# abstraction relied on profile.d alone and shipped an install where `git` and
+# `gh` both still resolved to the credential shim with the feature reported as
+# armed — the same failure this comment already described for the wrappers.
+#
+# The guard is the directory, not the git inside it. Prepending a directory that
+# exists and is empty costs nothing, while gating on a binary means a future
+# image that stages the local git differently silently stops prepending and the
+# name `git` goes back to the shim with the feature still reported as armed.
+if [ "${CREDENTIAL_PROXY_VCS:-0}" = "1" ] && [ -d /opt/vcs/bin ]; then
+  SANDBOX_PATH="/opt/vcs/bin:$SANDBOX_PATH"
+fi
+# And `gh` goes away entirely. A forge CLI on PATH is the route out of a
+# forge-neutral abstraction, and the model takes it: with `gh` reachable, an
+# agent given the version-control skill still answered through `gh api` on a
+# quarter of the write probes and did not report having done so.
+#
+# Removed rather than shadowed by a refusing stub, which is what this image
+# shipped first. The stub's theory was that a named gap beats a `command not
+# found` the model reads as a broken image — the same argument _StubForge in
+# vcs_broker.py makes about GitLab. Measured against a build with no `gh` at
+# all, that did not hold: the agent never reached for `gh`, never emitted a
+# not-found, and finished the write probes faster than it had with the stub.
+# The skill already tells it no forge CLI is needed, and that turned out to be
+# enough. See docs/designs/version-control-abstraction.md.
+#
+# The consequence is real and is why the field is still experimental: an install
+# that arms versionControl has no `gh` in the sandbox, so the skills that shell
+# out to one (fleet-audit, submit-suggestion, github-issue-resolver, the
+# governance SOPs) must be ported to the vcs verbs first.
+#
+# Unguarded by /opt/vcs/bin on purpose, unlike the prepend above. What replaces
+# `gh` is vcs.py under $HERMES_HOME, not anything in that directory, so the
+# abstraction is reachable whether or not a local git was staged.
+if [ "${CREDENTIAL_PROXY_VCS:-0}" = "1" ]; then
+  rm -f /opt/credential-proxy/bin/gh
+fi
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
-# A one-element allowlist is still an allowlist. It is written as a loop because
-# the next variable to cross this boundary should be added to a list, not have
-# a second copy of this block written for it.
-# shellcheck disable=SC2043
-for name in CREDENTIAL_PROXY_URL; do
+# An allowlist, written as a loop so the next variable to cross this boundary is
+# added to a list rather than getting a second copy of this block.
+for name in CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_VCS; do
   value="${!name-}"
   if [ -z "$value" ]; then
     continue

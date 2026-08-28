@@ -1,23 +1,52 @@
 ---
 name: version-control
-description: Read and change a hosted repository through forge-neutral verbs — clone brings the history down as a bundle you can run log, annotate and grep against locally, and publish sends your revisions back. Also covers proposals and issues, so no forge CLI is needed. Use it for any question about history or file modes, and for opening a change proposal.
+description: Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use the ordinary VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed or available.
 ---
 
-# version-control - version-control verbs, with the credential on the broker's side
+# version-control - remote operations through vcs.py, local operations with git
+
+Version control here is **abstracted**. There is no forge CLI installed —
+`gh` is not on PATH and there is nothing to install it from. Everything is one
+of two things, and getting an operation into the right half is most of using
+this skill.
+
+**Remote operations — anything that crosses the network or spends a
+credential.** These go through `scripts/vcs.py`, which speaks to a broker in
+another container. Only the broker holds the credential; nothing here does.
+The remote verbs are exactly these:
+
+`capabilities`, `clone`, `publish`, `proposal create|list|view|comment`,
+`issue create|list|view|comment`.
+
+**Local operations — everything else.** `clone` unpacks a real working copy
+onto this filesystem and prints its `path`. Inside it, use ordinary `git`:
+`git log`, `git show`, `git blame`, `git grep`, `git diff`, `git status`,
+`git branch`, `git commit`, `git ls-files --stage`, and any other read you
+want. That git is the real binary, it holds no credential, and it cannot fetch
+or push — the remote-transport helpers are not in the image, so an `https://`
+URL fails with "Unable to find remote helper". Read files
+in the working copy with `cat`, `rg`, or anything else. You do not need
+`vcs.py` for any of this and it is faster without it.
+
+`vcs.py` also offers `log`, `show`, `annotate`, `files`, `grep`, `diff`,
+`status`, `branch` and `commit` as thin wrappers over that same local git, for
+when you want their JSON output. They make no network call. Use whichever you
+prefer; the wrapper is a convenience, not the sanctioned path.
+
+The reason for the split is that the history is here rather than there. `clone`
+brings a repository down as a git bundle, so the full object graph — every
+commit, every parent, every tree entry with its mode — is on this disk. Your
+revisions go **up** the same way, as a bundle, which is why a branch of five
+commits arrives as five commits. Nothing that came out of the repository is
+ever executed beside the credential.
 
 The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
 forge that is.
 
-History comes **down** as a git bundle and is unpacked here, so `log`, `show`,
-`annotate`, `grep` and file modes are answered locally at full fidelity with no
-credential involved. Your revisions go **up** the same way, as a bundle, which
-is why a branch of five commits arrives as five commits. Nothing that came out
-of the repository is ever executed beside the credential.
-
 Verb names are the version-control concept; the spelling you know is an alias.
 `annotate`/`blame`, `log`/`history`, `files`/`manifest`, `grep`/`search`,
-`publish`/`push`, `proposal`/`pr`/`mr` all work.
+`publish`/`push`, `proposal`/`pr`/`mr`, `create`/`open` all work.
 
 ## When to Use
 
@@ -41,9 +70,25 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 ## Read
 
+One remote call, then local work:
+
 ```bash
-V=agents/platform/skills/version-control/scripts/vcs.py
-python3 $V clone    https://github.com/dshnayder-org/infra
+V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+# Remote: one call, one bundle. Its JSON carries `path` — cd there.
+python3 $V clone https://github.com/dshnayder-org/infra
+
+# Local, in that working copy. No network, no credential, no vcs.py.
+git log      -n 20 -- inventory/clusters.yaml
+git show     HEAD~3:inventory/clusters.yaml
+git blame    scripts/rotate-keys.sh
+git ls-files --stage
+git grep     'nodeCount:'
+git status
+```
+
+The same reads through `vcs.py`, if you want JSON instead:
+
+```bash
 python3 $V log      -n 20 -- inventory/clusters.yaml
 python3 $V show     HEAD~3:inventory/clusters.yaml
 python3 $V annotate scripts/rotate-keys.sh
@@ -53,9 +98,9 @@ python3 $V status
 ```
 
 `clone` prints the working copy's `path`. Read files in it with ordinary tools.
-Every verb after the first infers the repository from the only copy there is, or
-from the directory you are standing in; `--repo` says which when there are
-several.
+Every `vcs.py` verb after the first infers the repository from the only copy
+there is, or from the directory you are standing in; `--repo` says which when
+there are several.
 
 ## Write
 
@@ -89,11 +134,30 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 - **`clone` before any other verb.** The read verbs answer from the local copy
   and say so when there is not one. The collaboration verbs do not need one if
   you pass `--repo`.
-- **Do not `git push`, `git fetch` or `git remote add` in the working copy.** It
-  has no remote on purpose. Revisions go up through `publish`.
+- **There is no `gh`, and looking for one is the wrong move.** `command -v gh`
+  comes up empty because the binary was removed, not hidden — that is the
+  install working as intended, not a broken image. Nothing this skill cannot do
+  becomes possible through a forge CLI; a verb you need and cannot find is a gap
+  worth reporting, and going around the abstraction answers a neutral question
+  in one forge's dialect.
+- **Do not `git push`, `git fetch`, `git clone` or `git remote add`.** The
+  working copy has no remote on purpose, and this git cannot speak the wire
+  protocol in any case. Revisions go up through `publish` and come down through
+  `clone`. Local git is for reading and committing, nothing else.
+- **Start a branch before you commit.** `clone` leaves you on the shared branch,
+  and publishing that branch is refused: revisions reach a repository through a
+  branch of your own and a proposal onto the shared one. `vcs.py branch <name>`
+  or `git switch -c <name>` before the first commit.
 - **`publish` can be refused, and the refusal is the answer.** `BASE_MOVED`
   means somebody pushed to the target since you cloned: clone again and reapply
   the change. Do not try to force it.
+- **A forge refusal names the code and the next move; do what it says.**
+  `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
+  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
+  the same way however many times you repeat the call — report or fix the
+  argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
+  `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
+  this install cannot see answers the same way.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
   credential side, so there is nothing else to release.
 - **Read `exitCode` and `stderr`.** The read verbs pass git's own exit status

@@ -94,33 +94,97 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # needing one goes through the wrapped CLIs, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
 
-# A real git, deliberately off PATH.
+# A real git with no credential, and which of the two gits owns the name `git`
+# is decided at login rather than here.
 #
-# `git` on PATH here is and stays the credential-proxy shim: the sandbox holds
-# no GitHub token, so anything that talks to a remote runs in the broker. What
-# this binary is for is the other half of the version-control skill — a
-# repository that arrived as a bundle, unpacked into the sandbox, with no
-# remote and no credential anywhere near it. `git log`, `git show`, `git blame`
-# and `ls-files --stage` against that clone are questions about objects the
-# sandbox already holds, and running them here rather than in the broker is
-# what keeps a repository's own history out of the container that holds the
-# token. See docs/designs/version-control-abstraction.md.
+# The sandbox holds no GitHub token, so anything that talks to a remote runs in
+# the broker, and in the default configuration `git` on PATH is the
+# credential-proxy shim that sends it there. The version-control skill inverts
+# that: a repository arrives as a bundle and is unpacked into the sandbox with
+# no remote, so `git log`, `git show`, `git blame` and `ls-files --stage`
+# against that clone are questions about objects the sandbox already holds.
+# Running them here rather than in the broker is what keeps a repository's own
+# history — and the `.git/config` that came with it — out of the container
+# holding the token. See docs/designs/version-control-abstraction.md.
 #
-# /opt/vcs/libexec rather than /usr/bin, and the guard further down is why the
-# distinction is load-bearing: `command -v git` must keep finding the shim and
-# nothing else, so the front-end moves somewhere PATH does not reach and
-# /usr/lib/git-core — git's compiled-in exec path, not a PATH directory — is
-# re-pointed at it. The server-side helpers go entirely; this git never serves
-# anything.
+# So the binary gets two homes. /opt/vcs/libexec/git is the file, on no PATH,
+# reached by name from vcs.py and by /usr/lib/git-core (git's compiled-in exec
+# path, not a PATH directory). /opt/vcs/bin/git is the link that vcs-path.sh
+# puts ahead of the shim when CREDENTIAL_PROXY_VCS is on, which is what makes a
+# bare `git` typed by the model resolve to the credential-free binary in the
+# one mode where that is the right answer. Neither directory is on the build
+# PATH, so the guard further down still sees only the shim.
+#
+# What makes putting this git on a PATH safe is that it has no transport. The
+# remote helpers are the whole of git's ability to reach a host — `git fetch`,
+# `git clone` and `git push` against an https URL all run git-remote-https —
+# and they are separate executables in /usr/lib/git-core, so removing them
+# leaves a git that reads and writes local repositories and cannot dial out.
+# That is true of the four that reach a network — git-remote-http is the binary
+# and ftp, ftps and https are symlinks to it — and it is not true of ext and fd,
+# whose entries in that directory are symlinks to `git` itself because both are
+# builtins. Deleting those two changes nothing: git dispatches a builtin from
+# its own table without consulting the filesystem. What actually stops `ext::`
+# is git's protocol allowlist, which has defaulted `protocol.ext.allow` to
+# `never` since 2.12, and the probe below asserts that refusal by its own
+# message rather than pretending an `rm` produced it. `fd::` needs a descriptor
+# the parent already opened, so it reaches whatever the caller could reach
+# anyway and opens nothing new.
+#
+# The four server-side helpers in /usr/bin go too, but only for tidiness. They
+# are what a *remote* runs, and `git upload-pack` is a builtin of the front-end
+# binary, so deleting /usr/bin/git-upload-pack does not remove the capability
+# and never did. An earlier version of this layer claimed it did and guarded
+# the claim with `git <helper> --help`, which git rewrites to `git help
+# <helper>` and execs man; this image has no man, so all four probes exited 128
+# and the guard passed no matter what the image contained.
+#
+# So the guard is a live probe per transport, and it matches the message rather
+# than the exit status. Every one of these URLs fails whatever the image does —
+# example.invalid does not resolve — so an assertion that only checks for
+# failure passes on an image with the helpers still installed. The message is
+# what separates "there is no transport" from "there is a transport and no
+# network". The file:// probe at the end is the other half of that: it fails if
+# the git here has been broken outright rather than disarmed, which is the way
+# a guard like this otherwise starts passing for the wrong reason.
+#
+# The two shapes below are both "no helper". Which one git prints depends on
+# whether /usr/lib/git-core/git exists — it does here, so git's external
+# dispatch finds it and reports an unknown subcommand; without it the message
+# is the classic "Unable to find remote helper". Accept either, so this layer
+# does not fail on an unrelated change to the exec-path symlink.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /opt/vcs/libexec && \
+    mkdir -p /opt/vcs/libexec /opt/vcs/bin && \
     mv /usr/bin/git /opt/vcs/libexec/git && \
     ln -sf /opt/vcs/libexec/git /usr/lib/git-core/git && \
+    ln -sf /opt/vcs/libexec/git /opt/vcs/bin/git && \
     rm -f /usr/bin/git-receive-pack /usr/bin/git-shell \
           /usr/bin/git-upload-archive /usr/bin/git-upload-pack && \
-    /opt/vcs/libexec/git --version
+    rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
+          /usr/lib/git-core/git-remote-ftp /usr/lib/git-core/git-remote-ftps && \
+    /opt/vcs/libexec/git --version && \
+    for helper in http https ftp ftps; do \
+        if [ -e "/usr/lib/git-core/git-remote-${helper}" ]; then \
+            echo "sandbox git still has a remote transport: ${helper}" >&2; \
+            exit 1; \
+        fi; \
+        if ! /opt/vcs/libexec/git ls-remote "${helper}://example.invalid/x.git" 2>&1 \
+             | grep -qE "'remote-${helper}' is not a git command|Unable to find remote helper"; then \
+            echo "sandbox git still resolves a ${helper} transport" >&2; \
+            /opt/vcs/libexec/git ls-remote "${helper}://example.invalid/x.git" >&2 2>&1 || true; \
+            exit 1; \
+        fi; \
+    done && \
+    if ! /opt/vcs/libexec/git ls-remote 'ext::sh -c whoami' 2>&1 \
+         | grep -q "transport 'ext' not allowed"; then \
+        echo "sandbox git does not refuse the ext transport" >&2; \
+        exit 1; \
+    fi && \
+    /opt/vcs/libexec/git init -q /tmp/vcs-guard && \
+    /opt/vcs/libexec/git ls-remote file:///tmp/vcs-guard >/dev/null && \
+    rm -rf /tmp/vcs-guard
 
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for
@@ -231,6 +295,11 @@ RUN groupadd --gid 1001 hermes && \
 # absent.
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
+# Sorts after credential-proxy-path.sh, which is what lets it take the name
+# `git` back for the local binary when the version control abstraction is on.
+# Renaming either file breaks that; the ordering is the mechanism.
+COPY --chmod=0755 deploy/sandbox/vcs-path.sh /etc/profile.d/vcs-path.sh
+
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # The ForceCommand the sshd_config names for the `agent` account. Root-owned and
