@@ -1570,8 +1570,8 @@ this section exists to disarm, and the shim replaces it once the proxy is a cont
 the same pod.
 
 **What that costs on an install without federation.** The sandbox image ships the four
-proxy shims at `/opt/credential-proxy/bin/` and puts that directory first on `PATH`, but
-`CREDENTIAL_PROXY_URL` is set only when the proxy is co-located —
+proxy shims at `/opt/credential-proxy/bin/` and the entrypoint puts that directory first
+on `PATH`, but `CREDENTIAL_PROXY_URL` is set only when the proxy is co-located —
 `buildShellSandboxStatefulSet` omits the variable while the URL is empty — so on a
 standalone-proxy install each of them resolves and then exits 1 with
 `CREDENTIAL_PROXY_URL is not configured`. `gh` in that state takes the `*/10`
@@ -1579,6 +1579,16 @@ standalone-proxy install each of them resolves and then exits 1 with
 repository's open work, and `git` takes the GitOps and pull-request write paths with it.
 Pointing the variable at the standalone Service would not recover them, because that proxy
 sees neither the caller's `cwd` nor its files; co-location is what returns them.
+
+`git` and `gh` are the two names the version-control abstraction takes back. When the CR
+arms `shellSandbox.versionControl`, the entrypoint prepends `/opt/vcs/bin` so `git` becomes
+the image's own credential-free binary, and deletes the shim's `gh` so no forge CLI
+resolves at all; `gcloud` and `kubectl` keep resolving to the shim either way. That is a
+separate switch from the one this paragraph is about, and it does not rescue a
+standalone-proxy install: the broker serves `/v1/vcs/*` there, but the sandbox has no
+`CREDENTIAL_PROXY_URL` to reach it with, so `vcs.py` refuses for the same missing variable
+the shims report. `docs/designs/version-control-abstraction.md` §Two gits, on purpose owns
+that mechanism.
 
 Agent-side callers reach the tooling the same way everything else in this section does —
 by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),

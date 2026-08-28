@@ -107,7 +107,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 
 | Skill | Description |
 | ----- | ----------- |
-| [`version-control`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/version-control/SKILL.md) | Read and change a hosted repository through forge-neutral verbs — clone brings the history down as a bundle you can run log, annotate and grep against locally, and publish sends your revisions back. Also covers proposals and issues, so no forge CLI is needed. Use it for any question about history or file modes, and for opening a change proposal. |
+| [`version-control`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/version-control/SKILL.md) | Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use the ordinary VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed or available. |
 
 ### Cluster Agent (per-cluster runtime)
 
