@@ -18,8 +18,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import content_workspace
 import credential_proxy
 import gke_endpoint
+import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
@@ -2045,6 +2047,30 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         self.assertTrue(self._serve_with("banana"))
 
 
+class AllowedExecutablesTest(unittest.TestCase):
+    """The allowlist is four names, and the version-control work must not add a fifth.
+
+    `/v1/vcs/*` runs its git inside vcs_broker.py, which reaches subprocess
+    directly and never consults this tuple. So the broker already works with the
+    allowlist exactly as it stands, and any entry added "for the abstraction"
+    buys nothing while widening the one route that hands the model a
+    credentialed process of its own choosing. A second version-control system
+    would arrive as a binary the broker invokes, not as a name here.
+    """
+
+    def test_the_allowlist_is_still_the_four_names_the_shims_cover(self):
+        self.assertEqual(
+            ("gcloud", "kubectl", "gh", "git"),
+            CommandExecutor.ALLOWED_EXECUTABLES,
+        )
+
+    def test_the_broker_does_not_need_an_entry_to_run_its_git(self):
+        # Named so the next reader does not conclude from the test above that a
+        # broker-side binary is missing something.
+        self.assertNotIn("hg", CommandExecutor.ALLOWED_EXECUTABLES)
+        self.assertNotIn("vcs.py", CommandExecutor.ALLOWED_EXECUTABLES)
+
+
 class ReadOnlyOverTheSocketTest(unittest.TestCase):
     """A mutation must stop at the proxy socket, not merely at a decision function."""
 
@@ -2199,12 +2225,14 @@ class BrokerRootContainmentTest(unittest.TestCase):
             "content workspaces must not live under the volume the agent writes",
         )
 
-    def test_containment_root_has_exactly_one_caller(self):
+    def test_containment_root_callers_are_the_two_broker_side_runners(self):
         """A behavioural test cannot see a *new* caller added later. This can.
 
-        If this fails because someone added a legitimate second caller, read
-        `_execute`'s docstring before raising the number: the argument is safe
-        because of who passes it, not because of what it does.
+        If this fails because someone added a legitimate caller, read
+        `_execute`'s docstring before extending the list: the argument is safe
+        because of who passes it, not because of what it does. Both callers here
+        run a broker-side process in a tree on the broker's own volume, and
+        neither is reachable from `/v1/exec`.
         """
         source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
         callers = [
@@ -2214,9 +2242,25 @@ class BrokerRootContainmentTest(unittest.TestCase):
         ]
         self.assertEqual(
             callers,
-            ["result = self._execute(argv, cwd=str(cwd), containment_root=self.content_root)"],
+            [
+                "result = self._execute(argv, cwd=str(cwd), containment_root=self.content_root)",
+                "argv, cwd=str(self.content_root), containment_root=self.content_root",
+            ],
             f"unexpected containment_root callers: {callers}",
         )
+
+    def test_the_forge_cli_runs_in_the_broker_root_rather_than_refusing_it(self):
+        """The regression that took out every `/v1/vcs/*` collaboration verb.
+
+        `execute_forge_cli` chooses the content root as its cwd on purpose, so
+        omitting `containment_root` made `_execute` measure that cwd against the
+        agent's workspace and raise. The failure was total and silent: clone and
+        publish kept working because they go through `execute_workspace_git`,
+        while every proposal and issue verb 500ed before `gh` was launched.
+        """
+        result = self.executor.execute_forge_cli(["/bin/echo", "hello"])
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("hello", result.stdout.strip())
 
     def test_the_default_is_still_the_agent_workspace(self):
         outside = Path(self.temp_dir.name) / "elsewhere"
@@ -2260,6 +2304,131 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler._handle_workspace_post()
         self.assertEqual(answered["status"], HTTPStatus.NOT_FOUND)
         self.assertFalse(store.method_calls)
+
+
+class VcsRouteTest(unittest.TestCase):
+    """The `/v1/vcs/*` seam, which no test reached before.
+
+    `vcs_broker` is covered on its own and so is `vcs.py`, but the HTTP layer
+    between them is where the two ceilings have to agree, and where a body
+    limit set at the wrong place refuses a publish with no error code at all.
+    """
+
+    def setUp(self):
+        CredentialProxyHandler.vcs = None
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        # The same expression main() wires, so the relationship between the two
+        # ceilings is what this class is testing rather than a number it chose.
+        CredentialProxyHandler.vcs_max_request_bytes = (
+            vcs_broker.max_bundle_bytes() * 4 // 3 + (1 << 20)
+        )
+        self.addCleanup(setattr, CredentialProxyHandler, "vcs", None)
+
+    def _handler(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.answered = {}
+        handler._json = lambda status, payload: handler.answered.update(
+            status=status, payload=payload
+        )
+        return handler
+
+    def test_disabled_broker_answers_404_with_the_code_the_client_reads(self):
+        # vcs.py turns this code into "the broker has version control turned
+        # off" rather than a generic failure, so the code is load-bearing.
+        handler = self._handler("/v1/vcs/clone")
+        handler._handle_vcs_post()
+        self.assertEqual(handler.answered["status"], HTTPStatus.NOT_FOUND)
+        self.assertEqual(handler.answered["payload"]["code"], "VCS_DISABLED")
+
+    def test_an_unknown_verb_reaches_no_route(self):
+        broker = mock.Mock(spec=vcs_broker.VcsBroker)
+        CredentialProxyHandler.vcs = broker
+        handler = self._handler("/v1/vcs/exec")
+        handler._handle_vcs_post()
+        self.assertEqual(handler.answered["status"], HTTPStatus.NOT_FOUND)
+        self.assertFalse(broker.method_calls)
+
+    def test_an_underscored_verb_reaches_the_hyphenated_route(self):
+        broker = mock.Mock(spec=vcs_broker.VcsBroker)
+        broker.proposal_create.return_value = {"proposal": {"number": 1}}
+        CredentialProxyHandler.vcs = broker
+        handler = self._handler("/v1/vcs/proposal_create")
+        handler.workspace_lock = threading.Lock()
+        handler._read_json_body = lambda limit=None: {"repository": "o/r"}
+        handler._handle_vcs_post()
+        self.assertEqual(handler.answered["status"], HTTPStatus.OK)
+        broker.proposal_create.assert_called_once()
+
+    def test_the_body_limit_is_the_bundle_ceiling_not_the_generic_one(self):
+        """The publish ceiling every message advertises is 64 MiB of bundle.
+
+        Read at the generic 1 MiB limit, `publish` would refuse at about 786 KB
+        of bundle — base64 expands by four thirds — from a layer that answers
+        with no code and that no document mentions.
+        """
+        broker = mock.Mock(spec=vcs_broker.VcsBroker)
+        broker.publish.return_value = {"revision": "a" * 40}
+        CredentialProxyHandler.vcs = broker
+        handler = self._handler("/v1/vcs/publish")
+        handler.workspace_lock = threading.Lock()
+        limits = []
+        handler._read_json_body = lambda limit=None: (
+            limits.append(limit) or {"repository": "o/r"}
+        )
+        handler._handle_vcs_post()
+        self.assertEqual(limits, [CredentialProxyHandler.vcs_max_request_bytes])
+        self.assertGreater(
+            CredentialProxyHandler.vcs_max_request_bytes,
+            vcs_broker.max_bundle_bytes(),
+            "the HTTP body limit must clear the bundle ceiling it fronts",
+        )
+
+    def test_the_wired_limit_clears_base64_expansion_of_the_ceiling(self):
+        """What `main()` actually sets, not what this test class set up."""
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_MAX_BUNDLE_BYTES": str(8 << 20)}
+        ):
+            ceiling = vcs_broker.max_bundle_bytes()
+            wired = ceiling * 4 // 3 + (1 << 20)
+        self.assertEqual(ceiling, 8 << 20)
+        self.assertGreater(wired, ceiling * 4 // 3)
+
+    def test_a_git_failure_answers_git_failed_and_never_the_stderr(self):
+        # git's stderr on a failed fetch carries the remote URL, and the broker
+        # builds that URL with the installation token in it. It must reach
+        # neither the response nor the log.
+        token = "ghs_" + "A1b2C3d4" * 5
+        broker = mock.Mock(spec=vcs_broker.VcsBroker)
+        broker.clone.side_effect = subprocess.CalledProcessError(
+            128,
+            ["git", "fetch"],
+            stderr=f"fatal: could not read https://x-access-token:{token}@h/r",
+        )
+        CredentialProxyHandler.vcs = broker
+        handler = self._handler("/v1/vcs/clone")
+        handler.workspace_lock = threading.Lock()
+        handler._read_json_body = lambda limit=None: {"repository": "o/r"}
+        with self.assertLogs("credential-proxy", level="WARNING") as logged:
+            handler._handle_vcs_post()
+        self.assertEqual(handler.answered["status"], HTTPStatus.BAD_GATEWAY)
+        self.assertEqual(handler.answered["payload"]["code"], "GIT_FAILED")
+        self.assertNotIn(token, json.dumps(handler.answered["payload"]))
+        self.assertNotIn(token, "\n".join(logged.output))
+        self.assertIn("[REDACTED]", "\n".join(logged.output))
+
+    def test_a_broker_refusal_keeps_its_status_and_code(self):
+        broker = mock.Mock(spec=vcs_broker.VcsBroker)
+        broker.publish.side_effect = content_workspace.WorkspaceError(
+            "branch and target are both main", status=409, code="TARGET_IS_BRANCH"
+        )
+        CredentialProxyHandler.vcs = broker
+        handler = self._handler("/v1/vcs/publish")
+        handler.workspace_lock = threading.Lock()
+        handler._read_json_body = lambda limit=None: {"repository": "o/r"}
+        handler._handle_vcs_post()
+        self.assertEqual(handler.answered["status"], HTTPStatus.CONFLICT)
+        self.assertEqual(handler.answered["payload"]["code"], "TARGET_IS_BRANCH")
 
 
 if __name__ == "__main__":

@@ -1167,10 +1167,19 @@ class CommandExecutor:
 
         Not reachable from `/v1/exec`. The argv is composed in `vcs_broker`, the
         subcommand is always `api`, and the only caller-supplied strings in it
-        are validated fields.
+        are validated fields. That is also why it passes `containment_root`: the
+        content root is on the broker's own volume, which is not under the
+        workspace the agent shares, so `_execute`'s default containment refuses
+        the cwd this method deliberately chose. Without it every collaboration
+        verb raised `ValueError` before `gh` was launched and the caller got a
+        bare 500 -- `/v1/vcs/*` could clone and publish but could not read or
+        write a single pull request, on any install whose state directory is a
+        different volume from its workspace, which is all of them.
         """
         self.content_root.mkdir(parents=True, exist_ok=True)
-        result = self._execute(argv, cwd=str(self.content_root))
+        result = self._execute(
+            argv, cwd=str(self.content_root), containment_root=self.content_root
+        )
         return subprocess.CompletedProcess(
             argv, result.exit_code, result.stdout, result.stderr
         )
@@ -1637,6 +1646,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     executor: CommandExecutor
     max_request_bytes: int
     slack_max_request_bytes: int
+    vcs_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
@@ -1936,7 +1946,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
         try:
-            payload = self._read_json_body()
+            # `publish` carries a git bundle as base64, and the ceiling that
+            # governs it is the broker's CREDENTIAL_PROXY_MAX_BUNDLE_BYTES.
+            # Reading this body at the generic 1 MiB limit would cap publish at
+            # about 786 KB of bundle instead — a refusal with no error code,
+            # from a layer the caller cannot see, three orders of magnitude
+            # below the size every message and document advertises.
+            payload = self._read_json_body(self.vcs_max_request_bytes)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -1962,7 +1978,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:
-            LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
+            # The message stays out of the response and goes to the log through
+            # the redactor, because an unexpected exception is the one case
+            # nobody has vetted the text of. It goes to the log at all because
+            # the type name alone is not diagnosable: a containment `ValueError`
+            # that made every forge verb 500 read in the log as `ValueError` and
+            # nothing else, and the agent facing it spent twenty-five minutes
+            # proving the outage was real rather than finding its cause.
+            LOGGER.warning(
+                "vcs %s error: %s: %s",
+                verb,
+                type(exc).__name__,
+                redact_credentials(str(exc)[:2000]),
+            )
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
@@ -2238,6 +2266,14 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
+    )
+    # `publish` posts a git bundle as base64, so the body this route must accept
+    # is the broker's bundle ceiling plus base64's four-thirds expansion, plus
+    # room for the JSON around it. Derived from the broker's own number rather
+    # than restated, so an operator who moves CREDENTIAL_PROXY_MAX_BUNDLE_BYTES
+    # moves both and BUNDLE_TOO_LARGE stays the refusal a caller sees.
+    CredentialProxyHandler.vcs_max_request_bytes = (
+        vcs_broker.max_bundle_bytes() * 4 // 3 + (1 << 20)
     )
     chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
     chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
