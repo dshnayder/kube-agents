@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -447,6 +448,28 @@ class WriteTest(VcsTestCase):
         # And the base is not advanced by a publish that did not happen.
         self.assertEqual(vcs.all_sessions()[0]["baseRevision"], self.origin_head)
 
+    def test_publish_refuses_the_branch_it_was_cloned_from(self):
+        """The failure mode is silent success, so it is refused before the call.
+
+        `clone` leaves the copy on the shared branch. Committing there and
+        publishing is a valid fast-forward of it, which every check on the
+        broker side passes.
+        """
+        self.change("a.txt", "a\n")
+        self.run_vcs("commit", "-m", "a")
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 1)
+        self.assertIn("branch this copy was cloned from", answer["error"])
+        self.assertEqual(self.broker.verbs, [])
+
+    def test_publish_refuses_a_detached_head(self):
+        tree = self.tree()
+        vcs.local_git(tree, "checkout", "--quiet", "--detach")
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 1)
+        self.assertIn("detached HEAD", answer["error"])
+        self.assertEqual(self.broker.verbs, [])
+
     def test_discard_removes_the_copy_and_its_session(self):
         path = self.tree()
         code, answer = self.run_vcs("discard")
@@ -635,6 +658,26 @@ class BrokerCallTest(unittest.TestCase):
                 vcs.call("publish", {})
         self.assertEqual(str(caught.exception), "fix/x has diverged")
 
+    def test_the_forge_s_own_line_is_kept_alongside_the_advice(self):
+        error = vcs.credential_proxy_client.WorkspaceRequestError(
+            "proposal rejected",
+            payload={
+                "error": "Fix the field named in the detail.",
+                "code": "FORGE_REJECTED",
+                "detail": "gh: Validation Failed: no commits between (HTTP 422)",
+            },
+        )
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("proposal-create", {})
+        rendered = str(caught.exception)
+        self.assertIn("Fix the field named in the detail.", rendered)
+        self.assertIn("no commits between", rendered)
+
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):
@@ -667,6 +710,60 @@ class LocalGitTest(VcsTestCase):
 # ---------------------------------------------------------------------------
 # the abstraction itself
 # ---------------------------------------------------------------------------
+
+
+class TransportFailureTest(unittest.TestCase):
+    """`call` is the one place a non-VcsError can come from.
+
+    Every subcommand promises one JSON object on stdout and the caller parsing
+    it is a model. A broker that is down raises `urllib.error.URLError`, which
+    is neither a `VcsError` nor a `TimeoutExpired`, so without translation it
+    leaves `main()` as a traceback: nothing on stdout, at the moment the caller
+    most needs a sentence it can act on. This class does not patch `vcs.call`,
+    which every other class here replaces wholesale.
+    """
+
+    def setUp(self):
+        self.env = mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name) / "vcsroot"
+        for attribute, value in (("ROOT", root), ("SESSIONS", root / ".sessions")):
+            patch = mock.patch.object(vcs, attribute, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _raising(self, exception):
+        return mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=exception
+        )
+
+    def test_a_broker_that_is_not_listening_becomes_a_vcs_error(self):
+        with self._raising(urllib.error.URLError("Connection refused")):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("clone", {})
+        self.assertIn("did not answer", str(caught.exception))
+
+    def test_an_answer_that_is_not_json_becomes_a_vcs_error(self):
+        with self._raising(ValueError("Expecting value: line 1 column 1")):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("clone", {})
+        self.assertIn("was not JSON", str(caught.exception))
+
+    def test_main_prints_json_for_anything_it_did_not_foresee(self):
+        parser_argv = ["capabilities", "--repo", "acme/infra"]
+        with mock.patch.object(vcs, "call", side_effect=RuntimeError("surprise")):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = vcs.main(parser_argv)
+        self.assertEqual(code, 1)
+        answer = json.loads(out.getvalue())
+        self.assertIn("RuntimeError", answer["error"])
+        self.assertIn("surprise", answer["error"])
 
 
 class AbstractionTest(unittest.TestCase):

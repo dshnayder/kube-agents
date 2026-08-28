@@ -22,7 +22,8 @@ both sides.
 
 The verbs are the version-control concepts rather than one system's spelling of
 them. Where systems disagree the neutral name is the command and the familiar
-one is an alias — `annotate`/`blame`, `publish`/`push`, `proposal`/`pr`/`mr`.
+one is an alias — `annotate`/`blame`, `publish`/`push`, `proposal`/`pr`/`mr`,
+and `create`/`open` on a proposal or an issue.
 `docs/designs/version-control-abstraction.md` §The vocabulary, and where it
 comes from, records the sources that vocabulary was drawn from.
 
@@ -101,7 +102,29 @@ def call(verb: str, payload: dict) -> dict:
             f"the broker has version control turned off: {exc}"
         ) from exc
     except credential_proxy_client.WorkspaceRequestError as exc:
-        raise VcsError(exc.payload.get("error", str(exc))) from exc
+        # Two sentences from two different places. `error` is the broker's, and
+        # says what to do next; `detail` is the forge's own line, and says
+        # which field it rejected. Dropping the second leaves the caller
+        # correct advice about a problem it cannot locate.
+        message = exc.payload.get("error", str(exc))
+        detail = str(exc.payload.get("detail") or "").strip()
+        if detail:
+            message = f"{message} The forge said: {detail}"
+        raise VcsError(message) from exc
+    except OSError as exc:
+        # urllib.error.URLError is an OSError, and so is the socket timeout
+        # under it. Neither is a VcsError, so without this they leave main()
+        # as a traceback -- nothing on stdout, and the caller is a model that
+        # was promised one JSON object there.
+        raise VcsError(
+            f"the broker did not answer at {endpoint}: {exc}. It runs beside "
+            "this container, so this is a broker that is down rather than an "
+            "argument to change."
+        ) from exc
+    except ValueError as exc:
+        raise VcsError(
+            f"the broker's answer to `{verb}` was not JSON: {exc}"
+        ) from exc
 
 
 # ---- the local working copy ----------------------------------------------
@@ -264,7 +287,19 @@ def current_branch(session: dict) -> str:
     done = local_git(
         tree_of(session), "rev-parse", "--abbrev-ref", "HEAD", check=False
     )
-    return (done.stdout or "").strip() or session.get("branch", "")
+    name = (done.stdout or "").strip()
+    # `--abbrev-ref HEAD` answers the literal string "HEAD" on a detached head,
+    # which is not a branch name. Publishing it would pass every check the
+    # broker makes and create a real refs/heads/HEAD on the forge, after which
+    # `HEAD` is ambiguous in every clone anyone takes. Refuse instead, and say
+    # what to do, because the fix is one command the agent can run itself.
+    if name == "HEAD":
+        raise VcsError(
+            "the working copy is on a detached HEAD, which has no branch name "
+            "to publish. Run `git switch -c <branch>` in the working copy "
+            "first, then publish that branch."
+        )
+    return name or session.get("branch", "")
 
 
 # ---- repository verbs -----------------------------------------------------
@@ -310,6 +345,13 @@ def verb_clone(arguments) -> dict:
             "--branch", answer["branch"], str(bundle_file), str(destination),
         )
         local_git(destination, "remote", "remove", "origin", check=False)
+        # Write the identity into the clone rather than relying on local_git's
+        # `-c` flags. The skill sanctions a bare `git commit` in this working
+        # copy, and a bare `git commit` is not run through local_git: with no
+        # system or global config in the sandbox it would fail on "Please tell
+        # me who you are" the first time an agent took the documented route.
+        local_git(destination, "config", "user.name", AUTHOR_NAME)
+        local_git(destination, "config", "user.email", AUTHOR_EMAIL)
     finally:
         bundle_file.unlink(missing_ok=True)
 
@@ -548,6 +590,23 @@ def verb_publish(arguments) -> dict:
         raise VcsError(
             "there are no new revisions to publish. `vcs.py commit` records "
             "one; `vcs.py status` shows what is still uncommitted."
+        )
+
+    if branch == target:
+        # `clone` leaves the working copy on the branch it cloned, so an agent
+        # that edits, commits and publishes without cutting a branch first
+        # fast-forwards the shared line of development -- and finds out only
+        # from the forge, if the forge happens to protect it. The refusal is
+        # here so it costs nothing and names the one command that fixes it.
+        # After the count check, not before: a `publish` with nothing committed
+        # is on the shared branch too, and "start a branch" is the wrong
+        # instruction for a caller whose real problem is an empty change.
+        raise VcsError(
+            f"`{branch}` is the branch this copy was cloned from, so publishing "
+            "it would put these revisions straight onto the shared line of "
+            "development. Start a branch first -- `vcs.py branch <name>`, or "
+            "`git switch -c <name>` in the working copy -- then publish that. "
+            "`git branch --move <name>` renames the one you are on."
         )
 
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
@@ -808,7 +867,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     actions = proposal.add_subparsers(dest="action", required=True)
 
-    create = actions.add_parser("create")
+    # Every forge says "open a pull request", and no forge says "create" one, so
+    # the word a model reaches for first is the alias rather than the command.
+    create = actions.add_parser("create", aliases=["open"])
     create.add_argument("--title", required=True)
     create.add_argument("--body", default="")
     create.add_argument("--source", help="the branch to merge (default: current)")
@@ -848,7 +909,7 @@ def build_parser() -> argparse.ArgumentParser:
     iview.add_argument("-n", "--limit", type=int)
     repo_option(iview).set_defaults(run=verb_issue_view)
 
-    icreate = iactions.add_parser("create")
+    icreate = iactions.add_parser("create", aliases=["open"])
     icreate.add_argument("--title", required=True)
     icreate.add_argument("--body", default="")
     icreate.add_argument("--labels", nargs="*")
@@ -872,6 +933,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except subprocess.TimeoutExpired:
         print(json.dumps({"error": "the local git command timed out"}, indent=2))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Every verb promises one JSON object on stdout, and the caller is a
+        # model that will parse it. A traceback breaks that promise in the one
+        # situation where the caller most needs a sentence it can act on, so
+        # anything unforeseen is reported in the shape everything else uses.
+        # The type name is kept because it is what makes the report a bug
+        # report rather than a shrug.
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2))
         return 1
     print(json.dumps(answer, indent=2))
     return 0

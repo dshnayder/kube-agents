@@ -649,6 +649,31 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(caught.exception.fields.get("code"), "BUNDLE_TOO_LARGE")
         self.assertEqual(list(self.scratch.iterdir()), [])
 
+    def test_publish_refuses_to_write_to_the_branch_it_was_cloned_from(self):
+        """The three ancestry checks cannot catch this one.
+
+        `clone` leaves the working copy on the shared branch, so committing
+        without cutting a branch first produces a perfectly valid fast-forward
+        of it — which every check below passes and which puts the agent's
+        revisions on trunk.
+        """
+        work, answer = self.clone_locally()
+        self.commit_in(work, "README.md", "straight to main\n", "no branch")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "main",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "main", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "TARGET_IS_BRANCH")
+        self.assertEqual(self.remote_tip("main"), answer["revision"])
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
     def test_scratch_names_come_from_a_counter_not_from_the_caller(self):
         first = self.broker._scratch("clone")
         second = self.broker._scratch("clone")
@@ -865,9 +890,35 @@ class CollaborationTest(unittest.TestCase):
                     "title": "t",
                 }
             )
-        self.assertEqual(caught.exception.status, 502)
-        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
-        self.assertIn("Validation Failed", str(caught.exception))
+        self.assertEqual(caught.exception.status, 422)
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_REJECTED")
+        self.assertIn("Validation Failed", caught.exception.fields.get("detail"))
+
+    def test_failures_that_want_different_actions_are_told_apart(self):
+        # A missing scope and a throttle are both HTTP 403 from GitHub, and the
+        # agent should wait out one and stop on the other. If this test ever
+        # collapses to one code, the caller has lost the ability to choose.
+        cases = [
+            ("gh: Bad credentials (HTTP 401)", 401, "FORGE_UNAUTHENTICATED"),
+            ("gh: Resource not accessible (HTTP 403)", 403, "FORGE_FORBIDDEN"),
+            ("gh: API rate limit exceeded (HTTP 403)", 429, "FORGE_RATE_LIMITED"),
+            ("gh: secondary rate limit (HTTP 429)", 429, "FORGE_RATE_LIMITED"),
+            ("gh: Not Found (HTTP 404)", 404, "FORGE_NOT_FOUND"),
+            ("gh: Conflict (HTTP 409)", 409, "FORGE_CONFLICT"),
+            ("gh: Server Error (HTTP 500)", 503, "FORGE_UNAVAILABLE"),
+            ("gh: Bad Gateway (HTTP 502)", 503, "FORGE_UNAVAILABLE"),
+            ("dial tcp: no such host", 502, "FORGE_CALL_FAILED"),
+        ]
+        for output, status, code in cases:
+            with self.subTest(output=output):
+                broker, _ = self.broker(
+                    subprocess.CompletedProcess(["gh"], 1, "", output)
+                )
+                with self.assertRaises(WorkspaceError) as caught:
+                    broker.issue_list({"repository": "acme/infra"})
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(caught.exception.fields.get("code"), code)
+                self.assertEqual(caught.exception.fields.get("detail"), output)
 
     def test_a_non_json_answer_is_a_forge_failure_not_a_traceback(self):
         broker, _ = self.broker(subprocess.CompletedProcess(["gh"], 0, "<html>", ""))

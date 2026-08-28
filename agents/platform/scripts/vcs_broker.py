@@ -105,6 +105,111 @@ class ForgeUnsupported(WorkspaceError):
         super().__init__(message, status=501, code="FORGE_UNSUPPORTED")
 
 
+# What the forge said, and what to do about it.
+#
+# The reader of these messages is a model deciding its next tool call, not an
+# operator reading a log, so each one names the cause and then the action that
+# follows from it. The distinction matters most where the right action differs
+# while the symptom does not: a rate limit and a missing scope are both HTTP
+# 403, and an agent told only "the forge refused it" retries the one that will
+# never succeed and gives up on the one that would have succeeded in ten
+# seconds. Collapsing every failure into one status is the same bug wearing a
+# number -- it was `FORGE_CALL_FAILED` with status 502 for all of them here
+# until this table.
+#
+# The forge's own first line is kept as `detail` underneath. It says which
+# field was rejected or that the branch has no commits, which no fixed message
+# can, and the two are answering different questions.
+_FORGE_ERRORS: dict[int, tuple[int, str, str]] = {
+    401: (
+        401,
+        "FORGE_UNAUTHENTICATED",
+        "The forge rejected this install's credential. It has expired or been "
+        "revoked. Nothing you can do from here will fix it -- report it and "
+        "stop rather than retrying.",
+    ),
+    403: (
+        403,
+        "FORGE_FORBIDDEN",
+        "The forge accepted the credential and refused the operation. The "
+        "credential is missing the permission this call needs, or the "
+        "repository denies it. Retrying will not change the answer; try a "
+        "read-only route, or report what you were denied.",
+    ),
+    404: (
+        404,
+        "FORGE_NOT_FOUND",
+        "No such repository, revision, or path. A private repository this "
+        "install's credential cannot see also answers 404, so this does not "
+        "prove the thing does not exist. Check the spelling and the branch "
+        "with `files` or `log` before concluding it is missing.",
+    ),
+    409: (
+        409,
+        "FORGE_CONFLICT",
+        "The forge says the state changed underneath this call -- something "
+        "else moved the branch or the proposal. Re-read it and try again "
+        "against what is there now.",
+    ),
+    422: (
+        422,
+        "FORGE_REJECTED",
+        "The forge understood the request and rejected its contents. This is "
+        "a bad argument, not a transient failure: fix the field named in the "
+        "detail below rather than retrying the same call.",
+    ),
+    429: (
+        429,
+        "FORGE_RATE_LIMITED",
+        "The forge is rate-limiting this install. Wait before the next call "
+        "and prefer one wide request over many narrow ones -- `files` over a "
+        "`show` per path. This will succeed later.",
+    ),
+}
+
+# 403 is the ambiguous one. GitHub spends it on both a missing scope and a
+# throttle, and the throttle is the one worth waiting out, so it is separated
+# on what the forge says rather than on the status alone.
+_THROTTLE_MARKERS = (
+    "rate limit",
+    "ratelimit",
+    "abuse detection",
+    "secondary rate",
+    "retry-after",
+    "too many requests",
+)
+
+
+def _forge_error(output: str) -> WorkspaceError:
+    """Turn a forge CLI failure into an answer the caller can act on."""
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    detail = lines[0][:400] if lines else ""
+    found = re.search(r"\(HTTP (\d{3})\)", output)
+    code = int(found.group(1)) if found else 0
+    lowered = output.lower()
+    if code in {403, 429} and any(mark in lowered for mark in _THROTTLE_MARKERS):
+        code = 429
+    if code >= 500:
+        return WorkspaceError(
+            "The forge is having its own problems -- this call failed on its "
+            "side, not on anything you sent. Wait a few minutes and retry the "
+            "same call unchanged.",
+            status=503,
+            code="FORGE_UNAVAILABLE",
+            detail=detail,
+        )
+    status, symbol, guidance = _FORGE_ERRORS.get(
+        code,
+        (
+            502,
+            "FORGE_CALL_FAILED",
+            "The forge did not answer this call and did not say why in a form "
+            "this broker recognises. One retry is reasonable; two is not.",
+        ),
+    )
+    return WorkspaceError(guidance, status=status, code=symbol, detail=detail)
+
+
 def vcs_enabled() -> bool:
     """Off by default, like every other route that spends a credential."""
     return os.getenv("CREDENTIAL_PROXY_VCS", "0").strip().lower() in {
@@ -130,6 +235,17 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def max_bundle_bytes() -> int:
+    """The publish ceiling, readable before a broker exists.
+
+    The HTTP layer in front of these routes has its own body limit, and it has
+    to be sized from this number or the smaller of the two is what actually
+    refuses -- at a size no error code names and no document advertises. It
+    reads the ceiling here rather than restating it.
+    """
+    return _positive_int("CREDENTIAL_PROXY_MAX_BUNDLE_BYTES", DEFAULT_MAX_BUNDLE_BYTES)
+
+
 # ---- validation -----------------------------------------------------------
 
 
@@ -142,6 +258,12 @@ def validate_branch(value: Any, field: str = "branch") -> str:
         or ".." in value
         or "@{" in value
         or value.endswith(".lock")
+        # `git rev-parse --abbrev-ref HEAD` answers "HEAD" on a detached head,
+        # so a client that forwards its answer unchecked asks to publish a
+        # branch by that name. It is a legal ref, which is the problem: pushing
+        # it creates refs/heads/HEAD and makes `HEAD` ambiguous in every later
+        # clone. vcs.py refuses this too; the broker does not trust it to.
+        or value == "HEAD"
     ):
         raise WorkspaceError(f"{field} is not an acceptable branch name")
     return value
@@ -687,9 +809,7 @@ class VcsBroker:
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
-        self.max_bundle_bytes = _positive_int(
-            "CREDENTIAL_PROXY_MAX_BUNDLE_BYTES", DEFAULT_MAX_BUNDLE_BYTES
-        )
+        self.max_bundle_bytes = max_bundle_bytes()
         self._sequence = 0
 
     # ---- plumbing ------------------------------------------------------
@@ -705,15 +825,7 @@ class VcsBroker:
         """
         done = self._cli_runner(["gh", "api", "--method", method, path, *fields])
         if done.returncode != 0:
-            # The forge's own first line, trimmed. It says which field was
-            # rejected or that the branch has no commits; a caller told only
-            # "the forge refused it" has to guess.
-            detail = (done.stderr or done.stdout or "").strip().splitlines()
-            raise WorkspaceError(
-                detail[0][:400] if detail else f"the forge refused {method} {path}",
-                status=502,
-                code="FORGE_CALL_FAILED",
-            )
+            raise _forge_error(done.stderr or done.stdout or "")
         if raw:
             return done.stdout or ""
         try:
@@ -859,8 +971,13 @@ class VcsBroker:
     def publish(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Take the caller's revisions as a bundle and put them on the remote.
 
-        Four checks stand between the bundle and the remote, and each one exists
+        Five checks stand between the bundle and the remote, and each one exists
         because the objects came from the sandbox:
+
+        The branch must not be the target. Every ancestry check below passes for
+        a publish onto the branch the copy was cloned from, because that is a
+        fast-forward; none of them can see that the branch being fast-forwarded
+        is the shared one.
 
         The bundle must carry exactly the branch it claims. A bundle holding a
         second ref would publish something the caller did not declare, and a
@@ -884,6 +1001,20 @@ class VcsBroker:
         branch = validate_branch(payload.get("branch"))
         target = validate_branch(payload.get("target"), "target")
         base_revision = validate_revision(payload.get("baseRevision"))
+        if branch == target:
+            # The three ancestry checks below all pass for a publish onto the
+            # branch it was cloned from -- it is a fast-forward, which is
+            # exactly what they are there to require. What they cannot see is
+            # that the branch being fast-forwarded is the shared one. vcs.py
+            # refuses this before it builds the bundle; the broker does not
+            # trust it to, for the same reason validate_branch runs twice.
+            raise WorkspaceError(
+                f"branch and target are both {branch}, so this publish would "
+                "write to the branch it was cloned from. Publish a branch of "
+                "your own and open a proposal onto this one.",
+                status=409,
+                code="TARGET_IS_BRANCH",
+            )
         raw = payload.get("bundleBase64")
         if not isinstance(raw, str) or not raw:
             raise WorkspaceError("bundleBase64 must be a base64 bundle")

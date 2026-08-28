@@ -319,5 +319,93 @@ class WorkspaceClientTest(unittest.TestCase):
                 workspace.push()
 
 
+class VcsCallTest(unittest.TestCase):
+    """The client half of `/v1/vcs/*`, which stands alone on every call."""
+
+    def setUp(self):
+        self.endpoint = "http://127.0.0.1:8765"
+
+    def test_the_verb_is_the_path_and_the_payload_is_the_body(self):
+        seen = {}
+
+        def fake_urlopen(request):
+            seen["url"] = request.full_url
+            seen["method"] = request.method
+            seen["body"] = json.loads(request.data)
+            seen["type"] = request.headers.get("Content-type")
+            return RecordingResponse(json.dumps({"forge": "github"}).encode())
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            answer = credential_proxy_client.vcs_call(
+                self.endpoint + "/", "proposal-create", {"repository": "acme/infra"}
+            )
+        self.assertEqual(answer, {"forge": "github"})
+        self.assertEqual(seen["url"], self.endpoint + "/v1/vcs/proposal-create")
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["body"], {"repository": "acme/infra"})
+        self.assertEqual(seen["type"], "application/json")
+
+    def test_a_disabled_broker_is_distinguishable_from_a_refusal(self):
+        def disabled(request):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                404,
+                "Not Found",
+                {},
+                io.BytesIO(
+                    json.dumps(
+                        {"error": "not enabled", "code": "VCS_DISABLED"}
+                    ).encode()
+                ),
+            )
+
+        with patch("urllib.request.urlopen", disabled):
+            with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
+                credential_proxy_client.vcs_call(self.endpoint, "clone", {})
+
+    def test_a_refusal_carries_the_code_and_the_forges_detail_through(self):
+        def conflict(request):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                409,
+                "Conflict",
+                {},
+                io.BytesIO(
+                    json.dumps(
+                        {
+                            "error": "main has moved on the remote",
+                            "code": "BASE_MOVED",
+                            "detail": "refusing to allow a fast-forward",
+                        }
+                    ).encode()
+                ),
+            )
+
+        with patch("urllib.request.urlopen", conflict):
+            with self.assertRaises(
+                credential_proxy_client.WorkspaceRequestError
+            ) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.payload["code"], "BASE_MOVED")
+        self.assertEqual(
+            caught.exception.payload["detail"], "refusing to allow a fast-forward"
+        )
+
+    def test_a_body_that_is_not_json_still_reaches_the_caller_as_a_refusal(self):
+        def html(request):
+            raise urllib.error.HTTPError(
+                request.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"<html>")
+            )
+
+        with patch("urllib.request.urlopen", html):
+            with self.assertRaises(
+                credential_proxy_client.WorkspaceRequestError
+            ) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "clone", {})
+        self.assertEqual(caught.exception.status, 502)
+        self.assertEqual(caught.exception.payload, {"error": "HTTP 502"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
