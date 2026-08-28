@@ -1035,49 +1035,60 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `240m` off a ten-task measurement; both have merged and the Prow `job-config` has rolled, which is
   what unblocked this pull request.
 
-  The expected run is measured rather than estimated, and it has now been measured twice because the
-  matrix grew underneath it twice — #956 took the active cases from three to **ten**, and #982 took
-  them to **thirteen**:
+  The expected run is measured rather than estimated, and it has been re-measured three times
+  because the matrix grew underneath it three times — #956 took the active cases from three to
+  **ten**, #982 took them to **thirteen**, and #998 took them to **fourteen**:
 
   | source | invocations | measured                                        | build                 |
   | ------ | ----------- | ----------------------------------------------- | --------------------- |
   | fixed  | —           | 17.3min (Boskos, image build, deploy, teardown) | `2092820036916875264` |
   | #956   | 10          | 51.6min                                         | `2092820036916875264` |
   | #982   | 3           | 9.2min (190s + 142s + 220s)                     | `2092719124550520832` |
+  | #998   | 1           | **never measured** — see below                  | —                     |
 
-  Only the 60.8min of invocations scales with `EVAL_REPETITIONS`:
+  Only the invocations scale with `EVAL_REPETITIONS`. At the 4.7min average of the thirteen measured
+  ones:
 
   | reps | invocations | expected | 150m  | 240m  |
   | ---- | ----------- | -------- | ----- | ----- |
-  | 1    | 13          | 78min    | 1.92× | 3.07× |
-  | 3    | 39          | 200min   | 0.75× | 1.20× |
+  | 1    | 14          | 83min    | 1.81× | 2.89× |
+  | 3    | 42          | 214min   | 0.70× | 1.12× |
 
   `150m` was therefore not a tight budget but a guaranteed timeout, which is what made #2669 a
-  prerequisite rather than a follow-up. **`240m` is now 1.20×**, against the ~2× this job carried for
+  prerequisite rather than a follow-up. **`240m` is now 1.12×**, against the ~2× this job carried for
   a year and the 1.40× #2669 itself argued for. It is not already negative only because #951 and
   seeded-cluster reuse cut `gpu-stress-test-diagnosis` from 21.1min to 244s.
+
+  **1.12× is the optimistic reading, because one of the fourteen terms is a substitution rather than
+  a measurement.** #998 activated `rca-remediation-pr` precisely so that its own smoke run would be
+  the first measurement of it, so there is nothing to cite and the table uses the average of the
+  other thirteen. That average is a floor rather than a centre for this particular case: it is the
+  only active task that **writes**, filing a remediation pull request against the leased project's
+  throwaway GitOps repository. If it costs what the compliance canary costs (600–1300s), three
+  repetitions of it alone is 30–65min and the total lands at ~250–285min, which is **over** `240m`.
+  The first run of this matrix settles it.
 
   **It is not being raised a third time yet, and that is a decision rather than an oversight.** Work
   to cut the eval's runtime is in flight separately; if it lands, the headroom returns without
   another pull request against another repository, and a `300m` ceiling raised in the meantime would
   outlive the reason for it. The cost of waiting is bounded — the ceiling only costs anything on a
-  run that has already hung — and `300m` (1.5×) is the follow-up if 1.20× is observed to bite first.
+  run that has already hung — and `300m` (1.5×) is the follow-up if 1.12× is observed to bite first.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull
-  request can replace, and nothing in this repository fails when it runs out. Three successive
+  request can replace, and nothing in this repository fails when it runs out. Four successive
   numbers have been invalidated the same way. Activating a case and raising the budget should be one
   change in two repositories, not a change and a follow-up — the comment above `EVAL_REPETITIONS` in
   `hack/ci-eval-pr.sh` says so where someone about to uncomment a line will read it.
 
   One term is worth watching in either direction: `consistency-authorized-networks-probe` cost
   **1039s** on the only run that exists, against the 150–350s #956 budgeted for each of its six
-  probes. Three repetitions of that single case is ~52min of the ~200min total. If 1039s is typical
-  rather than one bad sample, 1.20× does not survive it.
+  probes. Three repetitions of that single case is ~52min of the ~214min total. If 1039s is typical
+  rather than one bad sample, 1.12× does not survive it either.
 
   **Retry-on-failure — one repetition, two more only if the first fails — is the obvious way to buy
-  that runtime back, and it is deliberately not taken.** On a green run it would cost 13
-  invocations instead of 39 and land the job near 78min, which is real money. It is declined
+  that runtime back, and it is deliberately not taken.** On a green run it would cost 14
+  invocations instead of 42 and land the job near 83min, which is real money. It is declined
   because it is not verdict-identical to three unconditional repetitions, in four ways, and the
   cheap version of a gate that quietly grades differently is worse than an expensive one:
 

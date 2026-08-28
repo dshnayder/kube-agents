@@ -304,6 +304,15 @@ export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+# The harness's default delegation wait (1800s) sits INSIDE the compliance
+# canary's observed completion spread: on 2026-08-27 (build
+# 2093054394793725952, kube-agents-evals-2) the audit worker finished and
+# rewrote its ledger at 20:30:37Z -- five minutes AFTER the wait gave up at
+# ~20:24 -- and the run graded a bare receipt as the answer. Observed audit
+# completions: 606s / 827s / 1497s / ~2170s on identical inputs. 2700s puts
+# the ceiling above the worst observed; the variance itself is #985's
+# problem, this export just stops mislabeling slowness as wrongness.
+export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
 # For opentofu provider
@@ -508,6 +517,14 @@ TASKS=(
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
+  # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
+  # the job deadline before reaching it), so this entry's first smoke IS the
+  # measurement. Placed after the six probes (proven, ~20 min together) and
+  # before the canary so a surprise here cannot starve the probes of budget.
+  # The one active task that WRITES: it files a remediation PR against the
+  # leased project's throwaway GitOps repo via submit-suggestion.
+  "./tasks/rca-remediation-pr/task.yaml"
   # The audit-machinery canary: measured 606s clean on 2026-08-26, every
   # exact check green -- the only task that has proven the A1/A4 path
   # (minted token, cloned *-infra workspace, published ledger issue) in a
@@ -581,14 +598,13 @@ TASKS=(
   #      full-audit shape recast to the nightly tier (600-1300s each, measured
   #      or transport-failed on 2026-08-26); each domain is now covered by a
   #      probe above. They remain spec-ready and activation is uncommenting.
-  #   -- rca-remediation-pr: parked until it gets one clean measured run; the
-  #      2026-08-26 run hit the job deadline before reaching it, so its cost
-  #      and signal are still unknown.
+  #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
+  #      active above, this pull request's smoke run being the clean measured
+  #      run it was waiting for.
   # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
-  # "./tasks/rca-remediation-pr/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
@@ -678,44 +694,55 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
-# THIRTEEN tasks at three repetitions is THIRTY-NINE devops-bench invocations,
+# FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
 # where the presubmit's budget was sized for two. Measured, not estimated, from
-# two builds:
+# two builds -- with one term that has never been measured at all:
 #
 #   fixed: Boskos lease, image build (710s), deploy, teardown   17.3min
 #   the ten invocations #956 activated                          51.6min
 #     (build 2092820036916875264, the run #956 merged on)
 #   the three #982 activated: 190s + 142s + 220s                 9.2min
 #     (build 2092719124550520832, quoted in the TASKS array above)
+#   rca-remediation-pr, activated by #998                        UNKNOWN
+#     (deliberately: #998 activated it so that its own smoke run
+#      would BE the first measurement, so there is nothing to cite)
 #
-# Only the 60.8min of invocations scales, so one repetition is ~78min and three
-# is 17.3 + 3 x 60.8 = ~200min.
+# Only the invocations scale. At the 4.7min average of the thirteen measured
+# ones, fourteen tasks is ~65min per repetition, so three is 17.3 + 3 x 65 =
+# ~214min. Against 240m that is 1.12x, and the unmeasured term is the one
+# active task that WRITES -- it files a remediation PR -- so the average is a
+# floor for it rather than a centre. If it costs what the compliance canary
+# costs (600-1300s), three repetitions of it alone is 30-65min and the total
+# goes to ~250-285min, which is OVER 240m. The first run of this matrix
+# settles it; until then 1.12x is the optimistic reading.
 #
 # The budget has been raised twice to keep up, both merged: oss-test-infra #2667
 # took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off the
-# ten-task measurement. 240m against ~200min is 1.20x. That is thin -- this job
-# carried ~2x for a year, and the ten-task arithmetic #2669 argued was 1.40x --
-# and the reason it is not already negative is that #951 and seeded-cluster
-# reuse cut gpu-stress-test-diagnosis from 21.1min to 244s.
+# ten-task measurement. That is thin -- this job carried ~2x for a year, and the
+# ten-task arithmetic #2669 argued was 1.40x -- and the reason it is not already
+# negative is that #951 and seeded-cluster reuse cut gpu-stress-test-diagnosis
+# from 21.1min to 244s.
 #
 # It is deliberately NOT being raised a third time here: work to cut the eval's
 # runtime is in flight separately, and if it lands the headroom returns without
 # another pull request against another repository. If it has not landed by the
-# time 1.20x is observed to bite, 300m is the follow-up.
+# time 1.12x is observed to bite, 300m is the follow-up.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
 # separate pull request can replace, and this number has now been invalidated
-# three times by a matrix that grew after it was computed (#956, then #982).
-# At 1.20x the next activation of any average-cost case takes it under 1.0.
-# Activating a case and raising the budget are one change in two repositories,
-# not a change and a follow-up.
+# FOUR times by a matrix that grew after it was computed (#956, then #982, then
+# #998). At 1.12x the next activation of any average-cost case takes it to
+# 1.05x, and one canary-cost case takes it under 1.0. Activating a case and
+# raising the budget are one change in two repositories, not a change and a
+# follow-up.
 #
-# The variance to watch is consistency-authorized-networks-probe: budgeted at
-# 150-350s like its five sibling probes, it took 1039s on the only run that
-# exists. Three repetitions of that one case is ~52min of the ~200min total. If
-# 1039s is its normal cost rather than one bad sample, the probe set is a third
-# more expensive than #956 sized it for and 1.20x does not survive it.
+# The measured variance to watch is consistency-authorized-networks-probe:
+# budgeted at 150-350s like its five sibling probes, it took 1039s on the only
+# run that exists. Three repetitions of that one case is ~52min of the ~214min
+# total. If 1039s is its normal cost rather than one bad sample, the probe set
+# is a third more expensive than #956 sized it for and 1.12x does not survive
+# it either.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
