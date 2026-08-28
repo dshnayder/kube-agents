@@ -695,54 +695,55 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # -- how it scales past a handful of tasks is issue #902's lane, not this one.
 #
 # FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
-# where the presubmit's budget was sized for two. Measured, not estimated, from
-# two builds -- with one term that has never been measured at all:
+# where the presubmit's budget was sized for two. This number is no longer an
+# extrapolation from other builds: THIS matrix has now run end to end, at
+# thirteen tasks x three repetitions, on build 2093054834931404800
+# (2026-08-27, GREEN).
 #
-#   fixed: Boskos lease, image build (710s), deploy, teardown   17.3min
-#   the ten invocations #956 activated                          51.6min
-#     (build 2092820036916875264, the run #956 merged on)
-#   the three #982 activated: 190s + 142s + 220s                 9.2min
-#     (build 2092719124550520832, quoted in the TASKS array above)
-#   rca-remediation-pr, activated by #998                        UNKNOWN
-#     (deliberately: #998 activated it so that its own smoke run
-#      would BE the first measurement, so there is nothing to cite)
+#   whole job, wall clock                                       156.8min
+#     of which the 39 invocations                               140.4min
+#     of which fixed (Boskos, image build 756s, deploy 913s,
+#       teardown)                                                16.4min
 #
-# Only the invocations scale. At the 4.7min average of the thirteen measured
-# ones, fourteen tasks is ~65min per repetition, so three is 17.3 + 3 x 65 =
-# ~214min. Against 240m that is 1.12x, and the unmeasured term is the one
-# active task that WRITES -- it files a remediation PR -- so the average is a
-# floor for it rather than a centre. If it costs what the compliance canary
-# costs (600-1300s), three repetitions of it alone is 30-65min and the total
-# goes to ~250-285min, which is OVER 240m. The first run of this matrix
-# settles it; until then 1.12x is the optimistic reading.
+# So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
+# #982's builds -- those over-read it. Fourteen tasks x three is 42 invocations
+# and ~168min, or 1.43x against 240m.
 #
-# The budget has been raised twice to keep up, both merged: oss-test-infra #2667
-# took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off the
-# ten-task measurement. That is thin -- this job carried ~2x for a year, and the
-# ten-task arithmetic #2669 argued was 1.40x -- and the reason it is not already
-# negative is that #951 and seeded-cluster reuse cut gpu-stress-test-diagnosis
-# from 21.1min to 244s.
+# One term in that is still a substitution rather than a measurement:
+# rca-remediation-pr, activated by #998 so that its own smoke run would BE the
+# first measurement, is priced at the fleet average. It is one of the two active
+# tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
+# measured 681s per repetition -- at that cost the total is ~191min and 1.26x.
+# Treat 1.26x as the honest figure and 1.43x as the optimistic one until the
+# first fourteen-task run lands.
+#
+# The budget has been raised twice to get here, both merged: oss-test-infra
+# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
+# a ten-task measurement. 150m would still have been a guaranteed timeout, which
+# is what made #2669 a prerequisite rather than a follow-up.
 #
 # It is deliberately NOT being raised a third time here: work to cut the eval's
 # runtime is in flight separately, and if it lands the headroom returns without
-# another pull request against another repository. If it has not landed by the
-# time 1.12x is observed to bite, 300m is the follow-up.
+# another pull request against another repository. At 1.26x-1.43x measured there
+# is real room, so 300m stays a follow-up rather than a blocker.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
-# separate pull request can replace, and this number has now been invalidated
-# FOUR times by a matrix that grew after it was computed (#956, then #982, then
-# #998). At 1.12x the next activation of any average-cost case takes it to
-# 1.05x, and one canary-cost case takes it under 1.0. Activating a case and
-# raising the budget are one change in two repositories, not a change and a
-# follow-up.
+# separate pull request can replace, and this number was invalidated FOUR times
+# by a matrix that grew after it was computed (#956, then #982, then #998)
+# before a real run finally replaced the arithmetic. At the measured 3.6min
+# average, each further average-cost case costs ~11min of the remaining ~49-72min
+# of headroom, and a canary-cost case costs ~34min. Activating a case and raising
+# the budget are one change in two repositories, not a change and a follow-up.
 #
-# The measured variance to watch is consistency-authorized-networks-probe:
-# budgeted at 150-350s like its five sibling probes, it took 1039s on the only
-# run that exists. Three repetitions of that one case is ~52min of the ~214min
-# total. If 1039s is its normal cost rather than one bad sample, the probe set
-# is a third more expensive than #956 sized it for and 1.12x does not survive
-# it either.
+# The variance that was flagged as the thing to watch has resolved in the good
+# direction: consistency-authorized-networks-probe took 1039s on the one earlier
+# run that existed, against the 150-350s #956 budgeted per probe. On this matrix
+# it took 699s for all THREE repetitions -- 233s each. 1039s was one bad sample,
+# not its normal cost.
+#
+# The expensive term is instead compliance-rbac-overgrant at 2042s for three
+# repetitions (681s each), which is 24% of the whole task budget on its own.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
