@@ -395,6 +395,15 @@ platformAgent:
         # state volume. Off by default; the directory path keeps working beside
         # it, and a skill picks one per run by probing the proxy.
         contentWorkspaces: null # CRD default: false
+        # Arms the broker's /v1/vcs/* routes, which the version-control skill
+        # speaks: history moves between the sandbox and the broker as a git
+        # bundle in both directions, so the sandbox answers questions about the
+        # past from its own credential-free git. On by default. The value is a
+        # switch the sandbox reads too — with it off, `git` and `gh` in the
+        # shell go back to being the credential shim and the sandbox has no
+        # version-control route of its own, which is the configuration the
+        # alternatives are measured against.
+        versionControl: null # CRD default: true
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent

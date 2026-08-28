@@ -899,31 +899,109 @@ func TestVersionControlRoutesReachTheProxyAtEitherPlacement(t *testing.T) {
 		return "", false
 	}
 
+	// Nil is on. The abstraction is how a sandbox reaches a repository, so the
+	// field is an opt-out; only an explicit false closes the routes.
 	off := colocatedTestAgent()
+	off.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(false)
 	for _, colocated := range []bool{true, false} {
 		if _, ok := env(buildCredentialProxyContainer(off, colocated)); ok {
-			t.Errorf("colocated=%v: the vcs routes must be off unless asked for", colocated)
+			t.Errorf("colocated=%v: an explicit false must close the vcs routes", colocated)
 		}
 	}
 
-	on := colocatedTestAgent()
-	on.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(true)
-	for _, colocated := range []bool{true, false} {
-		value, ok := env(buildCredentialProxyContainer(on, colocated))
-		if !ok || value != "1" {
-			t.Errorf("colocated=%v: CREDENTIAL_PROXY_VCS = %q present=%v, want \"1\"",
-				colocated, value, ok)
+	for _, on := range []*agentv1alpha1.PlatformAgent{
+		colocatedTestAgent(),
+		func() *agentv1alpha1.PlatformAgent {
+			a := colocatedTestAgent()
+			a.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(true)
+			return a
+		}(),
+	} {
+		for _, colocated := range []bool{true, false} {
+			value, ok := env(buildCredentialProxyContainer(on, colocated))
+			if !ok || value != "1" {
+				t.Errorf("colocated=%v: CREDENTIAL_PROXY_VCS = %q present=%v, want \"1\"",
+					colocated, value, ok)
+			}
 		}
 	}
 
-	// Independent of contentWorkspaces in both directions: an install may arm
-	// either alone, and the two answer the same problem differently.
-	if _, ok := env(buildCredentialProxyContainer(func() *agentv1alpha1.PlatformAgent {
-		a := colocatedTestAgent()
-		a.Spec.Harness.Experimental.ShellSandbox.ContentWorkspaces = ptr.To(true)
-		return a
-	}(), true)); ok {
-		t.Error("contentWorkspaces alone must not arm the vcs routes")
+	// Independent of contentWorkspaces: turning Brian's content routes on is not
+	// what closes these, and turning these off is not what opens those. The two
+	// are different answers to the same problem, and the comparison between them
+	// is the only reason both exist.
+	both := colocatedTestAgent()
+	both.Spec.Harness.Experimental.ShellSandbox.ContentWorkspaces = ptr.To(true)
+	both.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(false)
+	if _, ok := env(buildCredentialProxyContainer(both, true)); ok {
+		t.Error("contentWorkspaces must not arm the vcs routes on its own")
+	}
+}
+
+func TestVersionControlDecidesWhichGitTheShellGets(t *testing.T) {
+	// The shell container gets the same flag as the broker, and it does a
+	// different job there: the image's entrypoint reads it and decides whether
+	// `git` and `gh` are the credential-proxy shims or /opt/vcs/bin's pair --
+	// the credential-free local git, and a `gh` that refuses and names the verb
+	// to use instead. Miss it and the abstraction ships with two bypasses on
+	// PATH under the obvious names, which is measured rather than hypothetical:
+	// given the skill and the shims still owning both names, an agent answered
+	// 8 of 60 read probes through bare `git` with no call to the skill at all,
+	// issued 4 credentialed clones, and reached for `gh api` whenever a
+	// question got awkward.
+	//
+	// This test covers only that the variable lands on the container. What the
+	// entrypoint does with it is deploy/sandbox/smoke-test.sh §9, and that
+	// division is why the first build shipped broken: the variable was on the
+	// pod and never crossed into the ssh session, which is the only session
+	// Hermes opens.
+	shellEnv := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh",
+			credentialProxySandboxURL(agent), "settings-hash", "policy-hash")
+		for _, c := range sts.Spec.Template.Spec.Containers {
+			if c.Name != "shell" {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.Name == "CREDENTIAL_PROXY_VCS" {
+					return e.Value, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	// Nil is on: a sandbox is abstracted unless an install says otherwise.
+	if value, ok := shellEnv(colocatedTestAgent()); !ok || value != "1" {
+		t.Errorf("default shell CREDENTIAL_PROXY_VCS = %q present=%v, want \"1\"", value, ok)
+	}
+
+	// Explicit false is the comparison configuration, and there the shims keep
+	// both names -- with no local clone to read, `git` has to mean the shim or
+	// it means nothing.
+	off := colocatedTestAgent()
+	off.Spec.Harness.Experimental.ShellSandbox.VersionControl = ptr.To(false)
+	if _, ok := shellEnv(off); ok {
+		t.Error("an explicit false must leave the shell on the credential shims")
+	}
+
+	// Not gated on co-location, for the same reason the broker's copy is not:
+	// the bundle protocol works with the broker in its own pod, and the shell's
+	// PATH question is the same one in either topology.
+	separate := shellSandboxTestAgent()
+	separate.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{
+			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{
+				Enabled:        ptr.To(true),
+				VersionControl: ptr.To(true),
+			},
+		},
+	}
+	if credentialProxyColocated(separate) {
+		t.Fatal("this agent is meant to exercise the standalone proxy placement")
+	}
+	if value, ok := shellEnv(separate); !ok || value != "1" {
+		t.Errorf("standalone placement: shell CREDENTIAL_PROXY_VCS = %q present=%v, want \"1\"", value, ok)
 	}
 }
 

@@ -48,11 +48,22 @@ spec:
     {{- if and $sandbox.contentWorkspaces (not $sandbox.enabled) }}
     {{- fail "platformAgent.harness.experimental.shellSandbox.contentWorkspaces has no effect without shellSandbox.enabled: the content-passing routes are served by the credential proxy that runs beside the sandbox" }}
     {{- end }}
+    {{- /*
+      versionControl defaults to true in the CRD, so the check is the other way
+      round from the one above: leaving it unset with the sandbox off is the
+      ordinary arrangement and says nothing, while turning it explicitly off
+      there asks for a configuration the install already has. Both flags reach
+      the broker only through its co-located placement.
+    */}}
+    {{- if and (kindIs "bool" $sandbox.versionControl) (not $sandbox.enabled) }}
+    {{- fail "platformAgent.harness.experimental.shellSandbox.versionControl has no effect without shellSandbox.enabled: the /v1/vcs routes are served by the credential proxy that runs beside the sandbox" }}
+    {{- end }}
     {{- with include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
           "runtimeClassName" $sandbox.runtimeClassName
-          "contentWorkspaces" $sandbox.contentWorkspaces) }}
+          "contentWorkspaces" $sandbox.contentWorkspaces
+          "versionControl" $sandbox.versionControl) }}
     experimental:
       shellSandbox:
         {{- . | nindent 8 }}

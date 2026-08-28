@@ -266,14 +266,17 @@ func shellSandboxContentWorkspaces(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // shellSandboxVersionControl reports whether the broker should serve the
-// /v1/vcs/* routes the version-control skill speaks.
+// /v1/vcs/* routes the version-control skill speaks, and whether the shell
+// container gets the abstraction as its only version-control door.
 //
-// Read separately from contentWorkspaces rather than folded into it: the two
-// are different answers to the same problem and an install may want either
-// alone. See the field comment on ShellSandboxSpec.VersionControl.
+// Nil means on, unlike every other field here. A sandbox reaches repositories
+// through the abstraction; the field is how an install opts out to measure
+// something else against it, not how it opts in. Read separately from
+// contentWorkspaces rather than folded into it: the two are different answers
+// to the same problem. See the field comment on ShellSandboxSpec.VersionControl.
 func shellSandboxVersionControl(agent *agentv1alpha1.PlatformAgent) bool {
 	spec := shellSandboxSpec(agent)
-	return spec != nil && spec.VersionControl != nil && *spec.VersionControl
+	return spec != nil && (spec.VersionControl == nil || *spec.VersionControl)
 }
 
 // shellSandboxName is the name of every object in this file: the StatefulSet, its
@@ -360,6 +363,18 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	env := []corev1.EnvVar{}
 	if credentialProxyURL != "" {
 		env = append(env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL})
+	}
+	if shellSandboxVersionControl(agent) {
+		// The same flag the broker gets, for a different reason: here it decides
+		// which of the image's two gits owns the name `git`. The image's
+		// entrypoint reads it and puts the credential-free /opt/vcs/bin ahead of
+		// the credential-proxy shim -- in the sshd SetEnv line, which is the
+		// whole environment of the non-login shell Hermes gets, and in
+		// /etc/profile.d/vcs-path.sh for `kubectl exec -- bash -l`. So a bare
+		// `git` in the sandbox reads the bundle-unpacked clone locally instead of
+		// sending it to the container holding the token. Without this the
+		// abstraction ships with its own bypass on PATH under the obvious name.
+		env = append(env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_VCS", Value: "1"})
 	}
 
 	containers := buildShellSandboxContainers(agent, env)

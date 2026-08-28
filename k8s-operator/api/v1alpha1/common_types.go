@@ -244,16 +244,22 @@ type ShellSandboxSpec struct {
 	// checks and pushes without ever checking the incoming objects out.
 	//
 	// This is the third answer to the same problem ContentWorkspaces addresses,
-	// and it is armed separately because it gives back what that one takes away.
-	// Content passing answers from one commit, so there is no log, no annotate,
-	// no earlier revision of a file and no file mode; measured against real
-	// questions, an agent on those routes reached those answers by leaving the
-	// protocol for `gh api`. Bundles carry history at full fidelity without
-	// putting a repository's own config, hooks or remotes beside the credential.
+	// and it is how a sandbox reaches a repository. Content passing answers from
+	// one commit, so there is no log, no annotate, no earlier revision of a file
+	// and no file mode; measured against real questions, an agent on those
+	// routes reached those answers by leaving the protocol for `gh api`. Bundles
+	// carry history at full fidelity without putting a repository's own config,
+	// hooks or remotes beside the credential.
 	//
-	// Off by default and independent of ContentWorkspaces, so an install can arm
-	// either, both, or neither. See docs/designs/version-control-abstraction.md.
-	// +kubebuilder:default=false
+	// On by default, and the field exists to be turned off rather than on. The
+	// value is a switch the sandbox reads too: with it on, `git` in the shell is
+	// the credential-free local binary and `gh` is a refusal naming the verb to
+	// use instead, so the abstraction is the only door rather than one of
+	// several. Turning it off restores the credential shim under both names and
+	// leaves the sandbox with no version-control route of its own, which is a
+	// configuration that exists to measure the alternatives against.
+	// See docs/designs/version-control-abstraction.md.
+	// +kubebuilder:default=true
 	// +optional
 	VersionControl *bool `json:"versionControl,omitempty"`
 }
