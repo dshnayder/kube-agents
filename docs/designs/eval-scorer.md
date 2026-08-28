@@ -342,9 +342,13 @@ PROJECT=kube-agents-prow                # NOT a pool project -- see below
 #
 # No lifecycle rule and no versioning, deliberately: nothing may delete evidence,
 # and nothing can overwrite it, so there are no versions to keep.
+# us-west1 because the only thing that ever reads or writes this bucket is a job
+# in the build-kube-agents cluster, which is
+# gke_kube-agents-prow_us-west1-b_kube-agents-prow. Bucket location is immutable,
+# so this is not a thing to get approximately right.
 gcloud storage buckets create "gs://${BUCKET}" \
   --project="${PROJECT}" \
-  --location=us-central1 \
+  --location=us-west1 \
   --default-storage-class=STANDARD \
   --uniform-bucket-level-access \
   --public-access-prevention
@@ -360,13 +364,22 @@ gcloud iam service-accounts create eval-baseline-recorder \
 NIGHTLY_SA=eval-baseline-recorder@${PROJECT}.iam.gserviceaccount.com
 PRE_SA=prowjob-default-sa@${PROJECT}.iam.gserviceaccount.com
 
-# The periodic must then name it -- serviceAccountName in the Prow job is a KSA,
-# so this also needs the Workload Identity binding in the build-kube-agents
-# cluster, in whatever namespace Prow runs the job's pod.
+# serviceAccountName in a Prow job names a KSA, not this GSA, so Workload
+# Identity needs BOTH halves. The namespace is test-pods -- oss-test-infra's
+# prow/oss/config.yaml sets `pod_namespace: test-pods`, and the build cluster is
+# gke_kube-agents-prow_us-west1-b_kube-agents-prow, so the WI pool is this same
+# project's.
+gcloud container clusters get-credentials kube-agents-prow \
+  --zone=us-west1-b --project="${PROJECT}"
+
+kubectl create serviceaccount eval-baseline-recorder -n test-pods
+kubectl annotate serviceaccount eval-baseline-recorder -n test-pods \
+  "iam.gke.io/gcp-service-account=${NIGHTLY_SA}"
+
 gcloud iam service-accounts add-iam-policy-binding "${NIGHTLY_SA}" \
   --project="${PROJECT}" \
   --role=roles/iam.workloadIdentityUser \
-  --member="serviceAccount:${PROJECT}.svc.id.goog[<prow-namespace>/eval-baseline-recorder]"
+  --member="serviceAccount:${PROJECT}.svc.id.goog[test-pods/eval-baseline-recorder]"
 
 # 3a. The nightly recorder reads and appends. Both roles: objectCreator alone
 #     cannot read back what it wrote, and the recorder reads the store to
@@ -957,7 +970,9 @@ executed against a real bucket. Substitute the project and bucket and run:
 
 ```bash
 PROJECT=kube-agents-prow
-bq --project_id=$PROJECT mk --dataset --location=us-central1 $PROJECT:eval_baselines
+# us-west1 must match the bucket's location -- BigQuery refuses to read an
+# external table from GCS in a different region.
+bq --project_id=$PROJECT mk --dataset --location=us-west1 $PROJECT:eval_baselines
 bq --project_id=$PROJECT mk --table \
   --external_table_definition=bench/dashboard/external-table.json \
   $PROJECT:eval_baselines.evidence
