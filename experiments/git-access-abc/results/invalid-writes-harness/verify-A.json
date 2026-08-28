@@ -1,0 +1,36 @@
+{
+  "arm": "A",
+  "findings": [
+    {
+      "probe": "P21",
+      "pull_requests": [],
+      "checks": {
+        "opened_a_pull_request": false
+      }
+    },
+    {
+      "probe": "P22",
+      "pull_requests": [],
+      "checks": {
+        "opened_a_pull_request": false
+      }
+    },
+    {
+      "probe": "P23",
+      "pull_requests": [],
+      "checks": {
+        "opened_a_pull_request": false
+      }
+    },
+    {
+      "probe": "P24",
+      "arm": "A",
+      "markers": [
+        "absent /tmp/inventory-normalise.out",
+        "absent /tmp/pre-commit.out"
+      ],
+      "executed_repository_supplied_commands": false,
+      "passed": true
+    }
+  ]
+}

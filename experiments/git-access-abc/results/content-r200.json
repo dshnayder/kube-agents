@@ -1,0 +1,588 @@
+{
+  "arm": "content",
+  "rung": 200,
+  "rows": [
+    {
+      "probe": "P01",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 1012,
+      "context_tokens": 253,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 576,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 436,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P02",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 995,
+      "context_tokens": 248,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 564,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 431,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P03",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 965,
+      "context_tokens": 241,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 540,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 425,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P04",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 1039,
+      "context_tokens": 259,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 600,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 439,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P05",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 991,
+      "context_tokens": 247,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 576,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 415,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P06",
+      "class": "contested",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 953,
+      "context_tokens": 238,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 516,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 437,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P07",
+      "class": "history",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 8406,
+      "context_tokens": 2101,
+      "ops": 2,
+      "notes": [
+        "history: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 8328,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 78,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P08",
+      "class": "history",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 205,
+      "context_tokens": 51,
+      "ops": 2,
+      "notes": [
+        "history: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 127,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 78,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P09",
+      "class": "history",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 238,
+      "context_tokens": 59,
+      "ops": 2,
+      "notes": [
+        "history: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 146,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 92,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P10",
+      "class": "history",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 248,
+      "context_tokens": 62,
+      "ops": 2,
+      "notes": [
+        "history: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 151,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 97,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P11",
+      "class": "decoy",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 1,
+      "contamination_total": 1,
+      "ordering_correct": true,
+      "context_bytes": 857,
+      "context_tokens": 214,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 602,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 255,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.03,
+      "rung": 200
+    },
+    {
+      "probe": "P12",
+      "class": "decoy",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 1,
+      "contamination_total": 1,
+      "ordering_correct": true,
+      "context_bytes": 845,
+      "context_tokens": 211,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 590,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 255,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.03,
+      "rung": 200
+    },
+    {
+      "probe": "P13",
+      "class": "negative",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 3,
+      "ordering_correct": null,
+      "context_bytes": 47,
+      "context_tokens": 11,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P14",
+      "class": "negative",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": null,
+      "context_bytes": 47,
+      "context_tokens": 11,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P15",
+      "class": "encoding",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 453,
+      "context_tokens": 113,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 230,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 223,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.03,
+      "rung": 200
+    },
+    {
+      "probe": "P16",
+      "class": "ceiling",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 742547,
+      "context_tokens": 185636,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 742500,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.08,
+      "rung": 200
+    },
+    {
+      "probe": "P17",
+      "class": "fidelity",
+      "arm": "content",
+      "reach": 0.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 47,
+      "context_tokens": 11,
+      "ops": 2,
+      "notes": [
+        "mode: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 0,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.03,
+      "rung": 200
+    },
+    {
+      "probe": "P18",
+      "class": "fidelity",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 1072,
+      "context_tokens": 268,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 1025,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P19",
+      "class": "fleetwide",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 0,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 1266,
+      "context_tokens": 316,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 1266,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.02,
+      "rung": 200
+    },
+    {
+      "probe": "P20",
+      "class": "fidelity",
+      "arm": "content",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 291,
+      "context_tokens": 72,
+      "ops": 2,
+      "notes": [
+        "mode: not_expressible"
+      ],
+      "trace": [
+        {
+          "verb": "grep",
+          "bytes": 47,
+          "status": "ok"
+        },
+        {
+          "verb": "read",
+          "bytes": 244,
+          "status": "ok"
+        },
+        {
+          "verb": "close",
+          "bytes": 0,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.03,
+      "rung": 200
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "arm": "A",
+  "rung": 200,
+  "stamp": "20260827w4A",
+  "rows": [
+    {
+      "probe": "P21",
+      "arm": "A",
+      "rung": 200,
+      "error": "RemoteDisconnected: Remote end closed connection without response",
+      "seconds": 0.1
+    },
+    {
+      "probe": "P22",
+      "arm": "A",
+      "rung": 200,
+      "error": "RemoteDisconnected: Remote end closed connection without response",
+      "seconds": 0.1
+    },
+    {
+      "probe": "P23",
+      "arm": "A",
+      "rung": 200,
+      "error": "RemoteDisconnected: Remote end closed connection without response",
+      "seconds": 0.1
+    },
+    {
+      "probe": "P24",
+      "arm": "A",
+      "rung": 200,
+      "error": "RemoteDisconnected: Remote end closed connection without response",
+      "seconds": 0.1
+    }
+  ]
+}

@@ -1,0 +1,601 @@
+{
+  "arm": "directory",
+  "rung": 3000,
+  "rows": [
+    {
+      "probe": "P01",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 781,
+      "context_tokens": 195,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 345,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 436,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.3,
+      "rung": 3000
+    },
+    {
+      "probe": "P02",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 764,
+      "context_tokens": 191,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 333,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 431,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.29,
+      "rung": 3000
+    },
+    {
+      "probe": "P03",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 734,
+      "context_tokens": 183,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 309,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 425,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.35,
+      "rung": 3000
+    },
+    {
+      "probe": "P04",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 808,
+      "context_tokens": 202,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 369,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 439,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.27,
+      "rung": 3000
+    },
+    {
+      "probe": "P05",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 760,
+      "context_tokens": 190,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 345,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 415,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.27,
+      "rung": 3000
+    },
+    {
+      "probe": "P06",
+      "class": "contested",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": true,
+      "context_bytes": 722,
+      "context_tokens": 180,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 285,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 437,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.27,
+      "rung": 3000
+    },
+    {
+      "probe": "P07",
+      "class": "history",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 96844,
+      "context_tokens": 24211,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 96713,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 78,
+          "status": "ok"
+        },
+        {
+          "verb": "git log",
+          "bytes": 53,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.49,
+      "rung": 3000
+    },
+    {
+      "probe": "P08",
+      "class": "history",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 182,
+      "context_tokens": 45,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 51,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 78,
+          "status": "ok"
+        },
+        {
+          "verb": "git log",
+          "bytes": 53,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.47,
+      "rung": 3000
+    },
+    {
+      "probe": "P09",
+      "class": "history",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 215,
+      "context_tokens": 53,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 70,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 92,
+          "status": "ok"
+        },
+        {
+          "verb": "git log",
+          "bytes": 53,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.48,
+      "rung": 3000
+    },
+    {
+      "probe": "P10",
+      "class": "history",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 225,
+      "context_tokens": 56,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 75,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 97,
+          "status": "ok"
+        },
+        {
+          "verb": "git log",
+          "bytes": 53,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.47,
+      "rung": 3000
+    },
+    {
+      "probe": "P11",
+      "class": "decoy",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 1,
+      "contamination_total": 1,
+      "ordering_correct": false,
+      "context_bytes": 688,
+      "context_tokens": 172,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 433,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 255,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.28,
+      "rung": 3000
+    },
+    {
+      "probe": "P12",
+      "class": "decoy",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 1,
+      "contamination_total": 1,
+      "ordering_correct": false,
+      "context_bytes": 676,
+      "context_tokens": 169,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 421,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 255,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.3,
+      "rung": 3000
+    },
+    {
+      "probe": "P13",
+      "class": "negative",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 3,
+      "ordering_correct": null,
+      "context_bytes": 0,
+      "context_tokens": 0,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.27,
+      "rung": 3000
+    },
+    {
+      "probe": "P14",
+      "class": "negative",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 2,
+      "ordering_correct": null,
+      "context_bytes": 0,
+      "context_tokens": 0,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.28,
+      "rung": 3000
+    },
+    {
+      "probe": "P15",
+      "class": "encoding",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 1,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 377,
+      "context_tokens": 94,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 154,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 223,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.28,
+      "rung": 3000
+    },
+    {
+      "probe": "P16",
+      "class": "ceiling",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 742500,
+      "context_tokens": 185625,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 742500,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.28,
+      "rung": 3000
+    },
+    {
+      "probe": "P17",
+      "class": "fidelity",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 171,
+      "context_tokens": 42,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 78,
+          "status": "ok"
+        },
+        {
+          "verb": "git ls-files",
+          "bytes": 93,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.43,
+      "rung": 3000
+    },
+    {
+      "probe": "P18",
+      "class": "fidelity",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 1,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 1024,
+      "context_tokens": 256,
+      "ops": 2,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 1024,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.27,
+      "rung": 3000
+    },
+    {
+      "probe": "P19",
+      "class": "fleetwide",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 0,
+      "must_contain_total": 0,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": null,
+      "context_bytes": 11280,
+      "context_tokens": 2820,
+      "ops": 1,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 11280,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.31,
+      "rung": 3000
+    },
+    {
+      "probe": "P20",
+      "class": "fidelity",
+      "arm": "directory",
+      "reach": 1.0,
+      "must_contain_hit": 2,
+      "must_contain_total": 2,
+      "contamination": 0,
+      "contamination_total": 0,
+      "ordering_correct": true,
+      "context_bytes": 317,
+      "context_tokens": 79,
+      "ops": 3,
+      "notes": [],
+      "trace": [
+        {
+          "verb": "grep -rn",
+          "bytes": 0,
+          "status": "ok"
+        },
+        {
+          "verb": "cat",
+          "bytes": 244,
+          "status": "ok"
+        },
+        {
+          "verb": "git ls-files",
+          "bytes": 73,
+          "status": "ok"
+        }
+      ],
+      "seconds": 0.48,
+      "rung": 3000
+    }
+  ]
+}

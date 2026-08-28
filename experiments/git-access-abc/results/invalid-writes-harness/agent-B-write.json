@@ -1,0 +1,35 @@
+{
+  "arm": "B",
+  "rung": 200,
+  "stamp": "20260827w4B",
+  "rows": [
+    {
+      "probe": "P21",
+      "arm": "B",
+      "rung": 200,
+      "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+      "seconds": 0.0
+    },
+    {
+      "probe": "P22",
+      "arm": "B",
+      "rung": 200,
+      "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+      "seconds": 0.0
+    },
+    {
+      "probe": "P23",
+      "arm": "B",
+      "rung": 200,
+      "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+      "seconds": 0.0
+    },
+    {
+      "probe": "P24",
+      "arm": "B",
+      "rung": 200,
+      "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+      "seconds": 0.0
+    }
+  ]
+}
