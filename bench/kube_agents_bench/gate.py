@@ -59,6 +59,7 @@ from kube_agents_bench.baselines import (
 )
 from kube_agents_bench.cases import CaseSpecError, load_case
 from kube_agents_bench.scoring import (
+    DEFAULT_AGGREGATE_MIN_SCORED,
     DEFAULT_CORRECTNESS_FLOOR,
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
@@ -80,6 +81,16 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
     except ValueError:
         return default
 
@@ -279,6 +290,8 @@ def _markdown(verdict: Any, cases: list[dict[str, Any]]) -> str:
         else:
             rate += " (no baseline at the current version key -- advisory)"
         lines += [f"Admitted-case pass rate: {rate}", ""]
+    for note in getattr(verdict, "notes", None) or []:
+        lines += [f"_{note}_", ""]
     if verdict.reasons:
         lines += ["### Why it is red", ""]
         lines += [f"- {r}" for r in verdict.reasons]
@@ -379,13 +392,40 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         cases,
         baseline_rate=baseline_rate,
         margin=args.margin,
+        min_scored=args.min_scored,
     )
+
+    # BOOTSTRAP_ADMITTED is hand-edited in the Prow job config, and a
+    # misspelling there does not fail -- it silently un-arms the case it was
+    # written to keep blocking. `crashloop-debug` for
+    # `cluster-agent-crashloop-debug` reads as a working entry and gates
+    # nothing. This is the same silent-disarm class the corrupt-store exit 2
+    # exists to close, arriving through configuration rather than data, so it
+    # is reported the same way: loudly, and in the markdown rather than only
+    # in a log line nobody reads on a green run.
+    #
+    # A warning rather than a red. The name might belong to a case that is
+    # legitimately absent from this run -- commented out of TASKS, or filtered
+    # -- and redding the job for naming a case it did not run would make the
+    # variable unusable for the transition it exists to cover.
+    unknown = sorted(_bootstrap_admitted() - {str(c.get("case")) for c in cases})
 
     text = _markdown(verdict, cases)
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.
     banners = []
+    if unknown:
+        print(
+            f"WARNING: BOOTSTRAP_ADMITTED names no graded case: {unknown}",
+            file=sys.stderr,
+        )
+        banners.append(
+            "> **WARNING — `BOOTSTRAP_ADMITTED` names no graded case.** "
+            f"`{'`, `'.join(unknown)}` matched nothing this run graded. If "
+            "that is a typo, the case it was meant to keep blocking is not "
+            "blocking."
+        )
     if degraded:
         banners.append(
             f"> **WARNING — baseline unavailable.** {degraded}\n>\n"
@@ -603,6 +643,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=_env_float("EVAL_AGGREGATE_MARGIN", 0.05),
         help="non-inferiority margin on the aggregate (default: %(default)s)",
+    )
+    suite.add_argument(
+        "--min-scored",
+        type=int,
+        default=_env_int("EVAL_AGGREGATE_MIN_SCORED", DEFAULT_AGGREGATE_MIN_SCORED),
+        help=(
+            "scored repetitions the aggregate needs before it may block; "
+            "below this it is reported but advisory (default: %(default)s)"
+        ),
     )
     suite.set_defaults(func=_cmd_suite)
 

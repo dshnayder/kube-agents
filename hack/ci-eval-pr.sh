@@ -195,8 +195,22 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+#
+# `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
+# trap, so on any failing exit the `(exit "${exit_code}")` below returns
+# non-zero and aborts the trap on that line -- and the dumper on the next line
+# never runs. Every red eval job would lose the kubectl logs, pod descriptions
+# and events that tell a transport storm from a real failure, while the
+# comment above claims the exit code is handed to the dumper. Reproduce with:
+#
+#   bash -c 'set -e; f(){ local c=$?; (exit $c); echo reached; }; \
+#            trap f EXIT; exit 7'   # never prints "reached"
+#
+# Clearing errexit after `$?` is captured keeps the subshell's job of setting
+# `$?` for the dumper, and bash still exits with the original status.
 profile_and_dump_on_exit() {
   local exit_code=$?
+  set +e
   collect_bench_results
   profile_report "${exit_code}"
   (exit "${exit_code}")

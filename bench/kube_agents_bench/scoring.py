@@ -51,6 +51,7 @@ from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
     "CaseVerdict",
+    "DEFAULT_AGGREGATE_MIN_SCORED",
     "DEFAULT_JUDGED_MARGIN",
     "DEFAULT_JUDGED_METRICS",
     "MISSING",
@@ -73,6 +74,32 @@ MISSING = "MISSING"
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
 DEFAULT_CORRECTNESS_FLOOR = 1.0
+
+#: Scored repetitions the aggregate needs before it may BLOCK. Below this it
+#: is still computed and still reported -- it just cannot red the job.
+#:
+#: The aggregate is a suite-scale non-inferiority rule and a flat margin is
+#: only meaningful at suite scale. The arithmetic, at the 0.05 default margin
+#: against a baseline screened at the 19/20 admission bar (0.95, so the
+#: blocking threshold is 0.90): a run of ``n`` scored repetitions survives
+#: ``floor(n * 0.098)`` failures. One flaky repetition therefore reds the job
+#: outright at any ``n`` below 11 -- and with a single admitted case at three
+#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is nowhere near 0.902.
+#:
+#: That is precisely ``agent-kanban-smoke``'s failure mode -- one bad run reds
+#: an unchanged pull request -- reintroduced through the aggregate on the day
+#: the first case is screened in, and it would contradict the promise the
+#: per-case ladder makes two rungs above it. The floor closes it by refusing
+#: to compare rather than by widening the margin, because no single flat
+#: margin is right at both n=3 and n=600.
+#:
+#: 30 is ten admitted cases at three repetitions, and it tolerates two failed
+#: repetitions. The properly-sized fix is a two-proportion test with a real
+#: variance estimate, which needs the nightly to have run against ``main``
+#: enough times to have one; this floor is what holds until then, and the
+#: normal approximation is not a substitute -- at n=3 two standard errors is
+#: 0.247, which still reds 2/3.
+DEFAULT_AGGREGATE_MIN_SCORED = 30
 
 #: Terminal record status devops-bench writes for a run that completed. The
 #: only other value is ``"failed"`` (``devops_bench/results/row.py``), which
@@ -792,14 +819,24 @@ class SuiteVerdict:
     pass_rate: float | None
     baseline_rate: float | None
     margin: float
+    #: Scored repetitions the aggregate was computed over -- the denominator
+    #: of ``pass_rate``, and what :data:`DEFAULT_AGGREGATE_MIN_SCORED` gates on.
+    scored: int = 0
+    #: Things a reader must know that are not reasons the job is red. An
+    #: aggregate too small to block belongs here: reporting it as a reason
+    #: would red the job, and dropping it silently is how a rule that never
+    #: fires goes unnoticed for a year.
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "green": self.green,
             "reasons": self.reasons,
+            "notes": self.notes,
             "pass_rate": self.pass_rate,
             "baseline_rate": self.baseline_rate,
             "margin": self.margin,
+            "scored": self.scored,
             "cases": self.cases,
         }
 
@@ -809,6 +846,7 @@ def grade_suite(
     *,
     baseline_rate: float | None = None,
     margin: float = 0.05,
+    min_scored: int = DEFAULT_AGGREGATE_MIN_SCORED,
 ) -> SuiteVerdict:
     """Combine per-case verdicts into the job's exit status.
 
@@ -816,8 +854,14 @@ def grade_suite(
     per-case JSON the shell wrote. The aggregate covers ADMITTED cases only
     and excludes infrastructure repetitions: an unscreened case's pass rate is
     not yet a number anything should be compared against.
+
+    It also covers a large enough sample to mean something. Below
+    ``min_scored`` scored repetitions the rate is computed and reported but
+    cannot block -- see :data:`DEFAULT_AGGREGATE_MIN_SCORED` for why a flat
+    margin at n=3 is a coin flip rather than a gate.
     """
     reasons: list[str] = []
+    notes: list[str] = []
 
     for case in cases:
         if case.get("blocking"):
@@ -832,10 +876,23 @@ def grade_suite(
     pass_rate = (passes / scored) if scored else None
 
     if pass_rate is not None and baseline_rate is not None:
-        if pass_rate < baseline_rate - margin:
+        below = pass_rate < baseline_rate - margin
+        if scored < min_scored:
+            # Report it, never block on it. One flaky repetition out of three
+            # is 0.667 against a 0.902 threshold: at this sample size the rule
+            # measures luck, not the pull request.
+            notes.append(
+                f"aggregate advisory only: {scored} scored repetition(s) is "
+                f"below the {min_scored} the comparison needs to mean "
+                f"anything. Pass rate {pass_rate:.3f} vs main's "
+                f"{baseline_rate:.3f}"
+                + (" -- BELOW the margin, and not blocking." if below else ".")
+            )
+        elif below:
             reasons.append(
                 f"suite pass rate {pass_rate:.3f} is below main's "
-                f"{baseline_rate:.3f} by more than the {margin:.3f} margin"
+                f"{baseline_rate:.3f} by more than the {margin:.3f} margin "
+                f"(over {scored} scored repetitions)"
             )
 
     if not cases:
@@ -852,8 +909,10 @@ def grade_suite(
     return SuiteVerdict(
         green=not reasons,
         reasons=reasons,
+        notes=notes,
         cases=cases,
         pass_rate=pass_rate,
         baseline_rate=baseline_rate,
         margin=margin,
+        scored=scored,
     )

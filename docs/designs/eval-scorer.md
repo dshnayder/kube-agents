@@ -109,9 +109,25 @@ dropping is not news, and it is a no-op whenever the store has nothing at the cu
 the state everything ships in.
 
 **The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
-`pr_rate < main_rate - margin`. Two job-level rules sit alongside it: any blocking case reds the
-job, and _all_ cases failing on infrastructure reds it too — individually that is weather, but all
-at once means the eval infrastructure is down and a green would be a lie about coverage.
+`pr_rate < main_rate - margin` **over at least `EVAL_AGGREGATE_MIN_SCORED` scored repetitions**
+(default 30). Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
+failing on infrastructure reds it too — individually that is weather, but all at once means the
+eval infrastructure is down and a green would be a lie about coverage.
+
+**Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
+suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
+admission bar the blocking threshold is 0.90, so a run of `n` scored repetitions survives
+`floor(n × 0.098)` failures — which is **zero** below `n = 11`. With one admitted case at three
+repetitions, `n` is 3: one flaky repetition is 2/3 = 0.667, and the job reds. That is
+`agent-kanban-smoke`'s failure mode — one bad run reds an unchanged pull request — reintroduced
+through the aggregate on the day the first case is screened in, directly contradicting what the
+collapse rung promises two rungs above it. Widening the margin cannot fix it, because no single
+flat margin is right at both `n = 3` and `n = 600`; nor does the normal approximation, which at
+`n = 3` gives two standard errors of 0.247 and still reds 2/3. So the rule refuses to compare
+instead. Below the floor the rate is still computed, still printed, and still says when it fell
+below the margin — it just cannot block. The properly-sized replacement is a two-proportion test,
+which needs a variance estimate that does not exist until the nightly has run against `main` enough
+times to produce one.
 
 Every threshold above is a named constant read from the environment. All of them are starting
 points, to be tuned by running the suite against `main` and setting the bars above the observed
@@ -865,6 +881,15 @@ inconvenient.
 not a destination: a bootstrap-admitted case has no measured evidence, so it arms rung 4 but leaves
 rung 6 quiet and contributes nothing to `main`'s side of the aggregate.
 
+**A name in it that matches no graded case is reported, loudly.** It is a free-text environment
+variable holding case ids, and its whole job is to keep something blocking — so a typo, or a rename
+that did not reach it, silently disarms the case it was meant to protect, and the run goes green in
+exactly the way it would have if the list were right. `bench-gate suite` therefore intersects the
+list against the ids it actually graded and prints every unmatched name on stderr and as a banner
+in the markdown verdict. It is a warning rather than a red: the list is also legitimately allowed
+to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
+that would make the bridge harder to hold than the thing it bridges.
+
 ## How "judged scores below main's baseline" is determined
 
 This is rung 6, and it is the only place in the ladder where "it technically passed but got worse"
@@ -1050,6 +1075,30 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   probes. Three repetitions of that single case is ~52min of the ~200min total. If 1039s is typical
   rather than one bad sample, 1.20× does not survive it.
 
+  **Retry-on-failure — one repetition, two more only if the first fails — is the obvious way to buy
+  that runtime back, and it is deliberately not taken.** On a green run it would cost 13
+  invocations instead of 39 and land the job near 78min, which is real money. It is declined
+  because it is not verdict-identical to three unconditional repetitions, in four ways, and the
+  cheap version of a gate that quietly grades differently is worse than an expensive one:
+
+  - **Rung 5 inverts.** It fires on `expected_fail` and _every_ repetition passing. Sample once and
+    a single flaky pass flips the marker that three repetitions would have held; the retry never
+    triggers, because from the sampler's point of view nothing failed.
+  - **Rungs 1–3 are "any repetition", by design.** A catastrophic trip, an errored check or a dead
+    trajectory that shows up on repetitions 2 and 3 but not on 1 is simply never sampled. These are
+    the rungs that are absolute and admission-blind precisely because they must not be missed.
+  - **Rung 6's margin is sized to a three-repetition mean.** `DEFAULT_JUDGED_MARGIN = 0.5` came from
+    the ~0.25 standard error of a mean of three; a mean of one has SE ~0.44 and the rung is
+    mis-sized against it. See [Why the margin is 0.5](#why-the-margin-is-05).
+  - **It interacts with the aggregate's sample floor.** Fewer scored repetitions on green runs is
+    exactly the direction the floor already has to defend against.
+
+  Repetitions are how this gate distinguishes a flaky agent from a regression, and sampling them
+  conditionally on the thing being measured is not a sampling strategy. The runtime is a real
+  problem with an unrelated fix already in flight; if it does not land, the honest levers are
+  `EVAL_REPETITIONS=1` with rungs 4–6 explicitly reported as unarmed, or a smaller matrix — not a
+  three-repetition ladder fed one repetition.
+
 - The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
   dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a
   single `roles/owner` holds it — for three things, all in that project and none of them optional:
@@ -1089,5 +1138,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
+- **The aggregate's sample floor is a placeholder for a real test.**
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
+  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
+  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  actually scales is a two-proportion test — which needs a variance estimate that does not exist
+  until the nightly has run against `main` enough times to produce one. Until then the aggregate is
+  advisory on small runs and says so in the verdict. Two things to watch when it is replaced: `30`
+  is not load-bearing except as "enough to tolerate two failed repetitions", and the advisory note
+  must keep reporting when the rate fell below the margin, or a rule that never fires goes
+  unnoticed.
 - Every threshold here is a starting point. The way to tune them is to run the suite against `main`
   a few dozen times, see how much it moves when nothing changed, and set the bars above that.

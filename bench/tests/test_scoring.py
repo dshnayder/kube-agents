@@ -725,7 +725,7 @@ def test_the_aggregate_covers_admitted_cases_only():
 
 def test_the_aggregate_reds_when_it_falls_below_main_by_more_than_the_margin():
     verdict = grade_suite(
-        [_case(passes=5, scored=10)], baseline_rate=0.9, margin=0.05
+        [_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05
     )
     assert verdict.green is False
     assert any("below main's" in r for r in verdict.reasons)
@@ -734,6 +734,76 @@ def test_the_aggregate_reds_when_it_falls_below_main_by_more_than_the_margin():
 def test_the_aggregate_tolerates_movement_inside_the_margin():
     verdict = grade_suite([_case(passes=87, scored=100)], baseline_rate=0.9, margin=0.05)
     assert verdict.green is True
+
+
+def test_the_margin_rule_is_separable_from_the_sample_floor():
+    """An explicit floor of 1 isolates HOW FAR it may move from OVER WHAT.
+
+    Ten scored repetitions is below the shipped floor, so without this the
+    same input is green for a reason that has nothing to do with the margin.
+    """
+    verdict = grade_suite(
+        [_case(passes=5, scored=10)], baseline_rate=0.9, margin=0.05, min_scored=1
+    )
+    assert verdict.green is False
+    assert any("below main's" in r for r in verdict.reasons)
+
+
+def test_one_flaky_repetition_of_one_admitted_case_cannot_red_the_suite():
+    """The regression the sample floor exists to prevent.
+
+    A single admitted case at three repetitions is the state the day the first
+    case is screened in. One failed repetition is 2/3 = 0.667 against a 0.902
+    threshold, so a flat margin reds an unchanged pull request -- which is
+    `agent-kanban-smoke`'s failure mode arriving through the aggregate, and it
+    would contradict what the collapse rung promises two rungs above.
+    """
+    verdict = grade_suite(
+        [_case(passes=2, scored=3, pass_rate=2 / 3)],
+        baseline_rate=0.952,
+        margin=0.05,
+    )
+    assert verdict.green is True
+    assert verdict.reasons == []
+    assert verdict.scored == 3
+
+
+def test_an_advisory_aggregate_still_says_it_fell_below():
+    """Not blocking is not the same as not reported.
+
+    Dropping the number silently is how a rule that never fires goes unnoticed
+    for a year; it goes in `notes`, which the markdown renders, rather than in
+    `reasons`, which reds the job.
+    """
+    verdict = grade_suite(
+        [_case(passes=2, scored=3, pass_rate=2 / 3)],
+        baseline_rate=0.952,
+        margin=0.05,
+    )
+    assert verdict.green is True
+    assert any("advisory only" in n for n in verdict.notes)
+    assert any("BELOW the margin" in n for n in verdict.notes)
+
+
+def test_the_sample_floor_stops_applying_at_the_floor():
+    """At exactly `min_scored` the comparison blocks again."""
+    below = grade_suite(
+        [_case(passes=26, scored=29)], baseline_rate=0.95, margin=0.05, min_scored=30
+    )
+    at = grade_suite(
+        [_case(passes=26, scored=30)], baseline_rate=0.95, margin=0.05, min_scored=30
+    )
+    assert below.green is True
+    assert at.green is False
+
+
+def test_an_advisory_aggregate_inside_the_margin_says_so_without_alarm():
+    verdict = grade_suite(
+        [_case(passes=3, scored=3)], baseline_rate=0.95, margin=0.05
+    )
+    assert verdict.green is True
+    assert any("advisory only" in n for n in verdict.notes)
+    assert not any("BELOW the margin" in n for n in verdict.notes)
 
 
 def test_the_aggregate_is_advisory_with_no_baseline():
