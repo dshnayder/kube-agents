@@ -611,6 +611,10 @@ class CaseVerdict:
     reps: list[RepResult]
     admitted: bool
     expected_fail: bool
+    # Advisory, never blocking. Things the reader needs to know about how much
+    # this verdict is worth -- currently only a judged metric name that matched
+    # nothing, which leaves rung 6 gating less than the configuration claims.
+    notes: list[str] = field(default_factory=list)
 
     @property
     def scored_reps(self) -> list[RepResult]:
@@ -637,6 +641,7 @@ class CaseVerdict:
             "reason": self.reason,
             "admitted": self.admitted,
             "expected_fail": self.expected_fail,
+            "notes": list(self.notes),
             "passes": self.passes,
             "scored": len(self.scored_reps),
             "pass_rate": self.pass_rate,
@@ -689,6 +694,8 @@ def grade_case(
         for i, d in enumerate(run_dirs)
     ]
 
+    notes: list[str] = []
+
     def verdict(rung: Rung, blocking: bool, reason: str) -> CaseVerdict:
         return CaseVerdict(
             case_id=spec.case_id,
@@ -700,6 +707,7 @@ def grade_case(
             reps=reps,
             admitted=admitted,
             expected_fail=spec.expected_fail,
+            notes=list(notes),
         )
 
     # Rungs 1-3, in order, on ANY repetition. Deliberately admission-blind:
@@ -722,6 +730,35 @@ def grade_case(
             f"all {len(reps)} repetition(s) failed on infrastructure before the "
             "case could be evaluated",
         )
+
+    means = judged_means(reps)
+
+    # Rung 6 is only as good as the metric names it was handed, and a name that
+    # matches nothing is invisible: the rung's loop skips it without a word, so
+    # the judged comparison gates nothing while EVAL_JUDGED_METRICS reads as
+    # though it gates a metric. That is the same failure as a typo in
+    # BOOTSTRAP_ADMITTED and it is reported the same way -- named here, warned
+    # about by the caller, and never blocking.
+    #
+    # Matched against the UNION of what this run scored and what the baseline
+    # carries, not the baseline alone. A metric the store does not have yet is
+    # legitimate -- configuration moves ahead of evidence, and the store fills
+    # in behind it -- and the rung's `continue` is the right handling for it. A
+    # metric that neither the records nor the baseline has ever emitted is not
+    # ahead of anything; it is misspelled.
+    #
+    # Guarded on `known` being non-empty so a case whose judges all failed does
+    # not report every configured name as a typo. No evidence either way is not
+    # evidence of a typo.
+    known = set(means) | set(baseline_judged or {})
+    if known:
+        unmatched = sorted(m for m in judged_metrics if m not in known)
+        if unmatched:
+            notes.append(
+                "judged metric(s) named in EVAL_JUDGED_METRICS matched nothing "
+                "this run scored and nothing the baseline carries: "
+                f"{', '.join(unmatched)}. Rung 6 is not gating on them."
+            )
 
     passes = sum(1 for r in scored if r.outcome == "pass")
 
@@ -771,7 +808,6 @@ def grade_case(
     # and still land here, which is the only place in the ladder where "it
     # technically passed but got worse" is sayable.
     if admitted and not spec.expected_fail and complete and baseline_judged:
-        means = judged_means(reps)
         drops = []
         for metric in judged_metrics:
             was = baseline_judged.get(metric)

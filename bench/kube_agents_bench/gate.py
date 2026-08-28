@@ -267,6 +267,11 @@ def _cmd_case(args: argparse.Namespace) -> int:
         judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
         print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
     print(f"  admission: {admission_reason}")
+    # stderr, not stdout: this is the one line that says the judged rung is
+    # quieter than the configuration claims, and it must survive a reader who
+    # only greps for "Result:".
+    for note in verdict.notes:
+        print(f"WARNING: {spec.case_id}: {note}", file=sys.stderr)
 
     if args.json_out:
         out = Path(args.json_out)
@@ -410,6 +415,11 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # variable unusable for the transition it exists to cover.
     unknown = sorted(_bootstrap_admitted() - {str(c.get("case")) for c in cases})
 
+    # Per-case notes, deduplicated. A misspelled EVAL_JUDGED_METRICS name is
+    # one configuration mistake, not one per case, and repeating it fourteen
+    # times in the banner is how a reader learns to skip banners.
+    case_notes = sorted({n for c in cases for n in (c.get("notes") or [])})
+
     text = _markdown(verdict, cases)
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
@@ -426,6 +436,9 @@ def _cmd_suite(args: argparse.Namespace) -> int:
             "that is a typo, the case it was meant to keep blocking is not "
             "blocking."
         )
+    for note in case_notes:
+        print(f"WARNING: {note}", file=sys.stderr)
+        banners.append(f"> **WARNING — judged rung degraded.** {note}")
     if degraded:
         banners.append(
             f"> **WARNING — baseline unavailable.** {degraded}\n>\n"

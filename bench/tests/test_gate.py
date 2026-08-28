@@ -688,6 +688,60 @@ def test_a_fully_matching_bootstrap_admitted_says_nothing(tmp_path, monkeypatch,
     assert "names no graded case" not in capsys.readouterr().out
 
 
+def test_a_judged_metric_matching_nothing_is_reported_by_the_case_command(
+    kanban_task, tmp_path, monkeypatch, capsys
+):
+    """The twin of the BOOTSTRAP_ADMITTED typo, and just as quiet.
+
+    `OutcomValidity` matches no score the run emitted and nothing the baseline
+    carries, so rung 6's loop skips it without a word: the judged comparison
+    gates nothing while EVAL_JUDGED_METRICS reads as though it gates a metric.
+    """
+    monkeypatch.setenv("EVAL_JUDGED_METRICS", "OutcomValidity")
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], out) == 0
+    # stderr, so it survives a reader who only greps stdout for "Result:".
+    assert "OutcomValidity" in capsys.readouterr().err
+    assert any("OutcomValidity" in n for n in payload(out)["notes"])
+
+
+def test_a_correctly_spelled_judged_metric_says_nothing(
+    kanban_task, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("EVAL_JUDGED_METRICS", "OutcomeValidity")
+    assert run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0]], tmp_path / "c.json") == 0
+    assert "matched nothing" not in capsys.readouterr().err
+
+
+def test_the_suite_banners_a_judged_metric_that_matched_nothing_once(tmp_path, capsys):
+    """One configuration mistake, reported once.
+
+    It is per-case in the ladder because that is where the evidence is, but it
+    is one typo in one environment variable -- repeating it fourteen times in
+    the banner is how a reader learns to skip banners.
+    """
+    note = (
+        "judged metric(s) named in EVAL_JUDGED_METRICS matched nothing this run "
+        "scored and nothing the baseline carries: OutcomValidity. Rung 6 is not "
+        "gating on them."
+    )
+    docs = [case_file(tmp_path, n, notes=[note]) for n in ("a", "b")]
+    assert main(["suite", *sum((["--case-result", str(d)] for d in docs), [])]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.count("OutcomValidity") == 1
+    assert "judged rung degraded" in captured.out
+    assert captured.err.count("OutcomValidity") == 1
+
+
+def test_a_suite_of_cases_without_notes_is_unchanged(tmp_path, capsys):
+    """Older case files predate the field. Absent must read as empty, not
+    crash the suite that consumes them."""
+    doc = case_file(tmp_path, "a")
+    assert "notes" not in payload(doc)
+    assert main(["suite", "--case-result", str(doc)]) == 0
+    assert "judged rung degraded" not in capsys.readouterr().out
+
+
 def test_an_explicit_baseline_rate_still_overrides_the_store(tmp_path):
     store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
     doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)

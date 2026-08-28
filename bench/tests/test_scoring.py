@@ -986,6 +986,94 @@ def test_rung_6_only_gates_the_metrics_it_was_asked_to(noop_spec, make_run):
     assert verdict.rung is Rung.JUDGED_REGRESSION
 
 
+def test_a_misspelled_judged_metric_is_reported_and_does_not_gate(noop_spec, make_run):
+    """The regression this guards, and the twin of the BOOTSTRAP_ADMITTED one.
+
+    `OutcomValidity` matches nothing. Rung 6's loop skips it in silence, so the
+    judged comparison gates nothing at all while EVAL_JUDGED_METRICS reads as
+    though it gates one metric -- a green that was measured against nothing.
+    """
+    runs = [make_run(mutate=depress_the_judge(0.0)) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged=MAIN_IS_PERFECT,
+        judged_metrics=("OutcomValidity",),
+    )
+    # Not gating -- a 1.00 -> 0.00 drop, and still green.
+    assert verdict.rung is Rung.GREEN
+    assert verdict.blocking is False
+    # But it said so.
+    assert len(verdict.notes) == 1
+    assert "OutcomValidity" in verdict.notes[0]
+    assert "not gating" in verdict.notes[0]
+    assert verdict.to_dict()["notes"] == verdict.notes
+
+
+def test_a_metric_the_baseline_lacks_but_the_run_scored_is_not_a_typo(
+    noop_spec, make_run
+):
+    """Configuration is allowed to move ahead of evidence.
+
+    ToolInvocation is in the records but not in this baseline. That is the
+    store filling in behind a config change, which rung 6's `continue` already
+    handles correctly -- warning about it would train the reader to ignore the
+    warning that matters.
+    """
+    runs = [make_run() for _ in range(3)]
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged={"OutcomeValidity": 1.0},
+        judged_metrics=("OutcomeValidity", "ToolInvocation"),
+    )
+    assert verdict.notes == []
+
+
+def test_a_metric_the_run_lacks_but_the_baseline_carries_is_not_a_typo(
+    noop_spec, make_run
+):
+    """The other half of the union, and the direction that actually matters:
+    a judge that stopped emitting a metric must not read as a typo, because
+    the name is exactly right and the evidence is what went missing."""
+    runs = [make_run() for _ in range(3)]
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged={"OutcomeValidity": 1.0, "SomeRetiredMetric": 0.9},
+        judged_metrics=("SomeRetiredMetric",),
+    )
+    assert verdict.notes == []
+
+
+def test_no_judged_evidence_at_all_is_not_reported_as_a_typo(specless_spec, make_run):
+    """A case whose judges emitted nothing, with no baseline either, knows
+    nothing about the metric names. Silence is the honest answer; reporting
+    every configured name would cry wolf on every degraded run.
+    """
+    runs = [make_run(mutate=drop_the_scores_map) for _ in range(3)]
+    verdict = grade_case(specless_spec, runs, admitted=True, baseline_judged=None)
+    assert verdict.notes == []
+
+
+def test_the_note_is_advisory_on_a_case_that_is_otherwise_red(noop_spec, make_run):
+    """It annotates the verdict; it never changes it in either direction."""
+    runs = [make_run(mutate=make_it_fail) for _ in range(3)]
+    verdict = grade_case(
+        noop_spec,
+        runs,
+        admitted=True,
+        baseline_judged=MAIN_IS_PERFECT,
+        judged_metrics=("OutcomValidity",),
+    )
+    assert verdict.rung is Rung.COLLAPSE
+    assert verdict.blocking is True
+    assert any("OutcomValidity" in n for n in verdict.notes)
+
+
 def test_rung_6_needs_admission(noop_spec, make_run):
     """A case nobody has screened has no measured baseline to have regressed
     from, and unadmitted cases must not red the job."""
