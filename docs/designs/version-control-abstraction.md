@@ -52,16 +52,18 @@ branch of the fork — the same arrangement
 
 ## How to read this document
 
-Each section goes a level deeper than the one before it, so a reader can stop as
-soon as they have what they came for. An agent should read all of it.
+Each section goes a level deeper than the one before it, so a human reader can
+stop as soon as they have what they came for. An agent should read all of it.
 
-| Section                           | What it gives you                                                                              |
-| --------------------------------- | ---------------------------------------------------------------------------------------------- |
-| [Why](#why)                       | the customer requirement, and the shape of the answer — stop here if that is what you came for |
-| [The concepts](#the-concepts)     | what the three systems call things, and which words the verbs use                              |
-| [Modularity](#modularity)         | what adding a fourth forge costs, and what a plugin mechanism would take                       |
-| [The design](#the-design)         | the transport, the two gits, the routes, the error contract                                    |
-| [The experiment](#the-experiment) | how this was measured against the two existing designs, and the results                        |
+| Section                                           | What it gives you                                                                              |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| [Why](#why)                                       | the customer requirement, and the shape of the answer — stop here if that is what you came for |
+| [The concepts](#the-concepts)                     | what the three systems call things, and which words the verbs use                              |
+| [Modularity](#modularity)                         | what adding a fourth forge costs, and what a plugin mechanism would take                       |
+| [The design](#the-design)                         | the transport, the two gits, the routes, the error contract                                    |
+| [The experiment](#the-experiment)                 | how this was measured against the two existing designs, and the results                        |
+| [What this does not fix](#what-this-does-not-fix) | the limits that remain once this lands                                                         |
+| [Related](#related)                               | the designs and pull requests this sits next to                                                |
 
 ---
 
@@ -361,6 +363,28 @@ verb for each such narrowing and a cap on each verb's response, and a caller
 that hits the cap gets a truncated list rather than a smaller question. This
 design has no cap on a history question, because a history question never
 crosses the seam. The one transfer it does make is bounded, once, at `clone`.
+
+### The proxy stops having to share the sandbox's pod
+
+Everything above crosses as a payload rather than as a path, and that retires
+the one reason the credential runtime is co-located with the shell today.
+[`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) puts the proxy in the
+sandbox's pod because `credential_proxy_client.py` forwards the caller's `cwd`
+and `kubeconfig` only when the endpoint is loopback; without that forwarding,
+proxied `git` from another pod runs in the proxy's own empty workspace instead
+of the tree the agent is working in. These routes send a bundle, so there is no
+tree to point at and nothing for the proxy to be co-resident with.
+
+Splitting the pod is worth doing on its own, because co-location is the weaker
+arrangement on three counts it cannot avoid. The containers share a pod IP, so
+NetworkPolicy cannot distinguish them and the sandbox's egress has to be widened
+to everything the proxy needs to reach — the forge, the token broker, the
+cluster's API server. `runtimeClassName` is pod-scoped too, so running the shell
+under gVisor puts the proxy inside the same sentry. And the mount namespace ends
+up the only boundary between the shell and the proxy's kubeconfig, gcloud
+directory and federated token, which is why the two containers run as the same
+uid and why every one of the proxy's volumes is one the shell must never mount.
+None of those survive the split.
 
 ### No shallow clones
 
