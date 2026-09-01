@@ -65,11 +65,18 @@ The looser parser in `gitops_workspace.repo_from_settings` is deliberately not
 reused. It strips a `github.com/` prefix and otherwise takes the last two path
 segments, so `https://evil.com/github.com/attacker/repo` resolves to
 `attacker/repo`. That is out of scope here and noted rather than fixed.
+
+A third parser, `github_token_refresh.github_repo_from_remote`, reads the git
+remote rather than a configured value and rejects a non-GitHub host outright.
+Its host set carries `ssh.github.com` — GitHub's SSH-over-443 endpoint, which
+appears in a clone URL but not in a `SETTINGS.md` repository line — so a remote
+of that form resolves there and not here.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import urllib.parse
@@ -77,6 +84,8 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
 import sandbox_exec
+
+LOGGER = logging.getLogger(__name__)
 
 SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
@@ -696,7 +705,16 @@ class GitHubProvider:
             self._call(
                 ["api", "-X", "POST", path, "-f", "content=eyes"], expect_json=False
             )
-        except ForgeError:
+        except ForgeError as error:
+            # Expected through the credential proxy, which refuses mutating
+            # `gh api` calls as github.api-mutation -- the same rule that stops
+            # the agent merging its own pull request. The reaction is a
+            # courtesy and the request is answered without it, so this is a
+            # accepted loss rather than a failure, but it is logged because a
+            # silent one leaves nobody able to explain a missing eyes emoji.
+            # Note the proxy also logs its refusal at WARNING, so a brokered
+            # sweep emits a SECURITY_POLICY_BLOCKED line per acknowledgement.
+            LOGGER.info("acknowledgement reaction not left on %s: %s", path, error)
             return False
         return True
 

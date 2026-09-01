@@ -338,8 +338,9 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
   filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
   file the container executing the command cannot open, and every refusal dies on "no such file" —
-  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
-  the sort of thing a second implementation rediscovers the hard way.
+  as one did, live, before this moved. The fleet audit hit the same trap and took the other exit:
+  its bodies now go to `gh` on stdin (`audit_report.BODY_STDIN`), which needs no shared filesystem
+  at all. This gate has not been moved to it yet.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -356,6 +357,16 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
 - **Acknowledge** each surviving trigger (👀) before filing, when the provider supports it. Doing it
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
+
+  **Not through the credential proxy.** The reaction is a `gh api -X POST …/reactions` call, and the
+  proxy refuses mutating `gh api` — the same rule that stops the agent merging its own pull request.
+  Narrowing the rule to exempt reaction endpoints was considered and rejected: the rules match a
+  joined command string, so a path-shaped exemption is one that an argv can be built to satisfy, and
+  a recognisable emoji is not worth widening the control that keeps the review gate a gate. So a
+  brokered sweep leaves no 👀; it is best-effort by contract and the reply still lands. It logs the
+  refusal rather than dropping it silently, and the proxy logs one `SECURITY_POLICY_BLOCKED` warning
+  per acknowledgement, which is expected rather than a signal.
+
 - **`--dry-run` reaches into the sweeps, not just the card filing.** The refusal and the 👀 are
   written by the sweep, so a flag that only suppressed `file_card` would still post to a public
   thread — and a refusal carries `agent-refused`, which closes the request it names for good. A dry
@@ -456,11 +467,10 @@ they are worth naming precisely because nothing in this branch closes them now.
 
 Alongside the list-item fence opener, and two backtracking patterns reachable before any trust
 check — `REMEDIATE_RE`, quadratic, and `INLINE_CODE_RE`, measured cubic at 20.7s on a
-16,384-backtick run. A quoted `> /remediate` does not fire, but a lazy continuation under one does;
-that is [#782](https://github.com/gke-labs/kube-agents/issues/782), the one that _is_ filed. Its
-description of the `audit_report.py` half holds, while its premise that both paths share
-`pr_triggers.visible_text` is stale as of this branch: the shared helper is deleted, so only the
-ledger half survives.
+16,384-backtick run. A quoted `> /remediate` and lazy continuations under one are stripped by
+`strip_block_quotes` ([#782](https://github.com/gke-labs/kube-agents/issues/782)).
+Its premise that both paths share `pr_triggers.visible_text` is stale as of this branch: the shared
+helper is deleted, so only the ledger half survives.
 
 **The others are unfiled**, by decision rather than oversight. They are pre-existing on `main`, they
 need the ledger's own visibility model rather than this one's, and filing them against a path this

@@ -65,6 +65,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,6 +79,29 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+
+# The complete set of git subcommands this module ever issues, mirroring
+# `content_workspace.WORKSPACE_GIT_SUBCOMMANDS` and deliberately not shared
+# with it. The two brokers issue different git: this one moves history as a
+# bundle and never authors a commit, so it needs `bundle`, `init`, `ls-remote`,
+# `merge-base` and `remote` and needs nothing that stages or writes a tree. A
+# single union list would hand each path the other's reach for no reason
+# either one has. Enforced in the executor as well; this copy is what makes the
+# intent reviewable.
+VCS_GIT_SUBCOMMANDS = frozenset(
+    {
+        "bundle",
+        "checkout",
+        "fetch",
+        "init",
+        "ls-remote",
+        "merge-base",
+        "push",
+        "remote",
+        "rev-parse",
+        "symbolic-ref",
+    }
+)
 
 # How many items a listing returns. One page, deliberately: paginating walks
 # every page of an issue tracker, which is minutes of API calls and a response
@@ -811,6 +835,15 @@ class VcsBroker:
         )
         self.max_bundle_bytes = max_bundle_bytes()
         self._sequence = 0
+        # One lock, held across the whole of every verb, for the reason
+        # `ContentWorkspaceStore` holds one: the handler runs on a
+        # `ThreadingHTTPServer`, and every verb here is a sequence of git
+        # invocations against a scratch tree that assumes nothing moved
+        # underneath it. Coarse, and the cost is real — this is held across
+        # `clone`, `fetch` and `push`, so across network I/O bounded only by
+        # the timeout. Right for a single agent publishing one proposal at a
+        # time, which is what this serves.
+        self.lock = threading.RLock()
 
     # ---- plumbing ------------------------------------------------------
 

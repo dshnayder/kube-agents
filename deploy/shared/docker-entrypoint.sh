@@ -1,6 +1,16 @@
 #!/bin/sh
 set -e
 
+# The credential sidecar runs as a different user (see the UID constants in the
+# operator's platformagent_manifests.go) and executes the proxied gcloud, git and
+# gh commands against this container's workspace on the shared PVC. It reaches
+# those files through the shared fsGroup, which only helps if what we create is
+# group-writable: a leased GitOps directory this container makes has to be a
+# directory the sidecar can clone into, and a profile home it makes has to be one
+# the sidecar can write a kubeconfig pin into. The kubelet's fsGroup pass fixes up
+# files that already exist at mount time; this fixes up the ones created after.
+umask 0002
+
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
@@ -250,6 +260,62 @@ else
     IS_BOOTSTRAP_PRIMARY=1
 fi
 
+# 1.55 Check the image's skill trees against the SHA-256 manifests the build wrote
+# beside them, before anything below propagates one of them.
+#
+# The trees are prompt material: a SKILL.md tells the agent what to do and a
+# skills/*/scripts/*.py runs with the agent's credentials. Until now nothing compared
+# what boots against what was built, so a tree that had been altered — by a previous
+# boot under an older image, by a corrupted layer, by a bad build — was copied to every
+# profile and loaded, indistinguishably from a good one.
+#
+# Here rather than anywhere later because everything that spreads these trees is below:
+# step 2 copies /opt/defaults onto the PVC and sync_profile_skills installs
+# $PLATFORM_TEMPLATE/skills and $CLUSTER_TEMPLATE/skills into each profile. Failing at
+# this line leaves the PVC exactly as the last good boot left it.
+#
+# It is the DETECTION half of the pair; the barrier is that these trees, and the two
+# templates around them, are root-owned in the image while the agent runs as uid 10000
+# (the ownership comment in deploy/docker/Dockerfile has the reasoning, including why
+# the modes are left writable-looking). Read it as "this image's skills are the ones it
+# was built with", not as a runtime sandbox.
+#
+# The manifest, not the script, decides whether the check is mandatory. Both sides are
+# root-owned in the image — the manifest inside the tree it describes, the verifier in
+# /opt/defaults/scripts — so neither is something the runtime user removes, and the
+# FATAL branch below reads as a corrupted or mis-built image rather than as the last
+# thing standing between an agent and a disabled check. It is kept because the
+# alternative to reporting a missing checker is skipping the tree it would have checked:
+# a tree that carries a manifest is verified or the container does not start. A tree
+# with no manifest beside it is one no manifesting build produced (agent-base ships
+# /opt/hermes/skills and never reaches the platform stage) and is skipped, which is also
+# what makes this a no-op on a developer host.
+#
+# Fail-closed, which is a deliberate departure from the WARN-and-continue that every
+# other step here uses. Those steps degrade to a stale file; this one degrades to
+# running instructions nobody can account for, which is the whole thing it exists to
+# report. The blast radius is bounded on the other side: the manifest ships in the same
+# image layer as the files it covers and the build asserts it is complete, so a mismatch
+# is never a version skew between the two — it is the image having changed since it was
+# built. There is deliberately no env-var override; a bypass switch would be readable to
+# exactly the caller this is meant to be honest with.
+SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do
+    [ -f "$_tree/skills_manifest.sha256" ] || continue
+    if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+        echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
+        exit 1
+    fi
+    # The script names the specific difference on stderr; this only says what the
+    # container did about it.
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$SKILL_PROVENANCE_SCRIPT" \
+        --manifest "$_tree/skills_manifest.sha256" --dir "$_tree"; then
+        echo "FATAL: $_tree does not match the manifest baked beside it at build time; refusing to start" >&2
+        exit 1
+    fi
+done
+unset _tree
+
 # 1.6 Serialise everything below that writes to $TARGET_DIR.
 #
 # The step-1.5 gate leaves at most one owner per POD, not one owner per VOLUME.
@@ -363,6 +429,27 @@ if [ -d "/opt/defaults/scripts" ]; then
     mkdir -p "$TARGET_DIR/scripts"
     cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" \
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
+fi
+
+# 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
+#
+# Why: Hermes caches tool definitions from `mcp_servers` in `<profile>/cache/mcp_schema_cache.json`
+# so lazy startup can register tools without spawning subprocesses on every turn.
+# However, Hermes keys the cache entry only on `config_fingerprint` (command/args/url),
+# which does not change when an image update modifies the contents of a local script
+# (e.g. platform_mcp_server.py or router_server.py).
+# When an upgraded container image starts over an existing PVC, the stale cached tool list
+# shadows newly added or modified tools indefinitely (Issue #854).
+# Dropping local server entries forces Hermes to re-discover tools on first connect.
+# Remote servers (e.g. developer_knowledge, gke) are preserved to avoid unnecessary
+# network round-trips.
+INVALIDATE_MCP_SCRIPT="/opt/defaults/scripts/invalidate_mcp_cache.py"
+[ -f "$INVALIDATE_MCP_SCRIPT" ] || INVALIDATE_MCP_SCRIPT="$TARGET_DIR/scripts/invalidate_mcp_cache.py"
+if [ -f "$INVALIDATE_MCP_SCRIPT" ]; then
+    PYTHON="python3"
+    [ -x "$INSTALL_DIR/.venv/bin/python3" ] && PYTHON="$INSTALL_DIR/.venv/bin/python3"
+    "$PYTHON" "$INVALIDATE_MCP_SCRIPT" "$TARGET_DIR" \
+        || echo "WARN: could not invalidate local MCP schema caches; upgraded tools may not be discovered" >&2
 fi
 
 # Where the operator mounts its per-profile overlay ConfigMap (the operator's
@@ -1349,6 +1436,22 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     exec 9>&-
 fi
 
+# 4.5 The scratch directory scripts stage files in — the fleet audit's findings
+# JSON, and the `gh --body-file` payloads github_scan_gate._post_body hands to
+# the credential sidecar. The audit's own bodies no longer come through here:
+# they travel on stdin (audit_report.BODY_STDIN), which is where the remaining
+# body-file caller should end up too.
+# Created HERE, deterministically and under this script's umask-0002 discipline
+# (the header comment on the #955 UID split), rather than lazily by whichever
+# process reaches it first with whatever umask it happens to carry: the sandbox
+# (uid 10000) writes these files and the sidecar (uid 10001) reads them through
+# the shared fsGroup, which only works if the directory is group-accessible.
+# The chmod also repairs a long-lived PVC where a pre-#955 process already
+# created it too tight; guarded because an already-correct dir owned by the
+# peer uid may refuse the chmod, and that is fine.
+mkdir -p "$TARGET_DIR/scratch"
+chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
+
 # 5. Start background microservices (FastAPI proxy)
 #
 # Primary only: this binds a fixed port in the pod's shared network namespace,
@@ -1444,13 +1547,33 @@ fi
 # same script with --skeleton-only when it scaffolds one, so a profile created
 # between restarts does not wait for the next one.
 #
-# Backgrounded and non-fatal, for the reason step 5.6 gives and one more: the
-# sandbox is a separate StatefulSet with no start ordering against this
-# Deployment, so "not up yet" is an ordinary outcome rather than an error. The
-# script waits, gives up quietly, and both halves are idempotent — the layout is
-# re-pushed on every start and the copy is guarded by a marker on the sandbox's
-# own volume, so a fresh sandbox PVC gets a fresh copy and an existing one does
-# not.
+# Foreground, and fatal. It was neither, and the reason it was both is sound as
+# far as it goes: the sandbox is a separate StatefulSet with no start ordering
+# against this Deployment, so "not up yet" is an ordinary outcome rather than an
+# error. What that misses is that the script already draws the distinction. A
+# sandbox that never answers inside --wait returns 0 and leaves the marker
+# unwritten, so the next start retries; the only non-zero exits are a
+# --remote-root that is not the sandbox's volume, and a transfer that ran and
+# failed. Neither is survivable and neither is transient, so backgrounding them
+# bought nothing but silence: the agent came up healthy, the model's files were
+# still on this volume where its shell can no longer see them, and the sole
+# trace was a WARN line in a log file nobody reads. That happened on a live
+# upgrade — ten cluster profile homes, every one Permission denied — and it was
+# found by hand, days later.
+#
+# Exiting non-zero here is what makes it visible, and it needs no privilege the
+# agent does not have. The kubelet restarts the container, CrashLoopBackOff
+# follows, and getDeploymentStatusDetails in the operator already scans the
+# gateway pod's container statuses for a waiting reason and writes it into the
+# CR: phase Degraded, Ready=False, and a message naming this container. The
+# tail below puts the cause in `kubectl logs`, which is where the CR sends you.
+#
+# The cost is startup latency in the one case that blocks — a sandbox that is
+# slow rather than absent — bounded by --wait at 180s. The startupProbe budget
+# is agentAPIProbe(10, 60), 600s, and progressDeadlineSeconds is 1200, so the
+# wait fits with room over. The copy itself runs once: it is guarded by a marker
+# on the sandbox's own volume, so a fresh sandbox PVC gets a fresh copy and every
+# later start skips it and re-pushes only the layout.
 #
 # Gated on IS_BOOTSTRAP_PRIMARY: every replica can reach the sandbox, and two
 # tar streams extracting into the same directory would race. --skip-old-files
@@ -1460,12 +1583,13 @@ SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
 [ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
     echo "Mirroring the profile layout into the shell sandbox..."
-    (
-        HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
-            "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
-            >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 \
-            || echo "WARN: sandbox mirror did not complete; the agent pod's files are untouched and the next start will retry (see logs/sandbox_mirror.log)" >&2
-    ) &
+    if ! HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
+        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1; then
+        echo "FATAL: the shell sandbox migration failed. The model's files are still on this pod's volume, where its shell cannot reach them, so this container is refusing to start rather than come up looking healthy with the agent's work missing. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+        exit 1
+    fi
 fi
 
 # 6. Execute primary process from inside the agent's own directory.
