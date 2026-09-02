@@ -1,4 +1,5 @@
-"""Credential-free Google Chat transport for Hermes' bundled adapter."""
+"""Credential-free Google Chat transport for Hermes' bundled adapter, and the
+inline delivery of deliverables it cannot attach."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import json
 import logging
 import os
 import urllib.request
-from typing import Any
+from typing import Any, NamedTuple
 
 from credential_proxy_client import authorization_headers
 
@@ -36,16 +37,36 @@ INLINE_SUFFIXES = frozenset(
 )
 
 #: Bytes above which a file is left as a notice rather than pasted. 32 KiB is
-#: ten messages at the chunk budget below; past that the thread stops being a
-#: place anyone reads the report and becomes a place it is buried.
+#: roughly ten messages at the payload budget below; past that the thread stops
+#: being a place anyone reads the report and becomes a place it is buried.
 INLINE_MAX_BYTES = 32 * 1024
 
-#: Characters per posted chunk. The adapter caps a Chat message at 4000 and
-#: chunks anything longer itself, so this only has to leave room for the header
-#: line and a code fence -- but it has to leave *enough*: a chunk that arrives
-#: over 4000 once decorated is re-split by ``send``, which would cut a fence in
-#: half and render the tail of the report as prose.
-INLINE_CHUNK_CHARS = 3500
+#: The adapter's own per-message ceiling. Restated here because every budget
+#: below is derived from it, and restating an upstream constant is how the
+#: Slack shim broke: ``deploy/docker/patches/verify_slack_relay_registry_contract.py``
+#: parses the real ``_MAX_TEXT_LENGTH`` out of the shipped adapter at
+#: image-build time and fails the build if this copy has drifted, the way
+#: ``verify_kanban_progress_lines.py`` guards ``kanban_progress_lines.MAX_RENDER``.
+MESSAGE_CHAR_CAP = 4000
+
+#: Longest filename rendered into a header before it is middle-truncated. The
+#: header reserve below is only sound if the name inside it is bounded, and a
+#: deliverable named by an agent has no length limit of its own.
+FILENAME_DISPLAY_MAX = 80
+
+#: Characters reserved in every message for the decoration wrapped around the
+#: payload: a ``📄 **<name>** (31.9 KB · 10 of 10)`` header at the longest
+#: filename above, and the blank line under it. Generous on purpose -- the
+#: budget it leaves is spent on one fewer line of report per message, whereas
+#: the other direction cuts a fence in half.
+HEADER_RESERVE_CHARS = 128
+
+#: Characters a code fence adds: the opening ```` ```\n ```` and the closing
+#: ```` \n``` ````.
+FENCE_RESERVE_CHARS = 8
+
+#: Bytes in a kibibyte, for the header's size rendering.
+BYTES_PER_KIB = 1024
 
 #: Extensions posted inside a code fence rather than as prose. Chat renders the
 #: message body as markdown, which eats the underscores and asterisks in a JSON
@@ -54,15 +75,65 @@ INLINE_CHUNK_CHARS = 3500
 INLINE_FENCED_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".csv", ".log"})
 
 
+def _payload_budget(*, fenced: bool) -> int:
+    """Characters of report that fit in one message once decorated.
+
+    Derived from ``MESSAGE_CHAR_CAP`` rather than written down beside it. The
+    first version of this budgeted the payload at a flat 3500 and then added a
+    header, a fence and a caption on top, so a caption of 455 characters was
+    enough to push the first message past the adapter's cap -- at which point
+    ``send`` re-split it, through the middle of the fence, which is the exact
+    outcome the budget exists to prevent.
+    """
+    reserve = HEADER_RESERVE_CHARS + (FENCE_RESERVE_CHARS if fenced else 0)
+    return MESSAGE_CHAR_CAP - reserve
+
+
 def _human_size(size: int) -> str:
     """``9.6 KB``-style size for the header line."""
-    kib = 1024
-    if size < kib:
+    if size < BYTES_PER_KIB:
         return f"{size} B"
-    return f"{size / kib:.1f} KB"
+    return f"{size / BYTES_PER_KIB:.1f} KB"
 
 
-def _inline_text(path: str) -> str | None:
+def _display_filename(filename: str) -> str:
+    """``filename`` shortened to fit the header reserve, keeping both ends.
+
+    The tail matters as much as the head -- it carries the extension, and the
+    part number that distinguishes ``audit-1.md`` from ``audit-11.md``.
+    """
+    if len(filename) <= FILENAME_DISPLAY_MAX:
+        return filename
+    keep = FILENAME_DISPLAY_MAX - 1
+    head = keep // 2
+    return f"{filename[:head]}…{filename[-(keep - head):]}"
+
+
+def _inline_header(filename: str, *, size: str, index: int, total: int) -> str:
+    """The ``📄 **report.md** (9.6 KB · 2 of 5)`` line above a chunk.
+
+    Every message carries the part marker when there is more than one part,
+    including the first. Marking only parts 2..N means a report whose second
+    message is refused leaves a thread holding a header and the opening 3800
+    characters with nothing to say the rest is missing.
+    """
+    name = _display_filename(filename)
+    if total == 1:
+        return f"📄 **{name}** ({size})"
+    if index == 0:
+        return f"📄 **{name}** ({size} · 1 of {total})"
+    return f"📄 **{name}** ({index + 1} of {total})"
+
+
+class _Deliverable(NamedTuple):
+    """A file that can be pasted, and the two facts the header needs about it."""
+
+    text: str
+    suffix: str
+    size: int
+
+
+def _inline_text(path: str) -> _Deliverable | None:
     """The file's text if it is small enough and textual, else ``None``.
 
     ``None`` is the "leave it to the notice" answer and covers every way this
@@ -70,6 +141,10 @@ def _inline_text(path: str) -> str | None:
     after all, and a file that is not readable from this process. A caller that
     got ``None`` has learned only that inlining is not available -- never that
     the file is absent, which is the notice's business to report.
+
+    Returns the suffix and byte count alongside the text because it has both in
+    hand. Returning the text alone made the caller re-split the path and
+    re-encode the whole report just to render a size into a header.
     """
     suffix = os.path.splitext(path)[1].lower()
     if suffix not in INLINE_SUFFIXES:
@@ -84,7 +159,7 @@ def _inline_text(path: str) -> str | None:
     if len(raw) > INLINE_MAX_BYTES:
         return None
     try:
-        return raw.decode("utf-8")
+        return _Deliverable(raw.decode("utf-8"), suffix, len(raw))
     except UnicodeDecodeError:
         return None
 
@@ -100,17 +175,18 @@ def _inline_chunks(text: str, *, fenced: bool) -> list[str]:
     Splits on a line boundary when there is one to split on, because a report
     cut mid-line reads as corrupted rather than as continued.
     """
+    budget = _payload_budget(fenced=fenced)
     chunks: list[str] = []
     remaining = text
     while remaining:
-        if len(remaining) <= INLINE_CHUNK_CHARS:
+        if len(remaining) <= budget:
             head, remaining = remaining, ""
         else:
-            cut = remaining.rfind("\n", 0, INLINE_CHUNK_CHARS)
+            cut = remaining.rfind("\n", 0, budget)
             # No newline in the whole window: a minified blob or one very long
             # line. Cut at the budget -- an ugly break beats no delivery.
             if cut <= 0:
-                cut = INLINE_CHUNK_CHARS
+                cut = budget
             head, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
         chunks.append(f"```\n{head}\n```" if fenced else head)
     return chunks
@@ -291,11 +367,14 @@ def install() -> None:
 
             Falls back to ``original_fallback`` -- the English, relay-aware
             notice the image's build-time patch leaves here -- for anything
-            with no text form, anything too large to read in a thread, and any
-            failure to read the bytes at all.
+            with no text form, anything too large to read in a thread, any
+            failure to read the bytes at all, and any refusal partway through
+            posting. That last one matters most: the notice names the host
+            path, and a paste that stopped halfway is exactly when the person
+            in the thread needs the copy that did not make it.
             """
-            text = _inline_text(path)
-            if text is None or not text.strip():
+
+            async def notice() -> Any:
                 return await original_fallback(
                     self,
                     chat_id=chat_id,
@@ -305,31 +384,53 @@ def install() -> None:
                     thread_id=thread_id,
                 )
 
-            suffix = os.path.splitext(path)[1].lower()
-            chunks = _inline_chunks(
-                text, fenced=suffix in INLINE_FENCED_SUFFIXES
-            )
+            deliverable = _inline_text(path)
+            if deliverable is None or not deliverable.text.strip():
+                return await notice()
+
+            fenced = deliverable.suffix in INLINE_FENCED_SUFFIXES
+            chunks = _inline_chunks(deliverable.text, fenced=fenced)
             metadata = {"thread_id": thread_id} if thread_id else None
-            size = _human_size(len(text.encode("utf-8")))
+            size = _human_size(deliverable.size)
+
+            # A caption is agent-written prose of no bounded length, so it
+            # cannot ride along in the first message on the strength of a
+            # reserve. It leads on its own whenever the two together would not
+            # fit -- which keeps the common case at one message and the long
+            # case under the cap, rather than trading one for the other.
+            lead = _inline_header(filename, size=size, index=0, total=len(chunks))
+            first = "\n\n".join([lead, chunks[0]])
+            if caption and len(caption) + len("\n\n") + len(first) > MESSAGE_CHAR_CAP:
+                preamble = await self.send(chat_id, caption, metadata=metadata)
+                if not getattr(preamble, "success", False):
+                    LOGGER.warning(
+                        "Google Chat inline delivery of %s failed on the "
+                        "caption: %s",
+                        filename,
+                        getattr(preamble, "error", ""),
+                    )
+                    return await notice()
+                caption = None
 
             result = None
             for index, chunk in enumerate(chunks):
-                header = []
-                if index == 0 and caption:
-                    header.append(caption)
-                if index == 0:
-                    header.append(f"📄 **{filename}** ({size})")
-                else:
-                    header.append(
-                        f"📄 **{filename}** "
-                        f"({index + 1} of {len(chunks)})"
+                header = [
+                    _inline_header(
+                        filename, size=size, index=index, total=len(chunks)
                     )
+                ]
+                if index == 0 and caption:
+                    header.insert(0, caption)
                 result = await self.send(
                     chat_id, "\n\n".join([*header, chunk]), metadata=metadata
                 )
                 # Stop at the first refusal rather than posting the tail of a
-                # report whose head never arrived.
-                if result is not None and not getattr(result, "success", False):
+                # report whose head never arrived -- and hand back to the
+                # notice, so the thread is left with the host path instead of
+                # nothing at all. A ``None`` return counts as a refusal here:
+                # upstream's own fallback always yields a ``SendResult``, so a
+                # missing one is not a success anybody can read.
+                if not getattr(result, "success", False):
                     LOGGER.warning(
                         "Google Chat inline delivery of %s failed at part "
                         "%d/%d: %s",
@@ -338,7 +439,7 @@ def install() -> None:
                         len(chunks),
                         getattr(result, "error", ""),
                     )
-                    return result
+                    return await notice()
             return result
 
         adapter_class.connect = connect

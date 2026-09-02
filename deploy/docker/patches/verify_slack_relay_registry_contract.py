@@ -143,6 +143,9 @@ UPSTREAM_SIGNATURES = {
     "GoogleChatAdapter._handle_setup_files_command": (
         "self, chat_id, thread_id, raw_text, sender_email=..."
     ),
+    "GoogleChatAdapter._post_attachment_fallback": (
+        "self, chat_id, path, filename, caption, thread_id"
+    ),
 }
 
 # Default values the relay patches depend on. Keyed by (callable label, parameter name).
@@ -189,6 +192,9 @@ def upstream_callables() -> dict[str, Any]:
         "GoogleChatAdapter._new_authed_http": google_chat._new_authed_http,
         "GoogleChatAdapter._handle_setup_files_command": (
             google_chat._handle_setup_files_command
+        ),
+        "GoogleChatAdapter._post_attachment_fallback": (
+            google_chat._post_attachment_fallback
         ),
     }
 
@@ -323,6 +329,40 @@ def unwired() -> int:
                 param.default,
                 expected_default,
             )
+
+    # --- the Google Chat message cap the inline paste is budgeted against ---
+    # google_chat_relay_patch splits a deliverable into messages sized to fit
+    # under the adapter's own ceiling, and it holds that ceiling as its own
+    # constant. A signature pin does not cover a number, and the failure is
+    # quiet in the same way: the unit suite compares chunks against the copy,
+    # so a base image that lowers the real cap keeps every test green and ships
+    # an image whose every fenced multi-part paste is re-split by send() with
+    # the fence cut in half. verify_kanban_progress_lines.py guards MAX_RENDER
+    # against the same constant for the same reason.
+    import google_chat_relay_patch
+
+    from plugins.platforms.google_chat import adapter as google_chat_adapter
+
+    upstream_cap = getattr(google_chat_adapter, "_MAX_TEXT_LENGTH", None)
+    check(
+        "the adapter's text cap was located",
+        isinstance(upstream_cap, int),
+        True,
+    )
+    if isinstance(upstream_cap, int):
+        check(
+            "the relay patch's copy of the cap matches the adapter's",
+            google_chat_relay_patch.MESSAGE_CHAR_CAP,
+            upstream_cap,
+        )
+        check(
+            "a decorated chunk still fits under the cap",
+            google_chat_relay_patch._payload_budget(fenced=True)
+            + google_chat_relay_patch.HEADER_RESERVE_CHARS
+            + google_chat_relay_patch.FENCE_RESERVE_CHARS
+            <= upstream_cap,
+            True,
+        )
 
     os.environ["SLACK_RELAY_URL"] = RELAY_URL
     # No token anywhere: the credential proxy holds the only one, and that is

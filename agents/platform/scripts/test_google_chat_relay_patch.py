@@ -109,7 +109,17 @@ class InlineHelpersTest(unittest.TestCase):
 
     def test_reads_a_text_deliverable(self):
         path = self._write("report.md", "# Title\n\nBody.\n")
-        self.assertEqual(self.patch._inline_text(path), "# Title\n\nBody.\n")
+        deliverable = self.patch._inline_text(path)
+        self.assertEqual(deliverable.text, "# Title\n\nBody.\n")
+        self.assertEqual(deliverable.suffix, ".md")
+        self.assertEqual(deliverable.size, len("# Title\n\nBody.\n"))
+
+    def test_reports_the_byte_count_not_the_character_count(self):
+        # The header renders a file size, and a multi-byte character makes the
+        # two differ. Reading it off the decoded text understated a UTF-8 report.
+        body = "café\n" * 10
+        path = self._write("report.md", body)
+        self.assertEqual(self.patch._inline_text(path).size, len(body.encode()))
 
     def test_declines_a_binary_extension(self):
         # The bytes are valid UTF-8; the extension alone must decide, because a
@@ -124,7 +134,8 @@ class InlineHelpersTest(unittest.TestCase):
     def test_accepts_exactly_the_cap(self):
         atlimit = "x" * self.patch.INLINE_MAX_BYTES
         self.assertEqual(
-            self.patch._inline_text(self._write("atlimit.md", atlimit)), atlimit
+            self.patch._inline_text(self._write("atlimit.md", atlimit)).text,
+            atlimit,
         )
 
     def test_declines_bytes_that_are_not_utf8(self):
@@ -140,9 +151,31 @@ class InlineHelpersTest(unittest.TestCase):
         chunks = self.patch._inline_chunks(text, fenced=True)
         self.assertGreater(len(chunks), 1)
         for chunk in chunks:
-            # 4000 is the adapter's own cap. A chunk at or over it would be
-            # re-split by send() and the fence would be cut in half.
-            self.assertLess(len(chunk), 4000)
+            # The adapter's own cap. A chunk at or over it would be re-split by
+            # send() and the fence would be cut in half.
+            self.assertLess(len(chunk), self.patch.MESSAGE_CHAR_CAP)
+
+    def test_the_header_reserve_covers_the_longest_header_it_can_render(self):
+        # HEADER_RESERVE_CHARS is what makes the payload budget sound, and it is
+        # a number rather than a derivation, so pin it against the widest header
+        # _inline_header can actually produce: the longest displayable filename,
+        # a three-figure size and a two-figure part count.
+        widest = self.patch._inline_header(
+            "n" * self.patch.FILENAME_DISPLAY_MAX,
+            size="999.9 KB",
+            index=98,
+            total=99,
+        )
+        self.assertLessEqual(
+            len(widest) + len("\n\n"), self.patch.HEADER_RESERVE_CHARS
+        )
+
+    def test_a_long_filename_is_truncated_at_both_ends(self):
+        name = "a" * 100 + "-audit.md"
+        shown = self.patch._display_filename(name)
+        self.assertLessEqual(len(shown), self.patch.FILENAME_DISPLAY_MAX)
+        self.assertTrue(shown.startswith("aaa"))
+        self.assertTrue(shown.endswith("-audit.md"), "the extension must survive")
 
     def test_every_fenced_chunk_carries_its_own_fence(self):
         text = "\n".join(f"line {n}" for n in range(4000))
@@ -158,7 +191,7 @@ class InlineHelpersTest(unittest.TestCase):
 
     def test_splits_a_line_only_when_it_has_to(self):
         # No newline anywhere: an ugly cut is correct, losing the tail is not.
-        text = "x" * (self.patch.INLINE_CHUNK_CHARS * 2 + 5)
+        text = "x" * (self.patch._payload_budget(fenced=False) * 2 + 5)
         chunks = self.patch._inline_chunks(text, fenced=False)
         self.assertEqual("".join(chunks), text)
 
@@ -345,6 +378,110 @@ class InlineFallbackTest(unittest.TestCase):
         self.assertEqual(len(adapter.sent), 1)
         self.assertIn("long.md", logs.output[0])
         self.assertIn("rate limited", logs.output[0])
+
+    def test_a_refusal_still_leaves_the_notice_and_the_host_path(self):
+        # Before inlining existed, every path through _post_attachment_fallback
+        # posted the notice naming the host path. A paste that is refused must
+        # not be the one case where the thread gets nothing at all -- that is
+        # strictly worse than the bug this change fixes.
+        adapter = self._patched_adapter(
+            send_results=[FakeSendResult(success=False, error="rate limited")]
+        )
+        path = self._write("long.md", "\n".join(f"line {n}" for n in range(1000)))
+
+        with self.assertLogs("google-chat-relay-patch", level="WARNING"):
+            self._fallback(adapter, path, "long.md")
+
+        self.assertEqual(
+            len(adapter.fallback_calls), 1, "the notice is the last resort"
+        )
+        self.assertEqual(adapter.fallback_calls[0]["filename"], "long.md")
+
+    def test_a_send_returning_none_is_treated_as_a_refusal(self):
+        # The guard used to read `result is not None and not result.success`,
+        # so a None counted as delivered: the loop kept posting and the method
+        # handed None back to _send_file, whose caller reads .success off it.
+        adapter = self._patched_adapter(send_results=[None])
+        path = self._write("long.md", "\n".join(f"line {n}" for n in range(1000)))
+
+        with self.assertLogs("google-chat-relay-patch", level="WARNING"):
+            result = self._fallback(adapter, path, "long.md")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(adapter.sent), 1, "it must not keep posting")
+        self.assertEqual(len(adapter.fallback_calls), 1)
+
+    def test_the_first_message_says_which_part_it_is(self):
+        # Marking only parts 2..N means a report whose second message is refused
+        # leaves a thread that reads as a complete, short report.
+        adapter = self._patched_adapter()
+        path = self._write("long.md", "\n".join(f"line {n}" for n in range(1000)))
+
+        self._fallback(adapter, path, "long.md")
+
+        self.assertGreater(len(adapter.sent), 1)
+        self.assertIn(f"1 of {len(adapter.sent)}", adapter.sent[0][1])
+
+    def test_a_single_message_report_carries_no_part_marker(self):
+        adapter = self._patched_adapter()
+        path = self._write("short.md", "body\n")
+
+        self._fallback(adapter, path, "short.md")
+
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertNotIn(" of ", adapter.sent[0][1])
+
+    def test_no_message_exceeds_the_cap_however_long_the_caption(self):
+        # The regression this whole budget exists for: the payload was budgeted
+        # at 3500 and the caption, header and fence were added afterwards, so a
+        # caption of ~455 characters pushed the first message past 4000 and
+        # send() re-split it through the middle of a code fence.
+        adapter = self._patched_adapter()
+        path = self._write(
+            "findings.json", "\n".join(f'{{"line": {n}}}' for n in range(2000))
+        )
+        caption = "Here is the deep dive you asked for. " * 14
+
+        result = self._fallback(adapter, path, "findings.json", caption=caption)
+
+        self.assertTrue(result.success)
+        self.assertGreater(len(adapter.sent), 1)
+        for _chat_id, content, _metadata in adapter.sent:
+            self.assertLessEqual(len(content), self.patch.MESSAGE_CHAR_CAP)
+
+    def test_an_oversized_caption_leads_in_its_own_message(self):
+        adapter = self._patched_adapter()
+        path = self._write("report.md", "\n".join(f"line {n}" for n in range(600)))
+        caption = "Context. " * 500
+
+        self._fallback(adapter, path, "report.md", caption=caption)
+
+        self.assertEqual(adapter.sent[0][1], caption)
+        self.assertNotIn(caption, adapter.sent[1][1])
+        self.assertIn("**report.md**", adapter.sent[1][1])
+
+    def test_a_short_caption_still_rides_with_the_first_chunk(self):
+        # The separate-message path must not become the common case: a caption
+        # and a small report belong in one message.
+        adapter = self._patched_adapter()
+        path = self._write("report.md", "body\n")
+
+        self._fallback(adapter, path, "report.md", caption="Here is the report")
+
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertTrue(adapter.sent[0][1].startswith("Here is the report"))
+
+    def test_a_refused_caption_falls_back_to_the_notice(self):
+        adapter = self._patched_adapter(
+            send_results=[FakeSendResult(success=False, error="rejected")]
+        )
+        path = self._write("report.md", "\n".join(f"line {n}" for n in range(600)))
+
+        with self.assertLogs("google-chat-relay-patch", level="WARNING"):
+            self._fallback(adapter, path, "report.md", caption="Context. " * 500)
+
+        self.assertEqual(len(adapter.sent), 1, "no report follows a refused caption")
+        self.assertEqual(len(adapter.fallback_calls), 1)
 
 
 if __name__ == "__main__":
