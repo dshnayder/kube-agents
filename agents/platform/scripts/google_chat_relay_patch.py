@@ -368,10 +368,10 @@ def install() -> None:
             Falls back to ``original_fallback`` -- the English, relay-aware
             notice the image's build-time patch leaves here -- for anything
             with no text form, anything too large to read in a thread, any
-            failure to read the bytes at all, and any refusal partway through
-            posting. That last one matters most: the notice names the host
-            path, and a paste that stopped halfway is exactly when the person
-            in the thread needs the copy that did not make it.
+            failure to read the bytes at all, and any refusal or error partway
+            through posting. That last one matters most: the notice names the
+            host path, and a paste that stopped halfway is exactly when the
+            person in the thread needs the copy that did not make it.
             """
 
             async def notice() -> Any:
@@ -384,63 +384,91 @@ def install() -> None:
                     thread_id=thread_id,
                 )
 
-            deliverable = _inline_text(path)
-            if deliverable is None or not deliverable.text.strip():
-                return await notice()
-
-            fenced = deliverable.suffix in INLINE_FENCED_SUFFIXES
-            chunks = _inline_chunks(deliverable.text, fenced=fenced)
-            metadata = {"thread_id": thread_id} if thread_id else None
-            size = _human_size(deliverable.size)
-
-            # A caption is agent-written prose of no bounded length, so it
-            # cannot ride along in the first message on the strength of a
-            # reserve. It leads on its own whenever the two together would not
-            # fit -- which keeps the common case at one message and the long
-            # case under the cap, rather than trading one for the other.
-            lead = _inline_header(filename, size=size, index=0, total=len(chunks))
-            first = "\n\n".join([lead, chunks[0]])
-            if caption and len(caption) + len("\n\n") + len(first) > MESSAGE_CHAR_CAP:
-                preamble = await self.send(chat_id, caption, metadata=metadata)
-                if not getattr(preamble, "success", False):
-                    LOGGER.warning(
-                        "Google Chat inline delivery of %s failed on the "
-                        "caption: %s",
-                        filename,
-                        getattr(preamble, "error", ""),
-                    )
+            async def paste(caption: str | None) -> Any:
+                """Post the deliverable, or hand back to ``notice``."""
+                deliverable = _inline_text(path)
+                if deliverable is None or not deliverable.text.strip():
                     return await notice()
-                caption = None
 
-            result = None
-            for index, chunk in enumerate(chunks):
-                header = [
-                    _inline_header(
-                        filename, size=size, index=index, total=len(chunks)
-                    )
-                ]
-                if index == 0 and caption:
-                    header.insert(0, caption)
-                result = await self.send(
-                    chat_id, "\n\n".join([*header, chunk]), metadata=metadata
+                fenced = deliverable.suffix in INLINE_FENCED_SUFFIXES
+                chunks = _inline_chunks(deliverable.text, fenced=fenced)
+                metadata = {"thread_id": thread_id} if thread_id else None
+                size = _human_size(deliverable.size)
+
+                # A caption is agent-written prose of no bounded length, so it
+                # cannot ride along in the first message on the strength of a
+                # reserve. It leads on its own whenever the two together would
+                # not fit -- which keeps the common case at one message and the
+                # long case under the cap, rather than trading one for the
+                # other.
+                lead = _inline_header(
+                    filename, size=size, index=0, total=len(chunks)
                 )
-                # Stop at the first refusal rather than posting the tail of a
-                # report whose head never arrived -- and hand back to the
-                # notice, so the thread is left with the host path instead of
-                # nothing at all. A ``None`` return counts as a refusal here:
-                # upstream's own fallback always yields a ``SendResult``, so a
-                # missing one is not a success anybody can read.
-                if not getattr(result, "success", False):
-                    LOGGER.warning(
-                        "Google Chat inline delivery of %s failed at part "
-                        "%d/%d: %s",
-                        filename,
-                        index + 1,
-                        len(chunks),
-                        getattr(result, "error", ""),
+                first = "\n\n".join([lead, chunks[0]])
+                if (
+                    caption
+                    and len(caption) + len("\n\n") + len(first) > MESSAGE_CHAR_CAP
+                ):
+                    preamble = await self.send(chat_id, caption, metadata=metadata)
+                    if not getattr(preamble, "success", False):
+                        LOGGER.warning(
+                            "Google Chat inline delivery of %s failed on the "
+                            "caption: %s",
+                            filename,
+                            getattr(preamble, "error", ""),
+                        )
+                        return await notice()
+                    caption = None
+
+                result = None
+                for index, chunk in enumerate(chunks):
+                    header = [
+                        _inline_header(
+                            filename, size=size, index=index, total=len(chunks)
+                        )
+                    ]
+                    if index == 0 and caption:
+                        header.insert(0, caption)
+                    result = await self.send(
+                        chat_id, "\n\n".join([*header, chunk]), metadata=metadata
                     )
-                    return await notice()
-            return result
+                    # Stop at the first refusal rather than posting the tail of
+                    # a report whose head never arrived -- and hand back to the
+                    # notice, so the thread is left with the host path instead
+                    # of nothing at all. A ``None`` return counts as a refusal
+                    # here: the shipped ``send`` returns a ``SendResult`` or
+                    # raises, so a missing one is not a success anybody can
+                    # read.
+                    if not getattr(result, "success", False):
+                        LOGGER.warning(
+                            "Google Chat inline delivery of %s failed at part "
+                            "%d/%d: %s",
+                            filename,
+                            index + 1,
+                            len(chunks),
+                            getattr(result, "error", ""),
+                        )
+                        return await notice()
+                return result
+
+            # ``send`` raises rather than returning on a 429 and on any status
+            # it has no branch for, and nothing between here and the notifier
+            # catches it: ``_send_file`` calls this method outside its own
+            # try, and ``_deliver_kanban_artifacts`` logs the escape and moves
+            # on. So an exception here is a thread that gets nothing at all --
+            # not even the host path, which is what the same deployment posts
+            # today. Upstream's fallback cannot do that: it swallows its one
+            # send. Matching that is the whole of this handler.
+            try:
+                return await paste(caption)
+            except Exception:
+                LOGGER.warning(
+                    "Google Chat inline delivery of %s raised; falling back "
+                    "to the notice",
+                    filename,
+                    exc_info=True,
+                )
+                return await notice()
 
         adapter_class.connect = connect
         adapter_class.disconnect = disconnect

@@ -62,7 +62,12 @@ def make_adapter_class(send_results=None):
         async def send(self, chat_id, content, metadata=None):
             self.sent.append((chat_id, content, metadata))
             if self._send_results:
-                return self._send_results.pop(0)
+                nxt = self._send_results.pop(0)
+                # An exception in the queue stands for the shipped adapter's
+                # `raise` branches -- a 429, or any status it has no case for.
+                if isinstance(nxt, BaseException):
+                    raise nxt
+                return nxt
             return FakeSendResult()
 
         async def _post_attachment_fallback(
@@ -396,6 +401,22 @@ class InlineFallbackTest(unittest.TestCase):
             len(adapter.fallback_calls), 1, "the notice is the last resort"
         )
         self.assertEqual(adapter.fallback_calls[0]["filename"], "long.md")
+
+    def test_a_raising_send_still_leaves_the_notice_and_the_host_path(self):
+        # The shipped `send` re-raises on a 429 and on any status it has no
+        # branch for, and nothing downstream catches it: `_send_file` calls
+        # this method outside its own try, and the notifier's artifact loop
+        # only logs. Letting it out would leave the thread with nothing --
+        # worse than the notice this deployment posts today, and something
+        # upstream's fallback cannot do, since it swallows its one send.
+        adapter = self._patched_adapter(send_results=[RuntimeError("429")])
+        path = self._write("long.md", "\n".join(f"line {n}" for n in range(1000)))
+
+        with self.assertLogs("google-chat-relay-patch", level="WARNING"):
+            result = self._fallback(adapter, path, "long.md")
+
+        self.assertEqual(len(adapter.fallback_calls), 1, "the notice is owed")
+        self.assertFalse(result.success)
 
     def test_a_send_returning_none_is_treated_as_a_refusal(self):
         # The guard used to read `result is not None and not result.success`,
