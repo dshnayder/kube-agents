@@ -3301,38 +3301,68 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler._workspace_route(route, payload)
         return store
 
-    def test_the_open_route_gates_on_the_managed_repository_list(self):
-        # `open` is the only workspace route that names a repository, so it is
-        # the only place the gate can sit. It raises rather than returning a
-        # reply tuple, because the route's contract is a handle and there is no
-        # handle to hand back.
+    def test_the_write_verbs_gate_on_the_managed_repository_list(self):
+        # The gate is on `commit` and `push` and not on `open`: opening is a
+        # read, and `inspect-repository` opens repositories this install does
+        # not manage on purpose. It raises rather than returning a reply tuple,
+        # because the workspace routes answer through this exception family.
         import content_workspace
 
-        with mock.patch.object(
-            credential_proxy, "repository_is_managed", return_value=True
+        for route, payload in (
+            ("commit", {"handle": "h", "branch": "b", "message": "m", "changes": []}),
+            ("push", {"handle": "h", "branch": "b"}),
         ):
-            store = self._route("open", {"repo": "owner/name"})
-        self.assertEqual("open", store.method_calls[0][0])
+            with self.subTest(route=route):
+                with mock.patch.object(
+                    credential_proxy, "repository_is_managed", return_value=True
+                ):
+                    store = self._route(route, payload)
+                self.assertIn(route, [call[0] for call in store.method_calls])
 
-        with mock.patch.object(
-            credential_proxy, "repository_is_managed", return_value=False
-        ):
-            with self.assertRaises(content_workspace.RepositoryNotManaged):
-                self._route("open", {"repo": "owner/name"})
+                with mock.patch.object(
+                    credential_proxy, "repository_is_managed", return_value=False
+                ):
+                    with self.assertRaises(content_workspace.RepositoryNotManaged):
+                        self._route(route, payload)
 
-        # An unreadable list is not an unmanaged repository. Answering 403 to a
-        # ConfigMap read that failed would tell an operator to register a
-        # repository that is already registered.
+                # An unreadable list is not an unmanaged repository. Answering
+                # 403 to a ConfigMap read that failed would tell an operator to
+                # register a repository that is already registered.
+                with mock.patch.object(
+                    credential_proxy,
+                    "repository_is_managed",
+                    side_effect=RuntimeError("kubectl exited 1"),
+                ):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                        with self.assertRaises(
+                            content_workspace.ManagedRepositoriesUnavailable
+                        ):
+                            self._route(route, payload)
+
+    def test_the_write_gate_reads_the_repository_off_the_handle(self):
+        # Off the handle rather than off the request body, or a caller could
+        # name a managed repository and write to the one it opened.
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="acme/unmanaged")
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        seen = []
         with mock.patch.object(
             credential_proxy,
             "repository_is_managed",
-            side_effect=RuntimeError("kubectl exited 1"),
+            side_effect=lambda repo: seen.append(repo) or True,
         ):
-            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-                with self.assertRaises(
-                    content_workspace.ManagedRepositoriesUnavailable
-                ):
-                    self._route("open", {"repo": "owner/name"})
+            handler._require_managed_workspace(store, "h")
+        self.assertEqual(["acme/unmanaged"], seen)
+
+    def test_the_open_route_does_not_consult_the_managed_repository_list(self):
+        # Reading an upstream project is what `inspect-repository` is for, and
+        # a gate here would refuse every one of them.
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=False
+        ) as gate:
+            store = self._route("open", {"repo": "kubernetes-sigs/kustomize"})
+        gate.assert_not_called()
+        self.assertEqual("open", store.method_calls[0][0])
 
     def test_the_read_verb_splits_on_paths_rather_than_on_a_second_route(self):
         # One verb, two shapes. Keyed on the presence of `paths` so that a
