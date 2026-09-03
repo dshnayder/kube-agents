@@ -3305,6 +3305,11 @@ class WorkspaceRouteTest(unittest.TestCase):
     def _route(self, route, payload):
         store = mock.Mock()
         store.read.return_value = b""
+        # Assigned rather than left to auto-create, which keeps the write
+        # gate's handle lookup out of `method_calls` -- the assertions below are
+        # about the call the route makes, and every one of them reads the first
+        # entry.
+        store.get = mock.Mock(return_value=mock.Mock(repo="acme/fleet"))
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.workspaces = store
         handler._workspace_route(route, payload)
@@ -3318,7 +3323,15 @@ class WorkspaceRouteTest(unittest.TestCase):
         import content_workspace
 
         for route, payload in (
-            ("commit", {"handle": "h", "branch": "b", "message": "m", "changes": []}),
+            (
+                "commit",
+                {
+                    "handle": "h",
+                    "branch": "b",
+                    "message": "m",
+                    "changes": [{"path": "a.yaml", "delete": True}],
+                },
+            ),
             ("push", {"handle": "h", "branch": "b"}),
         ):
             with self.subTest(route=route):
