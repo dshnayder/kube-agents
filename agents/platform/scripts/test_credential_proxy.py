@@ -3305,11 +3305,14 @@ class WorkspaceRouteTest(unittest.TestCase):
     def _route(self, route, payload):
         store = mock.Mock()
         store.read.return_value = b""
-        # Assigned rather than left to auto-create, which keeps the write
-        # gate's handle lookup out of `method_calls` -- the assertions below are
-        # about the call the route makes, and every one of them reads the first
-        # entry.
-        store.get = mock.Mock(return_value=mock.Mock(repo="acme/fleet"))
+        # Named, which is what keeps it out of `store.method_calls`: a Mock
+        # assigned to an attribute is adopted as a child and has its calls
+        # recorded unless it already carries a name. The write gate looks the
+        # handle up before calling the store, and the assertions below are about
+        # the call the route makes -- every one of them reads the first entry.
+        store.get = mock.Mock(
+            name="workspace_get", return_value=mock.Mock(repo="acme/fleet")
+        )
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.workspaces = store
         handler._workspace_route(route, payload)
