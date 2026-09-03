@@ -106,6 +106,13 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             "get_managed_github_repos",
             lambda: ["acme/fleet", "acme/secondary-repo"],
         )
+        # The broker's write gate caches this list in a module global with a
+        # five-minute TTL, so without the reset a value another test warmed
+        # would decide the gate rather than the stub above.
+        credential_proxy._managed_repository_cache = None
+        self.addCleanup(
+            setattr, credential_proxy, "_managed_repository_cache", None
+        )
         real_ensure = gitops_workspace.ensure_workspace
 
         def local_ensure(repo, runner, **kwargs):

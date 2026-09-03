@@ -8303,6 +8303,22 @@ class ContentModeTestCase(BaseTestCase):
             lambda audit_id=None, repo=None, workspace=None: "acme/fleet",
         )
 
+        # The broker's write gate reads this list before `commit` and `push`,
+        # and the real reader shells out to kubectl. The cache is cleared as
+        # well as stubbed: it is a module global with a five-minute TTL, so a
+        # value another test warmed would decide the gate here instead.
+        credential_proxy._managed_repository_cache = None
+        self.addCleanup(
+            setattr, credential_proxy, "_managed_repository_cache", None
+        )
+        managed = patch.object(
+            gitops_workspace,
+            "get_managed_github_repos",
+            return_value=["acme/fleet"],
+        )
+        managed.start()
+        self.addCleanup(managed.stop)
+
         # `open` composes https://github.com/<owner>/<name>.git itself and takes
         # no caller-supplied URL, by design — so the redirect to the local bare
         # repo goes in at the runner, below the code under test.
