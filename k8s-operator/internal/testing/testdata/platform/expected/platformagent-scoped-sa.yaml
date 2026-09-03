@@ -624,6 +624,12 @@ spec:
             requests:
               cpu: 200m
               memory: 512Mi
+          securityContext:
+            capabilities:
+              drop:
+                - NET_RAW
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - mountPath: /etc/ssh-authorized
               name: authorized-keys
@@ -725,6 +731,8 @@ spec:
               k8s-app: node-local-dns
         - ipBlock:
             cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
     - ports:
@@ -893,6 +901,8 @@ spec:
               value: serviceaccount
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
+            - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
+              value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
               value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
@@ -1577,7 +1587,7 @@ spec:
             defaultMode: 256
             sources:
               - serviceAccountToken:
-                  audience: kubeagents-credential-proxy
+                  audience: kubeagents-credential-proxy-chat
                   expirationSeconds: 3600
                   path: token
         - name: sandbox-ssh-secret
