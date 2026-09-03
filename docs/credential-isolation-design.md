@@ -126,9 +126,11 @@ that is a file in its own Pod, or give the broker a ServiceAccount of its own an
 the annotation off the gateway's. Neither ships today.
 
 `spec.security.egressPolicy: Allowlist` renders a default-deny egress NetworkPolicy on
-the gateway Pod that leaves the metadata server off its allowlist, and it does not close
-that path either. Adding a NetworkPolicy is monotone — policies selecting one Pod are
-unioned and the API has no deny rule — and the gateway Pod is already selected for egress
+the gateway Pod that leaves the metadata server's credential API off its allowlist — the
+address itself is permitted on port 53, where under Cloud DNS for GKE it is the Pod's
+resolver — and it does not close that path either. Adding a NetworkPolicy is monotone —
+policies selecting one Pod are unioned and the API has no deny rule — and the gateway Pod
+is already selected for egress
 by the `<agent>-gateway-netpol` this same operator renders (unless
 `spec.networkPolicy.enabled: false` withholds it — on a Helm install the one shape where
 the allowlist stands alone and enforces; a Kustomize install's static
