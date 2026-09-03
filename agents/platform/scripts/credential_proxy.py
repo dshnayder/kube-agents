@@ -264,6 +264,46 @@ def repository_is_managed(repository: str) -> bool:
     return repository.lower() in managed_repositories()
 
 
+def require_managed_workspace(store, handle: object) -> None:
+    """Refuse a workspace write to a repository this install does not manage.
+
+    `validate_repo` and `get_managed_github_repos` moved into skill scripts that
+    now run in the sandbox, which makes them advice the agent gives itself
+    rather than a control. The broker holds the installation token, so the
+    question "is this a repository we write to" has to be answered here.
+    `CredentialProxyHandler._repository_is_permitted` is the same check on the
+    GitHub API routes; this one raises instead of writing a reply, because the
+    workspace routes answer through the `ContentWorkspaceError` family.
+
+    On `commit` and `push` rather than on `open`: opening is a read, and
+    `inspect-repository` opens repositories this install does not manage on
+    purpose. The repository comes off the handle rather than off the request, so
+    a caller cannot name one repository and write to another.
+
+    An unreadable list refuses rather than allows -- an authorization check that
+    fails open is not one -- and says which of the two it was in the log.
+    """
+    import content_workspace
+
+    repository = store.get(handle).repo
+    try:
+        permitted = repository_is_managed(repository)
+    except Exception as exc:
+        LOGGER.warning(
+            "refusing a workspace write: the managed-repository list could not "
+            "be read type=%s",
+            type(exc).__name__,
+        )
+        raise content_workspace.ManagedRepositoriesUnavailable(
+            "the managed repository list is unavailable"
+        ) from exc
+    if not permitted:
+        raise content_workspace.RepositoryNotManaged(
+            f"{repository} is not one of the repositories this agent manages; "
+            "register it in the gitops-state ConfigMap first"
+        )
+
+
 # Chat API methods the relay refuses to spend its credential on.
 #
 # A denylist rather than an allowlist, for the reason the command policy below
@@ -3373,47 +3413,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, body)
 
-    @staticmethod
-    def _require_managed_workspace(store, handle: object) -> None:
-        """Refuse a write to a repository this install does not manage.
-
-        `validate_repo` and `get_managed_github_repos` moved into skill scripts
-        that now run in the sandbox, which makes them advice the agent gives
-        itself rather than a control. The broker holds the installation token,
-        so the question "is this a repository we write to" has to be answered
-        here. `_repository_is_permitted` is the same check on the GitHub API
-        routes; this one raises instead of writing a reply, because the
-        workspace routes answer through the ContentWorkspaceError family.
-
-        On `commit` and `push` rather than on `open`: opening is a read, and
-        `inspect-repository` opens repositories this install does not manage on
-        purpose. The repository comes off the handle rather than the request,
-        so a caller cannot name one repository and write to another.
-
-        An unreadable list refuses rather than allows -- an authorization check
-        that fails open is not one -- and says which of the two it was in the
-        log.
-        """
-        import content_workspace
-
-        repository = store.get(handle).repo
-        try:
-            permitted = repository_is_managed(repository)
-        except Exception as exc:
-            LOGGER.warning(
-                "refusing a workspace write: the managed-repository list "
-                "could not be read type=%s",
-                type(exc).__name__,
-            )
-            raise content_workspace.ManagedRepositoriesUnavailable(
-                "the managed repository list is unavailable"
-            ) from exc
-        if not permitted:
-            raise content_workspace.RepositoryNotManaged(
-                f"{repository} is not one of the repositories this agent "
-                "manages; register it in the gitops-state ConfigMap first"
-            )
-
     def _workspace_route(self, route: str, payload: dict) -> dict | None:
         import content_workspace
 
@@ -3480,7 +3479,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 ignore_case=payload.get("ignoreCase") is True,
             )
         if route == "commit":
-            self._require_managed_workspace(store, payload.get("handle"))
+            require_managed_workspace(store, payload.get("handle"))
             changes = content_workspace.parse_changes(payload.get("changes"))
             return store.commit(
                 payload.get("handle"),
@@ -3491,7 +3490,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 expected_branch_sha=payload.get("expectedBranchSha") or None,
             )
         if route == "push":
-            self._require_managed_workspace(store, payload.get("handle"))
+            require_managed_workspace(store, payload.get("handle"))
             return store.push(payload.get("handle"), payload.get("branch"))
         if route == "close":
             store.close(payload.get("handle"))

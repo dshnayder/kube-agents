@@ -3273,6 +3273,15 @@ class WorkspaceRouteTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
+        # The write verbs consult the managed-repository list, which reads a
+        # ConfigMap through kubectl. Open by default here so that the routing
+        # claims below are about routing; the gate has its own tests, which
+        # patch over this one.
+        gate = mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=True
+        )
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def test_containment_root_has_exactly_one_caller(self):
         """A behavioural test cannot see a *new* caller added later. This can.
@@ -3344,14 +3353,13 @@ class WorkspaceRouteTest(unittest.TestCase):
         # name a managed repository and write to the one it opened.
         store = mock.Mock()
         store.get.return_value = mock.Mock(repo="acme/unmanaged")
-        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         seen = []
         with mock.patch.object(
             credential_proxy,
             "repository_is_managed",
             side_effect=lambda repo: seen.append(repo) or True,
         ):
-            handler._require_managed_workspace(store, "h")
+            credential_proxy.require_managed_workspace(store, "h")
         self.assertEqual(["acme/unmanaged"], seen)
 
     def test_the_open_route_does_not_consult_the_managed_repository_list(self):
