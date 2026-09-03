@@ -3385,7 +3385,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # after.
             requested = payload.get("repo")
             if not is_valid_repository(requested):
-                raise ValueError("repo must be owner/name")
+                # A ContentWorkspaceError rather than a ValueError, though both
+                # answer 400. `credential_proxy_client.workspaces_available`
+                # probes this route with an empty repo to find out whether the
+                # broker serves it at all, so a malformed slug is a reply this
+                # route owes an error *code* for, and the code is what tells a
+                # probe apart from a caller that got the name wrong. It also
+                # keeps the refusal on the same exception family as the two
+                # below, so a caller catching one catches all three.
+                raise content_workspace.ContentWorkspaceError(
+                    "repo must be owner/name"
+                )
             try:
                 permitted = repository_is_managed(requested)
             except Exception as exc:

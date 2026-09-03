@@ -71,8 +71,8 @@ where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod,
 `command not found` there is the split working as designed rather than a broken install. When you hit
 it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
 does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
-see the next paragraph. The gap is deferred deliberately in
-`docs/designs/agent-shell-sandboxing.md`, under "Executing `hermes`".
+see the next paragraph. The gap is a deliberate deferral of the shell-sandbox design, not an
+oversight.
 
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and
