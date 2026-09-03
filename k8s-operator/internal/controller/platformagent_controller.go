@@ -293,8 +293,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
+	//
+	// The guardrail reconcile before the refusal is the rule step 11e states at
+	// length: a refusal withholds the workload, and it must not also withhold a
+	// NetworkPolicy, because a policy that stops being reconciled is one an
+	// operator can delete permanently — and with nothing selecting the agent Pod,
+	// NetworkPolicy permits all egress. Read 11e for why; both refusals here are
+	// the same hazard and take the same rescue.
 	if msg := validateExtraVolumeMounts(instance); msg != "" {
 		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, "ForbiddenVolumeMount", msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -310,6 +320,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// whatever it is already running rather than being half-reconfigured.
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -378,9 +391,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at the egress refusal only. The refusal above
-		// it — step 10's RuntimeClassNotFound — returns without reconciling the
-		// gateway policy and still has it. Issue #964 tracks that; do not read
+		// Steps 9b and 9c take the same rescue for the same reason. What is
+		// still open is step 10's RuntimeClassNotFound, which returns without
+		// reconciling the gateway policy. Issue #964 tracks that; do not read
 		// the rule stated here as one the whole function keeps yet.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
 			return ctrl.Result{}, err

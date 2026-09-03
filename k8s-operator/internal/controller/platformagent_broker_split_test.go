@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -182,12 +183,36 @@ func TestTheAgentTokenIsAudienceBoundAndShortLived(t *testing.T) {
 		t.Fatal("expected a ServiceAccountToken projection")
 	}
 	// The audience is what stops this token being replayed against the
-	// Kubernetes API, or anything else in the cluster.
-	if token.Audience != credentialProxyAudience {
-		t.Errorf("expected audience %q, got %q", credentialProxyAudience, token.Audience)
+	// Kubernetes API, or anything else in the cluster. The *chat* audience
+	// specifically: it is also what stops this token opening the shell's
+	// routes on the broker, which is the whole of the caller separation —
+	// both Pods run as ServiceAccounts the broker will serve, so the username
+	// cannot do it.
+	if token.Audience != credentialProxyChatAudience {
+		t.Errorf("expected audience %q, got %q", credentialProxyChatAudience, token.Audience)
+	}
+	if token.Audience == credentialProxyAudience {
+		t.Error("the gateway must not be handed the sandbox's audience")
 	}
 	if token.ExpirationSeconds == nil || *token.ExpirationSeconds > 3600 {
 		t.Errorf("expected the token to expire within an hour, got %v", token.ExpirationSeconds)
+	}
+}
+
+func TestTheSandboxAndGatewayTokensNameDifferentAudiences(t *testing.T) {
+	// The separation is only real while these two differ, and both are string
+	// constants a later edit could quietly reconcile.
+	gateway := buildAgentCredentialProxyTokenVolume().
+		VolumeSource.Projected.Sources[0].ServiceAccountToken
+	sandbox := buildShellSandboxCredentialProxyTokenVolume().
+		VolumeSource.Projected.Sources[0].ServiceAccountToken
+
+	if gateway.Audience == sandbox.Audience {
+		t.Fatalf("the two Pods must not share an audience, both got %q", gateway.Audience)
+	}
+	if sandbox.Audience != credentialProxyAudience {
+		t.Errorf("expected the sandbox audience %q, got %q",
+			credentialProxyAudience, sandbox.Audience)
 	}
 }
 
@@ -207,6 +232,7 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 		"CREDENTIAL_PROXY_ROLE":            "broker",
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
+		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
 		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell",
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 	}
@@ -373,6 +399,9 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 		{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "none"},
 		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: "system:serviceaccount:evil:evil"},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: "https://kubernetes.default.svc"},
+		// Setting this to the shell audience would collapse the two roles back
+		// into one and hand the gateway's token the exec routes.
+		{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyAudience},
 		{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "127.0.0.1"},
 		{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"},
 	}}
@@ -382,6 +411,7 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent),
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
+		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 		"CREDENTIAL_PROXY_ROLE":            "broker",
 	}
@@ -583,6 +613,72 @@ func TestReconcileRefusesADisabledSandboxBeforeRenderingAnything(t *testing.T) {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(object), object); !errors.IsNotFound(err) {
 			t.Errorf("a refused spec must render no %T %s, got %v", object, object.GetName(), err)
 		}
+	}
+}
+
+// TestARefusalStillReconcilesTheAgentsNetworkPolicies is the rule step 11e of
+// Reconcile states and steps 9b and 9c now keep: a refusal withholds the
+// workload, and it must not also withhold a guardrail. A NetworkPolicy that
+// stops being reconciled is one an operator can delete permanently, and with
+// nothing selecting the agent Pod, NetworkPolicy permits all egress — behind a
+// Degraded status that names something else entirely.
+func TestARefusalStillReconcilesTheAgentsNetworkPolicies(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.PlatformAgent)
+		reason string
+	}{
+		{
+			name: "a disabled sandbox",
+			mutate: func(agent *agentv1alpha1.PlatformAgent) {
+				agent.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+					ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+				}
+			},
+			reason: reasonShellSandboxCannotBeDisabled,
+		},
+		{
+			name: "a forbidden volume mount",
+			mutate: func(agent *agentv1alpha1.PlatformAgent) {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					ExtraVolumeMounts: []corev1.VolumeMount{
+						{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
+					},
+				}
+			},
+			reason: "ForbiddenVolumeMount",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			agent := brokerPodAgent()
+			testCase.mutate(agent)
+			r, cl := newSplitReconciler(t, agent)
+			ctx := context.Background()
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+			}
+
+			updated := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+				t.Fatalf("re-reading the agent failed: %v", err)
+			}
+			ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			if ready == nil || ready.Reason != testCase.reason {
+				t.Fatalf("expected Ready=False/%s, got %+v", testCase.reason, ready)
+			}
+
+			policy := &networkingv1.NetworkPolicy{}
+			key := types.NamespacedName{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}
+			if err := cl.Get(ctx, key, policy); err != nil {
+				t.Fatalf("the refusal withheld %s, leaving the agent Pod's egress unrestricted: %v",
+					key.Name, err)
+			}
+			if len(policy.Spec.Egress) == 0 {
+				t.Error("the reconciled policy has no egress rules, which permits nothing and is not what this renders")
+			}
+		})
 	}
 }
 

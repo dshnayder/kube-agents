@@ -2037,8 +2037,12 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
         handler.executor = types.SimpleNamespace(execute_internal=lambda argv: result)
         replies = []
         handler._json = lambda status, payload: replies.append((status, payload))
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            handler._handle_github_refresh()
+        # The managed-repository gate runs before the refresh does, and reading
+        # the list needs the gitops-state ConfigMap. Answering it here keeps
+        # these tests about what a failed refresh logs.
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                handler._handle_github_refresh()
         return replies, logs.output
 
     @staticmethod
@@ -2196,6 +2200,28 @@ class GoogleChatRelayTest(unittest.TestCase):
             [(("futureResource", "messages"), "futureMethod", arguments)], relay.calls
         )
         self.assertEqual(arguments, result["arguments"])
+
+    def test_a_destructive_method_is_refused_before_it_reaches_the_api(self):
+        """The relay forwards any method by name, so deletion needs its own gate.
+
+        A denylist rather than a read-only allowlist: the resource tree belongs
+        to the Hermes adapter and the Chat discovery document, neither of them
+        in this repository, so an allowlist that missed a resource would be
+        chat down while a denylist that misses one is a call that still works.
+        """
+        relay = self.relay()
+        for method in ("delete", "Delete", "batchDelete"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call(["spaces", "messages"], method, {"name": "spaces/x"})
+        self.assertEqual([], relay.calls)
+
+    def test_a_read_or_write_method_still_passes(self):
+        relay = self.relay()
+        for method in ("create", "get", "list", "patch"):
+            with self.subTest(method=method):
+                relay.api_call(["spaces", "messages"], method, {"body": {}})
+        self.assertEqual(4, len(relay.calls))
 
     def test_the_call_carries_a_transport_and_the_retry_budget(self):
         seen = []
@@ -2447,6 +2473,24 @@ class SlackRelayTest(unittest.TestCase):
         self.assertEqual(arguments, result["arguments"])
         self.assertNotIn("token", json.dumps(result))
         self.assertEqual({"x-oauth-scopes": "chat:write"}, result.get("__headers"))
+
+    def test_a_destructive_web_api_method_is_refused(self):
+        """Same gate as the Chat relay's, matched on the verb after the last dot.
+
+        `chat.delete` and `conversations.kick` are one forwarded string away
+        from the relay otherwise, and the token behind it is the workspace's.
+        """
+        relay = self.relay()
+        for method in ("chat.delete", "conversations.kick", "conversations.archive", "files.remove"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call("T123", method, {})
+
+    def test_a_non_destructive_web_api_method_still_passes(self):
+        relay = self.relay()
+        for method in ("chat.postMessage", "conversations.list", "users.info"):
+            with self.subTest(method=method):
+                self.assertTrue(relay.api_call("T123", method, {})["ok"])
 
     def test_nack_requeues_event(self):
         relay = self.relay()
@@ -3257,6 +3301,39 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler._workspace_route(route, payload)
         return store
 
+    def test_the_open_route_gates_on_the_managed_repository_list(self):
+        # `open` is the only workspace route that names a repository, so it is
+        # the only place the gate can sit. It raises rather than returning a
+        # reply tuple, because the route's contract is a handle and there is no
+        # handle to hand back.
+        import content_workspace
+
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=True
+        ):
+            store = self._route("open", {"repo": "owner/name"})
+        self.assertEqual("open", store.method_calls[0][0])
+
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=False
+        ):
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                self._route("open", {"repo": "owner/name"})
+
+        # An unreadable list is not an unmanaged repository. Answering 403 to a
+        # ConfigMap read that failed would tell an operator to register a
+        # repository that is already registered.
+        with mock.patch.object(
+            credential_proxy,
+            "repository_is_managed",
+            side_effect=RuntimeError("kubectl exited 1"),
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                with self.assertRaises(
+                    content_workspace.ManagedRepositoriesUnavailable
+                ):
+                    self._route("open", {"repo": "owner/name"})
+
     def test_the_read_verb_splits_on_paths_rather_than_on_a_second_route(self):
         # One verb, two shapes. Keyed on the presence of `paths` so that a
         # caller reading one file and a caller reading forty use one route --
@@ -3752,7 +3829,7 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
 
     def _authenticator(self, **overrides):
         kwargs = dict(
-            audience=self.AUDIENCE,
+            audience_roles={self.AUDIENCE: ""},
             allowed_callers=frozenset({self.CALLER}),
             api_host="10.0.0.1",
             api_port="443",
@@ -3918,6 +3995,212 @@ class PrincipalAuditLineTest(unittest.TestCase):
         )
 
 
+class AudienceRoleTest(unittest.TestCase):
+    """The audience is the only thing that tells the broker's two callers apart.
+
+    Both Pods run as ServiceAccounts on CREDENTIAL_PROXY_ALLOWED_CALLERS, and
+    the gateway shares its with the broker, so the TokenReview username says
+    only that the caller was entitled to call -- not which of the two it was.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    def _authenticator(self):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+            },
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _status(self, audiences):
+        return {
+            "authenticated": True,
+            "audiences": audiences,
+            "user": {"username": self.CALLER, "uid": "sa-uid", "groups": []},
+        }
+
+    def test_the_validated_audience_becomes_the_role(self):
+        authenticator = self._authenticator()
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_SHELL,
+            authenticator._principal_from({"status": self._status([self.SHELL])}).role,
+        )
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_CHAT,
+            authenticator._principal_from({"status": self._status([self.CHAT])}).role,
+        )
+
+    def test_an_audience_this_broker_does_not_know_is_refused(self):
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            self._authenticator()._principal_from(
+                {"status": self._status(["https://kubernetes.default.svc"])}
+            )
+
+    def test_a_token_naming_both_audiences_is_refused(self):
+        # A token minted for both would be one caller holding both roles, which
+        # is the separation gone. Refusing beats picking one.
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            self._authenticator()._principal_from(
+                {"status": self._status([self.SHELL, self.CHAT])}
+            )
+
+    def test_the_review_asks_for_every_audience_the_broker_knows(self):
+        # A TokenReview that named only one would reject the other caller
+        # outright rather than telling the two apart.
+        captured = {}
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        authenticator = self._authenticator()
+        token_file = Path(tempfile.mkdtemp()) / "token"
+        token_file.write_text("broker-own-token", encoding="utf-8")
+        authenticator.token_file = str(token_file)
+
+        def fake_urlopen(request, *args, **kwargs):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return Response(json.dumps({"status": self._status([self.CHAT])}).encode())
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+            authenticator.authenticate({"Authorization": "Bearer gateway-token"})
+
+        self.assertEqual([self.SHELL, self.CHAT], captured["body"]["spec"]["audiences"])
+
+
+class RequiredRoleTest(unittest.TestCase):
+    """Which side of the split each route belongs to."""
+
+    def test_the_shell_routes(self):
+        for path in ("/v1/exec", "/v1/github/refresh", "/v1/workspace/open"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    credential_proxy.CALLER_ROLE_SHELL, credential_proxy.required_role(path)
+                )
+
+    def test_the_chat_routes(self):
+        for path in ("/v1/chat/slack/events", "/v1/chat/google/api"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    credential_proxy.CALLER_ROLE_CHAT, credential_proxy.required_role(path)
+                )
+
+    def test_a_route_belonging_to_neither(self):
+        self.assertEqual("", credential_proxy.required_role("/healthz"))
+
+
+class RolePermitsTest(unittest.TestCase):
+    """The 403 that keeps each caller on its own routes."""
+
+    def _handler(self, path, role):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
+        )
+        return handler, principal
+
+    def test_the_shell_cannot_reach_a_chat_route(self):
+        handler, principal = self._handler(
+            "/v1/chat/slack/api", credential_proxy.CALLER_ROLE_SHELL
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertFalse(handler._role_permits(principal))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+
+    def test_the_gateway_cannot_reach_an_exec_route(self):
+        handler, principal = self._handler("/v1/exec", credential_proxy.CALLER_ROLE_CHAT)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertFalse(handler._role_permits(principal))
+        self.assertEqual(HTTPStatus.FORBIDDEN, handler.replies[0][0])
+
+    def test_each_caller_reaches_its_own(self):
+        for path, role in (
+            ("/v1/exec", credential_proxy.CALLER_ROLE_SHELL),
+            ("/v1/chat/slack/api", credential_proxy.CALLER_ROLE_CHAT),
+        ):
+            with self.subTest(path=path):
+                handler, principal = self._handler(path, role)
+                self.assertTrue(handler._role_permits(principal))
+                self.assertEqual([], handler.replies)
+
+    def test_a_principal_with_no_role_reaches_everything(self):
+        # The NullAuthenticator, and a broker an older operator has not yet
+        # given a second audience. Neither may be locked out mid-upgrade.
+        for path in ("/v1/exec", "/v1/chat/slack/api", "/healthz"):
+            with self.subTest(path=path):
+                handler, principal = self._handler(path, "")
+                self.assertTrue(handler._role_permits(principal))
+                self.assertEqual([], handler.replies)
+
+
+class ManagedRepositoryGateTest(unittest.TestCase):
+    """The broker answers "is this a repository we act on" for itself."""
+
+    def _handler(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        return handler
+
+    def test_a_managed_repository_passes_silently(self):
+        handler = self._handler()
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            self.assertTrue(handler._repository_is_permitted("gke-labs/kube-agents"))
+        self.assertEqual([], handler.replies)
+
+    def test_an_unmanaged_repository_is_refused(self):
+        handler = self._handler()
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=False):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertFalse(handler._repository_is_permitted("attacker/exfil"))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
+
+    def test_an_unreadable_list_refuses_rather_than_allows(self):
+        # Fail closed: the alternative spends the installation token on a
+        # repository nobody has said the agent manages.
+        handler = self._handler()
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", side_effect=RuntimeError("no kubectl")
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertFalse(handler._repository_is_permitted("gke-labs/kube-agents"))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", payload["code"])
+
+    def test_the_comparison_ignores_case(self):
+        with mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset({"gke-labs/kube-agents"})
+        ):
+            self.assertTrue(credential_proxy.repository_is_managed("GKE-Labs/Kube-Agents"))
+            self.assertFalse(credential_proxy.repository_is_managed("gke-labs/other"))
+
+
 class BuildAuthenticatorTest(unittest.TestCase):
     def test_the_default_is_the_null_authenticator(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -3963,7 +4246,39 @@ class BuildAuthenticatorTest(unittest.TestCase):
         self.assertEqual(
             frozenset({"system:serviceaccount:ns:agent"}), authenticator.allowed_callers
         )
-        self.assertEqual("kubeagents-credential-proxy", authenticator.audience)
+        # No CREDENTIAL_PROXY_CHAT_AUDIENCE in the environment, so one audience
+        # carrying no role: an older operator's broker must not 403 the gateway.
+        self.assertEqual({"kubeagents-credential-proxy": ""}, authenticator.audience_roles)
+
+    def test_a_chat_audience_splits_the_two_callers_by_role(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "kubeagents-credential-proxy-chat",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            {
+                "kubeagents-credential-proxy": credential_proxy.CALLER_ROLE_SHELL,
+                "kubeagents-credential-proxy-chat": credential_proxy.CALLER_ROLE_CHAT,
+            },
+            authenticator.audience_roles,
+        )
+
+    def test_a_chat_audience_equal_to_the_shell_one_is_not_a_split(self):
+        # Setting both to the same string cannot separate anything, and taking
+        # it at face value would map one audience onto two roles.
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "kubeagents-credential-proxy",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual({"kubeagents-credential-proxy": ""}, authenticator.audience_roles)
 
 
 class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
@@ -4143,7 +4458,7 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = True
 
         authenticator = credential_proxy.ServiceAccountAuthenticator(
-            audience="kubeagents-credential-proxy",
+            audience_roles={"kubeagents-credential-proxy": ""},
             allowed_callers=frozenset({self.CALLER}),
             api_host="10.0.0.1",
             api_port="443",

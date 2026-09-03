@@ -558,6 +558,72 @@ func TestResolveShellSandboxImageHonoursTheMirrorOverride(t *testing.T) {
 	}
 }
 
+// TestResolveShellSandboxImageFollowsTheOperatorsRegistry covers the install that
+// mirrors images privately and configures only the operator's own reference,
+// because that is the only image its Deployment names. Without this rung the
+// sandbox is the one pod that reaches ghcr.io anyway, and fails at ImagePull on a
+// cluster whose point may be that it cannot.
+func TestResolveShellSandboxImageFollowsTheOperatorsRegistry(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	t.Setenv(shellSandboxImageEnvVar, "")
+	t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0")
+
+	if got, want := resolveShellSandboxImage(agent),
+		"mirror.corp.internal:5000/kube-agents/agent-sandbox:0.2.0"; got != want {
+		t.Errorf("resolveShellSandboxImage = %q, want %q", got, want)
+	}
+
+	// A digest cannot name a different repository's manifest, so the derivation
+	// drops to the tag beside it, exactly as the agent image does.
+	t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator@sha256:"+strings.Repeat("1", 64))
+	if got, want := resolveShellSandboxImage(agent),
+		"mirror.corp.internal:5000/kube-agents/agent-sandbox:latest"; got != want {
+		t.Errorf("resolveShellSandboxImage on a digest pin = %q, want %q", got, want)
+	}
+
+	// AGENT_SANDBOX_IMAGE is the explicit answer and outranks the inferred one.
+	t.Setenv(shellSandboxImageEnvVar, "registry.example.com/mirror/agent-sandbox:v1.2.3")
+	if got, want := resolveShellSandboxImage(agent),
+		"registry.example.com/mirror/agent-sandbox:v1.2.3"; got != want {
+		t.Errorf("expected %s to outrank %s, got %q", shellSandboxImageEnvVar, operatorImageEnvVar, got)
+	}
+}
+
+// TestTheShellSandboxContainerIsHardenedWhereItCanBe pins the two settings that
+// hold with sshd's privilege separation. The rest of the capability audit is
+// deferred; these two are not part of that question and this is the pod where
+// every model-authored command runs.
+func TestTheShellSandboxContainerIsHardenedWhereItCanBe(t *testing.T) {
+	container := buildShellSandboxContainer(shellSandboxTestAgent(), nil)
+
+	security := container.SecurityContext
+	if security == nil {
+		t.Fatal("expected a container securityContext on the sandbox")
+	}
+	if security.SeccompProfile == nil ||
+		security.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("expected the RuntimeDefault seccomp profile, got %+v", security.SeccompProfile)
+	}
+	if security.Capabilities == nil {
+		t.Fatal("expected NET_RAW to be dropped")
+	}
+	var dropped bool
+	for _, capability := range security.Capabilities.Drop {
+		if capability == "NET_RAW" {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Errorf("expected NET_RAW in the drop list, got %v", security.Capabilities.Drop)
+	}
+	// Not asserted as absent by accident: dropping every capability, or setting
+	// runAsNonRoot, breaks sshd's privilege separation at login. See the pod-level
+	// comment in buildShellSandboxStatefulSet.
+	if len(security.Capabilities.Add) != 0 {
+		t.Errorf("the sandbox adds no capability, got %v", security.Capabilities.Add)
+	}
+}
+
 // The failure this guards against is silent: a Secret volume's files are
 // root-owned, the agent pod runs as uid 10000, and `ssh -i` refuses any key with
 // a group or other permission bit set. 0400 is unreadable and 0440 is refused, so

@@ -738,15 +738,41 @@ class MirrorExitCodes(unittest.TestCase):
         # root that may not be the sandbox's volume.
         self.assertEqual([], copied)
 
-    def test_a_copy_that_ran_and_failed_is_still_fatal(self):
-        # Nothing catches this one, so it leaves main() as a traceback and the
-        # interpreter exits 1 -- which is EXIT_FATAL, and is the conservative
-        # way round for a failure nobody has classified.
+    def test_a_copy_that_ran_and_failed_asks_for_a_retry(self):
+        # `transfer` reads the agent pod's home and never removes from it, so a
+        # tar that dies halfway leaves every byte where it was. The next start
+        # runs the copy again and --skip-old-files keeps whatever landed. Fatal
+        # here would hold the gateway down over a failure the restart repairs.
+        attempted = []
+
         def failing_transfer(*args, **kwargs):
+            attempted.append(args)
             raise RuntimeError("tar: exit 2")
 
-        with self.assertRaises(RuntimeError):
-            self.drive(lambda ssh, command, check=True: self.ok(command, check), failing_transfer)
+        commands = []
+
+        def remote(ssh, command, check=True):
+            commands.append(command)
+            return self.ok(command, check)
+
+        self.assertEqual(sm.EXIT_RETRY, self.drive(remote, failing_transfer))
+        # The copy has to have been attempted, or this is testing the earlier
+        # refusals rather than the one it names.
+        self.assertEqual(1, len(attempted))
+        # And no marker, or the retry would skip the copy it still owes.
+        self.assertEqual(
+            [], [c for c in commands if c.startswith("cat >") and sm.MIGRATION_MARKER in c]
+        )
+
+    def test_an_unclassified_failure_is_still_fatal(self):
+        # EXIT_FATAL is what an unhandled exception exits with on its own, and
+        # that is the conservative way round: a state nobody has reasoned about
+        # should not continue silently.
+        def remote(ssh, command, check=True):
+            raise TypeError("something nobody classified")
+
+        with self.assertRaises(TypeError):
+            self.drive(remote)
         self.assertEqual(1, sm.EXIT_FATAL)
 
 

@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import command_policy
 import scoped_sa_pool
@@ -148,12 +148,147 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 # What it is honestly *not*: encryption.  The token crosses the cluster
 # network in cleartext, exactly as the github-token-minter call already does
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
-# the namespace can replay it until it expires.  mTLS closes that, and the
-# NetworkPolicy work in the next task narrows who can open the connection at
-# all.  Neither is done here.
+# the namespace can replay it until it expires.  mTLS closes that and is not
+# done here.  buildCredentialProxyNetworkPolicy narrows who can open the
+# connection at all, to the sandbox Pod and the gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
+
+# The second audience, and the whole of the per-caller split.
+#
+# Two Pods call this broker and ``Principal.workload`` cannot tell them apart.
+# It is per-ServiceAccount, and the two ServiceAccounts are both on
+# CREDENTIAL_PROXY_ALLOWED_CALLERS, so knowing which one called says only that
+# the caller was one of the two Pods entitled to. What *can* separate them is
+# the audience their token was projected with: the operator chooses it per Pod,
+# and the API server refuses to validate a token against an audience it was not
+# minted for. So the gateway's token is minted for the chat audience and the
+# sandbox's for the audience above, and the routes each may reach follow from
+# whichever one the TokenReview echoed back.
+#
+# The split is real rather than notional because the two callers already need
+# disjoint routes and the operator already gives each only what its side needs:
+# the gateway has GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL and an empty
+# CREDENTIAL_PROXY_URL, and the sandbox has the reverse. What was missing was
+# anything on this side that refused when a caller reached across.
+#
+# Enforced here rather than by splitting the listener across two ports and
+# letting the NetworkPolicy sort them out, for one reason:
+# buildCredentialProxyNetworkPolicy is inert on a cluster whose CNI does not
+# implement NetworkPolicy, and the API server's TokenReview is not. A port
+# split would have been a control on some clusters and a comment on the rest.
+DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
+
+# The roles a caller can hold, named by which Pod holds them.
+CALLER_ROLE_SHELL = "shell"
+CALLER_ROLE_CHAT = "chat"
+
+# Which role each route demands. Checked by prefix, so the trailing slash on
+# the three families is load-bearing: without it "/v1/chatter" would match
+# "/v1/chat" and inherit its rule.
+#
+# A route absent from this table is reachable by any authenticated caller.
+# That is the right default for the two that are: /healthz, which the readiness
+# probe reaches before any token exists, and an unknown path, which must answer
+# 404 to the caller that may legitimately be probing for it —
+# credential_proxy_client.workspaces_available detects an older broker by
+# asking, and a 403 there would read as "not permitted" rather than "not
+# supported".
+ROUTE_ROLES: tuple[tuple[str, str], ...] = (
+    ("/v1/chat/", CALLER_ROLE_CHAT),
+    ("/v1/exec", CALLER_ROLE_SHELL),
+    ("/v1/github/", CALLER_ROLE_SHELL),
+    ("/v1/workspace/", CALLER_ROLE_SHELL),
+)
+
+
+def required_role(path: str) -> str:
+    """The caller role ``path`` demands, or "" if it demands none."""
+    for prefix, role in ROUTE_ROLES:
+        if path.startswith(prefix):
+            return role
+    return ""
+
+
+# How long a managed-repository allowlist read is reused.
+#
+# The list arrives as a ConfigMap mounted read-only at GITOPS_STATE_PATH, and
+# kubelet refreshes such a mount on its own schedule -- around a minute, and not
+# promptly. So there is already a window between registering a repository and
+# this Pod seeing it, and a cache shorter than that window buys nothing but
+# syscalls. Thirty seconds keeps the added delay well inside the one the mount
+# imposes anyway.
+MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
+
+_managed_repository_cache: tuple[float, frozenset[str]] | None = None
+_managed_repository_lock = threading.Lock()
+
+
+def managed_repositories() -> frozenset[str]:
+    """The `owner/name` slugs this install is configured to act on, lowercased.
+
+    Read from the same mounted ConfigMap `github_token_refresh` already reads to
+    widen token scoping, through the same helper, so there is one parser and one
+    notion of what counts as a managed GitHub repository.
+
+    Raises rather than returning empty when the list cannot be read. The two
+    outcomes are not the same: an empty list is an install with nothing
+    registered, which is a legitimate state that refuses every repository, and
+    an unreadable one is a broker that does not know what it is allowed to do.
+    Returning empty for both would make them indistinguishable in the log at the
+    moment an operator most needs to tell them apart.
+    """
+    global _managed_repository_cache
+    now = time.monotonic()
+    with _managed_repository_lock:
+        cached = _managed_repository_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    from gitops_workspace import get_managed_github_repos
+
+    slugs = frozenset(slug.lower() for slug in get_managed_github_repos())
+    with _managed_repository_lock:
+        _managed_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
+    return slugs
+
+
+def repository_is_managed(repository: str) -> bool:
+    """Is ``repository`` one this install registered?
+
+    Compared case-insensitively because GitHub treats owner and repository names
+    that way, and the two sides of this comparison are written by different
+    people: the slug in the request comes from a git remote or a model, and the
+    one in the ConfigMap from whoever registered it.
+    """
+    return repository.lower() in managed_repositories()
+
+
+# Chat API methods the relay refuses to spend its credential on.
+#
+# A denylist rather than an allowlist, for the reason the command policy below
+# gives at "A denylist rather than a read-only allowlist, deliberately": the
+# resource tree these names index belongs to the Hermes adapter and the Google
+# Chat discovery document, neither of which is in this repository, so an
+# allowlist would be enumerated by reading an image we do not build. A name
+# missed out of a denylist is a call that still works; a name missed out of an
+# allowlist is chat down, and chat is the front door.
+#
+# What is on it is the set whose effect cannot be undone by sending another
+# message: removing a space, removing a member, deleting a message or a
+# reaction. Reads and writes stay open, because the relay's whole purpose is
+# for the agent to read and answer chat.
+#
+# Case-folded on comparison. googleapiclient resolves method names exactly, so
+# a differing case would 404 upstream rather than execute -- but the check is
+# an authorization decision and should not depend on that being true.
+DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"})
+
+# The same, for Slack, whose API is flat `group.verb` strings rather than a
+# resource tree. Matched on the verb after the last dot so that a family added
+# upstream -- `bookmarks.remove` after `chat.delete` -- is covered without this
+# list naming it.
+DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
 
 class AuthenticationError(Exception):
@@ -195,12 +330,22 @@ class Principal:
     neither field is ever derived from the request body — from ``argv``, from
     ``cwd``, from anything a model produced. Both come from a token the API
     server verified.
+
+    ``role`` is the coarse version of that idea which does hold today, and it
+    comes from the same place: the audience the API server validated the token
+    against, which the operator sets per Pod. It says which *side* is calling —
+    the shell or the chat gateway — and that is enough to keep either from
+    reaching the other's routes. It is not per-session and does not pretend to
+    be. "" means no role was established, which is the ``NullAuthenticator``
+    case and reaches every route, because that authenticator is only sound
+    behind a Unix socket where the filesystem is the access control.
     """
 
     workload: str
     uid: str = ""
     groups: tuple[str, ...] = ()
     caller: str | None = None
+    role: str = ""
 
     def describe(self) -> str:
         if self.caller:
@@ -237,13 +382,20 @@ class ServiceAccountAuthenticator:
     unless the audience matches — so a token stolen from the agent cannot be
     replayed against the Kubernetes API, and a token minted for anything else
     cannot be replayed against the broker.
+
+    ``audience_roles`` maps each audience this broker accepts to the caller role
+    it confers. The TokenReview asks about all of them at once and the API
+    server echoes back only those it actually validated, so the role is read off
+    the answer rather than guessed from the request. A projected token carries
+    exactly one audience, so exactly one can come back; more than one is a
+    disagreement with that assumption rather than a wider grant, and is refused.
     """
 
     authenticates = True
 
     def __init__(
         self,
-        audience: str,
+        audience_roles: Mapping[str, str],
         allowed_callers: frozenset[str],
         api_host: str,
         api_port: str,
@@ -252,13 +404,13 @@ class ServiceAccountAuthenticator:
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
     ) -> None:
-        if not audience:
+        if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
         if not allowed_callers:
             raise ValueError("at least one allowed caller is required")
         if not api_host:
             raise ValueError("the Kubernetes API server address is not configured")
-        self.audience = audience
+        self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
         self.api_host = api_host
         self.api_port = api_port
@@ -324,7 +476,7 @@ class ServiceAccountAuthenticator:
             {
                 "apiVersion": "authentication.k8s.io/v1",
                 "kind": "TokenReview",
-                "spec": {"token": token, "audiences": [self.audience]},
+                "spec": {"token": token, "audiences": sorted(self.audience_roles)},
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -365,11 +517,23 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("TokenReview reported an error")
         if status.get("authenticated") is not True:
             raise AuthenticationError("the presented token is not authenticated")
+        # The API server echoes the audiences it actually validated. A token it
+        # authenticated for some other audience is not for us, and one it
+        # validated for two of ours breaks the assumption the role rests on.
         audiences = status.get("audiences") or []
-        if self.audience not in audiences:
-            # The API server echoes the audiences it actually validated. A token
-            # it authenticated for some other audience is not for us.
+        matched = sorted(
+            {
+                audience
+                for audience in audiences
+                if isinstance(audience, str) and audience in self.audience_roles
+            }
+        )
+        if not matched:
             raise AuthenticationError("the presented token is for another audience")
+        if len(matched) > 1:
+            raise AuthenticationError(
+                "the presented token names more than one of this broker's audiences"
+            )
         user = status.get("user") or {}
         username = user.get("username") or ""
         if username not in self.allowed_callers:
@@ -379,6 +543,7 @@ class ServiceAccountAuthenticator:
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
+            role=self.audience_roles[matched[0]],
         )
 
 
@@ -406,10 +571,31 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount requires "
             "CREDENTIAL_PROXY_ALLOWED_CALLERS to name at least one ServiceAccount"
         )
+    shell_audience = os.getenv(
+        "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
+    ).strip()
+    # Absent means "no split", and that is the whole of the upgrade story.
+    #
+    # A broker on this image rendered by an operator that predates the split
+    # sees one audience, and every caller presenting it gets role "" — which
+    # reaches every route, exactly as it did before this existed. Were the
+    # second audience defaulted instead, that broker would hand the gateway the
+    # shell role and answer 403 to every chat call, and an upgrade that rolls
+    # the broker before the operator would take chat down until it caught up.
+    #
+    # This is why the value is read raw rather than through a default: unset and
+    # set-to-the-default have to be distinguishable, and after os.getenv applies
+    # a default they are not.
+    chat_audience = os.getenv("CREDENTIAL_PROXY_CHAT_AUDIENCE", "").strip()
+    if chat_audience and chat_audience != shell_audience:
+        audience_roles = {
+            shell_audience: CALLER_ROLE_SHELL,
+            chat_audience: CALLER_ROLE_CHAT,
+        }
+    else:
+        audience_roles = {shell_audience: ""}
     return ServiceAccountAuthenticator(
-        audience=os.getenv(
-            "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
-        ).strip(),
+        audience_roles=audience_roles,
         allowed_callers=allowed,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -645,6 +831,10 @@ class GoogleChatRelay:
             target = getattr(target, name)()
         if not method or method.startswith("_"):
             raise ValueError("invalid Google Chat API method")
+        if method.lower() in DESTRUCTIVE_CHAT_METHODS:
+            raise ValueError(
+                f"the Google Chat method {method!r} is not available through the relay"
+            )
         operation = getattr(target, method)(**arguments)
         # num_retries opts into googleapiclient's own jittered backoff, which
         # covers ssl.SSLError, socket timeouts and 5xx. Left at its default of
@@ -851,6 +1041,10 @@ class SlackRelay:
     ) -> dict[str, Any]:
         if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
+        if method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS:
+            raise ValueError(
+                f"the Slack method {method!r} is not available through the relay"
+            )
         response = self._client(team_id).api_call(
             method, **self._decode_argument(arguments)
         )
@@ -2722,7 +2916,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         """
         try:
             self.principal = self.authenticator.authenticate(self.headers)
-            return self.principal
         except AuthenticationError as exc:
             LOGGER.warning(
                 "rejected an unauthenticated request path=%s reason=%s",
@@ -2733,6 +2926,88 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
             )
             return None
+        if not self._role_permits(self.principal):
+            return None
+        return self.principal
+
+    def _role_permits(self, principal: Principal) -> bool:
+        """Answer 403 and return False if this caller's side may not use this route.
+
+        Separate from authentication because the answer is a different one: 401
+        says "I do not know who you are", 403 says "I do, and this is not
+        yours". Collapsing them would tell the gateway its token had expired
+        when what happened is that it asked for a route belonging to the shell.
+
+        A principal with no role reaches everything. That is the
+        ``NullAuthenticator`` behind a Unix socket, and a broker whose operator
+        has not been upgraded to project a second audience yet; ``role`` is set
+        only where the API server confirmed which audience it validated.
+        """
+        needed = required_role(self.path)
+        if not needed or not principal.role or principal.role == needed:
+            return True
+        LOGGER.warning(
+            "refused a route this caller's role does not reach path=%s role=%s needed=%s",
+            _sanitize_for_logging(self.path),
+            principal.role,
+            needed,
+        )
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": "this route is not available to this caller",
+                "code": "CALLER_ROLE_FORBIDDEN",
+            },
+        )
+        return False
+
+    def _repository_is_permitted(self, repository: str) -> bool:
+        """Answer 403 and return False unless this install registered ``repository``.
+
+        The broker is where this belongs and where it has not been until now.
+        `SOUL.md` tells the agent to check the managed-repository list before
+        acting, and the GitOps skills do -- but that is the agent policing
+        itself with the list it was handed, which is advice rather than a
+        control. Everything downstream of this method spends the installation
+        token, so the question "is this a repository we act on" has to be
+        answered on the side that holds the credential.
+
+        An unreadable list refuses rather than allows, and says which of the two
+        it was in the log: an authorization check that fails open is not one.
+        """
+        try:
+            permitted = repository_is_managed(repository)
+        except Exception as exc:
+            LOGGER.warning(
+                "refusing a repository request: the managed-repository list "
+                "could not be read type=%s",
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the managed repository list is unavailable",
+                    "code": "MANAGED_REPOSITORIES_UNAVAILABLE",
+                },
+            )
+            return False
+        if permitted:
+            return True
+        LOGGER.warning(
+            "refused a repository this install does not manage repository=%s",
+            _sanitize_for_logging(repository),
+        )
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": (
+                    "this repository is not one the agent manages; register it "
+                    "in the gitops-state ConfigMap first"
+                ),
+                "code": "REPOSITORY_NOT_MANAGED",
+            },
+        )
+        return False
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path != "/healthz" and self._authenticated() is None:
@@ -3103,8 +3378,32 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         store = self.workspaces
         if route == "open":
+            # The only workspace route that names a repository. Every other one
+            # takes a handle this route issued, and `push` writes to the remote
+            # that handle was opened against, so gating here gates `commit` and
+            # `push` with it -- and does so before a clone runs rather than
+            # after.
+            requested = payload.get("repo")
+            if not is_valid_repository(requested):
+                raise ValueError("repo must be owner/name")
+            try:
+                permitted = repository_is_managed(requested)
+            except Exception as exc:
+                LOGGER.warning(
+                    "refusing a workspace open: the managed-repository list "
+                    "could not be read type=%s",
+                    type(exc).__name__,
+                )
+                raise content_workspace.ManagedRepositoriesUnavailable(
+                    "the managed repository list is unavailable"
+                ) from exc
+            if not permitted:
+                raise content_workspace.RepositoryNotManaged(
+                    f"{requested} is not one of the repositories this agent "
+                    "manages; register it in the gitops-state ConfigMap first"
+                )
             workspace = store.open(
-                payload.get("repo"),
+                requested,
                 payload.get("base") or None,
                 payload.get("branch") or None,
                 payload.get("depth"),
@@ -3172,6 +3471,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("repository must be owner/name")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        if not self._repository_is_permitted(repository):
             return
 
         try:

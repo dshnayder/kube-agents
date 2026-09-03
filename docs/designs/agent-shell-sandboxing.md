@@ -2133,9 +2133,16 @@ runs on the sandbox terminal backend, where the shims reach the broker's Service
 Restoring `CREDENTIAL_PROXY_URL` on the gateway would fix it and undo the change — it puts a
 credential path back in the pod this design exists to empty. The fix is to give the
 subprocess jobs the same route the model's shell already takes and mint through the sandbox,
-which also settles what `no_agent` should mean once the gateway holds nothing: either the
-entry declares that it needs credentials and is scheduled into the sandbox, or it is
-restricted to work that needs none. That is not implemented here.
+and that is what `refresh_git_credentials` now does: with no `CREDENTIAL_PROXY_URL` and a
+sandbox configured, it runs itself in the sandbox over the existing SSH connection, where the
+variable is set and the broker's Service is reachable. The forwarded process takes the
+`CREDENTIAL_PROXY_URL` branch and stops, so there is no recursion — `sandbox_enabled()` reads
+the gateway's managed Hermes config, which the sandbox image does not carry.
+
+What is still open is the wider question this exposed: what `no_agent` should mean once the
+gateway holds nothing. Either the entry declares that it needs credentials and is scheduled
+into the sandbox, or it is restricted to work that needs none. The forward above fixes the one
+credential a `no_agent` job actually asks for; it does not decide that.
 
 ### Caller authentication
 
@@ -2144,21 +2151,36 @@ The broker listens on `0.0.0.0` behind a ClusterIP, and both the sandbox and the
 dial the Service by name.
 
 What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
-token: audience `kubeagents-credential-proxy`, one hour, presented as a bearer header and
-verified with a `TokenReview` against the API server. Every path except `/healthz` requires
-it, and an unidentified caller gets an undifferentiated `401` rather than a reason.
-`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the two TokenReview usernames the broker will
-serve — the sandbox's ServiceAccount, which is where every credentialed command originates,
-and the gateway's, because the chat relays go through the same listener. The operator grants
-the broker exactly one verb, `create` on `tokenreviews`, to do it.
+token: one hour, presented as a bearer header and verified with a `TokenReview` against the
+API server. Every path except `/healthz` requires it, and an unidentified caller gets an
+undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the two
+TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
+every credentialed command originates, and the gateway's, because the chat relays go through
+the same listener. The operator grants the broker exactly one verb, `create` on
+`tokenreviews`, to do it.
 
-Be precise about what this buys: it is a **multi-tenancy control** that stops another
+**The audience is per Pod, and it is what separates the two callers.** The sandbox's token is
+minted for `kubeagents-credential-proxy`, the gateway's for
+`kubeagents-credential-proxy-chat`, and the `TokenReview` response echoes which audience it
+validated. A username cannot do this job: the gateway shares its ServiceAccount with the
+broker because the Workload Identity binding names it, so the two Pods are one identity at
+the `TokenReview` layer. The audience is chosen by the operator, per Pod, and the API server
+will not validate a token against an audience it was not minted for, so it is a claim the
+caller cannot restate. `ROUTE_ROLES` in `credential_proxy.py` is the table it feeds: the
+sandbox, where every model-authored command runs, cannot reach `/v1/chat/**` at all, and the
+gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. Neither ever needed
+the other's routes, so this enforces a separation the deployment already had and nothing
+checked. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
+`TokenReview` is answered by the API server on every cluster.
+
+Be precise about what the token buys: it is a **multi-tenancy control** that stops another
 workload in the cluster borrowing the agent's credentials, and not an agent-containment
-control, because the agent's shell legitimately holds a token. It records the principal and
-nothing yet varies on it, so it cannot tell the gateway from the sandbox at the policy
-layer. The token crosses the cluster network in cleartext, exactly as the Minty call does,
-so anyone who can observe pod-to-pod traffic in the namespace can replay it until it
-expires. mTLS is the fix and is not deployed.
+control, because the agent's shell legitimately holds a token. The audience split narrows
+what that shell's token opens; it does not make the shell untrusted, which it is not. The
+token crosses the cluster network in cleartext, exactly as the Minty call does, so anyone who
+can observe pod-to-pod traffic in the namespace can replay it until it expires. mTLS is the
+fix and is not deployed.
 
 ### The relay path
 

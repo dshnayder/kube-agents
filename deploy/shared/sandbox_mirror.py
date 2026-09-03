@@ -90,10 +90,11 @@ SKELETON_DIRS = ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
 
 # What this script returns, and what the agent pod's entrypoint does with it.
 #
-# EXIT_FATAL holds the gateway container down, and one failure earns it: a copy
-# that ran and failed, which is the only one that can have moved the model's
-# files off this pod's volume without landing them on the sandbox's. Everything
-# else is EXIT_RETRY, because the next container start fixes it on its own.
+# Almost everything is EXIT_RETRY, because the next container start fixes it on
+# its own. That includes a copy that ran and failed. `transfer` reads the agent
+# pod's home and never removes from it, so a tar that dies halfway leaves every
+# byte where it was and leaves MIGRATION_MARKER unwritten; the next start runs
+# the copy again and `--skip-old-files` keeps whatever already landed.
 #
 # The dividing line is not "how bad does this look" but "who can make it
 # happen". Everything below /opt/data on the sandbox is owned by uid 1000, so a
@@ -102,8 +103,11 @@ SKELETON_DIRS = ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
 # and the repair needs the agent that is no longer running. Nothing has been
 # copied at any of those points, so nothing is lost by coming up without them.
 #
-# An unhandled exception still exits 1 and so still counts as fatal, which is
-# the conservative way round: an unknown failure may have lost data.
+# EXIT_FATAL holds the gateway container down, and it is left for what running
+# the script again cannot fix: no tar on PATH, and an unhandled exception,
+# which exits 1 on its own. The second is the conservative way round -- an
+# unknown failure is a state nobody has reasoned about, and holding the
+# container down is the answer that does not continue silently past it.
 EXIT_OK = 0
 EXIT_FATAL = 1
 EXIT_RETRY = 2
@@ -914,7 +918,22 @@ def main(argv: list[str] | None = None) -> int:
         if kept:
             total = sum(sizes[rel] for rel in kept)
             log(f"copying {len(kept)} path(s), {total // (1024 * 1024)} MiB, into the sandbox")
-            transfer(ssh, agent_home, args.remote_root, kept)
+            try:
+                transfer(ssh, agent_home, args.remote_root, kept)
+            except (RuntimeError, OSError) as exc:
+                # A failed copy is the one case the exit-code contract above
+                # used to call fatal, on the reading that it might have moved
+                # files off this volume without landing them. It cannot: tar
+                # reads here and extracts there, and the only thing this
+                # script unlinks is its own file list. So a broken pipe, a
+                # dead sshd or a full sandbox volume costs a retry, not a
+                # gateway container that will not come up.
+                log(
+                    f"copying into the sandbox failed: {exc}. Nothing was removed from "
+                    "the agent pod's volume and no marker was written, so the next "
+                    "start runs the copy again."
+                )
+                return EXIT_RETRY
             log("copy finished: " + ", ".join(kept))
             copied = kept
         else:

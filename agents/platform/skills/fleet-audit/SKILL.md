@@ -66,6 +66,14 @@ paragraph exists to prevent. Elsewhere it hands the run to the background delega
 returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
 behaves identically on every runtime and always runs in a fresh process.
 
+**Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
+where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
+`command not found` there is the split working as designed rather than a broken install. When you hit
+it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
+does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
+see the next paragraph. The gap is deferred deliberately in
+`docs/designs/agent-shell-sandboxing.md`, under "Executing `hermes`".
+
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and
 when the request is "run them all", it has one turn budget for work the schedule spreads across

@@ -534,6 +534,83 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 self.assertEqual(1, cm.exception.code)
 
 
+class SandboxForwardTest(unittest.TestCase):
+    """The gateway pod holds nothing that can mint, so it forwards.
+
+    Without this branch a `no_agent` cron job on the gateway falls through to
+    the direct mint and dies on a `gcloud` that is not installed there.
+    """
+
+    def _sandbox(self, enabled, completed=None):
+        import subprocess
+
+        module = MagicMock()
+        module.sandbox_enabled.return_value = enabled
+        module.run.return_value = completed or subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        return module
+
+    def test_the_gateway_forwards_the_mint_into_the_sandbox(self):
+        sandbox = self._sandbox(True)
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual("", refresh_git_credentials("owner/repository"))
+        sandbox.run.assert_called_once_with(
+            [
+                "python3",
+                github_token_refresh.SANDBOX_REFRESH_SCRIPT,
+                "owner/repository",
+            ],
+            timeout=github_token_refresh.SANDBOX_REFRESH_TIMEOUT_SECONDS,
+        )
+
+    def test_a_nonzero_exit_in_the_sandbox_raises_rather_than_returning_quietly(self):
+        import subprocess
+
+        sandbox = self._sandbox(
+            True,
+            subprocess.CompletedProcess([], 3, stdout="", stderr="broker said no\n"),
+        )
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials("owner/repository")
+        self.assertIn("exit 3", str(cm.exception))
+        self.assertIn("broker said no", str(cm.exception))
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_no_sandbox_leaves_the_direct_mint_alone(self, run):
+        # The sandbox is not configured, so this is the credential-holding
+        # deployment and the branch has to stay out of the way.
+        sandbox = self._sandbox(False)
+        run.side_effect = [Exception("fail1"), Exception("fail2")]
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials("owner/repository")
+        self.assertIn("Failed to retrieve Google OIDC token", str(cm.exception))
+        sandbox.run.assert_not_called()
+
+    def test_the_credential_proxy_url_still_wins(self):
+        # In the sandbox both are true. Taking the sandbox branch there would
+        # ssh into the pod the call is already running in.
+        sandbox = self._sandbox(True)
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+                response = MagicMock()
+                response.status = 200
+                response.__enter__.return_value = response
+                urlopen.return_value = response
+                with patch.dict(
+                    os.environ,
+                    {"CREDENTIAL_PROXY_URL": "http://broker:8765"},
+                    clear=True,
+                ):
+                    self.assertEqual("", refresh_git_credentials("owner/repository"))
+        sandbox.run.assert_not_called()
+
+
 class LooksLikeAuthFailureTest(unittest.TestCase):
     def _proc(self, returncode: int, stderr: str = ""):
         import subprocess

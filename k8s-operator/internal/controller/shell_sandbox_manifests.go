@@ -68,6 +68,11 @@ const (
 	// images.json. Set on the controller-manager Deployment.
 	shellSandboxImageEnvVar = "AGENT_SANDBOX_IMAGE"
 
+	// The repository half of the sandbox image reference, as it is named in
+	// images.json and pushed by the release workflow. Substituted into the
+	// operator's own image reference by resolveShellSandboxImage.
+	shellSandboxRepositoryName = "agent-sandbox"
+
 	// The login the agent ssh's in as, created by deploy/sandbox/Dockerfile as uid
 	// 1000, with an ephemeral home and a durable /opt/data. Not root, and not the
 	// agent pod's own uid 10000 — the two pods share nothing but a public key.
@@ -200,26 +205,41 @@ func shellSandboxClientKeyFilePath() string {
 // same commit by the same workflow and a skew between them is a bug, not a
 // configuration.
 func fallbackShellSandboxImage() string {
-	return "ghcr.io/gke-labs/kube-agents/agent-sandbox:" + DefaultPlatformAgentVersion
+	return "ghcr.io/gke-labs/kube-agents/" + shellSandboxRepositoryName + ":" + DefaultPlatformAgentVersion
 }
 
 // resolveShellSandboxImage returns the sandbox image: the CR's own override if it
-// carries one, else AGENT_SANDBOX_IMAGE from the controller, else the public
-// ghcr.io default.
+// carries one, else AGENT_SANDBOX_IMAGE from the controller, else the operator's
+// own image with the repository swapped, else the public ghcr.io default.
 //
-// Deliberately not derived from the resolved agent image the way
+// That third rung is the same one defaultPlatformAgentImage has, and it is here
+// for the same reason: an install that mirrored these images into a private
+// registry configures the operator's image and nothing else, because the
+// operator is the only image its Deployment names. Without the derivation the
+// sandbox is the one pod in the install that reaches ghcr.io anyway, on a
+// cluster whose whole point may be that it cannot — and it fails at ImagePull
+// on a Deployment nobody edited, which reads as a broken release rather than an
+// unset variable. main.go fills OPERATOR_IMAGE from the operator's own pod spec
+// when the manifests do not, so this rung is reached on any install, not only
+// the chart's.
+//
+// Deliberately not derived from the resolved *agent* image the way
 // resolveCredentialProxyImage is. That derivation exists because the proxy is a
 // second stage of the same Dockerfile and must not drift from the agent it sits
 // beside in one pod; the sandbox is a separate artifact in a separate pod, and
 // inferring its registry from a CR's spec.deployment.image would mean a user who
-// points the agent at their own mirror silently gets a sandbox image from a
-// repository they never populated. Hence the explicit per-agent field.
+// points one agent at their own mirror silently gets a sandbox image from a
+// repository they never populated. OPERATOR_IMAGE is not that: it is set once
+// per install by whoever installed the operator, not per CR by whoever wrote it.
 func resolveShellSandboxImage(agent *agentv1alpha1.PlatformAgent) string {
 	if spec := shellSandboxSpec(agent); spec != nil && spec.Image != "" {
 		return spec.Image
 	}
 	if override := os.Getenv(shellSandboxImageEnvVar); override != "" {
 		return override
+	}
+	if operatorImage := os.Getenv(operatorImageEnvVar); operatorImage != "" {
+		return deriveImageFromOperator(operatorImage, shellSandboxRepositoryName)
 	}
 	return fallbackShellSandboxImage()
 }
@@ -481,16 +501,20 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// existed. See ShellSandboxSpec.RuntimeClassName for why
 					// this is not the agent's field.
 					RuntimeClassName: shellSandboxRuntimeClassName(agent),
-					// No securityContext, and that is a decision rather than an
-					// omission. sshd's privilege separation forks as uid 0 and
-					// drops to the unprivileged `agent` user for the session, and
-					// the entrypoint chowns the freshly-mounted data volume before
-					// it — so runAsNonRoot cannot be set, and a capability drop
-					// has to keep at least CHOWN, SETUID, SETGID, SYS_CHROOT and
-					// DAC_OVERRIDE. Which of those is genuinely required is a
+					// No pod-level securityContext, and that is a decision rather
+					// than an omission. sshd's privilege separation forks as uid 0
+					// and drops to the unprivileged `agent` user for the session,
+					// and the entrypoint chowns the freshly-mounted data volume
+					// before it — so runAsNonRoot cannot be set, and a capability
+					// drop has to keep at least CHOWN, SETUID, SETGID, SYS_CHROOT
+					// and DAC_OVERRIDE. Which of those is genuinely required is a
 					// question deploy/sandbox/smoke-test.sh can answer and nobody
 					// has asked it yet; guessing here would produce a pod that
 					// fails at login, which reads as a key problem.
+					//
+					// What does not depend on that answer is set on the container
+					// instead — see buildShellSandboxContainer for the seccomp
+					// profile and the NET_RAW drop.
 					// The sandbox image is a fourth image, pulled by a pod that did
 					// not exist before this design. It needs the install's pull
 					// identity for the same reason the gateway does, and there is
@@ -627,6 +651,29 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			Name:          "ssh",
 			ContainerPort: shellSandboxPort,
 		}},
+		// The two hardening settings that hold with sshd's privilege
+		// separation. The pod-level comment in buildShellSandboxStatefulSet
+		// says why runAsNonRoot and a full capability drop are not here;
+		// these two are not part of that question.
+		//
+		// RuntimeDefault is the container runtime's own seccomp filter. It
+		// is what an unconfined pod would get if anyone had set it, and it
+		// leaves fork, setuid, setgid and chroot — everything privilege
+		// separation and the entrypoint's chown need — while removing the
+		// syscalls a container has no business making. This is the pod in
+		// the install where every model-authored command runs, so an
+		// unconfined seccomp profile here is the one that matters most.
+		//
+		// NET_RAW goes because nothing in the sandbox uses it: sshd does
+		// not, and neither do the wrapped CLIs, which speak TCP to the
+		// broker. What it buys is that a command running in here cannot
+		// open a raw socket, so it cannot forge or sniff packets on the
+		// pod network — the capability behind ARP and DNS spoofing, and
+		// the one Kubernetes' own baseline profile singles out.
+		SecurityContext: &corev1.SecurityContext{
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			Capabilities:   &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
+		},
 		Env: env,
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{

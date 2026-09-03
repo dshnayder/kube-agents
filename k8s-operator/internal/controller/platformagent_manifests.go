@@ -2965,6 +2965,11 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "serviceaccount"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
+		// The gateway's audience. Its absence is what an older operator looks
+		// like to this broker, and the broker treats that as "no split" rather
+		// than as "the gateway has the shell's role" — so the two can roll in
+		// either order without chat answering 403 in between.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
@@ -3037,6 +3042,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_ALLOWED_CALLERS",
 		"CREDENTIAL_PROXY_AUDIENCE",
 		"CREDENTIAL_PROXY_AUTH_MODE",
+		// And one that could set CREDENTIAL_PROXY_CHAT_AUDIENCE to the shell's
+		// audience would collapse the two roles into one, which is how the
+		// broker spells "no split".
+		"CREDENTIAL_PROXY_CHAT_AUDIENCE",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container

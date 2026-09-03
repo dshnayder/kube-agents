@@ -43,11 +43,28 @@ import (
 )
 
 const (
-	// credentialProxyAudience is the audience the agent's projected token is
-	// minted for and the only audience the broker accepts. A token for any
-	// other audience — including the Kubernetes API's own — is refused, and
-	// this one is useless anywhere but the broker.
+	// credentialProxyAudience is the audience the shell sandbox's projected token
+	// is minted for. A token for any other audience — including the Kubernetes
+	// API's own — is refused, and this one is useless anywhere but the broker.
 	credentialProxyAudience = "kubeagents-credential-proxy" // #nosec G101 -- Token audience name, not a credential
+
+	// credentialProxyChatAudience is the same for the gateway Pod, and the two
+	// being different is what lets the broker tell its two callers apart.
+	//
+	// It cannot do so any other way. Both Pods run as ServiceAccounts named on
+	// CREDENTIAL_PROXY_ALLOWED_CALLERS, so the TokenReview username says only
+	// that the caller was one of the two entitled to call — not which. The
+	// audience is chosen here, per Pod, and the API server will not validate a
+	// token against an audience it was not minted for, so it is a claim the
+	// caller cannot restate.
+	//
+	// What it buys: the sandbox, where every model-authored command runs, cannot
+	// reach /v1/chat/** at all, and the gateway cannot reach /v1/exec,
+	// /v1/github/** or /v1/workspace/**. Neither needed the other's routes —
+	// CREDENTIAL_PROXY_URL is empty on the gateway and the relay URLs are absent
+	// from the sandbox — so this enforces a separation the deployment already
+	// had and nothing checked. credential_proxy.py's ROUTE_ROLES is the table.
+	credentialProxyChatAudience = "kubeagents-credential-proxy-chat" // #nosec G101 -- Token audience name, not a credential
 
 	// credentialProxyTokenMountPath is where the agent container finds the
 	// token it presents to the broker.
@@ -109,8 +126,10 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
-// namespace mints. What it does not give is a way to tell them apart at the
-// policy layer; the broker records the principal, and nothing yet varies on it.
+// namespace mints. What it does not give is a way to tell them apart — the
+// sandbox runs as its own ServiceAccount, but the gateway shares the agent's
+// with the broker, so a username alone cannot say which Pod called. That is
+// what credentialProxyChatAudience is for.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	return strings.Join([]string{
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
@@ -121,13 +140,18 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 // buildAgentCredentialProxyTokenVolume projects the token the agent presents to
 // the broker. Audience-bound and one hour long, so a copy that escapes the Pod
 // is worth an hour of broker access and nothing else.
+//
+// credentialProxyChatAudience, not credentialProxyAudience: the chat relays are
+// the only thing in this Pod that calls the broker, and minting for the chat
+// audience is what stops this token opening the shell's routes if it does
+// escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
 func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	return corev1.Volume{
 		Name: agentCredentialProxyTokenVolume,
 		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+				Audience: credentialProxyChatAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
 			}}},
 		}},
 	}

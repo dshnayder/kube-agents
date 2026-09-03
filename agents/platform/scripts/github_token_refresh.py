@@ -52,6 +52,16 @@ GH_MISSING_RC = 127
 #: looks_like_auth_failure.
 GH_TIMEOUT_RC = 124
 
+#: Where this same script lands in the shell sandbox. deploy/sandbox/entrypoint.sh
+#: copies /opt/defaults/scripts into the machine home under /opt/data, so the path
+#: resolves there and is the one refresh_git_credentials forwards to.
+SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
+
+#: Bounds the ssh hop around that forward. The broker's own retry budget bounds
+#: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
+#: for the connection.
+SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
+
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
 # against stderr: the REST paths emit `HTTP 401: Bad credentials`, the GraphQL
@@ -298,6 +308,44 @@ def refresh_git_credentials(
             raise RuntimeError(
                 f"Credential sidecar failed to refresh GitHub auth: {exc}"
             ) from exc
+
+    # No CREDENTIAL_PROXY_URL, but a shell sandbox is configured: this is the
+    # gateway pod, which holds nothing that can mint. Forward to the sandbox,
+    # which has the variable and a route to the broker's Service.
+    #
+    # The `no_agent` cron jobs are what need this. They run as a plain Python
+    # subprocess on the gateway rather than as a model turn, so they never touch
+    # the terminal backend and never reach the sandbox the way a skill does —
+    # and once the gateway holds no credential, both branches around this one
+    # are dead there: CREDENTIAL_PROXY_URL is unset, and the direct mint below
+    # ends at `No such file or directory: 'gcloud'`. Putting the variable back
+    # on the gateway would fix it by restoring a credential path to the pod the
+    # split exists to empty. Taking the route the model's shell already takes
+    # does not.
+    #
+    # The forwarded process re-enters this function in the sandbox, where
+    # CREDENTIAL_PROXY_URL is set, so it takes the branch above and stops.
+    # There is no way round that into a loop: sandbox_enabled() reads the
+    # gateway's managed Hermes config, which the sandbox image does not carry.
+    try:
+        import sandbox_exec
+    except ImportError:
+        sandbox_exec = None
+    if sandbox_exec is not None and sandbox_exec.sandbox_enabled():
+        # SandboxUnavailable is a RuntimeError and is deliberately not caught:
+        # ssh failing to connect means the mint never ran, and this function's
+        # contract is that a failure raises rather than returning quietly.
+        completed = sandbox_exec.run(
+            ["python3", SANDBOX_REFRESH_SCRIPT, repository],
+            timeout=SANDBOX_REFRESH_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"the shell sandbox could not refresh GitHub auth for {repository} "
+                f"(exit {completed.returncode}): {(completed.stderr or '').strip()}"
+            )
+        log(f"GitHub credentials refreshed through the shell sandbox for {repository}.")
+        return ""
 
     # 1. Retrieve Google OIDC identity token.
     #

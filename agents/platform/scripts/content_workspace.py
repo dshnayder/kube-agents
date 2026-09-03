@@ -143,6 +143,33 @@ class PathRefused(ContentWorkspaceError):
     code = "workspace.path.refused"
 
 
+class RepositoryNotManaged(ContentWorkspaceError):
+    """The caller named a repository this install has not registered.
+
+    Raised by the broker's `open` route rather than in here: the allowlist is
+    deployment state read from a mounted ConfigMap, and this module deliberately
+    knows nothing about how the process it runs in was deployed. The class lives
+    here so the status and code sit with every other refusal the workspace
+    routes can answer with.
+    """
+
+    status = 403
+    code = "workspace.repository.not-managed"
+
+
+class ManagedRepositoriesUnavailable(ContentWorkspaceError):
+    """The allowlist could not be read, so no repository can be cleared.
+
+    503 rather than 403: the caller may well have named a repository this
+    install manages, and telling it otherwise would send someone looking at a
+    ConfigMap that is correct. Retryable is also true -- the list is a mounted
+    file, so the usual cause is a mount that has not appeared yet.
+    """
+
+    status = 503
+    code = "workspace.repository.list-unavailable"
+
+
 class TooLarge(ContentWorkspaceError):
     status = 413
     code = "workspace.too-large"
