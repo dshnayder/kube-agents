@@ -18,20 +18,23 @@ GitLab is the first forge that is not GitHub, so it is the one that finds out
 whether the seam is in the right place. Mostly it is: cloning, bundling,
 ancestry checking, pushing, the scratch lifecycle, the size ceilings and the
 whole sandbox client need no GitLab-specific code at all, which is what the
-abstraction was for. The `Forge` interface survives with one addition.
+abstraction was for. The `Forge` interface comes out one member shorter.
 
 Three things are not what the existing design predicts.
 
 **The stub has it backwards about credentials.** `_StubForge` refuses gitlab.com
 because "no credential minter is configured; the GitHub App installation flow
 has no GitLab equivalent here." That names an absence as a blocker when it is
-an absence of a requirement: a GitLab group access token is long-lived, so
-`mint()` does nothing and the base-class default is already correct. The
-credential work for GitLab is not minting. It is that **`git` and the API
-authenticate through two different mechanisms, and the interface only has a
-seam for one of them** — GitHub hides this because `gh auth setup-git` mutates
-global git config as a side effect of minting. That is a new method on the
-interface, and it is the one real change.
+an absence of a requirement: a GitLab group access token is long-lived, so there
+is nothing to mint. The real problem is the other direction — `mint()` is the
+wrong seam for *any* forge, because it assumes acquisition is a pipeline every
+forge is fitted into, and because it covers only half the credential: **`git`
+and the API authenticate through two different mechanisms and the interface has
+a seam for one**, GitHub hiding this because `gh auth setup-git` mutates global
+git config as a side effect of minting. `mint` is replaced by a
+[credential strategy the forge owns](#credentials-belong-to-the-forge), covering
+acquisition, the API header and git's helper together. That is the one real
+interface change.
 
 **There is a fifth GitHub leak the design does not list.** The four named in
 [Where GitHub still shows through](version-control-abstraction.md#where-github-still-shows-through)
@@ -59,10 +62,10 @@ broker, so GitLab as written today would be an edit to GitHub's file.
 | Layer                     | Where it goes                                                             |
 | ------------------------- | ------------------------------------------------------------------------- |
 | The forge packages        | `agents/platform/scripts/forges/{github,gitlab}/`                         |
-| The shared contract       | `forges/base.py`, `validate.py`, `errors.py`, `identity.py`, `transport.py` |
+| The shared contract       | `forges/base.py`, `validate.py`, `errors.py`, `identity.py`, `transport.py`, `credentials.py` |
 | Registration              | `forges/registry.py` — the one shared file a new forge edits              |
 | The broker                | `vcs_broker.py`, with no forge name left in it                            |
-| Its credential            | a Secret, projected into the credential-proxy container                   |
+| Its credential            | a `Credential` strategy the forge owns, over a projected Secret           |
 | Which hosts are GitLab's  | operator configuration, rendered into the broker's environment            |
 | The sandbox client        | unchanged — `vcs.py` needs no GitLab code                                 |
 
@@ -129,6 +132,14 @@ nothing, and its docstring already anticipates this —
 — so the correct GitLab implementation of the method the stub calls a blocker
 is to not implement it.
 
+That the default is already right is the tell that the seam is in the wrong
+place. A method whose correct implementation for the second forge is "inherit
+the no-op" is not an abstraction over acquisition; it is GitHub's acquisition
+with an escape hatch. What GitLab needs is not an empty `mint` but a
+[different strategy](#credentials-belong-to-the-forge), because the parts of the
+credential that are *not* empty for GitLab — the `PRIVATE-TOKEN` header, the git
+helper, the file it reads — have nowhere to live on the current interface.
+
 That is worth stating plainly because it changes the sequencing. The credential
 work GitLab needs is not a minter. It is [the git seam](#gits-credential-has-no-seam)
 and a scope boundary the broker enforces itself, neither of which the stub
@@ -167,7 +178,7 @@ file, from a script that is not part of the forge module. A reader of the
 interface cannot see that `clone` will work, and a second forge inherits
 nothing.
 
-**The addition:** a sixth method.
+**The addition:** the credential declares git's config as well as the API's.
 
 ```python
 def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
@@ -176,9 +187,12 @@ def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
     return ()
 ```
 
-`GitHubForge` returns `()` and keeps the helper `gh` installs — no behaviour
-change, but now the interface says the coupling exists and the docstring names
-where it comes from. `GitLabForge` returns a credential-helper pin:
+This sits on the credential rather than on `Forge` — see
+[Credentials belong to the forge](#credentials-belong-to-the-forge) for why the
+two halves are one object. GitHub's `BrokeredCredential` returns `()` and keeps
+the helper `gh` installs — no behaviour change, but now the interface says the
+coupling exists and the docstring names where it comes from. GitLab's
+`StaticFileCredential` returns a credential-helper pin:
 
 ```python
 (("credential.helper", f"!f() {{ echo username=oauth2; echo password=$(cat {TOKEN_FILE}); }}; f"),)
@@ -363,6 +377,7 @@ agents/platform/scripts/
     errors.py              # the status-to-guidance table, forge_error(status, detail)
     identity.py            # _strip_scheme, repository_host, the segment regexes
     transport.py           # Transport protocol, CliTransport, HttpTransport
+    credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential
     registry.py            # AVAILABLE, build_forges(config)
     github/
       __init__.py  forge.py  translate.py  errors.py  fixtures/
@@ -380,7 +395,7 @@ Three of those shared modules are lifts of code that is already forge-neutral
 and merely co-located: `validate.py` is the seven validators unchanged,
 `identity.py` is `_strip_scheme` and `repository_host` unchanged, `errors.py` is
 `_FORGE_ERRORS` unchanged plus the `forge_error(status, detail)` signature from
-[leak 3](#the-six-leaks-closed). This is not a rewrite of GitHub. It is `git mv`
+[leak 3](#the-seven-leaks). This is not a rewrite of GitHub. It is `git mv`
 plus imports, and it should read that way in review.
 
 ### Registration, in two levels
@@ -422,7 +437,8 @@ it into something that fails CI.
 
 1. No module outside `forges/` imports `forges.<name>` — only `forges` itself.
 2. `registry.py` is the sole exception, and only for names in `AVAILABLE`.
-3. A forge package imports only `forges.{base,validate,errors,identity,transport}`
+3. A forge package imports only
+   `forges.{base,validate,errors,identity,transport,credentials}`
    and the standard library. Not the broker, not another forge.
 
 Rule 3 is the one that matters. It is what makes "Bitbucket cannot reach into
@@ -477,26 +493,103 @@ response; it does not make the call. Every one of those "does not" is currently
 true of `GitHubForge` — the split is what keeps it true when the code lives
 somewhere a reviewer of the broker will not see.
 
-### The leak this exposes
+### Credentials belong to the forge
 
-Three of the five leaks named in
-[`version-control-abstraction.md`](version-control-abstraction.md) are inside
-`vcs_broker.py`. A sixth is not, and the modularity requirement is what surfaces
-it: `credential_proxy.py` builds the broker with
+This is where the requirement bites hardest, and it is the part the current
+interface gets most wrong.
+
+Four things about a credential differ per forge, and today they are in four
+different places, none of them the forge:
+
+| Concern                     | Where it lives now                                          |
+| --------------------------- | ------------------------------------------------------------- |
+| whether it expires at all   | implicit — `Forge.mint(refresh, repo)` assumes it might        |
+| how it is acquired          | `credential_proxy.py`, hard-coded to `refresh_github_credential` |
+| how the API presents it     | inside `gh`, invisible to the broker                          |
+| how `git` presents it       | a side effect of `gh auth setup-git`, per [above](#gits-credential-has-no-seam) |
+
+The merged [`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md)
+§5 states the principle this design should have followed: token acquisition is
+**"a strategy selected per provider, not a pipeline every forge is fitted
+into."** GitHub App tokens are signature-derived and expire hourly, so Minty
+exists; a GitLab group access token is a long-lived string with no minting step,
+so for GitLab there is nothing to acquire. Fitting the second into the first
+produces a `mint()` that does nothing and a `refresh` argument nobody uses.
+
+**So `mint` is deleted from the interface and replaced by one member the forge
+constructs and owns:**
+
+```python
+# forges/credentials.py — shared, forge-neutral
+class Credential(Protocol):
+    def ensure(self, repo: str) -> None: ...
+    def headers(self, repo: str) -> dict[str, str]: ...
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]: ...
+```
+
+`ensure` is "make yourself current, if that means anything to you." Two
+implementations cover both forges and, as far as anyone has proposed, the third:
+
+| Strategy               | `ensure`                                  | `headers`                | `git_config`             |
+| ---------------------- | ----------------------------------------- | ------------------------ | ------------------------ |
+| `BrokeredCredential`   | asks the sidecar's refresh route          | none — the CLI carries it | none — the CLI installs a helper |
+| `StaticFileCredential` | **nothing** — a long-lived token cannot go stale | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam) |
+
+GitHub takes the first, GitLab the second. **GitLab's `ensure` is `pass`**, and
+that is the point: a forge whose credential does not expire says so by choosing
+a strategy that has nothing to do, rather than by inheriting a default from an
+abstraction shaped around a forge that does.
+
+`Credential` also collects the API header and the git config, which the previous
+draft had as a separate `git_config` method on `Forge`. Those are the same
+concern seen twice — how this forge's token is presented — and separating them
+is what allowed `gh auth setup-git` to become an undeclared side effect in the
+first place. One object owns both, and a reader of a forge package can see the
+whole credential story without leaving the directory.
+
+**Who does the privileged act.** A forge still may not run a subprocess. It does
+not have to: `BrokeredCredential.ensure` POSTs to the sidecar's refresh route —
+which `multi-forge-support.md` §5 is already generalising from
+`/v1/github/refresh` to `/v1/forge/refresh` with the provider in the body — and
+the executor performs the mint. Three roles, cleanly separated: **the forge
+chooses the strategy, the strategy names the privileged operation, the executor
+performs it.** No shared file names a forge, and nothing in a forge package can
+execute anything.
+
+The broker, meanwhile, stops mentioning credentials entirely. It does not call
+`mint`; the transport calls `credential.ensure(repo)` before a request and the
+git runner asks for `git_config` before an invocation. "Invoked as needed" is
+the caller's timing and the strategy's decision, and neither is the broker's
+business.
+
+### The two leaks this exposes
+
+Both are outside `vcs_broker.py`, which is why the design of record — which
+locates all its leaks in that file — does not have them.
+
+**Leak 6, the refresh path.** `credential_proxy.py` builds the broker with
 `refresh=executor.refresh_github_credential`, and that method validates its
-argument with `is_valid_repository`, which requires exactly `owner/name`.
+argument with `is_valid_repository`, which requires exactly `owner/name`. So a
+third forge with any acquisition step cannot be added without editing that file,
+and GitLab subgroups fail the validator even with no acquisition step at all.
+Closed by the strategy above, plus moving repository validation to `forge.parse`
+— which the broker has already run by then, and which knows its own forge's
+shape. `is_valid_repository` stays where it is for its other callers.
 
-Two consequences. A forge that needs minting cannot be added without editing
-`credential_proxy.py` — so the requirement fails outright for forge number three
-if it has a token broker. And GitLab subgroups fail that validator, so even
-without minting the shape is wrong.
+**Leak 7, the executable allowlist.** `CommandExecutor.ALLOWED_EXECUTABLES` is
+`("gcloud", "kubectl", "gh", "git")`, and `credential_proxy_client.py` carries
+the same set again as `SUPPORTED_EXECUTABLES` — so it is two files. GitLab has
+`glab`; Bitbucket has no CLI at all. `multi-forge-support.md` §5 makes the
+allowlist derive from the configured providers, and it is right that the union
+of every supported forge's binaries grants every install more than it uses. The
+forge-side half is small — the CLI-backed strategy declares its binary, and the
+allowlist is built from the constructed forges — but the executor-side half is a
+change to how `CommandExecutor` is constructed, and it is shared work that
+belongs to that design rather than this one.
 
-The fix is the same move as `verbs`: `Forge.minter` names the refresh script or
-is `None`, and `CommandExecutor.refresh_credential(forge_name, minter, repo)`
-runs it generically. Repository validation moves to `forge.parse`, which the
-broker has already run by then and which knows its own forge's shape — GitLab's
-accepts nesting, GitHub's does not. `is_valid_repository` stays where it is for
-its other callers.
+Leak 7 is worth naming here anyway, because it is the second place where "adding
+a forge is a new directory" is false today, and because it is the one item in
+this section that this design does not close.
 
 ### Checking it against Bitbucket
 
@@ -539,26 +632,26 @@ After the four decisions and the modularity requirement, `Forge` is:
 | `hosts`                 | —         | which hostnames are this forge's; also the credential allowlist      |
 | `parse(url)`            | —         | the repository a URL names — and, now, the only repository validator |
 | `clone_url(repo)`       | —         | the URL to clone, composed from validated segments                  |
-| `capabilities(repo)`    | —         | what this install can do here, without minting or network           |
-| `mint(refresh, repo)`   | —         | make the credential current, if it expires; default nothing         |
-| `git_config(repo)`      | **new**   | config keys for the git invocations made on this forge's behalf     |
+| `capabilities(repo)`    | —         | what this install can do here, without acquisition or network       |
+| `mint(refresh, repo)`   | **gone**  | replaced by `credential`; see [Credentials belong to the forge](#credentials-belong-to-the-forge) |
+| `credential`            | **new**   | the acquisition strategy, the API header and the git config — one object |
 | `verbs`                 | **moved** | was `_GITHUB_VERBS`, a module constant; now a class attribute       |
 | the eight verbs         | signature | receive the neutral `api` above rather than a `gh`-argv callable    |
 | `transport`             | **new**   | which transport the broker builds for this forge: `"cli"` or `"http"` |
 | `for_config(config)`    | **new**   | how many instances of this forge this install has: 0, 1, or n       |
-| `minter`                | **new**   | the refresh script's name, or `None` — see [leak 6](#the-six-leaks-closed) |
 
-`for_config` and `minter` exist for [Modularity](#modularity) rather than for
-GitLab: the first is what lets `registry.py` stay ignorant of any particular
-forge, the second is what keeps the next forge's credential refresh out of
-`credential_proxy.py`.
+The interface gets one member shorter, not longer: `mint` and the `git_config`
+an earlier draft proposed collapse into `credential`. `for_config` and
+`credential` both exist for [Modularity](#modularity) rather than for GitLab —
+the first is what lets `registry.py` stay ignorant of any particular forge, the
+second is what keeps the next forge's credential out of `credential_proxy.py`.
 
 `transport` is a declaration, not an implementation — the forge names what it
 needs and the broker constructs it. That keeps the rule the earlier note was
 protecting (a forge says what to call, never how to execute it) while allowing
 a transport that is not a subprocess.
 
-### The six leaks, closed
+### The seven leaks
 
 | Leak                                       | Closed by                                                             |
 | ------------------------------------------ | ----------------------------------------------------------------------- |
@@ -567,14 +660,15 @@ a transport that is not a subprocess.
 | 3. `_forge_error` parses `(HTTP 404)`      | split: status extraction is per-transport, the guidance table stays shared |
 | 4. `_GITHUB_VERBS` module constant         | `Forge.verbs` class attribute                                            |
 | 5. the `api` callable's own signature      | neutral `(method, path, *, params, body, raw)`                          |
-| 6. `refresh_github_credential` + `is_valid_repository` | `Forge.minter` + a generic `refresh_credential`; validation moves to `parse` |
+| 6. `refresh_github_credential` + `is_valid_repository` | `Forge.credential` as a per-forge strategy; validation moves to `parse` |
+| 7. `ALLOWED_EXECUTABLES` / `SUPPORTED_EXECUTABLES` | **not closed here** — `multi-forge-support.md` §5 owns it       |
 
 The design of record names four leaks and locates all of them in
 `vcs_broker.py`. Leak 5 is the `api` callable's signature, which that document
 counts as part of leak 2 and which is worth separating because the transport can
-be replaced without the signature changing. Leak 6 is in `credential_proxy.py`,
-outside the file the leaks were said to live in, and is
-[the one the modularity requirement exposes](#the-leak-this-exposes).
+be replaced without the signature changing. Leaks 6 and 7 are outside that file
+— in `credential_proxy.py` and `credential_proxy_client.py` — and are
+[the ones the modularity requirement exposes](#the-two-leaks-this-exposes).
 
 Leak 3 splits rather than moves. `_FORGE_ERRORS` — the status-to-guidance table
 — is forge-neutral prose about what an agent should do next, and it stays
@@ -625,11 +719,17 @@ A GitLab **group access token** with `api` and `write_repository` scope, created
 by an administrator, stored in a Kubernetes Secret, projected into the
 credential-proxy container as a file.
 
-- `mint()` is not implemented — the base class default is correct.
-- The API reads it at call time from the file and sends it as a
-  `PRIVATE-TOKEN` header.
-- `git` reads it at use time through the credential helper from
-  [above](#gits-credential-has-no-seam).
+`GitLabForge.credential` is a `StaticFileCredential`, and all three of its
+methods are decided by that one sentence:
+
+- `ensure()` does nothing. The token is long-lived; there is no acquisition
+  step, no minter, no KMS key and no policy ConfigMap.
+- `headers()` reads the file at call time and returns `PRIVATE-TOKEN`.
+- `git_config()` returns the credential-helper pin from
+  [above](#gits-credential-has-no-seam), which reads the same file.
+
+This is the whole GitLab credential story, and it is nine lines in
+`forges/gitlab/`. Nothing outside that directory knows GitLab has a token.
 
 Reading from the file per call rather than caching at construction is
 deliberate: a rotated Secret updates the projected file, and the next call picks
@@ -742,49 +842,87 @@ surprise:
   neutral verb. `proposal_view` does not report approval state.
 - **Merging a proposal.** No forge implements this, on purpose — the neutral
   verb set stops at opening and commenting.
-- **OAuth-refreshed tokens.** A group access token is the only supported
-  credential. This is the decision Bitbucket will have to revisit, since its
-  tokens come from a refresh flow, and `mint()` is where that goes.
+- **OAuth-refreshed tokens.** A group access token is the only supported GitLab
+  credential; GitLab's own OIDC token exchange is deferred, which
+  [`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md)
+  §5 also decides and for the same reason. Bitbucket will revisit this — its
+  tokens do come from a refresh flow — and the point of the strategy is that
+  doing so is a third `Credential` implementation in `forges/bitbucket/`, not a
+  change to GitLab's or GitHub's.
 
 ## Delivery
 
-Ordered so each step is testable before the next, and so nothing needs a live
-GitLab until the last one.
+**Three pull requests, one per forge, and the first one has no forge in its
+title.** This follows the merged design's constraint —
+[`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md)
+§9, *"no-behaviour-change before behaviour change"* and *"everything provable on
+GitHub, before anything that needs GitLab"* — and it is also what makes the
+modularity claim falsifiable rather than aspirational.
+
+### PR 1 — the abstraction, with GitHub behind it
+
+No GitLab. Every step verifiable against the running GitHub install by showing
+existing behaviour unchanged.
 
 | Step | Change                                                                    | Tested by                                       |
 | ---- | ------------------------------------------------------------------------- | ------------------------------------------------- |
 | 1    | `Forge.verbs`; `_GITHUB_VERBS` deleted                                    | existing `test_vcs_broker.py`, unchanged behaviour |
-| 2    | neutral `api` signature; `CliTransport`; port the eight GitHub verbs      | existing tests, unchanged behaviour               |
-| 3    | `forge_error(status, detail)` split; `_THROTTLE_MARKERS` onto `GitHubForge` | existing error tests, unchanged behaviour        |
-| 4    | `Forge.git_config`; `GitHubForge` returns `()`                            | new test that the pins reach the git invocation   |
-| 5    | **the package split** — `forges/` and `forges/github/`, imports only      | existing tests, unchanged behaviour               |
-| 6    | the import-boundary test and the forge-name guard                         | they are the test                                 |
-| 7    | `Forge.minter`; generic `refresh_credential`; validation moves to `parse` | existing refresh tests, plus a nested-namespace case |
-| 8    | contract test parameterised over `AVAILABLE`; GitHub fixtures recorded    | the GitHub suite, passing through the new harness  |
-| 9    | `HttpTransport` — timeout, size cap, redaction, status mapping            | new unit tests against a local stub server        |
-| 10   | `AVAILABLE` + `for_config`; `FORGES`/`HOSTS` from `build_forges`; stub retained when unconfigured | new registry tests        |
-| 11   | `forges/gitlab/` — identity, credential, translation, errors              | the step-8 harness, with GitLab fixtures          |
-| 12   | operator: render the GitLab config and project the Secret                 | operator tests                                   |
-| 13   | live validation                                                           | see below                                        |
+| 2    | neutral `api` signature; `transport` declaration; `CliTransport`; port the eight GitHub verbs | existing tests, unchanged behaviour |
+| 3    | `forge_error(status, detail)` split; `_THROTTLE_MARKERS` onto GitHub      | existing error tests, unchanged behaviour        |
+| 4    | `Credential` protocol; `BrokeredCredential`; `mint` deleted; `git_config` on the credential | new test that the config reaches the git invocation |
+| 5    | generic refresh in `credential_proxy.py`; validation moves to `parse`     | existing refresh tests, plus a nested-namespace case |
+| 6    | **the package split** — `forges/` and `forges/github/`, imports only      | existing tests, unchanged behaviour               |
+| 7    | the import-boundary test and the forge-name guard                         | they are the test                                 |
+| 8    | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded | the GitHub suite, passing through the new harness  |
+| 9    | `AVAILABLE` + `for_config`; `FORGES`/`HOSTS` from `build_forges`; stubs retained | new registry tests                          |
 
-Steps 1–9 contain no GitLab. They are refactors of shared code, and they are
-worth landing as their own commits regardless of what happens to the rest,
-because they are the design's own stated debt. Steps 5–8 in particular are the
-[modularity](#modularity) work: 5 is `git mv` plus imports, 6 is what stops it
-decaying, 7 closes leak 6, and 8 is what makes step 11 cheap.
+**Exit criteria — falsifiable, and worth putting in the PR description:**
 
-The ordering is deliberate on one point. **The split (5–6) lands before
-`GitLabForge` exists (11).** The alternative — write GitLab into
-`vcs_broker.py`, then split — means the split is a two-forge refactor performed
-under the pressure of a nearly-finished feature, and the usual outcome of that
-is the split not happening. Doing it first also means step 5's diff is
-mechanical and reviewable against a suite that must not change, which is the
-cheapest form this work ever takes.
+- `grep -ci github agents/platform/scripts/vcs_broker.py` returns 0, and the
+  same for every module directly under `forges/`.
+- The pre-existing broker test suite passes with no assertions edited.
+- `credential_proxy.py` contains no forge name on the VCS path.
+- The import-boundary test passes, and fails if you add
+  `from forges.github import …` to the broker.
+
+The last one matters most. Anyone can produce the directory layout; the test is
+what says it will still be the layout in six months.
+
+### PR 2 — GitLab
+
+| Step | Change                                                                    | Tested by                                       |
+| ---- | ------------------------------------------------------------------------- | ------------------------------------------------- |
+| 10   | `HttpTransport` — timeout, size cap, redaction, status mapping            | unit tests against a local stub server           |
+| 11   | `forges/gitlab/` — identity, `StaticFileCredential`, translation, errors  | the PR-1 harness, with GitLab fixtures           |
+| 12   | one line in `registry.py`                                                 | registry tests                                   |
+| 13   | operator: render the GitLab config, project the Secret, widen egress      | operator tests                                   |
+| 14   | live validation                                                           | see below                                        |
+
+`HttpTransport` is here rather than in PR 1 deliberately: PR 1 declares the
+`transport` seam and implements only the one GitHub uses. A transport with no
+consumer is a guess about what the second forge will need, and the whole point
+of the sequence is to stop guessing.
+
+### PR 3 — Bitbucket
+
+Not designed here. What belongs in this document is the **measure**: PR 3 should
+touch `forges/bitbucket/`, one line of `registry.py`, and the operator's
+configuration — and nothing else. Every shared file it turns out to need is a
+place the seam was in the wrong spot, and
+[the Bitbucket check](#checking-it-against-bitbucket) already predicts one such
+place, the shared error-guidance table.
+
+If PR 3's diff outside its own directory is more than the registry line and the
+operator config, PR 1 did not succeed. That is the honest test, and it arrives
+too late to change PR 1 — which is the argument for the import-boundary test
+being in PR 1 rather than waiting for a third forge to prove the point.
 
 ### Where this gets validated
 
 No environment here has a GitLab. The endpoint-level claims marked
-*live-verify* above cannot be closed without one, and neither can step 13.
+*live-verify* above cannot be closed without one, and neither can step 14. **PR
+1 needs none of it**, which is most of the reason the sequence is shaped this
+way: the abstraction is not held hostage to an environment question.
 
 The cheapest sufficient answer is a **gitlab.com project under a throwaway
 group with a group access token** — it exercises the credential path, the
@@ -798,29 +936,37 @@ infrastructure. This is the same question
 [`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md) §10 asks and it should be
 answered once for both.
 
-Recommendation: gitlab.com for steps 11–12, and treat self-managed as a
+Recommendation: gitlab.com for steps 11–13, and treat self-managed as a
 prerequisite for calling GitLab supported rather than for merging the package.
 
 ## Open questions
 
-1. **Where the forge configuration is declared.** This design states what the
-   broker must receive; `multi-forge-support.md` owns the CR surface. The two
-   have to agree before step 8, and that is the same unreconciled boundary
-   issue #1154 names.
-2. **Egress for a customer-chosen host.** The broker's NetworkPolicy needs the
-   GitLab host, which for self-managed is not a literal anyone can ship. Either
-   the operator renders it from the same configuration, or the policy widens in
-   a way that should be argued for explicitly rather than by omission.
+1. **Whether `forges/` and `forge.py` become one thing.** This is the largest
+   one, and it is not GitLab-specific. There are two forge abstractions in
+   flight: this one, broker-side, for the eight collaboration verbs; and
+   `forge.py`, agent-side, which `multi-forge-support.md` §4 widens and migrates
+   three more consumers onto. Both dispatch on provider, both need repository
+   identity, both need a credential. They should probably converge on the
+   package layout described here, with the agent-side consumers becoming another
+   caller — but that is a claim, not a decision, and it needs the owners of both
+   documents in a room. Issue #1154 is where it is tracked.
+2. **Where the forge configuration is declared.** This design states what the
+   broker must receive; `multi-forge-support.md` §6 owns the CR surface —
+   `spec.integration.git` with a provider, a host and a repository. The two have
+   to agree before step 13, and the Go half of that surface is that design's
+   step 2, ahead of anything here.
 3. **Whether `allowed_paths` is this design's field or the shared surface's.**
-   GitHub gets the same boundary from Minty's policy ConfigMap. One field that
-   means "what this credential may be spent on" across forges would be better
-   than two mechanisms, but the enforcement points genuinely differ.
-4. **Whether the package split lands inside the VCS-abstraction PR or after
-   it.** Steps 5–8 are behaviour-preserving and touch a file that PR is already
-   rewriting, which argues for inside; they also add several hundred lines of
-   moved code to a review that is large already, which argues for a follow-up
-   that lands before any GitLab code. The one option that should be ruled out is
-   deferring it past step 11.
+   GitHub gets the same boundary from Minty's policy ConfigMap.
+   `multi-forge-support.md` §10 asks this twice — as "can one field name the
+   token's scope boundary on both forges" and as "does the Minty policy
+   ConfigMap have an analogue" — and it should be answered there rather than
+   here. `allowed_paths` as written is the local fallback if it is not.
+4. **Whether gitlab.com and self-managed GitLab are one forge or two.**
+   `multi-forge-support.md` §10 raises it, warning that a class branching on
+   "is this gitlab.com" repeats the Bitbucket mistake in miniature. The
+   `for_config` design here gives a partial answer — n instances of one class,
+   each with its own host and credential, no branching — but it does not settle
+   whether the token model differs enough to want two classes.
 5. **Whether `GitHubForge` should move onto `HttpTransport` afterwards.** Not
    proposed here. It would remove `gh` from the broker entirely, which
    [Replacing `gh`](version-control-abstraction.md#replacing-gh) wants for other
