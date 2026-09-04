@@ -59,8 +59,22 @@ spec:
             # sandbox does not: it is a separate repository, so it is named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
+            {{- /* `| default dict` and the repository fallback because
+                   agentSandbox is a key this chart gained: a caller that
+                   renders it against an older release's values -- `helm upgrade
+                   --reuse-values` does exactly that -- reaches this line with
+                   .Values.agentSandbox nil, and a bare field access on nil is a
+                   template error that aborts the upgrade after the new CRDs
+                   have already been applied. The same guard
+                   platform-agent-cr.yaml uses for harness.experimental.
+
+                   The repository fallback repeats values.yaml's default because
+                   a nil agentSandbox has no repository either, and there is no
+                   way to read a chart default that the release did not carry.
+                   Keep the two in step. */}}
+            {{- $sandboxImage := (.Values.agentSandbox | default dict).image | default dict }}
             - name: AGENT_SANDBOX_IMAGE
-              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.agentSandbox.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.agentSandbox.image.tag | default .Chart.AppVersion }}"
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" ($sandboxImage.repository | default "ghcr.io/gke-labs/kube-agents/agent-sandbox") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $sandboxImage.tag | default .Chart.AppVersion }}"
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
             {{- /* The pull identity for those same pods. Redundant for the CR
