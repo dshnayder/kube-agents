@@ -86,17 +86,15 @@ it. An agent should read all of it.
 
 ### What customers are asking for
 
-An agent that manages infrastructure has to read and change the repository that
-describes it. Prospective customers do not all keep that repository on GitHub,
-and an agent that only speaks GitHub is an agent they cannot evaluate. Two
-systems are required in the short term — **GitLab** and **Bitbucket** — and the
-list is not closed; self-hosted GitLab and Gerrit come up often enough that a
-design which handles three by enumeration and a fourth by rewrite is the wrong
-design.
+GitLab and Bitbucket are the two required in the short term, and the list being
+open is what shapes the design rather than the two names on it. Self-hosted
+GitLab and Gerrit come up often enough that a design which handles three by
+enumeration and a fourth by rewrite is the wrong design.
 
-This is the reason the work exists. It is not a response to a deficiency in how
-repositories are reached today: the mechanisms this repository ships work, and
-one of them is the baseline the new one had to match.
+That demand is the whole reason the work exists. It is worth being explicit that
+nothing else is: this is not a response to a deficiency in how repositories are
+reached today. The mechanisms this repository ships work, and one of them is the
+baseline the new one had to match.
 
 ### Where GitHub is named today
 
@@ -148,11 +146,8 @@ install points at GitLab.
 
 ### What is abstracted, and what stays native
 
-All three target systems are forges of git. That is the fact the design leans
-on hardest, because it means the version-control system is not what varies —
-the collaboration layer built on top of it is.
-
-Split accordingly:
+"Forges of git" is the fact the design leans on hardest, and the split it
+implies is sharper than it first looks:
 
 - **Remote operations are abstracted.** Anything that crosses the network or
   spends a credential: fetching a repository, sending revisions back, opening
@@ -217,21 +212,16 @@ than a silent drop.
 
 ### How this compares to what we have
 
-Before building on it, the abstraction was measured head to head against the two
-repository-access designs already in this repository, on identical probes and
-identical corpora: the existing shared-volume credential proxy, and content
-passing (#962). Twenty read probes at three repository sizes, plus a four-probe
-write rung.
+The two designs it was measured against are the shared-volume credential proxy
+and content passing (#962), on identical probes and identical corpora: twenty
+read probes at three repository sizes, plus a four-probe write rung. It was also
+the only one of the three that never reached past its own interface. Full method
+and results in [The experiment](#9-the-experiment).
 
-The short version: **the abstraction is as good as the current implementation
-and better on the measures taken.** It answered the most probes, took the fewest
-turns, was the only design whose cost did not grow with repository size, and was
-the only one that never reached past its own interface. Full method and results
-in [The experiment](#9-the-experiment).
-
-That is a sanity check, not the justification. The justification is the customer
-requirement above. What the numbers establish is that meeting it costs nothing
-in capability or speed — which is the thing that would have stopped the work.
+Those numbers are a sanity check, not the justification. The justification is
+the customer requirement above. What the measurement establishes is that meeting
+it costs nothing in capability or speed — which is the thing that would have
+stopped the work.
 
 ---
 
