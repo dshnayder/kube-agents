@@ -54,6 +54,7 @@ from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    kubeconfig_landed,
     list_profiles,
     profile_home,
     read_cluster_identity,
@@ -203,8 +204,14 @@ def _exclusive_run():
         yield True
 
 # Written by create_profile after the identity stamp, so their absence means the
-# scaffold was interrupted between the two.
-SCAFFOLD_ARTIFACTS = ("kubeconfig.yaml", "USER.md")
+# scaffold was interrupted between the two. The kubeconfig is checked separately:
+# it is not on this pod's filesystem.
+SCAFFOLD_ARTIFACTS = ("USER.md",)
+
+# What create_profile fetches in step 3, relative to the profile home. Named here
+# because this pod cannot stat it -- the path is resolved on whichever side
+# kubectl runs, which kubeconfig_landed decides.
+KUBECONFIG_ARTIFACT = "kubeconfig.yaml"
 
 
 def _scaffold_gaps(home: Path) -> list[str]:
@@ -218,8 +225,20 @@ def _scaffold_gaps(home: Path) -> list[str]:
     because the cluster still exists, and the half-scaffolded profile survives with
     no credentials for the life of the volume. Treating it as absent re-runs the
     scaffold, which is idempotent.
+
+    The kubeconfig is asked for over the sandbox rather than stat'ed here. With a
+    sandbox, ``gcloud container clusters get-credentials`` runs in the shell pod
+    and writes to the shell pod's volume, so this pod never sees the file:
+    stat'ing it locally reports every profile incomplete on every tick, which
+    re-scaffolds the whole fleet hourly and re-fetches a credential for each.
+    ``kubeconfig_landed`` asks the side that has it -- the same way create_profile
+    confirmed the fetch -- and answers "not landed" when the sandbox cannot be
+    reached, which is the case a recreated sandbox volume actually needs.
     """
-    return [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
+    gaps = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
+    if not kubeconfig_landed(home / KUBECONFIG_ARTIFACT):
+        gaps.insert(0, KUBECONFIG_ARTIFACT)
+    return gaps
 
 
 def reconcile(dry_run: bool = False) -> dict:
