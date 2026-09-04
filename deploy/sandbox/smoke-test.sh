@@ -427,6 +427,51 @@ check_absent "and does not land in the home every card shares" "/home/agent" \
 "${SSH[@]}" "rm -rf $KWS /opt/data/kanban/boards /opt/data/kanban/workspaces/scratchpad /opt/data/other" >/dev/null 2>&1
 
 echo
+echo "== 4e. the profile home the SSH crossing drops =="
+# HERMES_HOME names the *profile* home in the agent container — a Cluster Agent
+# worker sees /opt/data/profiles/cluster-<x> — and nothing carries a process
+# environment across the connection, so the entrypoint's SetEnv line can only
+# name one static value and it names the root. Section 3 above checks that
+# value; this section checks the wrapper narrowing it back per session.
+# cluster_preflight.sh is what shows when it does not: it reads the default
+# profile's USER.md and kubeconfig.yaml and reports the Cluster Agent has no
+# identity, or passes on an identity that is not its own.
+CP="/opt/data/profiles/cluster-smoke"
+# Staged by the entrypoint from $SANDBOX_HOME_ROOTS, and it has no kubeconfig —
+# which is the second case below.
+PP="/opt/data/profiles/platform"
+"${SSH[@]}" "mkdir -p $CP && printf 'kubeconfig\n' > $CP/kubeconfig.yaml" >/dev/null 2>&1
+check "the profile the entrypoint stages is there to narrow to" "$PP" \
+  "$("${SSH[@]}" "ls -d $PP" 2>&1)"
+check "a command run in a profile home sees that home" "home=[$CP]" \
+  "$(hermes_ssh "$CP" 'echo "home=[$HERMES_HOME]"' 2>&1)"
+check "and the kubeconfig pinned inside it" "kc=[$CP/kubeconfig.yaml]" \
+  "$(hermes_ssh "$CP" 'echo "kc=[$KUBECONFIG]"' 2>&1)"
+# The Cluster Agent's own commands run from a kanban workspace beneath its
+# profile home, not from the home itself, so the derivation has to survive the
+# depth — and both derivations have to happen, not one or the other.
+CPWS="$CP/kanban/workspaces/t_5eeded03"
+check "a workspace beneath it still resolves the home" "home=[$CP] ws=[$CPWS]" \
+  "$(hermes_ssh "$CPWS" 'echo "home=[$HERMES_HOME] ws=[$HERMES_KANBAN_WORKSPACE]"' 2>&1)"
+# Unset beats pointing at a file that is not there. `kubectl` with a KUBECONFIG
+# naming a missing path fails with an empty-config error on every invocation,
+# which turns "this profile has no credential yet" into "kubectl is broken".
+check "a profile with no kubeconfig narrows the home and no more" "home=[$PP] kc=[]" \
+  "$(hermes_ssh "$PP" 'echo "home=[$HERMES_HOME] kc=[$KUBECONFIG]"' 2>&1)"
+# Everything outside profiles/ is the default profile, and the root is what it
+# wants. The profiles directory itself has no profile name in it.
+check "an ordinary working directory leaves both as sshd set them" "home=[/opt/data] kc=[]" \
+  "$(hermes_ssh "/opt/data/scratch/smoke-$$" 'echo "home=[$HERMES_HOME] kc=[$KUBECONFIG]"' 2>&1)"
+check "and so does the profiles directory itself" "home=[/opt/data] kc=[]" \
+  "$(hermes_ssh /opt/data/profiles 'echo "home=[$HERMES_HOME] kc=[$KUBECONFIG]"' 2>&1)"
+# PLATFORM_AGENT_HOME names the data root, not a profile home
+# (gitops_workspace.agent_home()), and narrowing it would put every clone the
+# GitOps skills make outside the credential proxy's workspace root.
+check "PLATFORM_AGENT_HOME is not narrowed with it" "data=[/opt/data]" \
+  "$(hermes_ssh "$CP" 'echo "data=[$PLATFORM_AGENT_HOME]"' 2>&1)"
+"${SSH[@]}" "rm -rf $CP /opt/data/scratch/smoke-$$" >/dev/null 2>&1
+
+echo
 echo "== 5. credential-proxy wrappers =="
 for cli in kubectl gcloud gh git; do
   check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \

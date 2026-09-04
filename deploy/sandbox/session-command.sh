@@ -1,11 +1,13 @@
 #!/bin/bash
-# ForceCommand for the sandbox's `agent` account. It repairs two things the SSH
-# crossing drops and then runs the command sshd would have run anyway: the
+# ForceCommand for the sandbox's `agent` account. It repairs three things the
+# SSH crossing drops and then runs the command sshd would have run anyway: the
 # working directory the incoming command is about to cd into, which nothing
-# creates on this side, and — when that directory is a kanban workspace — the
-# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables, which the dispatcher
-# sets in the worker's process environment and no part of the SSH backend
-# forwards. The second is documented at export_kanban_vars below.
+# creates on this side; when that directory is a kanban workspace, the
+# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables; and when it is
+# inside a profile home, HERMES_HOME and the kubeconfig pinned there. All three
+# are set in the worker's process environment on the agent pod, and no part of
+# the SSH backend forwards a process environment. The second and third are
+# documented at export_kanban_vars and export_profile_home below.
 #
 # Why it exists. Hermes wraps every terminal command in a preamble whose cd line
 # is
@@ -36,6 +38,16 @@
 # a string base.py owns: if that line changes shape, the drift warning at the
 # bottom is what says so. See docs/designs/agent-shell-sandboxing.md.
 set -u
+
+# The data root sshd handed this session, and where profile homes hang off it.
+# Captured before anything rewrites HERMES_HOME: the drop-in
+# deploy/sandbox/entrypoint.sh writes sets it to the root, and
+# export_profile_home below narrows it to one profile.
+SANDBOX_DATA_ROOT=${HERMES_HOME:-/opt/data}
+PROFILES_ROOT="$SANDBOX_DATA_ROOT/profiles"
+# What cluster_agent_profile.py's step 3 writes into a profile home, on this
+# volume. Name matched with sandbox_mirror.CREDENTIALS and cluster_preflight.sh.
+PINNED_KUBECONFIG_NAME=kubeconfig.yaml
 
 warn() { printf 'sandbox-session-command: %s\n' "$1" >&2; }
 
@@ -104,6 +116,53 @@ export_kanban_vars() { # export_kanban_vars <resolved cwd>
   export HERMES_KANBAN_TASK="$tid"
 }
 
+# HERMES_HOME, and the kubeconfig pinned inside it, recovered the same way and
+# for the same reason.
+#
+# In the agent container HERMES_HOME names the *profile* home — a worker on the
+# platform profile sees `<root>/profiles/platform`, a Cluster Agent sees its own
+# — and Hermes sets it in the worker's process environment. Nothing carries it
+# across the SSH connection, so the drop-in the entrypoint writes has to name a
+# single static value, and it names the root. Every profile-scoped script then
+# reads the wrong tree: cluster_preflight.sh is the one that shows, checking
+# `<root>/USER.md` and `<root>/kubeconfig.yaml` — the default profile's — and
+# reporting the Cluster Agent has no identity, or worse, passing on an identity
+# that is not its own.
+#
+# The cwd is where that information survives, exactly as it is for the kanban
+# variables above: a Cluster Agent's cwd is its profile home or a kanban
+# workspace beneath it. Anything not under `<root>/profiles/<name>` leaves
+# HERMES_HOME as sshd set it, which is what the default profile wants.
+#
+# PLATFORM_AGENT_HOME is deliberately left alone. It names the agent's data
+# root, not a profile home — gitops_workspace.agent_home() says why, and a clone
+# under a profile home would fall outside the credential proxy's workspace root.
+export_profile_home() { # export_profile_home <resolved cwd>
+  local path=$1 rest name home kubeconfig
+  case $path in
+  "$PROFILES_ROOT"/*) rest=${path#"$PROFILES_ROOT"/} ;;
+  *) return 0 ;;
+  esac
+  name=${rest%%/*}
+  case $name in
+  "" | . | ..) return 0 ;;
+  esac
+  home="$PROFILES_ROOT/$name"
+  [ -d "$home" ] || return 0
+  export HERMES_HOME="$home"
+  # KUBECONFIG the same way, and only when the file is there. A plain `kubectl`
+  # reads it from the environment and nothing else pins it on this side, so
+  # without this every command a Cluster Agent runs resolves to whatever context
+  # the credential proxy last had rather than to its own cluster —
+  # cluster_preflight.sh check 4 is written to catch exactly that. Exporting a
+  # path to a file that does not exist would be worse than leaving it unset: it
+  # turns "the profile has no credential" into an empty-config error from every
+  # kubectl.
+  kubeconfig="$home/$PINNED_KUBECONFIG_NAME"
+  [ -f "$kubeconfig" ] || return 0
+  export KUBECONFIG="$kubeconfig"
+}
+
 found=0
 if [ -n "$script" ]; then
   while IFS= read -r line; do
@@ -144,6 +203,7 @@ if [ -n "$script" ]; then
     # have worked into one that does not.
     mkdir -p -- "$resolved" 2>/dev/null || warn "could not create $resolved"
     export_kanban_vars "$resolved"
+    export_profile_home "$resolved"
     # Only the first one. The cd line comes before the `eval '<command>'` line
     # that carries the model's own text, so stopping here keeps a command that
     # merely mentions `builtin cd --` from directing an mkdir.
