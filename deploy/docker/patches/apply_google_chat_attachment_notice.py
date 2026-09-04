@@ -182,7 +182,20 @@ PATCHED = '''\
                 "consent, done from this chat.",
                 "**To enable it:** send `/setup-files` and follow the steps.",
             ])
-        lines.append(f"The file is on the agent host at: `{path}`")
+        # A path under the system temp directory may be a copy this pod staged
+        # out of the shell sandbox, in which case it is deleted as soon as the
+        # delivery returns and naming it here describes nothing the user can
+        # act on. `original_path` gives back the path the agent actually wrote,
+        # and is the identity for every other path. The import is guarded
+        # because this patch also has to hold on an image built without the
+        # agent scripts on PYTHONPATH.
+        try:
+            import sandbox_artifact_patch as _sandbox_artifacts
+
+            reported = _sandbox_artifacts.original_path(path)
+        except Exception:
+            reported = path
+        lines.append(f"The file is on the agent host at: `{reported}`")
 '''
 
 

@@ -384,6 +384,32 @@ class InlineFallbackTest(unittest.TestCase):
         self.assertIn("long.md", logs.output[0])
         self.assertIn("rate limited", logs.output[0])
 
+    def test_the_notice_names_the_agents_path_not_the_staged_copy(self):
+        # Under the shell sandbox the file being read here is a copy this pod
+        # staged, and `sandbox_artifact_patch` deletes it as soon as the
+        # delivery returns. A notice naming that temp path sends the reader
+        # after something that no longer exists, on the one code path whose
+        # whole job is to say where the file is.
+        import sandbox_artifact_patch
+
+        adapter = self._patched_adapter()
+        staged = self._write("report.pdf", b"%PDF-1.4 binary")
+        sandbox_artifact_patch._ORIGINALS[staged] = "/opt/data/report.pdf"
+        self.addCleanup(sandbox_artifact_patch._ORIGINALS.pop, staged, None)
+
+        self._fallback(adapter, staged, "report.pdf")
+
+        self.assertEqual(len(adapter.fallback_calls), 1)
+        self.assertEqual(adapter.fallback_calls[0]["path"], "/opt/data/report.pdf")
+
+    def test_a_path_that_was_never_staged_is_named_as_it_is(self):
+        adapter = self._patched_adapter()
+        path = self._write("report.pdf", b"%PDF-1.4 binary")
+
+        self._fallback(adapter, path, "report.pdf")
+
+        self.assertEqual(adapter.fallback_calls[0]["path"], path)
+
     def test_a_refusal_still_leaves_the_notice_and_the_host_path(self):
         # Before inlining existed, every path through _post_attachment_fallback
         # posted the notice naming the host path. A paste that is refused must

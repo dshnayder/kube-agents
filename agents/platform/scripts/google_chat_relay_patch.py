@@ -11,6 +11,7 @@ import os
 import urllib.request
 from typing import Any, NamedTuple
 
+import sandbox_artifact_patch
 from credential_proxy_client import authorization_headers
 
 
@@ -24,8 +25,12 @@ LOGGER = logging.getLogger("google-chat-relay-patch")
 # native attachment, whatever it is granted. Upstream's answer is a notice
 # naming the host path, which on this deployment is a path the person in the
 # thread cannot reach; #999 is that notice arriving instead of a report someone
-# asked for. The content is already on the agent's own disk and needs no
-# credential to post, so the deliverable goes into the thread as text.
+# asked for. Posting the content as text needs no credential at all, so the
+# deliverable goes into the thread that way instead. The bytes are readable from
+# this process by the time the adapter is called: either the agent wrote them
+# here, or ``sandbox_artifact_patch`` staged them out of the shell sandbox and
+# rewrote the path -- which is why the notice below asks that module what the
+# agent's own path was before naming one.
 
 #: Extensions whose bytes are worth putting in a chat message. A deliverable
 #: outside this set -- a PDF, a PNG, an archive -- has no text form, and the
@@ -162,6 +167,19 @@ def _inline_text(path: str) -> _Deliverable | None:
         return _Deliverable(raw.decode("utf-8"), suffix, len(raw))
     except UnicodeDecodeError:
         return None
+
+
+def _agent_side_path(path: str) -> str:
+    """The path to name in a notice, which is not always the path being read.
+
+    With the shell sandbox on, the agent's files live in another pod and
+    ``sandbox_artifact_patch`` stages a copy here so the delivery can happen at
+    all. Everything downstream reads the copy; the reader has to be told about
+    the original, which is the only one that will still exist by the time they
+    look. Off the sandbox, and for anything the gateway wrote itself, this is
+    the identity.
+    """
+    return sandbox_artifact_patch.original_path(path)
 
 
 def _inline_chunks(text: str, *, fenced: bool) -> list[str]:
@@ -378,7 +396,12 @@ def install() -> None:
                 return await original_fallback(
                     self,
                     chat_id=chat_id,
-                    path=path,
+                    # The path the agent wrote, which under the shell sandbox is
+                    # not the path being read here: sandbox_artifact_patch
+                    # staged a copy into this pod and will delete it as soon as
+                    # this delivery returns. Naming the copy would point the
+                    # reader at a temp directory that no longer exists.
+                    path=_agent_side_path(path),
                     filename=filename,
                     caption=caption,
                     thread_id=thread_id,
