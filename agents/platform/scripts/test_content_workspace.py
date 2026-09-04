@@ -33,6 +33,7 @@ from content_workspace import (
     Workspace,
     assert_disjoint_roots,
     check_branch,
+    check_expected_sha,
     parse_changes,
     repo_relative,
 )
@@ -360,6 +361,59 @@ class CheckBranchTest(unittest.TestCase):
             check_branch("platform-agent/provision-mercury-09"),
         )
         self.assertEqual("fix/cve-2026-1234", check_branch("  fix/cve-2026-1234  "))
+
+
+class CheckExpectedShaTest(unittest.TestCase):
+    """The conflict guard's two caller-supplied revisions.
+
+    Both reach a revision position in `git diff <expected> <current> --
+    <paths>`, which the workspace routes get to without passing
+    `git_argument_violation`, so this function is the only thing between the
+    caller and git's option parser.
+    """
+
+    def test_an_option_in_a_revision_position_is_refused(self):
+        # --output= is the sharp one: git writes the diff to that path and
+        # prints nothing, so the caller's guard reads the empty result as "no
+        # overlap" and the conflict it exists to catch never raises.
+        for value in ("--output=/opt/data/pwn", "-p", "--exit-code"):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBaseSha")
+
+    def test_a_revision_that_is_not_a_full_object_id_is_refused(self):
+        # Each of these resolves to a commit, so git would answer rather than
+        # fail — with a comparison against something other than what the caller
+        # meant. Wrong quietly is the failure mode this refuses.
+        for value in ("HEAD~1", "main", "origin/main", "deadbee", "@"):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBranchSha")
+
+    def test_the_field_name_is_in_the_message(self):
+        # Two of these are checked in a row and the payload carries both, so
+        # the caller has to be told which one they got wrong.
+        with self.assertRaises(ContentWorkspaceError) as raised:
+            check_expected_sha("HEAD", "expectedBranchSha")
+        self.assertIn("expectedBranchSha", str(raised.exception))
+
+    def test_an_empty_or_non_string_value_is_refused(self):
+        for value in ("", "   ", None, 42, ["a" * 40]):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBaseSha")
+
+    def test_both_object_id_lengths_are_accepted(self):
+        # A repository is SHA-1 or SHA-256 and the broker clones what it is
+        # pointed at, so refusing the longer one would refuse the guard itself
+        # on a SHA-256 repository.
+        sha1 = "e9ee1c37ab4f5d0c2b8a91f6d3e0c47a5b1d8e92"
+        sha256 = "b" * 64
+        self.assertEqual(sha1, check_expected_sha(sha1, "expectedBaseSha"))
+        self.assertEqual(sha256, check_expected_sha(sha256, "expectedBaseSha"))
+        self.assertEqual(
+            sha1.upper(), check_expected_sha(f"  {sha1.upper()}  ", "expectedBaseSha")
+        )
 
 
 class StoreTest(unittest.TestCase):
