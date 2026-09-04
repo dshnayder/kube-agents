@@ -1381,14 +1381,30 @@ The boundary is also a security boundary, and it is worth stating as a
 prohibition because every item is something a forge package could plausibly want
 to do:
 
-| A forge may not         | Because                                                          |
-| ----------------------- | ---------------------------------------------------------------- |
-| run a subprocess        | it declares `transport`; the broker constructs and executes it   |
-| choose a scratch path   | path containment is the broker's invariant and is tested there   |
-| set a timeout           | a forge could set it to zero and hang the proxy                  |
-| bypass the size ceiling | the bundle limit is a resource bound, not a policy a forge tunes |
+| A forge may not         | Because                                                                                             |
+| ----------------------- | --------------------------------------------------------------------------------------------------- |
+| run a subprocess        | every control on what the credentialed process executes lives in one place, and it is not the forge |
+| choose a scratch path   | path containment is the broker's invariant and is tested there                                      |
+| set a timeout           | a forge could set it to zero and hang the proxy                                                     |
+| bypass the size ceiling | the bundle limit is a resource bound, not a policy a forge tunes                                    |
 
-The compressed form: **a forge answers questions, it does not do things.**
+The first row is the load-bearing one, and it is not a style preference. A forge
+package is ordinary Python running inside the process that holds the token, so
+nothing at the language level stops it from calling `subprocess.run` — which is
+exactly why the prohibition has to be stated and tested rather than assumed. On
+`main` today, `CommandExecutor` is the single point where every control on an
+executed command is applied: `ALLOWED_EXECUTABLES` decides what may run at all,
+an argv refusal list closes `--upload-pack` and `--receive-pack`,
+`GIT_ALLOW_PROTOCOL` pins the transports, `GIT_FORCED_CONFIG` outranks every
+config layer, `GIT_EDITOR=false` closes the editor vector, and the timeout and
+output ceilings bound the result. A forge that shells out directly is not
+subject to any of them, and none of those controls would report that they had
+been skipped. The allowlist would become advisory the moment one forge decided
+it needed something the executor did not offer.
+
+So a forge declares `transport` and returns a request; the broker constructs the
+command and `CommandExecutor` runs it. The compressed form: **a forge answers
+questions, it does not do things.**
 `clone_url` returns a URL; it does not clone. `verbs` names what is supported;
 it does not dispatch. A verb returns a request description and translates a
 response; it does not make the call. Holding to that is easy while there is one
