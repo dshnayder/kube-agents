@@ -835,6 +835,42 @@ class TestResolveRepo(WorkspaceTestCase):
             self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
             mock_run.assert_not_called()
 
+    def test_get_managed_repo_entries_treats_a_mounted_dir_with_no_key_as_empty(self):
+        mount = self.tmp_path / "gitops-mount"
+        mount.mkdir()
+        state_file = mount / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_falls_back_when_the_mount_is_absent(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/repo1\\"}]"}}',
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run", return_value=fake_cm) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/repo1"],
+            )
+            mock_run.assert_called_once()
+
+    def test_get_managed_repo_entries_bounds_the_kubectl_fallback(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(["kubectl"], 30)
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_repo_entries()
+            self.assertIn("Timed out", str(caught.exception))
+            self.assertEqual(
+                mock_run.call_args.kwargs["timeout"],
+                gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
+            )
+
     def test_get_managed_github_repos_filters_github_urls(self):
         fake_cm = CompletedProcess(
             args=["kubectl"],

@@ -703,6 +703,7 @@ def extract_github_slug(entry: str) -> str | None:
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
 
 
 def _parse_managed_repos_json(repos_str: str) -> list[dict[str, str]]:
@@ -736,6 +737,15 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             return _parse_managed_repos_json(content)
         except Exception:
             pass
+    elif state_file.parent.is_dir():
+        # The mount is there and the key is not, which is what kubelet projects
+        # for a ConfigMap with no data: an install with nothing registered. That
+        # is a known-empty list, not an unreadable one, and the two get
+        # different answers from callers that gate on the list. Falling through
+        # to kubectl here would turn it into the unreadable one -- the broker
+        # pod has no context of its own to pass, so the fallback fails and every
+        # gated call answers 503 instead of refusing the repository.
+        return []
 
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
@@ -751,9 +761,15 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=GITOPS_STATE_READ_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as e:
         raise RuntimeError("kubectl binary not found in PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"Timed out after {GITOPS_STATE_READ_TIMEOUT_SECONDS}s reading ConfigMap "
+            f"{cfg_name} in namespace {ns}"
+        ) from e
     except subprocess.CalledProcessError as e:
         err_msg = (e.stderr or e.stdout or "").strip()
         raise RuntimeError(
