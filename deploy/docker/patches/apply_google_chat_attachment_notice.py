@@ -172,8 +172,8 @@ PATCHED = '''\
             )
             lines.append(
                 "This one could not be pasted into the thread either: it "
-                "has no text form, is too large to read here, or could not "
-                "be read at all."
+                "has no text form, is too large to read here, could not "
+                "be read at all, or posting it failed partway through."
             )
         else:
             lines.extend([

@@ -270,15 +270,30 @@ class BranchTest(PatchedFixture, unittest.TestCase):
         For a while what replaced it was an offer to paste the contents in
         chat. Since #999 the relay patch does that automatically, so this
         notice is only reached when pasting was already tried and declined --
-        a PNG, a file over the 32 KiB ceiling, bytes that do not decode. An
-        offer to paste is then an invitation the agent cannot honour, so the
-        line gives the reason instead, and the host path below it stays as the
-        one thing the reader can still act on.
+        a PNG, a file over the 32 KiB ceiling, bytes that do not decode, or a
+        paste the API refused partway through. An offer to paste is then an
+        invitation the agent cannot honour, so the line gives the reason
+        instead, and the host path below it stays as the one thing the reader
+        can still act on.
         """
         rendered = self.text(self.relayed_cls)
         self.assertNotIn("Ask me to paste", rendered)
         self.assertIn("could not be pasted", rendered)
         self.assertIn("on the agent host at", rendered)
+
+    def test_a_relay_install_is_told_a_failed_paste_is_one_of_the_reasons(self):
+        """The refused-paste path reaches this notice too, and a reader who
+        retries on it would likely succeed.
+
+        ``google_chat_relay_patch`` routes both a ``send`` that refuses and a
+        ``send`` that raises back here, and on that path the file is a
+        perfectly pasteable text file: none of "no text form", "too large" or
+        "could not be read" is true of it. A 429 at part 2 of a valid 10 KiB
+        ``.md`` would otherwise leave the reader three false reasons and the
+        impression that asking again is pointless.
+        """
+        rendered = self.text(self.relayed_cls)
+        self.assertIn("failed partway through", rendered)
 
     def test_the_flag_is_honoured_when_set_on_the_class_itself(self):
         """How the relay patch actually sets it — on the class it patched.
