@@ -626,11 +626,21 @@ precisely because the shared concept and the forge's model disagree.
 ### The protocol
 
 `/v1/vcs/*` is a separate namespace from `/v1/workspace/*` rather than more
-verbs on it. They are different protocols sharing a transport: workspace routes
-are handle-oriented and stateful across a session, while every vcs route stands
-alone. Folding them together would put a `handle` argument on routes that have
-none and invite a caller to hold one. They share the broker's `workspace_lock`,
-because they share the disk.
+verbs on it. `/v1/workspace/*` exists on the broker today: it is the
+content-passing surface, where the agent never holds a checkout at all but
+`open`s a repository, `read`s and `list`s paths through the broker, and sends
+`{path, bytes}` changes to `commit` and `push` in a tree on the broker's own
+volume. It is gated behind `CREDENTIAL_PROXY_CONTENT_WORKSPACE`, answers 404
+while that is off, and no shipped skill drives it yet. [The
+experiment](#9-the-experiment) measures it as arm B.
+
+The two are different protocols sharing a transport. Workspace routes are
+handle-oriented and stateful across a session — `open` returns a handle every
+later call carries, and the broker holds the tree behind it — while every vcs
+route stands alone: it names a repository, does one thing, and keeps nothing.
+Folding them together would put a `handle` argument on routes that have none and
+invite a caller to hold one. They share the broker's `workspace_lock`, because
+they share the disk.
 
 | Verb                                 | Request                                                    | Response                                              |
 | ------------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
