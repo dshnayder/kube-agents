@@ -55,19 +55,23 @@ import subprocess
 # the module docstring.
 SANDBOX_PRINCIPAL = "hermes"
 
-# The model's own account, and the `principal=` argument every caller but one
-# must not pass. One key authorises both logins, so this is a username on the
-# command line rather than a second credential, and the separation the module
-# docstring describes is the only thing keeping them apart.
+# The model's own account, and the `principal=` argument almost no caller must
+# pass. One key authorises both logins, so this is a username on the command
+# line rather than a second credential, and the separation the module docstring
+# describes is the only thing keeping them apart.
 #
-# `kanban_workspace_gc.py` passes it because the scratch workspaces it removes
-# are `agent:agent 755` to the leaves, so uid 1001 cannot unlink inside them,
-# and the alternative — loosening the modes and the umask in the sandbox image
-# so a shared group could — buys a wider grant than the narrower login does.
-# What makes it safe there does not generalise: that caller consumes no output
-# as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be
-# doing to uid 1000's own files what uid 1000 can already do. A caller that
-# reads a command's output and believes it must use the default.
+# Two callers pass it, both for the same reason: they have to write inside a
+# tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
+# `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
+# writes one profile's kubeconfig. The alternative in either case — loosening
+# the modes so a shared group could reach in — buys a wider grant than the
+# narrower login does, and leaves uid 1001 writing into a tree uid 1000 owns,
+# which is a symlink-follow waiting to happen.
+#
+# What makes it safe there does not generalise: neither caller consumes the
+# command's output as a fact about the cluster, and a `.bashrc` that hijacked
+# either would be doing to uid 1000's own files what uid 1000 can already do. A
+# caller that reads a command's output and believes it must use the default.
 TERMINAL_PRINCIPAL = "agent"
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
@@ -326,7 +330,7 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     """Run `argv` in the sandbox and return the finished process.
 
     `principal` selects the sandbox login and should be left alone; see
-    `TERMINAL_PRINCIPAL` for the single caller that does not.
+    `TERMINAL_PRINCIPAL` for the two callers that do not.
 
     `remote_env` names the variables the command itself needs; they are
     rendered into the remote command line. `local_env` replaces the environment

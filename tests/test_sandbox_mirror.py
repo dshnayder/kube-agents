@@ -665,6 +665,136 @@ class Skeleton(unittest.TestCase):
             sm.push_skeleton(["sh", "-c"], "/proc/nonexistent-and-unwritable", [""])
 
 
+class ClusterIdentities(unittest.TestCase):
+    """The one file AGENT_POD_ONLY holds back and a Cluster Agent still needs.
+
+    cluster_preflight.sh runs over SSH like every other command the agent
+    issues, so the USER.md it reads is the sandbox's copy. Without this push
+    there is no sandbox copy, and preflight reports every Cluster Agent as
+    having no identity. Driven against a real filesystem with `sh -c` as the
+    SSH hop, the way Skeleton and Transfer above are: the quoting is half of
+    what this function does, and a mock for the remote would not test it.
+    """
+
+    def setUp(self):
+        agent = tempfile.TemporaryDirectory()
+        self.addCleanup(agent.cleanup)
+        sandbox = tempfile.TemporaryDirectory()
+        self.addCleanup(sandbox.cleanup)
+        self.agent_home = pathlib.Path(agent.name)
+        self.sandbox_root = pathlib.Path(sandbox.name)
+        self.logged = []
+        patcher = unittest.mock.patch.object(sm, "log", self.logged.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def profile(self, name, identity=None):
+        """A profile home on both sides; its USER.md only on the agent's."""
+        home = f"{sm.PROFILES_DIR}/{name}"
+        (self.agent_home / home).mkdir(parents=True)
+        (self.sandbox_root / home).mkdir(parents=True)
+        if identity is not None:
+            (self.agent_home / home / sm.CLUSTER_IDENTITY_FILE).write_text(identity)
+        return home
+
+    def push(self, homes):
+        sm.push_cluster_identities(
+            ["sh", "-c"], self.agent_home, str(self.sandbox_root), list(homes)
+        )
+
+    def landed(self, home):
+        path = self.sandbox_root / home / sm.CLUSTER_IDENTITY_FILE
+        return path.read_text() if path.exists() else None
+
+    def fail_on_call(self, *args, **kwargs):
+        self.fail(f"a remote call with nothing to deliver: {args}")
+
+    def test_a_cluster_profile_s_identity_crosses(self):
+        home = self.profile("cluster-alpha", "# Cluster alpha\n")
+        self.push(["", home])
+        self.assertEqual("# Cluster alpha\n", self.landed(home))
+
+    def test_every_cluster_profile_crosses_in_one_call(self):
+        homes = [self.profile(f"cluster-{n}", f"identity {n}\n") for n in ("a", "b", "c")]
+        calls = []
+
+        def counting_remote(ssh, command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(ssh, 0, "", "")
+
+        with unittest.mock.patch.object(sm, "remote", counting_remote):
+            self.push(homes)
+        self.assertEqual(1, len(calls), f"one round trip per start, not per profile: {calls}")
+        for name in ("a", "b", "c"):
+            self.assertIn(f"cluster-{name}", calls[0])
+
+    def test_the_persona_of_a_non_cluster_profile_stays_behind(self):
+        # AGENT_POD_ONLY holds USER.md back because it is the persona. Only a
+        # Cluster Agent's copy is an identity stamp, and only it is excepted.
+        platform = self.profile("platform", "# The Platform Agent persona\n")
+        (self.agent_home / sm.CLUSTER_IDENTITY_FILE).write_text("# The machine persona\n")
+        self.push(["", platform])
+        self.assertIsNone(self.landed(platform))
+        self.assertIsNone(self.landed(""))
+
+    def test_a_profile_merely_mentioning_the_prefix_is_not_one(self):
+        home = self.profile("my-cluster-notes", "not an identity\n")
+        self.push([home])
+        self.assertIsNone(self.landed(home))
+
+    def test_a_profile_with_no_identity_yet_is_skipped_without_a_remote_call(self):
+        # create_profile's step 2e runs before the identity is written, so this
+        # is the ordinary case on a scaffold and not an error worth reporting.
+        home = self.profile("cluster-alpha")
+        with unittest.mock.patch.object(sm, "remote", self.fail_on_call):
+            self.push([home])
+        self.assertEqual([], self.logged)
+
+    def test_one_missing_identity_does_not_hold_back_the_others(self):
+        empty = self.profile("cluster-empty")
+        full = self.profile("cluster-full", "identity\n")
+        self.push([empty, full])
+        self.assertIsNone(self.landed(empty))
+        self.assertEqual("identity\n", self.landed(full))
+
+    def test_a_re_scaffolded_identity_replaces_the_stale_one(self):
+        # The transfer's tar refuses to overwrite, deliberately. This must, or
+        # a profile rebuilt against a different cluster keeps answering with
+        # the old one.
+        home = self.profile("cluster-alpha", "cluster: new\n")
+        (self.sandbox_root / home / sm.CLUSTER_IDENTITY_FILE).write_text("cluster: old\n")
+        self.push([home])
+        self.assertEqual("cluster: new\n", self.landed(home))
+
+    def test_the_content_reaches_the_far_side_verbatim(self):
+        # It is written by the scaffold from cluster metadata, so it is not
+        # model-authored, but it does reach a shell as an argument and a
+        # backtick or a $( in a cluster description must stay text.
+        body = "name: `whoami`\ndesc: $(id) 'quoted' \"double\" \\ tail\n"
+        home = self.profile("cluster-alpha", body)
+        self.push([home])
+        self.assertEqual(body, self.landed(home))
+
+    def test_the_delivery_is_logged_so_a_missing_identity_can_be_traced(self):
+        home = self.profile("cluster-alpha", "identity\n")
+        self.push([home])
+        self.assertTrue(
+            any(sm.CLUSTER_IDENTITY_FILE in line and home in line for line in self.logged),
+            f"the push was silent: {self.logged}",
+        )
+
+    def test_a_write_that_fails_raises_rather_than_reporting_success(self):
+        # main() turns this into EXIT_RETRY. Swallowing it would leave preflight
+        # reporting no identity with nothing anywhere saying why.
+        home = f"{sm.PROFILES_DIR}/cluster-alpha"
+        (self.agent_home / home).mkdir(parents=True)
+        (self.agent_home / home / sm.CLUSTER_IDENTITY_FILE).write_text("identity\n")
+        with self.assertRaises(RuntimeError):
+            sm.push_cluster_identities(
+                ["sh", "-c"], self.agent_home, "/proc/nonexistent-and-unwritable", [home]
+            )
+
+
 class MirrorExitCodes(unittest.TestCase):
     """Which failures hold the gateway container down, and which do not.
 

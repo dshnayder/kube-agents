@@ -206,18 +206,18 @@ class CreateProfileTest(unittest.TestCase):
         with mock.patch.object(cap.sandbox_exec, "sandbox_enabled", return_value=True):
             probe = subprocess.CompletedProcess(["test"], 0, "", "")
             with mock.patch.object(cap.sandbox_exec, "run", return_value=probe) as run:
-                self.assertTrue(cap._kubeconfig_landed(missing))
+                self.assertTrue(cap.kubeconfig_landed(missing))
             self.assertEqual(run.call_args[0][0][1:], ["-s", str(missing)])
 
             probe = subprocess.CompletedProcess(["test"], 1, "", "")
             with mock.patch.object(cap.sandbox_exec, "run", return_value=probe):
-                self.assertFalse(cap._kubeconfig_landed(missing))
+                self.assertFalse(cap.kubeconfig_landed(missing))
 
             # A sandbox that went away between the fetch and the check answers
             # nothing, which is not the same as answering yes.
             unavailable = cap.sandbox_exec.SandboxUnavailable("gone")
             with mock.patch.object(cap.sandbox_exec, "run", side_effect=unavailable):
-                self.assertFalse(cap._kubeconfig_landed(missing))
+                self.assertFalse(cap.kubeconfig_landed(missing))
 
     def test_fetches_credentials_over_the_ip_endpoint_by_default(self):
         self.create()

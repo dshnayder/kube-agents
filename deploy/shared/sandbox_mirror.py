@@ -234,6 +234,33 @@ CREDENTIALS = frozenset(
     {"auth.lock", "gke_gcloud_auth_plugin_cache", "kubeconfig.yaml"}
 )
 
+# The one entry above the sandbox needs a copy of, and only inside a Cluster
+# Agent's profile. cluster_preflight.sh reads the project, cluster and location
+# out of it, and it runs in the sandbox like every other command the agent
+# issues -- so with the file left behind, its check 1 reports that the Cluster
+# Agent has no identity, on every profile, forever. Pushed by
+# push_cluster_identities rather than by dropping the name from AGENT_POD_ONLY,
+# which would carry the default profile's USER.md across as well: that one is
+# persona, and the persona stays behind.
+#
+# The copy is on a volume uid 1000 owns, so the model can rewrite it. That does
+# not make preflight weaker than it was: the kubeconfig it checks the identity
+# against sits on the same volume. Preflight tells a broken scaffold from a
+# working one; it is not a control against the model, and never was.
+CLUSTER_IDENTITY_FILE = "USER.md"
+
+# What cluster_agent_profile.profile_name() prefixes every Cluster Agent profile
+# with. A profile named anything else is not one, and its USER.md stays where
+# AGENT_POD_ONLY puts it.
+CLUSTER_PROFILE_PREFIX = "cluster-"
+
+# Overwrites, unlike the tar in transfer(): a re-scaffolded profile's identity
+# has to replace the old one, and a disagreement between the two is exactly the
+# case where the stale copy is the wrong answer. `set -e` so a failed write
+# stops the batch instead of leaving the exit status to whichever write ran
+# last. printf with the content as an argument, never as the format string.
+IDENTITY_WRITE_SHELL = "printf '%s' {content} > {path}"
+
 # Handled by recursion rather than excluded: each profile home is walked with
 # the same rules and its contents land under profiles/<name>/ on the far side.
 PROFILES_DIR = "profiles"
@@ -334,6 +361,28 @@ DEFAULT_SSH_USER = "agent"
 # behind `--wait` is what covers a sandbox still being scheduled.
 CONNECT_TIMEOUT_SECONDS = 10
 
+# Keepalives on the established session, matching sandbox_exec.py. 45 seconds
+# of silence from a pod that was evicted mid-transfer ends the call instead of
+# leaving it to the far side's TCP.
+SERVER_ALIVE_INTERVAL_SECONDS = 15
+SERVER_ALIVE_COUNT_MAX = 3
+
+# The ceiling on any single ssh call, and the reason it exists is the far side
+# rather than the network. sshd runs the login shell for a non-interactive
+# command too, so it sources ~/.bashrc -- a file the sandbox image deliberately
+# leaves writable by the model. A `sleep infinity` at the top of it makes every
+# call here hang forever, and this script runs in the gateway's entrypoint
+# before `exec "$@"`, so the hang is the whole agent, permanently, across
+# restarts. Neither ConnectTimeout nor the keepalives above cover it: the
+# connection is healthy and the command is simply not returning. Generous
+# because a real mirror of a large profile tree legitimately takes minutes.
+SSH_CALL_TIMEOUT_SECONDS = 600
+
+# The shorter ceiling for the liveness probe, which runs `true` and nothing
+# else. A probe that takes longer than a connection setup is not a slow
+# transfer, it is the hang above, and the retry loop has its own deadline.
+SSH_PROBE_TIMEOUT_SECONDS = 30
+
 # How long `--wait` waits by default: three minutes, which covers a sandbox
 # StatefulSet pulling its image on a cold node.
 DEFAULT_WAIT_SECONDS = 180
@@ -403,10 +452,32 @@ def ssh_base_command(
         "ssh",
         "-p",
         port,
+        # No user ssh config, the same rule sandbox_exec.py states for the same
+        # connection. OpenSSH reads ~/.ssh/config from the passwd entry's home
+        # directory and ignores $HOME, and this process's uid has /opt/data --
+        # the gateway PVC -- as its pw_dir. A config file planted there could
+        # redirect this connection or hand it a ProxyCommand, and it would run
+        # during the entrypoint, before Hermes starts, in the pod that holds the
+        # profile keys and the sandbox private key.
+        "-F",
+        "/dev/null",
         "-o",
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=accept-new",
+        # Offer only the key named below. Without it ssh also tries whatever
+        # agent or default identity it can find, which is how -F /dev/null gets
+        # quietly undone by a key file that appears next to the config it just
+        # stopped reading.
+        "-o",
+        "IdentitiesOnly=yes",
+        # A connection to a pod that went away mid-transfer otherwise sits
+        # half-open until the far side's TCP gives up. ConnectTimeout covers
+        # only the handshake; these cover the session after it.
+        "-o",
+        f"ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}",
+        "-o",
+        f"ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}",
         f"-o=ConnectTimeout={connect_timeout}",
     ]
     if key:
@@ -425,13 +496,28 @@ def wait_for_sandbox(ssh: list[str], deadline: float) -> bool:
     attempt = 0
     while True:
         attempt += 1
-        result = subprocess.run(
-            ssh + ["true"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode == 0:
+        try:
+            result = subprocess.run(
+                ssh + ["true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=SSH_PROBE_TIMEOUT_SECONDS,
+            )
+            returncode = result.returncode
+            stderr = result.stderr
+        except subprocess.TimeoutExpired:
+            # The connection succeeded and `true` did not return, which is the
+            # far side's shell startup hanging rather than a sandbox that is
+            # not up yet. Treated as a failed attempt so the deadline still
+            # bounds the loop.
+            returncode = 1
+            stderr = (
+                f"the sandbox accepted the connection but did not answer within "
+                f"{SSH_PROBE_TIMEOUT_SECONDS}s"
+            )
+        if returncode == 0:
             if attempt > 1:
                 log(f"sandbox answered on attempt {attempt}")
             return True
@@ -439,20 +525,47 @@ def wait_for_sandbox(ssh: list[str], deadline: float) -> bool:
         if remaining <= 0:
             log(
                 "sandbox did not answer before the deadline "
-                f"({result.stderr.strip() or 'no error output'}); "
+                f"({stderr.strip() or 'no error output'}); "
                 "the next container start will retry"
             )
             return False
         time.sleep(min(5.0, max(0.5, remaining)))
 
 
-def remote(ssh: list[str], command: str, *, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        ssh + ["--", command],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+class RemoteTimeout(RuntimeError):
+    """An ssh call connected and then never returned.
+
+    Its own type because the caller answers it with EXIT_RETRY rather than
+    EXIT_FATAL: the far side's shell startup is something a human can fix by
+    recycling the sandbox pod, and holding the gateway down for it turns a
+    broken shell into a broken agent.
+    """
+
+
+def remote(
+    ssh: list[str],
+    command: str,
+    *,
+    check: bool = True,
+    timeout: int = SSH_CALL_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess:
+    try:
+        result = subprocess.run(
+            ssh + ["--", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Not strict UTF-8. The far side's shell startup files are writable
+            # by the model, so one non-UTF-8 byte echoed from ~/.bashrc would
+            # otherwise raise UnicodeDecodeError out of the decode and take the
+            # whole mirror down on every start.
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteTimeout(
+            f"remote command did not return within {timeout}s: {command}"
+        ) from exc
     if check and result.returncode != 0:
         raise RuntimeError(
             f"remote command failed ({result.returncode}): {command}\n{result.stderr.strip()}"
@@ -512,6 +625,50 @@ def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
                 "know what put it there."
             )
     log(f"skeleton in place for {len(homes)} home(s): {', '.join(h or '<machine>' for h in homes)}")
+
+
+def push_cluster_identities(
+    ssh: list[str], agent_home: Path, remote_root: str, homes: list[str]
+) -> None:
+    """Put every Cluster Agent's identity file on the sandbox's volume.
+
+    Runs alongside the skeleton, on every start and on every scaffold, because
+    both are cases where the sandbox has a profile home and nothing in it: a
+    recreated sandbox volume, a profile created after the last start, a
+    re-scaffold that corrected an identity. Overwrites, for the last of those.
+
+    One remote call for the whole set. Nine cluster profiles is nine SSH round
+    trips otherwise, on a path that runs on every container start, and the
+    files are a few hundred bytes each.
+
+    A profile whose USER.md is missing is skipped without comment: the scaffold
+    writes it last, so this legitimately runs before it exists (the scaffold's
+    step 2e) and again after (its step 5).
+    """
+    writes: list[str] = []
+    pushed: list[str] = []
+    prefix = f"{PROFILES_DIR}/{CLUSTER_PROFILE_PREFIX}"
+    for home in homes:
+        if not home.startswith(prefix):
+            continue
+        try:
+            content = (agent_home / home / CLUSTER_IDENTITY_FILE).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        writes.append(
+            IDENTITY_WRITE_SHELL.format(
+                content=shlex.quote(content),
+                path=shlex.quote(f"{remote_root}/{home}/{CLUSTER_IDENTITY_FILE}"),
+            )
+        )
+        pushed.append(home)
+    if not writes:
+        return
+    remote(ssh, "\n".join(["set -e", *writes]))
+    log(
+        f"delivered {CLUSTER_IDENTITY_FILE} to {len(pushed)} cluster profile(s): "
+        + ", ".join(pushed)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -723,7 +880,20 @@ def transfer(ssh: list[str], agent_home: Path, remote_root: str, paths: list[str
         )
         assert source.stdout is not None
         source.stdout.close()
-        sink_out, sink_err = sink.communicate()
+        try:
+            sink_out, sink_err = sink.communicate(timeout=SSH_CALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            # Kill both ends. Leaving the local tar running would hold the
+            # pipe, and leaving the ssh client running would hold the
+            # entrypoint that is about to exit.
+            sink.kill()
+            source.kill()
+            sink.communicate()
+            source.communicate()
+            raise RemoteTimeout(
+                f"the transfer into the sandbox did not finish within "
+                f"{SSH_CALL_TIMEOUT_SECONDS}s"
+            ) from exc
         if source.stderr:
             source_err = source.stderr.read()
             source.stderr.close()
@@ -882,6 +1052,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_RETRY
 
+    # Same trade, one step later and for the same reasons: the sandbox can go
+    # away between the skeleton push and this, and nothing here is destructive.
+    # A Cluster Agent whose identity did not land reports a failed preflight and
+    # blocks its card, which is loud and recoverable; a gateway held down is
+    # neither.
+    try:
+        push_cluster_identities(ssh, agent_home, args.remote_root, homes)
+    except (RuntimeError, OSError) as exc:
+        log(
+            f"could not deliver {CLUSTER_IDENTITY_FILE} into the sandbox: {exc}. "
+            "Starting anyway and leaving it for the next start; a Cluster Agent "
+            "without it fails preflight check 1 rather than working on the wrong "
+            "cluster."
+        )
+        return EXIT_RETRY
+
     if args.skeleton_only:
         return EXIT_OK
 
@@ -991,4 +1177,14 @@ if __name__ == "__main__":
     if shutil.which("tar") is None:
         log("no tar on PATH; cannot move files to the sandbox")
         sys.exit(EXIT_FATAL)
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except RemoteTimeout as exc:
+        # Not every remote() call in main() sits inside a try. An uncaught
+        # exception exits 1, which is EXIT_FATAL, which holds the gateway
+        # container down -- and a sandbox whose shell startup hangs is the one
+        # thing the model itself can arrange, so that would be a way to stop
+        # the agent for good. Retry instead: the next start tries again, and a
+        # human recycling the sandbox pod is what actually clears it.
+        log(f"{exc}. Leaving it for the next start.")
+        sys.exit(EXIT_RETRY)
