@@ -61,9 +61,9 @@ broker, so GitLab as written today would be an edit to GitHub's file.
 
 | Layer                     | Where it goes                                                             |
 | ------------------------- | ------------------------------------------------------------------------- |
-| The forge packages        | `agents/platform/scripts/forges/{github,gitlab}/`                         |
-| The shared contract       | `forges/base.py`, `validate.py`, `errors.py`, `identity.py`, `transport.py`, `credentials.py` |
-| Registration              | `forges/registry.py` — the one shared file a new forge edits              |
+| The forge packages        | `agents/platform/scripts/providers/{github,gitlab}/`                         |
+| The shared contract       | `providers/base.py`, `validate.py`, `errors.py`, `identity.py`, `transport.py`, `credentials.py` |
+| Registration              | `providers/registry.py` — the one shared file a new forge edits              |
 | The broker                | `vcs_broker.py`, with no forge name left in it                            |
 | Its credential            | a `Credential` strategy the forge owns, over a projected Secret           |
 | Which hosts are GitLab's  | operator configuration, rendered into the broker's environment            |
@@ -82,7 +82,7 @@ stop as soon as they have what they came for; an agent should read all of it.
 | [The interface, revised](#the-interface-revised)    | the seam after those decisions                                          |
 | [The GitLab package](#the-gitlab-package)           | identity, credentials, translation, errors                              |
 | [What is not built](#what-is-not-built)             | the limits this ships with, deliberately                                |
-| [Delivery](#delivery)                               | the order, and what each step can be tested against                     |
+| [Delivery](#delivery)                               | the three PRs, and how they survive work in flight not landing          |
 | [Open questions](#open-questions)                   | what is still undecided                                                 |
 
 ---
@@ -124,7 +124,7 @@ and the interface changes below.
 The second is right. The first is true and misleading: GitLab has no
 App-installation flow because it does not need one. A **group access token** is
 created once by an administrator, scoped to a group and everything under it,
-and does not expire on an hourly cycle. `Forge.mint` already defaults to doing
+and lasts up to a year rather than an hour. `Forge.mint` already defaults to doing
 nothing, and its docstring already anticipates this —
 
 > a forge configured with a long-lived personal token has nothing to do here
@@ -370,7 +370,7 @@ GitHub" stops having a one-file answer.
 ```text
 agents/platform/scripts/
   vcs_broker.py            # broker verbs, clone/publish, scratch, locking, routes
-  forges/
+  providers/
     __init__.py            # the public surface: Forge, ForgeUnsupported, resolve_forge
     base.py                # Forge ABC, ForgeUnsupported, StubForge, normalised shapes
     validate.py            # the seven validators
@@ -385,7 +385,7 @@ agents/platform/scripts/
       __init__.py  forge.py  translate.py  fixtures/
 ```
 
-The split is by *who owns the decision*. `forges/` holds everything a forge
+The split is by *who owns the decision*. `providers/` holds everything a forge
 needs to be written against; a forge package holds everything only that forge
 knows. `vcs_broker.py` keeps what is true regardless of forge — the workspace
 lock, the scratch tree, the bundle size ceiling, the route table — and after the
@@ -407,7 +407,7 @@ or four, and their hostnames come from configuration.
 Resolved by making the class, not the registry, answer "how many of me exist":
 
 ```python
-# forges/registry.py — the one shared file a new forge edits
+# providers/registry.py — the one shared file a new forge edits
 from .github import GitHubForge
 from .gitlab import GitLabForge
 
@@ -435,10 +435,10 @@ it into something that fails CI.
 **An import-boundary test**, `ast`-parsing every module under
 `agents/platform/scripts/` and asserting three rules:
 
-1. No module outside `forges/` imports `forges.<name>` — only `forges` itself.
+1. No module outside `providers/` imports `providers.<name>` — only `providers` itself.
 2. `registry.py` is the sole exception, and only for names in `AVAILABLE`.
 3. A forge package imports only
-   `forges.{base,validate,errors,identity,transport,credentials}`
+   `providers.{base,validate,errors,identity,transport,credentials}`
    and the standard library. Not the broker, not another forge.
 
 Rule 3 is the one that matters. It is what makes "Bitbucket cannot reach into
@@ -448,7 +448,7 @@ it is the reason the shared modules have to be genuinely forge-neutral: if
 heuristics through the front door and the test would not notice.
 
 **A forge-name guard**, which the import test cannot catch: the string `github`
-must not appear in `vcs_broker.py` or in any module directly under `forges/`.
+must not appear in `vcs_broker.py` or in any module directly under `providers/`.
 An `if host == "github.com":` needs no import. This is a grep, it is crude, and
 crude is the point — it is the check that catches the special case someone adds
 at 6pm.
@@ -520,7 +520,7 @@ produces a `mint()` that does nothing and a `refresh` argument nobody uses.
 constructs and owns:**
 
 ```python
-# forges/credentials.py — shared, forge-neutral
+# providers/credentials.py — shared, forge-neutral
 class Credential(Protocol):
     def ensure(self, repo: str) -> None: ...
     def headers(self, repo: str) -> dict[str, str]: ...
@@ -602,7 +602,7 @@ GitLab in ways this design did not anticipate:
 | `workspace/repo` slugs, and a UUID form | `parse`, `clone_url` in its own package     | none                |
 | pull requests, not MRs; comments are on an `/comments` sub-resource | `translate.py` in its own package | none  |
 | app passwords / API tokens, Basic auth not a bearer header | `git_config`, and the token file it reads | none            |
-| no issue tracker on many workspaces | `verbs` omitting the four issue verbs, `ForgeUnsupported` for free | none |
+| no issue tracker on many workspaces | `verbs` omitting the four issue verbs, `ForgeUnsupported` for free — **but see [below](#not-every-provider-is-a-forge)** | none |
 | `values`/`page`/`size` pagination, not `Link` headers | its own translation of listings | none  |
 | 401 where GitHub 404s on a private repo | `forge_error(status, detail)` with its own status extraction | none |
 
@@ -613,6 +613,56 @@ GitHub's 401 means "credential expired". Guidance keyed only on status is
 therefore not fully forge-neutral. The narrow fix is a per-forge override map
 merged over the shared table, which stays inside the forge package; that is
 cheap and it should be written when Bitbucket lands, not speculatively now.
+
+### Not every provider is a forge
+
+The Bitbucket row above says "no issue tracker" is free, absorbed by `verbs`
+omitting the issue verbs. That is true and it is not the whole answer, because
+a Bitbucket install usually *does* have an issue tracker — it is Jira, on a
+different host, behind a different credential.
+
+**Jira is not designed here and is not on the delivery plan.** What belongs in
+this document is the one assumption it breaks, because that assumption is cheap
+to avoid now and expensive to unpick later.
+
+Everything above assumes **one repository resolves to one provider that answers
+every verb**. `resolve_forge(repository)` returns a single object; the routing
+key is the repository's host; `parse` returns a repository. All three are false
+for an issue tracker:
+
+| Assumption                            | Why Jira breaks it                                        |
+| ------------------------------------- | ----------------------------------------------------------- |
+| the routing key is the repository host | Jira's host has nothing to do with the code host            |
+| one provider answers every verb        | proposals come from Bitbucket, issues from Jira, at once     |
+| `parse` yields a repository            | a Jira issue is `PROJ-123` and belongs to no repository      |
+
+So the general shape is not "a forge" but **capabilities bound to a project
+context**: code hosting and proposals from one provider, issue tracking from
+another, which today happen to be the same object for GitHub and GitLab.
+
+**What this design does about it now: two things, both nearly free.**
+
+1. **Resolution returns a binding, not a forge.** `resolve(repository)` yields a
+   small object with a provider per capability group, rather than one provider.
+   For GitHub and GitLab every group points at the same instance and nothing
+   observable changes. Adding Jira later is then a configuration entry and a new
+   package, not a change to how every caller resolves.
+2. **The directory is `providers/`, not `providers/`.** "Forge" is the right word
+   for GitHub, GitLab and Bitbucket and the wrong one for an issue tracker.
+   Renaming a package with three implementations in it is churn nobody will
+   schedule; naming it correctly before the first one lands costs a keystroke.
+   `multi-forge-support.md` already says "provider" throughout, so this also
+   settles a vocabulary split rather than creating one.
+
+**What it does not do:** no Jira package, no second credential plane, no
+declarative surface for "issues live over there", and no split of the protocol
+into capability groups beyond what `verbs` already expresses. Those are a
+design of their own, and the first install that needs one will specify it better
+than speculation would.
+
+The point of naming it here is narrow: **whoever reviews the first provider
+package should know that "one host, one provider, all verbs" is a convenience of
+the first three forges and not a property of the domain.**
 
 What the table shows is that five of six differences land in the forge's own
 directory with no shared edit, and the sixth needs one shared mechanism that is
@@ -684,7 +734,7 @@ headers and does not need the heuristic.
 
 ## The GitLab package
 
-Everything below lives in `forges/gitlab/` and is imported by exactly one line
+Everything below lives in `providers/gitlab/` and is imported by exactly one line
 outside it, in `registry.py`.
 
 ### Repository identity
@@ -722,14 +772,40 @@ credential-proxy container as a file.
 `GitLabForge.credential` is a `StaticFileCredential`, and all three of its
 methods are decided by that one sentence:
 
-- `ensure()` does nothing. The token is long-lived; there is no acquisition
-  step, no minter, no KMS key and no policy ConfigMap.
+- `ensure()` does nothing. There is no acquisition step, no minter, no KMS key
+  and no policy ConfigMap.
 - `headers()` reads the file at call time and returns `PRIVATE-TOKEN`.
 - `git_config()` returns the credential-helper pin from
   [above](#gits-credential-has-no-seam), which reads the same file.
 
 This is the whole GitLab credential story, and it is nine lines in
-`forges/gitlab/`. Nothing outside that directory knows GitLab has a token.
+`providers/gitlab/`. Nothing outside that directory knows GitLab has a token.
+
+**"Long-lived" is not "permanent," and the difference has to be designed for.**
+GitLab requires every access token to carry an expiry; an unset one defaults to
+365 days, and the ceiling is 400. So the token does not go stale between calls —
+which is why `ensure()` is still right to do nothing — but it does expire once a
+year, with no automatic recovery and no warning from anything in this system.
+
+Two consequences, both small and both easy to omit:
+
+- **Rotation is an operator action**, and it works: the administrator updates
+  the Secret, the projected file changes, and the next call reads the new value
+  with no restart. That is the per-call file read earning its keep.
+- **A GitLab 401 needs its own guidance string.** The shared table maps 401 to
+  GitHub's meaning — the credential expired and a refresh will fix it — which
+  for GitLab is advice to do something no code path implements. GitLab's 401
+  should say the group access token may have expired and name the Secret. This
+  is the per-forge guidance override that
+  [the Bitbucket check](#checking-it-against-bitbucket) predicted would be
+  needed; GitLab needs it first.
+
+One more property of the token that belongs here because it surfaces elsewhere:
+**a group access token authenticates as a bot user** that GitLab creates with
+it. Anything that asks "did the agent write this?" — the branch-prefix and
+`agent:ignore` rules, `viewer_login`, comment attribution — resolves to that bot
+on GitLab, not to a human account. It is not a problem, but it is a fact the
+agent-side policy has to be told rather than infer.
 
 Reading from the file per call rather than caching at construction is
 deliberate: a rotated Secret updates the projected file, and the next call picks
@@ -847,7 +923,7 @@ surprise:
   [`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md)
   §5 also decides and for the same reason. Bitbucket will revisit this — its
   tokens do come from a refresh flow — and the point of the strategy is that
-  doing so is a third `Credential` implementation in `forges/bitbucket/`, not a
+  doing so is a third `Credential` implementation in `providers/bitbucket/`, not a
   change to GitLab's or GitHub's.
 
 ## Delivery
@@ -858,6 +934,57 @@ title.** This follows the merged design's constraint —
 §9, *"no-behaviour-change before behaviour change"* and *"everything provable on
 GitHub, before anything that needs GitLab"* — and it is also what makes the
 modularity claim falsifiable rather than aspirational.
+
+### Sequencing against work already in flight
+
+There are two forge abstractions being built at once. This one is broker-side.
+The other is `forge.py`, agent-side, which `multi-forge-support.md` §4 widens
+and migrates four consumers onto, and which has a draft stack behind it
+(#1159, #1161, #1234, #1241). Both have a provider protocol, a GitHub
+implementation, a host resolver, a repository parser, an error taxonomy and a
+`(HTTP nnn)` regex. **The decision is that there is one implementation, not
+two.**
+
+The sequencing constraint is not that stack — it is a draft, and a plan that
+waits on a draft has no trigger. It is this:
+
+> **`vcs_broker.py` is not on `main`.** It exists only on the abstraction
+> branch. The duplication therefore does not exist yet, and comes into being
+> only if that branch merges as-is.
+
+So the strategy depends on the *merged* design and not on anyone's draft code:
+
+- **PR 1 builds `providers/` against `multi-forge-support.md`**, which is merged
+  and is the contract. Nothing in it needs a draft to land.
+- **The abstraction branch must not merge ahead of PR 1.** That is the one hard
+  ordering rule here. Merging it first puts a second `GitHubForge` on `main`,
+  and PR 1 becomes an argument about deleting someone's merged code instead of
+  a refactor.
+- **If the draft stack lands first**, PR 1 folds `forge.py` in and the four
+  consumer migrations come along for free — they are needed under any layout and
+  are worth having regardless of who writes them.
+- **If it never lands**, PR 1 is the only implementation, and the consumer
+  migration happens against `providers/` whenever someone picks it up.
+
+Either branch of that is fine, which is the property being bought. What is *not*
+fine is a third state where both merge independently.
+
+**Best of both, if the stack does land.** These are the pieces worth taking from
+each side rather than reconciling by seniority:
+
+| From `forge.py`                                       | From `vcs_broker.py`                                   |
+| ----------------------------------------------------- | -------------------------------------------------------- |
+| `RepoRef` as a value type, not an `owner/name` string | `ForgeUnsupported` → 501, and `verbs`                    |
+| typed `PullRequest`/`Comment`/`Commit`/`Issue`        | `capabilities(repo)` answered with no token and no network |
+| the executable-allowlist derivation (leak 7)          | the status-to-guidance table                              |
+| the wider verb surface the skills actually need       | the seven validators                                      |
+| agent policy kept above the provider                  | `clone_url` composed from validated segments only         |
+|                                                       | the `Credential` strategy, and this package layout        |
+
+The two halves need each other more than either reads alone: a union protocol is
+roughly thirty methods, which is unimplementable without `verbs` and
+`ForgeUnsupported` to make partial support a first-class answer — and the eight
+broker verbs are too narrow to serve the skills. Neither is the superset.
 
 ### PR 1 — the abstraction, with GitHub behind it
 
@@ -871,32 +998,36 @@ existing behaviour unchanged.
 | 3    | `forge_error(status, detail)` split; `_THROTTLE_MARKERS` onto GitHub      | existing error tests, unchanged behaviour        |
 | 4    | `Credential` protocol; `BrokeredCredential`; `mint` deleted; `git_config` on the credential | new test that the config reaches the git invocation |
 | 5    | generic refresh in `credential_proxy.py`; validation moves to `parse`     | existing refresh tests, plus a nested-namespace case |
-| 6    | **the package split** — `forges/` and `forges/github/`, imports only      | existing tests, unchanged behaviour               |
+| 6    | **the package split** — `providers/` and `providers/github/`, imports only      | existing tests, unchanged behaviour               |
 | 7    | the import-boundary test and the forge-name guard                         | they are the test                                 |
 | 8    | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded | the GitHub suite, passing through the new harness  |
 | 9    | `AVAILABLE` + `for_config`; `FORGES`/`HOSTS` from `build_forges`; stubs retained | new registry tests                          |
+| 10   | `resolve` returns a per-capability binding, not a bare forge              | existing tests; see [Not every provider is a forge](#not-every-provider-is-a-forge) |
 
 **Exit criteria — falsifiable, and worth putting in the PR description:**
 
 - `grep -ci github agents/platform/scripts/vcs_broker.py` returns 0, and the
-  same for every module directly under `forges/`.
+  same for every module directly under `providers/`.
 - The pre-existing broker test suite passes with no assertions edited.
 - `credential_proxy.py` contains no forge name on the VCS path.
 - The import-boundary test passes, and fails if you add
-  `from forges.github import …` to the broker.
+  `from providers.github import …` to the broker.
+- There is exactly one GitHub implementation in the tree.
 
-The last one matters most. Anyone can produce the directory layout; the test is
-what says it will still be the layout in six months.
+The fourth matters most. Anyone can produce the directory layout; the test is
+what says it will still be the layout in six months. The fifth is the one this
+whole sequence exists to protect.
 
 ### PR 2 — GitLab
 
 | Step | Change                                                                    | Tested by                                       |
 | ---- | ------------------------------------------------------------------------- | ------------------------------------------------- |
-| 10   | `HttpTransport` — timeout, size cap, redaction, status mapping            | unit tests against a local stub server           |
-| 11   | `forges/gitlab/` — identity, `StaticFileCredential`, translation, errors  | the PR-1 harness, with GitLab fixtures           |
-| 12   | one line in `registry.py`                                                 | registry tests                                   |
-| 13   | operator: render the GitLab config, project the Secret, widen egress      | operator tests                                   |
-| 14   | live validation                                                           | see below                                        |
+| 11   | `HttpTransport` — timeout, size cap, redaction, status mapping            | unit tests against a local stub server           |
+| 12   | `providers/gitlab/` — identity, `StaticFileCredential`, translation, errors  | the PR-1 harness, with GitLab fixtures           |
+| 13   | GitLab's 401 guidance override (the token expiry case)                    | error tests                                      |
+| 14   | one line in `registry.py`                                                 | registry tests                                   |
+| 15   | operator: render the GitLab config, project the Secret, widen egress      | operator tests                                   |
+| 16   | live validation                                                           | see below                                        |
 
 `HttpTransport` is here rather than in PR 1 deliberately: PR 1 declares the
 `transport` seam and implements only the one GitHub uses. A transport with no
@@ -906,7 +1037,7 @@ of the sequence is to stop guessing.
 ### PR 3 — Bitbucket
 
 Not designed here. What belongs in this document is the **measure**: PR 3 should
-touch `forges/bitbucket/`, one line of `registry.py`, and the operator's
+touch `providers/bitbucket/`, one line of `registry.py`, and the operator's
 configuration — and nothing else. Every shared file it turns out to need is a
 place the seam was in the wrong spot, and
 [the Bitbucket check](#checking-it-against-bitbucket) already predicts one such
@@ -920,41 +1051,54 @@ being in PR 1 rather than waiting for a third forge to prove the point.
 ### Where this gets validated
 
 No environment here has a GitLab. The endpoint-level claims marked
-*live-verify* above cannot be closed without one, and neither can step 14. **PR
+*live-verify* above cannot be closed without one, and neither can step 16. **PR
 1 needs none of it**, which is most of the reason the sequence is shaped this
 way: the abstraction is not held hostage to an environment question.
 
-The cheapest sufficient answer is a **gitlab.com project under a throwaway
-group with a group access token** — it exercises the credential path, the
-namespace nesting, `iid` handling, notes filtering and the real error shapes.
-It does not exercise the customer-chosen hostname, the private CA, or the
-egress policy for a host that is not in any repository literal.
+Three options, and the middle one is the recommendation:
 
-A **self-managed GitLab CE in the development cluster** exercises all of it,
-including the parts most likely to break at a customer, at the cost of standing
-infrastructure. This is the same question
-[`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md) §10 asks and it should be
-answered once for both.
+| Option                                    | Footprint                        | What it does not cover                     |
+| ----------------------------------------- | -------------------------------- | ------------------------------------------ |
+| a gitlab.com project under a throwaway group | none                          | customer hostname, private CA, egress rule |
+| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs                 |
+| the GitLab Helm chart                     | ≥8 vCPU / 30 GB cluster          | nothing — and it costs the most            |
 
-Recommendation: gitlab.com for steps 11–13, and treat self-managed as a
-prerequisite for calling GitLab supported rather than for merging the package.
+The omnibus image is the Linux package in a container: PostgreSQL, Redis,
+Sidekiq, Gitaly and NGINX all inside one pod, configured through
+`GITLAB_OMNIBUS_CONFIG` and three volumes. That matters because the Helm chart
+**removed its bundled PostgreSQL, Redis and MinIO in GitLab 19.0** — the chart
+now expects those to be supplied, which turns "stand up a test GitLab" into
+"stand up a test GitLab and three datastores."
+
+One pod is enough to exercise everything gitlab.com cannot: an `external_url`
+that appears in no shipped literal, a self-signed or private CA, and the egress
+path for a host the operator has to render. Everything this design needs from
+GitLab is Free-tier — merge requests, issues, notes, API v4, and group access
+tokens, which on self-managed are available with any licence.
+
+Recommendation: an omnibus GitLab CE container in the development cluster for
+steps 12–15. If standing infrastructure is the blocker, the same image runs
+ephemerally in a CI job for the API-shape and credential tests, and the
+long-lived instance is deferred to whenever the hostname, CA and egress work
+lands. gitlab.com is not on the path at all — it costs nothing but it also
+proves the least. This is the same question
+[`multi-forge-support.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/multi-forge-support.md)
+§10 asks, and it should be answered once for both.
 
 ## Open questions
 
-1. **Whether `forges/` and `forge.py` become one thing.** This is the largest
-   one, and it is not GitLab-specific. There are two forge abstractions in
-   flight: this one, broker-side, for the eight collaboration verbs; and
-   `forge.py`, agent-side, which `multi-forge-support.md` §4 widens and migrates
-   three more consumers onto. Both dispatch on provider, both need repository
-   identity, both need a credential. They should probably converge on the
-   package layout described here, with the agent-side consumers becoming another
-   caller — but that is a claim, not a decision, and it needs the owners of both
-   documents in a room. Issue #1154 is where it is tracked.
+1. ~~**Whether `providers/` and `forge.py` become one thing.**~~ **Decided:
+   one implementation.** See
+   [Sequencing against work already in flight](#sequencing-against-work-already-in-flight)
+   for what that means for the draft stack and for the abstraction branch. What
+   remains open is only the coordination — who rebases what, and when — which is
+   tracked on issue #1154 rather than settled here.
 2. **Where the forge configuration is declared.** This design states what the
    broker must receive; `multi-forge-support.md` §6 owns the CR surface —
    `spec.integration.git` with a provider, a host and a repository. The two have
-   to agree before step 13, and the Go half of that surface is that design's
-   step 2, ahead of anything here.
+   to agree before step 15, and the Go half of that surface is that design's
+   step 2. #1159 is the draft that does it, so this is a dependency on work that
+   may or may not land — if it does not, PR 2 carries the CRD change itself.
 3. **Whether `allowed_paths` is this design's field or the shared surface's.**
    GitHub gets the same boundary from Minty's policy ConfigMap.
    `multi-forge-support.md` §10 asks this twice — as "can one field name the
