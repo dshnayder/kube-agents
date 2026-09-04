@@ -519,9 +519,16 @@ the shim is what makes that failure impossible rather than merely ordered
 against: with one git in the image, a missed prepend is a `git: not found` at the
 first call, not a silent forward to the wrong container.
 
-A build guard fails the image when `command -v git` finds a native binary:
-neither directory is on the build PATH, so the guard sees the shim. A second
-guard runs beside it and proves the local binary cannot reach a
+A build guard fails the image when a bare `command -v git` resolves to anything
+at all. That is not a contradiction of shipping git: the guard's subject is
+placement, not presence. `/opt/vcs/bin` is deliberately absent from the default
+PATH, so the hardened binary is invisible to a bare lookup by design, and
+anything a bare lookup _does_ find got there by another route — a package left
+behind by a build stage, or a shim — and is by construction not the git this
+section describes. The guard runs beside the existing one that fails the image
+on a stray `gcloud`, `kubectl` or `gh`, and for the same reason.
+
+A second guard proves the shipped binary cannot reach a
 network. The four transports that dial a host — `git-remote-http` and the
 `-https`, `-ftp` and `-ftps` symlinks to it — are deleted from
 `/usr/lib/git-core`, and the guard fails the build if any is back and then runs
