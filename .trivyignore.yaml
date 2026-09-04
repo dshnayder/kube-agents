@@ -55,6 +55,21 @@ misconfigurations:
     paths:
       - "k8s-operator/config/rbac/**"
 
+  # Ignore KSV-0041: manager-role holds `get` on secrets and nothing else.
+  # checkShellSandboxKeys is the only caller and it asks whether the sandbox's
+  # authorized-keys Secret exists, so the CR can report a missing one instead of
+  # leaving the pod in ContainerCreating with the cause on an object nobody is
+  # looking at. It reads no value out of a Secret, and the operator creates that
+  # Secret nowhere. There is no API for "does this object exist" narrower than
+  # `get`, so the grant cannot be reduced further.
+  # This exemption covers every rule in the directory, because `paths` is the
+  # only scoping trivy offers. tests/test_operator_secrets_grant.py is what
+  # replaces the check: it fails if the verb set grows past `get`, if a second
+  # rule names secrets, or if this exemption widens past the rbac directory.
+  - id: KSV-0041
+    paths:
+      - "k8s-operator/config/rbac/**"
+
   # Ignore KSV-0118: sample manifests, testdata, and kustomize overlays do not define full security contexts
   - id: KSV-0118
     paths:
