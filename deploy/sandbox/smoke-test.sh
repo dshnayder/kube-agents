@@ -627,6 +627,29 @@ check "the displaced directory kept its contents" "the model put this here" \
   "$("${SSH[@]}" 'cat /opt/data/.sandbox.displaced-*/kept' 2>&1)"
 
 echo
+echo "== 12. opening the agent pod's board from here must fail, not return empty =="
+# The board lives on the agent pod's volume, and this container's /opt/data is a
+# different one. sqlite3 CREATES a database it cannot find, so before the
+# tripwire a worker that opened it got no error, no tables and exit 0 -- an empty
+# board it had no reason to disbelieve. One did, spent 25 minutes concluding the
+# board was unreachable, and left the 0-byte file behind for every later worker
+# on the volume. Asserted through sqlite3 rather than `stat` because a directory
+# is the mechanism and the raise is the requirement.
+start_sandbox || exit 1
+check "sqlite3 refuses the path" "unable to open database file" \
+  "$("${SSH[@]}" 'python3 -c "
+import sqlite3
+sqlite3.connect(\"/opt/data/kanban.db\").execute(\"select name from sqlite_master\")
+"' 2>&1)"
+check "and says where the board actually is" "kanban_show" \
+  "$("${SSH[@]}" 'cat /opt/data/kanban.db/NOT-THE-AGENT-POD-DATABASE.txt' 2>&1)"
+# Sections 9 and 10 plant with `rm -rf /opt/data/profiles`, so a root-owned
+# read-only tripwire inside a profile home breaks them -- and sandbox_mirror.py
+# with them. It is the model's volume; the tripwire is the model's too.
+check "the model can still clear a profile home it stands in" "gone" \
+  "$("${SSH[@]}" 'rm -rf /opt/data/profiles && echo gone' 2>&1)"
+
+echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |
   awk '{printf "== %s layers, %.0f MB ==\n", $1, $2/1024/1024}'
 

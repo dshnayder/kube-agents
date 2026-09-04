@@ -281,11 +281,36 @@ class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
 
         self.assertTrue(planted.is_dir(), "the fabricated database was left in place")
 
+    def test_the_model_can_still_clear_its_own_home(self) -> None:
+        """The tripwire is uid 1000's, like every other name on the volume.
+
+        Root-owned and mode 0555 also makes sqlite3 raise, and it makes the
+        directory undeletable from inside the model's own home -- which breaks
+        the plain `rm -rf /opt/data/profiles` that sections 9 and 10 of
+        deploy/sandbox/smoke-test.sh plant with, and that sandbox_mirror.py
+        needs to replace a profile home. The directory is the mechanism; the
+        mode never was.
+        """
+        self._run(". profiles/platform")
+        shutil.rmtree(self.data / "profiles")
+        self.assertFalse((self.data / "profiles").exists())
+
+    def test_the_note_is_handed_to_the_sandboxed_account(self) -> None:
+        """The other half of the same invariant, which rmtree cannot see.
+
+        The test host is not root, so `chown` is stubbed and ownership is only
+        observable as the paths the script hands it -- the technique this
+        module's docstring describes.
+        """
+        chowned = self._run(". profiles/platform")
+        for board in self._boards():
+            with self.subTest(board=str(board)):
+                self.assertIn(str(board / "NOT-THE-AGENT-POD-DATABASE.txt"), chowned)
+
     def test_the_tripwire_is_not_rebuilt_on_every_start(self) -> None:
         """A pod recycle must not churn the volume it is protecting."""
         self._run(". profiles/platform")
         note = self.data / "kanban.db" / "NOT-THE-AGENT-POD-DATABASE.txt"
-        note.parent.chmod(0o755)
         marker = note.parent / "witness"
         marker.write_text("survived")
 

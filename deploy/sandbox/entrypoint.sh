@@ -246,9 +246,17 @@ fi
 #     "unable to open database file", `cat` says "Is a directory", and neither can
 #     be mistaken for data. The explanation goes inside it, where an `ls` finds it.
 #
-#     uid 1000 owns $DATA and so could still remove these; that is not the threat
-#     being addressed. A confused worker trips over the error, and the next pod
-#     start puts the tripwire back either way.
+#     The tripwire is the model's, like every other name on this volume: agent-
+#     owned and writable, so `rm -rf` over a profile home still works. Root-owned
+#     and read-only is the tempting version and it is wrong — it makes an
+#     undeletable directory inside the model's own home, which breaks the plain
+#     `rm -rf /opt/data/profiles` that sections 9 and 10 of smoke-test.sh pin, and
+#     with it sandbox_mirror.py's ability to replace a profile home.
+#
+#     Being removable costs little. The directory is what makes sqlite3 raise;
+#     the mode never was. A worker that deletes it has to `rm -rf` a directory
+#     named kanban.db after reading a note inside saying it is not the database,
+#     and the next pod start puts the tripwire back.
 for root in $SANDBOX_HOME_ROOTS; do
   case $root in
   .) home="$DATA" ;;
@@ -264,11 +272,7 @@ for root in $SANDBOX_HOME_ROOTS; do
     # A regular file here is either the fabricated empty one or something a model
     # wrote; neither is the board, and both read as it.
     rm -rf "${path:?}"
-    # Writable while the note goes in, read-only afterwards. The other order
-    # works as root and only as root, and the entrypoint is not the only thing
-    # that runs this — tests/test_sandbox_entrypoint.py drives the real script
-    # as an ordinary user, and a step that needs uid 0 is a step it cannot cover.
-    install -d -m 0755 "$path"
+    install -d -m 0755 -o agent -g agent "$path"
     cat >"$path/$AGENT_POD_DATABASE_NOTE" <<MARKER
 $db is not here. It lives on the agent pod's volume, which this container
 cannot read, and this directory stands where it would be so that opening it
@@ -279,8 +283,7 @@ kanban_complete, kanban_block, kanban_link. They run in the agent pod and reach
 the real board. No shell command here can, and no answer one gives you about
 the board is true.
 MARKER
-    chmod 0444 "$path/$AGENT_POD_DATABASE_NOTE"
-    chmod 0555 "$path"
+    chown agent:agent "$path/$AGENT_POD_DATABASE_NOTE"
   done
 done
 
