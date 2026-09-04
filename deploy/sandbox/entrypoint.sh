@@ -32,6 +32,14 @@ DEFAULTS="${SANDBOX_DEFAULTS:-/opt/defaults}"
 # deploy/shared/sandbox_mirror.py, which does know the list.
 SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
 
+# The SQLite databases the agent pod keeps in each of those homes, which this
+# container has no copy of. Step 1b puts a directory at every one of them so a
+# shell command that opens one fails rather than being handed an empty database
+# that sqlite3 created on the spot. Names, not paths: they are joined onto each
+# home root above, so a home that gains a database gains a tripwire with it.
+AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
+AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
+
 # Every name under $DATA is owned by uid 1000 and survives a pod recycle, so any
 # path below it that this script hands to root may be a symlink the model planted
 # on a previous boot. None of the three operations used below resolves anything
@@ -214,6 +222,67 @@ else
   log "no $DEFAULTS in this image — the agent's skills, SOPs and shared scripts"
   log "will be absent from $DATA and every skill that names one will fail."
 fi
+
+# 1b. A tripwire on the agent pod's databases, which do not exist here.
+#
+#     The `.sandbox` marker in step 1 is passive: it explains the two-/opt/data
+#     situation to anyone who goes looking. Nobody goes looking. What a stuck
+#     model does instead is open the board directly, and both SOUL.md files
+#     forbid exactly that in exactly those words — "not with sqlite3, not with
+#     `python3 -c \"import sqlite3...\"`" — because a worker once used it to close
+#     three cards `done` with an invented result.
+#
+#     On the agent pod that prohibition guards a write. Here it guards a read, and
+#     the read is the more dangerous of the two: sqlite3 creates a database it
+#     cannot find, so the call succeeds, reports no tables and exits 0. The model
+#     is handed an empty board rather than an error, and an empty board is a
+#     plausible answer — so it believes it. On 2026-09-04 a Platform Agent worker
+#     did this at 13:19, spent the next 25 minutes concluding the board was
+#     unreachable, and blocked its card with "local direct DB access to kanban.db
+#     returns empty tables". The 0-byte file it created stayed on the volume, so
+#     every later worker that looked saw the same empty board.
+#
+#     A directory at the path is what turns that back into an error: sqlite3 says
+#     "unable to open database file", `cat` says "Is a directory", and neither can
+#     be mistaken for data. The explanation goes inside it, where an `ls` finds it.
+#
+#     uid 1000 owns $DATA and so could still remove these; that is not the threat
+#     being addressed. A confused worker trips over the error, and the next pod
+#     start puts the tripwire back either way.
+for root in $SANDBOX_HOME_ROOTS; do
+  case $root in
+  .) home="$DATA" ;;
+  *) home="$DATA/$root" ;;
+  esac
+  [ -d "$home" ] || continue
+  for db in $AGENT_POD_DATABASES; do
+    path="$home/$db"
+    clear_symlinks_under_data "$path"
+    if [ -d "$path" ] && [ -f "$path/$AGENT_POD_DATABASE_NOTE" ]; then
+      continue
+    fi
+    # A regular file here is either the fabricated empty one or something a model
+    # wrote; neither is the board, and both read as it.
+    rm -rf "${path:?}"
+    # Writable while the note goes in, read-only afterwards. The other order
+    # works as root and only as root, and the entrypoint is not the only thing
+    # that runs this — tests/test_sandbox_entrypoint.py drives the real script
+    # as an ordinary user, and a step that needs uid 0 is a step it cannot cover.
+    install -d -m 0755 "$path"
+    cat >"$path/$AGENT_POD_DATABASE_NOTE" <<MARKER
+$db is not here. It lives on the agent pod's volume, which this container
+cannot read, and this directory stands where it would be so that opening it
+fails instead of quietly returning an empty database.
+
+Read and change the board with the kanban tools — kanban_show, kanban_create,
+kanban_complete, kanban_block, kanban_link. They run in the agent pod and reach
+the real board. No shell command here can, and no answer one gives you about
+the board is true.
+MARKER
+    chmod 0444 "$path/$AGENT_POD_DATABASE_NOTE"
+    chmod 0555 "$path"
+  done
+done
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd
 #    starts perfectly happily and every connection is refused with "Permission

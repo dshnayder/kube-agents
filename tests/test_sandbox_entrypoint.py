@@ -1,4 +1,5 @@
-"""Tests for the home-root sync in deploy/sandbox/entrypoint.sh.
+"""Tests for the home-root sync and the database tripwire in
+deploy/sandbox/entrypoint.sh.
 
     python3 -m unittest discover -s tests -p 'test_*.py'
 
@@ -21,6 +22,7 @@ other profiles, so the migration aborts and the model's files never arrive.
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -44,11 +46,17 @@ exit 0
 # Drops -o/-g -- the real ones need root -- and keeps the directory creation the
 # loop depends on. Deliberately NOT a passthrough to /usr/bin/install: stubbing
 # out the ownership is what makes the chown log the only record of it.
+#
+# -m takes an argument and so has to be consumed like -o/-g rather than ignored
+# like -d: dropped from the case below, `install -d -m 0555 x` reads 0555 as a
+# second directory to create and the mode silently becomes a path.
 _INSTALL_STUB = """#!/bin/sh
 dirs=""
+mode=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -d) ;;
+    -m) shift; mode="$1" ;;
     -o|-g) shift ;;
     -*) ;;
     *) dirs="$dirs $1" ;;
@@ -56,10 +64,16 @@ while [ $# -gt 0 ]; do
   shift
 done
 mkdir -p $dirs
+if [ -n "$mode" ]; then
+  chmod "$mode" $dirs
+fi
 """
 
 
-class SandboxEntrypointHomeRootsTest(unittest.TestCase):
+class _SandboxEntrypointHarness(unittest.TestCase):
+    """Setup shared by the classes below. No tests of its own — a concrete case
+    here would be collected once per subclass and reported as several."""
+
     def setUp(self) -> None:
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -105,6 +119,8 @@ class SandboxEntrypointHomeRootsTest(unittest.TestCase):
             return []
         return [line for line in self.chown_log.read_text().splitlines() if line]
 
+
+class SandboxEntrypointHomeRootsTest(_SandboxEntrypointHarness):
     def test_intermediate_directories_are_chowned_with_the_leaf(self) -> None:
         """`profiles/platform` must leave $DATA/profiles agent-owned too."""
         chowned = self._run(". profiles/platform")
@@ -200,6 +216,85 @@ class SandboxEntrypointHomeRootsTest(unittest.TestCase):
         moved = self._displaced(planted)
         self.assertEqual(1, len(moved), f"expected the directory to be moved aside, found {moved}")
         self.assertEqual("the model put this here", (moved[0] / "kept").read_text())
+
+
+class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
+    """Step 1b, which makes the agent pod's databases fail to open rather than
+    open empty.
+
+    The defect is that sqlite3 creates a database it cannot find. A worker that
+    reaches for the board from the sandbox shell -- which both SOUL.md files
+    forbid, and which a stuck worker does anyway -- gets no error, no tables and
+    exit 0, and an empty board is a plausible enough answer to act on. One did,
+    on 2026-09-04: 25 minutes, then `kanban_block` with "local direct DB access
+    to kanban.db returns empty tables", and a 0-byte file left on the volume so
+    the next worker saw the same thing.
+    """
+
+    def _boards(self) -> list[pathlib.Path]:
+        return [
+            self.data / "kanban.db",
+            self.data / "state.db",
+            self.data / "profiles" / "platform" / "kanban.db",
+            self.data / "profiles" / "platform" / "state.db",
+        ]
+
+    def test_opening_a_board_from_the_sandbox_fails_instead_of_returning_empty(
+        self,
+    ) -> None:
+        """The property that matters, asserted through sqlite3 rather than stat.
+
+        A directory is the mechanism, not the requirement -- what the sandbox
+        owes the model is that the call raises.
+
+        Connected the way a model would, with no `mode=rw`: that is the call
+        that creates the file when nothing is there, and creating it is the
+        defect. An assertion that passes because the path is simply absent would
+        pass today, against the behaviour this is here to change.
+        """
+        self._run(". profiles/platform")
+        for board in self._boards():
+            with self.subTest(board=str(board)):
+                self.assertTrue(board.is_dir(), "no tripwire at the board's path")
+                with self.assertRaises(sqlite3.OperationalError):
+                    sqlite3.connect(str(board)).execute(
+                        "select name from sqlite_master"
+                    )
+
+    def test_the_tripwire_says_where_the_board_actually_is(self) -> None:
+        """An error the model cannot act on just moves where it gets stuck."""
+        self._run(". profiles/platform")
+        note = self.data / "kanban.db" / "NOT-THE-AGENT-POD-DATABASE.txt"
+        self.assertTrue(note.is_file(), "no explanation beside the tripwire")
+        self.assertIn("kanban_show", note.read_text())
+
+    def test_a_fabricated_empty_database_is_cleared_off_the_volume(self) -> None:
+        """The 0-byte file outlives the worker that created it.
+
+        $DATA is a PVC, so without this the board reads as empty for every
+        worker on that volume until someone deletes the file by hand.
+        """
+        planted = self.data / "kanban.db"
+        planted.write_bytes(b"")
+
+        self._run(". profiles/platform")
+
+        self.assertTrue(planted.is_dir(), "the fabricated database was left in place")
+
+    def test_the_tripwire_is_not_rebuilt_on_every_start(self) -> None:
+        """A pod recycle must not churn the volume it is protecting."""
+        self._run(". profiles/platform")
+        note = self.data / "kanban.db" / "NOT-THE-AGENT-POD-DATABASE.txt"
+        note.parent.chmod(0o755)
+        marker = note.parent / "witness"
+        marker.write_text("survived")
+
+        self._run(". profiles/platform")
+
+        self.assertTrue(
+            marker.is_file(),
+            "step 1b tore down a tripwire it had already put there",
+        )
 
 
 if __name__ == "__main__":
