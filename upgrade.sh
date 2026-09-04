@@ -215,7 +215,7 @@ random_hex_32() {
 # A fresh install generates these (the composition's random_password
 # resources), and the harness/operator fast paths never touch
 # platform-agent-secrets — `helm upgrade
-# --reuse-values` re-tags images and nothing else, so a Secret from an old
+# --reset-then-reuse-values` re-tags images and nothing else, so a Secret from an old
 # enough install keeps missing the keys until something adds them. The
 # operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
@@ -811,8 +811,17 @@ main() {
   #
   # Takes every key it must move in one `helm upgrade`, not one call per key:
   # two sequential upgrades leave the release briefly holding a new agent
-  # against an old sandbox, and the second one's --reuse-values would have to
+  # against an old sandbox, and the second one's reused values would have to
   # re-read what the first wrote.
+  #
+  # --reset-then-reuse-values, not --reuse-values. --reuse-values renders this
+  # checkout's chart against only the previous release's values, so any key the
+  # chart gained since that release is simply absent: upgrading a pre-split
+  # install this way hits a nil pointer in operator-deployment.yaml, or renders
+  # the sandbox image as ":<tag>" and leaves the StatefulSet unable to start.
+  # Resetting first takes the checkout's defaults for the new keys and re-applies
+  # the release's own overrides on top, which is what the redeploy workflows
+  # already do for the same reason.
   helm_retag() {
     local set_args=()
     local set_key
@@ -820,7 +829,7 @@ main() {
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
     helm upgrade kube-agents "${repo_dir}/charts/kube-agents" \
-      --namespace "$target_namespace" --reuse-values \
+      --namespace "$target_namespace" --reset-then-reuse-values \
       "${set_args[@]}" --wait --timeout 10m
   }
 
