@@ -445,6 +445,36 @@ def check_branch_name(name: object) -> str:
     return branch
 
 
+def check_expected_sha(value: object, field: str) -> str:
+    """A caller-supplied commit id, or a refusal.
+
+    `expectedBaseSha` and `expectedBranchSha` reach a revision position in `git
+    diff <expected> <current> -- <paths>`, so a value starting with `-` is not a
+    revision at all — it is an option. `--output=<path>` is the sharp one: git
+    writes the diff to that path and prints nothing, so the caller's own guard
+    reads an empty result as "no overlap", the conflict it exists to catch never
+    raises, and the broker has written a file wherever it can write. The
+    workspace routes bypass `git_argument_violation` by design and
+    `execute_workspace_git` checks only the subcommand, so this is the check.
+
+    A full hex object id and nothing else. `--end-of-options` would stop the
+    option reading and still admit `HEAD~1` or a branch name, which the conflict
+    guard would compare against and answer wrongly rather than loudly; and it
+    needs a git new enough to have it, which this cannot assume of a workspace
+    image it does not build. Both SHA-1 and SHA-256 lengths, because a
+    repository can be either and the broker clones what it is pointed at.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ContentWorkspaceError(f"{field} must be a non-empty string")
+    sha = value.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
+        raise ContentWorkspaceError(
+            f"{field} must be a full 40- or 64-character hex commit id; "
+            f"{sha!r} is not one"
+        )
+    return sha
+
+
 def check_branch(name: object) -> str:
     """A branch name the broker is willing to *author*.
 
@@ -1069,6 +1099,14 @@ class ContentWorkspaceStore:
             self._git(workspace, ["check-ref-format", "--branch", branch])
             if not isinstance(message, str) or not message.strip():
                 raise ContentWorkspaceError("message must be a non-empty string")
+            # Before either reaches a revision position below. See
+            # check_expected_sha for what a non-sha buys the caller.
+            if expected_base_sha is not None:
+                expected_base_sha = check_expected_sha(expected_base_sha, "expectedBaseSha")
+            if expected_branch_sha is not None:
+                expected_branch_sha = check_expected_sha(
+                    expected_branch_sha, "expectedBranchSha"
+                )
             changes = list(changes)
 
             self._git(workspace, ["fetch", "--quiet", "--prune", "origin"])
