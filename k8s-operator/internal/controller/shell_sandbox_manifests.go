@@ -123,6 +123,25 @@ const (
 	// what TERMINAL_CWD points at.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
+	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
+	// and, in FileSyncManager.sync_back, copies anything new or changed back onto
+	// the agent pod's Hermes home. Skills live in that tree, so a file written
+	// here would land in the gateway's skills/ as instructions the next session
+	// loads. deploy/sandbox/Dockerfile makes the directory root-owned and 0555 to
+	// stop that, and on its own that is not enough: /home/agent is owned by uid
+	// 1000 on a writable container filesystem, and removing a directory needs
+	// write on the parent rather than on the directory. `rmdir ~/.hermes && mkdir
+	// ~/.hermes` hands the model a writable one back.
+	//
+	// An empty read-only volume over the path closes it from the other side. The
+	// mount cannot be removed — rmdir on a mount point is EBUSY — and cannot be
+	// written whatever it is replaced by, and undoing it needs CAP_SYS_ADMIN,
+	// which this container does not have. Leaving /home/agent itself
+	// agent-writable keeps ~/.bashrc and the rest of the home working the way the
+	// comment above describes.
+	shellSandboxHermesHomeVolume = "hermes-sync-block"
+	shellSandboxHermesHomePath   = shellSandboxHomePath + "/.hermes"
+
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.
@@ -612,6 +631,11 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 				Optional: ptr.To(true),
 			},
 		},
+	}, {
+		// See shellSandboxHermesHomePath. Empty and read-only: the point is the
+		// mount, not what is behind it.
+		Name:         shellSandboxHermesHomeVolume,
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 	}, buildShellSandboxCredentialProxyTokenVolume()}
 	return volumes
 }
@@ -700,6 +724,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
 			{Name: shellSandboxSshdVolume, MountPath: shellSandboxSshdPath},
+			{
+				Name:      shellSandboxHermesHomeVolume,
+				MountPath: shellSandboxHermesHomePath,
+				ReadOnly:  true,
+			},
 			{
 				Name:      shellSandboxCredentialProxyTokenVolume,
 				MountPath: credentialProxyTokenMountPath,

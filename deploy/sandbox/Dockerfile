@@ -116,17 +116,26 @@ RUN pip install --no-cache-dir pyyaml requests
 # it can rename any entry there — a private key on that volume is one the model
 # can read today or displace tomorrow, whatever the mode on the file itself.
 #
-# /home/agent/.hermes is root-owned and unwritable, and that is what closes the
-# sandbox's one write channel back into the agent pod. Hermes' ssh backend keeps
-# a file sync over this directory: it pushes at connect and, in
+# /home/agent/.hermes is root-owned and unwritable, which is half of what closes
+# the sandbox's one write channel back into the agent pod. Hermes' ssh backend
+# keeps a file sync over this directory: it pushes at connect and, in
 # FileSyncManager.sync_back, tars the whole tree back and copies anything new or
 # changed onto the agent pod's Hermes home. Skills are in that tree, so a file
 # the model writes here lands in the gateway's skills/ — instructions the next
-# session loads into context, on a volume that outlives this pod. Making the
-# directory unwritable is what stops it, and it costs nothing: nothing in this
-# image reads the pushed copy. The sandbox's authoritative skills come from
-# /opt/defaults/skills (see the note further down), and what Hermes pushes here
-# is the wrong profile's tree anyway.
+# session loads into context, on a volume that outlives this pod. It costs
+# nothing to stop: nothing in this image reads the pushed copy. The sandbox's
+# authoritative skills come from /opt/defaults/skills (see the note further
+# down), and what Hermes pushes here is the wrong profile's tree anyway.
+#
+# The other half is a mount, and it is the half that makes this hold. The mode
+# here binds the directory; it does not bind the NAME. /home/agent is owned by
+# uid 1000, and removing a directory takes write on the parent rather than on
+# the directory, so `rmdir ~/.hermes && mkdir ~/.hermes` returns a writable one
+# to the model and the sync resumes on the next command. The operator mounts an
+# empty read-only volume over this path (shellSandboxHermesHomePath in
+# k8s-operator/internal/controller/shell_sandbox_manifests.go), which makes the
+# rmdir EBUSY. A build of this image run outside that StatefulSet keeps the mode
+# and loses the guarantee.
 #
 # The far end degrades quietly, which is why this works from one side.
 # _ensure_remote_dirs runs `mkdir -p` and ignores the exit status; the push then
