@@ -2106,16 +2106,16 @@ callers; then the tests that hold the boundary.
 | 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge) |
 | 13   | the abstraction becomes unconditional: every upgraded install gets it, and the `git` and `gh` shims are deleted from the sandbox image                   | operator tests, and the image smoke test asserting both by absence  |
 
-Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is actually
-paid for, and it is the only step that changes an install that was working
-before. The sandbox is on for everyone afterwards, which means its
-`spec.harness.experimental.shellSandbox.enabled` field has nothing left to
-decide. It is kept in the schema all the same, and an explicit `false` is
-refused with a named reason rather than honoured. Deleting the field instead
-would be worse than leaving it: an existing CR carrying `enabled: false` would
-have that line pruned on the next reconcile and the install would come up armed,
-with nothing in the diff to say why. A refusal makes the same upgrade an error
-the operator reads.
+Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is paid
+for. It also removes `spec.harness.experimental.shellSandbox.enabled`, which by
+then decides nothing: the shell-sandbox design already refuses `false` with a
+named reason rather than rendering the old arrangement, and keeps the field only
+so that an install which set it gets that refusal instead of a silently ignored
+setting. Deleting a field is normally the risky direction — an unknown key is
+pruned from an existing CR on the next reconcile, and the setting disappears
+with nothing in the diff to say so. It is safe here precisely because of the
+order: no install can be quietly sitting at `false`, since one that tried has
+been Degraded and visible since the sandbox landed.
 
 Step 7 is the one that splits naturally if the PR gets too large: each of the
 five consumers is independent of the others, and each is a no-functional-delta
@@ -2268,4 +2268,5 @@ proves the least.
 - Issue [#1085](https://github.com/gke-labs/kube-agents/issues/1085) — the
   host-confusion report that §2's repository identity closes.
 - The shell-sandbox design (#737) — the sandbox, the credential proxy, and why
-  `git` on PATH is a shim. Not upstream yet, and §3 depends on it.
+  the sandbox is mandatory rather than opt-in. Not upstream yet, and §3 depends
+  on it.
