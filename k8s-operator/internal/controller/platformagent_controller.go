@@ -87,6 +87,14 @@ const (
 	// The gap between reads while that wait runs.
 	shellSandboxDeletePollInterval = 100 * time.Millisecond
 
+	// How long applyCredentialProxyDeployment waits for its foreground delete.
+	// Longer than the sandbox's budget because this one waits on a pod to
+	// terminate and not only on a finalizer: foreground propagation holds the
+	// Deployment until the ReplicaSet and its pod are gone, and the broker has a
+	// termination grace period to serve out. Expiry requeues, so overshooting
+	// costs a reconcile rather than the recreation.
+	credentialProxyDeleteTimeout = 60 * time.Second
+
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
@@ -190,6 +198,14 @@ type PlatformAgentReconciler struct {
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
+// whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
+// a value out of one, and the operator creates that Secret nowhere. The read goes through
+// r.APIReader rather than the cached client on purpose: a cached Get of a type the manager does
+// not already watch starts a cluster-wide Secret informer, which would both hold every Secret in
+// the cluster in the operator's memory and, on any cluster where this grant is trimmed, block
+// WaitForCacheSync forever behind a forbidden LIST.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1249,11 +1265,87 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
-		if err := r.applyManaged(ctx, agent, obj); err != nil {
+		apply := r.applyManaged
+		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
+			apply = r.applyCredentialProxyDeployment
+		}
+		if err := apply(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
 	return nil
+}
+
+// applyCredentialProxyDeployment applies the broker's Deployment, recreating it
+// when the API server refuses the update.
+//
+// spec.selector is immutable on a Deployment, and this Deployment's selector
+// changed. An install that ran the broker in its own pod before this PR — the
+// old splitCredentialBrokerPod field — matched on `app` alone; the selector now
+// also carries kubeagents.x-k8s.io/component=credential-proxy. Without this the
+// apply comes back 422 Invalid on every reconcile, forever, and takes the rest
+// of the agent's reconcile with it: the Service has already been applied by
+// then, so its endpoints are empty, every credentialed command fails, and the CR
+// still reads Ready because the status update is never reached.
+//
+// Foreground propagation rather than the Orphan the StatefulSet uses. Orphaning
+// works there because the replacement adopts the running pod by selector; here
+// the selector is the thing that changed and the new labels are not a superset,
+// so nothing would ever adopt the old pod. It would sit in the namespace
+// unowned, unreferenced by the Service, and still mounting the broker's
+// credentials. Deleting it costs the outage that the label change makes
+// unavoidable, and the outage is bounded by one pod start.
+func (r *PlatformAgentReconciler) applyCredentialProxyDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	err := r.applyManaged(ctx, agent, obj)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("the credential broker Deployment needs an immutable field changed; recreating it",
+		"deployment", obj.GetName(), "reason", err.Error())
+
+	foreground := metav1.DeletePropagationForeground
+	existing := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Namespace: obj.GetNamespace()},
+	}
+	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &foreground}); client.IgnoreNotFound(delErr) != nil {
+		return fmt.Errorf("failed to delete the credential broker Deployment for recreation: %w", delErr)
+	}
+	if err := r.awaitCredentialProxyDeploymentGone(ctx, client.ObjectKeyFromObject(obj)); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, obj)
+}
+
+// awaitCredentialProxyDeploymentGone blocks until the deleted Deployment has left
+// the API server, or the budget runs out.
+//
+// Same reason as awaitStatefulSetGone: Delete returns once the object is marked,
+// and an apply issued inside that window addresses the object that is still
+// terminating, so it is validated against the immutable field the recreation
+// exists to change and comes back Invalid a second time. Running out of budget
+// requeues — the delete has been accepted, and the next reconcile finds the name
+// free.
+func (r *PlatformAgentReconciler) awaitCredentialProxyDeploymentGone(ctx context.Context, key client.ObjectKey) error {
+	deadline := time.Now().Add(credentialProxyDeleteTimeout)
+	for {
+		err := r.Get(ctx, key, &appsv1.Deployment{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read the credential broker Deployment %s/%s while waiting for its deletion: %w", key.Namespace, key.Name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the credential broker Deployment %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", key.Namespace, key.Name, credentialProxyDeleteTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(shellSandboxDeletePollInterval):
+		}
+	}
 }
 
 // reconcileCredentialBrokerTokenReviewRBAC applies, or removes, the one verb the
@@ -1862,6 +1954,56 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
+// splitWorkloadStatus is one of the two workloads the credential-broker split made
+// mandatory alongside the gateway, read back so Ready can depend on it.
+type splitWorkloadStatus struct {
+	// name is the object's name, and what the Provisioning message reports.
+	name string
+	// kind is "StatefulSet" or "Deployment", so the message says which to describe.
+	kind string
+	// ready is the workload's ReadyReplicas; zero when the object is absent.
+	ready int32
+}
+
+// readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
+// Deployment.
+//
+// Ready has to depend on both. Before the split the credential runtime was a native
+// sidecar of the gateway pod, so a broker that could not start held the gateway out of
+// readiness and the existing pod scan reported why. Splitting it into its own pod took
+// that away: the gateway now becomes Ready on its own while the model cannot run a single
+// command, because the shell it runs them in does not exist. sandbox_mirror returns
+// EXIT_OK when its wait times out, so nothing else in the gateway notices either.
+//
+// A read error other than NotFound is returned to the caller, which fails the reconcile
+// rather than reporting a readiness it could not check. NotFound is not an error here: it
+// is the ordinary state between applying the objects and the API server serving them back,
+// and it reads as not-ready, which is what it is.
+func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]splitWorkloadStatus, error) {
+	shell := &appsv1.StatefulSet{}
+	shellName := shellSandboxName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
+		}
+		shell.Status.ReadyReplicas = 0
+	}
+
+	broker := &appsv1.Deployment{}
+	brokerName := credentialBrokerName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: brokerName}, broker); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get credential broker Deployment for status update: %w", err)
+		}
+		broker.Status.ReadyReplicas = 0
+	}
+
+	return []splitWorkloadStatus{
+		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
+		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
+	}, nil
+}
+
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
 // the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
@@ -1917,21 +2059,40 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
+	// The two workloads the split made mandatory. Read before the phase is decided,
+	// because Ready is a claim about all three and not about the gateway alone.
+	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
+	if errSplit != nil {
+		return "", errSplit
+	}
+	notReady := make([]string, 0, len(splitWorkloads))
+	for _, w := range splitWorkloads {
+		if w.ready == 0 {
+			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+		}
+	}
+
 	// Determine Phase and Condition
 	newPhase := "Provisioning"
 	condStatus := metav1.ConditionFalse
 	condReason := "Provisioning"
 	condMsg := "Waiting for deployment replicas to be ready"
-	if errWorkload == nil && newDeploymentStatusReadyReplicas > 0 {
+	switch {
+	case errWorkload == nil && newDeploymentStatusReadyReplicas > 0 && len(notReady) == 0:
 		newPhase = "Ready"
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
-		condMsg = "Agent sandbox and Envoy credential sidecar are fully reconciled"
-	} else if errWorkload == nil {
+		condMsg = "Gateway, shell sandbox and credential broker are all ready"
+	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
+		} else if newDeploymentStatusReadyReplicas > 0 && len(notReady) > 0 {
+			// The gateway is up and the pod scan found no fault to name, so the
+			// generic "waiting for replicas" message would point at the one
+			// workload that is fine. Say which of the other two is missing.
+			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
 		}
 	}
 
@@ -2081,13 +2242,29 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
-	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-gateway"})
-	if err != nil || len(podList.Items) == 0 {
+	// All three pods, gateway first so an install with a fault in more than one of
+	// them reports the same sentence it always has. The other two are here because
+	// the faults this function names are exactly the ones the split introduced a
+	// new way to hit: a runtimeClassName the cluster has no node pool for, and a
+	// sandbox or broker image tag nothing published. Neither is visible from the
+	// gateway's own pod any more.
+	pods := make([]corev1.Pod, 0)
+	for _, selector := range []map[string]string{
+		{"app": agent.Name + "-gateway"},
+		shellSandboxSelector(agent),
+		{"app": credentialProxyName(agent)},
+	} {
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+			continue
+		}
+		pods = append(pods, podList.Items...)
+	}
+	if len(pods) == 0 {
 		return phase, reason, message
 	}
 
-	for _, pod := range podList.Items {
+	for _, pod := range pods {
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
 		//
 		// Init statuses first, and PodInitializing filtered out with
@@ -2154,9 +2331,23 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 // A read error other than NotFound returns "" as well. This runs after every object
 // is applied and its only job is to phrase a status; an API blip must not turn a
 // healthy agent Degraded on a claim this function could not check.
+//
+// The read goes through r.APIReader. Secrets are the one type the manager's cache does not
+// already hold, and a cached Get of an unwatched type starts a cluster-wide informer and
+// blocks in WaitForCacheSync until it syncs. On the RBAC this operator ships that LIST is
+// forbidden, so it never syncs: the call does not fail, it hangs, and with one reconcile
+// worker that is the whole controller stopped on an install that reports success. Reading
+// live also keeps every Secret in the cluster out of the operator's memory.
 func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if reader == nil {
+		return "", ""
+	}
 	name := shellSandboxAuthorizedKeysSecretName(agent)
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, &corev1.Secret{})
+	err := reader.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, &corev1.Secret{})
 	if err == nil || !errors.IsNotFound(err) {
 		return "", ""
 	}
