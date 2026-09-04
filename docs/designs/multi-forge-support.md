@@ -13,7 +13,10 @@ the per-provider token and git-credential shapes, the declarative surface and th
 prompts use, where MCP fits, and the sequencing of all of it. The provider protocol's original
 seven operations and the reasoning behind their normalisations belong to
 [`pr-comment-conversation.md`](pr-comment-conversation.md) §3; credential containment belongs to
-[`../credential-isolation-design.md`](../credential-isolation-design.md).
+[`../credential-isolation-design.md`](../credential-isolation-design.md). The seam a provider is
+reached through — the broker, the transport, the credential strategy — belongs to
+[`version-control-abstraction.md`](version-control-abstraction.md), and the package layout a new
+provider is added as belongs to [`gitlab-forge.md`](gitlab-forge.md).
 
 ---
 
@@ -197,6 +200,17 @@ harness policy stays above the provider. The existing split is the precedent: th
 Two provider shapes come out of the credential plane rather than out of this section, and §5 explains
 why: a CLI-backed provider that shells a brokered binary, and a proxy-backed provider that speaks
 REST through a sidecar route. Both implement the same protocol; `_call()` is where they differ.
+[`gitlab-forge.md`](gitlab-forge.md) makes that difference a declared `transport` rather than a
+subclass, which is what lets one provider class serve both shapes.
+
+**One implementation.** The seam described here is agent-side; the broker described in
+[`version-control-abstraction.md`](version-control-abstraction.md) needs the same protocol, the same
+host resolver, the same repository parser and the same error taxonomy on its own side of the
+credential boundary. Those are one implementation, not two — a second copy is two places to add
+GitLab to and two answers to every question a third forge asks.
+[`gitlab-forge.md`](gitlab-forge.md) carries the package layout they converge into and what each
+side contributes; this design continues to own the protocol's contents and the consumer migrations
+above.
 
 ## 5. The credential plane
 
@@ -410,18 +424,29 @@ The resulting sequence:
   exercises the
   customer-chosen-hostname path that no literal egress rule could cover, which argues for it, at the
   cost of standing infrastructure.
+  [`gitlab-forge.md`](gitlab-forge.md) recommends the middle option neither of those names — the
+  omnibus `gitlab/gitlab-ce` container, one pod, which is self-managed without the standing cost —
+  and this should be decided once for both designs rather than twice.
 - **Whether gitlab.com and self-managed GitLab are one provider or two.**
   `pr-comment-conversation.md` §3 records that "Bitbucket" is two providers sharing almost nothing.
   GitLab is better off than that — the API is the same — but the token model, the host and the
   network path all differ, and a single class that branches on "is this gitlab.com" is how the
   Bitbucket mistake would be repeated in a smaller way.
+  [`gitlab-forge.md`](gitlab-forge.md) answers the half that matters most: a provider class is asked
+  how many instances an install wants, so gitlab.com and a self-managed host are two instances of
+  one class, each carrying its own host and its own credential, with nothing branching on which is
+  which. What that does not settle is whether the token models diverge far enough to want two
+  classes anyway; on the evidence so far they do not.
 - **Whether one field can name the token's scope boundary on both forges** (§6). On GitHub that
   boundary is an App installation and it lines up with the first path component. On GitLab it is a
   group, a project's namespace can sit several segments below it, and "the first path component" is
   therefore false. Either the field generalises to "scope boundary" and each provider says how to
   derive it, or the two forges want different fields. The token-scoping code depends on the answer,
-  and so does whether a per-repository permission policy has anywhere to hang.
+  and so does whether a per-repository permission policy has anywhere to hang. This one stays open,
+  and it is the one the other two designs both defer to this section.
 - **Whether the Minty policy ConfigMap has an analogue.** GitHub's per-repository permission policy
   is enforced at mint time. A long-lived GitLab token carries its scope from creation, so the
   equivalent enforcement — if it is wanted — has to live somewhere else, most plausibly as a check in
-  the broker before it brokers.
+  the broker before it brokers. [`gitlab-forge.md`](gitlab-forge.md) proposes exactly that shape, as
+  a per-credential list of path prefixes the provider refuses outside of, and treats it as the local
+  fallback if the field above generalises instead.
