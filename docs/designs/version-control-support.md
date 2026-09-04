@@ -1878,11 +1878,11 @@ the fork at
 
 ### What was compared
 
-| Arm | Access design                                                                                                    |
-| --- | ---------------------------------------------------------------------------------------------------------------- |
-| A   | The shared volume this repository ships: `git` and `gh` in the sandbox are shims into the credentialed container |
-| B   | Content passing: the agent holds no checkout and sends `{path, bytes}` payloads; the broker owns the tree        |
-| C   | This design: forge-neutral verbs over `/v1/vcs/*`, history as a bundle, native git locally                       |
+| Arm | Access design                                                                                                         |
+| --- | --------------------------------------------------------------------------------------------------------------------- |
+| A   | The shared volume this repository ships: `git` and `gh` in the sandbox are shims into the credentialed container      |
+| B   | Content passing (#962): `{path, bytes}` payloads over the broker's `/v1/workspace/*` routes, the broker owns the tree |
+| C   | This design: forge-neutral verbs over `/v1/vcs/*`, history as a bundle, native git locally                            |
 
 Twenty read probes at three repository sizes — 200, 3,000 and 10,000 files — and
 a four-probe write rung. The read probes cover contested facts across revisions,
@@ -1897,10 +1897,9 @@ Each arm ran the write rung against a repository that arm had never seen, since
 the first arm to open a proposal turns "open a pull request" into "notice one
 exists" for everyone after it.
 
-Arm C's write rung was run **sealed**: every route belonging to another arm
-disabled, and no `gh` binary under any path, so the numbers describe an install
-that shipped only this design rather than one where other doors happened to be
-open.
+Arm C's write rung was run **sealed**: arm B's routes disabled and no `gh`
+binary under any path, so the numbers describe an install that shipped only this
+design rather than one where other doors happened to be open.
 
 ### Results
 
@@ -1959,9 +1958,9 @@ indirection.
 
 - One run per probe per arm. A one-probe difference is noise; only whole-class
   differences are load-bearing.
-- The read rungs were run unsealed for arm C — the other arms' routes still
-  serving, and a `gh` on PATH. Those runs made zero calls on either, so sealing
-  removes doors they never opened, but they were not re-run to prove it.
+- The read rungs were run unsealed for arm C — arm B's routes still serving, and
+  a `gh` on PATH. Those runs made zero calls on either, so sealing removes doors
+  they never opened, but they were not re-run to prove it.
 - The write rung ran on a later broker build than the read rungs.
 - The adversarial probe is one injection corpus. It shows those two techniques
   did not fire, not that the class is closed.
