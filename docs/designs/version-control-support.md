@@ -212,7 +212,7 @@ than a silent drop.
 ### How this compares to what we have
 
 The two designs it was measured against are the shared-volume credential proxy
-and content passing (#962), on identical probes and identical corpora: twenty
+and content passing, on identical probes and identical corpora: twenty
 read probes at three repository sizes, plus a four-probe write rung. It was also
 the only one of the three that never reached past its own interface. Full method
 and results in [The experiment](#9-the-experiment).
@@ -625,22 +625,20 @@ precisely because the shared concept and the forge's model disagree.
 
 ### The protocol
 
-`/v1/vcs/*` is a separate namespace from `/v1/workspace/*` rather than more
-verbs on it. `/v1/workspace/*` exists on the broker today: it is the
-content-passing surface, where the agent never holds a checkout at all but
-`open`s a repository, `read`s and `list`s paths through the broker, and sends
-`{path, bytes}` changes to `commit` and `push` in a tree on the broker's own
-volume. It is gated behind `CREDENTIAL_PROXY_CONTENT_WORKSPACE`, answers 404
-while that is off, and no shipped skill drives it yet. [The
-experiment](#9-the-experiment) measures it as arm B.
+Every route lives under `/v1/vcs/*`, and every one of them stands alone: it
+names a repository, does one thing, and keeps nothing. There is no session, no
+handle, and no state on the broker that a later call depends on — a caller that
+crashes between two verbs leaves nothing behind to reconcile, and two agents
+calling the same verb on the same repository do not have to be ordered against
+each other. `clone` is the only route that hands back something durable, and it
+hands it to the sandbox as a bundle rather than keeping a tree.
 
-The two are different protocols sharing a transport. Workspace routes are
-handle-oriented and stateful across a session — `open` returns a handle every
-later call carries, and the broker holds the tree behind it — while every vcs
-route stands alone: it names a repository, does one thing, and keeps nothing.
-Folding them together would put a `handle` argument on routes that have none and
-invite a caller to hold one. They share the broker's `workspace_lock`, because
-they share the disk.
+That is a constraint on what the verbs may be, not just a description of them.
+It is why `publish` carries `baseRevision` instead of remembering what `clone`
+served, and why nothing in the table takes an identifier the broker minted. The
+routes still take `gitops_workspace.workspace_lock` while they run, because the
+broker's clone touches the same disk as the leased checkout, but the lock is
+held within one call and never across two.
 
 | Verb                                 | Request                                                    | Response                                              |
 | ------------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
@@ -769,8 +767,9 @@ broker and logged — was the obvious way to keep an agent that needs something
 unmodelled inside the boundary rather than out on the allowlist. It is not here,
 and the measurement is why. Across the read rungs the agent on these verbs made
 one `gh api` call, on a probe it had already answered from a commit message, and
-it made that call with a working `gh` on PATH and the content-passing routes
-still serving beside it. The escape hatch is a solution to a demand that did not
+it made that call with a working `gh` on PATH and every other route it might
+have used still serving beside it. The escape hatch is a solution to a demand
+that did not
 appear. Adding it would also put a forge-shaped hole in a forge-neutral protocol
 and give a model a documented reason to stop at the first verb that does not
 quite fit. If a real gap turns up, the verb list is where it gets answered.
@@ -871,8 +870,8 @@ system, global and repo-local config.
 Three properties this shape has that the alternatives do not:
 
 - **It is per-invocation, not global.** `GIT_FORCED_CONFIG` is one tuple applied
-  to every git the broker runs, including the content-workspace git. A
-  credential belonging to one forge does not belong on all of them.
+  to every git the broker runs, whatever it is running it for. A credential
+  belonging to one forge does not belong on all of them.
 - **The token is read from a file at use time, not interpolated into config.**
   A rotated Secret takes effect without restarting anything, and the token is
   not in the process environment, not in `/proc/*/environ`, and not in any
@@ -1882,7 +1881,7 @@ the fork at
 | Arm | Access design                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------- |
 | A   | The shared volume this repository ships: `git` and `gh` in the sandbox are shims into the credentialed container |
-| B   | Content passing (#962): `{path, bytes}` payloads over `/v1/workspace/*`, the broker owns the tree                |
+| B   | Content passing: the agent holds no checkout and sends `{path, bytes}` payloads; the broker owns the tree        |
 | C   | This design: forge-neutral verbs over `/v1/vcs/*`, history as a bundle, native git locally                       |
 
 Twenty read probes at three repository sizes — 200, 3,000 and 10,000 files — and
@@ -1898,9 +1897,10 @@ Each arm ran the write rung against a repository that arm had never seen, since
 the first arm to open a proposal turns "open a pull request" into "notice one
 exists" for everyone after it.
 
-Arm C's write rung was run **sealed**: content-passing routes disabled and no
-`gh` binary under any path, so the numbers describe an install that shipped only
-this design rather than one where other doors happened to be open.
+Arm C's write rung was run **sealed**: every route belonging to another arm
+disabled, and no `gh` binary under any path, so the numbers describe an install
+that shipped only this design rather than one where other doors happened to be
+open.
 
 ### Results
 
@@ -1959,9 +1959,9 @@ indirection.
 
 - One run per probe per arm. A one-probe difference is noise; only whole-class
   differences are load-bearing.
-- The read rungs were run unsealed for arm C — content-passing routes serving
-  and a `gh` on PATH. Those runs made zero calls on either, so sealing removes
-  doors they never opened, but they were not re-run to prove it.
+- The read rungs were run unsealed for arm C — the other arms' routes still
+  serving, and a `gh` on PATH. Those runs made zero calls on either, so sealing
+  removes doors they never opened, but they were not re-run to prove it.
 - The write rung ran on a later broker build than the read rungs.
 - The adversarial probe is one injection corpus. It shows those two techniques
   did not fire, not that the class is closed.
