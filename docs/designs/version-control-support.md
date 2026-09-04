@@ -1598,10 +1598,8 @@ play. There is no supported arrangement in which an agent reaches a forge some
 other way, so a toggle would only describe a configuration nobody is allowed to
 run — and every such field is a second code path to keep working, a second
 combination to test, and a way for an install to sit in the state the design
-exists to remove. `spec.harness.experimental.shellSandbox.enabled` survives in
-the schema, but only so that removing it cannot silently drop an `enabled: false`
-from an existing CR and flip that install on the next reconcile; an explicit
-`false` is refused with a named reason rather than honoured.
+exists to remove. What that costs at upgrade time, and the one field that has to
+be kept anyway to make the upgrade safe, is [step 13](#11-delivery).
 
 That is a deliberate reversal of how an experimental feature usually arrives.
 The justification is that this removes no capability: every verb replaces a call
@@ -2106,7 +2104,18 @@ callers; then the tests that hold the boundary.
 | 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                               |
 | 11   | `AVAILABLE`, `for_config`, `build_forges`; `StubForge` for registered-but-unconfigured hosts                                                             | registry tests                                                      |
 | 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge) |
-| 13   | the abstraction becomes unconditional: `versionControl` retired, `enabled: false` refused, the `git` and `gh` shims deleted from the sandbox image       | operator tests, and the image smoke test asserting both by absence  |
+| 13   | the abstraction becomes unconditional: every upgraded install gets it, and the `git` and `gh` shims are deleted from the sandbox image                   | operator tests, and the image smoke test asserting both by absence  |
+
+Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is actually
+paid for, and it is the only step that changes an install that was working
+before. The sandbox is on for everyone afterwards, which means its
+`spec.harness.experimental.shellSandbox.enabled` field has nothing left to
+decide. It is kept in the schema all the same, and an explicit `false` is
+refused with a named reason rather than honoured. Deleting the field instead
+would be worse than leaving it: an existing CR carrying `enabled: false` would
+have that line pruned on the next reconcile and the install would come up armed,
+with nothing in the diff to say why. A refusal makes the same upgrade an error
+the operator reads.
 
 Step 7 is the one that splits naturally if the PR gets too large: each of the
 five consumers is independent of the others, and each is a no-functional-delta
