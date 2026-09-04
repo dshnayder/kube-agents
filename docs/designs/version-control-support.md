@@ -1,12 +1,8 @@
 # Version control and issue tracking
 
 > **STATUS — design of record; not implemented.** Today an install drives exactly
-> one forge, GitHub, and most of the code says so by name. This document is the
-> design for driving any of them, and the order it has to happen in. It describes
-> the end state throughout: where it names a module or a route that does not
-> exist yet, that is something the implementation creates, not something being
-> changed. The parts that are true of `main` today are marked as such, because a
-> reviewer should be able to check them.
+> one forge, GitHub, and most of the code says so by name. This is the design for
+> driving any of them, and the order it has to happen in.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
@@ -65,9 +61,9 @@ size. Method and results in [The experiment](#9-the-experiment).
 
 ## How to read this document
 
-It is long because it is one document instead of three, and it is layered so that
-a human reader can stop as soon as they have what they came for. Each section
-goes a level deeper than the one before it. An agent should read all of it.
+It is long, and it is layered so that a human reader can stop as soon as they
+have what they came for. Each section goes a level deeper than the one before
+it. An agent should read all of it.
 
 | Section                                                         | What it gives you                                                                                                               |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
