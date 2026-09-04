@@ -528,11 +528,25 @@ behind by a build stage, or a shim — and is by construction not the git this
 section describes. The guard runs beside the existing one that fails the image
 on a stray `gcloud`, `kubectl` or `gh`, and for the same reason.
 
-A second guard proves the shipped binary cannot reach a
-network. The four transports that dial a host — `git-remote-http` and the
-`-https`, `-ftp` and `-ftps` symlinks to it — are deleted from
-`/usr/lib/git-core`, and the guard fails the build if any is back and then runs
-an actual `ls-remote` per scheme against an unroutable URL, requiring git's own
+A second guard proves the shipped binary cannot reach a forge. The control is
+deletion, and it is deletion for a specific reason: inside the sandbox the agent
+owns its own environment and its own config files, so `GIT_ALLOW_PROTOCOL`,
+`protocol.<name>.allow` and `/etc/gitconfig` are all things it can override or
+neutralise with one flag. Only the absence of a file survives that. The broker
+can rely on the environment — `GIT_ALLOW_PROTOCOL` outranks every config layer
+including `-c`, which is what makes it the boundary in `credential_proxy.py`
+today — because the broker, not the agent, builds that environment. The sandbox
+has no such advantage, so it gets the file-shaped control instead.
+
+Git reaches a network three different ways, and each needs its own answer.
+
+**Remote helpers are separate executables**, found on PATH by name, so deleting
+them removes the transport outright. The four that dial a host —
+`git-remote-http` and the `-https`, `-ftp` and `-ftps` symlinks to it — are
+deleted from `/usr/lib/git-core`. This is the one that matters: https is how
+every forge is reached, so removing it is what leaves a broker verb as the only
+route to one. The guard fails the build if any is back, then runs an actual
+`ls-remote` per scheme against an unroutable URL and requires git's own
 missing-helper message in the answer.
 
 The message is what carries the assertion, not the exit status. `example.invalid`
@@ -544,14 +558,30 @@ guard these replaced asked `git <helper> --help`, which git rewrites to
 `git help <helper>` and execs `man`, absent in `python:3.11-slim` — so all four
 probes exited 128 and it passed whatever the image contained.
 
-`ext` and `fd` are handled differently because deleting them does nothing. Their
-entries in `/usr/lib/git-core` are symlinks to `git` itself: both are builtins,
-dispatched from git's own table without the filesystem being consulted. What
-stops `ext::` — which would run an arbitrary command — is git's protocol
-allowlist, where `protocol.ext.allow` has defaulted to `never` since 2.12, and
-the guard asserts that refusal by its own message rather than attributing it to
-an `rm`. `fd::` reads a descriptor the parent already opened, so it reaches
-whatever the caller could reach anyway and opens nothing new.
+**`ext` and `fd` look like helpers and are not.** Their entries in
+`/usr/lib/git-core` are symlinks to `git` itself: both are builtins, dispatched
+from git's own table without the filesystem being consulted, so deleting them
+does nothing. What stops `ext::` — which would run an arbitrary command — is
+git's protocol allowlist, where `protocol.ext.allow` has defaulted to `never`
+since 2.12, and the guard asserts that refusal by its own message rather than
+attributing it to an `rm`. `fd::` reads a descriptor the parent already opened,
+so it reaches whatever the caller could reach anyway and opens nothing new.
+
+**`ssh://` and `git://` are dialled from git's own code.** There is no
+`git-remote-ssh` to delete, and a default that an agent can turn off is not a
+control, so these two are answered by what they need to run and by scope.
+`ssh://` execs an ssh _client_, and the image ships none — the sandbox runs an
+ssh server, because that is how Hermes arrives; nothing in it makes an outbound
+ssh connection. The guard asserts the client's absence the same way it asserts
+git's placement, which matters because it is the only thing standing between a
+sandbox and a forge's ssh endpoint, and an unrelated package pulling in
+`openssh-client` would restore that route silently. `git://` opens port 9418
+from inside git and cannot be disarmed by removing a file. It is left, and named
+here rather than in [What this does not fix](#10-what-this-does-not-fix),
+because the anonymous daemon protocol is read-only, spends no credential, and no
+forge in scope serves writes over it. It buys an agent nothing a plain outbound
+socket would not, which is a question about egress from the sandbox and not
+about git.
 
 `vcs.py` runs that binary with `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `core.hooksPath` pointed at an empty directory,
