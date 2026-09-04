@@ -56,7 +56,6 @@ size. Method and results in [The experiment](#9-the-experiment).
 | Each provider                | `providers/github/`, `providers/gitlab/` — one directory each        |
 | Registration                 | `providers/registry.py` — the one shared file a new provider edits   |
 | The declarative surface      | `spec.integration.git` on the CR                                     |
-| Whether an install arms it   | `spec.harness.experimental.shellSandbox.versionControl`              |
 | The local git                | `/opt/vcs/libexec/git` in the sandbox image                          |
 
 ## How to read this document
@@ -475,33 +474,50 @@ single-branch. The two ceilings — `CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB
 of working tree) and `CREDENTIAL_PROXY_MAX_BUNDLE_BYTES` (64 MiB of bundle, both
 directions) — say so in their refusals.
 
-### Two gits, on purpose
+### One git in the sandbox
 
-The sandbox image carries a real git at `/opt/vcs/libexec/git` and the
-credential shim at `/opt/credential-proxy/bin/git`, and which of the two owns
-the name `git` is decided at startup rather than in the image. `/opt/vcs/bin` —
-whose `git` is a symlink to that binary — goes ahead of the shim when
-`CREDENTIAL_PROXY_VCS=1`, and the operator sets that variable on the shell
-container exactly when the CR arms the routes. `gcloud` and `kubectl` keep
-resolving to the shim, because there is no credential-free equivalent of them
-and nothing local for them to read.
+The sandbox has exactly one git: the real binary at `/opt/vcs/libexec/git`,
+reached through a symlink in `/opt/vcs/bin`. There is no credential shim named
+`git` beside it, and that is worth stating explicitly because the sandbox does
+carry shims for `gcloud` and `kubectl`.
 
-This is the mechanism behind "local operations stay native". With the routes
-armed, `git log` in the sandbox is a real git reading a real clone, not a
-command forwarded to a credentialed container.
+Two reasons, and either alone would be enough.
 
-That prepend has to happen twice, because a sandbox session arrives by two
-different doors. `/etc/profile.d/vcs-path.sh` covers a login shell, which is
-what `kubectl exec -- bash -l` and the image's smoke test get. Hermes reaches
-the sandbox over ssh, and `ssh sandbox git log` is not a login shell: its whole
-environment is the `SetEnv` line `deploy/sandbox/entrypoint.sh` writes into
-`/etc/ssh/sshd_config.d/`, since `sshd_config` sets `PermitUserEnvironment no`
-and accepts only `LANG` and `LC_*` from the client. The first build of this
-abstraction did the prepend in `profile.d` alone and shipped an install that
-reported the feature armed while `git` and `gh` both still resolved to the
-credential shim on the only path the agent uses. The entrypoint now decides the
-PATH itself and forwards `CREDENTIAL_PROXY_VCS` through the same allowlist that
-carries `CREDENTIAL_PROXY_URL`, so `profile.d` and ssh agree by construction.
+**Nothing the sandbox does with git spends a credential.** Local operations are
+local by definition. Remote operations are not the sandbox's to make: fetching a
+repository and sending revisions back are broker verbs, and the broker runs its
+own git, in its own pod, over a checkout the sandbox cannot see. A shim would be
+forwarding the one category of command that no longer travels that way.
+
+**A forwarded git could not serve them anyway.** The proxy relays argv, and
+git's state _is_ the local filesystem — `clone`, `add`, `commit`, `push` each
+need the previous step's bytes to still be there. That worked while the proxy
+was a sidecar sharing the agent's volume; it stopped working when the broker
+became a separate pod, because two pods cannot mount the same ReadWriteOnce
+volume. `credential_proxy_client.py` carries the conclusion as a comment: git
+cannot be driven from another pod. A shim on PATH is then worse than no shim,
+because it answers a command with a confusing failure instead of a missing
+binary.
+
+So the sandbox entrypoint deletes `/opt/credential-proxy/bin/git`, for the same
+reason and at the same moment it deletes the `gh` shim, and the smoke test
+asserts both by absence rather than by which path wins. `gcloud` and `kubectl`
+keep their shims, because there is no credential-free equivalent of either and
+nothing local for them to read.
+
+That leaves `/opt/vcs/bin` to be prepended, and it has to happen twice, because a
+sandbox session arrives by two different doors. `/etc/profile.d/vcs-path.sh`
+covers a login shell, which is what `kubectl exec -- bash -l` and the image's
+smoke test get. Hermes reaches the sandbox over ssh, and `ssh sandbox git log` is
+not a login shell: its whole environment is the `SetEnv` line
+`deploy/sandbox/entrypoint.sh` writes into `/etc/ssh/sshd_config.d/`, since
+`sshd_config` sets `PermitUserEnvironment no` and accepts only `LANG` and `LC_*`
+from the client. An earlier build did the prepend in `profile.d` alone and
+shipped an install where `git` and `gh` both still resolved to the credential
+shim on the only path the agent uses. Deleting
+the shim is what makes that failure impossible rather than merely ordered
+against: with one git in the image, a missed prepend is a `git: not found` at the
+first call, not a silent forward to the wrong container.
 
 A build guard fails the image when `command -v git` finds a native binary:
 neither directory is on the build PATH, so the guard sees the shim. A second
@@ -592,8 +608,7 @@ because they share the disk.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED` and
-`TARGET_IS_BRANCH`, 502 `GIT_FAILED`. `404 VCS_DISABLED` is what an install that
-has turned `shellSandbox.versionControl` off answers.
+`TARGET_IS_BRANCH`, 502 `GIT_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool
@@ -663,8 +678,7 @@ abstraction says, so the collaboration verbs exist to make removing it possible:
 `vcs.py issue list --state open --labels bug` replaces `gh issue list`, and
 `vcs.py proposal create` replaces `gh pr create`.
 
-In the sandbox that removal is literal. When the CR arms
-`shellSandbox.versionControl` the entrypoint deletes
+In the sandbox that removal is literal. The entrypoint deletes
 `/opt/credential-proxy/bin/gh`, and nothing else in the image supplies one, so
 `gh` resolves nowhere in either session type. The smoke test asserts that by
 absence rather than by which path wins, because a check on PATH order would pass
@@ -1374,13 +1388,29 @@ used one; Bitbucket has no CLI at all. So the union of every supported forge's
 binaries is granted to every install, twice over, and adding a CLI-backed forge
 means editing two files nobody would think to look in.
 
-The allowlist therefore derives from the configured providers rather than from a
-literal. The forge-side half is small: a CLI-backed credential declares its
-binary, and the allowlist is built from the constructed forges — so an install
-with no GitLab never grants `glab`, and an install that reaches GitHub over HTTP
-never grants `gh`. The executor-side half changes how `CommandExecutor` is
-constructed, which is why this is called out as its own step in
-[Delivery](#11-delivery) rather than folded into a provider package.
+**The two lists answer different questions, and that is the fix.**
+`ALLOWED_EXECUTABLES` is the broker's: what the credentialed process may run.
+`SUPPORTED_EXECUTABLES` is the sandbox's: what the agent may ask it to. Holding
+identical contents is what made them look like a duplicate to keep in sync,
+when in fact only one of the four belongs to both.
+
+| Binary    | Broker may run it                           | Sandbox may forward it                          |
+| --------- | ------------------------------------------- | ----------------------------------------------- |
+| `gcloud`  | yes                                         | yes — no credential-free equivalent             |
+| `kubectl` | yes                                         | yes — same                                      |
+| `gh`      | only while GitHub's transport is `"cli"`    | **no** — the verbs replace it, by design        |
+| `git`     | yes — the broker clones, fetches and pushes | **no** — see [one git](#one-git-in-the-sandbox) |
+
+So the broker's list derives from the configured providers: a CLI-backed
+credential declares its binary and the list is built from the constructed
+forges, which means an install with no GitLab never grants `glab` and an install
+whose GitHub provider speaks HTTP never grants `gh`. The sandbox's list loses
+`gh` and `git` outright and needs no per-forge logic at all, because a forge CLI
+is exactly what the sandbox is not allowed to reach.
+
+That is also why this is called out as its own delivery step rather than folded
+into a provider package: the broker half changes how `CommandExecutor` is
+constructed, and the sandbox half changes what the image ships.
 
 ### Checking it against Bitbucket
 
@@ -1499,6 +1529,24 @@ GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
 `githubMinter.kms.*`. All of them are provider-conditional: an install that declares GitLab
 provisions no KMS key and no minter.
+
+**What the surface does not carry is a switch for the abstraction itself.** An
+install declares _which_ forge it uses, never _whether_ the abstraction is in
+play. There is no supported arrangement in which an agent reaches a forge some
+other way, so a toggle would only describe a configuration nobody is allowed to
+run — and every such field is a second code path to keep working, a second
+combination to test, and a way for an install to sit in the state the design
+exists to remove. `spec.harness.experimental.shellSandbox.enabled` survives in
+the schema, but only so that removing it cannot silently drop an `enabled: false`
+from an existing CR and flip that install on the next reconcile; an explicit
+`false` is refused with a named reason rather than honoured.
+
+That is a deliberate reversal of how an experimental feature usually arrives.
+The justification is that this removes no capability: every verb replaces a call
+an agent could already make, the measurement in
+[The experiment](#9-the-experiment) is what establishes that it does so at least
+as well, and the thing being retired — a forge CLI on PATH in a credentialed
+container — is not something an install should be able to opt back into.
 
 ---
 
@@ -1914,11 +1962,10 @@ What the design does buy is that the text cannot become a credential: the
 credential never enters the sandbox, `raw_token`-style routes are not
 agent-callable, and the sandbox has no other path to one. What it does not buy
 is protection against the model being talked into an action it is allowed to
-take. `publish`, `proposal create` and `issue create` are all reachable the
-moment `CREDENTIAL_PROXY_VCS` is on, so an install that wants an agent to read
-history without being able to write to a forge has no way to say so.
-Splitting the flag so the read verbs and the write verbs arm separately is the
-smallest thing that would fix it, and it is not built.
+take. `publish`, `proposal create` and `issue create` are reachable to any agent that
+can reach the read verbs, so an install that wants an agent to read history
+without being able to write to a forge has no way to say so. A read-only mode is
+the smallest thing that would fix it, and it is not designed here.
 
 Until GitLab and Bitbucket ship, this is a forge-neutral design with one forge
 in it — and an abstraction with one implementation is a hypothesis. The measure
@@ -1992,11 +2039,12 @@ callers; then the tests that hold the boundary.
 | 5    | `Credential` protocol; `BrokeredCredential`; `git_config` reaching the broker's git invocations                                                          | a test that the config lands on the invocation and nowhere else     |
 | 6    | `providers/github/` — the eight verbs, translation, its throttle heuristics, its `error_overrides`                                                       | the verb suite                                                      |
 | 7    | the consumer migration: the five scripts of layer 1 reach the forge through the provider and nothing else                                                | their own tests, with no functional delta to explain                |
-| 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, the executable allowlist derived from configured forges     | refresh tests, including a nested-namespace repository              |
+| 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, and the two executable allowlists split by purpose          | refresh tests, including a nested-namespace repository              |
 | 9    | the import-boundary test and the forge-name guard                                                                                                        | they are the test                                                   |
 | 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                               |
 | 11   | `AVAILABLE`, `for_config`, `build_forges`; `StubForge` for registered-but-unconfigured hosts                                                             | registry tests                                                      |
 | 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge) |
+| 13   | the abstraction becomes unconditional: `versionControl` retired, `enabled: false` refused, the `git` and `gh` shims deleted from the sandbox image       | operator tests, and the image smoke test asserting both by absence  |
 
 Step 7 is the one that splits naturally if the PR gets too large: each of the
 five consumers is independent of the others, and each is a no-functional-delta
@@ -2020,20 +2068,20 @@ whole sequence exists to protect.
 
 | Step | Delivers                                                                            | Held to it by                          |
 | ---- | ----------------------------------------------------------------------------------- | -------------------------------------- |
-| 13   | `HttpTransport` — timeout, size cap, redaction, status mapping                      | unit tests against a local stub server |
-| 14   | `providers/gitlab/` — identity, `StaticFileCredential`, translation, errors         | the PR-1 harness, with GitLab fixtures |
-| 15   | GitLab's 401 guidance override (the token-expiry case)                              | error tests                            |
-| 16   | one line in `registry.py`                                                           | registry tests                         |
-| 17   | operator: render the GitLab config, project the Secret, derive egress from the host | operator tests                         |
-| 18   | the vocabulary: the four `SKILL.md` files, then the seven governance SOPs           | the terminology check                  |
-| 19   | live validation                                                                     | see below                              |
+| 14   | `HttpTransport` — timeout, size cap, redaction, status mapping                      | unit tests against a local stub server |
+| 15   | `providers/gitlab/` — identity, `StaticFileCredential`, translation, errors         | the PR-1 harness, with GitLab fixtures |
+| 16   | GitLab's 401 guidance override (the token-expiry case)                              | error tests                            |
+| 17   | one line in `registry.py`                                                           | registry tests                         |
+| 18   | operator: render the GitLab config, project the Secret, derive egress from the host | operator tests                         |
+| 19   | the vocabulary: the four `SKILL.md` files, then the seven governance SOPs           | the terminology check                  |
+| 20   | live validation                                                                     | see below                              |
 
 `HttpTransport` is here rather than in PR 1 deliberately: PR 1 declares the
 `transport` seam and implements only the one GitHub uses. A transport with no
 consumer is a guess about what the second forge will need, and the whole point
 of the sequence is to stop guessing.
 
-Step 18 is here for a related reason. Neutral verb names are worth having on
+Step 19 is here for a related reason. Neutral verb names are worth having on
 their own, but a prompt that says "pull request" is only _wrong_ once the install
 might be talking to something that calls it a merge request. Landing the sweep
 alongside the forge that makes it matter also means it is reviewed against a real
@@ -2056,7 +2104,7 @@ being in PR 1 rather than waiting for a third forge to prove the point.
 ### Where GitLab gets validated
 
 No environment here has a GitLab. The endpoint-level claims marked
-_live-verify_ above cannot be closed without one, and neither can step 19. **PR
+_live-verify_ above cannot be closed without one, and neither can step 20. **PR
 1 needs none of it**, which is most of the reason the sequence is shaped this
 way: the abstraction is not held hostage to an environment question.
 
@@ -2082,7 +2130,7 @@ GitLab is Free-tier — merge requests, issues, notes, API v4, and group access
 tokens, which on self-managed are available with any licence.
 
 Recommendation: an omnibus GitLab CE container in the development cluster for
-steps 14–17. If standing infrastructure is the blocker, the same image runs
+steps 15–18. If standing infrastructure is the blocker, the same image runs
 ephemerally in a CI job for the API-shape and credential tests, and the
 long-lived instance is deferred to whenever the hostname, CA and egress work
 lands. gitlab.com is not on the path at all — it costs nothing but it also
@@ -2115,13 +2163,14 @@ proves the least.
    not settle is whether the token models diverge far enough to want two classes
    anyway. On the evidence so far they do not.
 
-3. **Where the sandbox client's arming flag splits.** `CREDENTIAL_PROXY_VCS` arms
-   the read verbs and the write verbs together, which
-   [What this does not fix](#10-what-this-does-not-fix) names as a real gap: an
-   install that wants an agent to read history without being able to write to a
-   forge cannot say so. Splitting the flag is the smallest fix and it is not
-   designed here, because the CR surface it lands on is §6's and the two should
-   be decided together.
+3. **Whether there is a read-only mode, and where it is declared.** The verbs
+   arrive as one set, which [What this does not fix](#10-what-this-does-not-fix)
+   names as a real gap: an install that wants an agent to read history without
+   being able to write to a forge cannot say so. This is a permission question,
+   not a feature toggle — the abstraction itself is not optional — so it belongs
+   on the declarative surface of §6 alongside whatever answers
+   [the token's scope boundary](#the-gitlab-credential), and the two should be
+   decided together.
 
 4. **Whether `GitHubProvider` moves onto the in-process HTTP transport.** Not
    proposed. It would take `gh` out of the broker entirely, which
