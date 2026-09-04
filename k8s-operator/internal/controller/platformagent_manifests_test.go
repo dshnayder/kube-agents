@@ -2080,8 +2080,11 @@ func TestBuildDeploymentTeamsIntegration(t *testing.T) {
 	if _, ok := envMap["TEAMS_APP_PASSWORD"]; ok {
 		t.Error("expected TEAMS_APP_PASSWORD to be absent from sandbox")
 	}
-	if envMap["TEAMS_RELAY_URL"].Value != "http://127.0.0.1:8765" {
-		t.Errorf("expected credential-free Teams relay URL, got %v", envMap["TEAMS_RELAY_URL"])
+	// Same as the Slack case above: the relay runs in the broker's process, which
+	// is a Pod of its own, so the URL names its Service rather than loopback.
+	wantTeamsRelay := credentialProxyBaseURL(agent)
+	if envMap["TEAMS_RELAY_URL"].Value != wantTeamsRelay {
+		t.Errorf("expected Teams relay URL %q, got %v", wantTeamsRelay, envMap["TEAMS_RELAY_URL"])
 	}
 	if envMap["TEAMS_ALLOWED_USERS"].Value != "user-aad-123,admin-aad-456" {
 		t.Errorf("expected TEAMS_ALLOWED_USERS user-aad-123,admin-aad-456, got %s", envMap["TEAMS_ALLOWED_USERS"].Value)
@@ -2100,7 +2103,7 @@ func TestBuildDeploymentTeamsIntegration(t *testing.T) {
 	}
 
 	proxyEnv := make(map[string]corev1.EnvVar)
-	for _, env := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+	for _, env := range buildCredentialProxyContainer(agent).Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["TEAMS_APP_ID"].ValueFrom.SecretKeyRef.Name != "custom-teams-secret" || proxyEnv["TEAMS_APP_ID"].ValueFrom.SecretKeyRef.Key != "teams-app-id" {

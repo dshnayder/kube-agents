@@ -329,6 +329,10 @@ data:
         enabled: false
         extra:
           rich_blocks: true
+      teams:
+        enabled: false
+        extra:
+          adaptive_cards: true
     terminal:
       backend: ssh
       lifetime_seconds: 2592000
