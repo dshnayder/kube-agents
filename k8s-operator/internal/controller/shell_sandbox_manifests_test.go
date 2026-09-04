@@ -71,20 +71,26 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	// The whole list, by name, rather than a count: every volume here is a way to
 	// put bytes into the pod the agent can run arbitrary commands in, so adding one
-	// should be a decision someone makes on purpose. Exactly three are allowed —
-	// the authorized-keys Secret, the SETTINGS.md ConfigMap, and the token the
-	// shell presents to the credential runtime. Anything else fails here and gets
-	// argued about in review.
+	// should be a decision someone makes on purpose. Exactly four are allowed —
+	// the authorized-keys Secret, the SETTINGS.md ConfigMap, the token the shell
+	// presents to the credential runtime, and the empty mount over ~/.hermes.
+	// Anything else fails here and gets argued about in review.
 	//
-	// The third one is a credential, unlike the other two, and it is here because
+	// The third one is a credential, unlike the others, and it is here because
 	// the alternative is not "the sandbox holds nothing" but "the sandbox cannot
 	// run a command": the broker authenticates its callers at every placement the
 	// sandbox exists in. What keeps it from being the thing this test is named
 	// after is the audience, asserted below.
+	//
+	// The fourth carries nothing in either direction — it exists so the path
+	// cannot be replaced with a writable directory, which is the one write channel
+	// the sandbox has back into the agent pod. See shellSandboxHermesHomePath;
+	// that it is empty and read-only is asserted below.
 	allowed := map[string]bool{
 		shellSandboxKeysVolume:                 true,
 		shellSandboxSettingsVolume:             true,
 		shellSandboxCredentialProxyTokenVolume: true,
+		shellSandboxHermesHomeVolume:           true,
 	}
 	byName := map[string]corev1.Volume{}
 	for _, v := range pod.Volumes {
@@ -129,6 +135,33 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	if projection.ExpirationSeconds == nil || *projection.ExpirationSeconds > 3600 {
 		t.Errorf("expected an expiry of at most an hour, got %v", projection.ExpirationSeconds)
+	}
+	// The sync block. An EmptyDir with nothing behind it, mounted read-only:
+	// anything else here would be bytes crossing at a path whose whole purpose is
+	// that nothing does. Read-only is the half that matters — a writable mount
+	// leaves Hermes' file sync copying the sandbox's ~/.hermes back onto the agent
+	// pod, which is what shellSandboxHermesHomePath exists to stop.
+	block, ok := byName[shellSandboxHermesHomeVolume]
+	if !ok {
+		t.Fatalf("expected the %q volume, got %#v", shellSandboxHermesHomeVolume, pod.Volumes)
+	}
+	if block.EmptyDir == nil {
+		t.Errorf("expected %q to be an EmptyDir, got %#v", shellSandboxHermesHomeVolume, block.VolumeSource)
+	}
+	var mount *corev1.VolumeMount
+	for i, m := range pod.Containers[0].VolumeMounts {
+		if m.Name == shellSandboxHermesHomeVolume {
+			mount = &pod.Containers[0].VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("expected %q to be mounted, got %#v", shellSandboxHermesHomeVolume, pod.Containers[0].VolumeMounts)
+	}
+	if mount.MountPath != shellSandboxHermesHomePath {
+		t.Errorf("expected the mount at %q, got %q", shellSandboxHermesHomePath, mount.MountPath)
+	}
+	if !mount.ReadOnly {
+		t.Errorf("expected %q to be mounted read-only", shellSandboxHermesHomeVolume)
 	}
 }
 

@@ -16,13 +16,22 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
@@ -60,6 +69,45 @@ func gkeContext(project, cluster, location string) string {
 	return "gke_" + project + "_" + location + "_" + cluster
 }
 
+// testCA is the certificate stubGKE hands back as every cluster's CA, built
+// once for the whole package. Generated rather than pasted in: a PEM blob in a
+// public repository invites the question of where it came from, and this way
+// there is no answer to give.
+var (
+	testCAOnce sync.Once
+	testCA     []byte
+	testCAErr  error
+)
+
+func testCAPEM(t *testing.T) []byte {
+	t.Helper()
+	testCAOnce.Do(func() {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			testCAErr = err
+			return
+		}
+		template := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: "k8s-event-watcher test CA"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		if err != nil {
+			testCAErr = err
+			return
+		}
+		testCA = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	})
+	if testCAErr != nil {
+		t.Fatalf("generating the test CA: %v", testCAErr)
+	}
+	return testCA
+}
+
 // stubGKE makes discovery answerable without a Google credential or a network
 // call: every cluster is described as an ordinary public one, and the token
 // source hands back a fixed string. Returns the failures map — put an error in
@@ -76,8 +124,12 @@ func stubGKE(t *testing.T) map[string]error {
 		}
 		return &container.Cluster{
 			Endpoint: key + ".example.invalid",
-			// Any base64; nothing in these tests establishes a TLS session.
-			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString([]byte("ca"))},
+			// A real certificate, even though no TLS session is established here.
+			// clientConfigForIdentity puts these bytes in rest.Config.CAData and
+			// kubernetes.NewForConfig builds the CertPool eagerly, so arbitrary
+			// base64 fails at client construction with "unable to parse bytes as
+			// PEM block" and every discovery test reports zero clusters.
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString(testCAPEM(t))},
 		}, nil
 	}
 	newTokenSource = func(context.Context) (oauth2.TokenSource, error) {

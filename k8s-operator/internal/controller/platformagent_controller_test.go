@@ -4200,9 +4200,28 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 		},
 	}
 
+	// The other two workloads Ready depends on. This test is about what the
+	// NetworkPolicy status fields say, so it wants the phase to reach Ready — and
+	// since the credential-broker split that takes all three, because a gateway on
+	// its own is an agent that can run no command. readSplitWorkloads reads them.
+	shell := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-shell",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	broker := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-credential-proxy",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, dep).
+		WithObjects(agent, dep, shell, broker).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
