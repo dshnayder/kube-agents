@@ -68,7 +68,7 @@ it. An agent should read all of it.
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | [1. Why](#1-why)                                                | the customer requirement, where GitHub is named today, and the shape of the answer — **stop here if that is what you came for** |
 | [2. The concepts](#2-the-concepts)                              | what the systems call things, which words the verbs use, and how a repository is named                                          |
-| [3. The seam](#3-the-seam)                                      | the broker, the bundle transport, the two gits, the routes and the error contract                                               |
+| [3. The seam](#3-the-seam)                                      | the broker, the bundle transport, the sandbox’s one git, the routes and the error contract                                      |
 | [4. The provider interface](#4-the-provider-interface)          | what a provider supplies, and the decisions a second forge forces                                                               |
 | [5. Modularity](#5-modularity)                                  | the package layout, and what makes the boundary hold at the third forge                                                         |
 | [6. The declarative surface](#6-the-declarative-surface)        | how an install says which provider it uses                                                                                      |
