@@ -23,6 +23,7 @@ from unittest import mock
 
 import credential_proxy
 import gke_endpoint
+import providers
 import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -3663,6 +3664,83 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.NOT_IMPLEMENTED, status)
         self.assertEqual("FORGE_UNSUPPORTED", payload.get("code"))
 
+    def test_a_write_verb_refuses_a_repository_this_install_does_not_manage(self):
+        # The control this route did not have. Nothing downstream asks the
+        # question -- a forge is handed a repository and spends the token on it
+        # -- so `POST /v1/vcs/publish` for an unregistered repository would have
+        # pushed with the installation token. The only check that existed lived
+        # inside the credential refresh, which caught the refusal and logged it.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/managed"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish",
+                {"repository": "https://github.com/acme/not-ours"},
+                self.broker(),
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_read_verb_is_not_gated_on_the_managed_list(self):
+        # Deliberately, and for the reason `require_managed_workspace` gives
+        # about the content workspace's `open`: reading a repository this
+        # install does not write to is something the agent is supposed to be
+        # able to do. What this asserts is that the gate above did not
+        # accidentally cover the read half.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/managed"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/capabilities",
+                {"repository": "https://github.com/acme/not-ours"},
+                self.broker(),
+            )
+        self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertNotEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_every_write_verb_is_covered_by_the_gate(self):
+        # Named against the route table rather than a hand-written list, so a
+        # verb added to the broker and not classified fails here instead of
+        # shipping ungated. `capabilities` and `clone` are reads; the rest of
+        # the split is asserted by name.
+        routes = set(vcs_broker.route_table(self.broker()))
+        self.assertTrue(vcs_broker.WRITE_VERBS <= routes)
+        unclassified = routes - vcs_broker.WRITE_VERBS
+        self.assertEqual(
+            {"capabilities", "clone", "proposal-list", "proposal-view",
+             "issue-list", "issue-view"},
+            unclassified,
+            "a new verb must be classified as a read or a write",
+        )
+
+    def test_a_forge_refusal_is_redacted_before_it_crosses_back(self):
+        # The forge's own words are what the caller needs, and they are also a
+        # string this process did not write. The sandbox is the side that must
+        # not learn a credential, so anything token-shaped comes out first.
+        leaked = "remote: denied for ghp_" + "A" * 36
+        broker = self.broker()
+
+        def refuse(payload):
+            raise providers.WorkspaceError(
+                leaked, status=403, code="FORGE_FORBIDDEN", detail=leaked
+            )
+
+        broker.publish = refuse
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/infra"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish",
+                {"repository": "https://github.com/acme/infra"},
+                broker,
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertNotIn("ghp_", json.dumps(payload))
+        self.assertIn("[REDACTED]", json.dumps(payload))
+
     def test_capabilities_answers_rather_than_refusing(self):
         """The one verb that must not raise: it is how a caller finds out.
 
@@ -3737,7 +3815,7 @@ class VcsRouteTest(unittest.TestCase):
 
     def test_the_broker_is_built_unconditionally(self):
         """There is no off switch, and the roots are proven disjoint at boot."""
-        broker = credential_proxy.build_vcs_broker(self.executor, 30)
+        broker = credential_proxy.build_vcs_broker(self.executor)
         self.assertIsNotNone(broker)
         self.assertTrue(broker.registry.forges)
 
@@ -3745,7 +3823,7 @@ class VcsRouteTest(unittest.TestCase):
         overlapping.vcs_root = self.executor.workspace_dir / "vcs"
         overlapping.workspace_dir = self.executor.workspace_dir
         with self.assertRaises(RuntimeError):
-            credential_proxy.build_vcs_broker(overlapping, 30)
+            credential_proxy.build_vcs_broker(overlapping)
 
 
 class WorkspaceRouteTest(unittest.TestCase):

@@ -213,10 +213,27 @@ class CloneTest(VcsTestCase):
         answer = self.clone()
         self.assertTrue(os.access(Path(answer["path"]) / "rotate-keys.sh", os.X_OK))
 
-    def test_a_second_clone_replaces_the_first(self):
+    def test_a_second_clone_replaces_a_clean_first(self):
+        first = self.clone()
+        second = self.clone()
+        self.assertEqual(first["path"], second["path"])
+        self.assertEqual(len(vcs.all_sessions()), 1)
+
+    def test_a_second_clone_refuses_to_discard_work(self):
+        # It used to replace the tree silently, so a commit made here and never
+        # published was gone with no message. Worse in context: the publish
+        # refusals say to clone again, which pointed the caller straight at it.
         first = self.clone()
         (Path(first["path"]) / "stale.txt").write_text("x")
-        second = self.clone()
+        code, answer = self.run_vcs("clone", "local.test/acme/infra")
+        self.assertEqual(code, 1)
+        self.assertIn("--force", answer["error"])
+        self.assertTrue((Path(first["path"]) / "stale.txt").exists())
+
+    def test_force_replaces_it_anyway(self):
+        first = self.clone()
+        (Path(first["path"]) / "stale.txt").write_text("x")
+        second = self.clone("--force")
         self.assertEqual(first["path"], second["path"])
         self.assertFalse((Path(second["path"]) / "stale.txt").exists())
         self.assertEqual(len(vcs.all_sessions()), 1)

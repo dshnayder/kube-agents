@@ -159,7 +159,14 @@ class GitHubForge(Forge):
         # for issues and got proposals mixed in would have to know that. The
         # `pull_request` key is how they are told apart.
         issues = [node for node in nodes if "pull_request" not in node]
-        return listing([translate.issue(node) for node in issues], limit, "issues")
+        # `per_page` bounded what GitHub sent, not what survived the filter, so
+        # `truncated` is judged on the page rather than on the remainder.
+        return listing(
+            [translate.issue(node) for node in issues],
+            limit,
+            "issues",
+            returned=len(nodes),
+        )
 
     def issue_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

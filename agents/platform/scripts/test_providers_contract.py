@@ -28,6 +28,7 @@ from typing import Any
 from unittest import mock
 
 from providers import AVAILABLE, COLLABORATION_VERBS, ForgeUnsupported
+from providers.credentials import BrokeredCredential
 from workspace_paths import WorkspaceError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -348,6 +349,31 @@ class ContractTest(unittest.TestCase):
                 self.assertTrue(answer["proposalNoun"])
                 for verb in forge.verbs:
                     self.assertIn(verb, answer["verbs"])
+
+
+class BrokeredCredentialTest(unittest.TestCase):
+    """The one refusal `ensure` must not swallow."""
+
+    def test_a_transient_refresh_failure_is_swallowed(self):
+        # The behaviour the class is built around: the broker may already hold
+        # a valid token, in which case a failed re-acquisition is the only
+        # thing that failed and the verb should still run.
+        def blow_up(provider, repo):
+            raise RuntimeError("the helper is not there")
+
+        BrokeredCredential("acme", blow_up).ensure("acme/infra")
+
+    def test_an_authorization_refusal_is_not(self):
+        # `refresh_forge_credential` asks the managed-repository list and
+        # raises `PermissionError` when the answer is no. Swallowed, that let
+        # the verb proceed against a repository that had just been refused --
+        # on a token that was perfectly valid, which is why nothing downstream
+        # would have stopped it.
+        def refuse(provider, repo):
+            raise PermissionError(f"{repo} is not one this install manages")
+
+        with self.assertRaises(PermissionError):
+            BrokeredCredential("acme", refuse).ensure("acme/not-ours")
 
 
 if __name__ == "__main__":

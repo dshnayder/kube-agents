@@ -14,7 +14,7 @@ Each file is one JSON object:
 ```json
 {
   "payload": { "repository": "...", "...": "..." },
-  "responses": [ { "...": "..." } ]
+  "responses": [{ "...": "..." }]
 }
 ```
 
@@ -31,7 +31,7 @@ ways and never regenerated wholesale:
 
 - **Trimmed.** GitHub answers a pull request with roughly 80 fields; what is
   left is what the translation reads plus enough neighbours that a field the
-  translation should *not* be reading is present to be gotten wrong. Trimming
+  translation should _not_ be reading is present to be gotten wrong. Trimming
   to exactly the fields used would make the harness unable to catch a
   translation that reached for the wrong one.
 - **Redacted.** Every login, avatar URL, node ID, repository name and

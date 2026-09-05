@@ -19,11 +19,10 @@ from pathlib import Path
 
 # What this client may be invoked *as*, which is a different list from what the
 # broker may run. `CommandExecutor.ALLOWED_EXECUTABLES` is derived from the
-# forges an install configured and still includes a forge CLI, because the
-# broker is where that CLI runs; here it would be the sandbox reaching a forge
-# directly, which is the thing the version-control abstraction removes. There is
-# no `gh` shim in the sandbox image for the same reason.
-SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "git")
+# forges an install configured, so a forge CLI appears there and only there:
+# the broker is where that CLI runs. The overlap is not an invariant and these
+# two lists are not to be folded together.
+SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
 
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.

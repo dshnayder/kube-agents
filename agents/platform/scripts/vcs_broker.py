@@ -202,7 +202,6 @@ class VcsBroker:
         git_runner: Callable[..., subprocess.CompletedProcess],
         cli_runner: Callable[..., subprocess.CompletedProcess] | None = None,
         refresh: Callable[[str, str], None] | None = None,
-        timeout_seconds: int = 600,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -210,8 +209,10 @@ class VcsBroker:
         # A CLI transport needs the broker's credential environment but no
         # repository. When the caller does not separate the two, the git runner
         # serves both.
+        # No timeout here on purpose: the runners are given one by whoever
+        # built them, and a second number this class merely stored would read
+        # like a bound it enforces.
         self._cli_runner = cli_runner or git_runner
-        self.timeout_seconds = timeout_seconds
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
@@ -496,6 +497,45 @@ class VcsBroker:
                     f"refs/heads/{branch}",
                 )
 
+            # Before the bundle is read, because a rewritten target is also why
+            # reading it fails: the bundle's prerequisites sit on the revision
+            # this copy was cloned at, and if that revision is gone the unbundle
+            # refuses first and the caller gets a git failure instead of the
+            # reason for it.
+            #
+            # Only on a branch's first publish, and that is the whole subtlety.
+            # `baseRevision` means "what this bundle builds on", which is a
+            # revision of the target the first time and the caller's own last
+            # published tip every time after -- and that tip is on the branch,
+            # never on the target. Asking this question of a second publish
+            # refuses every one of them.
+            #
+            # The direction is base-under-target, not target-under-tip. The
+            # other way round demands that the bundle contain everything on the
+            # target, which is to say that a topic branch be rebased onto the
+            # tip of the shared branch before every publish -- so any push to
+            # the target by anyone, between the clone and the publish, refuses a
+            # change that would have merged cleanly. On a shared branch that is
+            # most of them, and the refusal it handed back said to clone again,
+            # which is the one operation that discards the work.
+            #
+            # What this direction catches is the case the message is actually
+            # about: the target was rewritten rather than advanced, so there is
+            # nothing to fast-forward from and cloning again is the right
+            # advice. An ordinary advance leaves the base an ancestor and
+            # passes; the change then opens as a proposal with a base behind the
+            # tip, which is a rebase on the forge and not an error here.
+            if not existing_head and not self._is_ancestor(
+                git, root, base_revision, remote_target
+            ):
+                raise WorkspaceError(
+                    f"{target} no longer contains {base_revision[:12]}, the "
+                    "revision this copy was cloned at, so it was rewritten "
+                    "rather than advanced. Clone again and reapply the change.",
+                    status=409,
+                    code="BASE_MOVED",
+                )
+
             listed = git(root, "bundle", "list-heads", str(bundle)).stdout
             heads = [
                 (line.split(" ", 1)[0].strip(), line.split(" ", 1)[1].strip())
@@ -537,13 +577,6 @@ class VcsBroker:
                     f"{base_revision[:12]}, the revision this copy was cloned at",
                     status=409,
                     code="NOT_FAST_FORWARD",
-                )
-            if not self._is_ancestor(git, root, remote_target, tip):
-                raise WorkspaceError(
-                    f"{target} has moved on the remote since this copy was "
-                    "cloned. Clone again and reapply the change.",
-                    status=409,
-                    code="BASE_MOVED",
                 )
             if existing_head and not self._is_ancestor(git, root, existing_head, tip):
                 raise WorkspaceError(
@@ -601,6 +634,29 @@ class VcsBroker:
         return self._forge_verb("issue-comment", payload)
 
 
+# The verbs that leave a mark on the forge, named here so the HTTP layer can
+# refuse an unmanaged repository before one of them runs. The classification
+# lives beside the route table because that is where a new verb gets added, and
+# a verb added to one and not the other is the mistake this placement is meant
+# to make loud.
+#
+# The read verbs are deliberately absent rather than overlooked. `clone`,
+# `capabilities` and the four list/view verbs spend the credential too, and they
+# stay open for the reason `require_managed_workspace` gives about the content
+# workspace's `open`: reading a repository this install does not write to is a
+# thing the agent is supposed to be able to do, and `inspect-repository` is
+# built on it. The managed list is a write control, not a visibility one.
+WRITE_VERBS = frozenset(
+    {
+        "publish",
+        "proposal-create",
+        "proposal-comment",
+        "issue-create",
+        "issue-comment",
+    }
+)
+
+
 def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
     """The verbs `POST /v1/vcs/<verb>` dispatches to.
 
@@ -626,6 +682,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
 __all__ = [
     "Binding",
     "VcsBroker",
+    "WRITE_VERBS",
     "max_bundle_bytes",
     "route_table",
 ]

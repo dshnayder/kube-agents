@@ -85,9 +85,20 @@ class ForgeUnsupported(WorkspaceError):
         super().__init__(message, status=501, code="FORGE_UNSUPPORTED")
 
 
-def listing(items: list[dict], limit: int, key: str) -> dict[str, Any]:
-    """A page of results that says when it is a page rather than the answer."""
-    return {key: items, "count": len(items), "truncated": len(items) >= limit}
+def listing(
+    items: list[dict], limit: int, key: str, returned: int | None = None
+) -> dict[str, Any]:
+    """A page of results that says when it is a page rather than the answer.
+
+    `returned` is how many the forge sent, which is not always how many come
+    out. A forge whose issue endpoint also carries change proposals is filtered
+    after the page is fetched, and a full page filtered down to three is still a
+    page: judging `truncated` on what survived would tell the caller it has
+    everything while the forge is holding more. It defaults to the length of
+    `items`, which is right for every verb that filters nothing.
+    """
+    fetched = len(items) if returned is None else returned
+    return {key: items, "count": len(items), "truncated": fetched >= limit}
 
 
 class Forge:

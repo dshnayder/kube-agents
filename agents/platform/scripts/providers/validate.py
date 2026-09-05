@@ -80,7 +80,15 @@ def validate_limit(value: Any) -> int:
 
 
 def validate_state(value: Any) -> str:
-    state = value.strip().lower() if isinstance(value, str) and value else "open"
+    # Absent means "open"; present and not a string is a mistake and says so.
+    # Folding the two -- coercing anything non-string to the default -- answers
+    # a caller that sent `{"state": 3}` with the open ones and no indication
+    # that the filter it asked for was dropped.
+    if value is None:
+        return "open"
+    if not isinstance(value, str):
+        raise WorkspaceError("state must be one of open, closed, all")
+    state = value.strip().lower() or "open"
     if state not in {"open", "closed", "all"}:
         raise WorkspaceError("state must be one of open, closed, all")
     return state

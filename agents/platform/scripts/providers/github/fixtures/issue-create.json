@@ -2,10 +2,7 @@
   "payload": {
     "title": "Ingest drops events during a node drain",
     "body": "Reproduced twice on the staging cluster.\n",
-    "labels": [
-      "kind/bug",
-      "area/ingest"
-    ]
+    "labels": ["kind/bug", "area/ingest"]
   },
   "responses": [
     {

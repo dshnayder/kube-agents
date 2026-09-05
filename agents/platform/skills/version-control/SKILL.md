@@ -1,14 +1,12 @@
 ---
 name: version-control
-description: Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use the ordinary VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed or available.
+description: Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use a credential-free VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed.
 ---
 
 # version-control - remote operations through vcs.py, local operations with git
 
-Version control here is **abstracted**. There is no forge CLI installed —
-`gh` is not on PATH and there is nothing to install it from. Everything is one
-of two things, and getting an operation into the right half is most of using
-this skill.
+Version control here is **abstracted**. Everything is one of two things, and
+getting an operation into the right half is most of using this skill.
 
 **Remote operations — anything that crosses the network or spends a
 credential.** These go through `scripts/vcs.py`, which speaks to a broker in
@@ -19,14 +17,19 @@ The remote verbs are exactly these:
 `issue create|list|view|comment`.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
-onto this filesystem and prints its `path`. Inside it, use ordinary `git`:
+onto this filesystem and prints its `path`. Inside it, use the local git, which
+is `/opt/vcs/libexec/git` — set `alias git=/opt/vcs/libexec/git` once and then
 `git log`, `git show`, `git blame`, `git grep`, `git diff`, `git status`,
-`git branch`, `git commit`, `git ls-files --stage`, and any other read you
-want. That git is the real binary, it holds no credential, and it cannot fetch
-or push — the remote-transport helpers are not in the image, so an `https://`
-URL fails with "Unable to find remote helper". Read files
-in the working copy with `cat`, `rg`, or anything else. You do not need
-`vcs.py` for any of this and it is faster without it.
+`git branch`, `git commit`, `git ls-files --stage` and any other read all work
+as you expect. Read files in the working copy with `cat`, `rg`, or anything
+else. You do not need `vcs.py` for any of this and it is faster without it.
+
+The full path matters: plain `git` on this machine is a different program that
+runs elsewhere and holds a credential. The one named above holds none and
+cannot reach a network at all — the remote-transport helpers are not in the
+image, so an `https://` URL fails with `'remote-https' is not a git command`.
+Seeing that message means you used the right git and asked it for the one thing
+it does not do; the answer is a `vcs.py` verb, not the other binary.
 
 `vcs.py` also offers `log`, `show`, `annotate`, `files`, `grep`, `diff`,
 `status`, `branch` and `commit` as thin wrappers over that same local git, for
@@ -78,6 +81,8 @@ V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
 python3 $V clone https://github.com/dshnayder-org/infra
 
 # Local, in that working copy. No network, no credential, no vcs.py.
+# The alias is the point: bare `git` is a different, credentialed program.
+alias git=/opt/vcs/libexec/git
 git log      -n 20 -- inventory/clusters.yaml
 git show     HEAD~3:inventory/clusters.yaml
 git blame    scripts/rotate-keys.sh
@@ -134,23 +139,28 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 - **`clone` before any other verb.** The read verbs answer from the local copy
   and say so when there is not one. The collaboration verbs do not need one if
   you pass `--repo`.
-- **There is no `gh`, and looking for one is the wrong move.** `command -v gh`
-  comes up empty because the binary was removed, not hidden — that is the
-  install working as intended, not a broken image. Nothing this skill cannot do
-  becomes possible through a forge CLI; a verb you need and cannot find is a gap
-  worth reporting, and going around the abstraction answers a neutral question
-  in one forge's dialect.
+- **Do not reach for `gh`, even though it answers.** A forge CLI is reachable
+  on this machine and it is not the sanctioned path: it answers a
+  forge-neutral question in one forge's dialect, and the same request against
+  the next forge this install adds would have to be written again. Nothing this
+  skill cannot do becomes possible through it. A verb you need and cannot find
+  is a gap worth reporting, not a reason to go around.
 - **Do not `git push`, `git fetch`, `git clone` or `git remote add`.** The
-  working copy has no remote on purpose, and this git cannot speak the wire
+  working copy has no remote on purpose, and the local git cannot speak the wire
   protocol in any case. Revisions go up through `publish` and come down through
   `clone`. Local git is for reading and committing, nothing else.
 - **Start a branch before you commit.** `clone` leaves you on the shared branch,
   and publishing that branch is refused: revisions reach a repository through a
   branch of your own and a proposal onto the shared one. `vcs.py branch <name>`
-  or `git switch -c <name>` before the first commit.
-- **`publish` can be refused, and the refusal is the answer.** `BASE_MOVED`
-  means somebody pushed to the target since you cloned: clone again and reapply
-  the change. Do not try to force it.
+  or `git switch -c <name>` (the local git) before the first commit.
+- **`publish` can be refused, and the refusal is the answer.**
+  `NOT_FAST_FORWARD` and `BRANCH_DIVERGED` mean your revisions do not build on
+  what the remote has; `BASE_MOVED` means the target branch was rewritten, so
+  the revision you cloned at is not on it any more and there is nothing to build
+  on — clone again and reapply the change. An ordinary push to the target by
+  somebody else is _not_ refused: your proposal simply opens with a base behind
+  the tip, which is a rebase on the forge and not a problem here. Do not try to
+  force any of them.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
   `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer

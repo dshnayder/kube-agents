@@ -619,14 +619,45 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(caught.exception.fields.get("code"), "NOT_FAST_FORWARD")
 
-    def test_publish_refuses_when_the_target_moved_underneath(self):
+    def test_publish_survives_the_target_advancing(self):
+        # The case this suite used to assert a refusal for, and the reason it
+        # is now asserted the other way: requiring the bundle to contain
+        # everything on the target means a topic branch must be rebased onto
+        # the tip of the shared branch before every publish, so any push by
+        # anyone in between refuses a change that would have merged cleanly.
+        # On a shared branch that is most of them, and the refusal it handed
+        # back said to clone again -- the one operation that discards the work.
         work, answer = self.clone_locally()
         git(work, "checkout", "--quiet", "-b", "late")
-        self.commit_in(work, "README.md", "mine\n", "mine")
+        tip = self.commit_in(work, "mine.txt", "mine\n", "mine")
         bundle = self.bundle_of(work, "late", answer["revision"])
         # Somebody else pushes to main between the clone and the publish.
-        self.commit_in(self.seed, "README.md", "theirs\n", "theirs")
+        self.commit_in(self.seed, "theirs.txt", "theirs\n", "theirs")
         git(self.seed, "push", "--quiet", "origin", "main")
+        result = self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "late",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": bundle,
+            }
+        )
+        self.assertEqual(result["revision"], tip)
+        self.assertEqual(self.remote_tip("late"), tip)
+
+    def test_publish_refuses_when_the_target_was_rewritten(self):
+        # What BASE_MOVED is for after the change above: the revision this copy
+        # was cloned at is not on the target any more, so the target was
+        # replaced rather than advanced and there is nothing to build on.
+        # "Clone again and reapply" is the right advice here and only here.
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "late")
+        self.commit_in(work, "mine.txt", "mine\n", "mine")
+        bundle = self.bundle_of(work, "late", answer["revision"])
+        git(self.seed, "checkout", "--quiet", "--orphan", "rewritten")
+        self.commit_in(self.seed, "fresh.txt", "fresh\n", "a new root")
+        git(self.seed, "push", "--quiet", "--force", "origin", "rewritten:main")
         with self.assertRaises(WorkspaceError) as caught:
             self.broker.publish(
                 {
@@ -637,6 +668,7 @@ class RepositoryVerbTest(unittest.TestCase):
                     "bundleBase64": bundle,
                 }
             )
+        self.assertEqual(caught.exception.status, 409)
         self.assertEqual(caught.exception.fields.get("code"), "BASE_MOVED")
 
     def test_publish_refuses_to_clobber_a_diverged_branch(self):

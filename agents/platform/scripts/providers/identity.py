@@ -24,7 +24,13 @@ import re
 # revision syntax. Deliberately narrower than `git check-ref-format`: every name
 # this has to carry is one a person typed.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
-SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+# A leading dot is legal and in use: the convention of a dot-prefixed
+# repository holding an organisation's own metadata is one more than one forge
+# has, and refusing it here would make those repositories unreachable. So the
+# first character admits a dot, and the lookahead is what keeps that from also
+# admitting `.` and `..`. A leading hyphen stays refused -- that is the one
+# that reads as an option.
+SEGMENT_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9.][A-Za-z0-9._-]{0,99}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 _SCHEMES = ("https://", "http://", "ssh://", "git+ssh://", "git@")

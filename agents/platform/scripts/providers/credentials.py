@@ -68,6 +68,13 @@ class BrokeredCredential:
     valid token, in which case the verb about to run succeeds and a refusal
     would have been the only thing that failed.
 
+    `PermissionError` is the exception, and it is not a failure to refresh. The
+    operation this strategy names answers two questions at once -- is the token
+    current, and is this a repository the install acts on -- and the second is
+    an authorization decision. Swallowing it would let a verb proceed against a
+    repository that was just refused, on a token that is valid, which is the
+    only shape of "refresh failed" that must stop the verb.
+
     `headers` and `git_config` are both empty, and that is a statement rather
     than an omission: this strategy is for a forge whose CLI carries the token
     on the API side and installs a git credential helper on the git side, so
@@ -83,6 +90,8 @@ class BrokeredCredential:
             return
         try:
             self._refresh(self.provider, repo)
+        except PermissionError:
+            raise
         except Exception as exc:  # noqa: BLE001 - the verb's own error is better
             LOGGER.warning(
                 "%s: credential refresh for %s failed: %s",

@@ -284,6 +284,49 @@ def verb_capabilities(arguments) -> dict:
     return answer
 
 
+def _refuse_to_discard(destination: Path, *, force: bool) -> None:
+    """Stop a re-clone from deleting work that was never published.
+
+    A second `clone` of the same repository replaces the tree, and until this
+    check it did so silently -- so a commit made here and not yet published was
+    gone with no message. That is the wrong default anywhere; it is worse here
+    because `publish` used to answer a moved target by saying to clone again,
+    which pointed the caller straight at it.
+
+    Anything at all is enough to refuse: a commit past the recorded base, or an
+    uncommitted change, or a git that cannot answer either question. Refusing on
+    the third is deliberate -- a tree this cannot read is exactly the one whose
+    contents cannot be vouched for.
+    """
+    if force:
+        return
+    session = next(
+        (s for s in all_sessions() if Path(s.get("path", "")) == destination), None
+    )
+    reasons = []
+    dirty = local_git(destination, "status", "--porcelain", check=False)
+    if dirty.returncode != 0:
+        reasons.append("its state could not be read")
+    elif dirty.stdout.strip():
+        reasons.append(f"{len(dirty.stdout.strip().splitlines())} uncommitted change(s)")
+    base = (session or {}).get("baseRevision")
+    if base:
+        ahead = local_git(
+            destination, "rev-list", "--count", f"{base}..HEAD", check=False
+        )
+        if ahead.returncode != 0:
+            reasons.append("its revisions could not be counted")
+        elif (ahead.stdout or "0").strip() not in ("", "0"):
+            reasons.append(f"{ahead.stdout.strip()} unpublished revision(s)")
+    if not reasons:
+        return
+    raise VcsError(
+        f"there is already a copy at {destination} with "
+        + " and ".join(reasons)
+        + ". Publish it, or re-run with --force to replace it."
+    )
+
+
 def verb_clone(arguments) -> dict:
     """Bring the repository down as history, not as a directory listing.
 
@@ -298,6 +341,7 @@ def verb_clone(arguments) -> dict:
 
     destination = ROOT / _slug(answer["forge"], answer["repo"])
     if destination.exists():
+        _refuse_to_discard(destination, force=arguments.force)
         shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     handle, name = tempfile.mkstemp(dir=str(destination.parent), suffix=".bundle")
@@ -542,7 +586,6 @@ def verb_publish(arguments) -> dict:
     branch = current_branch(session)
     base = session["baseRevision"]
     target = arguments.target or session["branch"]
-
     ahead = local_git(tree, "rev-list", "--count", f"{base}..HEAD", check=False)
     if ahead.returncode != 0:
         raise VcsError(
@@ -553,6 +596,21 @@ def verb_publish(arguments) -> dict:
         raise VcsError(
             "there are no new revisions to publish. `vcs.py commit` records "
             "one; `vcs.py status` shows what is still uncommitted."
+        )
+    if branch == target:
+        # After the count, not before: on the shared branch with nothing
+        # committed, "there is nothing to publish" is the more specific of the
+        # two true things and the one that says what to do next.
+        #
+        # Refused here as well as in the broker, and the broker's is the
+        # control -- this only saves the round trip and the bundle. Worth having
+        # because it is the mistake with no signal: `clone`, `commit`,
+        # `publish` with no `--target` reads like the obvious sequence right up
+        # to the 409.
+        raise VcsError(
+            f"you are on {branch}, which is the branch this copy was cloned "
+            "from, so this would write to the shared branch. Make a branch of "
+            "your own with `vcs.py branch <name>` and publish that."
         )
 
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
@@ -746,6 +804,11 @@ def build_parser() -> argparse.ArgumentParser:
     clone = verbs.add_parser("clone", help="local copy, with full history")
     clone.add_argument("repository", help="repository URL or owner/name")
     clone.add_argument("--branch", help="which line of development (default: the trunk)")
+    clone.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing copy even if it holds unpublished work",
+    )
     clone.set_defaults(run=verb_clone)
 
     log = verbs.add_parser("log", aliases=["history"], help="the revisions behind HEAD")
@@ -877,6 +940,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except subprocess.TimeoutExpired:
         print(json.dumps({"error": "the local git command timed out"}, indent=2))
+        return 1
+    except subprocess.CalledProcessError as exc:
+        # Every other exit from here is a JSON object on stdout, and this one
+        # was a traceback on stderr. The model is told to read the JSON, so a
+        # local git that fails -- an unmerged path, a branch that is not there --
+        # arrived as something it had no rule for.
+        detail = (exc.stderr or "").strip() or f"git exited {exc.returncode}"
+        print(
+            json.dumps(
+                {"error": f"the local git command failed: {detail}"}, indent=2
+            )
+        )
         return 1
     print(json.dumps(answer, indent=2))
     return 0

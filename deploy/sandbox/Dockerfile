@@ -105,15 +105,25 @@ RUN pip install --no-cache-dir pyyaml requests
 # `.git/config` that came with it -- out of the container holding the token.
 # See docs/designs/version-control-support.md.
 #
-# The binary gets two homes. /opt/vcs/libexec/git is the file, on no PATH,
-# reached by absolute path from vcs.py and by /usr/lib/git-core (git's
-# compiled-in exec path, not a PATH directory). /opt/vcs/bin/git is the link
-# that vcs-path.sh and the entrypoint put ahead of the credential shim, so a
-# bare `git` typed by the model reaches the credential-free binary. Neither
-# directory is on the build PATH, so the shim guard further down still sees only
-# the shim.
+# The binary lives at /opt/vcs/libexec/git and is on no PATH at all. It is
+# reached by absolute path from vcs.py -- see KUBE_AGENTS_LOCAL_GIT there -- and
+# by /usr/lib/git-core, which is git's compiled-in exec path rather than a PATH
+# directory. A bare `git` typed by the model still resolves to the credential
+# shim, exactly as it did before this layer existed.
 #
-# What makes putting this git on a PATH safe is that it has no transport. The
+# Giving the local binary the name `git` instead is the better arrangement and
+# it is deliberately not done here. Every shipped caller of bare `git` today --
+# gitops_workspace.py, submit_suggestion.py, audit_report.py -- means the shim,
+# so the rename has to travel with those callers moving onto the verbs. It goes
+# in the consumer-migration change; this one adds a binary and takes nothing
+# away. docs/designs/version-control-support.md carries the reasoning, including
+# the measurement that motivates it: given the version-control skill and a shim
+# still owning the name, an agent answered 8 of 60 read probes through the shim
+# alone and issued 4 credentialed clones through it.
+#
+# What will make putting this git on a PATH safe is that it has no transport,
+# and that property is established now so the later change is a PATH edit and
+# nothing more. The
 # remote helpers are the whole of git's ability to reach a host -- `git fetch`,
 # `git clone` and `git push` against an https URL all run git-remote-https --
 # and they are separate executables in /usr/lib/git-core, so removing them
@@ -154,10 +164,9 @@ RUN pip install --no-cache-dir pyyaml requests
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/* && \
-    mkdir -p /opt/vcs/libexec /opt/vcs/bin && \
+    mkdir -p /opt/vcs/libexec && \
     mv /usr/bin/git /opt/vcs/libexec/git && \
     ln -sf /opt/vcs/libexec/git /usr/lib/git-core/git && \
-    ln -sf /opt/vcs/libexec/git /opt/vcs/bin/git && \
     rm -f /usr/bin/git-receive-pack /usr/bin/git-shell \
           /usr/bin/git-upload-archive /usr/bin/git-upload-pack && \
     rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
@@ -302,10 +311,6 @@ RUN groupadd --gid 1001 hermes && \
 # absent.
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
-# Sorts after credential-proxy-path.sh, which is what lets it take the name
-# `git` back for the local binary. Renaming either file breaks that; the
-# ordering is the mechanism.
-COPY --chmod=0755 deploy/sandbox/vcs-path.sh /etc/profile.d/vcs-path.sh
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # The ForceCommand the sshd_config names for the `agent` account. Root-owned and
@@ -449,23 +454,14 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # the build PATH — profile.d puts it there at login — so `command -v` here can
 # only be finding a native binary.
 #
-# `gh` is not among the shims, and its absence is a decision rather than an
-# omission. A forge CLI on PATH is the route out of a forge-neutral abstraction
-# and the model takes it: with `gh` reachable, an agent holding the
-# version-control skill still answered through `gh api` on a quarter of the
-# write probes and did not report having done so. It is absent rather than
-# shadowed by a refusing stub, which is what an earlier build shipped. The
-# stub's theory was that a named gap beats a `command not found` the model reads
-# as a broken image -- the same argument StubForge makes about an unimplemented
-# forge. Measured against a build with no `gh` at all, it did not hold: the
-# agent never reached for `gh`, never emitted a not-found, stayed on the verbs
-# throughout, and finished the rung faster and in fewer turns. The skill already
-# says no forge CLI is needed, and that turned out to be enough.
-#
-# `gh` stays in the guard loop below for the reason the loop exists: what must
-# not be here is a *native* one.
+# `gh` keeps its shim here. Taking it away is the right end state -- a forge CLI
+# on PATH is the route out of a forge-neutral abstraction and the model takes
+# it, answering through `gh api` on a quarter of the write probes with the
+# version-control skill loaded -- but every `gh` caller in the tree still means
+# this shim, so its removal travels with them in the consumer-migration change
+# rather than landing here ahead of them.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl git; do \
+    for binary in gcloud kubectl gh git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
     done && \
     for binary in gcloud kubectl gh git; do \
