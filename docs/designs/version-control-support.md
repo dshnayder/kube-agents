@@ -103,10 +103,14 @@ repository lives on GitLab cannot use any of it.
 
 The coupling runs through five layers, each with a different owner and a different cost to unwind:
 
-1. **The consumers.** Five scripts call the forge's API to get work done. Two go through a provider
-   abstraction; three shell `gh` directly, two behind a private runner of their own and one inline.
-   (`github_token_refresh.py` and `credential_proxy.py` also run `gh`, but for credentials rather
-   than for forge work; they are layer 3.)
+1. **The consumers.** Six scripts call the forge's API to get work done. Three go through a
+   provider abstraction — `pr_conversation.py`, `pr_triggers.py` and `github_scan_gate.py`, all on
+   `forge.py`; three shell `gh` directly — `resolver.py`, `submit_suggestion.py` and
+   `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
+   `inspect_repository.py`, reaches a repository rather than an API, and does it by running
+   `git clone` through the sandbox's credential shim. (`github_token_refresh.py` and
+   `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
+   layer 3.)
 2. **Repository identity.** `owner/repo` — exactly two path segments — is asserted in seven places
    across Python and Go, and one regex expressing it is copy-pasted into six modules. This is the
    widest assumption and the one least visible from any single file.
@@ -292,7 +296,7 @@ see what another is asserting:
 - `github_token_refresh.github_repo_from_remote` returns `owner/repo` from a git remote, and returns
   `None` for a host that is not GitHub.
 - `github_token_refresh.refresh_git_credentials` asserts it inline — `repository.count("/") != 1`
-  raises — on the path every token refresh takes, sidecar or direct.
+  raises — on the path every token refresh takes, brokered or direct.
 - `credential_proxy.is_valid_repository` splits on the first `/` and requires the remainder to hold
   no further separator, so a deeper path fails validation.
 - `CleanRepoSlugWithOrg` in the operator strips the scheme, a `user@` prefix, an SCP `host:` prefix
@@ -441,27 +445,25 @@ that hits the cap gets a truncated list rather than a smaller question. This
 design has no cap on a history question, because a history question never
 crosses the seam. The one transfer it does make is bounded, once, at `clone`.
 
-### The proxy stops having to share the sandbox's pod
+### The broker is already in its own pod
 
-Everything above crosses as a payload rather than as a path, and that retires
-the one reason the credential runtime is co-located with the shell today. The
-shell-sandbox design (#737) puts the proxy in the
-sandbox's pod because `credential_proxy_client.py` forwards the caller's `cwd`
-and `kubeconfig` only when the endpoint is loopback; without that forwarding,
-proxied `git` from another pod runs in the proxy's own empty workspace instead
-of the tree the agent is working in. These routes send a bundle, so there is no
-tree to point at and nothing for the proxy to be co-resident with.
+Everything above crosses as a payload rather than as a path, and that matters
+because the credential broker does not share the sandbox's pod. It runs as its
+own Deployment, reached over a Service, and the sandbox authenticates to it with
+a projected ServiceAccount token that a TokenReview validates against the
+audience `kubeagents-credential-proxy`.
 
-Splitting the pod is worth doing on its own, because co-location is the weaker
-arrangement on three counts it cannot avoid. The containers share a pod IP, so
-NetworkPolicy cannot distinguish them and the sandbox's egress has to be widened
-to everything the proxy needs to reach — the forge, the token broker, the
-cluster's API server. `runtimeClassName` is pod-scoped too, so running the shell
-under gVisor puts the proxy inside the same sentry. And the mount namespace ends
-up the only boundary between the shell and the proxy's kubeconfig, gcloud
-directory and federated token, which is why the two containers run as the same
-uid and why every one of the proxy's volumes is one the shell must never mount.
-None of those survive the split.
+That arrangement is the reason a verb protocol is the only thing that can work
+here, and `credential_proxy_client.py` says so directly: it forwards no `cwd`,
+because "the broker resolves a path against its own filesystem, and it has no
+view of this one". A protocol whose operations name paths in the agent's tree
+has nothing to name. These routes send a bundle, so there is no tree to point at
+and nothing that needs to be co-resident.
+
+`/v1/vcs/*` takes its place in the existing `ROUTE_ROLES` table alongside
+`/v1/exec`, demanding the `shell` role — the same role, because the caller is
+the same sandbox, and a route that demanded nothing would be the one gap in a
+table whose point is that every route names what it requires.
 
 ### No shallow clones
 
@@ -491,42 +493,39 @@ forwarding the one category of command that no longer travels that way.
 
 **A forwarded git could not serve them anyway.** The proxy relays argv, and
 git's state _is_ the local filesystem — `clone`, `add`, `commit`, `push` each
-need the previous step's bytes to still be there. That worked while the proxy
-was a sidecar sharing the agent's volume; it stopped working when the broker
-became a separate pod, because two pods cannot mount the same ReadWriteOnce
-volume. `credential_proxy_client.py` carries the conclusion as a comment: git
-cannot be driven from another pod. A shim on PATH is then worse than no shim,
-because it answers a command with a confusing failure instead of a missing
-binary.
+need the previous step's bytes to still be there, and the broker's filesystem is
+not the sandbox's. `credential_proxy_client.py` states the consequence in the
+comment standing where a `cwd` forward would go: the broker "resolves a path
+against its own filesystem, and it has no view of this one", so every forwarded
+command runs at the broker's own workspace root. A forwarded `git commit` does
+not fail in some subtle way — it operates on a tree the agent has never seen. A
+shim on PATH is worse than no shim, because that answers a command with a
+confusing success instead of a missing binary.
 
-So the sandbox entrypoint deletes `/opt/credential-proxy/bin/git`, for the same
-reason and at the same moment it deletes the `gh` shim, and the smoke test
-asserts both by absence rather than by which path wins. `gcloud` and `kubectl`
-keep their shims, because there is no credential-free equivalent of either and
-nothing local for them to read.
+So `git` and `gh` come off the sandbox's shim set, leaving `gcloud` and
+`kubectl`, which keep theirs because neither has a credential-free equivalent
+and neither has anything local to read. `SUPPORTED_EXECUTABLES` in
+`credential_proxy_client.py` and the shim symlinks in `deploy/sandbox/Dockerfile`
+are the two places that say so, and the image's smoke test asserts the two
+missing names by absence rather than by which path wins.
 
-That leaves `/opt/vcs/bin` to be prepended, and it has to happen twice, because a
-sandbox session arrives by two different doors. `/etc/profile.d/vcs-path.sh`
-covers a login shell, which is what `kubectl exec -- bash -l` and the image's
-smoke test get. Hermes reaches the sandbox over ssh, and `ssh sandbox git log` is
-not a login shell: its whole environment is the `SetEnv` line
-`deploy/sandbox/entrypoint.sh` writes into `/etc/ssh/sshd_config.d/`, since
-`sshd_config` sets `PermitUserEnvironment no` and accepts only `LANG` and `LC_*`
-from the client. An earlier build did the prepend in `profile.d` alone and
-shipped an install where `git` and `gh` both still resolved to the credential
-shim on the only path the agent uses. Deleting
-the shim is what makes that failure impossible rather than merely ordered
-against: with one git in the image, a missed prepend is a `git: not found` at the
-first call, not a silent forward to the wrong container.
+The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in one
+place: the `SANDBOX_PATH` line in `deploy/sandbox/entrypoint.sh`, which becomes
+the `SetEnv` directive in the generated `/etc/ssh/sshd_config.d` drop-in. One
+place is not an accident of this design — sshd keeps the first `SetEnv` it reads
+and discards every later one whole, so the environment a sandbox session gets
+cannot be assembled from more than one directive. A missed prepend is therefore
+a `git: not found` on the first call rather than a silent forward, which is the
+other thing deleting the shim buys.
 
-A build guard fails the image when a bare `command -v git` resolves to anything
-at all. That is not a contradiction of shipping git: the guard's subject is
-placement, not presence. `/opt/vcs/bin` is deliberately absent from the default
-PATH, so the hardened binary is invisible to a bare lookup by design, and
-anything a bare lookup _does_ find got there by another route — a package left
-behind by a build stage, or a shim — and is by construction not the git this
-section describes. The guard runs beside the existing one that fails the image
-on a stray `gcloud`, `kubectl` or `gh`, and for the same reason.
+The image's existing build guard needs no change to cover this. It already fails
+the build if a bare `command -v` finds any of `gcloud`, `kubectl`, `gh` or `git`,
+and its comment gives the reason in the same terms this section does:
+`/opt/credential-proxy/bin` is not on the build PATH, so a hit "can only be
+finding a native binary". `/opt/vcs/bin` is not on the build PATH either, so the
+hardened git stays invisible to that lookup and the guard keeps meaning what it
+meant — placement, not presence. Anything a bare lookup does find still got there
+by another route and is still wrong.
 
 A second guard proves the shipped binary cannot reach a forge. The control is
 deletion, and it is deletion for a specific reason: inside the sandbox the agent
@@ -700,7 +699,7 @@ before a request, and the git runner asks it for config before an invocation.
 That is one object per forge because it is one forge's answer to four questions
 that are really the same question — how is this forge's token presented. GitHub's
 is an App installation token that expires within the hour, so its strategy asks
-the sidecar to refresh before every verb; minting is idempotent and costs one
+the broker's refresh route before every verb; minting is idempotent and costs one
 local process, and the alternative is worse than the cost. An expired GitHub
 token surfaces as `Authentication failed` from inside the broker's own clone,
 which reaches the caller as a clone failure and reads like the repository is
@@ -924,7 +923,7 @@ implementations cover both forges and, as far as anyone has proposed, the third:
 
 | Strategy               | `ensure`                                         | `headers`                        | `git_config`                                              |
 | ---------------------- | ------------------------------------------------ | -------------------------------- | --------------------------------------------------------- |
-| `BrokeredCredential`   | asks the sidecar's refresh route                 | none — the CLI carries it        | none — the CLI installs a helper                          |
+| `BrokeredCredential`   | asks the broker's refresh route                  | none — the CLI carries it        | none — the CLI installs a helper                          |
 | `StaticFileCredential` | **nothing** — a long-lived token cannot go stale | reads the file, sends the header | the helper pin from [above](#gits-credential-has-no-seam) |
 
 GitHub takes the first, GitLab the second. **GitLab's `ensure` is `pass`**, and
@@ -956,8 +955,8 @@ the strategy's decision, and neither is the broker's business.
 The governing constraint is
 [`../credential-isolation-design.md`](../credential-isolation-design.md): the
 agent sandbox receives no API keys or access tokens through its environment or
-its filesystem, and under `spec.security.splitCredentialBrokerPod` that covers
-the ServiceAccount token too. Every forge call is therefore brokered, and a
+its filesystem, and no ServiceAccount token either — the one it does carry is
+projected for a single audience the broker checks, and is good for nothing else. Every forge call is therefore brokered, and a
 second forge is a change to the credentialed process before it is a change to
 anything the agent runs.
 
@@ -1868,10 +1867,10 @@ not a counterexample: they authenticate with a forked `mcp-remote` that mints Go
 call, and ADC is ambient to the pod rather than injected as a secret. A forge PAT has no ambient
 equivalent.
 
-The second is answered by running the MCP server as a trusted sidecar beside the credential proxy,
-with the agent reaching it over loopback and the sidecar attaching the token — the same containment
-the `_call()` seam already provides for a proxy-backed provider, expressed at the MCP layer instead
-of the REST one. The first has no such answer, because no arrangement of MCP servers puts a model in
+The second is answered by running the MCP server in the broker's pod rather than the sandbox's,
+with the agent reaching it over the same authenticated Service and the server attaching the token —
+the same containment the broker already provides for a brokered provider, expressed at the MCP layer
+instead of the REST one. The first has no such answer, because no arrangement of MCP servers puts a model in
 a cron loop that deliberately has none. The library stays either way.
 
 Where it pays off is the interactive path — an agent asked in chat to read a merge request, or a
@@ -2000,11 +1999,15 @@ of its verbs dead. The answer is tests and error messages, and both were added.
 
 ## 10. What this does not fix
 
-The credential proxy authenticates no caller. Anything that can reach loopback
-in the sandbox can drive these verbs. That is the same boundary #913 has and the
-same one the shell-sandbox design (#737) describes; what makes it a boundary at
-all is that the sandbox has no other credential path, not that the socket is
-trusted.
+The broker authenticates the caller but not the command's provenance. A
+projected ServiceAccount token establishes that a request came from the
+sandbox — and the `shell` role establishes which routes that entitles it to —
+but nothing distinguishes a verb the agent chose from a verb something else in
+the sandbox chose on its behalf. Anything running in that pod is the agent as
+far as these routes can tell. What makes the boundary hold is that the sandbox
+has no credential path of its own, so the worst that reaches the forge is
+something the agent could have asked for anyway; it is not that the caller is
+known to be the model.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
@@ -2098,7 +2101,7 @@ callers; then the tests that hold the boundary.
 | 4    | `Transport` protocol with the neutral `api` request; `CliTransport`, including status extraction                                                         | transport unit tests                                                |
 | 5    | `Credential` protocol; `BrokeredCredential`; `git_config` reaching the broker's git invocations                                                          | a test that the config lands on the invocation and nowhere else     |
 | 6    | `providers/github/` — the eight verbs, translation, its throttle heuristics, its `error_overrides`                                                       | the verb suite                                                      |
-| 7    | the consumer migration: the five scripts of layer 1 reach the forge through the provider and nothing else                                                | their own tests, with no functional delta to explain                |
+| 7    | the consumer migration: the six scripts of layer 1 reach the forge through the provider and nothing else, and `inspect_repository.py` clones by verb     | their own tests, with no functional delta to explain                |
 | 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, and the two executable allowlists split by purpose          | refresh tests, including a nested-namespace repository              |
 | 9    | the import-boundary test and the forge-name guard                                                                                                        | they are the test                                                   |
 | 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                               |
@@ -2108,18 +2111,18 @@ callers; then the tests that hold the boundary.
 
 Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is paid
 for. It also removes `spec.harness.experimental.shellSandbox.enabled`, which by
-then decides nothing: the shell-sandbox design already refuses `false` with a
-named reason rather than rendering the old arrangement, and keeps the field only
-so that an install which set it gets that refusal instead of a silently ignored
-setting. Deleting a field is normally the risky direction — an unknown key is
+then decides nothing: `validateShellSandbox` already refuses `false` with reason
+`ShellSandboxCannotBeDisabled` rather than rendering the old arrangement, and the
+field is retained only so that an install which set it gets that refusal instead
+of a silently ignored setting. Deleting a field is normally the risky direction — an unknown key is
 pruned from an existing CR on the next reconcile, and the setting disappears
 with nothing in the diff to say so. It is safe here precisely because of the
 order: no install can be quietly sitting at `false`, since one that tried has
 been Degraded and visible since the sandbox landed.
 
 Step 7 is the one that splits naturally if the PR gets too large: each of the
-five consumers is independent of the others, and each is a no-functional-delta
-change against a GitHub install. Nothing after it depends on all five having
+seven consumers is independent of the others, and each is a no-functional-delta
+change against a GitHub install. Nothing after it depends on all seven having
 landed.
 
 **Exit criteria — falsifiable, and worth putting in the PR description:**
@@ -2267,6 +2270,7 @@ proves the least.
 - Issue #1154 — the GitLab/Bitbucket tracking issue.
 - Issue [#1085](https://github.com/gke-labs/kube-agents/issues/1085) — the
   host-confusion report that §2's repository identity closes.
-- The shell-sandbox design (#737) — the sandbox, the credential proxy, and why
-  the sandbox is mandatory rather than opt-in. Not upstream yet, and §3 depends
-  on it.
+- [`docs/designs/agent-shell-sandboxing.md`](agent-shell-sandboxing.md) — the
+  sandbox pod, the broker's own pod, the projected-token authentication between
+  them, and why the sandbox is mandatory rather than opt-in. Merged as #913, and
+  §3 builds directly on it.
