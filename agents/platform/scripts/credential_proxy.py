@@ -1491,8 +1491,15 @@ VCS_SCRATCH_DIR = "vcs"
 # closed list checked against the argv as parsed, so a later edit that threads
 # a caller's string into a new vector is refused rather than run. Notably
 # absent: `checkout`, on the read path. `clone` writes one and nothing else
-# does -- an incoming bundle is fetched, inspected and pushed without its
+# does -- an incoming bundle is unbundled, inspected and pushed without its
 # objects ever being materialised into a working tree.
+#
+# `update-ref` is on the list for one caller: `bundle unbundle` puts the
+# objects in the store and prints the refs but writes none, so the broker names
+# the incoming tip itself. It is the narrower half of the alternative -- the
+# other way to read a bundle is `fetch <path>`, which is the `file` transport
+# `GIT_ALLOW_PROTOCOL` refuses everywhere for reasons the executor environment
+# spells out.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "bundle",
@@ -1506,6 +1513,7 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "remote",
         "rev-parse",
         "symbolic-ref",
+        "update-ref",
     }
 )
 

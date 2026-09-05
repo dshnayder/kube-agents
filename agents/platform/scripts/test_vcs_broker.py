@@ -499,6 +499,54 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(result["revision"], tip)
         self.assertEqual(self.remote_tip("fix/replicas"), tip)
 
+    def test_publish_reads_the_bundle_without_a_transport(self):
+        # This one is here because the suite missed the bug. `git_runner` above
+        # runs a bare git, and the executor in production does not: it pins
+        # `GIT_ALLOW_PROTOCOL=https`, which refuses the `file` transport that a
+        # `fetch <path>` of the incoming bundle needs. Publish therefore passed
+        # every test here and answered 502 `transport 'file' not allowed` on a
+        # real install, while every read verb passed there too -- reading
+        # travels as `bundle create`, which fetches nothing.
+        #
+        # Reproducing the pin inside `git_runner` is not the fix: the origin
+        # remotes in these tests *are* local paths, so the pin would refuse the
+        # setup rather than the thing under test. What is asserted instead is
+        # the property the pin cares about -- the bundle is read by a
+        # subcommand that opens no transport, and no git in the publish path
+        # takes the bundle's path as a remote.
+        seen: list[tuple[str, ...]] = []
+
+        def recording_git(argv, cwd, check=True, config=()):
+            seen.append(tuple(argv))
+            return git_runner(argv, cwd, check, config)
+
+        broker = VcsBroker(self.scratch / "transport", git_runner=recording_git)
+        broker.registry.hosts["local.test"] = self.forge
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "no-transport")
+        self.commit_in(work, "README.md", "changed\n", "change it")
+        broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "no-transport",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(
+                    work, "no-transport", answer["revision"]
+                ),
+            }
+        )
+
+        unbundled = [argv for argv in seen if argv[1:3] == ("bundle", "unbundle")]
+        self.assertEqual(len(unbundled), 1, seen)
+        bundles = [argv[3] for argv in unbundled]
+        for argv in seen:
+            if argv[1] in {"fetch", "clone", "ls-remote", "push"}:
+                self.assertFalse(
+                    set(argv) & set(bundles),
+                    f"{argv[1]} was handed the bundle path as a remote: {argv}",
+                )
+
     def test_publish_preserves_the_executable_bit(self):
         # The mode is the property arm B could not carry, so it gets its own
         # assertion at the other end of the round trip.

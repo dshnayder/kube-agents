@@ -497,19 +497,39 @@ class VcsBroker:
                 )
 
             listed = git(root, "bundle", "list-heads", str(bundle)).stdout
-            refs = [
-                line.split(" ", 1)[1].strip()
+            heads = [
+                (line.split(" ", 1)[0].strip(), line.split(" ", 1)[1].strip())
                 for line in listed.splitlines()
                 if " " in line
             ]
+            refs = [ref for _, ref in heads]
             wanted = {f"refs/heads/{branch}", branch}
             if len(refs) != 1 or refs[0] not in wanted:
                 raise WorkspaceError(
                     f"the bundle carries {refs or 'no refs'}; it must carry "
                     f"exactly refs/heads/{branch}"
                 )
-            git(root, "fetch", "--quiet", str(bundle), f"+{refs[0]}:{_INCOMING}")
-            tip = git(root, "rev-parse", _INCOMING).stdout.strip()
+            # `unbundle` rather than `fetch <path>`, and the difference is not
+            # stylistic: a fetch from a local path is git's `file` transport,
+            # which `GIT_ALLOW_PROTOCOL` refuses on every door this executor
+            # opens. That refusal is load-bearing -- the credential-proxy
+            # environment says why, and the short form is that `file` is what
+            # makes `--upload-pack=<cmd>` executable -- so the way through is a
+            # subcommand that needs no transport, not a wider allowlist. This
+            # one hands the pack to `index-pack` directly. Found live: publish
+            # answered 502 with `transport 'file' not allowed` while every
+            # read verb passed, because reading is the direction that travels
+            # as `bundle create` and never fetches anything.
+            #
+            # It verifies the bundle's prerequisites exactly as the fetch did,
+            # so a bundle that does not build on what this repository already
+            # has still fails here rather than downstream. What it does not do
+            # is write a ref, so the tip comes from `list-heads` -- already
+            # parsed above to check the bundle carries one branch -- and the
+            # ref is made by hand.
+            tip = heads[0][0]
+            git(root, "bundle", "unbundle", str(bundle))
+            git(root, "update-ref", _INCOMING, tip)
 
             if not self._is_ancestor(git, root, base_revision, tip):
                 raise WorkspaceError(
