@@ -437,7 +437,7 @@ class WriteTest(VcsTestCase):
         self.change("a.txt", "a\n")
         self.run_vcs("commit", "-m", "a")
         self.run_vcs("publish")
-        first_base = vcs.all_sessions()[0]["baseRevision"]
+        first_base = vcs.all_sessions()[0]["published"]["fix/replicas"]
         self.assertNotEqual(first_base, self.origin_head)
         self.change("b.txt", "b\n")
         self.run_vcs("commit", "-m", "b")
@@ -445,6 +445,29 @@ class WriteTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(answer["revisions"], 1)
         self.assertEqual(self.broker.payload("publish")["baseRevision"], first_base)
+
+    def test_a_second_branch_publishes_from_the_clone_point_not_the_first_tip(self):
+        # Found live. The published tip used to be one scalar on the session, so
+        # a branch made after another was published inherited that branch's tip
+        # as its base -- a revision on no target, which the broker's ancestry
+        # check reads as a rewritten target and refuses.
+        self.run_vcs("branch", "fix/one")
+        self.change("a.txt", "a\n")
+        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("publish")
+        first_tip = vcs.all_sessions()[0]["published"]["fix/one"]
+
+        self.run_vcs("branch", "fix/two")
+        self.change("b.txt", "b\n")
+        self.run_vcs("commit", "-m", "b")
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 0, answer)
+        payload = self.broker.payload("publish")
+        self.assertEqual(payload["branch"], "fix/two")
+        self.assertEqual(payload["baseRevision"], self.origin_head)
+        self.assertNotEqual(payload["baseRevision"], first_tip)
+        # And the first branch keeps its own answer.
+        self.assertEqual(vcs.all_sessions()[0]["published"]["fix/one"], first_tip)
 
     def test_publish_refuses_when_there_is_nothing_new(self):
         code, answer = self.run_vcs("publish")

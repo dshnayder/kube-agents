@@ -272,6 +272,23 @@ def current_branch(session: dict) -> str:
     return (done.stdout or "").strip() or session.get("branch", "")
 
 
+def base_for(session: dict, branch: str) -> str:
+    """What a publish of `branch` builds on: its own last published tip.
+
+    Per branch, and that is the whole point. One copy can carry several branches
+    -- the second one made after the first was published is the ordinary case --
+    and each has a different answer. A single scalar advanced on every publish
+    gives the second branch the first branch's tip, which is on no target and
+    which the remote has under a name the publish never fetches, so the ancestry
+    check refuses and the message blames a rewritten target.
+
+    Falling back to the clone point is what makes a branch's first publish work:
+    nothing of it is on the forge yet, so the last thing this copy and the broker
+    agreed on is where the copy came from.
+    """
+    return session.get("published", {}).get(branch) or session["baseRevision"]
+
+
 # ---- repository verbs -----------------------------------------------------
 
 
@@ -309,7 +326,16 @@ def _refuse_to_discard(destination: Path, *, force: bool) -> None:
         reasons.append("its state could not be read")
     elif dirty.stdout.strip():
         reasons.append(f"{len(dirty.stdout.strip().splitlines())} uncommitted change(s)")
-    base = (session or {}).get("baseRevision")
+    # The base for the branch that is checked out, not the clone point: a branch
+    # whose work has been published is not work this would lose, and asking the
+    # clone point would count those revisions again and refuse to replace a copy
+    # with nothing left in it.
+    head = local_git(destination, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    base = (
+        base_for(session, (head.stdout or "").strip())
+        if session and session.get("baseRevision")
+        else None
+    )
     if base:
         ahead = local_git(
             destination, "rev-list", "--count", f"{base}..HEAD", check=False
@@ -584,7 +610,7 @@ def verb_publish(arguments) -> dict:
     session = resolve_session(arguments.repo)
     tree = tree_of(session)
     branch = current_branch(session)
-    base = session["baseRevision"]
+    base = base_for(session, branch)
     target = arguments.target or session["branch"]
     ahead = local_git(tree, "rev-list", "--count", f"{base}..HEAD", check=False)
     if ahead.returncode != 0:
@@ -642,10 +668,10 @@ def verb_publish(arguments) -> dict:
     finally:
         bundle_file.unlink(missing_ok=True)
 
-    # The published tip becomes the new base. A second publish then sends only
-    # what came after it, and its ancestry check is against something the remote
-    # demonstrably has.
-    session["baseRevision"] = answer["revision"]
+    # The published tip becomes this branch's base. A second publish of the same
+    # branch then sends only what came after it, and its ancestry check is
+    # against something the remote demonstrably has.
+    session.setdefault("published", {})[answer["branch"]] = answer["revision"]
     session["publishedBranch"] = answer["branch"]
     save_session(session)
     answer["revisions"] = count
