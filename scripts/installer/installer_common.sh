@@ -641,6 +641,34 @@ sys.exit(0 if managed else 1)
 '
 }
 
+# The image tag this install's Terraform state RECORDS, which is not the tag
+# the cluster is serving: the redeploy workflows move the running tag with
+# `helm upgrade` and never run Terraform. A drift plan needs this one, or every
+# out-of-band redeploy reads as a pending change to helm_release.kube_agents.
+#
+# Read from the state object in GCS rather than through `terraform output`,
+# for the reason tf_state_has_cluster gives and one more: this runs BEFORE
+# terraform.tfvars is generated -- the tag is an input to that file -- and
+# lifecycle.sh's backend setup needs tfvars to resolve the bucket. The
+# coordinates here come from the environment instead, so there is no such loop.
+#
+# Empty on every failure, including the ordinary one: state written before the
+# composition had this output carries no value for it. Callers fall back.
+tf_state_image_tag() {
+  local state
+  state=$(gcloud storage cat "gs://$(tf_state_bucket)/$(tf_state_prefix)/default.tfstate" 2>/dev/null) || return 0
+  printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+value = (doc.get("outputs", {}).get("image_tag") or {}).get("value")
+if isinstance(value, str) and value:
+    sys.stdout.write(value)
+'
+}
+
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
 # generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
@@ -980,6 +1008,7 @@ write_tfvars_from_state() {
     echo "model_default_name = $(hcl_str "${MODEL_DEFAULT_NAME:-}")"
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
+    echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
