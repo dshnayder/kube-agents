@@ -94,6 +94,96 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # needing one goes through the wrapped CLIs, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
 
+# A real git with no credential and no way to reach a host.
+#
+# The sandbox holds no forge token, so anything that talks to a remote runs in
+# the broker. The version-control skill is built the other way round: a
+# repository arrives as a bundle and is unpacked here with no remote, so `git
+# log`, `git show`, `git blame` and `ls-files --stage` against that clone are
+# questions about objects this container already holds. Answering them here
+# rather than in the broker is what keeps a repository's own history -- and the
+# `.git/config` that came with it -- out of the container holding the token.
+# See docs/designs/version-control-support.md.
+#
+# The binary gets two homes. /opt/vcs/libexec/git is the file, on no PATH,
+# reached by absolute path from vcs.py and by /usr/lib/git-core (git's
+# compiled-in exec path, not a PATH directory). /opt/vcs/bin/git is the link
+# that vcs-path.sh and the entrypoint put ahead of the credential shim, so a
+# bare `git` typed by the model reaches the credential-free binary. Neither
+# directory is on the build PATH, so the shim guard further down still sees only
+# the shim.
+#
+# What makes putting this git on a PATH safe is that it has no transport. The
+# remote helpers are the whole of git's ability to reach a host -- `git fetch`,
+# `git clone` and `git push` against an https URL all run git-remote-https --
+# and they are separate executables in /usr/lib/git-core, so removing them
+# leaves a git that reads and writes local repositories and cannot dial out.
+# That is true of the four that reach a network -- git-remote-http is the binary
+# and ftp, ftps and https are symlinks to it -- and it is not true of ext and fd,
+# whose entries in that directory are symlinks to `git` itself because both are
+# builtins. Deleting those two changes nothing: git dispatches a builtin from
+# its own table without consulting the filesystem. What actually stops `ext::`
+# is git's protocol allowlist, which has defaulted `protocol.ext.allow` to
+# `never` since 2.12, and the probe below asserts that refusal by its own
+# message rather than pretending an `rm` produced it. `fd::` needs a descriptor
+# the parent already opened, so it reaches whatever the caller could reach
+# anyway and opens nothing new.
+#
+# The four server-side helpers in /usr/bin go too, but only for tidiness. They
+# are what a *remote* runs, and `git upload-pack` is a builtin of the front-end
+# binary, so deleting /usr/bin/git-upload-pack does not remove the capability
+# and never did. An earlier version of this layer claimed it did and guarded the
+# claim with `git <helper> --help`, which git rewrites to `git help <helper>`
+# and execs man; this image has no man, so all four probes exited 128 and the
+# guard passed no matter what the image contained.
+#
+# So the guard is a live probe per transport, and it matches the message rather
+# than the exit status. Every one of these URLs fails whatever the image does --
+# example.invalid does not resolve -- so an assertion that only checks for
+# failure passes on an image with the helpers still installed. The message is
+# what separates "there is no transport" from "there is a transport and no
+# network". The file:// probe at the end is the other half of that: it fails if
+# the git here has been broken outright rather than disarmed, which is the way a
+# guard like this otherwise starts passing for the wrong reason.
+#
+# The two shapes below are both "no helper". Which one git prints depends on
+# whether /usr/lib/git-core/git exists -- it does here, so git's external
+# dispatch finds it and reports an unknown subcommand; without it the message is
+# the classic "Unable to find remote helper". Accept either, so this layer does
+# not fail on an unrelated change to the exec-path symlink.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/vcs/libexec /opt/vcs/bin && \
+    mv /usr/bin/git /opt/vcs/libexec/git && \
+    ln -sf /opt/vcs/libexec/git /usr/lib/git-core/git && \
+    ln -sf /opt/vcs/libexec/git /opt/vcs/bin/git && \
+    rm -f /usr/bin/git-receive-pack /usr/bin/git-shell \
+          /usr/bin/git-upload-archive /usr/bin/git-upload-pack && \
+    rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
+          /usr/lib/git-core/git-remote-ftp /usr/lib/git-core/git-remote-ftps && \
+    /opt/vcs/libexec/git --version && \
+    for helper in http https ftp ftps; do \
+        if [ -e "/usr/lib/git-core/git-remote-${helper}" ]; then \
+            echo "sandbox git still has a remote transport: ${helper}" >&2; \
+            exit 1; \
+        fi; \
+        if ! /opt/vcs/libexec/git ls-remote "${helper}://example.invalid/x.git" 2>&1 \
+             | grep -qE "'remote-${helper}' is not a git command|Unable to find remote helper"; then \
+            echo "sandbox git still resolves a ${helper} transport" >&2; \
+            /opt/vcs/libexec/git ls-remote "${helper}://example.invalid/x.git" >&2 2>&1 || true; \
+            exit 1; \
+        fi; \
+    done && \
+    if ! /opt/vcs/libexec/git ls-remote 'ext::sh -c whoami' 2>&1 \
+         | grep -q "transport 'ext' not allowed"; then \
+        echo "sandbox git does not refuse the ext transport" >&2; \
+        exit 1; \
+    fi && \
+    /opt/vcs/libexec/git init -q /tmp/vcs-guard && \
+    /opt/vcs/libexec/git ls-remote file:///tmp/vcs-guard >/dev/null && \
+    rm -rf /tmp/vcs-guard
+
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for
 # public-key auth. '*' means "no password login is possible", which is what is
@@ -212,6 +302,10 @@ RUN groupadd --gid 1001 hermes && \
 # absent.
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
+# Sorts after credential-proxy-path.sh, which is what lets it take the name
+# `git` back for the local binary. Renaming either file breaks that; the
+# ordering is the mechanism.
+COPY --chmod=0755 deploy/sandbox/vcs-path.sh /etc/profile.d/vcs-path.sh
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # The ForceCommand the sshd_config names for the `agent` account. Root-owned and
@@ -354,8 +448,24 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # sandbox that no network policy would see. /opt/credential-proxy/bin is not on
 # the build PATH — profile.d puts it there at login — so `command -v` here can
 # only be finding a native binary.
+#
+# `gh` is not among the shims, and its absence is a decision rather than an
+# omission. A forge CLI on PATH is the route out of a forge-neutral abstraction
+# and the model takes it: with `gh` reachable, an agent holding the
+# version-control skill still answered through `gh api` on a quarter of the
+# write probes and did not report having done so. It is absent rather than
+# shadowed by a refusing stub, which is what an earlier build shipped. The
+# stub's theory was that a named gap beats a `command not found` the model reads
+# as a broken image -- the same argument StubForge makes about an unimplemented
+# forge. Measured against a build with no `gh` at all, it did not hold: the
+# agent never reached for `gh`, never emitted a not-found, stayed on the verbs
+# throughout, and finished the rung faster and in fewer turns. The skill already
+# says no forge CLI is needed, and that turned out to be enough.
+#
+# `gh` stays in the guard loop below for the reason the loop exists: what must
+# not be here is a *native* one.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl gh git; do \
+    for binary in gcloud kubectl git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
     done && \
     for binary in gcloud kubectl gh git; do \

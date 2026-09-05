@@ -473,10 +473,14 @@ check "PLATFORM_AGENT_HOME is not narrowed with it" "data=[/opt/data]" \
 
 echo
 echo "== 5. credential-proxy wrappers =="
-for cli in kubectl gcloud gh git; do
+for cli in kubectl gcloud; do
   check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
     "$("${SSH[@]}" "command -v $cli" 2>&1)"
 done
+# `git` has a shim too, but it is not what the name resolves to -- see section
+# 5b. The shim stays reachable by absolute path for the leased-clone skills.
+check "the git shim is still on disk behind the local binary" "credential-proxy-exec" \
+  "$("${SSH[@]}" 'readlink /opt/credential-proxy/bin/git' 2>&1)"
 # Non-login is the shape of every command the agent sends, and the case that
 # reads no /etc/profile. This is the check that caught the original bug: PATH
 # arrived and CREDENTIAL_PROXY_URL did not, so the wrappers resolved and then
@@ -498,6 +502,45 @@ check "the wrappers are ahead of anything else on PATH" "/opt/credential-proxy/b
 # what puts the wrappers back. Both paths, because only one of them is sshd's.
 check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/kubectl" \
   "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
+
+echo
+echo "== 5b. git is the local binary, and there is no forge CLI =="
+# The bug this section exists for: an early build of the version-control
+# abstraction did the PATH prepend in /etc/profile.d alone. `kubectl exec --
+# bash -l` and every check in section 5 saw the right thing, while the ssh
+# session Hermes actually uses -- not a login shell, so no /etc/profile -- kept
+# resolving `git` to the credential shim. A live install ran that way and the
+# routes were bypassed, so both session types are asserted here and neither is
+# allowed to stand in for the other.
+check "git is the local one in a non-login session" "/opt/vcs/bin/git" \
+  "$("${SSH[@]}" 'command -v git' 2>&1)"
+check "git is the local one in a login session too" "/opt/vcs/bin/git" \
+  "$("${SSH[@]}" "bash -l -c 'command -v git'" 2>&1)"
+check "the local git is a real git" "git version" \
+  "$("${SSH[@]}" 'git --version' 2>&1)"
+# The message, not the exit status: example.invalid resolves nowhere, so an
+# https ls-remote fails on an image that still ships git-remote-https too, and a
+# check on failure alone would pass there. "not a git command" is git's external
+# dispatch failing to find the helper -- the shape it prints when
+# /usr/lib/git-core/git exists, which it does here. The Dockerfile guard asserts
+# the same thing at build time; this asserts it of the image that was actually
+# pulled, over the transport the agent uses.
+check "and cannot reach a network" "is not a git command" \
+  "$("${SSH[@]}" 'git ls-remote https://example.invalid/x.git' 2>&1)"
+# The other half of the check above: a git broken outright also fails to reach a
+# network, and would pass it. This is what says the disarming was surgical.
+check "but still reads a local repository" "rc=0" \
+  "$("${SSH[@]}" 'git init -q /tmp/sm && git ls-remote file:///tmp/sm >/dev/null; echo rc=$?' 2>&1 | tail -1)"
+# `gh` is asserted by absence, not by which path wins: nothing in this image
+# provides one under any name, so both session types must come up empty. A check
+# on PATH order would pass against a build that merely shadowed it.
+check "gh resolves nowhere in a non-login session" "rc=1" \
+  "$("${SSH[@]}" 'command -v gh >/dev/null 2>&1; echo rc=$?' 2>&1)"
+check "gh resolves nowhere in a login session either" "rc=1" \
+  "$("${SSH[@]}" "bash -l -c 'command -v gh >/dev/null 2>&1; echo rc=\$?'" 2>&1)"
+check_absent "and no shim was left behind for it" "credential-proxy-exec" \
+  "$("${SSH[@]}" 'readlink /opt/credential-proxy/bin/gh 2>&1 || true' 2>&1)"
+"${SSH[@]}" 'rm -rf /tmp/sm' >/dev/null 2>&1
 
 echo
 echo "== 6. a restart must not change the host key or lose the model's work =="
