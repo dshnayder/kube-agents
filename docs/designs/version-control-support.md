@@ -1,8 +1,12 @@
 # Version control and issue tracking
 
-> **STATUS — design of record; not implemented.** Today an install drives exactly
-> one forge, GitHub, and most of the code says so by name. This is the design for
-> driving any of them, and the order it has to happen in.
+> **STATUS — design of record. PR 1 of 3 is open, the rest is not implemented.**
+> Today an install drives exactly one forge, GitHub, and most of the code says so
+> by name. This is the design for driving any of them, and the order it has to
+> happen in. The abstraction and the GitHub provider — PR 1's steps 3 through 11
+> in [Delivery](#11-delivery) — are up as #1253 and have been run on a live
+> install; everything from step 12 on, and both of the other forges, is designed
+> here and not built.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
@@ -1933,6 +1937,17 @@ corpora, probe definitions, harness, per-probe worker logs, raw scores — is on
 the fork at
 [`experiments/git-access-abc/`](https://github.com/dshnayder/kube-agents/tree/experiment/git-access-abc/experiments/git-access-abc).
 
+Every figure in this section can be recomputed from those files, and it is worth
+saying which ones, because the directory holds discarded passes too. The scored
+runs are `results/agent-{A,B,C}-r{200,3000,10000}.json` for the read rungs and
+`results/agent-{A,B,C}-write.json` for the write rung — arm C's being the sealed
+re-run. Each row carries a `route` object counting `vcs`, `git`, `ghapi`,
+`workspace_http`, `propose` and `skill` calls, which is what the route columns
+below are summed from. `results/FINDINGS.md` is the original write-up.
+Subdirectories — `invalid-pathbug/`, `writes-w4/`, `writes-w6-unsealed/`,
+`pass1-contaminated/` — are superseded passes, kept because two figures quoted
+here come from them and are labelled where they do.
+
 ### What was compared
 
 | Arm | Access design                                                                                                         |
@@ -1958,6 +1973,11 @@ Arm C's write rung was run **sealed**: arm B's routes disabled and no `gh`
 binary under any path, so the numbers describe an install that shipped only this
 design rather than one where other doors happened to be open.
 
+Alongside the three arms, `harness/ladder.py` drives each access layer with no
+model in the loop. It answers a different question — not how well an agent does
+on a probe, but whether the probe can be expressed in that layer's vocabulary at
+all — and it is what separates a protocol's limits from a model's.
+
 ### Results
 
 | arm | rung  | answered | stayed on its own route | left for `gh api` | median s | median turns |
@@ -1979,7 +1999,32 @@ Every arm passed every write probe, including the adversarial one — no arm
 executed anything the repository supplied. Capability is not what separates
 them.
 
-Four things the numbers say:
+The main result is the `left for gh api` column, and it is a result about
+protocol shape rather than about any one arm. A model-free control drives each
+access layer with no model in the loop and asks only whether a probe can be
+expressed: 6 of the 20 read probes cannot be asked of a content-passing
+protocol at all — four are history questions and there is no verb for commit
+history, and two more want a whole-tree operation the verbs do not name.
+Directory access scores 0 of 20 not expressible.
+
+The agent answered them anyway. Arm B comes back with an answer to all six, and
+the route log shows `gh api` on most of them at every rung. That is where the
+steady 4/20 in the table comes from, and those four are not a random four: they
+are drawn from the six the protocol cannot express. **An access design that omits a capability does
+not remove the capability; it relocates it to a route nobody designed** — here,
+a credentialed, general-purpose path into the forge that answers questions
+about a repository without touching the repository protocol at all. The
+model-free control cannot see this happen: it scores content passing at 0.95
+mean reach and records the gap as a limitation.
+
+That is the finding this design is built around, and it is why
+[The shape](#the-shape) argues that a protocol answering from the credential
+side has to grow a verb for every narrowing a caller might want. It is not an
+argument that arm B is badly built. It is an argument that a verb list is a
+closed set and a repository question is not, so the gap has to be closed by
+handing over the history rather than by adding verbs until none is left.
+
+Four more things the numbers say:
 
 **Cost does not grow with repository size.** Arm C is the cheapest arm at every
 read rung, and the one whose cost the corpus moves least: 4.0 → 5.0 → 5.0 median
