@@ -45,9 +45,10 @@ convention.
 
 The design was measured against the two repository-access designs this
 repository already has, on identical probes: it answered the most probes, was
-the cheapest at every read rung, and — unlike the control — did not get steadily
-more expensive as the repository grew. Writing costs it more turns than the
-control does. Method and results in [The experiment](#9-the-experiment).
+the fastest at every read rung and never took more turns than either, and —
+unlike the design that ships today — stayed that way as the repository grew.
+Writing costs it more turns than today's design does. Method and results in
+[The experiment](#9-the-experiment).
 
 | Layer                        | Where it goes                                                        |
 | ---------------------------- | -------------------------------------------------------------------- |
@@ -2024,19 +2025,25 @@ handing over the history rather than by adding verbs until none is left.
 
 Four more things the numbers say:
 
-**Cost does not grow with repository size.** Arm C is the cheapest arm at every
-read rung on wall-clock time, is never beaten on turns, and is the arm whose
-cost the corpus moves least: 4.0 → 5.0 → 5.0 median turns and
-171.4 → 215.0 → 216.3 seconds, against arm A's 4.5 → 5.0 → 7.0 and
-195.8 → 227.1 → 313.9. At the middle rung the two tie on turns and arm C wins
-only on seconds; the arms separate at 10,000 files, where arm A costs 7.0 turns
-to arm C's 5.0. The bundle is why — one crossing of the seam hands over the
-history and everything after it is local, so a bigger repository does not mean
-more round trips. Arm C at 10,000 files costs the same turns as arm A at 3,000
-and slightly fewer seconds, on a corpus more than three times the size. Arm B is
-comparably flat (6.5 → 6.5 → 7.0 turns, 296.3 → 286.3 → 317.7 seconds) but is
-the most expensive arm at every rung, so flatness is not what distinguishes it.
-The write rung is the one place arm C is not cheapest, and it is treated below.
+**Cost stays low as the repository grows.** Arm C is the cheapest arm at every
+read rung on wall-clock time and is never beaten on turns:
+4.0 → 5.0 → 5.0 median turns and 171.4 → 215.0 → 216.3 seconds, against arm A's
+4.5 → 5.0 → 7.0 and 195.8 → 227.1 → 313.9. At the middle rung the two tie on
+turns and arm C wins only on seconds; they separate at 10,000 files, where arm A
+costs 7.0 turns to arm C's 5.0. Arm C at 10,000 files costs the same turns as
+arm A at 3,000 and slightly fewer seconds, on a corpus more than three times the
+size. The bundle is the reason to expect this — one crossing of the seam hands
+over the history and everything after it is local, so a bigger repository does
+not mean more round trips.
+
+Flatness on its own is not the claim, and it should not be, because arm B is the
+flattest arm here: 6.5 → 6.5 → 7.0 turns and 296.3 → 286.3 → 317.7 seconds, a
+smaller rise than arm C's on both axes however it is read. It is also the most
+expensive arm at every rung. An arm can be flat by being uniformly slow, so what
+the corpus separates is the level, not the slope: arm C is cheapest everywhere
+and stays cheapest as the corpus grows, while the arm that grows is the one that
+ships today. The write rung is the one place arm C is not cheapest, and it is
+treated below.
 
 **Answered rate is at least as good.** 58 of 60 read probes against arm A's 57
 and arm B's 55, and arm C is the only arm that answered all 20 at the largest
