@@ -2301,11 +2301,11 @@ way: the abstraction is not held hostage to an environment question.
 
 Three options, and the middle one is the recommendation:
 
-| Option                                               | Footprint               | What it does not cover                |
-| ---------------------------------------------------- | ----------------------- | ------------------------------------- |
-| a gitlab.com project under a throwaway group         | none                    | customer hostname, egress rule        |
-| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs             |
-| the GitLab Helm chart                                | ≥8 vCPU / 30 GB cluster | nothing — and it costs the most       |
+| Option                                               | Footprint               | What it does not cover          |
+| ---------------------------------------------------- | ----------------------- | ------------------------------- |
+| a gitlab.com project under a throwaway group         | none                    | customer hostname, egress rule  |
+| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs       |
+| the GitLab Helm chart                                | ≥8 vCPU / 30 GB cluster | nothing — and it costs the most |
 
 The omnibus image is the Linux package in a container: PostgreSQL, Redis,
 Sidekiq, Gitaly and NGINX all inside one pod, configured through
