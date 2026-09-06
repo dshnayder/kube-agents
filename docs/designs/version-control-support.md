@@ -1,12 +1,8 @@
 # Version control and issue tracking
 
-> **STATUS — design of record. PR 1 of 3 is open, the rest is not implemented.**
-> Today an install drives exactly one forge, GitHub, and most of the code says so
-> by name. This is the design for driving any of them, and the order it has to
-> happen in. The abstraction and the GitHub provider — PR 1's steps 3 through 11
-> in [Delivery](#11-delivery) — are up as #1253 and have been run on a live
-> install; everything from step 12 on, and both of the other forges, is designed
-> here and not built.
+> **STATUS — design of record; not implemented.** Today an install drives exactly
+> one forge, GitHub, and most of the code says so by name. This is the design for
+> driving any of them, and the order it has to happen in.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
