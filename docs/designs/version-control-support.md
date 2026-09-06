@@ -412,11 +412,34 @@ flattened into one.
 
 `publish` sends those revisions back up as a bundle, symmetric with `clone`. The
 broker fetches the target branch into a scratch repository, unpacks the bundle
-beside it, and checks four things before it pushes: that the bundle carries
-exactly the branch it claims; that its tip descends from the revision `clone`
-handed out; that the target's current tip is also an ancestor, so a push nobody
-saw arrive is not silently discarded; and that an existing remote branch of the
-same name is not being clobbered. Then it pushes the ref it fetched.
+beside it, and checks four things before it pushes: that the target still
+contains the revision `clone` handed out; that the bundle carries exactly the
+branch it claims; that its tip descends from that same revision; and that an
+existing remote branch of the same name is not being clobbered. Then it pushes
+the ref it fetched.
+
+The first of those is `BASE_MOVED`, and its direction is the part worth
+arguing about. It asks that the base be an ancestor of the target — not that
+the target be an ancestor of the bundle's tip. The second direction sounds
+stricter and is the wrong check: it demands that the bundle contain everything
+on the target, which is to say that a topic branch be rebased onto the shared
+branch's tip before every publish. Any push to the target by anyone between the
+clone and the publish would then refuse a change that would have merged
+cleanly, and the only advice a `BASE_MOVED` refusal can give is to clone again,
+which is the one operation that discards the work. Base-under-target catches
+the case the refusal is actually about: the target was rewritten rather than
+advanced, so there is nothing to fast-forward from. An ordinary advance leaves
+the base an ancestor and passes, and the change then opens as a proposal with a
+base behind the tip — a rebase on the forge, not an error here.
+
+It is also asked only on a branch's first publish. `baseRevision` means what
+this bundle builds on: a revision of the target the first time, and the caller's
+own last published tip every time after — and that tip is on the branch, never
+on the target, so asking it of a second publish would refuse every one of them.
+It is checked before the bundle is read, because a rewritten target is also why
+reading the bundle fails: its prerequisites sit on the revision the copy was
+cloned at, and if that revision is gone the unbundle refuses first and the
+caller gets a git failure in place of the reason for it.
 
 Ahead of all four it checks that the branch is not the target. Those four are
 ancestry checks, and every one of them passes for a publish onto the branch the
