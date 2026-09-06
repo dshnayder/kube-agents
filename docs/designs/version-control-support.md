@@ -1874,7 +1874,9 @@ surprise:
 
 - **Self-managed instances behind a private CA.** The token and the API are the
   same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one.
+  container's CA bundle and nothing mounts a custom one. This constrains the test
+  environment too, and
+  [where GitLab gets validated](#where-gitlab-gets-validated) says how.
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
@@ -2023,14 +2025,18 @@ handing over the history rather than by adding verbs until none is left.
 Four more things the numbers say:
 
 **Cost does not grow with repository size.** Arm C is the cheapest arm at every
-read rung, and the one whose cost the corpus moves least: 4.0 → 5.0 → 5.0 median
-turns and 171.4 → 216.3 seconds, against the control's 4.5 → 7.0 and
-195.8 → 313.9. The bundle is why — one crossing of the seam hands over the
+read rung on wall-clock time, is never beaten on turns, and is the arm whose
+cost the corpus moves least: 4.0 → 5.0 → 5.0 median turns and
+171.4 → 215.0 → 216.3 seconds, against arm A's 4.5 → 5.0 → 7.0 and
+195.8 → 227.1 → 313.9. At the middle rung the two tie on turns and arm C wins
+only on seconds; the arms separate at 10,000 files, where arm A costs 7.0 turns
+to arm C's 5.0. The bundle is why — one crossing of the seam hands over the
 history and everything after it is local, so a bigger repository does not mean
-more round trips. Arm C at 10,000 files costs fewer turns than arm A at 3,000.
-Arm B is comparably flat (6.5 → 7.0 turns, 296.3 → 317.7 seconds) but is the
-most expensive arm at every rung, so flatness is not what distinguishes it. The
-write rung is the one place arm C is not cheapest, and it is treated below.
+more round trips. Arm C at 10,000 files costs the same turns as arm A at 3,000
+and slightly fewer seconds, on a corpus more than three times the size. Arm B is
+comparably flat (6.5 → 6.5 → 7.0 turns, 296.3 → 286.3 → 317.7 seconds) but is
+the most expensive arm at every rung, so flatness is not what distinguishes it.
+The write rung is the one place arm C is not cheapest, and it is treated below.
 
 **Answered rate is at least as good.** 58 of 60 read probes against arm A's 57
 and arm B's 55, and arm C is the only arm that answered all 20 at the largest
@@ -2039,8 +2045,12 @@ rung.
 **The interface carries the work.** Across 60 read probes and the sealed write
 rung, arm C made zero calls to a forge API — not because it could not, on the
 read rungs, but because the verbs answered. Per read rung the route counts are
-43/43/32 `vcs` calls against 29/27/30 local `git` calls: roughly one to one,
-which is the design's own claim about where the split falls.
+43/43/32 `vcs` calls against 29/27/30 local `git` calls — about three verb calls
+to every two local commands at the two smaller rungs (1.5:1 and 1.6:1), and
+close to one to one at the largest (1.1:1). Neither side grows with the corpus —
+the local count holds at 27–30 throughout and the verb count falls — which is
+the claim that matters here: the work does not migrate back across the seam when
+the repository gets bigger.
 
 **The repository is left in better shape.** On the write rung arms A and B each
 opened a duplicate proposal against the default branch from the same head
@@ -2284,11 +2294,11 @@ way: the abstraction is not held hostage to an environment question.
 
 Three options, and the middle one is the recommendation:
 
-| Option                                               | Footprint               | What it does not cover                     |
-| ---------------------------------------------------- | ----------------------- | ------------------------------------------ |
-| a gitlab.com project under a throwaway group         | none                    | customer hostname, private CA, egress rule |
-| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs                  |
-| the GitLab Helm chart                                | ≥8 vCPU / 30 GB cluster | nothing — and it costs the most            |
+| Option                                               | Footprint               | What it does not cover                |
+| ---------------------------------------------------- | ----------------------- | ------------------------------------- |
+| a gitlab.com project under a throwaway group         | none                    | customer hostname, egress rule        |
+| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs             |
+| the GitLab Helm chart                                | ≥8 vCPU / 30 GB cluster | nothing — and it costs the most       |
 
 The omnibus image is the Linux package in a container: PostgreSQL, Redis,
 Sidekiq, Gitaly and NGINX all inside one pod, configured through
@@ -2297,11 +2307,23 @@ Sidekiq, Gitaly and NGINX all inside one pod, configured through
 now expects those to be supplied, which turns "stand up a test GitLab" into
 "stand up a test GitLab and three datastores."
 
-One pod is enough to exercise everything gitlab.com cannot: an `external_url`
-that appears in no shipped literal, a self-signed or private CA, and the egress
-path for a host the operator has to render. Everything this design needs from
-GitLab is Free-tier — merge requests, issues, notes, API v4, and group access
-tokens, which on self-managed are available with any licence.
+One pod is enough to exercise everything gitlab.com cannot and this design does
+claim: an `external_url` that appears in no shipped literal, and the egress path
+for a host the operator has to render. Everything this design needs from GitLab
+is Free-tier — merge requests, issues, notes, API v4, and group access tokens,
+which on self-managed are available with any licence.
+
+The instance has to be given a certificate the sandbox image already trusts, or
+have TLS terminated by something that has one. That is not a limitation of the
+environment; it is
+[the private-CA refusal](#what-gitlab-does-not-include) showing up where it
+should. `HttpTransport` mounts no custom CA bundle, so a self-signed instance
+would fail to connect — and that failure is the design behaving as specified,
+not a validation gap. A test environment cannot close a capability the design
+declines to have, so private-CA coverage is not a reason to prefer one option
+here over another. If the refusal is ever lifted, the omnibus instance is where
+the work would be validated, which is a further argument for standing it up
+rather than for scoring it now.
 
 Recommendation: an omnibus GitLab CE container in the development cluster for
 steps 15–18. If standing infrastructure is the blocker, the same image runs
