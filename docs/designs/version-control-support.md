@@ -44,9 +44,10 @@ a registration file. Two tests make that a build failure rather than a
 convention.
 
 The design was measured against the two repository-access designs this
-repository already has, on identical probes: it answered the most probes, took
-the fewest turns, and was the only one whose cost did not grow with repository
-size. Method and results in [The experiment](#9-the-experiment).
+repository already has, on identical probes: it answered the most probes, was
+the cheapest at every read rung, and — unlike the control — did not get steadily
+more expensive as the repository grew. Writing costs it more turns than the
+control does. Method and results in [The experiment](#9-the-experiment).
 
 | Layer                        | Where it goes                                                        |
 | ---------------------------- | -------------------------------------------------------------------- |
@@ -634,10 +635,14 @@ hands it to the sandbox as a bundle rather than keeping a tree.
 
 That is a constraint on what the verbs may be, not just a description of them.
 It is why `publish` carries `baseRevision` instead of remembering what `clone`
-served, and why nothing in the table takes an identifier the broker minted. The
-routes still take `gitops_workspace.workspace_lock` while they run, because the
-broker's clone touches the same disk as the leased checkout, but the lock is
-held within one call and never across two.
+served, and why nothing in the table takes an identifier the broker minted. It
+is also why the routes take no lock at all. Each request gets a fresh directory
+under the broker's own scratch volume, named from a counter rather than from
+anything the caller sent, and deletes it on the way out; two requests share
+nothing but that counter, and the counter's own lock is the only one in the
+class. There is no shared tree here to serialise access to, and serialising
+whole requests anyway would make a clone of one repository wait on a publish of
+another for no property gained.
 
 | Verb                                 | Request                                                    | Response                                              |
 | ------------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
@@ -728,14 +733,23 @@ In the sandbox that removal is literal. The entrypoint deletes
 absence rather than by which path wins, because a check on PATH order would pass
 against a build that merely shadowed the name.
 
-The measurement is what settled that it had to happen at all. With a working
-`gh` on PATH the agent left the abstraction whenever a question got awkward, and
-it did so without reporting that it had: of 60 read probes, 8 were answered
-through the credential shim with no call to `vcs.py`, and 4 issued a
-credentialed network clone through it. It is not that the verbs could not
-answer — the same probes on the same skill were answered on the verbs once there
-was no CLI to reach for. An abstraction whose bypass is on PATH under the
-obvious name is one the model will take.
+What settled that a shim on an obvious name has to go was measured on `git`
+rather than on `gh`. An early pass of the read rungs shipped without the PATH
+prepend that reaches the real binary, so `git` in a sandbox session still
+resolved to the credential shim. The agent left the abstraction whenever a
+question got awkward, and did so without reporting that it had: of those 60 read
+probes, 8 were answered through the shim with no call to `vcs.py`, and 4 issued
+a credentialed network clone through it. The pass was discarded and re-run with
+the real git in place; the same probes on the same skill came back on the verbs,
+3 of 60 off-route and no network clone. It is not that the verbs could not
+answer. An abstraction whose bypass sits on PATH under the obvious name is one
+the model will take, and `gh` is that same shape.
+
+The honest counterweight is that `gh` was never observed being taken. Across all
+60 valid read probes, with a working `gh` on PATH and unsealed, the agent made
+zero `gh api` calls. Deleting it is therefore precautionary — it costs the
+sandbox nothing, since no verb needs it — rather than a response to an escape
+that showed up in the log.
 
 Removal replaced a refusing stub, and the second measurement is why. The first
 build shipped `/opt/vcs/bin/gh` as a script that refused and named the verb to
@@ -764,12 +778,12 @@ forge would otherwise have to be added by hand.
 A sanctioned `raw` verb — a forge-native method and path, passed through the
 broker and logged — was the obvious way to keep an agent that needs something
 unmodelled inside the boundary rather than out on the allowlist. It is not here,
-and the measurement is why. Across the read rungs the agent on these verbs made
-one `gh api` call, on a probe it had already answered from a commit message, and
-it made that call with a working `gh` on PATH and every other route it might
-have used still serving beside it. The escape hatch is a solution to a demand
-that did not
-appear. Adding it would also put a forge-shaped hole in a forge-neutral protocol
+and the measurement is why. Across 60 read probes the agent on these verbs made
+no `gh api` call at all, and across the write rung run unsealed it made exactly
+one, on the file-mode probe, unexplained in its answer; the sealed re-run of that
+rung made none. All of that was with a working `gh` on PATH and every other route
+it might have used still serving beside it. The escape hatch is a solution to a
+demand that did not appear. Adding it would also put a forge-shaped hole in a forge-neutral protocol
 and give a model a documented reason to stop at the first verb that does not
 quite fit. If a real gap turns up, the verb list is where it gets answered.
 
@@ -1348,10 +1362,17 @@ it is the reason the shared modules have to be genuinely forge-neutral: if
 heuristics through the front door and the test would not notice.
 
 **A forge-name guard**, which the import test cannot catch: the string `github`
-must not appear in `vcs_broker.py` or in any module directly under `providers/`.
-An `if host == "github.com":` needs no import. This is a grep, it is crude, and
-crude is the point — it is the check that catches the special case someone adds
-at 6pm.
+must not appear in `vcs_broker.py` or in any module directly under `providers/`
+other than `registry.py`. An `if host == "github.com":` needs no import. This is
+a grep, it is crude, and crude is the point — it is the check that catches the
+special case someone adds at 6pm.
+
+`registry.py` is carved out because the layout requires it to name every forge,
+and a guard that red-builds on the reference implementation gets weakened in its
+first week. It is held to the same standard by a narrower check instead: on every
+line of `registry.py` where a forge package name appears, that line must be an
+import or the `AVAILABLE` tuple. The name may be listed there and may not decide
+anything there.
 
 Both belong with the existing broker tests, and both are cheap enough to run on
 every change rather than in a nightly.
@@ -1938,11 +1959,14 @@ them.
 Four things the numbers say:
 
 **Cost does not grow with repository size.** Arm C is the cheapest arm at every
-rung and the only one that is flat from 200 to 10,000 files: 4.0 → 5.0 → 5.0
-median turns, against arm A's 4.5 → 7.0. The bundle is why — one crossing of the
-seam hands over the history and everything after it is local, so a bigger
-repository does not mean more round trips. Arm C at 10,000 files costs fewer
-turns than arm A at 3,000.
+read rung, and the one whose cost the corpus moves least: 4.0 → 5.0 → 5.0 median
+turns and 171.4 → 216.3 seconds, against the control's 4.5 → 7.0 and
+195.8 → 313.9. The bundle is why — one crossing of the seam hands over the
+history and everything after it is local, so a bigger repository does not mean
+more round trips. Arm C at 10,000 files costs fewer turns than arm A at 3,000.
+Arm B is comparably flat (6.5 → 7.0 turns, 296.3 → 317.7 seconds) but is the
+most expensive arm at every rung, so flatness is not what distinguishes it. The
+write rung is the one place arm C is not cheapest, and it is treated below.
 
 **Answered rate is at least as good.** 58 of 60 read probes against arm A's 57
 and arm B's 55, and arm C is the only arm that answered all 20 at the largest
@@ -1975,6 +1999,12 @@ indirection.
   a `gh` on PATH. Those runs made zero calls on either, so sealing removes doors
   they never opened, but they were not re-run to prove it.
 - The write rung ran on a later broker build than the read rungs.
+- An earlier pass of all three read rungs was discarded, not scored here: the
+  PATH prepend was missing, so arm C's `git` resolved to the credential shim and
+  the arm measured the control wearing arm C's label. The one thing taken from
+  it is the shim figure in
+  [Replacing `gh`](#replacing-gh), where being the wrong arm is precisely what
+  makes it evidence.
 - The adversarial probe is one injection corpus. It shows those two techniques
   did not fire, not that the class is closed.
 - Each arm's skill text was written by the same hand, which is not a neutral
@@ -2004,10 +2034,12 @@ projected ServiceAccount token establishes that a request came from the
 sandbox — and the `shell` role establishes which routes that entitles it to —
 but nothing distinguishes a verb the agent chose from a verb something else in
 the sandbox chose on its behalf. Anything running in that pod is the agent as
-far as these routes can tell. What makes the boundary hold is that the sandbox
-has no credential path of its own, so the worst that reaches the forge is
-something the agent could have asked for anyway; it is not that the caller is
-known to be the model.
+far as these routes can tell. What bounds that is the `shell` role: the worst
+these routes can be made to do is something the agent was already entitled to
+ask for. It is not that the caller is known to be the model, and it is not a
+claim about what else the sandbox can reach —
+[`../credential-isolation-design.md`](../credential-isolation-design.md) owns
+that question.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
@@ -2021,9 +2053,12 @@ Nothing here defends against prompt injection, and these verbs are a good
 delivery vehicle for it. A repository is untrusted text — file contents, commit
 messages, issue and proposal bodies, review comments — and `clone`, `log`,
 `issue view` and `proposal view` all exist to put that text in front of a model.
-What the design does buy is that the text cannot become a credential: the
-credential never enters the sandbox, `raw_token`-style routes are not
-agent-callable, and the sandbox has no other path to one. What it does not buy
+What the design does buy is bounded: no credential is added to the sandbox by
+these verbs, and no route here hands one over — the token stays in the broker
+and `raw_token`-style routes are not agent-callable. Whether the sandbox has any
+other path to a credential is not this design's question to answer, and
+[`../credential-isolation-design.md`](../credential-isolation-design.md) is where
+it is answered. What it does not buy
 is protection against the model being talked into an action it is allowed to
 take. `publish`, `proposal create` and `issue create` are reachable to any agent that
 can reach the read verbs, so an install that wants an agent to read history
@@ -2128,7 +2163,8 @@ landed.
 **Exit criteria — falsifiable, and worth putting in the PR description:**
 
 - `grep -ci github agents/platform/scripts/vcs_broker.py` returns 0, and the
-  same for every module directly under `providers/`.
+  same for every module directly under `providers/` except `registry.py`, whose
+  only hits are the import line and the `AVAILABLE` tuple.
 - `credential_proxy.py` names no forge on the VCS path.
 - The import-boundary test passes, and fails if you add
   `from providers.github import …` to the broker.
