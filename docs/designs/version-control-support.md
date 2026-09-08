@@ -297,8 +297,9 @@ see what another is asserting:
   `None` for anything else that looks like a URL or an SCP endpoint.
 - `github_token_refresh.github_repo_from_remote` returns `owner/repo` from a git remote, and returns
   `None` for a host that is not GitHub.
-- `github_token_refresh.refresh_git_credentials` asserts it inline — `repository.count("/") != 1`
-  raises — on the path every token refresh takes, brokered or direct.
+- `github_token_refresh.refresh_git_credentials` checks it inline — `repository.count("/") != 1`
+  raises `RuntimeError` — on the path every token refresh takes, brokered or direct. A raise rather
+  than an `assert`, so it survives `python -O`.
 - `credential_proxy.is_valid_repository` splits on the first `/` and requires the remainder to hold
   no further separator, so a deeper path fails validation.
 - `CleanRepoSlugWithOrg` in the operator strips the scheme, a `user@` prefix, an SCP `host:` prefix
