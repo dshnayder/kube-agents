@@ -129,9 +129,10 @@ The coupling runs through five layers, each with a different owner and a differe
 
 Layers 1, 2 and 3 are worth changing whether or not a second forge ever arrives — each one removes a
 duplicated parser, a silent fallback, or a hardcoded host. Layer 5 is only worth changing for a
-second forge, and layer 4 almost is: its one standalone defect is that the CR silently rewrites one
-shape of non-GitHub URL into a GitHub one ([Repository identity](#repository-identity)), which is
-worth fixing on its own but does not need any of this. That split says what is worth doing; it does
+second forge, and layer 4 almost is: its one standalone defect is that the CR silently rewrites a
+host-like shorthand such as `gitlab.com/project` into a GitHub URL it invents
+([Repository identity](#repository-identity)), which is worth fixing on its own but does not need any
+of this. That split says what is worth doing; it does
 not decide the order, which [Delivery](#11-delivery) derives from three sequencing constraints
 instead — and one of those pulls part of layer 4 forward ahead of layers 1 and 3.
 
@@ -302,8 +303,9 @@ see what another is asserting:
   than an `assert`, so it survives `python -O`.
 - `credential_proxy.is_valid_repository` splits on the first `/` and requires the remainder to hold
   no further separator, so a deeper path fails validation.
-- `CleanRepoSlugWithOrg` in the operator strips the scheme, a `user@` prefix, an SCP `host:` prefix
-  and a `github.com/` prefix, then requires exactly one slash in what is left.
+- `CleanRepoSlugWithOrg` in the operator strips the scheme and a `user@` prefix, then — for an SCP
+  `host:path` or a `host/owner/repo` form — rejects any host that is not `github.com` or
+  `www.github.com`, and requires exactly one slash in what is left.
   `ValidateGitRepoURLWithOrg` — the CRD's admission check — is a call to it, so admission and
   normalisation are one rule.
 
@@ -317,16 +319,28 @@ of the seven handles one. All of them refuse it, in four dialects: two raise (a 
 `RepoUnparseable`, and a bare `RuntimeError`), two return `None`, two return `False`, and one
 returns a Go `error`.
 
-**The one non-GitHub input that is not refused.** `CleanRepoSlugWithOrg` counts slashes _after_
-discarding the host, so an SCP-style URL whose path holds exactly one slash survives — and that is
-the form GitLab's clone button hands you for a project sitting directly under its group.
-`git@gitlab.com:group/project` is admitted by the CRD, reduced to `group/project`, and then
-`CleanRepoURLWithOrg`, which prefixes a literal `https://github.com/` to any shorthand, writes it
-into the state ConfigMap as `{"type": "github", "url": "https://github.com/group/project"}`. The
-GitLab repository is not rejected; it is rewritten into a GitHub one and labelled `github` by the
-constant above describes. Every reader downstream then behaves correctly, on a repository the operator
-invented. This is the layer-4 defect [Where GitHub is named today](#where-github-is-named-today) says is
-worth fixing on its own.
+**The one non-GitHub input that is not refused.** `CleanRepoSlugWithOrg` has two host checks, and
+both fire only when a host is syntactically identifiable: the SCP branch when the value contains a
+`:`, and the `host/owner/repo` branch when it holds more than one slash. Either rejects anything that
+is not `github.com` or `www.github.com`. A shorthand with exactly one slash goes through neither, and
+its first segment is then validated only as a slug component — a character class that permits dots.
+
+So `gitlab.com/project` is admitted, and `CleanRepoURLWithOrg`, which prefixes a literal
+`https://github.com/` to any shorthand, writes it into the state ConfigMap as
+`{"type": "github", "url": "https://github.com/gitlab.com/project"}`. The repository is not
+rejected; it is rewritten into a GitHub one and labelled `github` by the constant above describes.
+Every reader downstream then behaves correctly, on a repository the operator invented.
+`evil.example/repo` takes the same path for the same reason, so this is a shape defect rather than
+anything specific to GitLab. This is the layer-4 defect
+[Where GitHub is named today](#where-github-is-named-today) says is worth fixing on its own.
+
+What is **not** admitted is the form GitLab's clone button actually hands you.
+`git@gitlab.com:group/project` reaches the SCP branch, which reads `gitlab.com` as the host and
+returns `unsupported host "gitlab.com" for GitHub repository`; `common_types_test.go` asserts exactly
+that, for the SCP and the `https://gitlab.com/...` forms both. GitLab is refused at admission today.
+That matters for the delivery order more than it matters here: admitting `spec.integration.git` for
+GitLab is **relaxing an existing host check under provider dispatch**, not adding a host check where
+a host-blind shape check stood.
 
 **The change.** One `RepoRef` carrying a host and an opaque, arbitrary-depth path, constructed in one
 place and passed rather than re-parsed. Every validator above becomes a caller. The two-segment rule
@@ -343,13 +357,17 @@ step 1, which is what makes it true again.
 **Where #1085 now stands.** [#1085](https://github.com/gke-labs/kube-agents/issues/1085) reported
 that `repo_from_settings` resolved `https://evil.example/victim-org/victim-repo` to
 `victim-org/victim-repo` with no host check, pointing the token refresher at a repository the URL did
-not name. That function is gone. Three of the issue's four examples are now rejected at admission by
-the slash count above, and the fourth — the SCP form — is admitted with its host silently discarded,
-which grants nothing the plain `owner/repo` shorthand does not already grant. The host confusion the
-issue reported is closed; what the same code path costs now is the rewrite in the paragraph above.
-What remains is the half the issue deferred — "decide separately whether `ValidateGitRepoURL` should
-reject a non-GitHub host at admission". It does not, which is §6, so the remedy is step 2 rather
-than `RepoRef`.
+not name. That function is gone. All four of the issue's examples —
+`https://evil.example/gke-labs/kube-agents.git`, `https://github.com.evil.example/o/r.git`,
+`https://evil.example/github.com/o/r.git` and `git@evil.example:o/r.git` — are now rejected at
+admission, each by the explicit host check rather than by any slash count. The half the issue
+deferred, "decide separately whether `ValidateGitRepoURL` should reject a non-GitHub host at
+admission", has been decided the same way: it does reject one.
+
+So #1085 is closed on both halves, and the residue is not the one the issue was about. What the same
+code path still costs is the single-slash rewrite in the paragraph above — an invented GitHub
+repository rather than a confused host — which no host check catches because there is no host in the
+input to check.
 
 **A latent defect this also removes.** `provider_for` has two ways of choosing wrong. It selects by
 asking whether any key of the host table appears anywhere in the repository string — a substring
@@ -895,13 +913,41 @@ This sits on the credential rather than on `Forge` — see
 two halves are one object. GitHub's `BrokeredCredential` returns `()` and relies
 on the helper `gh` installs, which is fine as behaviour and is now a thing the
 interface says out loud with a docstring naming where it comes from. GitLab's
-`StaticFileCredential` returns a credential-helper pin:
+`StaticFileCredential` needs git to present a token that lives in a file, and
+the shape of that answer is constrained by a property of git worth stating
+before the answer, because it is easy to get wrong:
+
+**`credential.helper` is run through a shell whatever it contains.** The leading
+`!` is not what makes it a command — it only distinguishes "run this string" from
+"run `git-credential-<this>`". An absolute path with no `!` is still handed to
+`/bin/sh`, so a path containing a space breaks in two and a value containing `;`
+runs what follows it. There is therefore no such thing as a "plain, non-shell"
+helper value, and any design that puts an operator-supplied path into one is
+composing a shell command whether it means to or not.
+
+That rules out the obvious shape — an inline `!f() { … $(cat $TOKEN_FILE) … }; f`
+with the token path interpolated — on two independent grounds. It would be a
+command composed inside a forge package, which
+[the prohibitions](#what-a-forge-may-not-do) forbid outright; and the
+interpolation would be an injection point, since `tokenPath` is operator-supplied
+CR content.
+
+So the forge declares the strategy and the executor renders the config, which is
+the same three-role split the rest of the credential plane uses. The forge
+returns a description, never a command string:
 
 ```python
-(("credential.helper", f"!f() {{ echo username=oauth2; echo password=$(cat {TOKEN_FILE}); }}; f"),)
+def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+    # The executor substitutes the helper path; the forge names no command.
+    return (("credential.helper", GIT_CREDENTIAL_HELPER_TOKENFILE),)
 ```
 
-Applied through the existing `GIT_CONFIG_COUNT` layer, which
+`GIT_CREDENTIAL_HELPER_TOKENFILE` resolves to a fixed absolute path in the
+broker image — a small program that reads the token from the file named by an
+environment variable the executor sets, and writes `username=oauth2` and the
+token to stdout in git's credential protocol. It is a literal the executor owns,
+with nothing interpolated into it, so the shell it is handed to has nothing to
+act on. Applied through the existing `GIT_CONFIG_COUNT` layer, which
 `credential_proxy.py` already builds for `GIT_FORCED_CONFIG` and which outranks
 system, global and repo-local config.
 
@@ -916,8 +962,18 @@ Three properties this shape has that the alternatives do not:
   argv the redactor has to catch.
 - **It survives the token not being a bearer header.** GitLab accepts
   `username=oauth2` with the token as the password over HTTPS basic, which is
-  what git does natively. No `http.extraheader`, which would have to be set
-  per-host and which git logs in `GIT_TRACE`.
+  what git does natively.
+
+The alternative worth naming, because it is the one that avoids execution
+altogether, is a URL-scoped `http.<url>.extraHeader` carrying
+`Authorization: Basic base64(oauth2:<token>)`. It is data rather than a command,
+git resolves it only for a matching URL so it does not follow a redirect to
+another host, and it collapses `headers` and `git_config` into one value. What
+it costs is the second property above: the token has to be rendered into the
+config value, so it lands in the git child's environment and a rotated Secret
+does not take effect until the next render. That is the trade, and this design
+takes the helper because reading at use time is the property the rotation story
+depends on.
 
 ### The credential is one object
 
@@ -1282,7 +1338,7 @@ schedules it.
 
 ```text
 agents/platform/scripts/
-  vcs_broker.py            # broker verbs, clone/publish, scratch, locking, routes
+  vcs_broker.py            # broker verbs, clone/publish, scratch, routes
   providers/
     __init__.py            # the public surface: Forge, ForgeUnsupported, resolve_forge
     base.py                # Forge ABC, ForgeUnsupported, StubForge, normalised shapes
@@ -1300,9 +1356,9 @@ agents/platform/scripts/
 
 The split is by _who owns the decision_. `providers/` holds everything a forge
 needs to be written against; a forge package holds everything only that forge
-knows. `vcs_broker.py` keeps what is true regardless of forge — the workspace
-lock, the scratch tree, the bundle size ceiling, the route table — and contains
-no forge name at all.
+knows. `vcs_broker.py` keeps what is true regardless of forge — the scratch
+tree and the counter that names each request's directory, the bundle size
+ceiling, the route table — and contains no forge name at all.
 
 Most of `providers/` is not new logic. The validators, the scheme stripping and
 host resolution, and the status-to-guidance table are forge-neutral already;
@@ -1610,12 +1666,18 @@ the first three forges and not a property of the domain.**
 GitHub is the only _forge_ integration rather than the only integration.) `Org` carries GitHub's
 namespace grammar in a CRD pattern — alphanumerics and hyphens, at most 39 characters — which is not
 GitLab's: a group path admits dots and underscores, and a project can sit several groups deep, so no
-value of `org` names a nested GitLab namespace. `GitRepo`'s validation, `ValidateGitRepoURLWithOrg`,
-checks length and non-graphic runes and then defers to `CleanRepoSlugWithOrg`, so what the CR
-enforces about the repository is "exactly one slash once the host has been discarded" — and nothing
-at all about the host. The declarative surface names GitHub in the field path and nowhere in the
-validation, and the check that does fire is a shape check standing in for the host check
-[Repository identity](#repository-identity) shows is the one that matters.
+value of `org` names a nested GitLab namespace. `GitRepo`'s validation,
+`ValidateGitRepoURLWithOrg`, checks length and non-graphic runes and then defers to
+`CleanRepoSlugWithOrg`, which enforces two things: exactly one slash once the host has been
+discarded, and — wherever the input carries an identifiable host — that the host is `github.com` or
+`www.github.com`. So the declarative surface names GitHub twice over, in the field path and in the
+validation, and a GitLab URL is refused at admission today.
+
+This is the direction of step 2's work, and it is the opposite of what a reader might assume from a
+field called `GitRepo`: accepting GitLab means **relaxing** a host check that exists, under provider
+dispatch, rather than adding one where none stood. What the host check does not reach is an input
+with no identifiable host in it, which is the single-slash rewrite
+[Repository identity](#repository-identity) describes.
 
 The operator then writes the repository into the `managed_repos` state ConfigMap as a
 `ManagedRepoEntry` whose `type` is the literal `"github"`. The discriminator this design needs
@@ -1626,7 +1688,7 @@ today gets an entry the operator preserves and the agent discards.
 **The surface is `spec.integration.git`**, carrying a provider, a host and a repository, with
 `spec.integration.github` retained as a deprecated alias that maps onto it. Validation is
 provider-dispatched — each provider asserting its own namespace grammar, and each rejecting a host
-that is not its own — rather than one host-blind shape check standing in for all of them.
+that is not its own — rather than one hardcoded GitHub host check standing in for all of them.
 `ManagedRepoEntry.Type` carries the declared provider rather than a constant, which is how the
 discriminator reaches the agent: written down by the operator, rather than inferred from the URL's
 text.
@@ -1669,8 +1731,8 @@ same changes made again.
 ### What GitLab actually costs
 
 Small. The forge-independent half of the broker — `clone`, `publish`, the five
-publish checks, the scratch lifecycle, the size ceilings, the bundle transport,
-the workspace lock — is untouched. So is the whole of the sandbox client, because
+publish checks, the scratch lifecycle, the size ceilings, the bundle
+transport — is untouched. So is the whole of the sandbox client, because
 the sandbox never learns which forge it is talking to. So is the
 `version-control` skill, the CRD surface, the sandbox image and the entrypoint.
 
@@ -2210,21 +2272,21 @@ declarative surface first, because everything after them dispatches on the
 provider; then the shared contract; then the one forge that fills it in; then the
 callers; then the tests that hold the boundary.
 
-| Step | Delivers                                                                                                                                                 | Held to it by                                                       |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| 1    | repository identity in Python: one parser, the host carried rather than assumed, unknown hosts rejected; `get_managed_github_repos()` becomes a dispatch | parser unit tests, including a nested namespace and an unknown host |
-| 2    | the declarative surface in Go: `spec.integration.git`, the deprecated alias, provider-dispatched validation, the declared type reaching the agent        | operator tests; a GitHub CR still admits and reconciles             |
-| 3    | `providers/` shared contract: `Forge` ABC with `verbs`, the validators, identity, the guidance table, `forge_error(status, detail)`                      | unit tests per module                                               |
-| 4    | `Transport` protocol with the neutral `api` request; `CliTransport`, including status extraction                                                         | transport unit tests                                                |
-| 5    | `Credential` protocol; `BrokeredCredential`; `git_config` reaching the broker's git invocations                                                          | a test that the config lands on the invocation and nowhere else     |
-| 6    | `providers/github/` — the eight verbs, translation, its throttle heuristics, its `error_overrides`                                                       | the verb suite                                                      |
-| 7    | the consumer migration: the six scripts of layer 1 reach the forge through the provider and nothing else, and `inspect_repository.py` clones by verb     | their own tests, with no functional delta to explain                |
-| 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, and the two executable allowlists split by purpose          | refresh tests, including a nested-namespace repository              |
-| 9    | the import-boundary test and the forge-name guard                                                                                                        | they are the test                                                   |
-| 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                               |
-| 11   | `AVAILABLE`, `for_config`, `build_forges`; `StubForge` for registered-but-unconfigured hosts                                                             | registry tests                                                      |
-| 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge) |
-| 13   | the abstraction becomes unconditional: every upgraded install gets it, and the `git` and `gh` shims are deleted from the sandbox image                   | operator tests, and the image smoke test asserting both by absence  |
+| Step | Delivers                                                                                                                                                 | Held to it by                                                                                                                                                                                                                       |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | repository identity in Python: one parser, the host carried rather than assumed, unknown hosts rejected; `get_managed_github_repos()` becomes a dispatch | parser unit tests, including a nested namespace and an unknown host                                                                                                                                                                 |
+| 2    | the declarative surface in Go: `spec.integration.git`, the deprecated alias, provider-dispatched validation, the declared type reaching the agent        | operator tests; a GitHub CR still admits and reconciles, a GitLab CR now admits where it is refused today, and `common_types_test.go`'s two GitLab rejection cases move to the GitHub provider's dispatch rather than being deleted |
+| 3    | `providers/` shared contract: `Forge` ABC with `verbs`, the validators, identity, the guidance table, `forge_error(status, detail)`                      | unit tests per module                                                                                                                                                                                                               |
+| 4    | `Transport` protocol with the neutral `api` request; `CliTransport`, including status extraction                                                         | transport unit tests                                                                                                                                                                                                                |
+| 5    | `Credential` protocol; `BrokeredCredential`; `git_config` reaching the broker's git invocations                                                          | a test that the config lands on the invocation and nowhere else                                                                                                                                                                     |
+| 6    | `providers/github/` — the eight verbs, translation, its throttle heuristics, its `error_overrides`                                                       | the verb suite                                                                                                                                                                                                                      |
+| 7    | the consumer migration: the six scripts of layer 1 reach the forge through the provider and nothing else, and `inspect_repository.py` clones by verb     | their own tests, with no functional delta to explain                                                                                                                                                                                |
+| 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, and the two executable allowlists split by purpose          | refresh tests, including a nested-namespace repository                                                                                                                                                                              |
+| 9    | the import-boundary test and the forge-name guard                                                                                                        | they are the test                                                                                                                                                                                                                   |
+| 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                                                                                                                                                                                               |
+| 11   | `AVAILABLE`, `for_config`, `build_forges`; `StubForge` for registered-but-unconfigured hosts                                                             | registry tests                                                                                                                                                                                                                      |
+| 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge)                                                                                                                                                                 |
+| 13   | the abstraction becomes unconditional: every upgraded install gets it, and the `git` and `gh` shims are deleted from the sandbox image                   | operator tests, and the image smoke test asserting both by absence                                                                                                                                                                  |
 
 Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is paid
 for. It also removes `spec.harness.experimental.shellSandbox.enabled`, which by
