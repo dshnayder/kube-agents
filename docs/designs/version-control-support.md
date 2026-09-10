@@ -78,8 +78,12 @@ it. An agent should read all of it.
 | [8. MCP](#8-why-an-mcp-server-is-an-addition-not-the-mechanism) | why a forge MCP server is an addition rather than the mechanism                                                                 |
 | [9. The experiment](#9-the-experiment)                          | how this was measured against the two existing designs, and the results                                                         |
 | [10. What this does not fix](#10-what-this-does-not-fix)        | the limits that remain once it all lands                                                                                        |
-| [11. Delivery](#11-delivery)                                    | the order, and what each step can be held to                                                                                    |
-| [12. Open questions](#12-open-questions)                        | what is still undecided                                                                                                         |
+| [11. Open questions](#11-open-questions)                        | what is still undecided                                                                                                         |
+
+This document describes the end state and the reasoning that fixes it. It does
+not schedule the work: there is no delivery order, no step list and no division
+into pull requests here, because which change lands in which release is a
+question about the tree at the time, not about the design.
 
 ---
 
@@ -132,9 +136,11 @@ duplicated parser, a silent fallback, or a hardcoded host. Layer 5 is only worth
 second forge, and layer 4 almost is: its one standalone defect is that the CR silently rewrites a
 host-like shorthand such as `gitlab.com/project` into a GitHub URL it invents
 ([Repository identity](#repository-identity)), which is worth fixing on its own but does not need any
-of this. That split says what is worth doing; it does
-not decide the order, which [Delivery](#11-delivery) derives from three sequencing constraints
-instead — and one of those pulls part of layer 4 forward ahead of layers 1 and 3.
+of this. That split says what is worth doing. It does not say in what order, and neither does the
+rest of this document — with one exception that is a property of the design rather than of a
+schedule: the provider discriminator crosses a process boundary, so the Python reader has to accept
+it before the Go writer emits it, or a valid CR reconciles successfully and is then rejected inside
+the pod.
 
 ### Why one abstraction rather than three integrations
 
@@ -338,9 +344,9 @@ What is **not** admitted is the form GitLab's clone button actually hands you.
 `git@gitlab.com:group/project` reaches the SCP branch, which reads `gitlab.com` as the host and
 returns `unsupported host "gitlab.com" for GitHub repository`; `common_types_test.go` asserts exactly
 that, for the SCP and the `https://gitlab.com/...` forms both. GitLab is refused at admission today.
-That matters for the delivery order more than it matters here: admitting `spec.integration.git` for
-GitLab is **relaxing an existing host check under provider dispatch**, not adding a host check where
-a host-blind shape check stood.
+That is worth stating precisely, because it inverts the obvious reading: admitting
+`spec.integration.git` for GitLab is **relaxing an existing host check under provider dispatch**, not
+adding a host check where a host-blind shape check stood.
 
 **The change.** One `RepoRef` carrying a host and an opaque, arbitrary-depth path, constructed in one
 place and passed rather than re-parsed. Every validator above becomes a caller. The two-segment rule
@@ -351,8 +357,8 @@ discarded before the slashes are counted.
 `forge.py`'s "On the repository parser" note describes code that no longer exists: a parity test
 holding `_parse_repo` level with `resolver.get_target_repo`, and `gitops_workspace.repo_from_settings`
 as a loose parser knowingly left unfixed. All three are gone, and `resolver.py` imports
-`gitops_workspace` now instead of carrying a parser of its own. Correcting that note belongs to
-step 1, which is what makes it true again.
+`gitops_workspace` now instead of carrying a parser of its own. The note is corrected by the same
+change that makes it true again.
 
 **Where #1085 now stands.** [#1085](https://github.com/gke-labs/kube-agents/issues/1085) reported
 that `repo_from_settings` resolved `https://evil.example/victim-org/victim-repo` to
@@ -1162,7 +1168,7 @@ the cost side:
   per pod, and `git clone` already leaves that pod for the same host — but the
   egress policy needs the GitLab host, and for self-managed that host is
   customer-chosen and cannot be a literal in the repository. See
-  [Open questions](#12-open-questions).
+  [Open questions](#11-open-questions).
 - **Timeouts and output caps are not inherited.** A subprocess runner enforces
   both for the CLI path. `HttpTransport` has to enforce them itself, and a test
   has to hold it to that, because "the runner did it" is exactly the kind of
@@ -1278,10 +1284,9 @@ implementation is far harder to remove once merged than to not write.
 
 The constraint is deliberately narrow: it says where the code lands, not what
 order it is written in. `forge.py`'s two current consumers keep working untouched
-until step 7 migrates them, so PR 1 is not blocked on that migration and the
-migration is not blocked on PR 1. The state worth preventing is the third one,
-where two GitHub implementations arrive independently and each acquires
-consumers.
+until they are migrated, so neither the abstraction nor the migration blocks the
+other. The state worth preventing is the third one, where two GitHub
+implementations arrive independently and each acquires consumers.
 
 ### The protocol past its first feature
 
@@ -1298,8 +1303,8 @@ rewrites. It is anticipated rather than planned:
 obvious next consumer while holding the migration itself out of scope. Half of that has since
 happened by another route — `resolver.py` dropped its own repository parser and imports
 `gitops_workspace` for one instead — but it still runs its own `gh`, which is the half this section
-is about. [Delivery](#11-delivery) puts the rest on a schedule, and says why that schedule puts it
-before any GitLab code.
+is about. Migrating the remaining three is what makes the provider the only way to reach a forge;
+until it happens, a second forge buys a reviewer conversation and nothing else.
 
 The protocol grows to the union of what the four need. Beyond the existing seven, that is opening a
 change (branch plus pull request), editing and reading one back, listing and commenting on issues,
@@ -1571,9 +1576,10 @@ whose GitHub provider speaks HTTP never grants `gh`. The sandbox's list loses
 `gh` and `git` outright and needs no per-forge logic at all, because a forge CLI
 is exactly what the sandbox is not allowed to reach.
 
-That is also why this is called out as its own delivery step rather than folded
-into a provider package: the broker half changes how `CommandExecutor` is
-constructed, and the sandbox half changes what the image ships.
+That is also why the allowlist is called out as its own concern rather than
+folded into a provider package: the broker half changes how `CommandExecutor` is
+constructed, and the sandbox half changes what the image ships. Neither lives in
+a forge directory.
 
 ### Checking it against Bitbucket
 
@@ -1602,10 +1608,10 @@ has a user and a test rather than being a speculative hook.
 
 What the table shows is that all six differences land in the forge's own
 directory, and the only one that needs a shared mechanism uses one that already
-exists. That is the requirement holding. It is also the argument for building
-the contract harness at step 10 rather than after the third forge: a difference
-like the sixth is exactly the kind that gets absorbed by a special case in a
-shared file when there is no test saying it may not be.
+exists. That is the requirement holding. It is also the argument for the contract
+harness existing before the third forge rather than after it: a difference like
+the sixth is exactly the kind that gets absorbed by a special case in a shared
+file when there is no test saying it may not be.
 
 ### Not every provider is a forge
 
@@ -1614,7 +1620,7 @@ omitting the issue verbs. That is true and it is not the whole answer, because
 a Bitbucket install usually _does_ have an issue tracker — it is Jira, on a
 different host, behind a different credential.
 
-**Jira is not designed here and is not on the delivery plan.** What belongs in
+**Jira is not designed here.** What belongs in
 this document is the one assumption it breaks, because that assumption is cheap
 to avoid now and expensive to unpick later.
 
@@ -1673,9 +1679,9 @@ discarded, and — wherever the input carries an identifiable host — that the 
 `www.github.com`. So the declarative surface names GitHub twice over, in the field path and in the
 validation, and a GitLab URL is refused at admission today.
 
-This is the direction of step 2's work, and it is the opposite of what a reader might assume from a
-field called `GitRepo`: accepting GitLab means **relaxing** a host check that exists, under provider
-dispatch, rather than adding one where none stood. What the host check does not reach is an input
+The direction of travel is the opposite of what a reader might assume from a field called
+`GitRepo`: accepting GitLab means **relaxing** a host check that exists, under provider dispatch,
+rather than adding one where none stood. What the host check does not reach is an input
 with no identifiable host in it, which is the single-slash rewrite
 [Repository identity](#repository-identity) describes.
 
@@ -1705,8 +1711,18 @@ play. There is no supported arrangement in which an agent reaches a forge some
 other way, so a toggle would only describe a configuration nobody is allowed to
 run — and every such field is a second code path to keep working, a second
 combination to test, and a way for an install to sit in the state the design
-exists to remove. What that costs at upgrade time, and the one field that has to
-be kept anyway to make the upgrade safe, is [step 13](#11-delivery).
+exists to remove.
+
+One field is retained anyway, and for the opposite reason to the one that
+usually keeps a field alive: `spec.harness.experimental.shellSandbox.enabled`
+decides nothing, because `validateShellSandbox` refuses `false` with reason
+`ShellSandboxCannotBeDisabled` rather than rendering the old arrangement. It
+exists so that an install which set it gets that refusal instead of a silently
+ignored setting. Deleting a field is normally the risky direction — an unknown
+key is pruned from an existing CR on the next reconcile, and the setting
+disappears with nothing in the diff to say so — and it is safe here only because
+no install can be quietly sitting at `false`: one that tried has been Degraded
+and visible since the sandbox landed.
 
 That is a deliberate reversal of how an experimental feature usually arrives.
 The justification is that this removes no capability: every verb replaces a call
@@ -1938,9 +1954,11 @@ surprise:
 
 - **Self-managed instances behind a private CA.** The token and the API are the
   same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one. This constrains the test
-  environment too, and
-  [where GitLab gets validated](#where-gitlab-gets-validated) says how.
+  container's CA bundle and nothing mounts a custom one, so a self-signed
+  instance fails to connect — and that failure is the design behaving as
+  specified rather than a gap. Any instance this is exercised against has to
+  carry a certificate the sandbox image already trusts, or have TLS terminated
+  by something that does.
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
@@ -2212,8 +2230,8 @@ the smallest thing that would fix it, and it is not designed here.
 Until GitLab and Bitbucket ship, this is a forge-neutral design with one forge
 in it — and an abstraction with one implementation is a hypothesis. The measure
 of it is not that GitLab works but how much shared code has to change to make it
-work, which is why [Delivery](#11-delivery) states that measure as a falsifiable
-exit criterion rather than leaving it to be judged afterwards.
+work. [Modularity](#5-modularity) states what that budget is and what enforces
+it, so the hypothesis is falsifiable rather than judged afterwards.
 
 Issue trackers that are not part of a forge — Jira alongside Bitbucket being the
 case that will arrive first — are named in
@@ -2221,190 +2239,7 @@ case that will arrive first — are named in
 
 ---
 
-## 11. Delivery
-
-### The constraints that fix the order
-
-Three PRs, one per forge, and the first one carries the abstraction. Within the
-first, the order is not preference — three constraints fix most of it.
-
-**Reader before writer.** The provider discriminator that
-[Repository identity](#repository-identity) calls for crosses a process boundary:
-the Go operator declares it, the Python agent acts on it. Widening what the
-writer may emit before the reader accepts it produces a release where a valid CR
-is rejected inside the pod, and the operator sees a reconcile that succeeded and
-an agent that will not start. Repository identity therefore lands in Python
-first and in Go second — and the reader here is not only the parser. It is
-`get_managed_github_repos()`, which drops every entry whose `type` is not
-`github`. Teaching the operator to emit `type: gitlab` while that filter still
-runs is exactly the failure this constraint describes: a reconcile that succeeds
-and a repository the agent never sees. Turning that filter into a dispatch
-therefore lands in step 1, with the parsing work, and not in step 2 with the
-field that feeds it.
-
-That pairing is also why the Go half of layer 4 runs ahead of layers 1 and 3,
-which [Where GitHub is named today](#where-github-is-named-today) ranks as the
-work worth doing regardless. Both of those dispatch on the provider — the
-consumer migration decides which provider a caller gets, the credential plane
-decides which token and which binary — so the discriminator has to be declared
-before either has anything to dispatch on. Sequencing it later means building
-both against an inferred provider and then rewriting them.
-
-**No-behaviour-change before behaviour change.** The consumer migration is a
-large diff with no functional delta, verifiable against a GitHub install.
-Landing it before any GitLab code means a reviewer reads one thing at a time, and
-a regression has one candidate cause.
-
-**Everything provable on GitHub, before anything that needs GitLab.** Every step
-of PR 1 can be exercised against a running GitHub install by showing its
-behaviour unchanged — including the CRD step, where the evidence is a GitHub CR
-still admitting and reconciling through the `spec.integration.git` shape and its
-alias. The first change that cannot is the GitLab provider itself, which needs a
-real GitLab project to validate against. That environment does not exist here
-today — see [What this does not fix](#10-what-this-does-not-fix) — so the design
-puts every step that does not need it first, and none of that work is stranded if
-the environment question takes a while to answer.
-
-### PR 1 — the abstraction, with GitHub behind it
-
-No GitLab. The order below is what keeps it reviewable: identity and the
-declarative surface first, because everything after them dispatches on the
-provider; then the shared contract; then the one forge that fills it in; then the
-callers; then the tests that hold the boundary.
-
-| Step | Delivers                                                                                                                                                 | Held to it by                                                                                                                                                                                                                       |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | repository identity in Python: one parser, the host carried rather than assumed, unknown hosts rejected; `get_managed_github_repos()` becomes a dispatch | parser unit tests, including a nested namespace and an unknown host                                                                                                                                                                 |
-| 2    | the declarative surface in Go: `spec.integration.git`, the deprecated alias, provider-dispatched validation, the declared type reaching the agent        | operator tests; a GitHub CR still admits and reconciles, a GitLab CR now admits where it is refused today, and `common_types_test.go`'s two GitLab rejection cases move to the GitHub provider's dispatch rather than being deleted |
-| 3    | `providers/` shared contract: `Forge` ABC with `verbs`, the validators, identity, the guidance table, `forge_error(status, detail)`                      | unit tests per module                                                                                                                                                                                                               |
-| 4    | `Transport` protocol with the neutral `api` request; `CliTransport`, including status extraction                                                         | transport unit tests                                                                                                                                                                                                                |
-| 5    | `Credential` protocol; `BrokeredCredential`; `git_config` reaching the broker's git invocations                                                          | a test that the config lands on the invocation and nowhere else                                                                                                                                                                     |
-| 6    | `providers/github/` — the eight verbs, translation, its throttle heuristics, its `error_overrides`                                                       | the verb suite                                                                                                                                                                                                                      |
-| 7    | the consumer migration: the six scripts of layer 1 reach the forge through the provider and nothing else, and `inspect_repository.py` clones by verb     | their own tests, with no functional delta to explain                                                                                                                                                                                |
-| 8    | credential-proxy wiring: the generic refresh route, repository validation via `forge.parse`, and the two executable allowlists split by purpose          | refresh tests, including a nested-namespace repository                                                                                                                                                                              |
-| 9    | the import-boundary test and the forge-name guard                                                                                                        | they are the test                                                                                                                                                                                                                   |
-| 10   | contract harness parameterised over `AVAILABLE`; GitHub fixtures recorded                                                                                | the GitHub verb suite runs through it                                                                                                                                                                                               |
-| 11   | `AVAILABLE`, `for_config`, `build_forges`; `StubForge` for registered-but-unconfigured hosts                                                             | registry tests                                                                                                                                                                                                                      |
-| 12   | `resolve` returning a per-capability binding                                                                                                             | see [Not every provider is a forge](#not-every-provider-is-a-forge)                                                                                                                                                                 |
-| 13   | the abstraction becomes unconditional: every upgraded install gets it, and the `git` and `gh` shims are deleted from the sandbox image                   | operator tests, and the image smoke test asserting both by absence                                                                                                                                                                  |
-
-Step 13 is where the "no switch" of [§6](#6-the-declarative-surface) is paid
-for. It also removes `spec.harness.experimental.shellSandbox.enabled`, which by
-then decides nothing: `validateShellSandbox` already refuses `false` with reason
-`ShellSandboxCannotBeDisabled` rather than rendering the old arrangement, and the
-field is retained only so that an install which set it gets that refusal instead
-of a silently ignored setting. Deleting a field is normally the risky direction — an unknown key is
-pruned from an existing CR on the next reconcile, and the setting disappears
-with nothing in the diff to say so. It is safe here precisely because of the
-order: no install can be quietly sitting at `false`, since one that tried has
-been Degraded and visible since the sandbox landed.
-
-Step 7 is the one that splits naturally if the PR gets too large: each of the
-seven consumers is independent of the others, and each is a no-functional-delta
-change against a GitHub install. Nothing after it depends on all seven having
-landed.
-
-**Exit criteria — falsifiable, and worth putting in the PR description:**
-
-- `grep -ci github agents/platform/scripts/vcs_broker.py` returns 0, and the
-  same for every module directly under `providers/` except `registry.py`, whose
-  only hits are the import line and the `AVAILABLE` tuple.
-- `credential_proxy.py` names no forge on the VCS path.
-- The import-boundary test passes, and fails if you add
-  `from providers.github import …` to the broker.
-- There is exactly one GitHub provider implementation in the tree.
-
-The third matters most. Anyone can produce the directory layout; the test is
-what says it will still be the layout in six months. The fourth is the one this
-whole sequence exists to protect.
-
-### PR 2 — GitLab
-
-| Step | Delivers                                                                            | Held to it by                          |
-| ---- | ----------------------------------------------------------------------------------- | -------------------------------------- |
-| 14   | `HttpTransport` — timeout, size cap, redaction, status mapping                      | unit tests against a local stub server |
-| 15   | `providers/gitlab/` — identity, `StaticFileCredential`, translation, errors         | the PR-1 harness, with GitLab fixtures |
-| 16   | GitLab's 401 guidance override (the token-expiry case)                              | error tests                            |
-| 17   | one line in `registry.py`                                                           | registry tests                         |
-| 18   | operator: render the GitLab config, project the Secret, derive egress from the host | operator tests                         |
-| 19   | the vocabulary: the four `SKILL.md` files, then the seven governance SOPs           | the terminology check                  |
-| 20   | live validation                                                                     | see below                              |
-
-`HttpTransport` is here rather than in PR 1 deliberately: PR 1 declares the
-`transport` seam and implements only the one GitHub uses. A transport with no
-consumer is a guess about what the second forge will need, and the whole point
-of the sequence is to stop guessing.
-
-Step 19 is here for a related reason. Neutral verb names are worth having on
-their own, but a prompt that says "pull request" is only _wrong_ once the install
-might be talking to something that calls it a merge request. Landing the sweep
-alongside the forge that makes it matter also means it is reviewed against a real
-second spelling rather than against a hypothesis about one.
-
-### PR 3 — Bitbucket
-
-Not designed here. What belongs in this document is the **measure**: PR 3 should
-touch `providers/bitbucket/`, one line of `registry.py`, and the operator's
-configuration — and nothing else. Every shared file it turns out to need is a
-place the seam was in the wrong spot, and
-[the Bitbucket check](#checking-it-against-bitbucket) already predicts one such
-place, the shared error-guidance table.
-
-If PR 3's diff outside its own directory is more than the registry line and the
-operator config, PR 1 did not succeed. That is the honest test, and it arrives
-too late to change PR 1 — which is the argument for the import-boundary test
-being in PR 1 rather than waiting for a third forge to prove the point.
-
-### Where GitLab gets validated
-
-No environment here has a GitLab. The endpoint-level claims marked
-_live-verify_ above cannot be closed without one, and neither can step 20. **PR
-1 needs none of it**, which is most of the reason the sequence is shaped this
-way: the abstraction is not held hostage to an environment question.
-
-Three options, and the middle one is the recommendation:
-
-| Option                                               | Footprint               | What it does not cover          |
-| ---------------------------------------------------- | ----------------------- | ------------------------------- |
-| a gitlab.com project under a throwaway group         | none                    | customer hostname, egress rule  |
-| **omnibus GitLab CE container** (`gitlab/gitlab-ce`) | one pod, ~8 GB, one PVC | nothing this design needs       |
-| the GitLab Helm chart                                | ≥8 vCPU / 30 GB cluster | nothing — and it costs the most |
-
-The omnibus image is the Linux package in a container: PostgreSQL, Redis,
-Sidekiq, Gitaly and NGINX all inside one pod, configured through
-`GITLAB_OMNIBUS_CONFIG` and three volumes. That matters because the Helm chart
-**removed its bundled PostgreSQL, Redis and MinIO in GitLab 19.0** — the chart
-now expects those to be supplied, which turns "stand up a test GitLab" into
-"stand up a test GitLab and three datastores."
-
-One pod is enough to exercise everything gitlab.com cannot and this design does
-claim: an `external_url` that appears in no shipped literal, and the egress path
-for a host the operator has to render. Everything this design needs from GitLab
-is Free-tier — merge requests, issues, notes, API v4, and group access tokens,
-which on self-managed are available with any licence.
-
-The instance has to be given a certificate the sandbox image already trusts, or
-have TLS terminated by something that has one. That is not a limitation of the
-environment; it is
-[the private-CA refusal](#what-gitlab-does-not-include) showing up where it
-should. `HttpTransport` mounts no custom CA bundle, so a self-signed instance
-would fail to connect — and that failure is the design behaving as specified,
-not a validation gap. A test environment cannot close a capability the design
-declines to have, so private-CA coverage is not a reason to prefer one option
-here over another. If the refusal is ever lifted, the omnibus instance is where
-the work would be validated, which is a further argument for standing it up
-rather than for scoring it now.
-
-Recommendation: an omnibus GitLab CE container in the development cluster for
-steps 15–18. If standing infrastructure is the blocker, the same image runs
-ephemerally in a CI job for the API-shape and credential tests, and the
-long-lived instance is deferred to whenever the hostname, CA and egress work
-lands. gitlab.com is not on the path at all — it costs nothing but it also
-proves the least.
-
----
-
-## 12. Open questions
+## 11. Open questions
 
 1. **Whether one field can name the token's scope boundary on both forges.** On
    GitHub that boundary is an App installation and it lines up with the first
@@ -2458,7 +2293,7 @@ proves the least.
 - [`docs/designs/memory.md`](memory.md) — the document structure and the
   experiment format this follows.
 - [`docs/designs/live-test-lease.md`](live-test-lease.md) — how to take the
-  install before running the live validation steps in §11.
+  install before validating any of this against it.
 - Issue #1154 — the GitLab/Bitbucket tracking issue.
 - Issue [#1085](https://github.com/gke-labs/kube-agents/issues/1085) — the
   host-confusion report that §2's repository identity closes.
