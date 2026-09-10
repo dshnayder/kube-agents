@@ -334,8 +334,8 @@ its first segment is then validated only as a slug component — a character cla
 So `gitlab.com/project` is admitted, and `CleanRepoURLWithOrg`, which prefixes a literal
 `https://github.com/` to any shorthand, writes it into the state ConfigMap as
 `{"type": "github", "url": "https://github.com/gitlab.com/project"}`. The repository is not
-rejected; it is rewritten into a GitHub one and labelled `github` by the constant above describes.
-Every reader downstream then behaves correctly, on a repository the operator invented.
+rejected; it is rewritten into a GitHub one and labelled `github` by the operator itself. Every
+reader downstream then behaves correctly, on a repository the operator invented.
 `evil.example/repo` takes the same path for the same reason, so this is a shape defect rather than
 anything specific to GitLab. This is the layer-4 defect
 [Where GitHub is named today](#where-github-is-named-today) says is worth fixing on its own.
@@ -354,11 +354,10 @@ survives as a per-provider validation on the GitHub provider, where it is true, 
 invariant of the whole stack, where it is not — and the host survives the parse instead of being
 discarded before the slashes are counted.
 
-`forge.py`'s "On the repository parser" note describes code that no longer exists: a parity test
-holding `_parse_repo` level with `resolver.get_target_repo`, and `gitops_workspace.repo_from_settings`
-as a loose parser knowingly left unfixed. All three are gone, and `resolver.py` imports
-`gitops_workspace` now instead of carrying a parser of its own. The note is corrected by the same
-change that makes it true again.
+`forge.py`'s "On the repository parser" note now counts two parsers, `_parse_repo` and
+`github_token_refresh.github_repo_from_remote`, and that count is right for the module it sits in
+and wrong for the tree: it is a module's view of a problem no module can see the whole of, which is
+the argument for the parser being one object rather than a note in each file that has one.
 
 **Where #1085 now stands.** [#1085](https://github.com/gke-labs/kube-agents/issues/1085) reported
 that `repo_from_settings` resolved `https://evil.example/victim-org/victim-repo` to
