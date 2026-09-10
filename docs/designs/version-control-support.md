@@ -261,6 +261,39 @@ Jelmer Vernooij's `silver-platter`, which drives GitHub, GitLab and Launchpad
 through one `MergeProposal` abstraction and is the closest existing answer to
 this problem.
 
+### Where this agrees with an existing normalised API
+
+Google Cloud's
+[Developer Connect](https://docs.cloud.google.com/developer-connect/docs/api/reference/rest)
+answers an adjacent question — one resource model and one credential plane
+across GitHub, GitHub Enterprise, GitLab, self-managed GitLab, Bitbucket Cloud
+and Bitbucket Data Center. Nothing here calls it, depends on it or is built on
+it. It is cited because three of its choices are the same as three made here,
+and independent agreement is worth more as evidence than a resemblance would be:
+
+- **A repository is a registered object, not a string.** There, a repository is
+  linked under a connection and carries its clone URI as a required field, so
+  "which forge serves this?" is answered by looking the repository up rather
+  than by parsing text a caller supplied. [Repository
+  identity](#repository-identity) arrives at registration from the opposite
+  direction — seven parsers that disagree about the same string — and that is
+  the stronger of the two arguments, because it is a failure rather than a
+  preference.
+- **The forge set is the same, and so is the split inside it.** Bitbucket Cloud
+  and Bitbucket Data Center appear as separate connection types, each with its
+  own webhook route, as do gitlab.com and self-managed GitLab. That matches what
+  [`pr-comment-conversation.md`](pr-comment-conversation.md) §3 records from live
+  validation: Bitbucket is two providers sharing almost nothing, not one
+  provider with a flag.
+- **Read and write are separate credential grants.** They are fetched by
+  different calls rather than selected by a mode on a single token — capability
+  is a property of the credential, not of the request that uses it.
+
+The disagreement is one of scope rather than of shape: that API's public surface
+brokers access to a repository, and the collaboration half — proposals, review
+comments, issues — is not part of it. The verbs in the next section have no
+counterpart there to align with.
+
 ### The vocabulary
 
 | Concept                     | Command    | Aliases    | Why this name                                                                                                                                                                                                                                                                                               |
@@ -2298,7 +2331,11 @@ case that will arrive first — are named in
    not a feature toggle — the abstraction itself is not optional — so it belongs
    on the declarative surface of §6 alongside whatever answers
    [the token's scope boundary](#the-gitlab-credential), and the two should be
-   decided together.
+   decided together. There is one piece of outside evidence for the shape:
+   [the normalised API this agrees with](#where-this-agrees-with-an-existing-normalised-api)
+   hands out read and read-write as two different credential grants rather than
+   as one token carrying a mode, which argues the declaration attaches to the
+   credential and not to the install.
 
 4. **Whether `GitHubProvider` moves onto the in-process HTTP transport.** Not
    proposed. It would take `gh` out of the broker entirely, which
