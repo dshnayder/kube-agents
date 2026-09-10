@@ -19,7 +19,7 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check iac-parity-check tf-apply tf-destroy coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -282,7 +282,7 @@ e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -291,6 +291,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go test (a2a)";  cd a2a && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
@@ -562,11 +563,27 @@ chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules f
 chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
 	@./hack/sync-chart-manifests.sh --check
 
+iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "iac-parity-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/check_iac_parity.py
+
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
+
+# Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
+# by someone remembering them, and a conformance suite whose CI entry depends
+# on a glob is a conformance suite that stops running. It has its own
+# unfiltered workflow (.github/workflows/conformance.yml) for the same reason,
+# and the package's load_tests refuses root discovery so `make test-python`
+# cannot also half-run it with bucket 2 surfacing as skips.
+conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
+	@python3 tests/conformance/run.py
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	@if [ -n "$(BAD_SKILLS)" ]; then \

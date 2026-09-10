@@ -356,6 +356,24 @@ source "{_COMMON_SH}"
         head = git("rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
 
+    def _repo_with_staging_deploy_trigger(self, patterns):
+        """A mock repo whose HEAD carries staging-deploy.yml with `patterns`."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        workflow = pathlib.Path(repo_dir) / ".github" / "workflows"
+        workflow.mkdir(parents=True, exist_ok=True)
+        rendered = "\n".join(f'      - "{p}"' for p in patterns)
+        (workflow / "staging-deploy.yml").write_text(
+            "name: Staging Deploy\n\non:\n  push:\n    tags:\n" + rendered + "\n\njobs: {}\n"
+        )
+        git("add", "-A")
+        git("commit", "-m", "chore: staging deploy trigger")
+        return repo_dir, git("rev-parse", "HEAD").stdout.strip()
+
+    def test_staging_trigger_matches_in_consolidated_staging_deploy_workflow(self):
+        repo_dir, head = self._repo_with_staging_deploy_trigger(["staging_*"])
+        self.assertEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+
     def _repo_with_pipeline_markers(self, optional_runner=True, suite_selector=True,
                                     reconciler=True):
         temp_dir, repo_dir, git = create_mock_git_repo()
@@ -722,8 +740,10 @@ source "{_COMMON_SH}"
     #
     # Shared by calculate_next_version.sh, which reads it to pick the bump, and
     # resolve_scheduled_release.sh, which reads it to decide whether an
-    # unattended release stops for a human. The two disagreeing is silent in the
-    # unsafe direction, so the last test here pins that neither keeps a copy.
+    # unattended release on stable GA (>= 1.0.0) stops for a human (while
+    # pre-1.0 breaking changes bump MINOR and release unattended). The two
+    # disagreeing is silent in the unsafe direction, so the last test here pins
+    # that neither keeps a copy.
 
     def test_commit_messages_have_breaking_change_detects_a_bang_subject(self):
         for subject in ("feat!: drop it", "fix(operator)!: drop the v1alpha1 field"):
@@ -839,6 +859,28 @@ source "{_COMMON_SH}"
                     f"{script} re-implements the breaking-change test instead of calling common.sh",
                 )
                 self.assertIn("commit_messages_have_breaking_change", body, f"{script} does not call the helper")
+
+    def test_both_callers_use_ga_tag_is_initial_development(self):
+        """Both calculate_next_version.sh and resolve_scheduled_release.sh must use the shared predicate."""
+        for script in ("calculate_next_version.sh", "resolve_scheduled_release.sh"):
+            with self.subTest(script=script):
+                text = (_REPO_ROOT / "scripts" / "release" / script).read_text()
+                body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+                self.assertIn("ga_tag_is_initial_development", body, f"{script} does not call ga_tag_is_initial_development")
+
+    # ── ga_tag_is_initial_development ────────────────────────────────────────
+
+    def test_ga_tag_is_initial_development_true_for_zero_major(self):
+        for tag in ("0.1.0", "0.9.0", "0.10.0", "0.0.1"):
+            with self.subTest(tag=tag):
+                proc = self._run_common_func(f'ga_tag_is_initial_development "{tag}"')
+                self.assertEqual(proc.returncode, 0, f"Expected {tag} to be initial development")
+
+    def test_ga_tag_is_initial_development_false_for_stable_and_invalid(self):
+        for tag in ("1.0.0", "1.2.3", "2.0.0", "invalid", "", "foo.bar"):
+            with self.subTest(tag=tag):
+                proc = self._run_common_func(f'ga_tag_is_initial_development "{tag}"')
+                self.assertNotEqual(proc.returncode, 0, f"Expected {tag} not to be initial development")
 
     def test_release_bundle_registries(self):
         """Verifies common.sh exports release bundle directories, root files, and charts."""

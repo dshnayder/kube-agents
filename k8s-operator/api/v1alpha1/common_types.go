@@ -307,6 +307,46 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
+
+	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
+	// It only means something under mode: next - a today install renders neither
+	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+	// creation user-triggerable from chat and threads are free, so the principal
+	// map bounds WHO can spawn and this bounds HOW MANY.
+	//
+	// Unset means 10, the operator's default - a "busy day" sizing: at the
+	// session-pod shape (250m CPU / 512Mi requests) ten concurrent sessions
+	// hold 2.5 CPU / 5Gi, which a small dev cluster absorbs without
+	// preemption.
+	//
+	// The number lands in two places that deliberately differ. The gateway's
+	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
+	// delegation is refused with a chat reply naming the numbers, never queued,
+	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// ABOVE it as the enforcement control: a compromised or buggy gateway
+	// ignores its own cap and cannot ignore the quota, and keeping the quota
+	// above the cap is what makes users hit the honest refusal rather than an
+	// opaque admission failure. The quota is namespace-wide - the only shape a
+	// hostile pod-creator cannot dodge - so its headroom above the cap also
+	// bounds everything else in the namespace: an install whose namespace
+	// carries many non-session pods can see unrelated pod creation refused at
+	// admission before sessions reach this cap, and the headroom is an
+	// operator constant, not a CR field.
+	//
+	// Raising it buys concurrent delegations at the per-pod price plus model
+	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
+	// Lowering it turns busy-hour delegations into refusals sooner - a lower
+	// cap never reaps in-flight sessions, it only blocks new spawns until they
+	// finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+	// concurrency is MaxInProgress above, a different lane.
+	//
+	// The Maximum exists because the quota render adds its headroom to this
+	// number: an absurd but API-legal value would wrap the arithmetic into a
+	// negative quota and wedge the A2A reconcile.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
+	// +optional
+	MaxSessions *int `json:"maxSessions,omitempty"`
 }
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
@@ -1210,6 +1250,8 @@ const (
 	MaxGitRepoURLLength = 2048
 )
 
+var validRepoSlugPart = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+
 // githubOrgRegex validates GitHub organization or username format
 // (alphanumeric and hyphens, not starting or ending with hyphen, max 39 chars).
 var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
@@ -1225,17 +1267,13 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	cleaned := strings.TrimSpace(rawURL)
 	cleaned = strings.TrimSuffix(cleaned, ".git")
 
-	// Validate URL scheme if a scheme is present
+	// Validate URL scheme if a scheme is present and strip it
 	if idx := strings.Index(cleaned, "://"); idx != -1 {
 		scheme := strings.ToLower(cleaned[:idx])
 		if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
 			return "", fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
 		}
-	}
-
-	// Strip known URL schemes
-	for _, scheme := range []string{"ssh://", "git://", "https://", "http://"} {
-		cleaned = strings.TrimPrefix(cleaned, scheme)
+		cleaned = cleaned[idx+3:]
 	}
 
 	// Handle user@host prefix (e.g. git@github.com:owner/repo or git@github.com/owner/repo)
@@ -1247,13 +1285,30 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	if strings.Contains(cleaned, ":") {
 		parts := strings.SplitN(cleaned, ":", 2)
 		if len(parts) == 2 {
+			host := strings.ToLower(parts[0])
+			if host != "github.com" && host != "www.github.com" {
+				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
+			}
 			cleaned = parts[1]
 		}
 	}
 
-	// Strip common domain prefixes
-	cleaned = strings.TrimPrefix(cleaned, "github.com/")
-	cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	// Strip common domain prefixes or validate host if present with slashes (e.g. host/owner/repo)
+	if strings.HasPrefix(cleaned, "github.com/") {
+		cleaned = strings.TrimPrefix(cleaned, "github.com/")
+	} else if strings.HasPrefix(cleaned, "www.github.com/") {
+		cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	} else if strings.Count(cleaned, "/") > 1 {
+		parts := strings.SplitN(cleaned, "/", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			host := strings.ToLower(parts[0])
+			if host != "github.com" && host != "www.github.com" {
+				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
+			}
+			cleaned = parts[1]
+		}
+	}
+
 	cleaned = strings.Trim(cleaned, "/")
 
 	if cleaned == "" {
@@ -1265,23 +1320,31 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 		cleaned = strings.TrimSpace(org) + "/" + cleaned
 	}
 
-	// Basic verification of owner/repo structure
-	if strings.Count(cleaned, "/") != 1 {
+	// Basic verification of owner/repo structure and component character set
+	parts := strings.Split(cleaned, "/")
+	if len(parts) != 2 {
 		return "", fmt.Errorf("invalid repository format")
 	}
+
+	owner, repo := parts[0], parts[1]
+	for _, part := range []string{owner, repo} {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, "-") {
+			return "", fmt.Errorf("invalid repository slug %q", cleaned)
+		}
+	}
+	if !validRepoSlugPart.MatchString(owner) || !validRepoSlugPart.MatchString(repo) {
+		return "", fmt.Errorf("invalid characters in repository slug %q", cleaned)
+	}
+
 	return cleaned, nil
 }
 
 // CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
+// It rejects non-GitHub repository hosts.
 func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" || trimmed == "None" {
 		return "", fmt.Errorf("empty repository")
-	}
-	if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
-		u := strings.TrimSuffix(trimmed, ".git")
-		u = strings.TrimSuffix(u, "/")
-		return u, nil
 	}
 	cleanedSlug, err := CleanRepoSlugWithOrg(rawURL, org)
 	if err != nil {
@@ -1290,14 +1353,14 @@ func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	return "https://github.com/" + cleanedSlug, nil
 }
 
-// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid
-// and contains no whitespace or non-graphic character injections.
+// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid,
+// contains no whitespace or non-graphic character injections, and targets github.com.
 func ValidateGitRepoURL(gitRepo string) error {
 	return ValidateGitRepoURLWithOrg(gitRepo, "")
 }
 
 // ValidateGitRepoURLWithOrg verifies that a Git repository URL or shorthand (with optional org context)
-// is structurally valid and contains no whitespace or non-graphic character injections.
+// is structurally valid, contains no whitespace or non-graphic character injections, and targets github.com.
 func ValidateGitRepoURLWithOrg(gitRepo, org string) error {
 	trimmed := strings.TrimSpace(gitRepo)
 	if trimmed == "" || trimmed == "None" {

@@ -189,6 +189,38 @@ class LifecyclePlanTest(unittest.TestCase):
                                  re.MULTILINE | re.DOTALL).group(1)
         self.assertIn("adopt_pubsub", apply_branch)
 
+    def test_apply_runs_every_identity_guard_before_terraform(self):
+        """Each guard refuses a destroy-and-recreate an -auto-approve apply would not stop at."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        apply_idx = apply_branch.index("terraform apply")
+        for guard in ("guard_cluster_ownership", "guard_gsa_identity", "guard_release_namespace"):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, apply_branch)
+                self.assertLess(apply_branch.index(guard), apply_idx)
+
+    def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
+        """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
+        destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
+                                   re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(destroy_branch.index("guard_release_namespace"),
+                        destroy_branch.index("delete_agent_cr"))
+
+    def test_apply_forgets_unmanaged_cluster_kms_before_adopting(self):
+        """adopt_kms re-reads state, so the removals have to land first (#1296)."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(apply_branch.index("forget_unmanaged_cluster_kms"),
+                        apply_branch.index("adopt_kms"))
+
+    def test_apply_guards_the_kms_names_before_terraform_runs(self):
+        """The CMEK names are ForceNew and now come from install.env, so the
+        guard has to sit with the other identity guards, ahead of the apply."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(apply_branch.index("guard_kms_identity"),
+                        apply_branch.index("terraform apply"))
+
     def test_the_usage_range_still_covers_the_whole_header(self):
         """The fallback branch prints a fixed line range, so a longer header truncates it."""
         printed = re.search(r"sed -n '2,(\d+)p'", self.text)
@@ -394,22 +426,30 @@ class ReconcileScriptTest(unittest.TestCase):
         """A separate "is it free?" read leaves a window before the apply."""
         self.assertRegex(self.text, r'live_test_lease\.py"?\s+acquire')
         self.assertIn("trap release_lease EXIT", self.text)
+        self.assertIn("trap 'release_lease; exit 130' INT", self.text)
+        self.assertIn("trap 'release_lease; exit 143' TERM", self.text)
+        self.assertIn("trap 'release_lease; exit 129' HUP", self.text)
 
-    def test_an_apply_waits_out_an_in_flight_redeploy(self):
-        """Both drive `helm upgrade` on the release the composition owns."""
-        self.assertIn("await_redeploys", self.text)
-        self.assertIn("redeploy-${component}.yml", self.text)
+    def test_signals_release_lease_and_exit_nonzero(self):
+        """SIGINT/SIGTERM/SIGHUP must terminate bash and not continue execution."""
+        snippet = """
+LEASE_HELD="true"
+release_lease() {
+  echo "RELEASED"
+  LEASE_HELD="false"
+}
+trap release_lease EXIT
+trap 'release_lease; exit 130' INT
+trap 'release_lease; exit 143' TERM
+trap 'release_lease; exit 129' HUP
 
-    def test_the_redeploy_wait_counts_queued_runs_too(self):
-        """Each redeploy has its own concurrency group, so one can sit queued.
-
-        autopush's redeploys start on every push to main. A queued one that
-        dequeues halfway through the apply is the collision the wait exists to
-        avoid, and an `--status in_progress` query cannot see it.
-        """
-        self.assertIn('select(.status == "in_progress"', self.text)
-        self.assertIn('"queued"', self.text)
-        self.assertIn('"waiting"', self.text)
+kill -TERM $$
+echo "UNREACHABLE_AFTER_SIGNAL"
+"""
+        proc = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 143)
+        self.assertIn("RELEASED", proc.stdout)
+        self.assertNotIn("UNREACHABLE_AFTER_SIGNAL", proc.stdout)
 
     def test_credentials_are_fetched_before_the_lease_is_taken(self):
         """The lease is a ConfigMap read; without a kubeconfig it cannot be read.

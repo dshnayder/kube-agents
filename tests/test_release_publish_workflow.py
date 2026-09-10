@@ -18,10 +18,10 @@ Three expressions carry it, and each fails quietly if it is dropped:
     look wrong — until a candidate is promoted between the gate job and the
     publish job, and the release goes out at a commit nothing gated.
 
-The cron is deliberately absent: the gate reads the staging tag, and the nightly
-pipeline that pushes one is itself dispatch-only, so a weekly cron would skip
-green every week and demonstrate nothing. The test below does not require one,
-but does constrain what it may be when it arrives.
+The cron trigger is decoupled: release-publish.yml is strictly dispatch-only so that quiet
+ticks with nothing to release produce no workflow run at all. The weekly cron ("17 5 * * 4")
+lives on .github/workflows/release-scheduler.yml, which evaluates candidate eligibility
+and dispatches release-publish.yml only when work is required.
 """
 
 import pathlib
@@ -58,16 +58,21 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         self.assertEqual(gate_input["default"], "bypass")
         self.assertEqual(sorted(gate_input["options"]), ["bypass", "dry-run", "evaluate"])
 
-    def test_any_schedule_added_later_is_weekly_rather_than_daily(self):
+    def test_release_scheduler_cron_is_weekly_rather_than_daily(self):
         """The cron is the cadence — there is no rate limiter inside the resolver.
 
         Nothing in resolve_scheduled_release.sh rations releases by elapsed time,
         which is deliberate: the design chose a weekly cron over a daily attempt
-        capped by weekday arithmetic. A daily cron added here would therefore
-        release every day rather than every week, and no other test would catch
-        it. Absent for now, so this passes vacuously until the schedule lands.
+        capped by weekday arithmetic. The cron on release-scheduler.yml must fire
+        weekly rather than daily, while release-publish.yml has no schedule trigger.
         """
-        for entry in self.triggers.get("schedule", []):
+        self.assertNotIn("schedule", self.triggers, "release-publish.yml must remain dispatch-only")
+        scheduler_path = _REPO_ROOT / ".github" / "workflows" / "release-scheduler.yml"
+        scheduler_doc = yaml.safe_load(scheduler_path.read_text())
+        scheduler_triggers = scheduler_doc.get(True, scheduler_doc.get("on", {}))
+        schedules = scheduler_triggers.get("schedule", [])
+        self.assertTrue(schedules, "release-scheduler.yml must declare a schedule")
+        for entry in schedules:
             minute, hour, dom, month, dow = entry["cron"].split()
             self.assertNotEqual(dow, "*", f"'{entry['cron']}' fires daily; the cadence must be weekly")
             self.assertEqual(dom, "*", f"'{entry['cron']}' pins a day of month rather than a weekday")
@@ -154,7 +159,12 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         gated = [
             step
             for step in self.jobs[_PUBLISH_JOB]["steps"]
-            if step.get("name") not in ("Checkout repository", "Calculate Next Release Version", "Verify Release Eligibility")
+            if step.get("name") not in (
+                "Generate Release Bot Token",
+                "Checkout repository",
+                "Calculate Next Release Version",
+                "Verify Release Eligibility",
+            )
         ]
         self.assertTrue(gated, "publish job has no steps after eligibility")
         for step in gated:
@@ -163,6 +173,36 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
                 step.get("if", ""),
                 f"step {step.get('name')!r} is not behind the eligibility skip",
             )
+
+    def test_the_release_is_published_with_the_release_bot_token(self):
+        """The release tag and assets must be pushed with the GitHub App release bot token."""
+        steps = self.jobs[_PUBLISH_JOB]["steps"]
+        token_step = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+        )
+        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+        self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
+        self.assertEqual(token_step["with"].get("permission-contents"), "write")
+        checkout = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        self.assertIn(token_step.get("id", "release-token"), checkout["with"]["token"])
+
+    def test_the_helm_chart_is_published_with_github_token_packages_credential(self):
+        """Helm chart push to GHCR requires package write permissions, held by GITHUB_TOKEN."""
+        step = self._step(_PUBLISH_JOB, "Package, Publish and Sign Helm Chart")
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
+
+    def test_the_release_tag_and_github_release_use_release_bot_token(self):
+        """Git tag and GitHub release creation require the release bot token to bypass rulesets."""
+        tag_step = self._step(_PUBLISH_JOB, "Create Git Tag")
+        self.assertIn("steps.release-token.outputs.token", tag_step["env"]["GH_TOKEN"])
+        release_step = self._step(_PUBLISH_JOB, "Publish GitHub Release")
+        self.assertIn("steps.release-token.outputs.token", release_step["env"]["GH_TOKEN"])
 
     def _step(self, job, name):
         for step in self.jobs[job]["steps"]:

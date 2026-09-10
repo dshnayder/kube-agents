@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -54,6 +55,9 @@ func newTestScheme() *runtime.Scheme {
 	_ = agentv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
+	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
+	// reconcile, which is every golden case.
+	_ = batchv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
@@ -109,6 +113,20 @@ func TestAgentsGolden(t *testing.T) {
 			name:         "PlatformAgentScopedServiceAccounts",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-scoped-sa.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scoped-sa.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			// The above-one-replica shape. This is the only fixture that
+			// renders the leader Role's pods get/patch rule, and it is here
+			// because that rule is the agent identity's one write grant --
+			// the shape a reviewer most needs to be able to read off a
+			// manifest, and the one every other fixture renders away.
+			name:         "PlatformAgentHighAvailability",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-ha.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
