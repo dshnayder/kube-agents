@@ -483,7 +483,13 @@ them as objects, not as a repository it is standing in.
 
 Nothing under the broker's scratch root outlives a request. Every route is one
 request long, so there is no handle to leak, no tree to collide with another
-caller's, and no cleanup an interrupted client can skip.
+caller's, and no cleanup an interrupted client can skip. Two mechanisms hold
+that rather than one, and they cover different failures: each verb removes its
+directory and its bundle in a `finally`, which covers a request that raises or
+is refused partway through; and the scratch root is an `emptyDir`, which covers
+the case a `finally` cannot — a broker killed outright, by OOM or eviction,
+leaves nothing behind because the volume goes with the pod. No reaper sweep
+runs, and none is needed for either.
 
 One consequence is worth naming. An agent almost never wants a whole answer: it
 wants the shape of one, then one part of it in full. Here that is `log --stat`
@@ -1235,6 +1241,16 @@ single-forge design would have put them:
   `RateLimit-*` headers and needs none of it, and a shared module carrying
   GitHub's markers would be a shared module the next forge inherits through the
   front door.
+
+One thing runs the other way. Throttling is worth counting and not only
+refusing: an install running down its token quota shows up in the rate of
+throttled calls well before it shows up as a turn that timed out. Those counters
+belong to the broker, labelled by provider, rather than to each forge — a
+provider that registered metrics of its own would be a provider able to extend
+the shared surface, which is what [Modularity](#5-modularity) exists to prevent.
+The forge classifies the failure; the broker counts it. What the counters are
+named, and what scrapes them, follows whatever convention the platform settles
+on and is not invented here.
 
 ### One provider implementation, not two
 
@@ -2205,6 +2221,18 @@ that question.
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
 cheaper.
+
+Throttling is legible to the agent and not to an operator.
+[Where the error contract splits](#where-the-error-contract-splits) puts the
+counters on the broker, but there is no Python metrics surface in this
+repository for them to join — the only convention that exists belongs to a
+single Go binary — so what they are called and what scrapes them is settled
+elsewhere, and until it is, an install approaching its token quota is visible in
+the broker's logs and nowhere else. The refusal is also thinner than it could
+be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
+telling it when, and the `Retry-After` and `RateLimit-*` values both forges
+return are read to classify the failure and then dropped rather than carried
+into the error.
 
 `publish` proves ancestry, not authorship. The revisions in the bundle carry
 whatever author the sandbox's git wrote, and the broker does not sign or rewrite
