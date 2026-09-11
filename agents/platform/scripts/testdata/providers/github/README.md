@@ -2,10 +2,11 @@
 
 `test_providers_contract.py` runs every forge in `providers.AVAILABLE` against
 the same assertions, and it needs each forge to supply what its API actually
-answers. That is what these are. A forge package that ships no `fixtures/`
-directory fails the harness by name rather than being skipped, because a
-contract test that silently covers one forge is the failure mode the harness
-exists to prevent.
+answers. That is what these are: test input, kept beside the tests under
+`testdata/providers/<forge name>/` rather than inside the package the images
+ship. A forge with no directory here fails the harness by name rather than
+being skipped, because a contract test that silently covers one forge is the
+failure mode the harness exists to prevent.
 
 ## Shape
 

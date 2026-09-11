@@ -1,15 +1,16 @@
 """One suite, run against every forge this install has, not one file per forge.
 
-Each forge package ships a `fixtures/` directory of recorded API responses --
-the JSON its host actually returns for each verb it claims to serve -- and this
-suite reads them. The assertions are about the *neutral* shape: that a proposal
+Each forge ships a directory of recorded API responses under
+`testdata/providers/<forge name>/` -- the JSON its host actually returns for each
+verb it claims to serve -- and this suite reads them. Test input lives with the
+tests, not inside the package the images ship. The assertions are about the *neutral* shape: that a proposal
 has three states rather than one forge's two-plus-a-timestamp, that a listing
 says when it is truncated, that a verb a forge does not serve refuses by name.
 
 The point of the inversion is where the cost of a second forge falls. A file
 per forge means holding a new one to the same assertions is a shared-test edit
-somebody has to remember; here a new package ships its fixtures and this file
-does not change.
+somebody has to remember; here a new forge adds its recordings under `testdata/`
+and this file does not change.
 
 Fixtures rather than a live API because CI has no credential and no egress, and
 recorded rather than invented because an invented fixture encodes what its
@@ -21,7 +22,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 from typing import Any
@@ -78,9 +78,14 @@ SHAPES: dict[str, frozenset[str]] = {
 PROPOSAL_STATES = frozenset({"open", "closed", "merged"})
 
 
+TESTDATA = Path(__file__).resolve().parent / "testdata" / "providers"
+
+
 def fixtures_dir(forge_class: type) -> Path:
-    package = Path(sys.modules[forge_class.__module__].__file__).parent
-    return package / "fixtures"
+    """Where this forge's recordings live: keyed by its `name`, never by module.
+
+    A forge that ships none fails here by name rather than being skipped."""
+    return TESTDATA / forge_class.name
 
 
 class Recorded:

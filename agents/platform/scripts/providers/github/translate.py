@@ -7,7 +7,7 @@ URL, and the second forge would be a second client rather than a second class.
 
 Kept apart from `forge.py` because the two answer different questions --
 `forge.py` says which call to make, this says what came back means -- and
-because the fixtures that hold GitHub's real response shapes are tested against
+because the recorded responses under `testdata/providers/github/` are tested against
 this file alone.
 """
 

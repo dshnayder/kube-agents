@@ -9,7 +9,7 @@
       "state": "open",
       "title": "Ingest drops events during a node drain",
       "user": {
-        "login": "jayantid",
+        "login": "example-reviewer",
         "id": 88121,
         "type": "User"
       },
@@ -56,7 +56,7 @@
       {
         "id": 55512877,
         "user": {
-          "login": "jayantid",
+          "login": "example-reviewer",
           "id": 88121,
           "type": "User"
         },

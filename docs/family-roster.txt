@@ -55,8 +55,8 @@ agents/platform/governance/*.md
   agents/platform/governance/standardization_validator_sop.md
   agents/platform/governance/stockout_prevention_sop.md
 
-agents/platform/scripts/providers/*/fixtures/README.md
-  agents/platform/scripts/providers/github/fixtures/README.md
+agents/platform/scripts/testdata/providers/*/README.md
+  agents/platform/scripts/testdata/providers/github/README.md
 
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
