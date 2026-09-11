@@ -433,6 +433,24 @@ class WriteTest(VcsTestCase):
         self.assertTrue(blob.startswith(b"# v2 git bundle"), blob[:20])
         self.assertIn(committed["revision"], blob.decode("latin-1"))
 
+    def test_publish_refuses_the_cloned_branch_whatever_the_target(self):
+        # Seen live: on the cloned branch, `publish --target main` passed the
+        # branch==target check and fast-forwarded the branch the copy came from.
+        self.change("inventory/clusters.yaml", "replicas: 5\n")
+        self.run_vcs("commit", "-m", "straight onto the cloned branch")
+        code, answer = self.run_vcs("publish", "--target", "release")
+        self.assertEqual(code, 1)
+        self.assertIn("cloned from", answer["error"])
+        self.assertNotIn("publish", [name for name, _ in self.broker.calls])
+
+    def test_publish_tells_the_broker_which_branch_the_copy_was_cloned_from(self):
+        self.run_vcs("branch", "fix/replicas")
+        self.change("inventory/clusters.yaml", "replicas: 5\n")
+        self.run_vcs("commit", "-m", "raise it")
+        code, _ = self.run_vcs("publish")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("publish")["clonedFrom"], "main")
+
     def test_publish_advances_the_base_so_a_second_one_sends_only_the_rest(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("a.txt", "a\n")

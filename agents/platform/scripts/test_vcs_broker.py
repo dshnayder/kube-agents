@@ -827,6 +827,32 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(self.remote_tip("main"), answer["revision"])
         self.assertEqual(list(self.scratch.iterdir()), [])
 
+    def test_publish_refuses_the_branch_the_client_says_it_cloned(self):
+        # A non-default branch cloned and published under another target is
+        # what the default-branch check cannot see; the client names the
+        # cloned branch and the broker refuses it.
+        git(self.seed, "checkout", "--quiet", "-b", "release")
+        git(self.seed, "push", "--quiet", "origin", "release")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        # Stand on the non-default branch the remote has, as a copy cloned
+        # from it would; the copy has no remote of its own, by design.
+        git(work, "checkout", "--quiet", "-b", "release")
+        self.commit_in(work, "README.md", "onto release\n", "no branch")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "release",
+                    "target": "main",
+                    "clonedFrom": "release",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "release", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+
     def test_publish_still_reaches_a_non_default_branch_of_the_callers_own(self):
         # The guard is about the default branch only; a topic branch that
         # already exists on the remote is the second-publish case and must

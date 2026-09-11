@@ -531,7 +531,11 @@ field too: naming any other existing branch as the target would skip it and
 leave two ancestry checks that a fast-forward of the shared branch satisfies.
 So the broker also asks the remote which branch is its default and refuses a
 publish to that branch outright, `PROTECTED_BRANCH`, whatever the request says
-the target is. A protected branch that is not the default is the forge's own
+the target is. The client, which alone knows which branch its copy was cloned
+from, refuses to publish that branch under any target, and tells the broker
+which branch that was (`clonedFrom`) so the broker refuses it too,
+`CLONED_BRANCH` — defence in depth for a confused caller, since a client that
+lied would gain nothing it could not get by omitting the field. A protected branch that is not the default is the forge's own
 branch protection to enforce; the broker does not claim to know it.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
@@ -770,7 +774,7 @@ another for no property gained.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
-`TARGET_IS_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
+`TARGET_IS_BRANCH`, `CLONED_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool

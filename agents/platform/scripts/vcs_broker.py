@@ -442,6 +442,23 @@ class VcsBroker:
         branch = validate_branch(payload.get("branch"))
         target = validate_branch(payload.get("target"), "target")
         base_revision = validate_revision(payload.get("baseRevision"))
+        cloned_from = payload.get("clonedFrom")
+        if cloned_from is not None:
+            cloned_from = validate_branch(cloned_from, "clonedFrom")
+        if cloned_from and branch == cloned_from:
+            # The client says so itself: this is the branch the copy was
+            # cloned from, whatever `target` names. A client that lies here
+            # gains nothing it could not get by omitting the field, so this
+            # is defence in depth for a confused caller, not a control
+            # against a hostile one -- the default-branch check below and the
+            # forge's own branch protection are those.
+            raise WorkspaceError(
+                f"{branch} is the branch this copy was cloned from, so this "
+                "publish would write to it directly. Publish a branch of your "
+                "own and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
         if branch == target:
             # The three ancestry checks below all pass for a publish onto the
             # branch it was cloned from -- it is a fast-forward, which is

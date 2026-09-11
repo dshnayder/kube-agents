@@ -651,20 +651,24 @@ def verb_publish(arguments) -> dict:
             "there are no new revisions to publish. `vcs.py commit` records "
             "one; `vcs.py status` shows what is still uncommitted."
         )
-    if branch == target:
+    if branch == session["branch"] or branch == target:
         # After the count, not before: on the shared branch with nothing
         # committed, "there is nothing to publish" is the more specific of the
         # two true things and the one that says what to do next.
         #
-        # Refused here as well as in the broker, and the broker's is the
-        # control -- this only saves the round trip and the bundle. Worth having
-        # because it is the mistake with no signal: `clone`, `commit`,
-        # `publish` with no `--target` reads like the obvious sequence right up
-        # to the 409.
+        # Two comparisons, and the first is the one that matters. `branch ==
+        # target` alone was defeated by `--target <anything else>` while
+        # still standing on the branch the copy was cloned from -- seen live:
+        # a worker cloned a non-default branch, committed on it, published
+        # with `--target main`, and fast-forwarded the branch it had cloned.
+        # The copy knows which branch that was; the broker does not, so the
+        # copy is where the refusal is exact. The broker refuses the same
+        # thing when told (`clonedFrom` below) and refuses the remote's
+        # default branch on its own.
         raise VcsError(
             f"you are on {branch}, which is the branch this copy was cloned "
-            "from, so this would write to the shared branch. Make a branch of "
-            "your own with `vcs.py branch <name>` and publish that."
+            "from, so this would write to it directly. Make a branch of your "
+            "own with `vcs.py branch <name>` and publish that."
         )
 
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
@@ -690,6 +694,7 @@ def verb_publish(arguments) -> dict:
                 "branch": branch,
                 "target": target,
                 "baseRevision": base,
+                "clonedFrom": session["branch"],
                 "bundleBase64": base64.b64encode(blob).decode("ascii"),
             },
         )
