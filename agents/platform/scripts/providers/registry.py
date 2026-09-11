@@ -16,11 +16,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+import repo_ref
 from workspace_paths import WorkspaceError
 
 from .base import Forge, ForgeUnsupported, StubForge
 from .github import GitHubForge
-from .identity import repository_host
 
 AVAILABLE: tuple[type[Forge], ...] = (GitHubForge,)
 
@@ -120,7 +120,18 @@ class Registry:
         """
         if not isinstance(url, str) or not url.strip():
             raise WorkspaceError("repository must be a URL or owner/name")
-        host = repository_host(url)
+        ref = repo_ref.try_parse(url)
+        if ref is None:
+            raise WorkspaceError(f"{url!r} is not a repository URL or owner/name")
+        host = ref.host
+        if not host and len(ref.segments) > 1:
+            # The registration shorthand, for the hosts this install actually
+            # serves: the same lift `repo_ref` applies for the hosts it knows
+            # on its own, done here for a *configured* one -- answered from
+            # the table, never inferred from the string's shape.
+            first = ref.segments[0].lower()
+            if first in self.hosts:
+                host = first
         forge = self.hosts.get(host) if host else self.default
         if forge is None:
             known = ", ".join(sorted(self.hosts)) or "none"

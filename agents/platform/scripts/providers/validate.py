@@ -15,11 +15,19 @@ because it is the one on the side that holds the credential.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import repo_ref
 from workspace_paths import WorkspaceError
 
-from .identity import BRANCH_RE, SHA_RE
+# A branch name git will accept and that cannot be read as an option or as
+# revision syntax. Deliberately narrower than `git check-ref-format`: every name
+# this has to carry is one a person typed. Here rather than in `repo_ref`
+# because a branch is a git fact, not a repository identity -- the sidecar
+# validates repositories and never sees a branch.
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 # How many items a listing returns. One page, deliberately: paginating walks
 # every page of an issue tracker, which is minutes of API calls and a response
@@ -102,3 +110,23 @@ def validate_labels(value: Any) -> list[str]:
     ):
         raise WorkspaceError("labels must be a list of non-empty strings")
     return [label.strip() for label in value]
+
+
+def repo_segments(url: str, hosts: tuple[str, ...]) -> list[str]:
+    """Path segments of ``url``, read for a forge whose hosts are ``hosts``.
+
+    ``repo_ref.parse`` is the parser -- the same one the credential sidecar
+    runs -- so what a segment may contain is decided once, there, and raises
+    ``repo_ref.RepoRefError``. What this adds is the forge's-eye reading of
+    the result: a value naming some *other* forge's host is a refusal rather
+    than a deeper path, and a schemeless value leading with one of this
+    forge's own hosts is the registration shorthand with the host lifted off,
+    exactly as ``repo_ref`` already does for the hosts it knows on its own.
+    """
+    ref = repo_ref.parse(url)
+    if ref.host and ref.host not in hosts:
+        raise repo_ref.RepoRefError(url)
+    parts = list(ref.segments)
+    if not ref.host and len(parts) > 1 and parts[0].lower() in hosts:
+        parts = parts[1:]
+    return parts

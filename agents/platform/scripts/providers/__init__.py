@@ -24,12 +24,14 @@ from .base import (
 )
 from .credentials import BrokeredCredential, Credential, NoCredential
 from .errors import GUIDANCE, Guidance, forge_error
-from .identity import BRANCH_RE, SEGMENT_RE, SHA_RE, repository_host, strip_scheme
 from .registry import AVAILABLE, Registry, build_forges
 from .transport import CliTransport, Transport
 from .validate import (
+    BRANCH_RE,
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    SHA_RE,
+    repo_segments,
     validate_branch,
     validate_labels,
     validate_limit,
@@ -55,7 +57,6 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "NoCredential",
     "Registry",
-    "SEGMENT_RE",
     "SHA_RE",
     "StubForge",
     "Transport",
@@ -63,8 +64,7 @@ __all__ = [
     "build_forges",
     "forge_error",
     "listing",
-    "repository_host",
-    "strip_scheme",
+    "repo_segments",
     "validate_branch",
     "validate_labels",
     "validate_limit",

@@ -41,11 +41,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping
 
+import repo_ref
 from workspace_paths import WorkspaceError
 
 from .credentials import Credential, NoCredential
 from .errors import Override
-from .identity import SEGMENT_RE, path_segments
+from .validate import repo_segments
 
 # Re-exported so a forge package can refuse a request without importing outside
 # the shared contract. `WorkspaceError` is the broker's "the caller sent
@@ -255,10 +256,13 @@ class StubForge(Forge):
         return ()
 
     def parse(self, url: str) -> str:
-        parts = path_segments(url, self.hosts)
-        if len(parts) < self._segments or not all(
-            SEGMENT_RE.match(part) for part in parts
-        ):
+        try:
+            parts = repo_segments(url, self.hosts)
+        except repo_ref.RepoRefError as error:
+            raise WorkspaceError(
+                f"{url!r} is not a {self.name} repository"
+            ) from error
+        if len(parts) < self._segments:
             raise WorkspaceError(f"{url!r} is not a {self.name} repository")
         return "/".join(parts)
 

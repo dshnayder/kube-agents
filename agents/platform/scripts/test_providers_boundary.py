@@ -36,8 +36,14 @@ PROBE = "_boundary_probe.py"
 # else under `providers/` is either another forge or the registry, and a forge
 # that imports the registry has made the dependency point the wrong way.
 SHARED_MODULES = frozenset(
-    {"base", "validate", "errors", "identity", "transport", "credentials"}
+    {"base", "validate", "errors", "transport", "credentials"}
 )
+
+# The one top-level module a forge may import besides the shared contract:
+# repository identity is `repo_ref.py`, which sits outside `providers/`
+# because the credential sidecar imports it too. It is stdlib-only and
+# forge-neutral by constitution, so importing it opens no side door.
+ALLOWED_TOP_LEVEL = frozenset({"repo_ref"})
 
 # Derived, not listed: the packages that hold a forge are wherever the classes
 # in `AVAILABLE` were defined. A new forge is covered by these tests the moment
@@ -143,6 +149,8 @@ class ImportBoundaryTest(unittest.TestCase):
                 own = f"providers.{package}"
                 for name in imports_of(path):
                     if is_stdlib(name) or name.startswith(own):
+                        continue
+                    if name in ALLOWED_TOP_LEVEL:
                         continue
                     parts = name.split(".")
                     with self.subTest(module=module_name(path), imported=name):

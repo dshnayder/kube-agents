@@ -18,10 +18,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping
 
+import repo_ref
+
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import BrokeredCredential
-from ..identity import SEGMENT_RE, path_segments
 from ..validate import (
+    repo_segments,
     validate_branch,
     validate_labels,
     validate_limit,
@@ -63,8 +65,13 @@ class GitHubForge(Forge):
     # -- identity -----------------------------------------------------------
 
     def parse(self, url: str) -> str:
-        parts = path_segments(url, self.hosts)
-        if len(parts) != 2 or not all(SEGMENT_RE.match(part) for part in parts):
+        try:
+            parts = repo_segments(url, self.hosts)
+        except repo_ref.RepoRefError as error:
+            raise WorkspaceError(
+                f"{url!r} is not a GitHub repository; expected owner/name"
+            ) from error
+        if len(parts) != 2:
             raise WorkspaceError(
                 f"{url!r} is not a GitHub repository; expected owner/name"
             )

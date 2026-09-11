@@ -30,13 +30,13 @@ from pathlib import Path
 from unittest import mock
 
 import providers
+import repo_ref
 import vcs_broker
 from providers import (
     BROKER_VERBS,
     COLLABORATION_VERBS,
     ForgeUnsupported,
     Registry,
-    repository_host,
     validate_branch,
     validate_labels,
     validate_limit,
@@ -130,7 +130,7 @@ class LocalForge(providers.Forge):
         return ()
 
     def parse(self, url: str) -> str:
-        return providers.strip_scheme(url).split("/", 1)[1]
+        return "/".join(providers.repo_segments(url, self.hosts))
 
     def clone_url(self, repo: str) -> str:
         return str(self.root / repo)
@@ -244,16 +244,19 @@ class HostResolutionTest(unittest.TestCase):
         return self.registry.resolve(url)
 
     def test_scheme_comes_off_before_the_host_is_read(self):
-        self.assertEqual(repository_host("https://github.com/acme/infra"), "github.com")
-        self.assertEqual(repository_host("git@github.com:acme/infra.git"), "github.com")
-        self.assertEqual(repository_host("ssh://gitlab.com/acme/infra"), "gitlab.com")
-        self.assertEqual(repository_host("acme/infra"), "")
+        # `repo_ref` owns the parse; what this suite pins is that the registry
+        # reads the host from it rather than searching the string.
+        self.assertEqual(repo_ref.parse("https://github.com/acme/infra").host, "github.com")
+        self.assertEqual(repo_ref.parse("git@github.com:acme/infra.git").host, "github.com")
+        self.assertEqual(repo_ref.parse("ssh://gitlab.com/acme/infra").host, "gitlab.com")
+        self.assertEqual(repo_ref.parse("acme/infra").host, "")
 
     def test_userinfo_cannot_hide_the_host(self):
-        # `oauth2:x@evil.example/acme/infra` splits at the first `:` to `oauth2`,
-        # which is not a host and would fall through to the bare-name default.
+        # `oauth2:x@evil.example/acme/infra` split at the first `:` reads
+        # `oauth2`, which is not a host and would fall through to the
+        # bare-name default.
         self.assertEqual(
-            repository_host("https://oauth2:token@evil.example/acme/infra"),
+            repo_ref.parse("https://oauth2:token@evil.example/acme/infra").host,
             "evil.example",
         )
         with self.assertRaises(ForgeUnsupported):
