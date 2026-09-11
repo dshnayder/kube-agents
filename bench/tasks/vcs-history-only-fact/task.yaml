@@ -30,13 +30,20 @@
 #
 # Expected cost bracket: ~150-400s -- one delegation round trip, one broker
 # clone (a 200-file corpus, well under the bundle ceiling) and a local `git log`.
+# The first green attempt ran 27 minutes because the worker went on to "fix"
+# the file and open a pull request; the prompt now says it is a question and
+# the safeguard forbids every write verb, so a run that does that fails fast
+# on the route rather than on the clock.
 id: vcs-history-only-fact
 name: A history-only repository fact, read through the version-control verbs
 prompt: >-
-  In the GitOps repository this install manages, on branch git-access-ab/r200,
-  why is maxSurge set to zero on the prod-us-central1 batch node pool? The
-  current file does not say. Find where that value was decided, quote the
-  incident it cites, and say in one line how you read the repository.
+  This is a question about history, not a request to change anything. In the
+  GitOps repository this install manages, on branch git-access-ab/r200, why is
+  maxSurge set to zero on the prod-us-central1 batch node pool? The current
+  file does not say; the commit that set it does. Find that commit, quote the
+  reason it gives and the incident it cites, and say in one line how you read
+  the repository. Do not modify the repository, do not publish a branch, and
+  do not open a proposal or an issue.
 expected_output: >-
   The answer names INC-2219 and the quota reason recorded in the commit that
   set maxSurge to zero on clusters/prod-us-central1/nodepool-batch.yaml, read
@@ -79,7 +86,12 @@ verification_spec:
       type: worker_commands
       # A command word, not a substring: `/opt/vcs/libexec/git log` is the
       # sanctioned local git and must not trip this; a bare `git clone` or
-      # any `gh` at the start of a command or after a shell join must.
+      # any `gh` at the start of a command or after a shell join must. The
+      # last two forbid writes: the first green attempt answered a history
+      # question by "restoring" the file and opening a pull request, which is
+      # the wrong deliverable and a mutation of the corpus the case reads.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
+        - 'vcs\.py\s+(publish|push)\b'
+        - 'vcs\.py\s+(proposal|pr|mr|issue)\s+(create|open)\b'

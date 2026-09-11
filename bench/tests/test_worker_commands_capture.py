@@ -14,7 +14,7 @@ from devops_bench.agents import AgentResult
 
 from kube_agents_bench import harness, transcript
 
-_LOG = """
+_LOG = """__WORKER_LOG__
   ┊ 💻 preparing terminal…
   ┊ 💻 $         python3 /opt/defaults/skills/version-control/scripts/vcs.py clone acme/infra  4.1s
   ┊ 🔎 preparing search_files…
@@ -51,9 +51,16 @@ def test_every_command_line_becomes_a_row_without_its_suffixes(monkeypatch):
     assert seen and "/opt/data/kanban/logs/t_ab12.log" in seen[0]
 
 
-def test_an_unreadable_log_yields_no_rows_not_an_error(monkeypatch):
+def test_an_unreadable_log_is_none_so_the_check_errors_rather_than_grades(monkeypatch):
+    # kubectl failed (a credential hiccup on the runner): no sentinel at all.
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
-    assert harness._worker_commands(["t_gone"], 5.0) == []
+    assert harness._worker_commands(["t_gone"], 5.0) is None
+
+
+def test_an_absent_log_contributes_nothing_but_is_not_a_failure(monkeypatch):
+    # The card never had a worker log (a router-only card): captured, empty.
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "__NO_WORKER_LOG__\n")
+    assert harness._worker_commands(["t_router"], 5.0) == []
 
 
 def test_settle_records_the_commands_before_purging(monkeypatch):
@@ -61,7 +68,7 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
 
     def fake_shell(script, timeout):
         calls.append(script)
-        return _LOG if "head -c" in script and ".log" in script else ""
+        return _LOG if "head -c" in script and ".log" in script else ""  # rm -rf script gets ""
 
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     result = AgentResult(output="answer", trajectory=[])

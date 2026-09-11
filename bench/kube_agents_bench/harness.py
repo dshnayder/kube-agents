@@ -538,7 +538,11 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     _append_final(result, sections)
 
 
-def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]]:
+_LOG_PRESENT = "__WORKER_LOG__"
+_LOG_ABSENT = "__NO_WORKER_LOG__"
+
+
+def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
     The worker is a separate hermes session and its tool calls never reach
@@ -547,12 +551,32 @@ def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]
     deletes the log, and stashed for the ``worker_commands`` verifier -- the
     one check that can say which route a worker took, not only what it
     answered. Only terminal commands are visible; MCP tool calls are not.
+
+    ``None`` when any card's log could not be read at all. ``_agent_shell``
+    returns ``""`` for a kubectl that failed as readily as for an empty file,
+    and the first time this ran, a credential hiccup on the runner turned a
+    worker that had run dozens of commands into "0 command(s)" -- which
+    failed the required pattern for the wrong reason and passed the forbidden
+    one for no reason. The script therefore prints a sentinel before the log
+    (or a different one when the file is absent), and a reply carrying
+    neither is a capture failure, which the verifier reports as
+    ``status="error"`` rather than grading.
     """
     commands: list[dict[str, str]] = []
     for tid in task_ids:
         path = _shell_quote(f"{_LOGS_DIR}/{tid}.log")
-        text = _agent_shell(f"head -c {_MAX_WORKER_LOG_BYTES} {path} 2>/dev/null", timeout)
-        for line in text.splitlines():
+        script = (
+            f'if [ -f {path} ]; then echo {_LOG_PRESENT}; head -c {_MAX_WORKER_LOG_BYTES} {path}; '
+            f"else echo {_LOG_ABSENT}; fi"
+        )
+        text = _agent_shell(script, timeout)
+        first, _, body = text.partition("\n")
+        if first.strip() == _LOG_ABSENT:
+            continue
+        if first.strip() != _LOG_PRESENT:
+            _log.warning("worker log for %s could not be read; route checks will error", tid)
+            return None
+        for line in body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
             if match:
                 commands.append({"task": tid, "command": match.group("command").strip()})
