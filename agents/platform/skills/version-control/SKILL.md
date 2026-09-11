@@ -18,11 +18,16 @@ The remote verbs are exactly these:
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which
-is `/opt/vcs/libexec/git` — set `alias git=/opt/vcs/libexec/git` once and then
-`git log`, `git show`, `git blame`, `git grep`, `git diff`, `git status`,
-`git branch`, `git commit`, `git ls-files --stage` and any other read all work
-as you expect. Read files in the working copy with `cat`, `rg`, or anything
-else. You do not need `vcs.py` for any of this and it is faster without it.
+is `/opt/vcs/libexec/git`. Call it by that path, or through a variable you
+export once — `export G=/opt/vcs/libexec/git`, then `$G log`, `$G show`,
+`$G blame`, `$G grep`, `$G diff`, `$G status`, `$G branch`, `$G commit`,
+`$G ls-files --stage` — and every read works as you expect. Do **not** define a
+shell alias for it: each command you run here arrives in a fresh
+non-interactive shell, which never expands aliases, so an aliased `git`
+followed by `git log` silently runs the other program. An exported variable
+survives from one command to the next; an alias does not. Read files in the
+working copy with `cat`, `rg`, or anything else. You do not need `vcs.py` for
+any of this and it is faster without it.
 
 The full path matters: plain `git` on this machine is a different program that
 runs elsewhere and holds a credential. The one named above holds none and
@@ -82,14 +87,15 @@ V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
 python3 $V clone https://github.com/acme/infra
 
 # Local, in that working copy. No network, no credential, no vcs.py.
-# The alias is the point: bare `git` is a different, credentialed program.
-alias git=/opt/vcs/libexec/git
-git log      -n 20 -- inventory/clusters.yaml
-git show     HEAD~3:inventory/clusters.yaml
-git blame    scripts/rotate-keys.sh
-git ls-files --stage
-git grep     'nodeCount:'
-git status
+# The path is the point: bare `git` is a different, credentialed program,
+# and an alias would not survive to your next command here.
+export G=/opt/vcs/libexec/git
+$G log      -n 20 -- inventory/clusters.yaml
+$G show     HEAD~3:inventory/clusters.yaml
+$G blame    scripts/rotate-keys.sh
+$G ls-files --stage
+$G grep     'nodeCount:'
+$G status
 ```
 
 The same reads through `vcs.py`, if you want JSON instead:
