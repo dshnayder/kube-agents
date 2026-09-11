@@ -2,7 +2,8 @@
 
 **Scope:** The commands for getting a branch from "about to start" to "merged" in this repository —
 finding work already in flight, measuring drift from `main`, validating locally, working the
-automated review, the labels Tide merges on, and whose move it is at any point in between.
+automated review, the labels Tide merges on, re-running a check that flaked, and whose move it is
+at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
 review passes, live-test the change, resolve every thread — is stated in
@@ -10,8 +11,8 @@ review passes, live-test the change, resolve every thread — is stated in
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 
 A rule about how to run a command correctly can sit here rather than in `AGENTS.md`, because it
-means nothing until you have the command in front of you — that a contributor on a fork cannot
-self-assign an issue is the example. The test is when a rule has to fire, though, not how
+means nothing until you have the command in front of you — that self-assigning an issue needs
+`triage` access is the example. The test is when a rule has to fire, though, not how
 procedural it sounds: that a draft is not in the review queue reads like mechanics, but it has to
 reach an agent before it decides to wait, so `AGENTS.md` states it and only the measurement behind
 it is here. `AGENTS.md` is loaded into every session and this page is not, so anything that has to
@@ -58,8 +59,8 @@ gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me
 ```
 
 `@me` is the account whose token you hold, and `AGENTS.md` is explicit that this makes it a person
-you are volunteering. A contributor working from a fork without write access cannot self-assign at
-all; offer a comment instead.
+you are volunteering. A contributor without `triage` access cannot self-assign; offer a comment
+instead.
 
 ## Measure how far a branch has drifted from `main`
 
@@ -211,7 +212,10 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve:
+resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
+the `do-not-merge` label,
+applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
+resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
 # Every unresolved thread, with both ids you need: resolveReviewThread takes the
@@ -294,16 +298,26 @@ Prow's jobs, not the GitHub Actions checks, so a pull request can look fully gre
 waiting on it.
 
 `/hold` parks an otherwise-mergeable pull request without withdrawing anything else, and
-`/hold cancel` releases it — #1045 held that way for a smoke test. `/override <context>`, which only
-a repository admin can use, forces a required check that cannot pass on its own — and expires: the
-forced status embeds the base SHA at override time, so the next merge to `main` invalidates it,
-Tide re-runs the job, and the override has to be repeated if `main` moves before Tide merges
-(#1202).
-Prow's `/override-sticky` would write the `[prow:skip-retest]` sentinel instead, which Tide accepts
-regardless of base — but it is not in the Prow build this repository merges through: the
+`/hold cancel` releases it — #1045 held that way for a smoke test. The bare `do-not-merge` label is
+a different thing: [`hold-unresolved-threads.yml`](../.github/workflows/hold-unresolved-threads.yml)
+puts it on any pull request in the pool whose review threads are not all resolved, and takes it off
+at the next five-minute sweep after the last resolution. Tide does not read the
+conversation-resolution rule, so without the label it picks such a pull request, fails the merge,
+and retries it every ~85 seconds ahead of everyone else — #608 and #1197 held the queue that way
+for an hour on 2026-09-05. `/hold cancel` does not remove this label; resolving the threads does.
+A person who applies the same label by hand keeps it: the workflow removes only what it added.
+`/override <context>`, which only
+a repository admin can use, forces a required check that cannot pass on its own. The forced status
+embeds the base SHA at override time, so by itself it would expire on the next merge to `main` and
+Tide would re-run the job — which is how an override came to need repeating whenever `main` moved
+before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green, so
+an override usually holds for the head it was given until a push — subject to the same race with
+Tide's sync, and a lost race costs more here, because the retest is of a check that cannot pass: it
+comes back red and the override has to be given again. Prow's `/override-sticky` would do this
+without the race, with the `[prow:skip-retest]` sentinel Tide accepts regardless of base — but it is
+not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
-`/override`, and the command is silently ignored. A green run of the job is a different matter,
-below.
+`/override`, and the command is silently ignored.
 
 **Branch protection is not the gate and reads as though there is none.** `main` requires ten
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
@@ -341,7 +355,8 @@ starts the retest as before (a batch, when two or more qualify), crier's `pendin
 newer status, and the sweep leaves it alone. A push still starts a fresh run;
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
 reports (`/retest` does not, because it reruns only failed contexts); a red is never touched, and
-neither is an admin `/override`. What this trades away is testing the combination with the `main`
+an admin `/override` is carried the same way as a green, because crier stamps the same `BaseSHA:`
+suffix on it. What this trades away is testing the combination with the `main`
 it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
 found by the next smoke run that actually starts after it — a push or `/test` on whichever pull
 request that is, whose author then sees a red that is not theirs. Prow's own form of this — a `[prow:skip-retest]` sentinel
@@ -357,7 +372,7 @@ on the querying user. #1065 read `BLOCKED` while carrying both labels and while 
 merge attempt that failed — an unresolved review thread, most often — is retried every ~85
 seconds and recorded only in the `err` field of
 [tide-history](https://oss.gprow.dev/tide-history); #1122 sat approved for 5h46m and 231
-attempts that way.
+attempts that way — the case the `do-not-merge` label above now keeps out of the pool.
 
 ```bash
 # Why Tide has not merged it: its own reason first, then the labels it wants.
@@ -365,6 +380,27 @@ gh api repos/gke-labs/kube-agents/commits/<head-sha>/status \
   --jq '.statuses[] | select(.context == "tide") | "\(.state): \(.description)"'
 gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].name]'
 ```
+
+## Re-running a check that failed
+
+A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
+re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
+attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
+on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+(or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
+step when they name none or name more than a handful, or adds a row to the issue that class already
+has. The tree did not change
+between the attempts, so the code was not the cause; the issue is where the occurrences accumulate
+until someone
+reads them together. It never closes an issue, because every green run of a flaky check looks like a
+fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
+back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
+`Validate PR Title` and `Security Scanning` are left off.
+
+A re-run that fails again records nothing, and neither does a push that happens to go green: only a
+same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke
+test is a different system and is not watched; the `presubmit-gate` label is that job's channel.
 
 ## Who owns an open pull request
 

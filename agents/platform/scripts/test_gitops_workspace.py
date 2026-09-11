@@ -835,6 +835,13 @@ class TestResolveRepo(WorkspaceTestCase):
             self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
             mock_run.assert_not_called()
 
+    def test_get_managed_repo_entries_handles_malformed_json_list_in_file(self):
+        state_file = self.tmp_path / "managed_repos_malformed_list"
+        state_file.write_text("[invalid-json-content", encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            mock_run.assert_not_called()
+
     def test_get_managed_repo_entries_treats_a_mounted_dir_with_no_key_as_empty(self):
         mount = self.tmp_path / "gitops-mount"
         mount.mkdir()
@@ -871,6 +878,16 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
             )
 
+    def test_validate_repo_org_matching_primary_org(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")
+
+    def test_validate_repo_org_cross_org_raises_value_error(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            with self.assertRaises(ValueError) as ctx:
+                gitops_workspace.validate_repo_org("other-org/kube-agents")
+            self.assertIn("Cross-org repository 'other-org/kube-agents' is not supported", str(ctx.exception))
+
     def test_get_managed_github_repos_filters_github_urls(self):
         fake_cm = CompletedProcess(
             args=["kubectl"],
@@ -883,6 +900,57 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.get_managed_github_repos(),
                 ["acme/repo1"],
             )
+
+    def test_get_managed_github_repos_says_why_it_skipped_an_entry(self):
+        """A registered repository the agent will never touch has to be
+        distinguishable from one that was never registered."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"gitlab\\", \\"url\\": \\"https://gitlab.com/g/p\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"not a url\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertIn("not a GitHub repository URL", joined)
+
+    def test_get_managed_github_repos_survives_an_unparseable_url(self):
+        """One malformed entry skips that entry, not the whole sweep."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://[::1/acme/repo\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/good\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING"):
+                self.assertEqual(
+                    gitops_workspace.get_managed_github_repos(), ["acme/good"]
+                )
+
+    def test_extract_github_slug_accepts_only_the_canonical_host(self):
+        """The `hosts=` narrowing is the point: a registration is not a remote."""
+        self.assertEqual(
+            gitops_workspace.extract_github_slug("https://github.com/acme/repo"),
+            "acme/repo",
+        )
+        self.assertEqual(gitops_workspace.extract_github_slug("acme/repo"), "acme/repo")
+        for value in (
+            "https://ssh.github.com/acme/repo",
+            "https://ghe.example.com/acme/repo",
+            "https://gitlab.com/acme/repo",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(gitops_workspace.extract_github_slug(value))
+
+    def test_is_valid_repo_slug_refuses_what_it_would_have_to_rewrite(self):
+        self.assertTrue(gitops_workspace.is_valid_repo_slug("acme/repo"))
+        for value in ("acme/..", "acme/-x", "github.com/acme", " acme/repo ", "/acme/repo/"):
+            with self.subTest(value=value):
+                self.assertFalse(gitops_workspace.is_valid_repo_slug(value))
 
     def test_get_managed_github_repos_raises_on_kubectl_error(self):
         with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["kubectl"], stderr="Forbidden")):

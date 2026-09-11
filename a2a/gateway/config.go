@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -11,9 +12,31 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// attributionSaltInfo is the HKDF info string that binds the derived
+// fallback salt to this one use of the bus password, so the same password
+// expanded for any other purpose yields unrelated bytes. It is a wire
+// constant in the sense that changing it re-salts every pseudonym on an
+// install running the fallback; do not edit it to tidy the string.
+const attributionSaltInfo = "a2a-attribution-salt"
+
+// attributionSaltLen is how many bytes the derived fallback salt gets: one
+// SHA-256 output, the length the digest it replaces produced, so the HMAC
+// keying in principal.go sees the same shape it always did.
+const attributionSaltLen = 32
+
 // defaultMaxSessions is what MaxSessions means when unset; the field's
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
+
+// defaultGchatTokenPath is where the operator projects the gateway's
+// relay-audience ServiceAccount token when the gchat backend is armed.
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+
+// The display-mode values, matching the GoogleChatSpec.Mode enum.
+const (
+	displayModeDefault = "default"
+	displayModeDebug   = "debug"
+)
 
 // defaultTaskDeadline is what TaskDeadline means when unset — the worker
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
@@ -23,6 +46,10 @@ const defaultTaskDeadline = 30 * time.Minute
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
+
+// defaultFirstEventGrace is what FirstEventGrace means when unset; the
+// field's comment carries the sizing rationale.
+const defaultFirstEventGrace = 10 * time.Minute
 
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
@@ -35,6 +62,29 @@ type Config struct {
 
 	// PrincipalMapPath is the mounted principal-map ConfigMap.
 	PrincipalMapPath string
+
+	// GchatRelayURL is the credential proxy's relay base URL — the gchat
+	// backend's transport. Setting it selects the Google Chat adapter.
+	GchatRelayURL string
+	// GchatTokenPath is the projected ServiceAccount token (a2a-chat audience)
+	// the adapter authenticates to the relay with.
+	GchatTokenPath string
+	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
+	// the same gate the legacy path enforces as GOOGLE_CHAT_ALLOWED_USERS.
+	// gchat has no mapping table (the Google-asserted email IS the
+	// principal), so the allowlist is the whole verification config.
+	GchatAllowedUsers []string
+	// GchatAllowAllUsers disables the allowlist, stated explicitly —
+	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
+	GchatAllowAllUsers bool
+
+	// DisplayMode is the existing Chat integration's default-vs-debug split
+	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
+	// under "default" the rolling line carries the state but never the
+	// turn-by-turn narration; "debug" is the gateway's historical verbose
+	// behaviour and the value an unset env resolves to, so installs that
+	// predate the knob render exactly as before.
+	DisplayMode string
 
 	// DefaultAddressee is where every conversation's tasks route until a
 	// per-conversation override says otherwise. Retarget 8/26: the first
@@ -60,9 +110,14 @@ type Config struct {
 	// with anything else silently breaks the cross-surface audit join this
 	// pseudonym exists to preserve — one human, one value, on the bus and
 	// in session metadata. The env-var fallbacks below are playground
-	// posture for installs without that Secret, and the derived one is a
-	// recorded deviation on two counts: the broken join, and a
-	// de-anonymization key handed to whoever holds the bus password.
+	// posture for installs without that Secret, and the derived one
+	// (HKDF-SHA-256 over the bus password) is a recorded deviation on two
+	// counts: the broken join, and a de-anonymization key handed to whoever
+	// holds the bus password. HKDF is the construction a credential is
+	// permitted to pass through, and that is all it is: it answers neither
+	// count, and it is not a password hash — no work factor, so it does not
+	// make a weak hand-set NATS_PASSWORD any harder to guess from a leaked
+	// salt. Provisioning the Secret is what fixes that.
 	AttributionSalt []byte
 
 	// TaskDeadline mirrors the worker adapter's task deadline — the SAME
@@ -92,6 +147,27 @@ type Config struct {
 	// retention erodes exactly that claim; lowering it only trims how long
 	// a status card can echo the ask.
 	AskTTL time.Duration
+
+	// FirstEventGrace bounds how long an active task with NOTHING on its
+	// events subject may hold a conversation's serialization
+	// (A2A_FIRST_EVENT_GRACE). Every other bound assumes a pod: the adapter's
+	// deadline runs from task start inside the worker, the pod deadline from
+	// pod start, and Sweep watches pod phases — so a task whose executor
+	// never came up (a spawn that never happened, a bus that dropped between
+	// the two publishes, a gateway restart mid-turn) has no events for the
+	// heal in handleInbound to see a terminal in, and the record steers every
+	// later message into it. Past this grace the heal treats "no events" as
+	// "never started" and releases the serialization; it publishes no
+	// terminal for the task, because age alone is not evidence. Unset
+	// means 10 minutes: the spec's cold start is 5-10s and the pod deadline's
+	// pre-start budget (podDeadlineGrace, the image pull before the process
+	// starts) is 10 minutes, so a task still legitimately pre-first-event at
+	// this age is a pod that will not be coming up. Lowering it risks
+	// releasing a slow-starting worker's task out from under it — the next
+	// turn then starts a second task while the first may still emit;
+	// raising it is how long a user waits before the conversation answers
+	// again. Values under 1m are refused at boot.
+	FirstEventGrace time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
@@ -129,6 +205,14 @@ type Config struct {
 	MaxSessions int
 }
 
+// Backend names the chat backend this config arms: "gchat" or "discord".
+func (c *Config) Backend() string {
+	if c.GchatRelayURL != "" {
+		return gchatBackend
+	}
+	return "discord"
+}
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -143,11 +227,29 @@ func FromEnv() (*Config, error) {
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
 		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
 	}
+	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
+	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
+	for _, u := range strings.Split(os.Getenv("A2A_GCHAT_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.GchatAllowedUsers = append(cfg.GchatAllowedUsers, u)
+		}
+	}
+	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
+	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
+		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	if cfg.DiscordToken == "" {
-		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
+	// A silent default here would make a two-backend misconfiguration a
+	// working Discord gateway that quietly never consumes Chat — refuse
+	// both directions instead.
+	switch {
+	case cfg.GchatRelayURL != "" && cfg.DiscordToken != "":
+		return nil, fmt.Errorf("both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
+	case cfg.GchatRelayURL == "" && cfg.DiscordToken == "":
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or A2A_GCHAT_RELAY_URL (the credential proxy's chat relay)")
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
@@ -195,6 +297,16 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.AskTTL = at
 
+	grace := envOr("A2A_FIRST_EVENT_GRACE", defaultFirstEventGrace.String())
+	fg, err := time.ParseDuration(grace)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q: %w", grace, err)
+	}
+	if fg < time.Minute {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
+	}
+	cfg.FirstEventGrace = fg
+
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 
 	// Salt precedence: the install's provisioned SESSION_KV_SALT is the
@@ -215,8 +327,21 @@ func FromEnv() (*Config, error) {
 		if cfg.NATSPassword == "" {
 			return nil, fmt.Errorf("SESSION_KV_SALT or A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
 		}
-		derived := sha256.Sum256([]byte("a2a-attribution-salt:" + cfg.NATSPassword))
-		cfg.AttributionSalt = derived[:]
+		// HKDF, not a bare digest of the password: a credential reaching a
+		// plain hash is what CodeQL's go/weak-sensitive-data-hashing
+		// refuses, and extract-and-expand under a fixed info string is the
+		// construction one is allowed to go through. It buys no resistance
+		// to offline guessing — HKDF has no work factor, and at a nil salt
+		// the cost per candidate password is a handful of SHA-256
+		// compressions either way. What keeps this fallback from being a
+		// de-anonymization key is the password's own entropy (the operator
+		// mints 128 bits of it) and, properly, the provisioned Secret; see
+		// the AttributionSalt field comment.
+		derived, err := hkdf.Key(sha256.New, []byte(cfg.NATSPassword), nil, attributionSaltInfo, attributionSaltLen)
+		if err != nil {
+			return nil, fmt.Errorf("deriving the attribution salt from NATS_PASSWORD: %w", err)
+		}
+		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
 }

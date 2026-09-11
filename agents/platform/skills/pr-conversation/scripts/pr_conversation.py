@@ -55,7 +55,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from datetime import datetime
 
@@ -72,7 +71,6 @@ import pr_triggers  # noqa: E402
 
 SCRATCH_DIR = "/opt/data/scratch"
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # How much of a thread travels with the requests. All caps are generous enough
 # that no ordinary review conversation meets them, and all report what they
@@ -93,7 +91,7 @@ def _fail(message: str):
 
 def validate_repo(repo: str) -> str:
     """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
+    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
     if not repo or not is_valid_repo_slug(repo):
         raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
     managed = get_managed_github_repos()
@@ -101,7 +99,7 @@ def validate_repo(repo: str) -> str:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
-    return repo
+    return validate_repo_org(repo)
 
 
 def _resolve_repo(args=None) -> str:
@@ -317,8 +315,14 @@ def handle_poll(args) -> int:
         print(json.dumps({"status": "NOT_CONFIGURED"}))
         return 0
 
-    provider = forge.provider_for(repo=repos[0] if repos else None)
     try:
+        # Inside the guard, not above it: `provider_for` used to fall back to
+        # `GitHubProvider` for anything it did not recognise and so could not
+        # raise. It now raises `UnknownForgeHost` for a forge this build has no
+        # provider for, and `RepoUnparseable` for a value that names no
+        # repository at all — both of which belong in the reason code below
+        # rather than in a traceback.
+        provider = forge.provider_for(repo=repos[0] if repos else None)
         provider.preflight()
         viewer = provider.viewer_login()
         if not viewer:
@@ -418,11 +422,6 @@ def handle_poll(args) -> int:
         return 0
 
     payload = {"status": "FOUND", "requests": found, "conversations": threads}
-    if over_budget:
-        payload["warnings"] = [
-            f"pr_conversation: {over_budget} untrusted request(s) not offered — "
-            "the per-pull-request refusal budget is exhausted"
-        ]
     print(json.dumps(payload))
     return 0
 
@@ -626,13 +625,15 @@ def _check_claim(provider, repo: str, pr, sha: str, no_change: bool, requested_a
 
 def _post(args, marker_kind: str) -> int:
     repo = _resolve_repo(args)
-    provider = forge.provider_for(repo=repo)
 
     # Everything that talks to the forge before the post, inside one guard.
     # `handle_poll` turns a `ForgeError` into a reason code the SKILL tells the
     # model to read; leaving these outside the guard meant an auth blip handed
     # it a Python traceback instead, after it had already written the body.
+    # Selecting the provider is inside it for the same reason: it used to fall
+    # back to `GitHubProvider` and now raises on an unknown host.
     try:
+        provider = forge.provider_for(repo=repo)
         provider.preflight()
         viewer = provider.viewer_login()
         if not viewer:

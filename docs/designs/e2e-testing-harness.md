@@ -8,11 +8,11 @@
 
 The `kube-agents` test execution model partitions tests across three distinct automation tiers:
 
-| Tier                            | Trigger                                                                                                                    | Purpose                                                                                               | Execution Target                                                         |
-| :------------------------------ | :------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
-| **Tier 1: PR CI**               | Pull Request (`pull_request`)                                                                                              | Fast, offline unit and structural validation on every change                                          | `make coverage`, `make validate`, `make docs-check`                      |
-| **Tier 2: RC Promotion Gate**   | Release Candidate build (`rc-release-pipeline.yml`)                                                                        | Validates candidate container images on a freshly provisioned GKE cluster before tagging `_validated` | `make test-e2e` (`scripts/release/execute_e2e_tests.py`)                 |
-| **Tier 3: Nightly & On-Demand** | Manual dispatch only today (`nightly-pipeline.yml`, `e2e-manual-runner.yml`) — the nightly pipeline has no `schedule:` yet | Full matrix across multi-cluster environments, audit streams, and GPU/scarcity stockout scenarios     | `make test-e2e` with `FLEET_AUDIT_STREAMS=all`, `STOCKOUT_SCENARIOS=all` |
+| Tier                            | Trigger                                                                                                      | Purpose                                                                                               | Execution Target                                                         |
+| :------------------------------ | :----------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| **Tier 1: PR CI**               | Pull Request (`pull_request`)                                                                                | Fast, offline unit and structural validation on every change                                          | `make coverage`, `make validate`, `make docs-check`                      |
+| **Tier 2: RC Promotion Gate**   | Release Candidate build (`rc-release-pipeline.yml`)                                                          | Validates candidate container images on a freshly provisioned GKE cluster before tagging `_validated` | `make test-e2e` (`scripts/release/execute_e2e_tests.py`)                 |
+| **Tier 3: Nightly & On-Demand** | Dispatched daily by `nightly-scheduler.yml`; on-demand via `nightly-pipeline.yml` or `e2e-manual-runner.yml` | Full matrix across multi-cluster environments, audit streams, and GPU/scarcity stockout scenarios     | `make test-e2e` with `FLEET_AUDIT_STREAMS=all`, `STOCKOUT_SCENARIOS=all` |
 
 Tier 2's "freshly provisioned" is the intent. What the pipeline does today, and why it differs,
 is in [`scripts/release/README.md`](../../scripts/release/README.md).
@@ -147,7 +147,8 @@ make test-e2e
 The stockout suite waits for its AgentPlugin to reach Ready, for the gateway to finish
 rolling, and for the plugin's `SKILL.md` to be readable inside the surviving pod before
 the first scenario runs. A failure in any of those ends the module naming what was wrong
-rather than letting each scenario spend its watch timeout. The plugin is installed only
-when its custom resource is absent, so the suite needs the permissions that
-[`agentplugins/README.md`](../../agentplugins/README.md#installing) lists only on a
-cluster that has never had it.
+rather than letting each scenario spend its watch timeout. The suite does not install the
+plugin out of band or mutate cluster state: if the AgentPlugin CRD or custom resource is
+absent, the suite skips cleanly on optional environments and fails when expected
+(`ENABLE_STOCKOUT_INVESTIGATOR=true` or gating E2E suites), requiring the plugin to be
+pre-provisioned via Helm or Terraform.

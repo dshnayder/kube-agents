@@ -100,12 +100,19 @@ const (
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
 	AnnotationManagedMinterKeys       = "kubeagents.x-k8s.io/managed-minter-keys"
 
-	// GKE Autopilot API groups used to detect Autopilot clusters where Warden restricts Image volumes.
-	gkeAutopilotAPIGroup = "auto.gke.io"
-	gkeWardenAPIGroup    = "warden.gke.io"
+	// GKE Autopilot API groups and resources used to detect Autopilot clusters where Warden restricts Image volumes.
+	gkeAutopilotAPIGroup                     = "auto.gke.io"
+	gkeAutopilotAllowlistedWorkloadsResource = "allowlistedworkloads"
+	gkeAutopilotDefaultGroupVersion          = "auto.gke.io/v1"
 
 	pluginFailureReasonImagePull = "ImagePullFailed"
 	pluginFailureReasonStaging   = "StagingFailed"
+	exitCodeCommandNotFound      = int32(127)
+	pluginStagingContainerPrefix = "stage-"
+
+	reasonContainerCreating = "ContainerCreating"
+	reasonPodInitializing   = "PodInitializing"
+	reasonContainerError    = "Error"
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -118,7 +125,18 @@ const (
 		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
+
+	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
+	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	gitopsStateConfigMapSuffix         = "-gitops-state"
+	managedReposConfigMapKey           = "managed_repos"
 )
+
+var missingShellMessageMarkers = []string{
+	"/bin/sh",
+	"no such file or directory",
+	"executable file not found",
+}
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
@@ -248,6 +266,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.Info("WARNING: spec.harness needs projectId, location, and clusterName; "+
 			"without all three the credential proxy skips its kubeconfig bootstrap and kubectl will not reach any cluster",
 			"name", instance.Name, "namespace", instance.Namespace)
+	}
+
+	// gitRepo validation restricts repository URLs to github.com. CRs stored
+	// before that change still reconcile, but subsequent updates will be rejected
+	// at admission by the validating webhook until corrected. Warn loudly so an
+	// administrator discovers un-updatable CRs immediately upon operator upgrade.
+	if instance.Spec.Integration != nil && instance.Spec.Integration.GitHub != nil {
+		github := instance.Spec.Integration.GitHub
+		var gitRepoErr error
+		if github.Org != "" {
+			gitRepoErr = agentv1alpha1.ValidateGitHubOrg(github.Org)
+		}
+		if gitRepoErr == nil && github.GitRepo != "" {
+			gitRepoErr = agentv1alpha1.ValidateGitRepoURLWithOrg(github.GitRepo, github.Org)
+		}
+		if gitRepoErr != nil {
+			log.Info("WARNING: spec.integration.github contains invalid gitRepo URL or org; "+
+				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
+				"name", instance.Name, "namespace", instance.Namespace, "error", gitRepoErr.Error())
+		}
 	}
 
 	// 1. Intercept Deletion
@@ -380,7 +418,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// only the sandbox one.
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
+			if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -433,10 +474,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// Steps 9b and 9c take the same rescue for the same reason. What is
-		// still open is step 10's RuntimeClassNotFound, which returns without
-		// reconciling the gateway policy. Issue #964 tracks that; do not read
-		// the rule stated here as one the whole function keeps yet.
+		// Steps 9b, 9c, and 10 take the same rescue for the same reason: all
+		// refusal paths maintain the agent Pod's network guardrails before
+		// returning.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -810,6 +850,7 @@ func parseManagedRepos(raw string) ([]string, error) {
 // If the repository to be removed was declared in spec.integration.github.gitRepo on the CR, clear or
 // update gitRepo on the CR as well so the reconciler does not re-append it on subsequent passes.
 func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	logger := logf.FromContext(ctx)
 	cm := buildGitopsStateConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return err
@@ -844,11 +885,13 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 		}
 		specEntries, err := parseManagedRepoEntries(cmRepo)
 		if err != nil {
-			return fmt.Errorf("failed to parse spec repository JSON: %w", err)
+			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
-			return fmt.Errorf("failed to parse existing managed_repos in ConfigMap %s: %w", found.Name, err)
+			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
 		}
 		updated := false
 		for _, se := range specEntries {
@@ -935,7 +978,13 @@ func renderRepoPolicy(baseTemplate string, repos []string) string {
 // entry exists in github-token-minter-config ConfigMap.
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
-// Operator-managed <repo>.yaml entries for repositories that are no longer managed are pruned.
+//
+// Key ownership contract:
+// The operator owns every <repo>.yaml key for an active managed repository (including adopting
+// pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active managed repositories
+// is unsupported: custom edits will be overwritten with policy rendered from default.yaml on reconcile,
+// and the key will be pruned when the repository is unregistered. Keys for repositories not present in
+// managed_repos (and default.yaml itself) are never claimed or pruned.
 func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
@@ -965,7 +1014,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
 
-	// An empty managed_repos with no previously operator-managed keys is a no-op to avoid wiping unmanaged keys.
+	// If managed_repos is empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
 	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
 		return nil
 	}
@@ -986,7 +1035,8 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	repos, err := parseManagedRepos(managedReposStr)
 	if err != nil {
-		return fmt.Errorf("failed to parse managed_repos for minter policy sync: %w", err)
+		logger.Error(err, "skipping minter policy sync due to unparseable managed_repos in ConfigMap")
+		return nil
 	}
 	var allBareRepos []string
 	activeKeys := make(map[string]string, len(repos))
@@ -1019,17 +1069,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	updated := false
 
-	// Ensure all active managed repositories have policy entries containing all same-org managed repositories
+	// Ensure all active managed repositories have policy entries containing all same-org managed repositories.
+	// The operator claims and owns every <repo>.yaml key for an active managed repository: if unmanaged (!managed),
+	// it adopts the key and overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml
+	// for an active managed repository is unsupported; when the repository is later unregistered, the key is pruned.
 	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for key := range activeKeys {
 		currentVal, exists := minterCM.Data[key]
 		_, managed := operatorManagedKeys[key]
-		if !exists {
+		if !exists || !managed || currentVal != expectedContent {
 			minterCM.Data[key] = expectedContent
 			operatorManagedKeys[key] = struct{}{}
-			updated = true
-		} else if managed && currentVal != expectedContent {
-			minterCM.Data[key] = expectedContent
 			updated = true
 		}
 	}
@@ -1485,10 +1535,15 @@ func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object cl
 	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
-// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
-// policy is fine and still gets rendered, minus the destinations that were
-// refused.
-const reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+const (
+	// reasonRuntimeClassNotFound indicates that the requested RuntimeClass was not found in the cluster.
+	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
+
+	// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
+	// policy is fine and still gets rendered, minus the destinations that were
+	// refused.
+	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+)
 
 // validateEgressPolicy returns a Degraded reason and message when
 // spec.security.egressPolicy asks for something the operator cannot honestly
@@ -1534,9 +1589,9 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 // egress. That the CR reads Degraded at the time makes it worse rather than
 // better: the status names one bad CIDR while the Pod's egress is wide open.
 //
-// Both policies are reconciled whatever the refusal was. <name>-gateway-netpol
-// is the Pod's baseline, it predates spec.security.egressPolicy, and no refusal
-// is an objection to it; <name>-sandbox-metadata-deny is the refused policy
+// Both policies are reconciled whatever the refusal was (steps 9b, 9c, 10, 11e).
+// <name>-gateway-netpol is the Pod's baseline, it predates spec.security.egressPolicy,
+// and no refusal is an objection to it; <name>-sandbox-metadata-deny is the refused policy
 // itself, and the builder has already dropped the offending destination, so
 // what is left to render is a good policy minus one rule.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -2198,12 +2253,34 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	managedReposErr := error(nil)
+	if gitRepoErr == nil {
+		cmName := agent.Name + gitopsStateConfigMapSuffix
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Name: cmName, Namespace: agent.Namespace}, cm); err == nil {
+			if raw, ok := cm.Data[managedReposConfigMapKey]; ok && strings.TrimSpace(raw) != "" {
+				if _, err := parseManagedRepos(raw); err != nil {
+					managedReposErr = err
+				}
+			}
+		}
+	}
+
 	degradedStatus := metav1.ConditionFalse
+	degradedReason := ""
 	if gitRepoErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
-		condReason = "InvalidGitRepoURL"
-		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config", gitRepoErr.Error())
+		condReason = conditionReasonInvalidGitRepoURL
+		degradedReason = conditionReasonInvalidGitRepoURL
+		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		degradedStatus = metav1.ConditionTrue
+	} else if managedReposErr != nil {
+		newPhase = "Degraded"
+		condStatus = metav1.ConditionFalse
+		condReason = conditionReasonCorruptManagedRepos
+		degradedReason = conditionReasonCorruptManagedRepos
+		condMsg = fmt.Sprintf("Corrupt %s in ConfigMap %s%s (%s); GitOps disabled", managedReposConfigMapKey, agent.Name, gitopsStateConfigMapSuffix, managedReposErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	}
 
@@ -2235,9 +2312,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	rbacDegradedPreserved := degradedStatus == metav1.ConditionFalse && existingDegradedCond != nil &&
 		existingDegradedCond.Reason == reasonRBACIncomplete
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
-		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == "InvalidGitRepoURL" && existingDegradedCond.Message == condMsg)
+		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == condMsg)
 
-	// Check if anything actually changed
+	// Check if anything actually changed. The generation is in the list so that
+	// a spec edit which changes nothing derived here still gets one write:
+	// without it the status would keep describing the previous generation and
+	// a reader could not tell that the operator had seen the new one (#534).
+	// The witness is the Ready condition's observedGeneration rather than the
+	// top-level field, deliberately: the two are written together, but a CRD
+	// that predates status.observedGeneration prunes the top-level copy on
+	// every write while the condition's has always been in the schema. Keyed
+	// on the pruned copy, an operator rolled ahead of its CRD would write on
+	// every pass, and each write wakes the next through the unfiltered watch.
 	if agent.Status.Phase == newPhase &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
 		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
@@ -2249,12 +2335,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
-		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
+		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
+		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
 	}
 
 	// Apply updates
 	agent.Status.Phase = newPhase
+	agent.Status.ObservedGeneration = agent.Generation
 	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
 	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
@@ -2277,6 +2365,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		Status:             condStatus,
 		Reason:             condReason,
 		Message:            condMsg,
+		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
@@ -2285,8 +2374,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedCond := metav1.Condition{
 			Type:               "Degraded",
 			Status:             metav1.ConditionTrue,
-			Reason:             "InvalidGitRepoURL",
+			Reason:             degradedReason,
 			Message:            condMsg,
+			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		}
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
@@ -2305,6 +2395,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Status:             metav1.ConditionFalse,
 			Reason:             eventWatcherDisabledReason,
 			Message:            eventWatcherDisabledMessage,
+			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		})
 	}
@@ -2367,6 +2458,10 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	}
 
 	for _, pod := range pods {
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
 		//
 		// Init statuses first, and PodInitializing filtered out with
@@ -2388,10 +2483,32 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
 		for _, cs := range initThenApp {
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
-				cs.State.Waiting.Reason != "ContainerCreating" && cs.State.Waiting.Reason != "PodInitializing" {
+				cs.State.Waiting.Reason != reasonContainerCreating && cs.State.Waiting.Reason != reasonPodInitializing {
 				phase = "Degraded"
 				reason = cs.State.Waiting.Reason
 				message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - %s", cs.Name, pod.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+				if isPluginStagingContainer(cs.Name) {
+					if cs.LastTerminationState.Terminated != nil {
+						term := cs.LastTerminationState.Terminated
+						if isMissingShellFailure(term.ExitCode, term.Message) {
+							message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason, term.ExitCode)
+						}
+					} else if isMissingShellFailure(0, cs.State.Waiting.Message) {
+						message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed: plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason)
+					}
+				}
+				return phase, reason, message
+			}
+			if isPluginStagingContainer(cs.Name) && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+				phase = "Degraded"
+				reason = cs.State.Terminated.Reason
+				if reason == "" {
+					reason = reasonContainerError
+				}
+				message = fmt.Sprintf("Container '%s' in pod %s terminated with exit code %d: %s", cs.Name, pod.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Message)
+				if isMissingShellFailure(cs.State.Terminated.ExitCode, cs.State.Terminated.Message) {
+					message = fmt.Sprintf("Container '%s' in pod %s failed to stage plugin (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Terminated.ExitCode)
+				}
 				return phase, reason, message
 			}
 		}
@@ -2497,6 +2614,7 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
 	agent.Status.Phase = "Degraded"
+	agent.Status.ObservedGeneration = agent.Generation
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 
@@ -2505,6 +2623,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		Status:             metav1.ConditionFalse,
 		Reason:             reason,
 		Message:            message,
+		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
@@ -2686,32 +2805,86 @@ func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha
 	return supported
 }
 
-// isGKEAutopilot probes the API server for GKE Autopilot specific API groups.
-func isGKEAutopilot(dc discovery.DiscoveryInterface) bool {
+// isGKEAutopilot probes the API server for GKE Autopilot specific API resources.
+// It returns:
+//   - isAutopilot: true if allowlistedworkloads is found under the auto.gke.io API group.
+//   - determined: true if the determination is authoritative. Returns false if transient
+//     discovery errors (network failures, 503, timeouts) prevented establishing cluster type.
+func isGKEAutopilot(dc discovery.DiscoveryInterface) (isAutopilot bool, determined bool) {
 	if dc == nil {
-		return false
+		return false, false
 	}
 	defer func() {
-		_ = recover()
+		if r := recover(); r != nil {
+			isAutopilot = false
+			determined = false
+		}
 	}()
+
 	groups, err := dc.ServerGroups()
 	if err != nil || groups == nil {
-		return false
+		return false, false
 	}
-	for _, g := range groups.Groups {
-		if g.Name == gkeAutopilotAPIGroup || g.Name == gkeWardenAPIGroup {
-			return true
+
+	var autoGroup *metav1.APIGroup
+	for i := range groups.Groups {
+		if groups.Groups[i].Name == gkeAutopilotAPIGroup {
+			autoGroup = &groups.Groups[i]
+			break
 		}
 	}
-	return false
+	if autoGroup == nil {
+		// The API server responded with its API groups and auto.gke.io is absent:
+		// authoritatively not an Autopilot cluster.
+		return false, true
+	}
+
+	// Collect versions to probe, checking PreferredVersion first if available.
+	versionsToCheck := make([]string, 0, len(autoGroup.Versions)+1)
+	if autoGroup.PreferredVersion.GroupVersion != "" {
+		versionsToCheck = append(versionsToCheck, autoGroup.PreferredVersion.GroupVersion)
+	}
+	for _, gv := range autoGroup.Versions {
+		if gv.GroupVersion != "" && !slices.Contains(versionsToCheck, gv.GroupVersion) {
+			versionsToCheck = append(versionsToCheck, gv.GroupVersion)
+		}
+	}
+	if len(versionsToCheck) == 0 {
+		versionsToCheck = append(versionsToCheck, gkeAutopilotDefaultGroupVersion)
+	}
+
+	hasTransientError := false
+	for _, gv := range versionsToCheck {
+		resList, err := dc.ServerResourcesForGroupVersion(gv)
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				hasTransientError = true
+			}
+			continue
+		}
+		if resList == nil {
+			continue
+		}
+		for _, r := range resList.APIResources {
+			if r.Name == gkeAutopilotAllowlistedWorkloadsResource {
+				return true, true
+			}
+		}
+	}
+
+	if hasTransientError {
+		return false, false
+	}
+	return false, true
 }
 
 // clusterImageVolumeSupport probes the API server for ImageVolume support.
 //
 // determined reports whether the answer is authoritative. When the capability cannot be
-// established — no discovery client, an unreachable API server, an unparseable version —
-// supported is false and determined is false: the caller must fail closed for this pass
-// but must not remember the answer, because the next probe may succeed.
+// established — no discovery client, an unreachable API server, an unparseable version,
+// or a transient discovery failure probing Autopilot resources — supported is false and
+// determined is false: the caller must fail closed for this pass but must not remember
+// the answer, because the next probe may succeed.
 func clusterImageVolumeSupport(dc discovery.DiscoveryInterface) (supported bool, determined bool) {
 	log := logf.Log.WithName("platformagent-controller")
 	const override = "Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override."
@@ -2735,18 +2908,25 @@ func clusterImageVolumeSupport(dc discovery.DiscoveryInterface) (supported bool,
 		return false, false
 	}
 
+	// Kubernetes < 1.35 does not support native ImageVolumeSource on any cluster type.
+	if major < 1 || (major == 1 && minor < 35) {
+		return false, true
+	}
+
 	// GKE Autopilot clusters enforce GKE Warden admission policies (autopilot-volume-type-limitation)
 	// that reject the Image volume type. On Autopilot, fall back to initContainer/emptyDir staging.
 	// On GKE Standard (and non-GKE clusters), ImageVolumeSource is supported natively on Kubernetes 1.35+.
-	if isGKEAutopilot(dc) {
+	autopilot, determined := isGKEAutopilot(dc)
+	if !determined {
+		log.Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; assuming unsupported. " + override)
+		return false, false
+	}
+	if autopilot {
 		log.Info("GKE Autopilot cluster detected; using initContainer plugin staging fallback. " + override)
 		return false, true
 	}
 
-	if major > 1 {
-		return true, true
-	}
-	return major == 1 && minor >= 35, true
+	return true, true
 }
 
 // imageVolumeSupported resolves the cluster ImageVolume capability and reuses it for
@@ -2900,6 +3080,9 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 	}
 
 	for _, pod := range podList.Items {
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
 		// 1. Check init container statuses for staging failures or image pull issues
 		for _, cs := range pod.Status.InitContainerStatuses {
 			for _, plugin := range plugins {
@@ -2912,15 +3095,15 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 							reason:  pluginFailureReasonImagePull,
 							message: w.Message,
 						}
-					} else if w.Reason == "CrashLoopBackOff" {
+					} else if w.Reason != reasonContainerCreating && w.Reason != reasonPodInitializing {
 						msg := w.Message
 						if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.ExitCode != 0 {
-							msg = fmt.Sprintf("staging init container exited with code %d", cs.LastTerminationState.Terminated.ExitCode)
-							if cs.LastTerminationState.Terminated.Message != "" {
-								msg = fmt.Sprintf("%s: %s", msg, cs.LastTerminationState.Terminated.Message)
-							}
+							term := cs.LastTerminationState.Terminated
+							msg = formatStagingFailureMessage(term.ExitCode, term.Message, plugin.Spec.Image)
+						} else if isMissingShellFailure(0, w.Message) {
+							msg = fmt.Sprintf("staging init container failed (%s): plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", w.Reason, plugin.Spec.Image)
 						} else if msg == "" {
-							msg = "staging init container crashed"
+							msg = fmt.Sprintf("staging init container failed: %s", w.Reason)
 						}
 						failures[plugin.Name] = pluginFailure{
 							reason:  pluginFailureReasonStaging,
@@ -2928,13 +3111,9 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 						}
 					}
 				} else if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
-					msg := fmt.Sprintf("staging init container exited with code %d", t.ExitCode)
-					if t.Message != "" {
-						msg = fmt.Sprintf("%s: %s", msg, t.Message)
-					}
 					failures[plugin.Name] = pluginFailure{
 						reason:  pluginFailureReasonStaging,
-						message: msg,
+						message: formatStagingFailureMessage(t.ExitCode, t.Message, plugin.Spec.Image),
 					}
 				}
 			}
@@ -2957,6 +3136,36 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 		}
 	}
 	return failures
+}
+
+func isPluginStagingContainer(name string) bool {
+	return strings.HasPrefix(name, pluginStagingContainerPrefix)
+}
+
+func isMissingShellFailure(exitCode int32, msg string) bool {
+	if exitCode == exitCodeCommandNotFound {
+		return true
+	}
+	for _, marker := range missingShellMessageMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// formatStagingFailureMessage constructs an informative error message when a staging init container fails.
+// If the container exited with code 127 or the failure indicates a missing shell, it clarifies that
+// the plugin image may be outdated or missing /bin/sh (required on clusters using init container staging).
+func formatStagingFailureMessage(exitCode int32, termMsg string, pluginImage string) string {
+	baseMsg := fmt.Sprintf("staging init container exited with code %d", exitCode)
+	if termMsg != "" {
+		baseMsg = fmt.Sprintf("%s (%s)", baseMsg, termMsg)
+	}
+	if isMissingShellFailure(exitCode, termMsg) {
+		return fmt.Sprintf("%s: plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", baseMsg, pluginImage)
+	}
+	return baseMsg
 }
 
 // detectPluginImageFailures maps plugin name to the kubelet's message when the agent's

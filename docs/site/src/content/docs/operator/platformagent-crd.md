@@ -234,8 +234,10 @@ Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale 
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
 has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
-`maxTurns` interacts with `maxInProgress`: a long-running worker holds its slot for the whole task
-and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+`maxTurns` interacts with `maxInProgress`: a worker doing the work holds its slot for the whole
+task and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+A coordinator waiting on work it fanned out is the exception — see
+[why dispatch is capped](#why-dispatch-is-capped-by-default).
 
 #### Why dispatch is capped by default
 
@@ -255,6 +257,12 @@ hold on the smallest pod anyone runs, and because the cost of being wrong is asy
 delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
+
+The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
+waiting on work it fanned out is discounted, or it would hold the slot its own children need
+([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
+Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
+dispatcher's memory-pressure guard rather than by this number.
 
 ### `spec.harness.experimental`
 
@@ -481,7 +489,11 @@ Enables external integrations. Only the enabled ones need to be present.
 
 - **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
 - **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by the installer when Slack is enabled.
-- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by the installer when a GitOps repository is connected.
+- **`github`** — `org` (optional target GitHub organization/user, up to 39 characters) and `gitRepo` (optional target GitOps repository URL or `owner/repo` shorthand, up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@github.com:owner/repo`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand. Rejects non-GitHub hosts and URLs containing whitespace or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL or organization is encountered during reconciliation, GitOps is disabled in config and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. On reconcile, `gitRepo` is appended to the `gitops-state` ConfigMap (`managed_repos`) if absent; removing a repository configured via `gitRepo` requires clearing or updating `spec.integration.github.gitRepo` on the CR in addition to editing the ConfigMap. Populated by the installer when a GitOps repository is connected.
+
+:::caution[Upgrade note: non-GitHub repository rejection]
+Earlier operator versions passed arbitrary `https://` and `http://` URLs through to `CleanRepoURLWithOrg` without host validation. The operator now strictly restricts repository URLs to GitHub (`github.com` or `www.github.com`). Existing `PlatformAgent` resources configured with non-GitHub repositories reconcile into `phase: Degraded` with condition `Reason: InvalidGitRepoURL`, and subsequent updates to those resources are rejected at admission by the validating webhook (`failurePolicy: Fail`) until `spec.integration.github.gitRepo` is corrected or removed.
+:::
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
@@ -489,32 +501,33 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 The operator writes observed state to the `status` subresource:
 
-| Field                                  | Type     | Purpose                                                                                             |
-| -------------------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                           |
-| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                            |
-| `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                |
-| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                          |
-| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                  |
-| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                     |
-| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                         |
-| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                       |
-| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                          |
-| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.    |
-| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled. |
-| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                             |
-| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.               |
-| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                            |
-| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                |
-| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`. |
+| Field                                  | Type     | Purpose                                                                                                                                         |
+| -------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                                                                       |
+| `observedGeneration`                   | int64    | The `metadata.generation` the status was last computed from. Behind `metadata.generation` from a spec edit until the reconcile that follows it. |
+| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                                                                        |
+| `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                                                            |
+| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                                                                      |
+| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                                                              |
+| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                                                                 |
+| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                                                                     |
+| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                                                                   |
+| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                                                                      |
+| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.                                                |
+| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled.                                             |
+| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                                                                         |
+| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.                                                           |
+| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                                                                        |
+| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                                                            |
+| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`.                                             |
 
 Three condition types appear in `conditions`, and only the first is always present:
 
-| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| -------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the five reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`). The last two render today's stack in full and report at the end rather than returning early — `ModeNotRecognized` because it is a version skew rather than a bad spec, `ShellSandboxKeysMissing` because the objects are wanted in place so the Pod starts by itself once the Secret appears. Under `mode: next` a failed A2A provisioning Job parks the phase the same way with `A2AProvisionFailed`, naming the Job to inspect. |
-| `Degraded`     | Only while degraded                          | One of two things. `Reason: InvalidGitRepoURL`: something in the spec cannot be honoured (the refusals above ride the `Ready` condition instead of this one). `Reason: RBACIncomplete`: not a spec fault but install skew — the ClusterRole bound to the operator denies a permission its RBAC markers declare, which is what an image deployed ahead of its manifests looks like; the message names the denied verbs and the fix. While `InvalidGitRepoURL` holds the condition the RBAC reason is not written, and the operator's startup log is the only trace.                                                                                                                                                   |
-| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the five reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`). The last two render today's stack in full and report at the end rather than returning early — `ModeNotRecognized` because it is a version skew rather than a bad spec, `ShellSandboxKeysMissing` because the objects are wanted in place so the Pod starts by itself once the Secret appears. Under `mode: next` a failed A2A provisioning Job parks the phase the same way with `A2AProvisionFailed`, naming the Job to inspect. That signal is slow: the Job has `backoffLimit: 20`, so a deterministically failing script retries for over an hour before the condition is written. The earlier symptom is an install that looks healthy — NATS `1/1`, clients authenticating — while every stream read returns `stream not found` (`err_code=10059`). A fresh `next` install with no streams and no `Degraded` condition is this, not a render fault. |
+| `Degraded`     | Only while degraded                          | Something in the spec, cluster state, or operator install cannot be honoured. `Reason: InvalidGitRepoURL` (invalid org or non-GitHub repository in `spec.integration.github`; subsequent updates are rejected at admission until corrected), `Reason: CorruptManagedRepos` (unparseable `managed_repos` JSON in the `<agent>-gitops-state` ConfigMap; GitOps disabled), or `Reason: RBACIncomplete` (not a spec fault but install skew — the ClusterRole bound to the operator denies a permission its RBAC markers declare, which is what an image deployed ahead of its manifests looks like; the message names the denied verbs and the fix. While `InvalidGitRepoURL` or `CorruptManagedRepos` holds the condition the RBAC reason is not written, and the operator's startup log is the only trace). The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                                                                                                                                 |
+| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 `EventWatcher` is absent on a healthy install rather than `True`, deliberately: the operator can say
 it asked for a watcher, but nothing here checks that one is alive, and a permanently-`True`
@@ -525,10 +538,35 @@ state — it is a decision somebody made, and `phase` stays `Ready`.
 $ kubectl describe platformagent platform-agent -n kubeagents-system
 ...
   Conditions:
-    Type:     EventWatcher
-    Status:   False
-    Reason:   DisabledBySpec
-    Message:  Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. …
+    Type:                 EventWatcher
+    Status:               False
+    Observed Generation:  3
+    Reason:               DisabledBySpec
+    Message:              Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. …
+```
+
+### Telling a current status from a stale one
+
+`status.observedGeneration` is the `metadata.generation` the status was last computed from, and the
+`Ready` condition, with any `Degraded` or `EventWatcher` condition written in the same pass, carries
+it in its own `observedGeneration`. `Degraded`/`RBACIncomplete` is the exception: it is written when
+the set of denied permissions changes and left in place otherwise, so its `observedGeneration` is
+the generation at which that set last changed. A spec edit bumps `metadata.generation` at admission
+and leaves both behind until the next reconcile, so a `Ready` condition whose `observedGeneration`
+is below `metadata.generation` describes the previous spec, and `kubectl wait --for=condition=Ready`
+on its own can return on it. The field says the operator has processed that generation; it does not
+say the rollout it triggered has finished. `Ready` is still derived from replica counts, and during
+a rollout the replica satisfying it can be the previous one. `Ready` is a claim about three
+workloads (the gateway, the shell sandbox and the credential broker), so to gate on a change, wait
+for the generation to be observed, then for the rollout of each workload, then for the condition:
+
+```bash
+gen=$(kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.metadata.generation}')
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=jsonpath='{.status.observedGeneration}'="$gen"
+kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system
+kubectl rollout status statefulset/platform-agent-shell -n kubeagents-system
+kubectl rollout status deployment/platform-agent-credential-proxy -n kubeagents-system
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready
 ```
 
 ## How config reaches each profile
@@ -671,7 +709,7 @@ one reviewable place.
 
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
 - On delete, it garbage-collects owned resources.
-- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), requires each `imagePullSecrets` entry to name a Secret, and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
+- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per cluster, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), requires each `imagePullSecrets` entry to name a Secret, and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
 - The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 

@@ -326,7 +326,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Four workflows hold it, and none can give an approval:
+        Six workflows hold it, and none can give an approval:
 
         - auto_request_review, which requests reviewers and does not give them.
         - auto-assign-milestone: triggers on `pull_request_target: closed`
@@ -338,6 +338,18 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         - risk_classify: `pull_request_target` with `permissions: {}` at the
           top, the grant job-scoped, checkout pinned to the default branch,
           and its one write is swapping the `risk:*` label.
+        - hold-unresolved-threads: `schedule` plus `pull_request_target:
+          labeled`, `permissions: {}` at the top, the grant job-scoped,
+          checkout pinned to the default branch, and its writes are the
+          `do-not-merge` label and one comment on pull requests with
+          unresolved review threads. It withholds a merge; it cannot grant one.
+        - ci-health: `schedule` plus `workflow_dispatch`, job-gated on
+          `github.repository` and `refs/heads/main`, top-level permissions
+          `contents: read` and `id-token: write` only, the grant job-scoped,
+          checkout with `persist-credentials: false`, and its pull-request
+          write is one comment on a pull request whose smoke run went red,
+          edited in place on later runs. It explains a red; it cannot approve,
+          label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
@@ -359,7 +371,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             [
                 "auto-assign-milestone.yml",
                 "auto_request_review.yml",
+                "ci-health.yml",
                 "coverage-comment.yml",
+                "hold-unresolved-threads.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),
@@ -468,11 +482,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                     # there), so the strict form keys on the credential.
                     if permissions.get("id-token") == "write":
                         saw_a_deploy = True
-                        self.assertIn(
-                            "workflow_run.conclusion == 'success'", condition
+                        chain_conditions = [condition]
+                        needs = (job or {}).get("needs")
+                        if isinstance(needs, str):
+                            needs = [needs]
+                        elif not needs:
+                            needs = []
+                        all_jobs = document.get("jobs") or {}
+                        for needed in needs:
+                            if needed in all_jobs:
+                                chain_conditions.append(str((all_jobs[needed] or {}).get("if", "")))
+
+                        self.assertTrue(
+                            any("workflow_run.conclusion == 'success'" in c for c in chain_conditions),
+                            f"{path.name}:{job_name} and its prerequisites must gate on workflow_run.conclusion == 'success'",
                         )
-                        self.assertIn(
-                            "workflow_run.head_branch == 'main'", condition
+                        self.assertTrue(
+                            any("workflow_run.head_branch == 'main'" in c for c in chain_conditions),
+                            f"{path.name}:{job_name} and its prerequisites must gate on workflow_run.head_branch == 'main'",
                         )
         self.assertTrue(
             saw_a_deploy,

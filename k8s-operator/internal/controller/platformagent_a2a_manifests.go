@@ -40,6 +40,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -67,6 +68,12 @@ const (
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
 
+	// a2aProvisionWritablePath is the one writable path the provision
+	// container has: the emptyDir mount, the nats CLI's HOME and
+	// XDG_CONFIG_HOME, and its working directory. Four references that have to
+	// agree, so they read from one name rather than four string literals.
+	a2aProvisionWritablePath = "/tmp"
+
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
 	defaultA2ANATSImage     = "nats:2.10-alpine"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
@@ -83,6 +90,23 @@ const (
 	// registry move — a mirrored or air-gapped install that flips next must
 	// override all three via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
+
+	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
+	// each password goes when it re-renders nats.conf for hashing. It carries
+	// the key name so moving a credential from one user to another is still a
+	// changed render, and it is the reason the digest in the pod template is
+	// not a digest of the credentials.
+	a2aConfigHashPlaceholder = "{{a2a-credential:%s}}"
+
+	// a2aConfigHashRotationSeparator joins that render to the creds Secret's
+	// resourceVersion, which is what makes an in-place credential rotation
+	// roll the bus. A NUL byte cannot appear in the render, so no config text
+	// can forge the boundary and pass itself off as a resourceVersion.
+	a2aConfigHashRotationSeparator = "\x00resourceVersion="
+
+	// a2aConfigHashLength is how much of the hex digest rides the pod-template
+	// annotation. The annotation is a change detector, not an identifier.
+	a2aConfigHashLength = 16
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
@@ -142,6 +166,85 @@ func randomA2APassword() (string, error) {
 // key would render `password: ""` into nats.conf — a user anyone can log in
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
 var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
+
+// a2aProvisionedStreams is every JetStream stream the provision Job creates, and
+// the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
+// KV_<bucket>, so they belong in the same list.
+//
+// The seed grant in nats.conf renders from this slice. The provision script
+// does not: each stream's create line carries its own subjects, retention and
+// caps, so the script names the streams itself, in a2aProvisionScript. The two
+// are a pair — a grant that does not name a stream makes the script's create
+// for it time out on a refused API request, and a script that creates a stream
+// the grant does not name is the same bug from the other side — and what holds
+// them together is TestSeedGrantsAndProvisionScriptNameTheSameStreams, which
+// reads the script's `stream add` / `kv add` lines and checks both directions
+// against this list. Add a stream to one side and that test says so.
+var a2aProvisionedStreams = []string{
+	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
+	"KV_runtime-state", "KV_session-state", "KV_cap",
+}
+
+// a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
+// replacing the `$JS.API.>` wildcard this user shipped with.
+//
+// seed is trust-root — it is the identity the provision Job runs under — so this
+// is defence in depth rather than a boundary. It is worth having anyway, because
+// the seed password lives in the creds Secret for the life of the CR and
+// deliberately survives a flip back to today, so the blast radius of a leak is
+// not bounded by anything else.
+//
+// What the wildcard granted that provisioning never uses, and this list now
+// refuses: STREAM.RESTORE (arbitrary messages with arbitrary stored subjects),
+// STREAM.MSG.DELETE and PURGE (selective editing of the audit substrate),
+// CONSUMER.CREATE (deliver-subject redirection, the server-originated write onto
+// a subject nobody granted), and STREAM.DELETE.
+//
+// UPDATE is absent deliberately, and it is the interesting one. The script
+// guards every create with an info check (`stream info X || stream add X`), so
+// it never updates an existing stream — which means seed cannot set RePublish on
+// one either. RePublish is a stream-config field settable at CREATE and UPDATE,
+// and CREATE on an existing stream either returns that stream unchanged (when
+// the config it carries is identical) or fails with JSStreamNameExistErr (when
+// it differs). A RePublish edit is a differing config, so it takes the second
+// branch. The one write route that survives a name-scoped allow-list in general
+// is therefore closed here by the script's own idempotence. If a
+// future script ever needs UPDATE, that reopens RePublish and the grant should
+// say so out loud rather than quietly gaining a verb.
+func a2aSeedJetStreamGrants() []string {
+	// Account-level JetStream discovery. `stream add` asks for it
+	// (IsStreamMaxBytesRequired -> JetStreamAccountInfo) and so does the
+	// legacy CreateKeyValue path, which is what `kv add` runs.
+	//
+	// STREAM.NAMES is the one that is easy to miss and expensive to omit.
+	// natscli's selectStream falls through to mgr.StreamNames(nil) when
+	// LoadStream fails, which is exactly the first-run case the CREATE grants
+	// exist for: every `stream info X || stream add X` guard on a fresh store
+	// asks for it. A refused request is not an error the client sees -- nats.go
+	// only records it and fires the async callback -- so the CLI waits out its
+	// 5s timeout instead. Four streams, four timeouts, and four Publish
+	// Violations in the same log the install is verified from. It is a
+	// read-only listing of names the seed already knows, so granting it costs
+	// nothing the CREATE and INFO grants above do not already concede.
+	grants := []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES"}
+	for _, s := range a2aProvisionedStreams {
+		grants = append(grants,
+			`$JS.API.STREAM.CREATE.`+s,
+			`$JS.API.STREAM.INFO.`+s,
+		)
+	}
+	return grants
+}
+
+// a2aSeedJetStreamGrantLines renders those grants as nats.conf allow-list
+// entries at the seed block's indentation.
+func a2aSeedJetStreamGrantLines() string {
+	lines := make([]string, 0, len(a2aSeedJetStreamGrants()))
+	for _, g := range a2aSeedJetStreamGrants() {
+		lines = append(lines, fmt.Sprintf("            %q,", g))
+	}
+	return strings.Join(lines, "\n")
+}
 
 // a2aCredsValueRe is the exact shape randomA2APassword emits. It is a
 // security check, not tidiness: buildA2ANATSConfigSecret interpolates these
@@ -225,18 +328,34 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 	return secret, nil
 }
 
-// buildA2ANATSConfigSecret renders nats.conf with the static account layout.
+// renderA2ANATSConf renders nats.conf, taking every password from pw.
 //
 // The property being preserved, verbatim from the deployment spec: the bus
 // decides who may say what before a message is read. Deny-by-default — a
 // permissions block with allow lists denies everything else — with per-user
 // _INBOX prefixes so the reply path cannot leak what the subject grants
-// withheld. $JS.API.> on every app user is playground posture; production
-// narrows it to the per-stream API subjects when the callout arms.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
-	pw := func(key string) string { return string(creds.Data[key]) }
-
-	conf := a2aPostureComment + `
+// withheld. Seed's JetStream API grant is scoped to the streams it provisions,
+// by name and by verb. Gateway and worker still hold $JS.API.>, which is
+// playground posture; narrowing those is gke-labs#1316 and wants its own live
+// proof, because unlike seed they create consumers.
+//
+// pw is a parameter rather than a closure over the creds Secret because two
+// callers walk this template: buildA2ANATSConfigSecret with the real lookup,
+// and a2aConfigRolloutHash with one that returns placeholders. One template
+// and two lookups is what lets the rollout digest cover every non-secret byte
+// without covering a credential — a password interpolated here by any route
+// other than pw is back in the digest.
+//
+// TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation is the guard for
+// that: it hashes two creds Secrets that differ only in their password bytes
+// and requires the digests to be equal, so any route by which a credential
+// re-enters the hashed input reds it.
+// TestA2ARenderedObjectsCarryNoPasswordDigest is the wider but shallower one —
+// it catches a digest of a password, or of the real conf, reaching a rendered
+// name, label or annotation, and it cannot see a credential folded into the
+// hashed bytes as a third string.
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
+	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
 port: 4222
@@ -352,7 +471,23 @@ accounts {
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-            "a2a.agents.>",
+            # No a2a.agents.> publish. The directory is the identity plane:
+            # a2a.agents.{profile} is last-value, so one publish REPLACES a
+            # profile's card, and an agent-closed tombstone retires it. The
+            # payload spec says cards are "published by the profile's owner
+            # (the operator once profiles are CRs), not by workers", and
+            # nothing in the tree publishes one today — this grant had no
+            # caller and let the least-trusted principal in the deployment
+            # forge any profile's card. The gateway keeps SUBSCRIBE on the
+            # same subjects, which is the read discovery actually needs.
+            #
+            # This closes forgery, not reach: $JS.API.> below still covers
+            # STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
+            # STREAM.DELETE.DIRECTORY, so worker can still erase the whole
+            # directory in one call. Scoping that wildcard the way #1306
+            # scopes seed's is gke-labs/kube-agents#1316, and it is a
+            # separate change: the worker's JetStream use is TASKS and the
+            # KV bucket, and narrowing to those wants its own live proof.
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
@@ -377,15 +512,22 @@ accounts {
         password: "` + pw("seed-password") + `"
         permissions {
           # No ack grant at all: seed creates no consumers. Provisioning is
-          # $JS.API requests, the starter topics are publishes, and the
-          # CLI's topic reads are stream API calls — nothing here ever acks,
-          # so an ack grant would be pure unused capability to +TERM other
-          # principals' deliveries (the same deletion the web user got).
+          # $JS.API requests and the starter topics are publishes — nothing
+          # here ever acks, so an ack grant would be pure unused capability
+          # to +TERM other principals' deliveries (the same deletion the web
+          # user got).
+          #
+          # Seed also reads no topics. "a2a topics read" is a stream API call
+          # (GetLastMsgForSubject, so $JS.API.DIRECT.GET.<stream>.<subject> on
+          # these streams, or STREAM.MSG.GET as the fallback) and the scoped
+          # grant below refuses both. Nothing runs it as seed: the provision
+          # script does writes and info checks only, and the a2a CLI runs in
+          # the agent pod as worker.
           publish { allow = [
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-            "$JS.API.>",
+` + a2aSeedJetStreamGrantLines() + `
             "_INBOX.seed.>"
           ] }
           subscribe { allow = [
@@ -472,6 +614,13 @@ accounts {
 }
 system_account: SYS
 `
+}
+
+// buildA2ANATSConfigSecret renders nats.conf with the real credentials from
+// the creds Secret. This Secret's Data is the one place the passwords are
+// meant to appear; a2aConfigRolloutHash covers the rest of the render.
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) })
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -484,11 +633,53 @@ system_account: SYS
 	}
 }
 
-// buildA2ANATSStatefulSet renders the bus. confHash is a digest of the
-// rendered nats.conf: the config Secret updates in place but the nats
-// container only reads it at boot, so the hash rides the pod template — the
-// agent Deployment's config-hash mechanism — and a changed render rolls the
-// server instead of silently diverging from it.
+// a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
+// so a changed bus config reaches a running server: the config Secret updates
+// in place, but the nats container only reads it at boot.
+//
+// It is deliberately NOT a digest of the rendered nats.conf. That file carries
+// all five NATS passwords, so hashing it put a truncated digest of the
+// credentials in an annotation anyone who can get the StatefulSet can read —
+// harmless against 32 random hex characters, an offline target the day a
+// password is hand-set, and CodeQL alert 27 (go/weak-sensitive-data-hashing).
+//
+// Instead it covers the conf rendered with a placeholder in each password's
+// place, plus the creds Secret's resourceVersion. Both halves are load-bearing:
+// the placeholder render tracks every non-secret byte, so a config change still
+// rolls the bus, and the resourceVersion tracks a credential rotation, which
+// ensureA2ACredsSecret performs as an Update on the existing Secret — the UID
+// would not move, which is why this is the resourceVersion.
+//
+// Two things that costs, both accepted rather than overlooked:
+//
+// The hash is no longer content-addressed. resourceVersion moves on ANY
+// accepted write to the creds Secret, so labelling it by hand, a policy
+// controller stamping the namespace, or a restore that renumbers the namespace
+// rolls the single-replica bus once with nothing the server reads having
+// changed — clients reconnect, and JetStream state lives on the PV. The
+// alternative that ignores metadata churn is a digest of the password bytes,
+// which is the alert this function exists to close, so the spurious roll is
+// the price of not hashing the credential.
+//
+// And the rotation it notices rolls the bus, not the bus's clients. This hash
+// rides the NATS pod template alone; the gateway Deployment and the provision
+// Job take their passwords through valueFrom.secretKeyRef, which a running pod
+// does not re-read, so a repaired credential leaves the gateway holding the old
+// one until something else restarts it. That gap predates this function — the
+// conf digest rolled only the StatefulSet too — and closing it means deciding
+// what a rotation should restart, which is not this function's call.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) string {
+	redacted := renderA2ANATSConf(agent, func(key string) string {
+		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
+	})
+	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
+	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
+}
+
+// buildA2ANATSStatefulSet renders the bus. confHash comes from
+// a2aConfigRolloutHash and rides the pod template — the agent Deployment's
+// config-hash mechanism — so a changed render rolls the server instead of
+// silently diverging from it.
 // a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
@@ -798,11 +989,27 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
-						VolumeMounts:    []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
+						// nats-box ships WORKDIR /root and declares no USER,
+						// so it expects to run as root (measured with
+						// `crane config` on 0.14.5). The pod above runs it as
+						// 1000, which cannot so much as stat a 0700 root-owned
+						// directory: the Job died on "stat .: permission
+						// denied" after printing its provisioning JSON, and a
+						// fresh next install came up with a healthy bus and no
+						// streams at all (#1259).
+						//
+						// An image's WORKDIR is chosen for the user that image
+						// expects, so a render overriding the user owns the
+						// working directory too. See hardenedSecurityContext().
+						// This container wants a writable one rather than
+						// merely a traversable one, because it is also the nats
+						// CLI's HOME.
+						WorkingDir:   a2aProvisionWritablePath,
+						VolumeMounts: []corev1.VolumeMount{{Name: "tmp", MountPath: a2aProvisionWritablePath}},
 						Env: []corev1.EnvVar{{
-							Name: "HOME", Value: "/tmp",
+							Name: "HOME", Value: a2aProvisionWritablePath,
 						}, {
-							Name: "XDG_CONFIG_HOME", Value: "/tmp",
+							Name: "XDG_CONFIG_HOME", Value: a2aProvisionWritablePath,
 						}, {
 							Name: "SEED_PASSWORD",
 							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -956,6 +1163,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					Containers: []corev1.Container{{
 						Name:  "gateway",
 						Image: a2aGatewayImage(),
+						// Same rule as the provision container, caught by the
+						// same pass: the image is distroless nonroot, which
+						// ships WORKDIR /home/nonroot owned 0700 by 65532, and
+						// the pod above runs it as 1000. Latent rather than
+						// broken because the gateway binary never stats ".",
+						// which is luck rather than a guard. "/" is 0755 on
+						// that image and the gateway needs no writable cwd --
+						// it wants a directory it can traverse, not one it can
+						// write.
+						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)},
 							{Name: "NATS_USER", Value: "gateway"},
@@ -1049,8 +1266,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	confSum := sha256.Sum256(config.Data["nats.conf"])
-	sts := buildA2ANATSStatefulSet(agent, hex.EncodeToString(confSum[:])[:16])
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}
