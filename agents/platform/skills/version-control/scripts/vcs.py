@@ -28,7 +28,7 @@ vocabulary was drawn from.
 
 Every subcommand prints one JSON object on stdout.
 
-    vcs.py clone https://github.com/dshnayder-org/infra
+    vcs.py clone https://github.com/acme/infra
     vcs.py log -n 20 -- inventory/clusters.yaml
     vcs.py annotate scripts/rotate-keys.sh
     vcs.py branch fix/replicas
@@ -191,7 +191,7 @@ def _matches(session: dict, spec: str) -> bool:
     """Whether this working copy is the one `spec` names.
 
     Matched against what the caller typed and against what the broker resolved
-    it to, so `infra`, `dshnayder-org/infra` and the full URL all find the same
+    it to, so `infra`, `acme/infra` and the full URL all find the same
     copy. Deliberately not re-derived here: parsing a URL into a forge and a
     repository is the broker's job, and a second parser in this container is a
     second thing to keep in agreement.

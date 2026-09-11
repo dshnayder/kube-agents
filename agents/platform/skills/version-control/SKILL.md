@@ -78,7 +78,7 @@ One remote call, then local work:
 ```bash
 V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
 # Remote: one call, one bundle. Its JSON carries `path` — cd there.
-python3 $V clone https://github.com/dshnayder-org/infra
+python3 $V clone https://github.com/acme/infra
 
 # Local, in that working copy. No network, no credential, no vcs.py.
 # The alias is the point: bare `git` is a different, credentialed program.
