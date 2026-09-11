@@ -1424,9 +1424,12 @@ agents/platform/scripts/
     credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential
     registry.py            # AVAILABLE, build_forges(config)
     github/
-      __init__.py  forge.py  translate.py  errors.py  fixtures/
+      __init__.py  forge.py  translate.py  errors.py
     gitlab/
-      __init__.py  forge.py  translate.py  fixtures/
+      __init__.py  forge.py  translate.py
+  testdata/
+    providers/
+      github/  gitlab/       # recorded API responses the contract harness replays
 ```
 
 The split is by _who owns the decision_. `providers/` holds everything a forge
@@ -1537,13 +1540,14 @@ every change rather than in a nightly.
 ### The contract test, parameterised
 
 The verb tests are one suite parameterised over `AVAILABLE`, not a file per
-forge. Each forge package supplies a `fixtures/` directory of recorded API
-responses — the JSON its host actually returns for each of the eight verbs — and
-the suite reads them.
+forge. Each forge supplies a directory of recorded API responses — the JSON its
+host actually returns for each of the eight verbs — under
+`testdata/providers/<forge name>/`, beside the tests and outside the package the
+images ship, and the suite finds it by the forge's name.
 
 That inverts where the cost falls. A per-forge test file means holding a new
 forge to the same assertions is a shared-test edit somebody has to remember to
-make; here a new package ships its fixtures and the existing suite picks it up.
+make; here a new forge adds its recordings and the existing suite picks them up.
 The same assertions about normalised shape, about `ForgeUnsupported` for
 unimplemented verbs, about validators rejecting the same inputs, run against it
 without anyone touching a shared test.
