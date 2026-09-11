@@ -798,6 +798,53 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(self.remote_tip("main"), answer["revision"])
         self.assertEqual(list(self.scratch.iterdir()), [])
 
+    def test_publish_refuses_the_default_branch_whatever_target_says(self):
+        """Review finding: the branch/target comparison was bypassable.
+
+        `branch` and `target` are both the caller's fields. Naming any other
+        existing branch as `target` skipped the comparison, set `existing_head`
+        so the base check was skipped too, and left two ancestry checks that a
+        fast-forward of the shared branch satisfies. The broker now asks the
+        remote which branch is its default and refuses that one outright.
+        """
+        git(self.seed, "checkout", "--quiet", "-b", "release")
+        git(self.seed, "push", "--quiet", "origin", "release")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        self.commit_in(work, "README.md", "straight to main\n", "no branch")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "main",
+                    "target": "release",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "main", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+        self.assertEqual(self.remote_tip("main"), answer["revision"])
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_publish_still_reaches_a_non_default_branch_of_the_callers_own(self):
+        # The guard is about the default branch only; a topic branch that
+        # already exists on the remote is the second-publish case and must
+        # keep working.
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        first = self.commit_in(work, "a.txt", "a\n", "a")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "topic",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), first)
+
     def test_scratch_names_come_from_a_counter_not_from_the_caller(self):
         first = self.broker._scratch("clone")
         second = self.broker._scratch("clone")

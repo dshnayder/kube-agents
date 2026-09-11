@@ -406,13 +406,19 @@ class VcsBroker:
     def publish(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Take the caller's revisions as a bundle and put them on the remote.
 
-        Five checks stand between the bundle and the remote, and each one exists
+        Six checks stand between the bundle and the remote, and each one exists
         because the objects came from the sandbox:
 
-        The branch must not be the target. Every ancestry check below passes for
-        a publish onto the branch the copy was cloned from, because that is a
-        fast-forward; none of them can see that the branch being fast-forwarded
-        is the shared one.
+        The branch must not be the remote's default branch, whatever `target`
+        says. Every ancestry check below passes for a fast-forward of the
+        shared branch, and both `branch` and `target` are fields the sandbox
+        chose -- so a guard that only compared the two was defeated by naming
+        any other existing branch as the target. The default branch is the one
+        fact about "shared" the broker can learn from the remote itself.
+
+        The branch must not be the target either. That closes the same door for
+        a copy cloned from a branch that is not the default, where the broker
+        has nothing to check against but what the caller declared.
 
         The bundle must carry exactly the branch it claims. A bundle holding a
         second ref would publish something the caller did not declare, and a
@@ -443,7 +449,9 @@ class VcsBroker:
             # that the branch being fast-forwarded is the shared one. The
             # sandbox client refuses this before it builds the bundle; the
             # broker does not trust it to, for the same reason validate_branch
-            # runs twice.
+            # runs twice. On its own this check is not enough -- `target` is
+            # the caller's field too -- which is why the default-branch check
+            # below asks the remote rather than the request.
             raise WorkspaceError(
                 f"branch and target are both {branch}, so this publish would "
                 "write to the branch it was cloned from. Publish a branch of "
@@ -474,6 +482,23 @@ class VcsBroker:
             bundle.write_bytes(blob)
             git(root, "init", "--quiet")
             git(root, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
+            # Which branch the remote calls its default, from the remote and
+            # not from the request. Review found the `branch == target` check
+            # above bypassed by naming any other existing branch as `target`:
+            # `existing_head` is then set, the base check is skipped, both
+            # ancestry checks hold for a fast-forward, and the push lands on
+            # the shared branch with no proposal. The remote's HEAD is the one
+            # notion of "shared" the broker can establish for itself; a
+            # protected branch that is not the default is the forge's own
+            # branch protection to enforce, and this does not claim otherwise.
+            default = self._default_branch_of_remote(git, root)
+            if default and branch == default:
+                raise WorkspaceError(
+                    f"{branch} is the remote's default branch. Publish a branch "
+                    "of your own and open a proposal onto it.",
+                    status=409,
+                    code="PROTECTED_BRANCH",
+                )
             # The target first, so the ancestry checks below have something to
             # be about.
             git(root, "fetch", "--quiet", "--no-tags", "origin", target)
@@ -590,6 +615,22 @@ class VcsBroker:
             bundle.unlink(missing_ok=True)
             _remove_tree(root)
         return bound.stamp({"branch": branch, "revision": tip})
+
+    @staticmethod
+    def _default_branch_of_remote(git: Callable, root: Path) -> str:
+        """The branch the remote's HEAD points at, or "" if it says nothing.
+
+        `ls-remote --symref` prints `ref: refs/heads/<name>\tHEAD` first when
+        the remote advertises a symbolic HEAD. A remote that advertises none --
+        an empty repository, or a server that hides it -- yields "", and the
+        caller treats that as "no default to protect" rather than as a
+        refusal, because there is nothing to compare against.
+        """
+        listed = git(root, "ls-remote", "--symref", "origin", "HEAD", check=False)
+        for line in (listed.stdout or "").splitlines():
+            if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
+                return line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
+        return ""
 
     @staticmethod
     def _is_ancestor(

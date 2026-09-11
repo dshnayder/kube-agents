@@ -526,7 +526,13 @@ default clone, edit, commit, publish sequence writing to the shared line of
 development with nothing in the protocol objecting. `vcs.py` refuses it before
 it builds the bundle so the message costs no round trip, and the broker refuses
 it again with `TARGET_IS_BRANCH` rather than trusting the client that sent the
-objects.
+objects. That comparison alone is not enough, because `target` is the client's
+field too: naming any other existing branch as the target would skip it and
+leave two ancestry checks that a fast-forward of the shared branch satisfies.
+So the broker also asks the remote which branch is its default and refuses a
+publish to that branch outright, `PROTECTED_BRANCH`, whatever the request says
+the target is. A protected branch that is not the default is the forge's own
+branch protection to enforce; the broker does not claim to know it.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
 and nothing materialises a working tree, so a `.gitattributes`, a hook, or a
@@ -763,8 +769,8 @@ another for no property gained.
 | `issue-create`                       | `{repository, title, body?, labels?}`                      | `{issue}`                                             |
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
-`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED` and
-`TARGET_IS_BRANCH`, 502 `GIT_FAILED`.
+`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+`TARGET_IS_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool
