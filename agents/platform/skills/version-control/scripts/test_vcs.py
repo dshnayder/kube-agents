@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -682,6 +683,39 @@ class BrokerCallTest(unittest.TestCase):
         self.assertEqual(str(caught.exception), "fix/x has diverged")
 
 
+    def test_an_unreachable_broker_is_a_json_error_not_a_traceback(self):
+        # Review finding: URLError from a refused connect escaped main().
+        error = urllib.error.URLError("connection refused")
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("clone", {})
+        self.assertIn("could not be reached", str(caught.exception))
+
+    def test_a_missing_token_is_a_json_error_not_a_traceback(self):
+        error = vcs.credential_proxy_client.TokenUnavailable("token file is empty")
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("clone", {})
+        self.assertIn("credential is not readable", str(caught.exception))
+
+    def test_a_non_json_answer_is_a_json_error_not_a_traceback(self):
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=ValueError("x")
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs.call("clone", {})
+        self.assertIn("not JSON", str(caught.exception))
+
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):
         with mock.patch.object(vcs, "LOCAL_GIT", str(self.root / "no-such-git")):
@@ -790,6 +824,13 @@ class AbstractionTest(unittest.TestCase):
             with self.subTest(alias=alias):
                 self.assertIn(alias, choices)
                 self.assertIs(choices[alias], choices[concept])
+        # The nested pair SKILL.md advertises too. Review found it missing:
+        # `proposal open` died in argparse with no JSON.
+        for family in ("proposal", "issue"):
+            actions = choices[family]._subparsers._group_actions[0].choices  # noqa: SLF001
+            with self.subTest(alias=f"{family} open"):
+                self.assertIn("open", actions)
+                self.assertIs(actions["open"], actions["create"])
 
 
 if __name__ == "__main__":

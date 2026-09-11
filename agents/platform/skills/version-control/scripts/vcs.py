@@ -5,7 +5,8 @@ Everything that needs the token happens somewhere else. This script talks to
 exactly two things: the sandbox's own git, against a local working copy with no
 remote, and `POST /v1/vcs/*` on the credential broker over loopback. There is no
 third case. No verb here shells out to a network client, none of them names
-GitHub, and nothing in this container can reach a forge.
+GitHub, and the local git has no HTTP transport and no ssh client to exec, so
+nothing this script runs can present a request to a forge.
 
 The shape is symmetric. `clone` asks the broker for a git bundle and unpacks it;
 `publish` bundles the revisions made since that clone and hands them back.
@@ -47,6 +48,7 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.error
 import sys
 import tempfile
 from pathlib import Path
@@ -107,6 +109,28 @@ def call(verb: str, payload: dict) -> dict:
         ) from exc
     except credential_proxy_client.WorkspaceRequestError as exc:
         raise VcsError(exc.payload.get("error", str(exc))) from exc
+    except credential_proxy_client.TokenUnavailable as exc:
+        # The projected token is missing or empty -- the kubelet mid-rewrite,
+        # or a volume that was never projected. Nothing the caller can do from
+        # here except retry; saying so as JSON keeps the contract every other
+        # failure keeps.
+        raise VcsError(
+            f"the broker credential is not readable: {exc}. Retry shortly; "
+            "if it persists the sandbox's token volume is not projected."
+        ) from exc
+    except urllib.error.URLError as exc:
+        # Connection refused or dropped: a restarting broker, or a policy in
+        # the way. HTTP errors never reach here -- vcs_call turns them into
+        # WorkspaceRequestError above -- so this is the transport failing.
+        raise VcsError(
+            f"the broker at {endpoint} could not be reached: {exc.reason}. "
+            "Retry shortly."
+        ) from exc
+    except ValueError as exc:
+        raise VcsError(
+            "the broker answered with something that is not JSON; retry, and "
+            "if it persists the broker is unhealthy."
+        ) from exc
 
 
 # ---- the local working copy ----------------------------------------------
@@ -134,6 +158,10 @@ def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.Completed
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "/bin/false",
+            # `file` only, for the git this script runs. A default rather than
+            # a control -- the design says why an environment setting cannot
+            # be one inside the sandbox; the image's deletions are the control.
+            "GIT_ALLOW_PROTOCOL": "file",
             "HOME": str(ROOT / ".home"),
         }
     )
@@ -902,7 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     actions = proposal.add_subparsers(dest="action", required=True)
 
-    create = actions.add_parser("create")
+    create = actions.add_parser("create", aliases=["open"])
     create.add_argument("--title", required=True)
     create.add_argument("--body", default="")
     create.add_argument("--source", help="the branch to merge (default: current)")
@@ -942,7 +970,7 @@ def build_parser() -> argparse.ArgumentParser:
     iview.add_argument("-n", "--limit", type=int)
     repo_option(iview).set_defaults(run=verb_issue_view)
 
-    icreate = iactions.add_parser("create")
+    icreate = iactions.add_parser("create", aliases=["open"])
     icreate.add_argument("--title", required=True)
     icreate.add_argument("--body", default="")
     icreate.add_argument("--labels", nargs="*")
