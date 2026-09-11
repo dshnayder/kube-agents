@@ -26,10 +26,11 @@ else. You do not need `vcs.py` for any of this and it is faster without it.
 
 The full path matters: plain `git` on this machine is a different program that
 runs elsewhere and holds a credential. The one named above holds none and
-cannot reach a network at all — the remote-transport helpers are not in the
-image, so an `https://` URL fails with `'remote-https' is not a git command`.
-Seeing that message means you used the right git and asked it for the one thing
-it does not do; the answer is a `vcs.py` verb, not the other binary.
+cannot reach a forge: its HTTP transport helpers are not in the image, so an
+`https://` URL fails with `'remote-https' is not a git command`, and there is
+no ssh client, so an `ssh://` URL fails with `cannot run ssh`. Seeing either
+message means you used the right git and asked it for the one thing it does not
+do; the answer is a `vcs.py` verb, not the other binary.
 
 `vcs.py` also offers `log`, `show`, `annotate`, `files`, `grep`, `diff`,
 `status`, `branch` and `commit` as thin wrappers over that same local git, for

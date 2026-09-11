@@ -121,23 +121,41 @@ RUN pip install --no-cache-dir pyyaml requests
 # still owning the name, an agent answered 8 of 60 read probes through the shim
 # alone and issued 4 credentialed clones through it.
 #
-# What will make putting this git on a PATH safe is that it has no transport,
-# and that property is established now so the later change is a PATH edit and
-# nothing more. The
-# remote helpers are the whole of git's ability to reach a host -- `git fetch`,
-# `git clone` and `git push` against an https URL all run git-remote-https --
-# and they are separate executables in /usr/lib/git-core, so removing them
-# leaves a git that reads and writes local repositories and cannot dial out.
-# That is true of the four that reach a network -- git-remote-http is the binary
-# and ftp, ftps and https are symlinks to it -- and it is not true of ext and fd,
-# whose entries in that directory are symlinks to `git` itself because both are
-# builtins. Deleting those two changes nothing: git dispatches a builtin from
-# its own table without consulting the filesystem. What actually stops `ext::`
-# is git's protocol allowlist, which has defaulted `protocol.ext.allow` to
-# `never` since 2.12, and the probe below asserts that refusal by its own
-# message rather than pretending an `rm` produced it. `fd::` needs a descriptor
-# the parent already opened, so it reaches whatever the caller could reach
-# anyway and opens nothing new.
+# What will make putting this git on a PATH safe is that it cannot present a
+# request to a forge, and that property is established now so the later change
+# is a PATH edit and nothing more. Git reaches a network three ways and each
+# gets its own answer; docs/designs/version-control-support.md §3 is the
+# argument, this is the mechanism.
+#
+# The HTTP family goes by remote helper: `git fetch`, `git clone` and `git push`
+# against an https URL all run git-remote-https, a separate executable in
+# /usr/lib/git-core -- git-remote-http is the binary and ftp, ftps and https are
+# symlinks to it -- so deleting it removes the capability. ext and fd are not
+# like that: their entries in that directory are symlinks to `git` itself
+# because both are builtins, dispatched from git's own table without consulting
+# the filesystem. What stops `ext::` is git's protocol allowlist, where
+# `protocol.ext.allow` has defaulted to `never` since 2.12, and the probe below
+# asserts that refusal by its own message rather than pretending an `rm`
+# produced it. `fd::` needs a descriptor the parent already opened, so it
+# reaches whatever the caller could reach anyway and opens nothing new.
+#
+# `ssh://` is dialled from git's own code by exec'ing an ssh *client*, and
+# openssh-server brings one in as a dependency. Review caught an earlier version
+# of this layer claiming "cannot dial out" with that client still present. It
+# is deleted here -- ssh, scp, sftp and the agent tools; ssh-keygen stays for
+# the entrypoint and sftp-server stays for sshd -- and the guard asserts the
+# absence the same way it asserts git's placement, because an unrelated package
+# pulling openssh-client back in would restore the route silently. The control
+# is a deletion and not GIT_ALLOW_PROTOCOL or protocol.*.allow on purpose: inside
+# the sandbox the agent owns its environment and its config files, so a setting
+# is a default it can turn off, and only the absence of a file survives that.
+#
+# `git://` opens port 9418 from inside git and cannot be disarmed by removing a
+# file. It is left, by the design's own decision: the anonymous daemon protocol
+# is read-only, spends no credential, and no forge in scope serves writes over
+# it, so it buys an agent nothing a plain outbound socket would not -- which is
+# a question about egress from the sandbox, answered by the network policy, and
+# not about this binary.
 #
 # The four server-side helpers in /usr/bin go too, but only for tidiness. They
 # are what a *remote* runs, and `git upload-pack` is a builtin of the front-end
@@ -167,6 +185,7 @@ RUN apt-get update && \
     mkdir -p /opt/vcs/libexec && \
     mv /usr/bin/git /opt/vcs/libexec/git && \
     ln -sf /opt/vcs/libexec/git /usr/lib/git-core/git && \
+    rm -f /usr/bin/ssh /usr/bin/scp /usr/bin/sftp /usr/bin/ssh-add /usr/bin/ssh-agent && \
     rm -f /usr/bin/git-receive-pack /usr/bin/git-shell \
           /usr/bin/git-upload-archive /usr/bin/git-upload-pack && \
     rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
@@ -184,6 +203,18 @@ RUN apt-get update && \
             exit 1; \
         fi; \
     done && \
+    for client in ssh scp sftp; do \
+        if command -v "${client}" >/dev/null 2>&1; then \
+            echo "sandbox still has an ssh client: ${client}" >&2; \
+            exit 1; \
+        fi; \
+    done && \
+    if ! /opt/vcs/libexec/git ls-remote ssh://example.invalid/x 2>&1 \
+         | grep -qiE "cannot run ssh|ssh: No such file|unable to fork|ssh: not found"; then \
+        echo "sandbox git still dials ssh://" >&2; \
+        /opt/vcs/libexec/git ls-remote ssh://example.invalid/x >&2 2>&1 || true; \
+        exit 1; \
+    fi && \
     if ! /opt/vcs/libexec/git ls-remote 'ext::sh -c whoami' 2>&1 \
          | grep -q "transport 'ext' not allowed"; then \
         echo "sandbox git does not refuse the ext transport" >&2; \
@@ -191,7 +222,11 @@ RUN apt-get update && \
     fi && \
     /opt/vcs/libexec/git init -q /tmp/vcs-guard && \
     /opt/vcs/libexec/git ls-remote file:///tmp/vcs-guard >/dev/null && \
-    rm -rf /tmp/vcs-guard
+    /opt/vcs/libexec/git -C /tmp/vcs-guard -c user.name=g -c user.email=g@x commit -q --allow-empty -m g && \
+    /opt/vcs/libexec/git -C /tmp/vcs-guard bundle create /tmp/vcs-guard.bundle HEAD master 2>/dev/null \
+      || /opt/vcs/libexec/git -C /tmp/vcs-guard bundle create /tmp/vcs-guard.bundle HEAD main && \
+    /opt/vcs/libexec/git clone -q /tmp/vcs-guard.bundle /tmp/vcs-guard-clone && \
+    rm -rf /tmp/vcs-guard /tmp/vcs-guard.bundle /tmp/vcs-guard-clone
 
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for

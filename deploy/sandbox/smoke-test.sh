@@ -519,8 +519,15 @@ check "the local git is a real git" "git version" \
 # /usr/lib/git-core/git exists, which it does here. The Dockerfile guard asserts
 # the same thing at build time; this asserts it of the image that was actually
 # pulled, over the transport the agent uses.
-check "and cannot reach a network" "is not a git command" \
+check "and has no https transport" "is not a git command" \
   "$("${SSH[@]}" '/opt/vcs/libexec/git ls-remote https://example.invalid/x.git' 2>&1)"
+# ssh:// has no helper to delete; what closes it is that the image ships no ssh
+# client. Asserted as an absence, the file-shaped control the design asks for,
+# and then by git's own failure to exec one.
+check "and has no ssh client" "absent" \
+  "$("${SSH[@]}" 'command -v ssh >/dev/null 2>&1 && echo present || echo absent' 2>&1)"
+check "so ssh:// goes nowhere" "cannot run ssh" \
+  "$("${SSH[@]}" '/opt/vcs/libexec/git ls-remote ssh://example.invalid/x' 2>&1)"
 # The other half of the check above: a git broken outright also fails to reach a
 # network, and would pass it. This is what says the disarming was surgical.
 check "but still reads a local repository" "rc=0" \
