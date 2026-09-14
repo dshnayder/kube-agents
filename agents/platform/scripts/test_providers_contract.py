@@ -308,7 +308,10 @@ class ContractTest(unittest.TestCase):
                     # may precede it with a read.
                     writes = [c for c in api.calls if c[0] in {"POST", "PATCH", "PUT"}]
                     self.assertTrue(writes, "no write was made")
-                    method, path, params, body, _raw = writes[0]
+                    # The write that carried the prose, wherever it sits: an
+                    # update applies its labels before it patches the text.
+                    carrying = [c for c in writes if prose and prose in [str(v) for v in (c[3] or {}).values()]]
+                    method, path, params, body, _raw = (carrying or writes)[0]
                     self.assertIn(method, {"POST", "PATCH", "PUT"})
                     self.assertIsInstance(body, dict)
                     if prose:

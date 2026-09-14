@@ -6,6 +6,14 @@
     ]
   },
   "responses": [
+    [
+      {
+        "name": "kind/bug"
+      },
+      {
+        "name": "status:in-progress"
+      }
+    ],
     {
       "number": 719,
       "state": "open",
@@ -36,14 +44,6 @@
       "closed_at": null,
       "html_url": "https://github.com/acme/infra/issues/719",
       "comments": 4
-    },
-    [
-      {
-        "name": "kind/bug"
-      },
-      {
-        "name": "status:in-progress"
-      }
-    ]
+    }
   ]
 }

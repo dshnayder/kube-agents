@@ -11,6 +11,17 @@
     ]
   },
   "responses": [
+    [
+      {
+        "name": "agent:audit",
+        "color": "0e8a16"
+      },
+      {
+        "name": "kind/bug",
+        "color": "d73a4a"
+      }
+    ],
+    null,
     {
       "number": 4321,
       "state": "open",
@@ -37,17 +48,6 @@
         "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
       },
       "author_association": "CONTRIBUTOR"
-    },
-    [
-      {
-        "name": "agent:audit",
-        "color": "0e8a16"
-      },
-      {
-        "name": "kind/bug",
-        "color": "d73a4a"
-      }
-    ],
-    null
+    }
   ]
 }

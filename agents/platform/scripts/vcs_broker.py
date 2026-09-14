@@ -736,7 +736,13 @@ class VcsBroker:
         login = payload.get("login")
         if login is not None and not isinstance(login, str):
             raise WorkspaceError("login must be a string")
-        subject = (login or viewer or "").strip()
+        # `canWrite` is answered for a login the caller named, never for the
+        # credential itself: on GitHub an App is not a collaborator, so the
+        # permission endpoint answers 404 for the install's own bot login and
+        # would report the account that just pushed as unable to write. The
+        # callers that ask this ask about comment authors; the credential's own
+        # standing is what `publish` proves by doing it.
+        subject = (login or "").strip()
         can_write = bound.forge.can_write(bound.api, bound.repo, subject) if subject else None
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 

@@ -1095,17 +1095,18 @@ class CollaborationTest(unittest.TestCase):
         self.assertTrue(any("pulls/9/comments" in p for p in paths))
         self.assertTrue(any("pulls/9/reviews" in p for p in paths))
 
-    def test_proposal_update_patches_then_applies_labels(self):
-        broker, recorder = self.broker({"number": 9, "state": "open"}, [{"name": "a"}], None)
+    def test_proposal_update_applies_labels_then_patches(self):
+        broker, recorder = self.broker([{"name": "a"}], None, {"number": 9, "state": "open"})
         answer = broker.proposal_update(
             {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
         )
         self.assertEqual(answer["proposal"]["number"], 9)
+        # Labels land first so the PATCH's answer is the proposal as it now stands.
         methods = [call[3] for call in recorder.calls]
-        self.assertEqual(methods, ["PATCH", "POST", "DELETE"])
-        self.assertEqual(recorder.calls[0][4], "repos/acme/infra/pulls/9")
-        self.assertEqual(json.loads(recorder.stdin[0])["title"], "new")
-        self.assertEqual(recorder.calls[2][4], "repos/acme/infra/issues/9/labels/b")
+        self.assertEqual(methods, ["POST", "DELETE", "PATCH"])
+        self.assertEqual(recorder.calls[1][4], "repos/acme/infra/issues/9/labels/b")
+        self.assertEqual(recorder.calls[2][4], "repos/acme/infra/pulls/9")
+        self.assertEqual(json.loads(recorder.stdin[2])["title"], "new")
 
     def test_issue_close_carries_a_neutral_reason(self):
         broker, recorder = self.broker({"number": 5, "state": "closed"})
@@ -1153,8 +1154,14 @@ class CollaborationTest(unittest.TestCase):
         broker, recorder = self.broker(status, {"permission": "write"})
         answer = broker.identity({"repository": "acme/infra"})
         self.assertEqual(answer["identity"]["login"], "kube-agents[bot]")
-        self.assertTrue(answer["identity"]["canWrite"])
+        # The credential's own standing is not asked of the permission endpoint
+        # (an App is not a collaborator there): unknown, and one call made.
+        self.assertIsNone(answer["identity"]["canWrite"])
         self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        self.assertEqual(len(recorder.calls), 1)
+        broker, recorder = self.broker(status, {"permission": "write"})
+        answer = broker.identity({"repository": "acme/infra", "login": "kube-agents[bot]"})
+        self.assertTrue(answer["identity"]["canWrite"])
         self.assertIn("collaborators/kube-agents%5Bbot%5D/permission", recorder.calls[1][4])
         # A login nobody knows is a definitive no; a broker fault is unknown.
         gone = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")

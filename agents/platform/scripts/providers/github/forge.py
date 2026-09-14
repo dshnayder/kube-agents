@@ -209,8 +209,11 @@ class GitHubForge(Forge):
             body["body"] = validate_text(payload.get("body"), "body", required=False)
         # One PATCH whatever was given, so the answer is always the proposal
         # as it now stands; GitHub returns it unchanged for an empty patch.
-        node = api("PATCH", f"repos/{repo}/pulls/{number}", body=body)
+        # Labels first, then the PATCH: the answer is the proposal as it now
+        # stands, and a read taken before the labels landed would report them
+        # missing -- seen live on the first run of this verb.
         self._labels(api, repo, number, payload)
+        node = api("PATCH", f"repos/{repo}/pulls/{number}", body=body)
         return {"proposal": translate.proposal(node)}
 
     def proposal_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
@@ -326,8 +329,11 @@ class GitHubForge(Forge):
             body["title"] = validate_text(payload.get("title"), "title").strip()
         if payload.get("body") is not None:
             body["body"] = validate_text(payload.get("body"), "body", required=False)
-        node = api("PATCH", f"repos/{repo}/issues/{number}", body=body)
+        # Labels first, then the PATCH: the answer is the issue as it now
+        # stands, and a read taken before the labels landed would report them
+        # missing -- seen live on the first run of this verb.
         self._labels(api, repo, number, payload)
+        node = api("PATCH", f"repos/{repo}/issues/{number}", body=body)
         return {"issue": translate.issue(node)}
 
     def issue_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
