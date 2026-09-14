@@ -71,9 +71,14 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 ## When NOT to Use
 
-- **A one-off read of a large upstream repository.** `clone` pulls a whole
-  branch's history and there is no shallow option; **inspect-repository** pages
-  a shallow view and is cheaper for "how does upstream implement this".
+- **A repository this install does not manage.** Every verb that spends the
+  credential, `clone` and the list/view verbs included, is refused for a
+  repository outside the install's managed list, because the credential is
+  minted per repository; only `capabilities` answers for one. For "how does
+  upstream implement this", use **inspect-repository**.
+- **A one-off read of a large repository.** `clone` pulls a whole branch's
+  history and there is no shallow option; **inspect-repository** pages a
+  shallow view and is cheaper.
 - **The GitOps write flow that already gave you a workspace.** `fleet-audit`
   and `submit-suggestion` own theirs; do not open a second view.
 

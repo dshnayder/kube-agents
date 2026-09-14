@@ -3723,12 +3723,11 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
-    def test_a_read_verb_is_not_gated_on_the_managed_list(self):
-        # Deliberately, and for the reason `require_managed_workspace` gives
-        # about the content workspace's `open`: reading a repository this
-        # install does not write to is something the agent is supposed to be
-        # able to do. What this asserts is that the gate above did not
-        # accidentally cover the read half.
+    def test_capabilities_is_the_one_verb_an_unmanaged_repository_can_be_asked(self):
+        # The handler's gate covers writes only, so a read reaches its verb --
+        # and `capabilities` is the one verb that never asks for the
+        # credential, so it is the one that actually answers for a repository
+        # this install does not manage.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
             return_value=frozenset({"acme/managed"}),
@@ -3740,6 +3739,29 @@ class VcsRouteTest(unittest.TestCase):
             )
         self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
         self.assertNotEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_credentialed_read_of_an_unmanaged_repository_is_refused_by_the_credential(self):
+        # Review finding: the comment and the test above used to say reads
+        # "stay open". On the shipped forge they do not: every verb that spends
+        # the credential makes it current first, the refresh is where the
+        # managed list is asked (the token is minted per managed repository),
+        # and `BrokeredCredential.ensure` re-raises exactly that refusal. So a
+        # read of an unmanaged repository is a 403 from the credential side,
+        # before any forge call, and this pins that rather than the wish.
+        def refuse(provider, repository):
+            raise PermissionError(f"{repository} is not a repository this install manages")
+
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/managed"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/issue-view",
+                {"repository": "https://github.com/acme/not-ours", "number": 1},
+                self.broker(refresh=refuse),
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
     def test_every_write_verb_is_covered_by_the_gate(self):
         # Named against the route table rather than a hand-written list, so a

@@ -2336,6 +2336,18 @@ case that will arrive first — are named in
 
 ---
 
+**Reads of repositories the install does not manage.** The broker's own gate
+covers write verbs, and the intent is that reading a repository this install
+does not write to should work — a public upstream, read with no credential. On
+GitHub it does not: every verb that spends the credential makes it current
+first, the credential is minted per managed repository, and the refresh refuses
+an unmanaged one before any call is made, so `clone` and the list and view verbs
+refuse it as surely as `publish` does; only `capabilities` answers. Opening those
+reads needs a credential-less path — a clone with no token, a read API call with
+none — that the provider can take when the repository is public, which is a
+change to the credential strategy and not to the verbs, and is not designed
+here.
+
 ## 11. Open questions
 
 1. **Whether one field can name the token's scope boundary on both forges.** On

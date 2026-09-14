@@ -698,12 +698,21 @@ class VcsBroker:
 # a verb added to one and not the other is the mistake this placement is meant
 # to make loud.
 #
-# The read verbs are deliberately absent rather than overlooked. `clone`,
-# `capabilities` and the four list/view verbs spend the credential too, and they
-# stay open for the reason `require_managed_workspace` gives about the content
-# workspace's `open`: reading a repository this install does not write to is a
-# thing the agent is supposed to be able to do, and `inspect-repository` is
-# built on it. The managed list is a write control, not a visibility one.
+# The read verbs are absent from this set on purpose, and what that buys today
+# is narrower than it reads. This set is the HTTP layer's gate, and it covers
+# writes: a write against an unmanaged repository is refused here, before a
+# verb runs. The reads are not gated *here* -- but every verb that spends the
+# credential asks for it through `BrokeredCredential.ensure`, and on the one
+# forge this install ships the credential is minted per managed repository, so
+# the refresh refuses an unmanaged one with the same 403 before any call is
+# made. In practice, then, `capabilities` is the only verb an unmanaged
+# repository can be asked, and `clone`, `proposal-list/view` and
+# `issue-list/view` refuse it too. The intent that reads of a repository this
+# install does not write to should work -- a public upstream, read with no
+# credential at all -- is real and is not implemented by this set; it needs a
+# credential-less read path, which the design lists as open. Until then the
+# managed list is, in effect, a visibility control as well as a write one on
+# GitHub, and the test beside this classification says so.
 WRITE_VERBS = frozenset(
     {
         "publish",
