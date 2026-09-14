@@ -562,6 +562,12 @@ def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]
     neither is a capture failure, which the verifier reports as
     ``status="error"`` rather than grading.
     """
+    # No card, no capture: a router that answered from memory leaves nothing
+    # to read, and grading an empty list would let a forbidden-pattern check
+    # pass on a run where no worker ran -- silence as a pass. Review caught
+    # this returning [] here.
+    if not task_ids:
+        return None
     commands: list[dict[str, str]] = []
     for tid in task_ids:
         path = _shell_quote(f"{_LOGS_DIR}/{tid}.log")

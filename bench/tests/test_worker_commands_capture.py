@@ -57,6 +57,20 @@ def test_an_unreadable_log_is_none_so_the_check_errors_rather_than_grades(monkey
     assert harness._worker_commands(["t_gone"], 5.0) is None
 
 
+def test_no_delegated_card_means_nothing_captured_not_an_empty_capture(monkeypatch):
+    # Review finding: a run that delegated nothing reached _settle with no
+    # task ids and recorded [], which graded as "0 commands" -- a forbidden-only
+    # check passed on it. None is what the verifier reports as status=error.
+    calls = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")
+    assert harness._worker_commands([], 5.0) is None
+    assert calls == []
+    result = AgentResult(output="42", trajectory=[])
+    result.metadata["final_message"] = "42"
+    harness.KubeAgentsHarness._settle(result, [], [])
+    assert result.metadata["worker_commands"] is None
+
+
 def test_an_absent_log_contributes_nothing_but_is_not_a_failure(monkeypatch):
     # The card never had a worker log (a router-only card): captured, empty.
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "__NO_WORKER_LOG__\n")
