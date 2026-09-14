@@ -447,6 +447,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \

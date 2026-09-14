@@ -41,6 +41,7 @@ sys.path.insert(
 )
 
 import vcs  # noqa: E402
+import vcs_client  # noqa: E402
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Test",
@@ -166,7 +167,7 @@ class VcsTestCase(unittest.TestCase):
             ("LOCAL_GIT", REAL_GIT),
             ("call", self.broker),
         ):
-            patch = mock.patch.object(vcs, attribute, value)
+            patch = mock.patch.object(vcs_client, attribute, value)
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -182,7 +183,7 @@ class VcsTestCase(unittest.TestCase):
         return answer
 
     def tree(self) -> Path:
-        return Path(vcs.all_sessions()[0]["path"])
+        return Path(vcs_client.all_sessions()[0]["path"])
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,7 @@ class CloneTest(VcsTestCase):
         first = self.clone()
         second = self.clone()
         self.assertEqual(first["path"], second["path"])
-        self.assertEqual(len(vcs.all_sessions()), 1)
+        self.assertEqual(len(vcs_client.all_sessions()), 1)
 
     def test_a_second_clone_refuses_to_discard_work(self):
         # It used to replace the tree silently, so a commit made here and never
@@ -237,7 +238,7 @@ class CloneTest(VcsTestCase):
         second = self.clone("--force")
         self.assertEqual(first["path"], second["path"])
         self.assertFalse((Path(second["path"]) / "stale.txt").exists())
-        self.assertEqual(len(vcs.all_sessions()), 1)
+        self.assertEqual(len(vcs_client.all_sessions()), 1)
 
     def test_the_bundle_file_is_not_left_behind(self):
         self.clone()
@@ -259,7 +260,7 @@ class CloneTest(VcsTestCase):
 
     def test_the_base_revision_is_what_the_broker_handed_out(self):
         self.clone()
-        self.assertEqual(vcs.all_sessions()[0]["baseRevision"], self.origin_head)
+        self.assertEqual(vcs_client.all_sessions()[0]["baseRevision"], self.origin_head)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +457,7 @@ class WriteTest(VcsTestCase):
         self.change("a.txt", "a\n")
         self.run_vcs("commit", "-m", "a")
         self.run_vcs("publish")
-        first_base = vcs.all_sessions()[0]["published"]["fix/replicas"]
+        first_base = vcs_client.all_sessions()[0]["published"]["fix/replicas"]
         self.assertNotEqual(first_base, self.origin_head)
         self.change("b.txt", "b\n")
         self.run_vcs("commit", "-m", "b")
@@ -474,7 +475,7 @@ class WriteTest(VcsTestCase):
         self.change("a.txt", "a\n")
         self.run_vcs("commit", "-m", "a")
         self.run_vcs("publish")
-        first_tip = vcs.all_sessions()[0]["published"]["fix/one"]
+        first_tip = vcs_client.all_sessions()[0]["published"]["fix/one"]
 
         self.run_vcs("branch", "fix/two")
         self.change("b.txt", "b\n")
@@ -486,7 +487,7 @@ class WriteTest(VcsTestCase):
         self.assertEqual(payload["baseRevision"], self.origin_head)
         self.assertNotEqual(payload["baseRevision"], first_tip)
         # And the first branch keeps its own answer.
-        self.assertEqual(vcs.all_sessions()[0]["published"]["fix/one"], first_tip)
+        self.assertEqual(vcs_client.all_sessions()[0]["published"]["fix/one"], first_tip)
 
     def test_publish_refuses_when_there_is_nothing_new(self):
         code, answer = self.run_vcs("publish")
@@ -504,7 +505,7 @@ class WriteTest(VcsTestCase):
         self.assertIn("moved on", answer["error"])
         self.assertEqual([p.name for p in self.root.glob("*.bundle")], [])
         # And the base is not advanced by a publish that did not happen.
-        self.assertEqual(vcs.all_sessions()[0]["baseRevision"], self.origin_head)
+        self.assertEqual(vcs_client.all_sessions()[0]["baseRevision"], self.origin_head)
 
     def test_discard_removes_the_copy_and_its_session(self):
         path = self.tree()
@@ -512,7 +513,7 @@ class WriteTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(answer["removed"], str(path))
         self.assertFalse(path.exists())
-        self.assertEqual(vcs.all_sessions(), [])
+        self.assertEqual(vcs_client.all_sessions(), [])
         # Nothing is released on the credential side because nothing was held.
         self.assertEqual(self.broker.calls, [])
 
@@ -548,9 +549,9 @@ class SessionTest(VcsTestCase):
 
     def test_two_copies_and_no_repo_asks_which(self):
         self.clone()
-        second = dict(vcs.all_sessions()[0])
+        second = dict(vcs_client.all_sessions()[0])
         second.update({"repo": "acme/other", "spec": "acme/other"})
-        vcs.save_session(second)
+        vcs_client.save_session(second)
         code, answer = self.run_vcs("log")
         self.assertEqual(code, 1)
         self.assertIn("--repo", answer["error"])
@@ -690,7 +691,7 @@ class BrokerCallTest(unittest.TestCase):
     def test_without_an_endpoint_the_error_says_where_this_runs(self):
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("shell sandbox", str(caught.exception))
 
     def test_a_broker_without_the_routes_is_named_as_an_old_image(self):
@@ -700,29 +701,29 @@ class BrokerCallTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client,
+            vcs_client.credential_proxy_client,
             "vcs_call",
-            side_effect=vcs.credential_proxy_client.WorkspaceUnavailable(
+            side_effect=vcs_client.credential_proxy_client.WorkspaceUnavailable(
                 "VCS_UNAVAILABLE"
             ),
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("older than this skill", str(caught.exception))
         self.assertNotIn("turned off", str(caught.exception))
 
     def test_a_request_error_surfaces_the_broker_s_own_wording(self):
-        error = vcs.credential_proxy_client.WorkspaceRequestError(
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "publish failed",
             payload={"error": "fix/x has diverged", "code": "BRANCH_DIVERGED", "detail": "at 1234abcd"},
         )
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("publish", {})
+                vcs_client.call("publish", {})
         self.assertEqual(str(caught.exception), "fix/x has diverged")
         # Review finding: the code and detail SKILL.md tells the agent to act on
         # were stripped here. They travel, and main() prints them.
@@ -733,16 +734,16 @@ class BrokerCallTest(unittest.TestCase):
         )
 
     def test_main_prints_the_refusal_code_when_the_broker_sent_one(self):
-        error = vcs.credential_proxy_client.WorkspaceRequestError(
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "refused", payload={"error": "main is the remote's default branch.", "code": "PROTECTED_BRANCH"}
         )
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            vcs, "ROOT", Path(tmp)
+            vcs_client, "ROOT", Path(tmp)
         ), mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ), redirect_stdout(out):
             code = vcs.main(["capabilities", "acme/infra"])
         self.assertEqual(code, 1)
@@ -757,31 +758,31 @@ class BrokerCallTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("could not be reached", str(caught.exception))
 
     def test_a_missing_token_is_a_json_error_not_a_traceback(self):
-        error = vcs.credential_proxy_client.TokenUnavailable("token file is empty")
+        error = vcs_client.credential_proxy_client.TokenUnavailable("token file is empty")
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("credential is not readable", str(caught.exception))
 
     def test_a_non_json_answer_is_a_json_error_not_a_traceback(self):
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=ValueError("x")
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=ValueError("x")
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("not JSON", str(caught.exception))
 
 class SkillTextTest(unittest.TestCase):
@@ -797,9 +798,9 @@ class SkillTextTest(unittest.TestCase):
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):
-        with mock.patch.object(vcs, "LOCAL_GIT", str(self.root / "no-such-git")):
+        with mock.patch.object(vcs_client, "LOCAL_GIT", str(self.root / "no-such-git")):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.local_git(self.root, "status")
+                vcs_client.local_git(self.root, "status")
         self.assertIn("inspect-repository", str(caught.exception))
 
     def test_hooks_are_pointed_at_an_empty_directory(self):
@@ -819,8 +820,8 @@ class LocalGitTest(VcsTestCase):
 
     def test_the_copy_inherits_no_user_configuration(self):
         self.clone()
-        done = vcs.local_git(self.tree(), "config", "--get", "user.email")
-        self.assertEqual(done.stdout.strip(), vcs.AUTHOR_EMAIL)
+        done = vcs_client.local_git(self.tree(), "config", "--get", "user.email")
+        self.assertEqual(done.stdout.strip(), vcs_client.AUTHOR_EMAIL)
 
 
 # ---------------------------------------------------------------------------
@@ -837,18 +838,25 @@ class AbstractionTest(unittest.TestCase):
     """
 
     source = Path(vcs.__file__).read_text()
+    client_source = Path(vcs_client.__file__).read_text()
 
     def test_no_forge_client_is_invoked(self):
         for binary in ("gh", "glab", "hub", "tea"):
             with self.subTest(binary=binary):
-                self.assertNotIn(f'"{binary}"', self.source)
-                self.assertNotIn(f"'{binary}'", self.source)
+                for source in (self.source, self.client_source):
+                    self.assertNotIn(f'"{binary}"', source)
+                    self.assertNotIn(f"'{binary}'", source)
 
     def test_no_forge_host_appears_outside_an_example(self):
         # `github.com` may appear in the help text as something a caller types.
         # It may not appear anywhere a URL is composed, which is what the
         # broker's allowlist decides.
-        body = self.source.split("# ---- the broker")[1]
+        # Both halves: the client after its module docstring (which names a
+        # host as something a caller types), and the front after its imports.
+        body = (
+            self.client_source.split("# ---- the broker")[1]
+            + self.source.split("import argparse", 1)[1]
+        )
         for line in body.splitlines():
             if "github.com" in line or "gitlab.com" in line:
                 self.assertTrue(
