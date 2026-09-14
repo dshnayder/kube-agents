@@ -712,7 +712,7 @@ class VcsBroker:
 # credential at all -- is real and is not implemented by this set; it needs a
 # credential-less read path, which the design lists as open. Until then the
 # managed list is, in effect, a visibility control as well as a write one on
-# GitHub, and the test beside this classification says so.
+# that forge, and the test beside this classification says so.
 WRITE_VERBS = frozenset(
     {
         "publish",
