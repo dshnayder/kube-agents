@@ -1107,7 +1107,27 @@ class CollaborationTest(unittest.TestCase):
             )
         self.assertEqual(caught.exception.status, 422)
         self.assertEqual(caught.exception.fields.get("code"), "FORGE_REJECTED")
-        self.assertIn("Validation Failed", caught.exception.fields.get("detail"))
+        detail = caught.exception.fields.get("detail")
+        self.assertIn("Validation Failed", detail)
+        # Review finding: the line that names the reason used to be dropped.
+        self.assertIn("no commits between", detail)
+
+    def test_the_reason_in_the_api_s_json_body_reaches_the_caller(self):
+        # `gh api` prints the API's JSON body on stdout when the call is
+        # refused; the field the guidance tells the agent to fix is in there.
+        failed = subprocess.CompletedProcess(
+            ["gh"], 1,
+            '{"message": "Validation Failed", "errors": [{"resource": "PullRequest", '
+            '"code": "custom", "message": "A pull request already exists for acme:fix."}]}',
+            "gh: Validation Failed (HTTP 422)\n",
+        )
+        broker, _ = self.broker(failed)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_create(
+                {"repository": "acme/infra", "source": "fix", "target": "main", "title": "t"}
+            )
+        self.assertEqual(caught.exception.status, 422)
+        self.assertIn("A pull request already exists for acme:fix.", caught.exception.fields.get("detail"))
 
     def test_failures_that_want_different_actions_are_told_apart(self):
         # A missing scope and a throttle are both HTTP 403 from GitHub, and the

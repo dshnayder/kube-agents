@@ -110,7 +110,7 @@ class CliTransport:
             stdin = json.dumps(body)
         done = self._runner(argv, stdin=stdin)
         if done.returncode != 0:
-            raise self._failure(done.stderr or done.stdout or "")
+            raise self._failure(done.stderr or "", done.stdout or "")
         if raw:
             return done.stdout or ""
         try:
@@ -122,9 +122,47 @@ class CliTransport:
                 code="FORGE_CALL_FAILED",
             ) from exc
 
-    def _failure(self, output: str) -> WorkspaceError:
-        lines = [line for line in output.strip().splitlines() if line.strip()]
-        detail = lines[0] if lines else ""
+    def _failure(self, stderr: str, stdout: str = "") -> WorkspaceError:
+        """The forge's refusal, with the reason it actually gave as the detail.
+
+        A CLI puts its summary on the first line of stderr -- `gh: Validation
+        Failed (HTTP 422)` -- and the reason the caller needs on the lines
+        after it, or in the API's JSON body on stdout: `A pull request already
+        exists for …`, `No commits between main and x`. The shared guidance
+        for 422 tells the agent to fix the field the detail names, so a detail
+        that is only the summary line names nothing. Review caught exactly
+        that. The detail is therefore the summary plus the reason: the body's
+        `message` and each `errors[].message` (or `field`) when stdout is JSON,
+        otherwise the stderr lines that follow the summary, bounded.
+        """
+        output = f"{stderr}\n{stdout}".strip()
+        err_lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+        summary = err_lines[0] if err_lines else ""
+        reasons: list[str] = []
+        body: Any = None
+        try:
+            body = json.loads(stdout) if stdout.strip().startswith("{") else None
+        except json.JSONDecodeError:
+            body = None
+        if isinstance(body, dict):
+            if body.get("message"):
+                reasons.append(str(body["message"]))
+            for item in body.get("errors") or []:
+                if isinstance(item, dict):
+                    text = item.get("message") or item.get("field") or item.get("code")
+                    if text:
+                        reasons.append(str(text))
+                elif isinstance(item, str):
+                    reasons.append(item)
+        if not reasons:
+            reasons = err_lines[1:4]
+        if not summary and not reasons:
+            summary = stdout.strip().splitlines()[0] if stdout.strip() else ""
+        detail = summary
+        if reasons:
+            joined = "; ".join(r for r in reasons if r and r != summary)
+            if joined:
+                detail = f"{summary}: {joined}" if summary else joined
         found = _HTTP_STATUS_RE.search(output)
         # A CLI that failed without ever reaching the forge -- it could not
         # resolve the host, or it has no credential loaded -- prints no status
