@@ -83,7 +83,27 @@ MAX_BUNDLE_BYTES = 64 << 20
 
 
 class VcsError(RuntimeError):
-    pass
+    """A refusal the caller is meant to read, as JSON on stdout.
+
+    `code` and `detail` are the broker's, when the refusal was the broker's:
+    SKILL.md's rules are written against the codes -- `BASE_MOVED` means clone
+    again, `FORGE_RATE_LIMITED` means wait, `FORGE_REJECTED` means read the
+    detail -- so a client that reduced the answer to its message would be
+    handing the agent a decision keyed on a field it never receives.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None, detail: str | None = None):
+        super().__init__(message)
+        self.code = code or None
+        self.detail = detail or None
+
+    def as_json(self) -> dict:
+        answer = {"error": str(self)}
+        if self.code:
+            answer["code"] = self.code
+        if self.detail:
+            answer["detail"] = self.detail
+        return answer
 
 
 # ---- the broker -----------------------------------------------------------
@@ -108,7 +128,12 @@ def call(verb: str, payload: dict) -> dict:
             "Its image is older than this skill."
         ) from exc
     except credential_proxy_client.WorkspaceRequestError as exc:
-        raise VcsError(exc.payload.get("error", str(exc))) from exc
+        payload = exc.payload or {}
+        raise VcsError(
+            payload.get("error", str(exc)),
+            code=payload.get("code"),
+            detail=payload.get("detail"),
+        ) from exc
     except credential_proxy_client.TokenUnavailable as exc:
         # The projected token is missing or empty -- the kubelet mid-rewrite,
         # or a volume that was never projected. Nothing the caller can do from
@@ -995,7 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         answer = arguments.run(arguments)
     except VcsError as exc:
-        print(json.dumps({"error": str(exc)}, indent=2))
+        print(json.dumps(exc.as_json(), indent=2))
         return 1
     except subprocess.TimeoutExpired:
         print(json.dumps({"error": "the local git command timed out"}, indent=2))

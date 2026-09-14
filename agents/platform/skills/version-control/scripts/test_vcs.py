@@ -689,7 +689,8 @@ class BrokerCallTest(unittest.TestCase):
 
     def test_a_request_error_surfaces_the_broker_s_own_wording(self):
         error = vcs.credential_proxy_client.WorkspaceRequestError(
-            "publish failed", payload={"error": "fix/x has diverged", "code": "X"}
+            "publish failed",
+            payload={"error": "fix/x has diverged", "code": "BRANCH_DIVERGED", "detail": "at 1234abcd"},
         )
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
@@ -699,6 +700,31 @@ class BrokerCallTest(unittest.TestCase):
             with self.assertRaises(vcs.VcsError) as caught:
                 vcs.call("publish", {})
         self.assertEqual(str(caught.exception), "fix/x has diverged")
+        # Review finding: the code and detail SKILL.md tells the agent to act on
+        # were stripped here. They travel, and main() prints them.
+        self.assertEqual(caught.exception.code, "BRANCH_DIVERGED")
+        self.assertEqual(
+            caught.exception.as_json(),
+            {"error": "fix/x has diverged", "code": "BRANCH_DIVERGED", "detail": "at 1234abcd"},
+        )
+
+    def test_main_prints_the_refusal_code_when_the_broker_sent_one(self):
+        error = vcs.credential_proxy_client.WorkspaceRequestError(
+            "refused", payload={"error": "main is the remote's default branch.", "code": "PROTECTED_BRANCH"}
+        )
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            vcs, "ROOT", Path(tmp)
+        ), mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs.credential_proxy_client, "vcs_call", side_effect=error
+        ), redirect_stdout(out):
+            code = vcs.main(["capabilities", "acme/infra"])
+        self.assertEqual(code, 1)
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["code"], "PROTECTED_BRANCH")
+        self.assertNotIn("detail", printed)
 
 
     def test_an_unreachable_broker_is_a_json_error_not_a_traceback(self):
