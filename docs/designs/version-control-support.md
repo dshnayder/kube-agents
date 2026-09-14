@@ -1,10 +1,15 @@
 # Version control and issue tracking
 
-> **STATUS — design of record; repository identity's Python half is in, the rest
-> is not.** Today an install drives exactly one forge, GitHub, and most of the
-> code says so by name — except repository identity, whose Python assertions now
-> run through one parser, `repo_ref.py`. This is the design for driving any of
-> them, and the order it has to happen in.
+> **STATUS — design of record; the seam, the provider layer with GitHub behind
+> it, and the sandbox's own git are in; the consumer migration, the declarative
+> surface and the second forge are not.** On `main`, repository identity runs
+> through one parser (`repo_ref.py`); the broker serves the version-control verbs
+> over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
+> is `providers/github/`; the `version-control` skill drives those verbs from a
+> sandbox that holds a credential-free git. Every shipped consumer still reaches
+> GitHub by name through `gh` and the credential shim, the CRD still knows only
+> `spec.integration.github`, and no second forge exists. This is the design for
+> driving any forge, and the order the rest has to happen in.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
