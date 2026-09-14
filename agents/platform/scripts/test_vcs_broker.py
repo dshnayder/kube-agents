@@ -1070,18 +1070,107 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("pull request", str(caught.exception))
         self.assertIn("proposal view", str(caught.exception))
 
-    def test_comments_come_from_the_conversation_not_the_diff(self):
-        # `pulls/{n}/comments` is line notes; a caller asking to read the
-        # discussion means `issues/{n}/comments`.
+    def test_a_proposals_comments_come_from_all_three_places_tagged_by_kind(self):
+        # GitHub splits one conversation across the conversation tab, inline
+        # review comments and review summaries; a caller reading fewer than
+        # three ignores requests at random. Each carries where it came from,
+        # and an empty-bodied review (an approval) is not an utterance.
         broker, recorder = self.broker(
             {"number": 9, "state": "open"},
-            [{"user": {"login": "someone"}, "body": "looks good"}],
+            [{"id": 1, "user": {"login": "someone"}, "body": "looks good", "created_at": "2026-01-01T00:00:02Z"}],
+            [{"id": 2, "user": {"login": "someone"}, "body": "off by one", "created_at": "2026-01-01T00:00:01Z", "path": "a.yaml", "line": 3}],
+            [{"id": 3, "user": {"login": "someone"}, "body": "", "state": "APPROVED", "submitted_at": "2026-01-01T00:00:03Z"},
+             {"id": 4, "user": {"login": "someone"}, "body": "summary", "submitted_at": "2026-01-01T00:00:00Z"}],
         )
         answer = broker.proposal_view(
             {"repository": "acme/infra", "number": 9, "comments": True}
         )
-        self.assertEqual(answer["comments"][0]["body"], "looks good")
-        self.assertIn("repos/acme/infra/issues/9/comments", recorder.path)
+        self.assertEqual(
+            [(c["kind"], c["body"]) for c in answer["comments"]],
+            [("review", "summary"), ("review_comment", "off by one"), ("issue", "looks good")],
+        )
+        self.assertEqual(answer["comments"][1]["path"], "a.yaml")
+        paths = [call[4] for call in recorder.calls[1:]]
+        self.assertTrue(any("issues/9/comments" in p for p in paths))
+        self.assertTrue(any("pulls/9/comments" in p for p in paths))
+        self.assertTrue(any("pulls/9/reviews" in p for p in paths))
+
+    def test_proposal_update_patches_then_applies_labels(self):
+        broker, recorder = self.broker({"number": 9, "state": "open"}, [{"name": "a"}], None)
+        answer = broker.proposal_update(
+            {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+        )
+        self.assertEqual(answer["proposal"]["number"], 9)
+        methods = [call[3] for call in recorder.calls]
+        self.assertEqual(methods, ["PATCH", "POST", "DELETE"])
+        self.assertEqual(recorder.calls[0][4], "repos/acme/infra/pulls/9")
+        self.assertEqual(json.loads(recorder.stdin[0])["title"], "new")
+        self.assertEqual(recorder.calls[2][4], "repos/acme/infra/issues/9/labels/b")
+
+    def test_issue_close_carries_a_neutral_reason(self):
+        broker, recorder = self.broker({"number": 5, "state": "closed"})
+        broker.issue_close({"repository": "acme/infra", "number": 5, "reason": "not-planned"})
+        self.assertEqual(recorder.calls[-1][3], "PATCH")
+        self.assertEqual(recorder.body, {"state": "closed", "state_reason": "not_planned"})
+        with self.assertRaises(WorkspaceError):
+            broker.issue_close({"repository": "acme/infra", "number": 5, "reason": "wontfix"})
+
+    def test_proposal_commits_is_a_listing_of_commits(self):
+        broker, _ = self.broker([{"sha": "a" * 40, "commit": {"message": "m", "committer": {"date": "2026-01-01T00:00:00Z"}}}])
+        answer = broker.proposal_commits({"repository": "acme/infra", "number": 9})
+        self.assertEqual(answer["count"], 1)
+        self.assertEqual(answer["commits"][0]["sha"], "a" * 40)
+        self.assertEqual(answer["commits"][0]["committed"], "2026-01-01T00:00:00Z")
+
+    def test_acknowledge_reacts_on_comments_and_declines_reviews(self):
+        broker, recorder = self.broker({"id": 1, "content": "eyes"})
+        answer = broker.proposal_acknowledge(
+            {"repository": "acme/infra", "number": 9, "comment": {"id": 44, "kind": "review_comment"}}
+        )
+        self.assertTrue(answer["acknowledged"])
+        self.assertEqual(recorder.calls[-1][4], "repos/acme/infra/pulls/comments/44/reactions")
+        answer = broker.proposal_acknowledge(
+            {"repository": "acme/infra", "number": 9, "comment": {"id": 45, "kind": "review"}}
+        )
+        self.assertFalse(answer["acknowledged"])
+        self.assertEqual(len(recorder.calls), 1)
+
+    def test_label_ensure_creates_on_404_and_updates_otherwise(self):
+        missing = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker(missing, {"name": "x", "color": "fbca04"})
+        answer = broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "#fbca04"})
+        self.assertEqual([c[3] for c in recorder.calls], ["GET", "POST"])
+        self.assertEqual(answer["label"]["name"], "x")
+        self.assertEqual(recorder.body["color"], "fbca04")
+        broker, recorder = self.broker({"name": "x"}, {"name": "x", "color": "000000"})
+        broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "000000"})
+        self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
+
+    def test_identity_reads_the_login_from_the_cli_and_the_permission_from_the_api(self):
+        status = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
+        )
+        broker, recorder = self.broker(status, {"permission": "write"})
+        answer = broker.identity({"repository": "acme/infra"})
+        self.assertEqual(answer["identity"]["login"], "kube-agents[bot]")
+        self.assertTrue(answer["identity"]["canWrite"])
+        self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        self.assertIn("collaborators/kube-agents%5Bbot%5D/permission", recorder.calls[1][4])
+        # A login nobody knows is a definitive no; a broker fault is unknown.
+        gone = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, _ = self.broker(status, gone)
+        self.assertFalse(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+        broken = subprocess.CompletedProcess(["gh"], 1, "", "connect: timeout")
+        broker, _ = self.broker(status, broken)
+        self.assertIsNone(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+
+    def test_issue_list_with_a_query_goes_through_search(self):
+        broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})
+        answer = broker.issue_list({"repository": "acme/infra", "query": "drift", "labels": ["kind/bug"]})
+        self.assertEqual(recorder.calls[-1][4].split("?")[0], "search/issues")
+        self.assertIn("repo%3Aacme%2Finfra", recorder.calls[-1][4])
+        self.assertIn("is%3Aissue", recorder.calls[-1][4])
+        self.assertEqual(answer["count"], 1)
 
     def test_a_diff_is_asked_for_by_media_type_and_returned_raw(self):
         broker, recorder = self.broker({"number": 9}, "diff --git a/x b/x\n")
@@ -1168,11 +1257,14 @@ class CollaborationTest(unittest.TestCase):
         broker.proposal_comment({"repository": "acme/infra", "number": 1, "body": "hi"})
         self.assertEqual(self.minted, [("github", "acme/infra")] * 3)
 
-    def test_a_verb_that_calls_twice_refreshes_once(self):
-        broker, _ = self.broker({"number": 9}, [])
+    def test_a_verb_that_calls_several_times_refreshes_once(self):
+        # A proposal's comments are three endpoints; the credential is made
+        # current once for the request, not once per call.
+        broker, recorder = self.broker({"number": 9}, [], [], [])
         broker.proposal_view(
             {"repository": "acme/infra", "number": 9, "comments": True}
         )
+        self.assertEqual(len(recorder.calls), 4)
         self.assertEqual(self.minted, [("github", "acme/infra")])
 
     def test_an_unserved_forge_refuses_the_collaboration_verbs_by_name(self):

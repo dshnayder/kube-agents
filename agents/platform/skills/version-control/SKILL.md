@@ -13,8 +13,17 @@ credential.** These go through `scripts/vcs.py`, which speaks to a broker in
 another container. Only the broker holds the credential; nothing here does.
 The remote verbs are exactly these:
 
-`capabilities`, `clone`, `publish`, `proposal create|list|view|comment`,
-`issue create|list|view|comment`.
+`capabilities`, `identity`, `clone`, `publish`,
+`proposal create|list|view|comment|update|close|commits|acknowledge`,
+`issue create|list|view|comment|update|close`, `label ensure`.
+
+`update` edits a title or body and adds or removes labels; `close` closes;
+`commits` lists the revisions on a proposal's source branch; `acknowledge`
+reacts to a comment (its `id` and `kind` come from `view --comments`) so its
+author sees it was read — `capabilities` says whether this forge supports it.
+`issue list --query <text>` searches. `label ensure` creates a label or updates
+it if it exists. `identity` says who this install is on the forge and, with
+`--login`, whether that login may write to the repository.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which

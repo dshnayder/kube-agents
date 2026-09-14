@@ -73,10 +73,47 @@ def issue(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def comment(node: dict[str, Any]) -> dict[str, Any]:
+def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
+    """One utterance, from whichever of GitHub's three endpoints produced it.
+
+    `kind` is the caller's, not the node's: GitHub's three comment shapes do
+    not say which endpoint they came from, and the endpoint is what decides
+    whether a reaction can be left on it (`proposal-acknowledge`) and whether
+    `path`/`line` mean anything. A review's timestamp is `submitted_at`.
+    """
     return {
+        "id": node.get("id"),
+        "kind": kind,
         "author": actor(node.get("user")),
-        "created": node.get("created_at") or "",
+        "created": node.get("submitted_at") or node.get("created_at") or "",
         "body": node.get("body") or "",
         "url": node.get("html_url") or "",
+        "path": node.get("path") or "",
+        "line": node.get("line"),
+    }
+
+
+def commit(node: dict[str, Any]) -> dict[str, Any]:
+    """One commit on a proposal's source branch.
+
+    The committer date, not the author date: a rebase or a cherry-pick keeps
+    the author date of a commit written weeks ago, and the question a caller
+    asks of this list is "did it land after the request", which only the
+    committer date answers.
+    """
+    inner = node.get("commit") or {}
+    return {
+        "sha": node.get("sha") or "",
+        "author": actor(node.get("author")) or ((inner.get("author") or {}).get("name") or ""),
+        "committed": ((inner.get("committer") or {}).get("date")) or "",
+        "message": inner.get("message") or "",
+        "url": node.get("html_url") or "",
+    }
+
+
+def label(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": node.get("name") or "",
+        "color": node.get("color") or "",
+        "description": node.get("description") or "",
     }

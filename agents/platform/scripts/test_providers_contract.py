@@ -37,7 +37,7 @@ SCRIPTS = Path(__file__).resolve().parent
 # from the verb name because the naming is the contract: `issue-list` returns
 # `issues`, and a forge that returned something else has not implemented the
 # verb the caller asked for.
-CONCEPTS = {"proposal": "proposal", "issue": "issue"}
+CONCEPTS = {"proposal": "proposal", "issue": "issue", "label": "label"}
 
 # The fields a caller may rely on, per concept. A forge may not omit one and may
 # not add its own vocabulary alongside them -- the second is the failure that
@@ -72,8 +72,13 @@ SHAPES: dict[str, frozenset[str]] = {
             "body",
         }
     ),
-    "comment": frozenset({"author", "created", "body", "url"}),
+    # `id` and `kind` are what `proposal-acknowledge` takes back; `path` and
+    # `line` are empty except on an inline review comment.
+    "comment": frozenset({"id", "kind", "author", "created", "body", "url", "path", "line"}),
+    "commit": frozenset({"sha", "author", "committed", "message", "url"}),
+    "label": frozenset({"name", "color", "description"}),
 }
+COMMENT_KINDS = frozenset({"issue", "review_comment", "review"})
 
 PROPOSAL_STATES = frozenset({"open", "closed", "merged"})
 
@@ -103,7 +108,17 @@ class Recorded:
             return "diff --git a/x b/x\n"
         if not self.responses:
             raise AssertionError(f"the forge made an unfixtured call: {method} {path}")
-        return self.responses.pop(0)
+        answer = self.responses.pop(0)
+        # A recorded *refusal*: `{"__status__": 404}` is what the transport
+        # would have raised for that call, so a verb whose logic turns on one
+        # (label-ensure's read-then-create) can be pinned by a fixture too.
+        if isinstance(answer, dict) and "__status__" in answer:
+            raise WorkspaceError(
+                answer.get("__detail__") or "recorded refusal",
+                status=int(answer["__status__"]),
+                code="FORGE_CALL_FAILED",
+            )
+        return answer
 
 
 def forge_cases() -> list[tuple[str, type]]:
@@ -180,6 +195,17 @@ class ContractTest(unittest.TestCase):
                         self.assertEqual(
                             set(answer["comment"]), SHAPES["comment"]
                         )
+                        self.assertIn(answer["comment"]["kind"], COMMENT_KINDS)
+                    elif action == "commits":
+                        self.assertEqual(
+                            sorted(answer), sorted(["commits", "count", "truncated"])
+                        )
+                        self.assertEqual(answer["count"], len(answer["commits"]))
+                        for item in answer["commits"]:
+                            self.assertEqual(set(item), SHAPES["commit"])
+                    elif action == "acknowledge":
+                        self.assertEqual(set(answer), {"acknowledged"})
+                        self.assertIsInstance(answer["acknowledged"], bool)
                     elif action == "list":
                         key = f"{concept}s"
                         self.assertEqual(
@@ -237,6 +263,14 @@ class ContractTest(unittest.TestCase):
                     self.assertTrue(answer["comments"])
                     for item in answer["comments"]:
                         self.assertEqual(set(item), SHAPES["comment"])
+                        self.assertIn(item["kind"], COMMENT_KINDS)
+                    if verb == "proposal-view":
+                        # A proposal's discussion spans every kind a forge
+                        # has; the recording carries all three so a forge that
+                        # read only the conversation would be caught here.
+                        self.assertGreaterEqual(len({c["kind"] for c in answer["comments"]}), 2)
+                        created = [c["created"] for c in answer["comments"]]
+                        self.assertEqual(created, sorted(created))
 
     # -- what the forge asked for -------------------------------------------
 
@@ -263,14 +297,19 @@ class ContractTest(unittest.TestCase):
         # in an argv, in `ps`, or in a `CalledProcessError` some layer logs.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
-                if not verb.endswith(("-create", "-comment")):
+                if not verb.endswith(("-create", "-comment", "-update", "-close", "-ensure")):
                     continue
                 fixture = self.load(directory, verb)
                 prose = fixture["payload"].get("body") or ""
                 with self.subTest(forge=name, verb=verb):
                     _, api = self.invoke(forge, verb, fixture)
-                    method, path, params, body, _raw = api.calls[-1]
-                    self.assertEqual(method, "POST")
+                    # The call that carried the prose: the first write. An
+                    # update may follow it with label calls; a create-or-update
+                    # may precede it with a read.
+                    writes = [c for c in api.calls if c[0] in {"POST", "PATCH", "PUT"}]
+                    self.assertTrue(writes, "no write was made")
+                    method, path, params, body, _raw = writes[0]
+                    self.assertIn(method, {"POST", "PATCH", "PUT"})
                     self.assertIsInstance(body, dict)
                     if prose:
                         self.assertIn(prose, [str(value) for value in body.values()])
@@ -292,6 +331,13 @@ class ContractTest(unittest.TestCase):
             "issue-create": {"title": "", "body": "b"},
             "issue-list": {"labels": "bug"},
             "proposal-list": {"state": "merged"},
+            "proposal-update": {"number": 4321, "labelsAdd": ["ok", ""]},
+            "proposal-close": {"number": -1},
+            "proposal-commits": {"number": "x"},
+            "proposal-acknowledge": {"number": 1, "comment": {"id": "9", "kind": "issue"}},
+            "issue-update": {"number": 1, "title": "   "},
+            "issue-close": {"number": 1, "reason": "wontfix"},
+            "label-ensure": {"name": ""},
         }
         for name, forge, _ in self.instances():
             for verb, payload in bad.items():

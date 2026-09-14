@@ -634,6 +634,30 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.broker.payload("issue-comment")["number"], 12)
 
+    def test_the_migration_verbs_reach_the_broker_with_their_payloads(self):
+        code, _ = self.run_vcs("proposal", "update", "7", "--title", "t2", "--add-label", "a", "--remove-label", "b")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-update")
+        self.assertEqual((payload["number"], payload["title"], payload["labelsAdd"], payload["labelsRemove"]), (7, "t2", ["a"], ["b"]))
+        self.assertNotIn("body", payload)
+        code, _ = self.run_vcs("proposal", "close", "7")
+        self.assertEqual(self.broker.payload("proposal-close")["number"], 7)
+        code, _ = self.run_vcs("proposal", "commits", "7", "-n", "3")
+        self.assertEqual(self.broker.payload("proposal-commits")["limit"], 3)
+        code, _ = self.run_vcs("proposal", "ack", "7", "--comment-id", "55", "--kind", "review_comment")
+        self.assertEqual(self.broker.payload("proposal-acknowledge")["comment"], {"id": 55, "kind": "review_comment"})
+        code, _ = self.run_vcs("issue", "edit", "12", "--body", "more")
+        self.assertEqual(self.broker.payload("issue-update")["body"], "more")
+        code, _ = self.run_vcs("issue", "close", "12", "--reason", "not-planned")
+        self.assertEqual(self.broker.payload("issue-close")["reason"], "not-planned")
+        code, _ = self.run_vcs("issue", "list", "--query", "drift")
+        self.assertEqual(self.broker.payload("issue-list")["query"], "drift")
+        code, _ = self.run_vcs("label", "ensure", "status:in-progress", "--color", "fbca04")
+        self.assertEqual(self.broker.payload("label-ensure")["name"], "status:in-progress")
+        code, _ = self.run_vcs("whoami", "--login", "someone")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("identity")["login"], "someone")
+
     def test_the_repository_is_the_only_thing_resolved_locally(self):
         # Which forge this is, what it calls a proposal, and how to reach its
         # API are all decided on the credential side.
@@ -886,6 +910,9 @@ class AbstractionTest(unittest.TestCase):
             with self.subTest(alias=f"{family} open"):
                 self.assertIn("open", actions)
                 self.assertIs(actions["open"], actions["create"])
+            with self.subTest(alias=f"{family} edit"):
+                self.assertIs(actions["edit"], actions["update"])
+        self.assertIs(choices["whoami"], choices["identity"])
 
 
 if __name__ == "__main__":

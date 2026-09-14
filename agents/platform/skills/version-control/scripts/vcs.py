@@ -828,6 +828,7 @@ def verb_issue_list(arguments) -> dict:
             "state": arguments.state,
             "limit": arguments.limit,
             "labels": arguments.labels or None,
+            "query": arguments.query or None,
         },
     )
 
@@ -862,6 +863,81 @@ def verb_issue_comment(arguments) -> dict:
         "issue-comment",
         {"number": arguments.number, "body": arguments.body},
     )
+
+
+def verb_proposal_update(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-update",
+        {
+            "number": arguments.number,
+            "title": arguments.title,
+            "body": arguments.body,
+            "labelsAdd": arguments.add_label or None,
+            "labelsRemove": arguments.remove_label or None,
+        },
+    )
+
+
+def verb_proposal_close(arguments) -> dict:
+    return _collaboration(arguments, "proposal-close", {"number": arguments.number})
+
+
+def verb_proposal_commits(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-commits",
+        {"number": arguments.number, "limit": arguments.limit},
+    )
+
+
+def verb_proposal_acknowledge(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "proposal-acknowledge",
+        {
+            "number": arguments.number,
+            "comment": {"id": arguments.comment_id, "kind": arguments.kind},
+        },
+    )
+
+
+def verb_issue_update(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "issue-update",
+        {
+            "number": arguments.number,
+            "title": arguments.title,
+            "body": arguments.body,
+            "labelsAdd": arguments.add_label or None,
+            "labelsRemove": arguments.remove_label or None,
+        },
+    )
+
+
+def verb_issue_close(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "issue-close",
+        {"number": arguments.number, "reason": arguments.reason},
+    )
+
+
+def verb_label_ensure(arguments) -> dict:
+    return _collaboration(
+        arguments,
+        "label-ensure",
+        {
+            "name": arguments.name,
+            "color": arguments.color,
+            "description": arguments.description,
+        },
+    )
+
+
+def verb_identity(arguments) -> dict:
+    return _collaboration(arguments, "identity", {"login": arguments.login})
 
 
 # ---- command line ---------------------------------------------------------
@@ -985,12 +1061,38 @@ def build_parser() -> argparse.ArgumentParser:
     pcomment.add_argument("--body", required=True)
     repo_option(pcomment).set_defaults(run=verb_proposal_comment)
 
+    pupdate = actions.add_parser("update", aliases=["edit"])
+    pupdate.add_argument("number", type=int)
+    pupdate.add_argument("--title")
+    pupdate.add_argument("--body")
+    pupdate.add_argument("--add-label", nargs="*")
+    pupdate.add_argument("--remove-label", nargs="*")
+    repo_option(pupdate).set_defaults(run=verb_proposal_update)
+
+    pclose = actions.add_parser("close")
+    pclose.add_argument("number", type=int)
+    repo_option(pclose).set_defaults(run=verb_proposal_close)
+
+    pcommits = actions.add_parser("commits", help="the revisions on a proposal's source branch")
+    pcommits.add_argument("number", type=int)
+    pcommits.add_argument("-n", "--limit", type=int)
+    repo_option(pcommits).set_defaults(run=verb_proposal_commits)
+
+    pack = actions.add_parser(
+        "acknowledge", aliases=["ack"], help="react to a comment so its author sees it was read"
+    )
+    pack.add_argument("number", type=int)
+    pack.add_argument("--comment-id", type=int, required=True, help="the comment's `id` from `view --comments`")
+    pack.add_argument("--kind", required=True, help="the comment's `kind` from `view --comments`")
+    repo_option(pack).set_defaults(run=verb_proposal_acknowledge)
+
     issue = verbs.add_parser("issue", help="work items on the forge")
     iactions = issue.add_subparsers(dest="action", required=True)
 
     ilist = iactions.add_parser("list")
     ilist.add_argument("--state", default="open", choices=["open", "closed", "all"])
     ilist.add_argument("--labels", nargs="*")
+    ilist.add_argument("--query", help="free text to search for")
     ilist.add_argument("-n", "--limit", type=int)
     repo_option(ilist).set_defaults(run=verb_issue_list)
 
@@ -1010,6 +1112,33 @@ def build_parser() -> argparse.ArgumentParser:
     icomment.add_argument("number", type=int)
     icomment.add_argument("--body", required=True)
     repo_option(icomment).set_defaults(run=verb_issue_comment)
+
+    iupdate = iactions.add_parser("update", aliases=["edit"])
+    iupdate.add_argument("number", type=int)
+    iupdate.add_argument("--title")
+    iupdate.add_argument("--body")
+    iupdate.add_argument("--add-label", nargs="*")
+    iupdate.add_argument("--remove-label", nargs="*")
+    repo_option(iupdate).set_defaults(run=verb_issue_update)
+
+    iclose = iactions.add_parser("close")
+    iclose.add_argument("number", type=int)
+    iclose.add_argument("--reason", choices=["completed", "not-planned"])
+    repo_option(iclose).set_defaults(run=verb_issue_close)
+
+    label = verbs.add_parser("label", help="labels on the forge")
+    lactions = label.add_subparsers(dest="action", required=True)
+    lensure = lactions.add_parser("ensure", aliases=["create"], help="create the label, or update it if it exists")
+    lensure.add_argument("name")
+    lensure.add_argument("--color")
+    lensure.add_argument("--description")
+    repo_option(lensure).set_defaults(run=verb_label_ensure)
+
+    identity = verbs.add_parser(
+        "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"
+    )
+    identity.add_argument("--login", help="ask about this login instead of the credential's own")
+    repo_option(identity).set_defaults(run=verb_identity)
 
     return parser
 

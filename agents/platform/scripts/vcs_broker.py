@@ -176,11 +176,14 @@ class Binding:
             self.forge.credential.ensure(self.repo)
             self._ready = True
 
-    def api(self, method: str, path: str, **kwargs: Any) -> Any:
+    def transport(self) -> Transport:
         if self._built is None:
             self._built = self._transport()
+        return self._built
+
+    def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self._built.api(method, path, **kwargs)
+        return self.transport().api(method, path, **kwargs)
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -691,6 +694,52 @@ class VcsBroker:
     def issue_comment(self, payload):
         return self._forge_verb("issue-comment", payload)
 
+    def proposal_update(self, payload):
+        return self._forge_verb("proposal-update", payload)
+
+    def proposal_close(self, payload):
+        return self._forge_verb("proposal-close", payload)
+
+    def proposal_commits(self, payload):
+        return self._forge_verb("proposal-commits", payload)
+
+    def proposal_acknowledge(self, payload):
+        return self._forge_verb("proposal-acknowledge", payload)
+
+    def issue_update(self, payload):
+        return self._forge_verb("issue-update", payload)
+
+    def issue_close(self, payload):
+        return self._forge_verb("issue-close", payload)
+
+    def label_ensure(self, payload):
+        return self._forge_verb("label-ensure", payload)
+
+    def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Who this credential is on this forge, and whether a login may write.
+
+        A broker verb rather than a forge verb because half of it is a property
+        of the transport -- how the call is authenticated -- and not of the
+        API: a CLI reads its login out of the credential store, an HTTP client
+        asks the current-user route. The other half, `canWrite`, is the forge's
+        normalised answer to a question every forge spells differently. Both
+        exist so the agent-side policy that separates the agent's own
+        proposals and comments from a stranger's stays above the provider.
+
+        `login` in the payload asks about that login; absent, about the
+        credential itself.
+        """
+        bound = self._bind(payload)
+        bound.ensure()
+        transport = bound.transport()
+        viewer = transport.whoami()
+        login = payload.get("login")
+        if login is not None and not isinstance(login, str):
+            raise WorkspaceError("login must be a string")
+        subject = (login or viewer or "").strip()
+        can_write = bound.forge.can_write(bound.api, bound.repo, subject) if subject else None
+        return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
+
 
 # The verbs that leave a mark on the forge, named here so the HTTP layer can
 # refuse an unmanaged repository before one of them runs. The classification
@@ -718,8 +767,14 @@ WRITE_VERBS = frozenset(
         "publish",
         "proposal-create",
         "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
         "issue-create",
         "issue-comment",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
     }
 )
 
@@ -743,6 +798,14 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "issue-list": broker.issue_list,
         "issue-view": broker.issue_view,
         "issue-comment": broker.issue_comment,
+        "proposal-update": broker.proposal_update,
+        "proposal-close": broker.proposal_close,
+        "proposal-commits": broker.proposal_commits,
+        "proposal-acknowledge": broker.proposal_acknowledge,
+        "issue-update": broker.issue_update,
+        "issue-close": broker.issue_close,
+        "label-ensure": broker.label_ensure,
+        "identity": broker.identity,
     }
 
 

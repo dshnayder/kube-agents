@@ -766,16 +766,37 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
-| Verb                                 | Request                                                    | Response                                              |
-| ------------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
-| `capabilities`                       | `{repository}`                                             | `{forge, repo, proposalNoun, verbs, missing}`         |
-| `clone`                              | `{repository, branch?}`                                    | `{forge, repo, branch, revision, size, bundleBase64}` |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64}` | `{forge, repo, branch, revision}`                     |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`       | `{proposal}`                                          |
-| `proposal-list` / `issue-list`       | `{repository, state?, limit?, labels?}`                    | `{proposals\|issues, count, truncated}`               |
-| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?}`                   | `{proposal\|issue, comments?, diff?}`                 |
-| `proposal-comment` / `issue-comment` | `{repository, number, body}`                               | `{comment}`                                           |
-| `issue-create`                       | `{repository, title, body?, labels?}`                      | `{issue}`                                             |
+| Verb                                 | Request                                                          | Response                                              |
+| ------------------------------------ | ---------------------------------------------------------------- | ----------------------------------------------------- |
+| `capabilities`                       | `{repository}`                                                   | `{forge, repo, proposalNoun, verbs, missing}`         |
+| `clone`                              | `{repository, branch?}`                                          | `{forge, repo, branch, revision, size, bundleBase64}` |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64}`       | `{forge, repo, branch, revision}`                     |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`             | `{proposal}`                                          |
+| `proposal-list` / `issue-list`       | `{repository, state?, limit?, labels?}`                          | `{proposals\|issues, count, truncated}`               |
+| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?}`                         | `{proposal\|issue, comments?, diff?}`                 |
+| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                     | `{comment}`                                           |
+| `issue-create`                       | `{repository, title, body?, labels?}`                            | `{issue}`                                             |
+| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}` | `{proposal\|issue}`                                   |
+| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`         | `{proposal\|issue}`                                   |
+| `proposal-commits`                   | `{repository, number, limit?}`                                   | `{commits, count, truncated}`                         |
+| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                      | `{acknowledged}`                                      |
+| `label-ensure`                       | `{repository, name, color?, description?}`                       | `{label}`                                             |
+| `identity`                           | `{repository, login?}`                                           | `{identity: {login, subject, canWrite}}`              |
+
+The first eight are the version-control skill's. The rest are the union of
+what the shipped consumers do to a forge — edit and close what they opened, read
+a proposal's commits, acknowledge a comment, keep a label in existence, ask who
+the credential is and whether a login may write — decided by the callers rather
+than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
+requires. `issue-list` also takes `query?`, free text each forge composes into
+its own search grammar. A comment carries `id` and `kind` (`issue`,
+`review_comment`, `review`) because a proposal's discussion spans three places on
+GitHub and the kind decides whether it can be acknowledged; `capabilities` says
+whether the forge supports acknowledging at all. `identity` is a broker verb
+rather than a forge verb because half of it is a property of how the call is
+authenticated — a CLI reads its login out of its credential store, an HTTP
+client asks the current-user route — and the other half, `canWrite`, is the
+forge's normalised answer to a question every forge spells differently.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
@@ -920,18 +941,18 @@ than something the broker decides on the forge's behalf, and
 [Modularity](#5-modularity) is why the boundary they draw holds at the third
 forge.
 
-| Member               | What it decides                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------ |
-| `hosts`              | which hostnames are this forge's; also what the credential allowlist is built from   |
-| `parse(url)`         | the repository a URL names, and the only validator of that repository's shape        |
-| `clone_url(repo)`    | the URL to clone, composed from validated segments                                   |
-| `capabilities(repo)` | what this install can do here, without spending a credential or touching the network |
-| `verbs`              | which of the eight collaboration verbs this forge serves                             |
-| `credential`         | the acquisition strategy, the API header and the git config — one object             |
-| `transport`          | which transport the broker builds for it: `"cli"` or `"http"`                        |
-| `for_config(config)` | how many instances of this forge this install has: 0, 1, or n                        |
-| the eight verbs      | each describes a request and translates the response                                 |
-| `error_overrides`    | the few statuses whose shared guidance this forge disagrees with                     |
+| Member                  | What it decides                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| `hosts`                 | which hostnames are this forge's; also what the credential allowlist is built from   |
+| `parse(url)`            | the repository a URL names, and the only validator of that repository's shape        |
+| `clone_url(repo)`       | the URL to clone, composed from validated segments                                   |
+| `capabilities(repo)`    | what this install can do here, without spending a credential or touching the network |
+| `verbs`                 | which of the collaboration verbs this forge serves                                   |
+| `credential`            | the acquisition strategy, the API header and the git config — one object             |
+| `transport`             | which transport the broker builds for it: `"cli"` or `"http"`                        |
+| `for_config(config)`    | how many instances of this forge this install has: 0, 1, or n                        |
+| the collaboration verbs | each describes a request and translates the response                                 |
+| `error_overrides`       | the few statuses whose shared guidance this forge disagrees with                     |
 
 Three of these are the modularity requirement rather than GitLab. `for_config` is
 what lets `registry.py` stay ignorant of any particular forge. `credential` is
@@ -1354,7 +1375,7 @@ superset of the other:
 
 The union is roughly thirty methods, which is unimplementable without `verbs` and
 `ForgeUnsupported` to make partial support a first-class answer — and the eight
-broker verbs are too narrow to serve the skills. Neither can simply absorb the
+verbs the skill started with were too narrow to serve the other consumers. Neither can simply absorb the
 other, which is why the shape above is designed rather than inherited from
 whichever side happened to be written first.
 
@@ -1556,7 +1577,7 @@ every change rather than in a nightly.
 
 The verb tests are one suite parameterised over `AVAILABLE`, not a file per
 forge. Each forge supplies a directory of recorded API responses — the JSON its
-host actually returns for each of the eight verbs — under
+host actually returns for each verb it claims — under
 `testdata/providers/<forge name>/`, beside the tests and outside the package the
 images ship, and the suite finds it by the forge's name.
 
