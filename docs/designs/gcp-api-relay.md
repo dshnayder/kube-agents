@@ -28,7 +28,7 @@ Managed Prometheus query endpoints. The collector's one-function change is to ob
 
 ## What was verified on a live install
 
-All of the following were observed read-only on `kage-management` on 2026-09-15, against the
+All of the following were observed read-only on a live install on 2026-09-15, against the
 three-pod layout #913 reconciles. They are the facts the design rests on.
 
 | Fact                                                                                                                                                                                                 | Where it matters                                  |
@@ -246,19 +246,14 @@ timeout=)`" — so `read_usage` and its tests do not change.
 
 ```python
 def default_monitoring_session() -> SessionFn:
-    if os.environ.get("CREDENTIAL_PROXY_URL"):
-        from credential_proxy_client import ApiSession
-        return ApiSession()
-    import google.auth                       # a developer laptop, outside any pod
-    from google.auth.transport.requests import AuthorizedSession
-    credentials, _ = google.auth.default(scopes=[MONITORING_SCOPE])
-    return AuthorizedSession(credentials)
+    from credential_proxy_client import ApiSession
+    return ApiSession()
 ```
 
-The `google.auth` branch is kept for a laptop with Application Default Credentials and is not
-reachable in either pod. The startup failure text changes from "ADC credentials were
-unavailable" to "credential broker unavailable", which is what a `limitations` note will now
-mean.
+The `google.auth` import, `MONITORING_SCOPE`, and the `AuthorizedSession` construction go
+with it; nothing in either pod can use them. The startup failure text changes from "ADC
+credentials were unavailable" to "credential broker unavailable", which is what a
+`limitations` note will now mean.
 
 With that, the interpreter references go: `governance/fleet_wide_cost_analysis_sop.md` §3 and
 the `fleet-wide-cost-analysis` prompt in `agents/platform/cron/jobs.json` say `python3`. The
@@ -349,11 +344,11 @@ standing in for `monitoring.googleapis.com`:
 
 ## Live validation
 
-On `kage-management`, under the live-test lease, with the broker image rebuilt from the
+On a live install, under the live-test lease, with the broker image rebuilt from the
 branch:
 
 1. From the sandbox pod, a `curl` to the relay for one `timeSeries` page returns 200 with
-   `k8s_container` series for the management cluster, and the broker log shows the three `api`
+   `k8s_container` series for a cluster in the project, and the broker log shows the three `api`
    lines with `rule=gcp.api.monitoring.timeseries-list`.
 2. The same `curl` for `v3/projects/<p>/alertPolicies` returns 403 with `rule=gcp.api.path`;
    for `iamcredentials.googleapis.com/v1/...:generateAccessToken` returns 403 with
