@@ -286,18 +286,40 @@ class GitHubForge(Forge):
         labels = validate_labels(payload.get("labels"))
         if labels:
             params["labels"] = ",".join(labels)
+        # The negative half of the same filter. Asked of the forge rather than
+        # applied to the answer here, because a page is not the repository: a
+        # caller asking for "open issues nobody has claimed" on a repository
+        # with a hundred claimed ones gets a full page of exclusions and an
+        # empty result, which reads as a quiet repository. Every poller that
+        # watches a queue by label needs this shape of question.
+        excluded = validate_labels(payload.get("excludeLabels"))
         query = validate_text(payload.get("query"), "query", required=False).strip()
-        if query:
-            # Free text means the search API, whose query grammar is GitHub's
-            # own: the neutral request is text plus the same state and labels,
-            # and this is where they become `repo:`, `is:issue` and `label:`
+        if query or excluded:
+            # The search API, whose query grammar is GitHub's own: the neutral
+            # request is text plus the same state and labels, and this is where
+            # they become `repo:`, `is:issue`, `label:` and `-label:`
             # qualifiers. The result envelope is `{items}`, unlike `/issues`.
-            terms = [query, f"repo:{repo}", "is:issue"]
+            terms = ([query] if query else []) + [f"repo:{repo}", "is:issue"]
             if params["state"] != "all":
                 terms.append(f"is:{params['state']}")
             terms += [f'label:"{name}"' for name in labels]
+            terms += [f'-label:"{name}"' for name in excluded]
             found = api(
-                "GET", "search/issues", params={"q": " ".join(terms), "per_page": limit}
+                "GET",
+                "search/issues",
+                # Newest first, explicitly. Unsorted, this endpoint answers in
+                # relevance order, which is not an order the caller can predict
+                # and not the one `/repos/{repo}/issues` uses -- so the same
+                # verb with and without a filter returned differently ordered
+                # pages, and `truncated` meant a different thing in each. A
+                # caller that pages, or that ranks the page it got, needs the
+                # window to be a window rather than a sample.
+                params={
+                    "q": " ".join(terms),
+                    "per_page": limit,
+                    "sort": "created",
+                    "order": "desc",
+                },
             )
             nodes = (found or {}).get("items") or []
         else:

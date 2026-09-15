@@ -21,9 +21,11 @@ The remote verbs are exactly these:
 `commits` lists the revisions on a proposal's source branch; `acknowledge`
 reacts to a comment (its `id` and `kind` come from `view --comments`) so its
 author sees it was read — `capabilities` says whether this forge supports it.
-`issue list --query <text>` searches. `label ensure` creates a label or updates
-it if it exists. `identity` says who this install is on the forge and, with
-`--login`, whether that login may write to the repository.
+`issue list --query <text>` searches, and `--without-labels` skips issues
+carrying any of them — that is how a queue is read for unclaimed work.
+`label ensure` creates a label or updates it if it exists. `identity` says
+who this install is on the forge and, with `--login`, whether that login may
+write to the repository.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which
@@ -148,6 +150,7 @@ identifiers that land on the forge.
 
 ```bash
 python3 $V issue list --state open --labels bug
+python3 $V issue list --state open --without-labels status:in-progress
 python3 $V issue view 42 --comments
 python3 $V issue create --title 'Cluster drift on prod-eu' --body '...'
 python3 $V proposal list
@@ -221,7 +224,7 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `proposal list`    | Open proposals; `--state open\|closed\|all`                                                                 |
 | `proposal view`    | One proposal; `--comments` for the discussion, `--diff` for the patch                                       |
 | `proposal comment` | Reply on a proposal                                                                                         |
-| `issue list`       | Work items; `--state`, `--labels`                                                                           |
+| `issue list`       | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                            |
 | `issue view`       | One issue; `--comments` for the discussion                                                                  |
 | `issue create`     | Open an issue; `--labels`                                                                                   |
 | `issue comment`    | Reply on an issue                                                                                           |

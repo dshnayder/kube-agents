@@ -26,6 +26,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -1231,6 +1232,37 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("repo%3Aacme%2Finfra", recorder.calls[-1][4])
         self.assertIn("is%3Aissue", recorder.calls[-1][4])
         self.assertEqual(answer["count"], 1)
+
+    def test_issue_list_excludes_labels_at_the_forge_not_on_the_page(self):
+        # No query text, only an exclusion: it still has to leave the plain
+        # listing endpoint, because that endpoint can say which labels an issue
+        # must carry but not which it must not. A poller watching a queue for
+        # unclaimed work asks exactly this and nothing else.
+        broker, recorder = self.broker({"items": []})
+        broker.issue_list(
+            {
+                "repository": "acme/infra",
+                "labels": ["kind/bug"],
+                "excludeLabels": ["status:in-progress", "agent:ignore"],
+            }
+        )
+        asked = urllib.parse.unquote_plus(recorder.calls[-1][4])
+        self.assertTrue(asked.startswith("search/issues"))
+        self.assertIn('label:"kind/bug"', asked)
+        self.assertIn('-label:"status:in-progress"', asked)
+        self.assertIn('-label:"agent:ignore"', asked)
+
+    def test_the_search_path_orders_its_page_the_way_the_listing_does(self):
+        # Left alone this endpoint answers in relevance order, which is not an
+        # order a caller can predict and not the one the plain listing uses --
+        # so the same verb would hand back differently ordered pages depending
+        # on whether a filter was present, and `truncated` would mean a
+        # different thing in each.
+        broker, recorder = self.broker({"items": []})
+        broker.issue_list({"repository": "acme/infra", "query": "drift"})
+        asked = recorder.calls[-1][4]
+        self.assertIn("sort=created", asked)
+        self.assertIn("order=desc", asked)
 
     def test_a_diff_is_asked_for_by_media_type_and_returned_raw(self):
         broker, recorder = self.broker({"number": 9}, "diff --git a/x b/x\n")

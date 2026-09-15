@@ -627,6 +627,16 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(payload["state"], "closed")
         self.assertEqual(payload["labels"], ["bug", "p1"])
 
+    def test_issue_list_carries_the_labels_to_skip(self):
+        code, _ = self.run_vcs(
+            "issue", "list", "--without-labels", "status:in-progress", "agent:ignore"
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("issue-list")
+        self.assertEqual(
+            payload["excludeLabels"], ["status:in-progress", "agent:ignore"]
+        )
+
     def test_issue_create_and_comment(self):
         code, _ = self.run_vcs("issue", "create", "--title", "Drift", "--body", "why")
         self.assertEqual(code, 0)

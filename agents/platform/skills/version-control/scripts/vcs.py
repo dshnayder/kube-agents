@@ -257,6 +257,7 @@ def verb_issue_list(arguments) -> dict:
             "state": arguments.state,
             "limit": arguments.limit,
             "labels": arguments.labels or None,
+            "excludeLabels": arguments.without_labels or None,
             "query": arguments.query or None,
         },
     )
@@ -528,6 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
     ilist = iactions.add_parser("list")
     ilist.add_argument("--state", default="open", choices=["open", "closed", "all"])
     ilist.add_argument("--labels", nargs="*")
+    ilist.add_argument(
+        "--without-labels", nargs="*", help="skip issues carrying any of these"
+    )
     ilist.add_argument("--query", help="free text to search for")
     ilist.add_argument("-n", "--limit", type=int)
     repo_option(ilist).set_defaults(run=verb_issue_list)
