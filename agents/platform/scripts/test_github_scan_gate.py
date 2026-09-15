@@ -341,18 +341,18 @@ class PrCardKeyTest(unittest.TestCase):
     an abandoned one costs one retry rather than the pull request.
     """
 
-    def _card(self, now, node_id="IC_1", number=12, repo="acme/toolkit"):
+    def _card(self, now, ref="IC_1", number=12, repo="acme/toolkit"):
         pr = forge.PullRequest(
             number=number, head_ref="platform-agent/x", author="agent[bot]"
         )
         comment = forge.Comment(
-            node_id=node_id,
+            ref=ref,
             author="reviewer",
             body="/agent bump to 4",
             can_write=True,
             created_at="2026-08-17T14:00:00Z",
         )
-        trigger = pr_triggers.find_trigger(comment.body, "agent", node_id, comment.author)
+        trigger = pr_triggers.find_trigger(comment.body, "agent", ref, comment.author)
         return gate._pr_card(
             pr, [gate._Pending(pr=pr, comment=comment, trigger=trigger)], repo, now=now
         )
@@ -378,7 +378,7 @@ class PrCardKeyTest(unittest.TestCase):
         key = self._card(now).idempotency_key
         self.assertNotEqual(key, self._card(now, repo="other/repo").idempotency_key)
         self.assertNotEqual(key, self._card(now, number=13).idempotency_key)
-        self.assertNotEqual(key, self._card(now, node_id="IC_2").idempotency_key)
+        self.assertNotEqual(key, self._card(now, ref="IC_2").idempotency_key)
 
     def test_the_default_clock_is_utc_not_local(self):
         card = self._card(None)
@@ -626,22 +626,27 @@ class FakeProvider:
     is where the argv and the JSON get pinned.
     """
 
-    supports_acknowledge = True
-
-    def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=()):
+    def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=(),
+                 acknowledges=True):
         self.prs = prs or []
         self.comments = comments or {}
+        # Per repository, the way the real provider answers it. A plain string
+        # is every repository, which is what all but the multi-forge tests want.
         self._viewer = viewer
+        self.acknowledges = acknowledges
         self.fail_on = set(fail_on)
         self.posted = []
         self.acknowledged = []
-        self.preflighted = False
+        self.viewer_lookups = []
 
-    def preflight(self):
-        self.preflighted = True
-
-    def viewer_login(self):
+    def viewer_login(self, repo):
+        self.viewer_lookups.append(repo)
+        if isinstance(self._viewer, dict):
+            return self._viewer.get(repo, "")
         return self._viewer
+
+    def supports_acknowledge(self, repo):
+        return self.acknowledges
 
     def list_open_prs(self, repo):
         return list(self.prs)
@@ -655,11 +660,15 @@ class FakeProvider:
         self.posted.append((pr.number, body))
 
     def acknowledge(self, repo, comment):
-        self.acknowledged.append(comment.node_id)
+        self.acknowledged.append(comment.ref)
         return True
 
 
 REPO = "acme/toolkit"
+#: A second managed repository, deliberately on another host: identity,
+#: capability and permission are all properties of a forge, and a test that used
+#: two repositories on one would not notice a provider that asked once.
+OTHER_REPO = "gitlab.example/acme/toolkit"
 
 
 def make_pr(
@@ -679,7 +688,7 @@ def make_pr(
 
 
 def make_comment(
-    node_id,
+    ref,
     body,
     author="reviewer",
     can_write=True,
@@ -687,8 +696,8 @@ def make_comment(
     can_write_known=True,
 ):
     return forge.Comment(
-        node_id=node_id,
-        numeric_id=abs(hash(node_id)) % 10_000,
+        ref=ref,
+        numeric_id=abs(hash(ref)) % 10_000,
         author=author,
         body=body,
         can_write=can_write,
@@ -699,7 +708,12 @@ def make_comment(
 
 class PrCommentsSweepTest(unittest.TestCase):
     def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
-        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=[repo] if repo else [])
+        # `repo` is one name, a list of them, or None for an install with none.
+        if isinstance(repo, (list, tuple)):
+            managed = list(repo)
+        else:
+            managed = [repo] if repo else []
+        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=managed)
         with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
@@ -1242,10 +1256,38 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertTrue(result.warnings)
         self.assertIn("could not name the account", result.warnings[0])
 
-    def test_the_preflight_runs_through_the_provider(self):
-        provider = FakeProvider()
-        self._sweep(provider)
-        self.assertTrue(provider.preflighted)
+    def test_identity_is_asked_of_every_repository_not_once_for_the_install(self):
+        """Two forges are two accounts, and only one of them can write here.
+
+        The old shape asked once and reused the answer everywhere, which is the
+        GitHub-only assumption in miniature: with a second forge configured, a
+        proposal there is compared against a login that belongs to the first
+        one, `is_agent_pull_request` says no to every one of them, and the sweep
+        goes quiet on that repository without saying anything.
+        """
+        provider = FakeProvider(viewer={REPO: SELF, OTHER_REPO: "other-bot"})
+        self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(set(provider.viewer_lookups), {REPO, OTHER_REPO})
+
+    def test_a_repository_whose_credential_is_nameless_is_skipped_not_the_sweep(self):
+        """One unreadable credential must not blind the watcher everywhere else.
+
+        The warning names the repository for the same reason: "the credential
+        could not name itself" on an install with two forges sends an operator
+        to look at both.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={REPO: SELF, OTHER_REPO: ""},
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        # `FakeProvider` answers the same pull request for either repository, so
+        # the one card is the readable repository's and the other contributed
+        # nothing but its warning.
+        self.assertEqual(len(result.cards), 1)
+        self.assertTrue(any(OTHER_REPO in w for w in result.warnings))
+        self.assertFalse(any(f"`{REPO}`" in w for w in result.warnings))
 
 
 class ResolverPathTest(unittest.TestCase):

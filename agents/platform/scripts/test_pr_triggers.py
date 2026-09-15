@@ -50,9 +50,9 @@ import pr_triggers  # noqa: E402
 SELF = "kube-agents-bot"
 
 
-def comment(author, body, node_id="n1"):
+def comment(author, body, ref="n1"):
     return forge.Comment(
-        node_id=node_id, author=author, body=body, can_write=True, created_at=""
+        ref=ref, author=author, body=body, can_write=True, created_at=""
     )
 
 
@@ -540,13 +540,13 @@ class StripMarkersTest(unittest.TestCase):
         self.assertLess(elapsed, 10.0, f"took {elapsed:.3f}s")
 
     def test_stripping_does_not_change_what_counts_as_answered(self):
-        """`handled_node_ids` reads raw bodies — a stripped one is not the record."""
+        """`handled_refs` reads raw bodies — a stripped one is not the record."""
         body = "Done.\n\n<!-- agent-answered:IC_1 -->"
         self.assertEqual(
-            pr_triggers.handled_node_ids([comment(SELF, body)], SELF), {"IC_1"}
+            pr_triggers.handled_refs([comment(SELF, body)], SELF), {"IC_1"}
         )
         self.assertEqual(
-            pr_triggers.handled_node_ids(
+            pr_triggers.handled_refs(
                 [comment(SELF, pr_triggers.strip_markers(body))], SELF
             ),
             set(),
@@ -556,51 +556,61 @@ class StripMarkersTest(unittest.TestCase):
 class HandledNodeIdsTest(unittest.TestCase):
     def test_a_self_authored_marker_marks_a_request_answered(self):
         comments = [comment(SELF, "Done.\n\n<!-- agent-answered:IC_1 -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_1"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_1"})
 
     def test_a_refusal_marker_counts_too(self):
         comments = [comment(SELF, "<!-- agent-refused:IC_2 -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_2"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_2"})
 
     def test_a_marker_pasted_by_someone_else_is_ignored(self):
         """Otherwise anyone could suppress a request by quoting the string."""
         comments = [comment("attacker", "<!-- agent-answered:IC_1 -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), set())
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), set())
 
     def test_the_bot_suffix_does_not_break_self_recognition(self):
         comments = [comment(f"{SELF}[bot]", "<!-- agent-answered:IC_1 -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_1"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_1"})
 
     def test_author_case_does_not_break_self_recognition(self):
         comments = [comment("Kube-Agents-Bot", "<!-- agent-answered:IC_1 -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_1"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_1"})
 
     def test_several_markers_in_one_comment_are_all_read(self):
         comments = [
             comment(SELF, "<!-- agent-answered:IC_1 -->\n<!-- agent-answered:IC_2 -->")
         ]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_1", "IC_2"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_1", "IC_2"})
 
-    def test_base64ish_node_ids_survive_the_pattern(self):
-        node = "PRRC_kwDOA_b-c=="
-        comments = [comment(SELF, pr_triggers.marker(node))]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {node})
+    def test_the_ref_spellings_the_pattern_has_to_accept(self):
+        """Both the current one and the one already written on live threads.
+
+        A ref is now `<kind>-<id>` -- the pair `proposal-acknowledge` takes --
+        where it used to be the forge's own opaque node id, base64-ish and
+        carrying `=`, `+`, `/` and `-`. The charset was not narrowed with the
+        change, on purpose: markers the agent wrote before the migration are on
+        open pull requests right now, and a pattern that stopped matching them
+        would re-answer every in-flight request once.
+        """
+        for ref in ("issue-1", "review_comment-987654321", "PRRC_kwDOA_b-c=="):
+            with self.subTest(ref=ref):
+                comments = [comment(SELF, pr_triggers.marker(ref))]
+                self.assertEqual(pr_triggers.handled_refs(comments, SELF), {ref})
 
     def test_whitespace_inside_the_marker_is_tolerated(self):
         comments = [comment(SELF, "<!--   agent-answered : IC_1   -->")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), {"IC_1"})
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), {"IC_1"})
 
     def test_no_comments_means_nothing_handled(self):
-        self.assertEqual(pr_triggers.handled_node_ids([], SELF), set())
+        self.assertEqual(pr_triggers.handled_refs([], SELF), set())
 
     def test_a_self_comment_with_no_marker_handles_nothing(self):
         comments = [comment(SELF, "just a status update")]
-        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), set())
+        self.assertEqual(pr_triggers.handled_refs(comments, SELF), set())
 
     def test_the_marker_builder_round_trips_through_the_scanner(self):
         built = pr_triggers.marker("IC_9")
         self.assertEqual(
-            pr_triggers.handled_node_ids([comment(SELF, built)], SELF), {"IC_9"}
+            pr_triggers.handled_refs([comment(SELF, built)], SELF), {"IC_9"}
         )
 
 
@@ -612,7 +622,7 @@ class SlashPatternTest(unittest.TestCase):
         # limit. Reachable before the trust gate -- `find_trigger` parses the raw
         # body of every comment from every account that can post one -- and
         # re-paid on every tick, because a refused or budget-dropped comment
-        # writes no marker for `handled_node_ids` to exclude.
+        # writes no marker for `handled_refs` to exclude.
         #
         # The trailing `x` is load-bearing: it is what stops the run being
         # trailing whitespace the pattern can consume in one bite, and it is the

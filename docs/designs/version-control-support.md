@@ -202,12 +202,16 @@ Two things exist and do not need designing again.
 **The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as seven
 operations, normalises three GitHub-isms behind them (`can_write` as a boolean rather than
 `author_association`, `supports_acknowledge` as a capability rather than an assumption,
-`normalise_login` folding the spellings one account gets), and funnels every provider call through
-one `_call()` override point. `pr-comment-conversation.md` §3 explains each of those and why live
-validation forced two of them; this document does not restate it.
+`normalise_login` folding the spellings one account gets), and funnels every call through one
+`call()`. `pr-comment-conversation.md` §3 explains each of those and why live validation forced two
+of them; this document does not restate it.
 
-**Provider selection.** `PROVIDERS` is a host-keyed table and `provider_for` reads it. Adding a
-forge is a registration rather than a branch in a sweep.
+**Provider selection.** There is one implementation of that protocol and it serves every forge:
+each of its seven operations is a version-control verb, and which forge answers is decided from the
+repository on the credential side by `providers/registry.py`. Adding a forge is a registration
+there rather than a branch in a sweep — and, as [One provider implementation, not
+two](#one-provider-implementation-not-two) argues, a second host table on the agent side would be a
+second place to register it and a second answer to give the third forge.
 
 A third is half-built, and the missing half is the one this design turns on. **A place to record
 which forge a repository belongs to now exists.** The `managed_repos` state ConfigMap carries a list
@@ -223,15 +227,17 @@ repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry there
 reconciliation intact and reaches the agent — where `get_managed_github_repos()` keeps the `github`
 entries and returns bare slugs. It logs the ones it skips rather than dropping them in silence, so a
 repository an administrator registered is visible as unsupported instead of indistinguishable from
-one that was never registered; it is still skipped, because there is one provider to skip it in
-favour of. The `pr_comments` sweep then calls `forge.provider_for()` with no argument at all, having
-just discovered its repositories through that function, so it gets `GitHubProvider` from the default
-rather than from the data.
+one that was never registered; it is still skipped, and the discriminator the administrator wrote
+is discarded at the point of that skip.
 
-`provider_for` takes a repository and parses its host, so a host the table does not know is a
-rejection rather than a silent fallback — [Repository identity](#repository-identity) covers how.
-What is still missing is the other direction: the entry's declared `type` reaching the selection at
-all. That needs a second provider to select, and lands with one.
+Nothing downstream of it needs the discriminator. The sweep calls `forge.provider_for()` and gets
+the one provider there is, and the host each repository is on is re-read from the repository itself
+when a verb reaches the broker. So the missing half is upstream: `get_managed_github_repos()`
+keeping entries whose `type` is not `github`, and returning a value that still names the host it
+came from. A repository value that names no repository at all is refused before a round trip is
+spent on it, and a host no forge module serves is the broker's refusal, reported to an operator as
+`FORGE_HOST_UNSUPPORTED` — [Repository identity](#repository-identity) covers the parse behind
+both.
 
 ### How this compares to what we have
 

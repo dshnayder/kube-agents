@@ -122,7 +122,12 @@ class GitHubForge(Forge):
             # not an utterance.
             if (node.get("body") or "").strip()
         ]
-        out.sort(key=lambda c: (c["created"], str(c["id"])))
+        # `ref` and not `id` as the tie-break: two of these three endpoints
+        # number independently, so a conversation comment and a review comment
+        # can share an id and the order between them would depend on which of
+        # two equal keys the sort happened to see first. `ref` carries the kind
+        # as well, so it is unique across the merge and the order is stable.
+        out.sort(key=lambda c: (c["created"], c["ref"]))
         return out
 
     @staticmethod
