@@ -34,18 +34,40 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     Three states, not GitHub's two plus a timestamp. Closed and merged are
     different outcomes on every forge, and a caller should not have to know
     that GitHub encodes the difference in a nullable date field.
+
+    `source` is a branch name and says nothing about where that branch lives.
+    `sourceRepo` is the repository it lives in, and the two have to be read
+    together: a proposal opened from a fork carries the bare branch name, so a
+    caller deciding "did I open this, from a branch I wrote" on `source` alone
+    accepts any fork's branch of the same name. It is `""` when the fork has
+    been deleted, which is the forge saying it no longer knows -- distinct from
+    naming this repository, and a caller that treats the two alike will amend a
+    branch under a name a stranger chose.
+
+    `sourceRevision` is that branch's tip as of this read, and is deliberately
+    a property of the read rather than of the proposal: the question it
+    answers -- did anything land here after the request I am replying to -- is
+    only sound against a tip re-read at the moment of asking.
     """
     if node.get("merged_at"):
         state = "merged"
     else:
         state = "open" if node.get("state") == "open" else "closed"
+    head = node.get("head") or {}
     return {
         "number": node.get("number"),
         "title": node.get("title") or "",
         "state": state,
         "draft": bool(node.get("draft")),
         "author": actor(node.get("user")),
-        "source": ((node.get("head") or {}).get("ref")) or "",
+        "labels": [
+            item.get("name", "")
+            for item in (node.get("labels") or [])
+            if isinstance(item, dict)
+        ],
+        "source": head.get("ref") or "",
+        "sourceRepo": ((head.get("repo") or {}).get("full_name")) or "",
+        "sourceRevision": head.get("sha") or "",
         "target": ((node.get("base") or {}).get("ref")) or "",
         "url": node.get("html_url") or "",
         "created": node.get("created_at") or "",
@@ -80,9 +102,19 @@ def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
     not say which endpoint they came from, and the endpoint is what decides
     whether a reaction can be left on it (`proposal-acknowledge`) and whether
     `path`/`line` mean anything. A review's timestamp is `submitted_at`.
+
+    `ref` is `id` and `kind` together, and it is what a caller should key
+    bookkeeping on. `id` alone is unique only within the endpoint that issued
+    it: a conversation comment and a review comment on the same proposal can
+    carry the same number, so a marker recording that one had been answered
+    would suppress the other. The pair is also exactly the identity
+    `proposal-acknowledge` takes, so there is one notion of which comment is
+    meant rather than two.
     """
+    ident = node.get("id")
     return {
-        "id": node.get("id"),
+        "id": ident,
+        "ref": f"{kind}-{ident}",
         "kind": kind,
         "author": actor(node.get("user")),
         "created": node.get("submitted_at") or node.get("created_at") or "",

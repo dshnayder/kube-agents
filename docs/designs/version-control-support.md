@@ -1996,6 +1996,9 @@ side of each.
 | `draft`             | `draft`                           | `work_in_progress` on older instances; read `draft`, fall back |
 | `author`            | `author.username`                 | no `[bot]` suffix to strip                                     |
 | `source` / `target` | `source_branch` / `target_branch` | direct                                                         |
+| `sourceRepo`        | `source_project_id`               | an id, not a path; resolved through `/projects/:id`            |
+| `sourceRevision`    | `sha`                             | the diff head; GitHub spells it `head.sha`                     |
+| `ref` (comment)     | `"note-{id}"`                     | one notes endpoint, so the kind is constant                    |
 | `url`               | `web_url`                         |                                                                |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                  |
 | `body`              | `description`                     | GitLab's name for it                                           |

@@ -43,6 +43,8 @@ CONCEPTS = {"proposal": "proposal", "issue": "issue", "label": "label"}
 # not add its own vocabulary alongside them -- the second is the failure that
 # matters, because a caller that finds `head.ref` in the answer starts using it.
 SHAPES: dict[str, frozenset[str]] = {
+    # `sourceRepo` and `sourceRevision` sit beside `source` because a branch
+    # name alone answers neither "whose branch is this" nor "what is on it now".
     "proposal": frozenset(
         {
             "number",
@@ -50,7 +52,10 @@ SHAPES: dict[str, frozenset[str]] = {
             "state",
             "draft",
             "author",
+            "labels",
             "source",
+            "sourceRepo",
+            "sourceRevision",
             "target",
             "url",
             "created",
@@ -72,9 +77,12 @@ SHAPES: dict[str, frozenset[str]] = {
             "body",
         }
     ),
-    # `id` and `kind` are what `proposal-acknowledge` takes back; `path` and
-    # `line` are empty except on an inline review comment.
-    "comment": frozenset({"id", "kind", "author", "created", "body", "url", "path", "line"}),
+    # `id` and `kind` are what `proposal-acknowledge` takes back; `ref` is the
+    # two together, and the only one of the three unique across endpoints.
+    # `path` and `line` are empty except on an inline review comment.
+    "comment": frozenset(
+        {"id", "ref", "kind", "author", "created", "body", "url", "path", "line"}
+    ),
     "commit": frozenset({"sha", "author", "committed", "message", "url"}),
     "label": frozenset({"name", "color", "description"}),
 }

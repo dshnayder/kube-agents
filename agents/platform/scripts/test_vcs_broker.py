@@ -1029,6 +1029,72 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(answer["forge"], "github")
         self.assertEqual(answer["repo"], "acme/infra")
 
+    def test_a_proposal_says_where_its_source_branch_lives_and_what_is_on_it(self):
+        # `source` is a branch name and nothing else. A proposal opened from a
+        # fork carries the bare name, so a caller deciding "is this mine" on
+        # the name alone accepts any fork's branch spelled the same way -- and
+        # the caller that does this then amends by pushing that name to *this*
+        # repository, creating a branch somebody else chose the name of.
+        broker, _ = self.broker(
+            {
+                "number": 7,
+                "state": "open",
+                "head": {
+                    "ref": "platform-agent/bump",
+                    "sha": "c0ffee1",
+                    "repo": {"full_name": "acme/infra"},
+                },
+                "base": {"ref": "main"},
+                "labels": [{"name": "agent:ignore"}, {"name": "kind/bug"}],
+            }
+        )
+        proposal = broker.proposal_view({"repository": "acme/infra", "number": 7})[
+            "proposal"
+        ]
+        self.assertEqual(proposal["source"], "platform-agent/bump")
+        self.assertEqual(proposal["sourceRepo"], "acme/infra")
+        self.assertEqual(proposal["sourceRevision"], "c0ffee1")
+        self.assertEqual(proposal["labels"], ["agent:ignore", "kind/bug"])
+
+    def test_a_deleted_fork_leaves_the_source_repository_unnamed(self):
+        # Not this repository, and not the fork either -- the forge has stopped
+        # saying. Answering `""` is what lets a caller fail closed; answering
+        # the repository being read would be a claim the forge did not make.
+        broker, _ = self.broker(
+            {
+                "number": 8,
+                "state": "open",
+                "head": {"ref": "platform-agent/bump", "sha": "c0ffee1", "repo": None},
+                "base": {"ref": "main"},
+            }
+        )
+        proposal = broker.proposal_view({"repository": "acme/infra", "number": 8})[
+            "proposal"
+        ]
+        self.assertEqual(proposal["sourceRepo"], "")
+        self.assertEqual(proposal["source"], "platform-agent/bump")
+
+    def test_a_comment_carries_an_identity_unique_across_endpoints(self):
+        # The numeric id is unique only within the endpoint that issued it, so
+        # a conversation comment and a review comment on one proposal can share
+        # it. A caller keying "already answered" on the number alone would let
+        # an answer to either suppress the other.
+        broker, _ = self.broker(
+            {"number": 7, "state": "open"},
+            [{"id": 111, "user": {"login": "alice"}, "body": "please rebase"}],
+            [{"id": 111, "user": {"login": "bob"}, "body": "nit", "path": "a.py"}],
+            [],
+        )
+        comments = broker.proposal_view(
+            {"repository": "acme/infra", "number": 7, "comments": True}
+        )["comments"]
+        refs = {comment["ref"] for comment in comments}
+        self.assertEqual(refs, {"issue-111", "review_comment-111"})
+        # And the pair it is built from is still there, because that pair is
+        # what `proposal-acknowledge` takes back.
+        for comment in comments:
+            self.assertEqual(comment["ref"], f"{comment['kind']}-{comment['id']}")
+
     def test_closed_and_merged_are_different_outcomes(self):
         # GitHub encodes the difference in a nullable date field; nowhere else
         # does, and a caller should not have to know that.
