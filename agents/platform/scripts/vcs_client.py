@@ -529,7 +529,12 @@ def commit(message: str, paths: list[str] | tuple[str, ...] = (), spec: str | No
     }
 
 
-def publish(spec: str | None = None, target: str | None = None) -> dict:
+def publish(
+    spec: str | None = None,
+    target: str | None = None,
+    *,
+    advance: bool = False,
+) -> dict:
     """Send the revisions made since `clone` to the shared repository.
 
     Symmetric with `clone`: history goes up the way it came down, as a bundle of
@@ -537,6 +542,11 @@ def publish(spec: str | None = None, target: str | None = None) -> dict:
     checks that the tip descends from the revision it handed out, and pushes the
     branch — without ever checking the objects out. So the revision identifiers
     on the forge are the ones `log` printed here.
+
+    `advance` says this copy was cloned *of* a proposal branch in order to add
+    to it, which is the one reason to publish the branch the copy came down on.
+    It needs an explicit `target` beside it — the branch the proposal merges
+    into — because the default target is the cloned branch itself.
     """
     session = resolve_session(spec)
     tree = tree_of(session)
@@ -554,24 +564,35 @@ def publish(spec: str | None = None, target: str | None = None) -> dict:
             "there are no new revisions to publish. `vcs.py commit` records "
             "one; `vcs.py status` shows what is still uncommitted."
         )
-    if branch == session["branch"] or branch == target:
-        # After the count, not before: on the shared branch with nothing
-        # committed, "there is nothing to publish" is the more specific of the
-        # two true things and the one that says what to do next.
+    # Both of these come after the count, not before: on the shared branch with
+    # nothing committed, "there is nothing to publish" is the more specific of
+    # the two true things and the one that says what to do next.
+    if branch == target:
+        raise VcsError(
+            f"branch and target are both {branch}, so this would write the "
+            "revisions straight onto the branch they are meant to be proposed "
+            "for. Name the branch this work merges into as the target."
+        )
+    if branch == session["branch"] and not advance:
+        # This clause, not the one above, is what caught the real case. `branch
+        # == target` alone was defeated by `--target <anything else>` while
+        # still standing on the branch the copy was cloned from -- seen live: a
+        # worker cloned a non-default branch, committed on it, published with
+        # `--target main`, and fast-forwarded the branch it had cloned. The copy
+        # knows which branch that was; the broker does not, so the copy is where
+        # the refusal is exact. The broker refuses the same thing when told
+        # (`clonedFrom` below) and refuses the remote's default branch on its
+        # own.
         #
-        # Two comparisons, and the first is the one that matters. `branch ==
-        # target` alone was defeated by `--target <anything else>` while
-        # still standing on the branch the copy was cloned from -- seen live:
-        # a worker cloned a non-default branch, committed on it, published
-        # with `--target main`, and fast-forwarded the branch it had cloned.
-        # The copy knows which branch that was; the broker does not, so the
-        # copy is where the refusal is exact. The broker refuses the same
-        # thing when told (`clonedFrom` below) and refuses the remote's
-        # default branch on its own.
+        # `advance` is the one way past it, and it is a different sentence
+        # rather than a louder one: the copy was cloned *of* a proposal branch
+        # so that this publish could add to it. Nothing else is waived.
         raise VcsError(
             f"you are on {branch}, which is the branch this copy was cloned "
             "from, so this would write to it directly. Make a branch of your "
-            "own with `vcs.py branch <name>` and publish that."
+            "own with `vcs.py branch <name>` and publish that -- or, if you "
+            "cloned this branch to add to the proposal already on it, say so "
+            "with `--advance`."
         )
 
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
@@ -598,6 +619,7 @@ def publish(spec: str | None = None, target: str | None = None) -> dict:
                 "target": target,
                 "baseRevision": base,
                 "clonedFrom": session["branch"],
+                "advance": advance,
                 "bundleBase64": base64.b64encode(blob).decode("ascii"),
             },
         )

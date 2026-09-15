@@ -421,7 +421,10 @@ class VcsBroker:
 
         The branch must not be the target either. That closes the same door for
         a copy cloned from a branch that is not the default, where the broker
-        has nothing to check against but what the caller declared.
+        has nothing to check against but what the caller declared. `advance`
+        waives the declared half of that pair and nothing else -- it is how a
+        caller says the branch it cloned is a proposal branch it is here to add
+        to, which is the one case where writing to it is the whole point.
 
         The bundle must carry exactly the branch it claims. A bundle holding a
         second ref would publish something the caller did not declare, and a
@@ -448,7 +451,15 @@ class VcsBroker:
         cloned_from = payload.get("clonedFrom")
         if cloned_from is not None:
             cloned_from = validate_branch(cloned_from, "clonedFrom")
-        if cloned_from and branch == cloned_from:
+        # The one legitimate reason to write to the branch this copy was cloned
+        # from: the copy was taken *of* a proposal branch in order to add to it.
+        # A caller revising an open proposal has to clone the branch the
+        # proposal is on -- there is nowhere else its revisions are -- and every
+        # other check still applies to it, the default-branch refusal below
+        # included. The field is the caller saying which of the two situations
+        # this is, and a caller that omits it gets the refusal.
+        advance = bool(payload.get("advance"))
+        if cloned_from and branch == cloned_from and not advance:
             # The client says so itself: this is the branch the copy was
             # cloned from, whatever `target` names. A client that lies here
             # gains nothing it could not get by omitting the field, so this

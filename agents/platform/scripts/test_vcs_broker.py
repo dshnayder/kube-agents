@@ -871,6 +871,50 @@ class RepositoryVerbTest(unittest.TestCase):
         )
         self.assertEqual(self.remote_tip("topic"), first)
 
+    def test_advance_is_how_a_proposal_branch_gets_a_second_publish(self):
+        # The refusal above is about a copy that wandered onto the branch it
+        # came down on. A copy taken *of* a proposal branch in order to add to
+        # it is the other situation, and it is the whole of how an open
+        # proposal gets revised: there is nowhere else its revisions live.
+        git(self.seed, "checkout", "--quiet", "-b", "topic")
+        git(self.seed, "push", "--quiet", "origin", "topic")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        second = self.commit_in(work, "b.txt", "b\n", "another round")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "topic",
+                "target": "main",
+                "clonedFrom": "topic",
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), second)
+
+    def test_advance_does_not_reach_the_default_branch(self):
+        # Everything else still applies to it. The default-branch refusal is
+        # the one that does not come from the request, so it is the one worth
+        # proving the opt-in cannot talk its way past.
+        work, answer = self.clone_locally()
+        self.commit_in(work, "c.txt", "c\n", "onto main")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "main",
+                    "target": "release",
+                    "clonedFrom": "main",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "main", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
     def test_scratch_names_come_from_a_counter_not_from_the_caller(self):
         first = self.broker._scratch("clone")
         second = self.broker._scratch("clone")
@@ -1170,6 +1214,15 @@ class CollaborationTest(unittest.TestCase):
         broken = subprocess.CompletedProcess(["gh"], 1, "", "connect: timeout")
         broker, _ = self.broker(status, broken)
         self.assertIsNone(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+
+    def test_proposal_list_asks_for_one_branch_rather_than_filtering_a_page(self):
+        broker, recorder = self.broker([])
+        broker.proposal_list({"repository": "acme/infra", "source": "platform-agent/fix"})
+        asked = recorder.calls[-1][4]
+        self.assertIn("repos/acme/infra/pulls", asked)
+        # Owner-qualified, so a fork carrying the same branch name cannot
+        # answer for this repository's proposal.
+        self.assertIn("head=acme%3Aplatform-agent%2Ffix", asked)
 
     def test_issue_list_with_a_query_goes_through_search(self):
         broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})

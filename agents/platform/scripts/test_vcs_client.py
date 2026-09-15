@@ -129,6 +129,28 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertIn("cloned from", str(caught.exception))
         self.assertEqual(self.published, [])
 
+    def test_advance_publishes_the_cloned_branch_and_says_so_to_the_broker(self):
+        # The copy was taken of a proposal branch in order to add to it, which
+        # is the one reason to write to the branch it came down on. The flag
+        # travels: the broker refuses the same thing on its own, so a client
+        # that waived the check quietly would be refused there instead.
+        cloned = vcs_client.clone("acme/infra")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("another round on the proposal", spec="acme/infra")
+        answer = vcs_client.publish("acme/infra", target="release", advance=True)
+        self.assertEqual(answer["branch"], "main")
+        self.assertTrue(self.published[0]["advance"])
+        self.assertEqual(self.published[0]["clonedFrom"], "main")
+
+    def test_advance_still_refuses_a_target_that_is_the_branch_itself(self):
+        cloned = vcs_client.clone("acme/infra")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("no target of its own", spec="acme/infra")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.publish("acme/infra", advance=True)
+        self.assertIn("branch and target are both", str(caught.exception))
+        self.assertEqual(self.published, [])
+
 
 if __name__ == "__main__":
     unittest.main()

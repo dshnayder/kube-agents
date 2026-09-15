@@ -171,11 +171,28 @@ class GitHubForge(Forge):
 
     def proposal_list(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         limit = validate_limit(payload.get("limit"))
-        nodes = api(
-            "GET",
-            f"repos/{repo}/pulls",
-            params={"state": validate_state(payload.get("state")), "per_page": limit},
-        )
+        params: dict[str, Any] = {
+            "state": validate_state(payload.get("state")),
+            "per_page": limit,
+        }
+        source = payload.get("source")
+        if source is not None:
+            # Asked as a filter rather than by listing everything and matching
+            # on `source` here, because "is there an open proposal for the
+            # branch I just published" is the question every submitting caller
+            # asks, and a page of the newest twenty proposals answers it wrong
+            # on a busy repository.
+            #
+            # The owner qualifier is this repository's own. The bare branch
+            # name is also accepted here and matches the same branch on every
+            # fork, which would let a fork's proposal answer for ours; a
+            # published branch always lives on the repository itself.
+            owner = repo.split("/")[0]
+            params["head"] = f"{owner}:{validate_branch(source, 'source')}"
+        target = payload.get("target")
+        if target is not None:
+            params["base"] = validate_branch(target, "target")
+        nodes = api("GET", f"repos/{repo}/pulls", params=params)
         return listing([translate.proposal(node) for node in nodes], limit, "proposals")
 
     def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
