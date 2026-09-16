@@ -506,9 +506,11 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # `gh` keeps its shim here. Taking it away is the right end state -- a forge CLI
 # on PATH is the route out of a forge-neutral abstraction and the model takes
 # it, answering through `gh api` on a quarter of the write probes with the
-# version-control skill loaded -- but every `gh` caller in the tree still means
-# this shim, so its removal travels with them in the consumer-migration change
-# rather than landing here ahead of them.
+# version-control skill loaded -- but callers in the tree still mean this shim.
+# The consumer migration moved the pull-request and issue paths onto the
+# version-control verbs and deliberately left `fleet-audit`'s `audit_report.py`
+# on the CLI, on size grounds. The removal travels with that port, not with
+# this line.
 RUN mkdir -p /opt/credential-proxy/bin && \
     for binary in gcloud kubectl gh git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \

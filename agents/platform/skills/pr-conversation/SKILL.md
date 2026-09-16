@@ -130,8 +130,10 @@ Sort each request into one of two shapes:
 No commit.
 
 **A change request.** Follow **`submit-suggestion` Step 5** — `prepare --branch
-<head_ref>`, edit, `submit`. Its `--force-with-lease` and protected-branch
-guards apply unchanged, and the change goes on the pull request's own branch.
+<head_ref>`, edit, `submit`. The change goes on the pull request's own branch,
+and `submit` extends it: publishing is fast-forward only, so a branch somebody
+else has pushed to since you read it is refused by name rather than
+overwritten. The protected-branch guard applies unchanged.
 Never open a second pull request for a change to an existing one.
 
 **Stop after that skill's `submit`.** Its Step 5 ends by telling you to reply

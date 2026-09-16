@@ -1,15 +1,21 @@
 # Version control and issue tracking
 
 > **STATUS — design of record; the seam, the provider layer with GitHub behind
-> it, and the sandbox's own git are in; the consumer migration, the declarative
+> it, the sandbox's own git and the consumer migration are in; the declarative
 > surface and the second forge are not.** On `main`, repository identity runs
 > through one parser (`repo_ref.py`); the broker serves the version-control verbs
 > over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
 > is `providers/github/`; the `version-control` skill drives those verbs from a
-> sandbox that holds a credential-free git. Every shipped consumer still reaches
-> GitHub by name through `gh` and the credential shim, the CRD still knows only
-> `spec.integration.github`, and no second forge exists. This is the design for
-> driving any forge, and the order the rest has to happen in.
+> sandbox that holds a credential-free git; and the consumers reach the forge
+> through those verbs rather than by naming GitHub. Two things are deliberately
+> left behind by that migration and are not scheduling slips: `audit_report.py`
+> and the `fleet-audit` prose around it still shell `gh`, and
+> `inspect_repository.py` stays on the `git` shim because it reads repositories
+> this install does not manage and does it with a shallow clone — neither of
+> which the verbs offer, the second on purpose ([The seam](#3-the-seam)). The
+> CRD still knows only `spec.integration.github`, and no second forge exists.
+> This is the design for driving any forge, and the order the rest has to
+> happen in.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
@@ -116,14 +122,16 @@ repository lives on GitLab cannot use any of it.
 
 The coupling runs through five layers, each with a different owner and a different cost to unwind:
 
-1. **The consumers.** Six scripts call the forge's API to get work done. Three go through a
+1. **The consumers.** Six scripts call the forge's API to get work done. Three went through a
    provider abstraction — `pr_conversation.py`, `pr_triggers.py` and `github_scan_gate.py`, all on
-   `forge.py`; three shell `gh` directly — `resolver.py`, `submit_suggestion.py` and
+   `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
    `inspect_repository.py`, reaches a repository rather than an API, and does it by running
    `git clone` through the sandbox's credential shim. (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.)
+   layer 3.) Five of the six are now on the verbs, and `forge.py` with them — it holds typed
+   values and three policy rules and no forge implementation. `audit_report.py` is the sixth and
+   has not moved. `inspect_repository.py` will not move: see the status banner.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Every Python assertion now runs through one
@@ -137,8 +145,10 @@ The coupling runs through five layers, each with a different owner and a differe
    field takes GitHub's namespace grammar, the state ConfigMap the operator writes labels every
    repository `github` by a constant, and the chart, installer and Terraform composition all carry
    GitHub App inputs.
-5. **The prompts.** Four `SKILL.md` files instruct the model in `gh` spellings; seven governance
-   SOPs name `gh` to forbid it and call the artefact a pull request throughout.
+5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
+   SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
+   are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and
+   move when it does.
 
 Layers 1, 2 and 3 are worth changing whether or not a second forge ever arrives — each one removes a
 duplicated parser, a silent fallback, or a hardcoded host. Layer 2's half of that is done: the
@@ -458,11 +468,12 @@ host still selects GitHub, which is what the shorthand means until
 
 Two kinds of prompt name the forge, and they need different work.
 
-Four `SKILL.md` files instruct the model in `gh` spellings and call the artefact a pull request:
+Four `SKILL.md` files instructed the model in `gh` spellings and called the artefact a pull request:
 `fleet-audit`, `pr-conversation` and `submit-suggestion` under `agents/platform/skills/`, and
 `gke-stockout-investigator` under `agentplugins/`, which reaches an install through the
 `AgentPlugin` CRD rather than through the agent image and so is easy to miss. These want the command
-behind a wrapper and the noun taken from configuration.
+behind a wrapper and the noun taken from configuration. Three are done; `fleet-audit` is the one
+still written in `gh`, and it travels with `audit_report.py` for the reason the banner gives.
 
 The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
 owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
@@ -914,10 +925,11 @@ without a binary to carry it.
 
 What this does not remove is the dependency elsewhere. `gh` stays on the
 broker's executable allowlist, because the GitHub module uses `gh api` as an
-authenticated HTTP client, and these still name it from outside the sandbox: the
-seven governance SOPs under `agents/platform/governance/`, `forge.py`, the
-`fleet-audit`, `github-issue-resolver`, `pr-conversation` and `submit-suggestion`
-skills. Each is a port, not a rewrite. `forge.py` is the load-bearing one: it is
+authenticated HTTP client. When this was written six things still named it from
+outside the sandbox: the seven governance SOPs under
+`agents/platform/governance/`, `forge.py`, and the `fleet-audit`,
+`github-issue-resolver`, `pr-conversation` and `submit-suggestion` skills. Each
+is a port, not a rewrite. `forge.py` was the load-bearing one: it is
 already a provider seam of its own, it is what the four skills call, and
 [One implementation, not two](#one-provider-implementation-not-two) is the decision that
 it converges with `providers/` rather than becoming a second copy of it. Until
@@ -1355,7 +1367,9 @@ before this one is read as arriving on empty ground.
 `agents/platform/scripts/forge.py` is agent-side: a `ForgeProvider` protocol of
 seven read operations, a `GitHubProvider` shelling `gh` behind it, and typed
 `PullRequest` / `Comment` / `Commit` values. It exists to serve one feature — the
-pull-request review conversation — and it stops where that feature stops.
+pull-request review conversation — and it stops where that feature stops. That
+is the state this section argues against; what it now holds is the outcome of
+the argument, one `BrokerProvider` over the verbs.
 
 The broker described here needs the same furniture on its own side of the
 credential boundary: a provider protocol, a GitHub implementation, a host
@@ -1395,10 +1409,12 @@ Restructuring afterwards is the work nobody schedules, and a second GitHub
 implementation is far harder to remove once merged than to not write.
 
 The constraint is deliberately narrow: it says where the code lands, not what
-order it is written in. `forge.py`'s two current consumers keep working untouched
-until they are migrated, so neither the abstraction nor the migration blocks the
+order it is written in. `forge.py`'s two consumers kept working untouched until
+they were migrated, so neither the abstraction nor the migration blocked the
 other. The state worth preventing is the third one, where two GitHub
-implementations arrive independently and each acquires consumers.
+implementations arrive independently and each acquires consumers. That is what
+the sequencing bought: `forge.py` now holds no implementation to be the second
+of.
 
 ### The protocol past its first feature
 
@@ -1410,13 +1426,12 @@ sites. A second forge implemented against `forge.py` alone therefore buys a revi
 and no issue resolution, no audit ledger, and no way to open a change.
 
 Migrating those three onto the provider is the step that makes a forge a class rather than four
-rewrites. It is anticipated rather than planned:
+rewrites. It was anticipated rather than planned:
 [`pr-comment-conversation.md`](pr-comment-conversation.md) §7 names `resolver.py` as the module's
-obvious next consumer while holding the migration itself out of scope. Half of that has since
-happened by another route — `resolver.py` dropped its own repository parser and imports
-`gitops_workspace` for one instead — but it still runs its own `gh`, which is the half this section
-is about. Migrating the remaining three is what makes the provider the only way to reach a forge;
-until it happens, a second forge buys a reviewer conversation and nothing else.
+obvious next consumer while holding the migration itself out of scope. Two of the three have since
+made the move, onto the verbs rather than onto `forge.py` — which is the same destination, since
+`forge.py`'s operations are verbs now. `audit_report.py` is the one left, and until it moves the
+ledger is the one forge surface a second forge would not serve.
 
 The protocol grows to the union of what the four need. Beyond the existing seven, that is opening a
 change (branch plus pull request), editing and reading one back, listing and commenting on issues,
@@ -2421,11 +2436,14 @@ here.
    as one token carrying a mode, which argues the declaration attaches to the
    credential and not to the install.
 
-4. **Whether `GitHubProvider` moves onto the in-process HTTP transport.** Not
+4. **Whether the GitHub module moves onto the in-process HTTP transport.** Not
    proposed. It would take `gh` out of the broker entirely, which
    [Replacing `gh`](#replacing-gh) wants for other reasons, and the transport
    split makes it a small change. It needs the App token reachable by the broker
-   without `gh auth`, which is not true today.
+   without `gh auth`, which is not true today. (The question is about
+   `providers/github/`, the broker-side module. The agent-side `GitHubProvider`
+   this once also named is gone; there is one `BrokerProvider` for every forge
+   and it speaks verbs, not HTTP.)
 
 ## Related
 

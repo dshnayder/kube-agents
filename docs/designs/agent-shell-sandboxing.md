@@ -1802,13 +1802,19 @@ is not on the build PATH.
 
 `gh` needed one step the others did not.
 [`github_scan_gate.py`](../../agents/platform/scripts/github_scan_gate.py) runs
-`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shells out to
-`gh` at every call site. Both modules funnel those invocations through one function —
+`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shelled out to
+`gh` at every call site. Both modules funnelled those invocations through one function —
 `forge.run_gh` and `resolver._run_gh_once` — so routing that pair through
 `sandbox_exec.run` carried the whole sweep across without moving the script. Both files
 also run on the far side of the boundary when the model invokes them from its shell, and
 one call site serves both: `sandbox_enabled()` reads an agent-pod file, so in the sandbox
 it is false and `run()` executes locally.
+
+Neither of those two functions exists any more. The consumer migration replaced every `gh`
+call in both with a version-control verb, and the crossing is now `forge.call`, over the
+same `sandbox_exec.run` and for the same reason — the credential is on the far side. What
+this paragraph describes is the shape that made the crossing cheap enough to do at all;
+what remains of it is the one seam, in one place.
 
 `git` is the one that turns on placement. `credential_proxy.py::_execute` confines a git
 command's working directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it on the
@@ -2327,8 +2333,11 @@ exist and takes the same fork for the whole run. An unreachable broker answers "
 publishes through the leased clone, which is the one question in a run where falling back beats
 failing — every other call still fails loudly. It answers "no" by code as well as by status:
 `CONTENT_WORKSPACES_DISABLED` on a 404 says the broker does not have them armed, where a bare
-404 says that and "no such route" indistinguishably. The migrated skills are
-`submit-suggestion` and `fleet-audit`, and `fleet-audit` needed the read side to replace what
+404 says that and "no such route" indistinguishably. The migrated skills were
+`submit-suggestion` and `fleet-audit`. `submit-suggestion` has since left content mode
+entirely — the version-control verbs give it a real checkout in its own container, with the
+credential in another, so there is nothing for the contentless fork to buy — and what is
+written here now describes `fleet-audit` alone. It needed the read side to replace what
 the clone used to answer: `list` pages the repository's tracked files, `read` fetches them
 singly or in a batch, and `grep` searches them, which is how a remediation path stays something
 discovered rather than invented when there is nothing local to search.

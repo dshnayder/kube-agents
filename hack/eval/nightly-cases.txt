@@ -53,12 +53,13 @@
 # the ~1.15x the presubmit realised on whole-job wall clock at parallelism 4
 # under daytime quota contention that would be ~720-740min, over the
 # deadline; 480m holds only if the nightly, alone on the model quota at that
-# hour and two lanes wider, realises ~1.55x or better, which is priced, not measured. The first nights after this change measure it:
-# record the wall clock and any truncation on #1491, and if the deadline
-# bites, the lever is the periodic's timeout or this list's tail, in that
-# order. A deadline kill is survivable by design -- the cost-hinted queue
-# means it truncates in-flight units, the EXIT trap still records what
-# completed -- but it is a truncated night.
+# hour and two lanes wider, realises ~1.55x or better, which is priced, not
+# measured. The first nights after this change measure it: record the wall
+# clock and any truncation on #1491, and if the deadline bites, the lever is
+# the periodic's timeout or this list's tail, in that order. A deadline kill
+# is survivable by design -- the cost-hinted queue means it truncates
+# in-flight units, the EXIT trap still records what completed -- but it is a
+# truncated night.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

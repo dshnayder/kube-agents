@@ -101,8 +101,11 @@ The shared agent volume used to be the live gap here: a `core.fsmonitor` entry t
 sandbox wrote under a workspace root ran in the credential holder on the next
 `git status`, with no lease taken and no mutating verb, so neither the workspace-lease
 floor nor the argument-level deny policy reached it. Separate Pods close it. There is no
-volume both sides mount, the broker owns the only checkout, and the skills that write to
-a forge hand it file content and a commit message rather than a directory.
+volume both sides mount, and no skill that writes to a forge hands the broker a directory:
+the version-control verbs hand it a bundle of revisions, which it fetches into a scratch
+repository of its own, and `fleet-audit`, still on the older path, hands it file content
+and a commit message. A checkout the caller wrote is never a checkout the credential
+holder runs `git` in.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the

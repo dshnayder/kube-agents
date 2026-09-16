@@ -1,18 +1,27 @@
 # The issue resolver, end to end, over the migrated forge surface.
 #
 # THIS CASE IS NOT THE RED, and saying so is the point of this paragraph. It
-# was written expecting one -- `resolver.py` reaches the forge through
-# `run_gh`, and the sandbox image ships no `gh` binary (audited live
-# 2026-08-28: `rc: 127`, `bash: line 1: gh: command not found`). That audit is
-# real but it does not apply here: `run_gh` is `forge.run_gh`, which routes the
-# call through the credential broker rather than executing a CLI, so the
-# resolver is not broken on main. Run against `main-4556bc68` on 2026-09-15
-# this case PASSED, both checks (`run_20260915_202553_528206`), and it passes
-# on the branch too (`run_20260916_132438_579519`). It is kept anyway, as a
-# regression guard: PR-2 rewrites every forge call in `resolver.py`, that is
-# the largest consumer in the migration, and nothing else drives the skill end
-# to end against a live forge. vcs-review-feedback-read-back is the case that
-# carries this PR's red.
+# was written expecting one. On `main`, `resolver.py` reaches the forge by
+# shelling the `gh` CLI -- its own `run_gh`, over `sandbox_exec.run(["gh", ...])`
+# -- and an audit on 2026-08-28 found no `gh` binary in the sandbox image
+# (`rc: 127`, `bash: line 1: gh: command not found`). Both halves of that are
+# true and the conclusion drawn from them was still wrong: #1253 ships a `gh`
+# shim in the sandbox that routes to the credential broker, so those calls
+# succeed and the resolver works on `main`. Run against `main-4556bc68` on
+# 2026-09-15 this case PASSED, both checks (`run_20260915_202553_528206`), and
+# it passes on the branch too (`run_20260916_132438_579519`).
+#
+# It is kept anyway, as a regression guard, and the shim is why it is a good
+# one: on `main` this skill reaches the forge through a CLI that a shim
+# redirects, and on the branch through the verbs directly. PR-2 rewrites every
+# forge call in `resolver.py`, the largest consumer in the migration, and
+# nothing else drives the skill end to end against a live forge.
+# vcs-review-feedback-read-back is the case that carries this PR's red.
+#
+# There is no route check here, for the same reason the red case's route check
+# is a negative one: the resolver's `gh` calls are subprocesses of a Python
+# script, not commands the worker ran, so `worker_commands` never sees them on
+# either build.
 #
 # WHAT IS GRADED, and what deliberately is not. The property under test is
 # whether the resolver reaches the forge and completes its procedure -- poll,
