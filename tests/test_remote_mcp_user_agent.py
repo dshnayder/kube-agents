@@ -56,7 +56,7 @@ CLOUDBUILDS = (
 
 PROXY_ARG = "/opt/mcp-remote/dist/proxy.js"
 VERSION_VAR = "KUBE_AGENTS_VERSION"
-# The execution mode, in the RFC 9110 §5.6.3 comment after the product token.
+# The execution mode, in the RFC 9110 §5.6.5 comment after the product token.
 # The Developer Knowledge telemetry parser reads it out of the parentheses,
 # apart from any OS/architecture metadata that may share them; `daemon` is its
 # taxonomy value for Kubernetes operators and background controllers, which is

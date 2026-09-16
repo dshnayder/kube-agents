@@ -90,7 +90,7 @@ mcp_servers:
   #     divergent value survives alone as a bare positional after the URL,
   #     which mcp-remote reads as its optional callback port and discards as
   #     NaN. The overlay's spelling is the one silently lost.
-  #   - `(daemon)` is the execution mode, in the RFC 9110 §5.6.3 comment after
+  #   - `(daemon)` is the execution mode, in the RFC 9110 §5.6.5 comment after
   #     the product token, which is where the Developer Knowledge telemetry
   #     parser reads it from (kept apart from any OS/architecture metadata that
   #     may share the parentheses). `daemon` is their taxonomy value for
