@@ -616,23 +616,34 @@ class ViewerLoginTest(BrokerCase):
             provider.viewer_login(REPO)
         self.assertEqual(len(self.broker.payloads("identity")), 1)
 
-    def test_a_broken_credential_names_nobody_rather_than_raising(self):
-        """The callers already have one way to say this, and they stop loudly."""
-        self.broker.refuse["identity"] = vcs_client.VcsError(
-            "unauthenticated", code="FORGE_UNAUTHENTICATED"
-        )
-        provider = forge.provider_for()
-        with self.assertLogs(forge.LOGGER, logging.WARNING) as logs:
-            self.assertEqual(provider.viewer_login(REPO), "")
-        self.assertIn("could not name itself", "\n".join(logs.output))
+    def test_a_call_that_did_not_happen_raises_with_its_reason(self):
+        """A transport that is down must not read as a nameless credential.
 
-    def test_an_empty_answer_is_cached_too(self):
-        """Otherwise every pull request in the sweep pays for the same refusal."""
-        self.broker.refuse["identity"] = vcs_client.VcsError("down")
-        provider = forge.provider_for()
-        with self.assertLogs(forge.LOGGER, logging.WARNING):
-            for _ in range(3):
-                provider.viewer_login(REPO)
+        Identity is the first verb a tick sends, so an unreachable sandbox
+        reaches this before anything else. Collapsing it into "" would put the
+        repository in the sweep's `nameless` list and post the one warning that
+        says the credential is broken -- sending an operator to the credential
+        for a pod that is merely restarting. Raising puts it in the guard that
+        prints the reason code instead.
+        """
+        for code in ("SANDBOX_UNREACHABLE", "FORGE_RATE_LIMITED", "FORGE_UNAUTHENTICATED"):
+            with self.subTest(code=code):
+                self.broker.refuse["identity"] = vcs_client.VcsError("no", code=code)
+                provider = forge.provider_for()
+                with self.assertRaises(forge.ForgeError) as raised:
+                    provider.viewer_login(REPO)
+                self.assertEqual(raised.exception.reason, code)
+
+    def test_an_answer_carrying_no_login_is_empty_and_is_cached(self):
+        """This is the nameless credential, and it is the only one.
+
+        The forge answered; what it answered with names no account. Cached
+        because otherwise every pull request in the sweep pays for the same
+        lookup.
+        """
+        provider = self.provider(identity={"identity": {"login": ""}})
+        for _ in range(3):
+            self.assertEqual(provider.viewer_login(REPO), "")
         self.assertEqual(len(self.broker.payloads("identity")), 1)
 
     def test_a_permission_lookup_teaches_the_viewer_for_free(self):
@@ -898,11 +909,22 @@ class ListCommentsTest(BrokerCase):
         provider.list_comments(REPO, self.pr)
         self.assertEqual(len(self.broker.payloads("identity")), 2)
 
-    def test_is_bot_reads_the_unnormalised_suffix(self):
-        """The marker comparison normalises; "is this a bot" is the raw spelling."""
-        provider = self._provider([comment(author="kube-agents-bot[bot]")])
-        (c,) = provider.list_comments(REPO, self.pr)
-        self.assertTrue(c.is_bot)
+    def test_is_bot_comes_from_the_verb_and_not_from_the_login(self):
+        """The suffix is gone by the time this side sees the author.
+
+        `translate.actor` removes `[bot]` from every login the forge module
+        emits, so reading "is this an automation" off the spelling answers
+        False for every comment there is -- which silently retires the gate
+        that stops two agents answering each other. The verb carries the fact
+        instead, and this is the shape the real broker sends: an author with no
+        suffix and `bot` beside it.
+        """
+        provider = self._provider(
+            [comment(author="kube-agents-bot", bot=True), comment(ref="issue-2")]
+        )
+        bot, human = provider.list_comments(REPO, self.pr)
+        self.assertTrue(bot.is_bot)
+        self.assertFalse(human.is_bot)
 
     def test_a_truncated_conversation_refuses_rather_than_returning_short(self):
         """The one listing where a partial answer is wrong, not merely incomplete.

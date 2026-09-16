@@ -58,24 +58,6 @@ SANDBOX_RESOLVER = "/opt/data/skills/github-issue-resolver/scripts/resolver.py"
 FORWARD_TIMEOUT_PER_REPO_S = 300
 FORWARD_TIMEOUT_MARGIN_S = 15
 
-
-def _forward_timeout(argv) -> int:
-    """Seconds to allow the forwarded subcommand, sized like the caller's budget.
-
-    Only `poll` scales with the fleet -- it is the one subcommand that visits
-    every managed repository, and it is the one `github_scan_gate` budgets per
-    repository. `claim` and `transition` name a single issue, so they get the
-    one-repository ceiling and do not pay a ConfigMap read to find that out.
-    That read is not free and it is on the model's path for those two.
-    """
-    repos = 1
-    if argv and argv[0] == "poll":
-        try:
-            repos = max(1, len(get_managed_github_repos()))
-        except Exception:
-            repos = 1
-    return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
-
 IN_PROGRESS = "status:in-progress"
 ESCALATION_NEEDED = "status:escalation-needed"
 
@@ -156,6 +138,23 @@ def refuse(
     print(json.dumps(payload))
     sys.exit(1)
 
+
+def _forward_timeout(argv) -> int:
+    """Seconds to allow the forwarded subcommand, sized like the caller's budget.
+
+    Only `poll` scales with the fleet -- it is the one subcommand that visits
+    every managed repository, and it is the one `github_scan_gate` budgets per
+    repository. `claim` and `transition` name a single issue, so they get the
+    one-repository ceiling and do not pay a ConfigMap read to find that out.
+    That read is not free and it is on the model's path for those two.
+    """
+    repos = 1
+    if argv and argv[0] == "poll":
+        try:
+            repos = max(1, len(get_managed_github_repos()))
+        except Exception:
+            repos = 1
+    return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
 
 def _forward_to_sandbox(argv: list) -> int:
     """Re-run this whole subcommand inside the shell sandbox.
@@ -485,11 +484,17 @@ def calculate_issue_priority(issue: dict) -> tuple[int, str]:
     return score, priority_label
 
 
-def _fetch_comments(repo: str, number) -> list:
-    """Fetch one issue's comments, after the ranking has picked a winner.
+def _fetch_comments(repo: str, number) -> tuple[list, bool]:
+    """One issue's comments and whether that is all of them, after the ranking.
 
     Split out of the list query so that query can widen to a hundred issues
     without paying for a field only the selected issue needs.
+
+    `limit` is passed explicitly. Omitting it is not "no ceiling" -- the verb
+    validates an absent limit into its own default of 30, which is below what
+    the `gh issue view --json comments` call this replaces returned, and the
+    comments come oldest first, so the thirty-first is the reporter's newest
+    follow-up and exactly the one an investigation wants.
 
     Returns [] rather than raising when the fetch fails. The comments are
     context for the investigation, not the thing being investigated: an issue
@@ -499,19 +504,33 @@ def _fetch_comments(repo: str, number) -> list:
     A failure is warned about on stderr, though, because the payload cannot
     tell the two apart: `"comments": []` is what an issue with no comments
     looks like too, so an investigation that silently lost the reporter's
-    follow-up context would read as a complete one.
+    follow-up context would read as a complete one. A page that filled up is
+    the same problem one step milder, and the verb reports it
+    (`commentsTruncated`) rather than leaving it to be guessed at, so it is
+    warned about on stderr and carried on the payload.
     """
     try:
-        answer = forge("issue-view", {"number": int(number), "comments": True}, repo)
+        answer = forge(
+            "issue-view",
+            {"number": int(number), "comments": True, "limit": POLL_WINDOW},
+            repo,
+        )
     except (vcs_client.VcsError, ValueError, TypeError) as refusal:
         print(
             f"Warning: could not fetch comments for issue #{number} ({refusal}); "
             "continuing with title and body only.",
             file=sys.stderr,
         )
-        return []
+        return [], False
+    truncated = bool(answer.get("commentsTruncated"))
+    if truncated:
+        print(
+            f"Warning: issue #{number} has more than {POLL_WINDOW} comments; "
+            "the newest are not in this investigation's context.",
+            file=sys.stderr,
+        )
     comments = answer.get("comments")
-    return comments if isinstance(comments, list) else []
+    return (comments if isinstance(comments, list) else []), truncated
 
 
 def handle_poll(args):
@@ -608,7 +627,8 @@ def handle_poll(args):
     raw_body = target.get("body") or ""
     sanitized_body = sanitize_untrusted_text(raw_body)
     comments = []
-    for c in _fetch_comments(repo, target["number"]):
+    fetched, comments_truncated = _fetch_comments(repo, target["number"])
+    for c in fetched:
         # A forge login is short and alphanumeric, so there is nothing here for
         # a boundary tag to defend against; wrapping it only put markup in
         # front of every reader of this field. Sanitized anyway, because the
@@ -632,6 +652,10 @@ def handle_poll(args):
                 "title_plain": sanitized_title,
                 "body": f"<untrusted_body>{sanitized_body}</untrusted_body>",
                 "comments": comments,
+                # The model reads this. An investigation working from a
+                # conversation it cannot see all of should say so in its report
+                # rather than conclude from a partial one.
+                "comments_truncated": comments_truncated,
                 "unreachable_repos": unreachable_repos,
             },
             indent=2,

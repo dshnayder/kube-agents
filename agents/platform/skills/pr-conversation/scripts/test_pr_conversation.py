@@ -76,6 +76,12 @@ class FakeProvider:
         self.posted = []
         self.acknowledges = acknowledges
         self.viewer_lookups = []
+        #: What the real provider records when a listing fills its page.
+        #: Set by the tests that pin the operator warning.
+        self.truncated = []
+
+    def truncations(self):
+        return list(self.truncated)
 
     def viewer_login(self, repo):
         self.viewer_lookups.append(repo)
@@ -142,7 +148,12 @@ def make_comment(
     path="",
     line=None,
     can_write_known=True,
+    is_bot=False,
 ):
+    # `is_bot` is passed, not derived from `author`, because that is how it
+    # arrives: the forge says whether the author is an automation and the login
+    # is normalised on the way through, so `[bot]` in the string here is only
+    # what a caller would *see*, never what it decides on.
     return forge.Comment(
         ref=ref,
         numeric_id=1,
@@ -154,6 +165,7 @@ def make_comment(
         path=path,
         line=line,
         can_write_known=can_write_known,
+        is_bot=is_bot,
     )
 
 
@@ -967,7 +979,7 @@ class CommentIdValidationTest(_Harness):
         """
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]", is_bot=True)]},
         )
         with self.assertRaises(SystemExit):
             self._post(provider, "IC_1")
@@ -976,7 +988,7 @@ class CommentIdValidationTest(_Harness):
     def test_an_allowlisted_bot_is_answerable(self):
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]", is_bot=True)]},
         )
         with mock.patch.dict(
             "os.environ", {pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}, clear=False

@@ -155,11 +155,14 @@ def handle_prepare(args) -> int:
     proposal = open_proposal(repo, branch)
     if proposal:
         log(f"'{branch}' already has an open proposal; taking a copy of it.")
-        cloned = vcs_client.clone(repo, branch=branch, force=args.force)
+        cloned = vcs_client.clone(repo, branch=branch, force=args.force, key=branch)
         base = proposal["target"]
         started_from = branch
     else:
-        cloned = vcs_client.clone(repo, force=args.force)
+        # `key=branch` although the copy is of the base: the tree belongs to
+        # this card's change, and a sibling card preparing another branch of the
+        # same repository gets a tree of its own rather than colliding here.
+        cloned = vcs_client.clone(repo, force=args.force, key=branch)
         base = cloned["branch"]
         # `branch` reports a failed switch rather than raising on one, and the
         # JSON below would otherwise name a branch this run is not standing on.
@@ -167,7 +170,7 @@ def handle_prepare(args) -> int:
         # other than `--branch` -- but that is a turn later, after the agent has
         # written the whole change into a copy sitting on the base branch. Fail
         # where the fault is.
-        switched = vcs_client.branch(repo, branch)
+        switched = vcs_client.branch(repo, branch, key=branch)
         if switched["exitCode"] != 0:
             raise vcs_client.VcsError(
                 f"could not take the branch '{branch}': "
@@ -200,7 +203,15 @@ def handle_submit(args) -> int:
         )
     branch = check_branch(args.branch)
 
-    session = vcs_client.resolve_session(args.repo)
+    # Keyed on the branch: one repository can be cloned twice here, once per
+    # card. When nothing is keyed on it, resolve without the key -- the refusal
+    # below names the branch the copy is actually standing on, which says more
+    # about the mistake than "no local copy" would, and it is the mistake an
+    # agent submitting the wrong branch name makes.
+    try:
+        session = vcs_client.resolve_session(args.repo, key=branch)
+    except vcs_client.VcsError:
+        session = vcs_client.resolve_session(args.repo)
     repo = args.repo or session["spec"]
     validate_repo(repo)
 
@@ -227,11 +238,14 @@ def handle_submit(args) -> int:
             )
         if args.title:
             # Not silently. `--keep-description` keeps the title along with the
-            # body, so a title passed here is read and discarded, and a caller
-            # who passed one believes it landed.
+            # body, so a title passed here does not reach the proposal, and a
+            # caller who passed one believes it landed. It is still the message
+            # any uncommitted changes get recorded under below, which is why
+            # this says where it does not go rather than that it is ignored.
             log(
-                "--title is ignored under --keep-description: the title is part "
-                "of the description being kept."
+                "--title does not reach the proposal under --keep-description: "
+                "the title is part of the description being kept. It is still "
+                "the commit message for any uncommitted changes."
             )
 
     # What the change merges into. From the open proposal when there is one,
@@ -254,14 +268,30 @@ def handle_submit(args) -> int:
                 "`vcs.py commit --message ...` before submitting."
             )
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
-        vcs_client.commit(args.title, spec=repo)
+        vcs_client.commit(args.title, spec=repo, key=branch)
 
-    log(f"Publishing '{branch}' to {repo}...")
-    # `advance` exactly when the copy was taken of this branch rather than of
-    # the base — the second round on an open proposal. `publish` refuses to
-    # write to the branch a copy came down on otherwise, and that refusal is
-    # the one that caught a worker fast-forwarding a branch it had cloned.
-    vcs_client.publish(repo, target=base, advance=session["branch"] == branch)
+    if proposal is None and vcs_client.already_published(session, branch):
+        # The one state a retry has to be able to walk back into: the publish
+        # landed and the `proposal-create` after it did not — a rate limit, a
+        # 5xx, a body the forge rejected. Re-running `submit` would otherwise
+        # find nothing new to send and be refused before reaching the step that
+        # actually failed, and re-running `prepare` would cut the branch afresh
+        # and be refused by the broker as `BRANCH_DIVERGED`. The pair this
+        # replaced — `git push --force-with-lease` then `gh pr create` — was
+        # idempotent on retry, and this is what keeps that true.
+        log(
+            f"'{branch}' is already on {repo} at this revision; opening the "
+            "proposal that never landed."
+        )
+    else:
+        log(f"Publishing '{branch}' to {repo}...")
+        # `advance` exactly when the copy was taken of this branch rather than
+        # of the base — the second round on an open proposal. `publish` refuses
+        # to write to the branch a copy came down on otherwise, and that refusal
+        # is the one that caught a worker fast-forwarding a branch it had cloned.
+        vcs_client.publish(
+            repo, target=base, advance=session["branch"] == branch, key=branch
+        )
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {url}")
@@ -370,11 +400,15 @@ def _submit_body(args) -> str:
 COMMANDS = ("prepare", "submit")
 
 # Flags that named a thing this script no longer has. Accepted and ignored
-# rather than removed, for one turn of the agent's shell: a card that ran
-# `prepare` before the image rolled and `submit` after it would otherwise die
-# on "unrecognized arguments" with its work committed and unpublished. Each
-# names what took its place in the help text, and they go when the SKILL.md
-# that documented them has been through a release.
+# rather than removed, for one turn of the agent's shell, and what that is
+# worth is precise: a command written against the old shape then fails on what
+# is actually wrong with it — no working copy here — instead of on
+# "unrecognized arguments", which names none of it. It does not rescue the run.
+# A card that prepared before the image rolled has its clone on a volume this
+# script no longer reads, so its `submit` is going to refuse either way; the
+# point is that the refusal says `prepare` and the argparse error does not.
+# Each flag names what took its place in the help text, and they go when the
+# SKILL.md that documented them has been through a release.
 RETIRED = {
     "--workspace": "the copy's path is in the session, not an argument",
     "--lease": "there is no shared volume to lease a clone on",

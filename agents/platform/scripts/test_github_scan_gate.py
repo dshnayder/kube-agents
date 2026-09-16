@@ -623,7 +623,9 @@ class FakeProvider:
     what these tests are about is the sweep's policy — who is trusted, what
     counts as answered, how much it will do in one tick — and a fake that
     records `posted` and `acknowledged` states those directly. `test_forge.py`
-    is where the argv and the JSON get pinned.
+    is where the verb and its payload get pinned, and
+    `test_providers_contract.py` where the call the forge module makes of them
+    does.
     """
 
     def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=(),
@@ -639,6 +641,12 @@ class FakeProvider:
         self.posted = []
         self.acknowledged = []
         self.viewer_lookups = []
+        #: What the real provider records when a listing fills its page.
+        #: Set by the tests that pin the operator warning.
+        self.truncated = []
+
+    def truncations(self):
+        return list(self.truncated)
 
     def viewer_login(self, repo):
         self.viewer_lookups.append(repo)
@@ -695,7 +703,12 @@ def make_comment(
     can_write=True,
     created_at="2026-08-12T10:00:00Z",
     can_write_known=True,
+    is_bot=False,
 ):
+    # `is_bot` is passed, not derived from `author`, because that is how it
+    # arrives: the forge says whether the author is an automation and the login
+    # is normalised on the way through, so `[bot]` in the string here is only
+    # what a caller would *see*, never what it decides on.
     return forge.Comment(
         ref=ref,
         numeric_id=abs(hash(ref)) % 10_000,
@@ -704,6 +717,7 @@ def make_comment(
         can_write=can_write,
         created_at=created_at,
         can_write_known=can_write_known,
+        is_bot=is_bot,
     )
 
 
@@ -1002,7 +1016,23 @@ class PrCommentsSweepTest(unittest.TestCase):
         """Answering another bot is a loop nobody is watching."""
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+            comments={
+                12: [
+                    make_comment("IC_1", "/agent x", author="dependabot[bot]", is_bot=True)
+                ]
+            },
+        )
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertEqual(provider.posted, [])
+
+    def test_a_bot_whose_login_does_not_say_so_is_still_passed_over(self):
+        """The suffix is a spelling, not the fact. A GitHub App's REST author
+        arrives as `app/renovate`, and the login is normalised before any
+        caller sees it, so reading `[bot]` off the string caught neither."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", author="renovate", is_bot=True)]},
         )
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
@@ -1011,7 +1041,9 @@ class PrCommentsSweepTest(unittest.TestCase):
     def test_an_allowlisted_bot_is_honoured(self):
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+            comments={
+                12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]", is_bot=True)]
+            },
         )
         result = self._sweep(
             provider, env={pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}

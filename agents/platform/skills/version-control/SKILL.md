@@ -130,6 +130,12 @@ Every `vcs.py` verb after the first infers the repository from the only copy
 there is, or from the directory you are standing in; `--repo` says which when
 there are several.
 
+One repository can be cloned more than once here — the copy is named for its
+branch as well as its repository, so a second card working the same repository
+gets a copy of its own rather than yours. When two copies of one repository
+exist, `--repo` no longer picks between them: **run the verb from inside the
+copy you mean.** The refusal names the paths.
+
 ## Write
 
 ```bash
@@ -145,6 +151,12 @@ python3 $V discard
 `branch` and `commit` are local and make no network call. `publish` sends every
 revision made since the clone, and the identifiers `log` printed here are the
 identifiers that land on the forge.
+
+**Name the paths you mean.** `commit` with no paths records changes to files
+the copy already tracks and nothing else — it is never `git add .`. A file the
+copy has never seen is refused by name, because the working copy is also where
+your scratch output lands and a log swept into a public proposal cannot be
+taken back. Name it on the `commit` line to include it.
 
 ## Collaborate
 
@@ -217,7 +229,7 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `grep`                 | Text search over the working copy; `--regex`, `--ignore-case`                                                 |
 | `status`               | What the working copy has that its revision does not                                                          |
 | `branch`               | List lines of development, or start one. Local                                                                |
-| `commit`               | Record a revision locally, with a real parent and identifier                                                  |
+| `commit`               | Record a revision locally, with a real parent and identifier. Paths, or tracked changes only                  |
 | `publish`              | Send the revisions made since `clone` to the shared repository                                                |
 | `discard`              | Remove the local copy                                                                                         |
 | `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                |

@@ -157,6 +157,11 @@ verification_spec:
         - "github.com/"
         - "/pull/"
         - "eval: confirmed from the forge"
-      # One pull request, not two. The skill forbids opening a second for a
-      # change to an existing one, and this prompt is shaped to tempt it.
-      forbidden_phrases: ["second pull request"]
+      # No `forbidden_phrases` for the second pull request the prompt forbids.
+      # `report_contains` is a normalised substring test with no notion of
+      # negation, and the prompt hands the worker the words: a compliant report
+      # saying "no second pull request was opened" would fail the objective for
+      # having done exactly what was asked. The one-pull-request requirement is
+      # carried positively instead: the commit subject above can only be
+      # reported off a second revision of the proposal the fixture already
+      # opened, which a worker that opened its own would not have.

@@ -265,6 +265,16 @@ class SandboxForwardingTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(resolver, "handle_poll", lambda args: print("{}"))
             )
+            # `_forward_timeout` sizes the hop from the managed-repository
+            # list, and unpatched that is a real ConfigMap read from a test
+            # about argv. It swallows its own failures, so leaving it would not
+            # fail here -- it would just make these three tests depend on
+            # whatever the host happens to have mounted.
+            stack.enter_context(
+                mock.patch.object(
+                    resolver, "get_managed_github_repos", return_value=["acme/toolkit"]
+                )
+            )
             try:
                 resolver.main()
             except SystemExit as exc:

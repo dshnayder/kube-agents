@@ -137,6 +137,28 @@ class LocalForge(providers.Forge):
         return str(self.root / repo)
 
 
+class ProposingLocalForge(LocalForge):
+    """`LocalForge` plus the one collaboration verb the `advance` check asks.
+
+    A directory has no proposals, so the plain `LocalForge` above is the forge
+    that cannot be asked. This one answers, out of a set the test sets, and it
+    is what proves the check is a lookup rather than a reading of the request.
+    """
+
+    verbs = ("proposal-list",)
+
+    def __init__(self, root, minted=None, open_sources=()):
+        super().__init__(root, minted)
+        self.open_sources = set(open_sources)
+        self.listed: list[dict] = []
+
+    def proposal_list(self, api, repo, payload):
+        self.listed.append(dict(payload))
+        source = payload.get("source")
+        found = [{"id": 1, "source": source}] if source in self.open_sources else []
+        return {"proposals": found, "truncated": False}
+
+
 class Recorder:
     """A stand-in for the forge CLI, holding what it saw and what it answers."""
 
@@ -877,6 +899,63 @@ class RepositoryVerbTest(unittest.TestCase):
         # came down on. A copy taken *of* a proposal branch in order to add to
         # it is the other situation, and it is the whole of how an open
         # proposal gets revised: there is nowhere else its revisions live.
+        git(self.seed, "checkout", "--quiet", "-b", "topic")
+        git(self.seed, "push", "--quiet", "origin", "topic")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        second = self.commit_in(work, "b.txt", "b\n", "another round")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "topic",
+                "target": "main",
+                "clonedFrom": "topic",
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), second)
+
+    def test_advance_is_refused_on_a_branch_carrying_no_open_proposal(self):
+        """The waiver is for a proposal branch, and the forge is what says so.
+
+        Without this, `advance` is a field that turns the refusal off: a worker
+        that clones `release-1.2`, commits, and publishes `--target main
+        --advance` fast-forwards a long-lived shared branch -- the live incident
+        the refusal was added for -- and the client's own refusal text names the
+        flag to any worker that meets one.
+        """
+        forge = ProposingLocalForge(self.forges, self.refreshed, open_sources=())
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "checkout", "--quiet", "-b", "release-1.2")
+        git(self.seed, "push", "--quiet", "origin", "release-1.2")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "release-1.2")
+        self.commit_in(work, "b.txt", "b\n", "straight onto the release branch")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "release-1.2",
+                    "target": "main",
+                    "clonedFrom": "release-1.2",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "release-1.2", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+        self.assertEqual(forge.listed[0]["source"], "release-1.2")
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_is_honoured_when_the_forge_finds_the_proposal(self):
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"topic"}
+        )
+        self.broker.registry.hosts["local.test"] = forge
         git(self.seed, "checkout", "--quiet", "-b", "topic")
         git(self.seed, "push", "--quiet", "origin", "topic")
         git(self.seed, "checkout", "--quiet", "main")

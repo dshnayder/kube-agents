@@ -90,7 +90,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    ```json
    {
-     "workspace": "/opt/data/scratch/vcs/github__acme__fleet",
+     "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app",
      "repo": "acme/fleet",
      "branch": "platform-agent/remediate-stockout-frontend-web-app",
      "base": "main",

@@ -28,6 +28,23 @@ def actor(node: dict[str, Any] | None) -> str:
     return login.removesuffix("[bot]")
 
 
+def is_automation(node: dict[str, Any] | None) -> bool:
+    """Whether this author is an automation rather than a person.
+
+    Asked here because `actor` above removes the suffix that is the only thing
+    a caller could have read it off, and a caller above the boundary has no
+    business knowing that GitHub spells it `[bot]` at all. The answer is part of
+    a comment rather than derivable from it.
+
+    `type` is what REST says and is the reliable one. The suffix is the
+    fallback, for the GraphQL shapes that carry a login and no type.
+    """
+    node = node or {}
+    if str(node.get("type") or "").strip().lower() == "bot":
+        return True
+    return str(node.get("login") or "").strip().endswith("[bot]")
+
+
 def proposal(node: dict[str, Any]) -> dict[str, Any]:
     """A pull request as a proposal.
 
@@ -117,6 +134,10 @@ def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
         "ref": f"{kind}-{ident}",
         "kind": kind,
         "author": actor(node.get("user")),
+        # Beside the author rather than inside it: `author` has the `[bot]`
+        # suffix taken off, and the bot-loop gate the sweep runs on this is the
+        # one thing that suffix was ever read for.
+        "bot": is_automation(node.get("user")),
         "created": node.get("submitted_at") or node.get("created_at") or "",
         "body": node.get("body") or "",
         "url": node.get("html_url") or "",

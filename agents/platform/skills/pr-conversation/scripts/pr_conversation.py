@@ -16,7 +16,8 @@ Three subcommands, one job each:
 Why ``reply`` writes the marker rather than the model
 -----------------------------------------------------
 The marker is the whole idempotency scheme: a request is unanswered when no
-self-authored comment carries ``<!-- agent-answered:<node-id> -->``. If the model
+self-authored comment carries ``<!-- agent-answered:<comment-ref> -->``, the ref
+being the ``<kind>-<id>`` the poll reported for it. If the model
 had to remember to type it, the failure mode of forgetting is not a missing
 comment — it is the same request being answered again on every tick, ten minutes
 apart, forever. So the marker is appended here, from the ``--comment-id`` the
@@ -350,6 +351,15 @@ def handle_poll(args) -> int:
                 "value": ", ".join(nameless),
             }))
             return 0
+        if nameless:
+            # Some but not all. The poll goes on with what it can read, but a
+            # repository dropped in silence reads as one with nothing on it, so
+            # it is named on stderr — out of the JSON the SKILL parses, in
+            # front of whoever is debugging a request that never arrived.
+            sys.stderr.write(
+                f"pr_conversation: {len(nameless)} repository(ies) not swept — "
+                f"the credential cannot name itself there: {', '.join(nameless)}\n"
+            )
 
         found = []
         threads = []

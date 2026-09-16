@@ -55,12 +55,16 @@ else. Each concurrent operation gets its own clone, keyed by a lease it owns.
 separate processes — find the same tree with no lookup state between them.
 
 **Lease key.** The fleet audit uses the audit id, which `validate_audit_id` already constrains to a
-closed enum, so it is a safe directory name by construction. `submit-suggestion` resolves `--lease` →
-`$HERMES_KANBAN_TASK` (pinned into every dispatcher-spawned worker) → `$HERMES_SESSION_ID` → a
-generated `adhoc-<8 hex>`. The identifier must be stable across invocations, because the agent runs
-each shell command in a fresh process: a pid would hand `git commit` and the `submit` that follows it
-two different clones. Every id is reduced to `[A-Za-z0-9._-]{1,64}`; one that sanitises to nothing is
-refused rather than defaulted, because a shared default is the bug.
+closed enum, so it is a safe directory name by construction. It is the only caller that leases a
+clone here; the write skills take their working copies through the version-control verbs instead,
+which key a copy on the repository and the branch and need no lease to keep two of them apart —
+see §4. What the generic path still offers a caller that has no id of its own is `resolve_lease`:
+an explicit `--lease` → `$HERMES_KANBAN_TASK` (pinned into every dispatcher-spawned worker) →
+`$HERMES_SESSION_ID` → a generated `adhoc-<8 hex>`. The identifier must be stable across
+invocations, because the agent runs each shell command in a fresh process: a pid would hand
+`git commit` and the submit that follows it two different clones. Every id is reduced to
+`[A-Za-z0-9._-]{1,64}`; one that sanitises to nothing is refused rather than defaulted, because a
+shared default is the bug.
 
 **Lease file.** `.lease` is written before the clone and its mtime refreshed on every
 `ensure_workspace`. It is three things at once: the reaper's TTL anchor, the marker the proxy looks
@@ -124,10 +128,16 @@ audit streams holds a tree of its own, so `finish`'s forced checkout and the unt
 `start` left behind race nobody.
 
 **submit-suggestion** grew the two subcommands this section gave it — `prepare` and `submit` — and
-then left the lease behind. It works over the version-control verbs now, and the verbs hand each
-container one copy per repository under its own scratch root. Nothing is shared, so there is nothing
-to lease and no `assert_lease_owner` for `submit` to call: `--workspace` and `--lease` are both
-retired flags that warn and are ignored. `prepare --branch <name>` brings the repository down and
+then left the lease behind. It works over the version-control verbs now, and the verbs hand out one
+working copy per repository _and branch_, under a scratch root that is the container's alone. The
+branch is in the name because the scratch root is not per card: two cards suggesting changes to one
+GitOps repository are ordinary, and a copy named for the repository alone would make the second
+card's `prepare` either refuse or, with `--force`, delete the first card's unpublished work. Two
+cards, two copies, and no lease between them — so there is nothing to lease and no
+`assert_lease_owner` for `submit` to call: `--workspace` and `--lease` are both retired flags that
+warn and are ignored. Where a repository is cloned twice, `--repo` no longer identifies a copy on
+its own; the directory the caller is standing in does, and a caller that is standing nowhere is
+refused with the paths. `prepare --branch <name>` brings the repository down and
 prints `{"workspace", "repo", "branch", "base", "started_from", "proposal"}`; the agent works inside
 the printed `workspace`. Which branch the copy is taken of is decided by asking the forge rather than
 by inspecting refs: a branch carrying an **open proposal** is one this run is adding to, so the copy

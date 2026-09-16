@@ -192,6 +192,22 @@ check "hermes can write its kubeconfig directory" "700 hermes" \
   "$("${HERMES_SSH[@]}" 'stat -c "%a %U" /home/hermes/.kubeconfigs' 2>&1)"
 check "the agent cannot write a kubeconfig for hermes to use" "Permission denied" \
   "$("${SSH[@]}" 'touch /home/hermes/.kubeconfigs/planted.yaml' 2>&1)"
+# The same property one level up: not what a hermes session *sources*, but what
+# an agent-pod caller runs over it. `forge.py` is forwarded in as hermes
+# (agents/platform/scripts/forge.py, `_forward`), and the copy under /opt/data is
+# the model's own -- section 4b plants an edit in it on purpose. So the forwarded
+# path is a root-owned staging directory instead.
+check "the forwarded script is root-owned and writable by nobody else" "755 root root" \
+  "$("${SSH[@]}" 'stat -c "%a %U %G" /opt/vcs/libexec/platform/forge.py' 2>&1)"
+check "the model cannot rewrite what hermes runs" "Permission denied" \
+  "$("${SSH[@]}" 'echo "# planted" >> /opt/vcs/libexec/platform/forge.py' 2>&1)"
+check "nor take the directory out from under it" "Permission denied" \
+  "$("${SSH[@]}" 'mv /opt/vcs/libexec/platform /opt/vcs/libexec/platform.bak' 2>&1)"
+# And it runs from there, which is the other half: every module it imports is
+# staged beside it, so nothing has to be found under /opt/data.
+check "hermes can run the forwarded script" "usage:" \
+  "$("${HERMES_SSH[@]}" 'python3 /opt/vcs/libexec/platform/forge.py --help' 2>&1)"
+
 # Generated on the host so the private half never has to be copied back out of
 # the container: the model only needs the public half to authorise it.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
@@ -309,6 +325,11 @@ check "and the reference forms in the skills resolve to the same file" "ok" \
 "${SSH[@]}" 'echo "# planted" >> /opt/data/scripts/forge.py' >/dev/null 2>&1
 check "the model can edit what it runs" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
+# The other end of the boundary section 3b set up: this is the copy the *model*
+# runs, and the edit is allowed to stand. What an agent-pod caller runs is the
+# root-owned one, and it is untouched by this.
+check_absent "the edit does not reach the copy hermes runs" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/vcs/libexec/platform/forge.py' 2>&1)"
 
 echo
 echo "== 4c. the working directory Hermes cds into =="

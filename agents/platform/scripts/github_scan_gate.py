@@ -646,6 +646,18 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
+    # Drained here rather than warned about where it happens, because the same
+    # listing fills its page on every tick and on more than one repository. A
+    # listing read short is not an error the sweep can recover from — it simply
+    # did not see everything — so it is reported once and the tick continues.
+    truncated = provider.truncations()
+    if truncated:
+        warnings.append(
+            "⚠️ **GitHub PR watcher read only the first page of** "
+            + ", ".join(f"{note}" for note in sorted(set(truncated)))
+            + f" — a page is {forge.PAGE_SIZE}, and anything past it was not "
+            "swept this tick."
+        )
     # Oldest first, so a burst of new comments cannot starve a request that has
     # been waiting. Ordering is global rather than per pull request because the
     # cap is global.

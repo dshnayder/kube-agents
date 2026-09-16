@@ -80,8 +80,12 @@ SHAPES: dict[str, frozenset[str]] = {
     # `id` and `kind` are what `proposal-acknowledge` takes back; `ref` is the
     # two together, and the only one of the three unique across endpoints.
     # `path` and `line` are empty except on an inline review comment.
+    # `bot` is the forge's own answer about the author, carried beside `author`
+    # because it cannot be read off it: every login is normalised on the way
+    # through (GitHub's `[bot]` suffix is stripped), so the spelling a caller
+    # sees no longer says what the forge said.
     "comment": frozenset(
-        {"id", "ref", "kind", "author", "created", "body", "url", "path", "line"}
+        {"id", "ref", "kind", "author", "bot", "created", "body", "url", "path", "line"}
     ),
     "commit": frozenset({"sha", "author", "committed", "message", "url"}),
     "label": frozenset({"name", "color", "description"}),
@@ -339,13 +343,13 @@ class ContractTest(unittest.TestCase):
                 prose = fixture["payload"].get("body") or ""
                 with self.subTest(forge=name, verb=verb):
                     _, api = self.invoke(forge, verb, fixture)
-                    # The call that carried the prose: the first write. An
-                    # update may follow it with label calls; a create-or-update
-                    # may precede it with a read.
+                    # The call that carried the prose is not always the first
+                    # write: an update applies its labels before it patches the
+                    # text, and a create-or-update may precede both with a read.
+                    # So take the write the prose is actually in, and fall back
+                    # to the first only for a verb that carries no prose.
                     writes = [c for c in api.calls if c[0] in {"POST", "PATCH", "PUT"}]
                     self.assertTrue(writes, "no write was made")
-                    # The write that carried the prose, wherever it sits: an
-                    # update applies its labels before it patches the text.
                     carrying = [c for c in writes if prose and prose in [str(v) for v in (c[3] or {}).values()]]
                     method, path, params, body, _raw = (carrying or writes)[0]
                     self.assertIn(method, {"POST", "PATCH", "PUT"})
@@ -373,21 +377,30 @@ class ContractTest(unittest.TestCase):
             "proposal-update": {"number": 4321, "labelsAdd": ["ok", ""]},
             "proposal-close": {"number": -1},
             "proposal-commits": {"number": "x"},
-            "proposal-acknowledge": {"number": 1, "comment": {"id": "9", "kind": "issue"}},
+            # Two, because this verb carries two identifiers and a forge that
+            # checked only the one it happens to use would refuse a different
+            # set of requests from its neighbours.
+            "proposal-acknowledge": [
+                {"number": 0, "comment": {"id": 9, "kind": "issue"}},
+                {"number": 1, "comment": {"id": "9", "kind": "issue"}},
+            ],
             "issue-update": {"number": 1, "title": "   "},
             "issue-close": {"number": 1, "reason": "wontfix"},
             "label-ensure": {"name": ""},
         }
         for name, forge, _ in self.instances():
-            for verb, payload in bad.items():
+            for verb, payloads in bad.items():
                 if verb not in forge.verbs:
                     continue
-                with self.subTest(forge=name, verb=verb):
-                    api = Recorded([])
-                    method = getattr(forge, verb.replace("-", "_"))
-                    with self.assertRaises(WorkspaceError):
-                        method(api, "acme/infra", payload)
-                    self.assertEqual(api.calls, [])
+                if isinstance(payloads, dict):
+                    payloads = [payloads]
+                for payload in payloads:
+                    with self.subTest(forge=name, verb=verb, payload=payload):
+                        api = Recorded([])
+                        method = getattr(forge, verb.replace("-", "_"))
+                        with self.assertRaises(WorkspaceError):
+                            method(api, "acme/infra", payload)
+                        self.assertEqual(api.calls, [])
 
     # -- the prohibition ----------------------------------------------------
 

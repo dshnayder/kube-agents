@@ -318,15 +318,56 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.payloads("clone")[0]["repository"], "acme/other")
 
     def test_prepare_refuses_to_replace_a_copy_holding_unpublished_work(self):
-        prepared = self.prepare()
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare(branch)
         self.edit(prepared)
-        vcs_client.commit("not yet published", spec="acme/infra")
+        vcs_client.commit("not yet published", ["app.yaml"], spec="acme/infra")
         with self.assertRaises(vcs_client.VcsError) as caught:
-            self.run_subject("prepare", "--branch", "platform-agent/other")
+            self.run_subject("prepare", "--branch", branch)
         self.assertIn("unpublished revision", str(caught.exception))
         # And `--force` is the way past it, named in the refusal itself.
         self.assertIn("--force", str(caught.exception))
-        self.prepare("platform-agent/other", force=True)
+        self.prepare(branch, force=True)
+
+    def test_two_cards_on_one_repository_get_two_working_copies(self):
+        # The scratch root is shared by every card in this container. Keyed on
+        # the repository alone, the second card's `prepare` either refused or,
+        # with `--force`, deleted the first card's unpublished work.
+        first = self.prepare("platform-agent/scale-web")
+        self.edit(first, "replicas: 3\n")
+        vcs_client.commit("first card", ["app.yaml"], spec="acme/infra")
+
+        second = self.prepare("platform-agent/other")
+        self.assertNotEqual(second["workspace"], first["workspace"])
+        self.edit(second, "replicas: 9\n")
+
+        # Neither card can see the other's work, and the first one's revision
+        # is still there to publish.
+        self.assertEqual((Path(first["workspace"]) / "app.yaml").read_text(), "replicas: 3\n")
+        self.assertEqual(
+            git(Path(first["workspace"]), "log", "-1", "--format=%s").stdout.strip(),
+            "first card",
+        )
+        self.assertEqual(
+            git(Path(second["workspace"]), "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "platform-agent/other",
+        )
+
+    def test_submit_sends_the_copy_keyed_on_the_branch_it_names(self):
+        # Two copies of one repository, and `--repo` names both. The branch is
+        # what tells them apart: submitting the second card's change must not
+        # publish the first card's.
+        first = self.prepare("platform-agent/scale-web")
+        self.edit(first, "replicas: 3\n")
+        second = self.prepare("platform-agent/other")
+        self.edit(second, "replicas: 9\n")
+
+        self.run_subject(
+            "submit", "--branch", "platform-agent/other",
+            "--repo", "acme/infra", "--title", "t", "--body", "b",
+        )
+        self.assertIn("platform-agent/other", self.remote_branches())
+        self.assertNotIn("platform-agent/scale-web", self.remote_branches())
 
     # -- submit -----------------------------------------------------------
 
@@ -393,7 +434,15 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.proposals[0]["body"], "one")
         self.assertEqual(self.broker.payloads("proposal-update"), [])
         self.assertEqual(len(self.broker.payloads("publish")), 2)
-        self.assertTrue(any("ignored under --keep-description" in line for line in self.logged))
+        # Both halves of what the notice now claims: the title did not reach
+        # the proposal, and it is still what the pending edit was recorded
+        # under. The earlier wording said "ignored", which was false here.
+        self.assertTrue(
+            any("does not reach the proposal" in line for line in self.logged)
+        )
+        self.assertTrue(
+            any("commit message" in line for line in self.logged)
+        )
 
     def test_keep_description_with_no_open_proposal_refuses_before_publishing(self):
         prepared = self.prepare()
@@ -429,10 +478,41 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             self.run_subject("submit", "--branch", "main", "--title", "t", "--body", "b")
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
-    def test_submit_commits_what_the_copy_holds_under_the_title(self):
+    def test_submit_commits_the_tracked_changes_the_copy_holds_under_the_title(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "one file", "--body", "b"
+        )
+        listing = git(self.origin, "show", "--name-only", "--format=%s", "refs/heads/platform-agent/scale-web")
+        self.assertEqual(listing.stdout.split(), ["one", "file", "app.yaml"])
+
+    def test_submit_refuses_rather_than_sweeping_a_file_the_agent_never_staged(self):
+        """The SKILL forbids `git add .`; a helper doing it for them forbids nothing.
+
+        The copy is a real clone on a filesystem the agent also scratches in, so
+        the untracked file here is as likely to be a debug dump as a manifest.
+        Refusing names it and says what to do; the alternatives are shipping it
+        in a public proposal or dropping a real change without saying so.
+        """
+        prepared = self.prepare()
+        self.edit(prepared)
+        (Path(prepared["workspace"]) / "scratch.log").write_text("debug\n")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        self.assertIn("scratch.log", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_submit_records_a_new_file_the_agent_staged_itself(self):
+        """Staging is the agent saying this one belongs, which is the whole gate."""
         prepared = self.prepare()
         self.edit(prepared)
         (Path(prepared["workspace"]) / "new.yaml").write_text("added\n")
+        vcs_client.local(
+            vcs_client.resolve_session("acme/infra"), ["add", "--", "new.yaml"], "add"
+        )
         self.run_subject(
             "submit", "--branch", "platform-agent/scale-web", "--title", "two files", "--body", "b"
         )
@@ -450,6 +530,35 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         )
         subject = git(self.origin, "log", "--format=%s", "-1", "refs/heads/platform-agent/scale-web")
         self.assertEqual(subject.stdout.strip(), "the agent's own message")
+
+    def test_a_retry_after_the_create_failed_opens_the_proposal_it_never_got(self):
+        """Publish landed, `proposal-create` did not: the retry has to reach it.
+
+        Without this the second `submit` finds nothing new to send and is
+        refused before the step that failed, and `prepare` is no way out either
+        -- it cuts the branch afresh and the broker refuses the publish as
+        `BRANCH_DIVERGED`. The `git push --force-with-lease` + `gh pr create`
+        pair this replaced was idempotent on retry.
+        """
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.broker.create_fails_with = vcs_client.VcsError(
+            "secondary rate limit", code="FORGE_RATE_LIMITED"
+        )
+        with self.assertRaises(vcs_client.VcsError):
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        published = git(self.origin, "rev-parse", "refs/heads/platform-agent/scale-web")
+        self.assertTrue(published.stdout.strip())
+
+        self.broker.create_fails_with = None
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        # And it did not publish a second time: there was nothing new to send.
+        self.assertEqual(len(self.broker.payloads("publish")), 1)
 
     def test_a_proposal_opened_by_a_racing_run_is_updated_not_reported_as_failure(self):
         prepared = self.prepare()

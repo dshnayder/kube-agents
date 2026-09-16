@@ -42,7 +42,8 @@ repeated beats one that fires off a line nobody can see.
 **Has it already answered?** By its own marker in its own comment, and nothing
 else. There is no state file, no database, no label: a request is unanswered
 when no comment written by the agent on that pull request carries
-`<!-- agent-answered:<node-id> -->`. Counting only *self-authored* markers is
+`<!-- agent-answered:<comment-ref> -->`, where the ref is the forge-neutral
+`<kind>-<id>` the verb surface reports. Counting only *self-authored* markers is
 load-bearing — a marker scan that trusted any comment would let anyone suppress
 a request by pasting the string, which is the same trap
 `docs/designs/fleet-audit-issue-ledger.md` §3.1 records for the issue ledger.

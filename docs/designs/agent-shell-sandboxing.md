@@ -1162,12 +1162,13 @@ wrong if the sandbox ever holds credentials of its own.
 
 The sandbox has three directories that matter and only one of them keeps anything.
 
-| Path                    | Backing                        | Owner    | What it is                   |
-| ----------------------- | ------------------------------ | -------- | ---------------------------- |
-| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work             |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home             |
-| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home |
-| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                |
+| Path                    | Backing                        | Owner    | What it is                      |
+| ----------------------- | ------------------------------ | -------- | ------------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
+| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
+| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
 
 **The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
 it for a non-interactive `ssh host cmd`, and the model can delete Debian's
@@ -1212,6 +1213,18 @@ under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-
 a kubeconfig names an `exec` credential plugin and `kubectl` runs it, so one the model
 can author is arbitrary code execution as `hermes`. `/opt/data` is now durable as well
 as model-writable, which makes it a worse place for that file rather than a better one.
+
+**The same rule reaches what an agent-pod caller executes here, not just what it reads.**
+The shared scripts are staged twice. `/opt/data/scripts` is the model's copy — that is
+the path every SKILL.md names, the entrypoint replaces it from the image on each start,
+and an edit the model makes to it stands until then. `/opt/vcs/libexec/platform` is the
+second copy, root-owned and mode 0755, and it is the one a caller that logs in as
+`hermes` runs: the pull-request and issue crons forward a forge verb into this container
+rather than holding a forge CLI themselves, and running the model's copy over that
+session would be the credential handed to whatever the model last wrote there. The whole
+import closure is staged, because `sys.path[0]` is the script's own directory and a
+module missing from the root-owned copy would be found in the model's one instead. The
+image build fails if the import can resolve any other way.
 
 `volumeClaimTemplates` is immutable, so an install that already ran the single-volume
 layout does not roll into this one. The StatefulSet has to be deleted with
@@ -1811,10 +1824,19 @@ one call site serves both: `sandbox_enabled()` reads an agent-pod file, so in th
 it is false and `run()` executes locally.
 
 Neither of those two functions exists any more. The consumer migration replaced every `gh`
-call in both with a version-control verb, and the crossing is now `forge.call`, over the
-same `sandbox_exec.run` and for the same reason — the credential is on the far side. What
-this paragraph describes is the shape that made the crossing cheap enough to do at all;
-what remains of it is the one seam, in one place.
+call in both with a version-control verb, over the same `sandbox_exec.run` and for the
+same reason — the credential is on the far side. What this paragraph describes is the
+shape that made the crossing cheap enough to do at all.
+
+It did not stay one seam, and the reason is worth keeping. `forge.py` crosses per verb: it
+runs a copy of itself in the sandbox (`forge.SANDBOX_FORGE`) and gets one answer back, so
+the gate's sweep is a sequence of small crossings. `resolver.py` crosses **once, as the
+whole subcommand** (`resolver._forward_to_sandbox`), because a poll visits every managed
+repository and the per-call shape paid an ssh hop for each one — against a budget spent on
+the connection as readily as on the forge. Crossing once also keeps the ranking, the
+sanitizer and the JSON envelope on one side, so a connection that drops mid-poll drops a
+whole poll rather than half of one. The two shapes answer different questions: how many
+calls the work is, and whether a partial result is worth anything.
 
 `git` is the one that turns on placement. `credential_proxy.py::_execute` confines a git
 command's working directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it on the

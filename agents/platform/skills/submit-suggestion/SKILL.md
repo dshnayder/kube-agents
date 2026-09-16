@@ -74,11 +74,15 @@ _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` 
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.4).
 
-It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.**
+It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
+`workspace` is named for your branch as well as the repository, because
+`/opt/data/scratch` is shared with every other card: another card suggesting a
+change to the same repository right now has a copy of its own, and neither of
+you can reach into the other's.
 
 ```json
 {
-  "workspace": "/opt/data/scratch/vcs/github__acme__fleet",
+  "workspace": "/opt/data/scratch/vcs/github__acme__fleet__platform-agent__provision-mercury-09",
   "repo": "acme/fleet",
   "branch": "platform-agent/provision-mercury-09",
   "base": "main",
@@ -99,8 +103,10 @@ revision comes down with it, and `started_from` is the branch itself. Otherwise
 `proposal` is empty, the copy is taken of the base, and `started_from` is the
 base.
 
-There is one working copy per repository. If it holds revisions that were never
-published, `prepare` refuses to replace it and names `--force` as the way past.
+There is one working copy per repository **and branch**, so preparing a second
+change to the same repository does not disturb the first. If the copy for this
+branch holds revisions that were never published, `prepare` refuses to replace
+it and names `--force` as the way past.
 Read that refusal before reaching for the flag — it usually means the previous
 run's work never got submitted, and `--force` is how it stops existing.
 
@@ -132,10 +138,16 @@ public pull request.
 
 _(Example: `$G add config/manifest.yaml && $G commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
 
-Committing here is optional. Anything still uncommitted when you run Step 3 is
-recorded as a single revision under the `--title` you pass, which is what a
-single-purpose change wants. Commit yourself when the change deserves more than
-one revision, or a message that is not the pull request's headline.
+Committing here is optional. Uncommitted changes **to files the copy already
+tracks** are recorded as a single revision under the `--title` you pass when you
+run Step 3, which is what a single-purpose change wants. Commit yourself when
+the change deserves more than one revision, or a message that is not the pull
+request's headline.
+
+The rule above still holds at Step 3: a file the copy has never seen is not
+swept in for you. `submit` refuses and names it, because it cannot tell a
+manifest you generated from a log you left behind. Stage the ones that belong
+(`$G add <path>`) and delete the rest.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
@@ -186,9 +198,13 @@ the one exception: it leaves the open pull request's title and body as their
 author wrote them.
 
 Older invocations carried `--workspace`, `--lease`, `--handle` and `--base-sha`.
-They are still accepted so a card that prepared before an upgrade can still
-submit after one, but they are read and ignored with a line saying so. Do not
-write new commands with them.
+They are still accepted, and read and ignored with a line saying so. That is
+all they buy: a command written against the old shape fails on what is actually
+wrong with it — there is no working copy here, take the branch with `prepare`
+— rather than on "unrecognized arguments", which says nothing and hides the
+real cause. A card that prepared before an upgrade cannot submit after one; its
+clone was on a volume this script no longer has. Prepare again. Do not write
+new commands with these flags.
 
 ### Step 4: Confirm Suggestion
 

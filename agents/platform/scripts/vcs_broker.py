@@ -530,6 +530,23 @@ class VcsBroker:
                     status=409,
                     code="PROTECTED_BRANCH",
                 )
+            if advance:
+                # The waived refusal, verified against the forge rather than
+                # taken on the caller's word. `advance` says one thing -- this
+                # copy was cloned *of* a proposal branch in order to add to
+                # it -- and an open proposal whose source is this branch is
+                # that thing, stated in a fact the sandbox does not author.
+                # Without the check the field is simply a flag that turns the
+                # refusal off, and the client's own refusal text names it to
+                # every worker that meets one: a worker that clones
+                # `release-1.2`, commits, and publishes `--target main
+                # --advance` fast-forwards a long-lived shared branch, which is
+                # the live incident the refusal was added for.
+                #
+                # After the default-branch check, not before it. That refusal is
+                # the one the broker establishes for itself, and it must stay
+                # the answer a caller gets for trying `advance` on `main`.
+                self._require_open_proposal(bound, branch)
             # The target first, so the ancestry checks below have something to
             # be about.
             git(root, "fetch", "--quiet", "--no-tags", "origin", target)
@@ -675,6 +692,35 @@ class VcsBroker:
         return result.returncode == 0
 
     # ---- collaboration verbs -------------------------------------------
+
+    def _require_open_proposal(self, bound: Binding, branch: str) -> None:
+        """Refuse unless `branch` already carries an open proposal.
+
+        One extra read on the `advance` path only, which is the second and
+        later rounds of a proposal the caller already opened -- not the first
+        publish of anything.
+
+        A forge that does not serve `proposal-list` is left alone. `publish`
+        holds no forge otherwise -- it is git against a URL, which is what makes
+        the seam a seam -- and a forge with no proposals has no branch this
+        could be the second round of, so there is nothing for the check to
+        establish. The refusals that do not come from the request, the
+        default-branch one above chief among them, still stand there.
+        """
+        if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+            return
+        answer = bound.forge.proposal_list(
+            bound.api, bound.repo, {"state": "open", "source": branch, "limit": 1}
+        )
+        if not (answer.get("proposals") or []):
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, but no open proposal on this "
+                "repository has it as its source. Publish a branch of your own "
+                "and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
 
     def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
         bound = self._bind(payload)

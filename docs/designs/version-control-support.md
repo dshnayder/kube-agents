@@ -457,12 +457,15 @@ host table was reached only from tests.
 
 That was sound while there is one provider and a bare slug means GitHub. It stops being sound at
 the second, because the table becomes load-bearing at exactly the moment a caller starts passing
-hosts — and [the consumer migration](#the-protocol-past-its-first-feature) is about to add three
-callers that resolve repositories their own way. So selection parses the host now, an unparseable
-repository raises `RepoUnparseable`, and a host the table does not know raises `UnknownForgeHost`
-with a reason code, the way every other unresolvable input in this stack does. A repository with no
-host still selects GitHub, which is what the shorthand means until
-[the declarative surface](#6-the-declarative-surface) gives the CR somewhere else to point.
+hosts — and [the consumer migration](#the-protocol-past-its-first-feature) adds three callers that
+resolve repositories their own way. The answer is not a better table on this side: there is no host
+table on this side at all. `provider_for` parses the repository and refuses one nobody can read
+(`RepoUnparseable`, reason `GIT_REPO_UNPARSEABLE`), and then hands every readable one to the broker.
+Which forge serves a host is the broker's answer, and a host no forge module there serves comes back
+as `UnknownForgeHost`. One of the two ends had to be the one that knows; a table here would be a
+second answer for the third forge to disagree with. A repository with no host still means GitHub,
+which is what the shorthand means until [the declarative surface](#6-the-declarative-surface) gives
+the CR somewhere else to point.
 
 ### The vocabulary in prompts and procedures
 
@@ -783,33 +786,44 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
-| Verb                                 | Request                                                          | Response                                              |
-| ------------------------------------ | ---------------------------------------------------------------- | ----------------------------------------------------- |
-| `capabilities`                       | `{repository}`                                                   | `{forge, repo, proposalNoun, verbs, missing}`         |
-| `clone`                              | `{repository, branch?}`                                          | `{forge, repo, branch, revision, size, bundleBase64}` |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64}`       | `{forge, repo, branch, revision}`                     |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`             | `{proposal}`                                          |
-| `proposal-list` / `issue-list`       | `{repository, state?, limit?, labels?}`                          | `{proposals\|issues, count, truncated}`               |
-| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?}`                         | `{proposal\|issue, comments?, diff?}`                 |
-| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                     | `{comment}`                                           |
-| `issue-create`                       | `{repository, title, body?, labels?}`                            | `{issue}`                                             |
-| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}` | `{proposal\|issue}`                                   |
-| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`         | `{proposal\|issue}`                                   |
-| `proposal-commits`                   | `{repository, number, limit?}`                                   | `{commits, count, truncated}`                         |
-| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                      | `{acknowledged}`                                      |
-| `label-ensure`                       | `{repository, name, color?, description?}`                       | `{label}`                                             |
-| `identity`                           | `{repository, login?}`                                           | `{identity: {login, subject, canWrite}}`              |
+| Verb                                 | Request                                                              | Response                                                                 |
+| ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing}`               |
+| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64}`                    |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                        |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                             |
+| `proposal-list`                      | `{repository, state?, limit?, labels?, source?, target?}`            | `{proposals, count, truncated}`                                          |
+| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                             |
+| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}` |
+| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                              |
+| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                |
+| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                      |
+| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                      |
+| `proposal-commits`                   | `{repository, number, limit?}`                                       | `{commits, count, truncated}`                                            |
+| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                         |
+| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
+| `identity`                           | `{repository, login?}`                                               | `{identity: {login, subject, canWrite}}`                                 |
 
 The first eight are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
-requires. `issue-list` also takes `query?`, free text each forge composes into
-its own search grammar. A comment carries `id` and `kind` (`issue`,
-`review_comment`, `review`) because a proposal's discussion spans three places on
-GitHub and the kind decides whether it can be acknowledged; `capabilities` says
-whether the forge supports acknowledging at all. `identity` is a broker verb
+requires. `issue-list`'s `query?` is free text each forge composes into
+its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own claim marker asks with. `proposal-list` filters on the branches instead
+— `source?` and `target?` — because "is there already a proposal for this
+branch" is the question every write flow opens with. A comment carries `id` and
+`kind` (`issue`, `review_comment`, `review`) because a proposal's discussion
+spans three places on GitHub and the kind decides whether it can be
+acknowledged; `capabilities` answers `acknowledge` for whether the forge
+supports it at all. A comment also carries `bot`, which is the forge's own
+answer to whether the author is an automation — not the login's spelling, which
+is normalised before a caller ever sees it, and which is what keeps two agents
+from answering each other forever. Where a view reads comments it says how many
+it read (`commentCount`) and whether there were more (`commentsTruncated`): a
+conversation read short and reported as whole is a decision made on half the
+thread. `identity` is a broker verb
 rather than a forge verb because half of it is a property of how the call is
 authenticated — a CLI reads its login out of its credential store, an HTTP
 client asks the current-user route — and the other half, `canWrite`, is the

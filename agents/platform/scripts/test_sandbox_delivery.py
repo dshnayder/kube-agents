@@ -30,6 +30,11 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "agents/platform/scripts"
 DOCKERFILE = REPO / "deploy/sandbox/Dockerfile"
 
+# The second staging directory: root-owned, and the one the agent pod's crons
+# run over ssh. Everything else here is about what the *model* can run; this is
+# about what the trusted login runs, which must not be a file the model owns.
+TRUSTED_DIR = "/opt/vcs/libexec/platform"
+
 # Where an agent is told what to run. The cluster files are here because cluster
 # profiles run in the same pod as the platform agent and reach the same sandbox —
 # cluster_preflight.sh is on the allowlist only because agents/cluster/SOUL.md
@@ -210,6 +215,46 @@ class SandboxDelivery(unittest.TestCase):
             {},
             {k: sorted(v) for k, v in gaps.items()},
             "these skill scripts import shared modules the sandbox does not have",
+        )
+
+    def test_the_forwarded_script_is_the_root_owned_copy(self):
+        """`_forward` runs as `hermes`, so it must not run a file uid 1000 owns.
+
+        /opt/data is the agent's volume and an edit there survives until the next
+        restart -- the smoke test plants one deliberately. Forwarding to that copy
+        would run the model's code with the cron's credential.
+        """
+        import forge
+
+        self.assertTrue(
+            forge.SANDBOX_FORGE.startswith(TRUSTED_DIR + "/"),
+            f"the forwarded path {forge.SANDBOX_FORGE} is not under {TRUSTED_DIR}",
+        )
+        staged = dockerfile_paths(TRUSTED_DIR)
+        self.assertIn(Path(forge.SANDBOX_FORGE).name, staged)
+
+    def test_the_root_owned_copy_is_closed_under_import(self):
+        """A module missing here is not an error: it is found under /opt/data.
+
+        `sys.path[0]` is the script's own directory, so the fallback is silent
+        and it is the agent-owned copy -- the boundary gone with nothing to show
+        for it. The Dockerfile's `-P` import guard catches this at build time;
+        this catches it at review time.
+        """
+        staged = dockerfile_paths(TRUSTED_DIR)
+        pending = {Path("forge.py").name}
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop()
+            seen.add(name)
+            path = SCRIPTS / name
+            if path.exists():
+                pending |= local_imports(path, self.shared) - seen
+        self.assertEqual(
+            set(),
+            seen - staged,
+            f"these modules are imported by the forwarded script but not staged "
+            f"in {TRUSTED_DIR}",
         )
 
     def test_nothing_baked_names_the_agent_images_interpreter(self):

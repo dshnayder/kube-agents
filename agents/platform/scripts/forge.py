@@ -121,10 +121,16 @@ BROKER_UNSUPPORTED = "FORGE_UNSUPPORTED"
 #: this module used to raise for every failure alike.
 REASON_UNREACHABLE = "REPO_UNREACHABLE"
 
-#: Where this same file lands in the shell sandbox. `deploy/sandbox/entrypoint.sh`
-#: copies `/opt/defaults/scripts` into the machine home under `/opt/data`, so
-#: the path resolves there — the same one `github_token_refresh.py` forwards to.
-SANDBOX_FORGE = "/opt/data/scripts/forge.py"
+#: Where this same file lands in the shell sandbox, in the copy the model cannot
+#: reach. There are two: `/opt/data/scripts/forge.py` is the agent's own, on a
+#: volume uid 1000 owns and may rewrite, and it is the path the skills name; this
+#: one is staged root-owned, mode 0755, by `deploy/sandbox/Dockerfile`. The
+#: distinction matters because of who runs it. `_forward` below connects as
+#: `hermes` — the trusted login, holding this pod's credential path — so running
+#: the agent's copy would execute whatever the model last wrote there against
+#: that credential. The Dockerfile stages the whole import closure beside it and
+#: fails the build if the import can be satisfied any other way.
+SANDBOX_FORGE = "/opt/vcs/libexec/platform/forge.py"
 
 #: Bounds the ssh hop around a forwarded verb. The broker has its own ceiling on
 #: the work inside it; this is that plus room for the connection.
@@ -245,10 +251,13 @@ class Comment:
     numeric_id: int = 0
     path: str = ""
     line: Optional[int] = None
-
-    @property
-    def is_bot(self) -> bool:
-        return self.author.endswith("[bot]")
+    #: Whether the author is an automation rather than a person, as the forge
+    #: said and not as the login spells it. It cannot be read off `author`: the
+    #: forge module strips the `[bot]` suffix from every login it translates,
+    #: because a caller comparing one against an @-mention a human typed has to
+    #: compare the same thing. `pr_triggers.is_addressable_bot` is what this
+    #: feeds, and it is what stops two agents answering each other forever.
+    is_bot: bool = False
 
 
 @dataclass(frozen=True)
@@ -285,6 +294,8 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo: str, pr: PullRequest, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
+
+    def truncations(self) -> list[str]: ...
 
 
 def normalise_login(login: str) -> str:
@@ -536,13 +547,18 @@ class BrokerProvider:
         # answer, meaning the credential could not name itself, and is cached.
         self._viewers: dict[str, str] = {}
         self._acknowledges: dict[str, bool] = {}
+        # Every listing this instance read that filled its page, in the words an
+        # operator reads. Accumulated rather than only logged because the
+        # sweep's channel to a human is the `warnings` list it prints on stdout:
+        # `github_scan_gate.py` configures no logging, so a `LOGGER.warning`
+        # reaches the cron job's stderr and nothing else.
+        self._truncations: list[str] = []
 
     # -- the seam ----------------------------------------------------------
     def _verb(self, verb: str, payload: dict, repo: str) -> dict:
         return call(verb, payload, repo)
 
-    @staticmethod
-    def _page(answer: dict, key: str, repo: str, what: str) -> list:
+    def _page(self, answer: dict, key: str, repo: str, what: str) -> list:
         """One listing's items, with a truncated page reported rather than hidden.
 
         A truncated list looks exactly like a complete one, and every reading
@@ -551,6 +567,12 @@ class BrokerProvider:
         is one an amendment claim is checked against and does not find. The
         verbs say `truncated` rather than leaving that to be guessed at, and
         this is the one place the flag is read.
+
+        It is recorded as well as logged. `list_comments` refuses outright,
+        because a short conversation is read *backwards* rather than merely
+        short; these two are read short, which is recoverable -- but only if
+        somebody knows it happened, so the note also goes where an operator
+        will see it, through `truncations()`.
         """
         if answer.get("truncated"):
             LOGGER.warning(
@@ -560,21 +582,39 @@ class BrokerProvider:
                 repo,
                 PAGE_SIZE,
             )
+            self._truncations.append(f"{what} on {repo}")
         return answer.get(key) or []
+
+    def truncations(self) -> list[str]:
+        """Every listing this instance read short, in the order it read them.
+
+        The sweep drains this into its operator warnings at the end of a tick.
+        One list rather than one warning apiece: a repository over the ceiling
+        produces the same note on every tick and on more than one listing, and
+        an operator reads one line more reliably than five.
+        """
+        return list(self._truncations)
 
     # -- identity ----------------------------------------------------------
     def viewer_login(self, repo: str) -> str:
         """The account this credential authenticates as on `repo`'s forge.
 
-        Empty when no working account can be read. Every caller treats that as
-        "sweep nothing": this login is what separates the agent's own pull
-        requests from a stranger's, and its own comments from a reviewer's, so
-        proceeding without it is how the agent starts answering itself.
+        Empty when the forge answered and the answer carried no login. Every
+        caller treats that as "sweep nothing" for this repository: this login is
+        what separates the agent's own pull requests from a stranger's, and its
+        own comments from a reviewer's, so proceeding without it is how the
+        agent starts answering itself.
 
-        A refusal is emptiness rather than an exception for the same reason.
-        The callers already have to handle a credential that cannot name
-        itself — they stop, loudly, with a warning an operator reads — and
-        raising here would give them a second way to express one outcome.
+        **A call that did not happen is not an empty login, and raises.** The
+        two outcomes send an operator to different places — a credential with no
+        readable account is a configuration fault that will not clear on its
+        own, while `SANDBOX_UNREACHABLE` is a pod that is down and needs
+        nothing — and identity is the first verb a tick sends, so collapsing
+        them would report every transport outage as a broken credential. The
+        callers put this inside the guard that turns a `ForgeError` into a
+        warning carrying its reason code, which is where the distinction
+        becomes visible; swallowing it here would leave only a `LOGGER.warning`
+        on a cron job's stderr.
 
         It takes a repository because identity is asked of a forge and the
         repository is how the broker knows which one. There is no install-wide
@@ -582,13 +622,7 @@ class BrokerProvider:
         accounts, and the one that matters is the one that can write here.
         """
         if repo not in self._viewers:
-            try:
-                self._viewers[repo] = self._identity(repo, None)["login"]
-            except ForgeError as error:
-                LOGGER.warning(
-                    "the credential for %s could not name itself: %s", repo, error
-                )
-                self._viewers[repo] = ""
+            self._viewers[repo] = self._identity(repo, None)["login"]
         return self._viewers[repo]
 
     def _identity(self, repo: str, login: Optional[str]) -> dict:
@@ -747,6 +781,7 @@ class BrokerProvider:
                     kind=str(node.get("kind") or "issue"),
                     path=str(node.get("path") or ""),
                     line=node.get("line"),
+                    is_bot=bool(node.get("bot")),
                 )
             )
         return out

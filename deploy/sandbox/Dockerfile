@@ -396,22 +396,35 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          only and deliberately so — the sidecar imports it
 #                          across the credential boundary, so it may not reach
 #                          for anything that shells out
-#   forge.py               GitHub REST client, imported by pr_conversation
+#   forge.py               the typed layer over the version-control verbs —
+#                          pull requests, comments, identity, permission —
+#                          imported by pr_conversation. Not a REST client and no
+#                          longer a GitHub one: it asks the broker for a verb and
+#                          a forge module answers it, so it imports vcs_client
+#                          rather than anything that speaks HTTP
 #   pr_triggers.py         imported by pr_conversation, imports forge
 #   github_token_refresh.py  invoked directly by submit-suggestion Step 5
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves
-#   gitops_workspace.py    the leased clone every write skill uses
-#   credential_proxy_client.py  imported by submit-suggestion for the content
-#                          workspace client. The same file is also COPYed to
+#   gitops_workspace.py    what is left of it that this container reads: the
+#                          managed-repository config (`get_managed_github_repos`,
+#                          `is_valid_repo_slug`, `validate_repo_org`), which every
+#                          skill checks a `--repo` against before it acts. Its
+#                          leased clone is not used from here — the working copies
+#                          are `vcs_client`'s now
+#   credential_proxy_client.py  how anything here reaches the broker at all, and
+#                          the only way out of this container that carries a
+#                          credential. Imported by vcs_client, and through it by
+#                          every verb. The same file is also COPYed to
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/git/gh shim; that copy is not importable by
-#                          module name, so it is staged here as well. Content
-#                          mode is the one that works from this container at
-#                          all: no path crosses the protocol, so nothing depends
-#                          on the two ends sharing a filesystem, which they do
-#                          not.
+#                          module name, so it is staged here as well
+#   vcs_client.py          the client half of the verb surface: it composes a
+#                          request, sends it over the line above, and raises on a
+#                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
+#                          go through it, and nothing else in this image talks to
+#                          the broker
 #   workspace_paths.py     the workspace protocol's path validator, imported by
 #                          inspect-repository to re-check every name at the point
 #                          it becomes a write. The broker's content_workspace
@@ -496,6 +509,52 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
     chmod -R u=rwX,go=rX /opt/defaults && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + && \
     find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} +
+
+# The trusted principal's own copy of the forwarded scripts. Root-owned.
+#
+# The pull-request and issue crons run in the agent pod, hold the forge
+# credential, and do their forge work by sshing in as `hermes` and running
+# forge.py here (agents/platform/scripts/forge.py, `_forward`). The copy under
+# /opt/data is the model's: uid 1000 owns that mount, can rewrite any file in
+# it, and the edit lives until the next restart -- section 4b of
+# deploy/sandbox/smoke-test.sh plants one on purpose. Forwarding to that copy
+# would run the model's code with the cron's credential, which is exactly the
+# rule the block above states one caller short of keeping. So the forwarded
+# path is this one instead, outside every directory the agent can write. The
+# model's own copy stays where its instructions say it is; nothing about what
+# an agent runs changes here.
+#
+# The whole import closure is staged, not just forge.py: `sys.path[0]` is the
+# script's own directory, so a module missing here would be found under
+# /opt/data instead and the boundary would be gone with nothing to show for it.
+# The guard below imports it with `-P` and `PYTHONPATH` naming this directory
+# alone, so the import can only resolve inside it -- the closure check and a
+# syntax check in one, failing the build rather than the first cron tick.
+COPY agents/platform/scripts/forge.py \
+     agents/platform/scripts/repo_ref.py \
+     agents/platform/scripts/sandbox_exec.py \
+     agents/platform/scripts/vcs_client.py \
+     agents/platform/scripts/credential_proxy_client.py \
+     /opt/vcs/libexec/platform/
+RUN set -e; \
+    chown -R root:root /opt/vcs/libexec/platform; \
+    chmod 0755 /opt/vcs/libexec/platform; \
+    find /opt/vcs/libexec/platform -type f -exec chmod 0755 {} +; \
+    loose="$(find /opt/vcs/libexec/platform \( ! -user root -o -perm /go=w \) -print)"; \
+    if [ -n "$loose" ]; then \
+        echo "the trusted copy is writable by someone other than root:" >&2; \
+        echo "$loose" >&2; \
+        exit 1; \
+    fi; \
+    export PYTHONPATH=/opt/vcs/libexec/platform PYTHONDONTWRITEBYTECODE=1; \
+    if ! python3 -P -c "import forge"; then \
+        echo "the trusted copy does not import from its own directory alone" >&2; \
+        exit 1; \
+    fi; \
+    if ! python3 -P -c "import forge; raise SystemExit(forge.SANDBOX_FORGE != '/opt/vcs/libexec/platform/forge.py')"; then \
+        echo "forge.SANDBOX_FORGE does not name the root-owned copy" >&2; \
+        exit 1; \
+    fi
 
 # The same guard the agent image runs, for the same reason and with more at
 # stake: a real gcloud or kubectl in this image is a credential path out of the

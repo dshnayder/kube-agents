@@ -203,7 +203,7 @@ would close that request for good, and nobody would be told.
 
 ```bash
 "$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py reply \
-  --repo <owner/repo> --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md \
+  --repo <owner/repo> --pr <N> --comment-id <ref from the poll> --body-file /opt/data/scratch/pr_<N>_reply.md \
   --verify-commit <sha from Step 2b>     # or: --no-change
 ```
 

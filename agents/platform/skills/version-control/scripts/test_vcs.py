@@ -407,6 +407,28 @@ class WriteTest(VcsTestCase):
         self.assertEqual(code, 1)
         self.assertIn("nothing to record", answer["error"])
 
+    def test_commit_with_no_paths_refuses_rather_than_sweeping_an_untracked_file(self):
+        """`add --all` is what the skill forbids the agent to type by hand.
+
+        The working copy is also where scratch output lands, so the untracked
+        file is as likely to be a log as a manifest. Refusing names it; the
+        alternatives are publishing it or dropping it, both silently.
+        """
+        self.change("inventory/clusters.yaml", "replicas: 9\n")
+        self.change("debug.log", "noise\n")
+        code, answer = self.run_vcs("commit", "-m", "everything")
+        self.assertEqual(code, 1)
+        self.assertIn("debug.log", answer["error"])
+
+    def test_commit_with_no_paths_records_tracked_changes_including_deletions(self):
+        self.change("inventory/clusters.yaml", "replicas: 9\n")
+        (self.tree() / "README.md").unlink()
+        code, answer = self.run_vcs("commit", "-m", "tracked only")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(
+            sorted(answer["files"]), ["README.md", "inventory/clusters.yaml"]
+        )
+
     def test_commit_takes_named_paths_only(self):
         self.change("inventory/clusters.yaml", "replicas: 9\n")
         self.change("untouched.txt", "leave me\n")
@@ -455,12 +477,12 @@ class WriteTest(VcsTestCase):
     def test_publish_advances_the_base_so_a_second_one_sends_only_the_rest(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.run_vcs("publish")
         first_base = vcs_client.all_sessions()[0]["published"]["fix/replicas"]
         self.assertNotEqual(first_base, self.origin_head)
         self.change("b.txt", "b\n")
-        self.run_vcs("commit", "-m", "b")
+        self.run_vcs("commit", "b.txt", "-m", "b")
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 0)
         self.assertEqual(answer["revisions"], 1)
@@ -473,13 +495,13 @@ class WriteTest(VcsTestCase):
         # check reads as a rewritten target and refuses.
         self.run_vcs("branch", "fix/one")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.run_vcs("publish")
         first_tip = vcs_client.all_sessions()[0]["published"]["fix/one"]
 
         self.run_vcs("branch", "fix/two")
         self.change("b.txt", "b\n")
-        self.run_vcs("commit", "-m", "b")
+        self.run_vcs("commit", "b.txt", "-m", "b")
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 0, answer)
         payload = self.broker.payload("publish")
@@ -498,7 +520,7 @@ class WriteTest(VcsTestCase):
     def test_publish_leaves_no_bundle_behind_even_when_the_broker_refuses(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.broker.fail["publish"] = "main has moved on the remote"
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 1)
@@ -875,9 +897,13 @@ class AbstractionTest(unittest.TestCase):
                 )
 
     def test_the_only_network_client_is_the_broker(self):
+        # Both halves. The talking moved into `vcs_client`, so a check that
+        # read only the front would now be inspecting the file that no longer
+        # reaches anything.
         for module in ("requests", "urllib.request", "http.client", "socket"):
-            with self.subTest(module=module):
-                self.assertNotIn(f"import {module}", self.source)
+            for source in (self.source, self.client_source):
+                with self.subTest(module=module):
+                    self.assertNotIn(f"import {module}", source)
 
     def test_every_verb_the_broker_serves_has_a_command(self):
         parser = vcs.build_parser()

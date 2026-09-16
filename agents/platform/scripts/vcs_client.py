@@ -11,7 +11,7 @@ so the two callers cannot drift.
 Everything that spends a credential goes through `call()`, which is
 `POST /v1/vcs/<verb>` on the credential broker. Everything else runs the
 sandbox's own git, by absolute path, against a copy `clone()` unpacked from a
-bundle. The session store under `ROOT/.sessions` remembers, per repository,
+bundle. The session store under `ROOT/.sessions` remembers, per working copy,
 which branch the copy was cloned from and what each branch last published --
 the two facts `publish()` proves its revisions against.
 
@@ -196,17 +196,42 @@ def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.Completed
     )
 
 
-def _slug(forge: str, repo: str) -> str:
-    return f"{forge}__{repo.replace('/', '__')}"
+def _slug(forge: str, repo: str, key: str) -> str:
+    """The directory one working copy gets, under a root every card shares.
+
+    Keyed on the branch as well as the repository, because one repository worked
+    on by two cards at once is the ordinary case for a fleet: nine audit streams
+    and a suggestion card all target the same GitOps repository. Keyed on the
+    repository alone, the second `prepare` of the day either refused -- there is
+    already a copy here -- or, with `--force`, deleted the first card's
+    unpublished work.
+
+    `/` becomes `__` the way it already does in the repository name. A branch
+    name cannot contain `_` at all (`providers/validate.BRANCH_RE`), so no two
+    branches of one repository can land on the same directory.
+    """
+    return f"{forge}__{repo.replace('/', '__')}__{key.replace('/', '__')}"
 
 
-def session_path(forge: str, repo: str) -> Path:
-    return SESSIONS / f"{_slug(forge, repo)}.json"
+def _key_of(session: dict) -> str:
+    """Which branch the copy is *for*, which is not always the one it is *of*.
+
+    A branch this run is starting does not exist on the forge yet, so the copy
+    is taken of the base and the branch is cut from it locally: `branch` is the
+    base, and `key` is the name the work will be published under. They are the
+    same string whenever the branch already existed.
+    """
+    return session.get("key") or session.get("branch") or ""
+
+
+def session_path(forge: str, repo: str, key: str) -> Path:
+    return SESSIONS / f"{_slug(forge, repo, key)}.json"
 
 
 def save_session(data: dict) -> None:
     SESSIONS.mkdir(parents=True, exist_ok=True)
-    session_path(data["forge"], data["repo"]).write_text(json.dumps(data, indent=2))
+    path = session_path(data["forge"], data["repo"], _key_of(data))
+    path.write_text(json.dumps(data, indent=2))
 
 
 def all_sessions() -> list[dict]:
@@ -241,41 +266,80 @@ def _matches(session: dict, spec: str) -> bool:
     return bool(repo) and (wanted.endswith("/" + repo) or repo.endswith("/" + wanted))
 
 
-def resolve_session(spec: str | None) -> dict:
+def _listing(sessions: list[dict]) -> str:
+    """The copies, as something the caller can act on rather than choose from.
+
+    The path, because that is what `cd` takes and the working copy is where
+    every one of these verbs wants the caller to be standing anyway.
+    """
+    return ", ".join(
+        sorted(
+            f"{session['path']} ({session['repo']} on {_key_of(session)})"
+            for session in sessions
+        )
+    )
+
+
+def _standing_in(sessions: list[dict]) -> dict | None:
+    """The copy the caller is inside, if it is inside one."""
+    here = Path.cwd().resolve()
+    for session in sessions:
+        path = Path(session["path"]).resolve()
+        if here == path or path in here.parents:
+            return session
+    return None
+
+
+def resolve_session(spec: str | None = None, key: str | None = None) -> dict:
     """Which working copy a verb is about.
 
     Named, then inferred from the directory the caller is standing in, then the
     only one there is. That is the order every version-control system resolves
     it in, and the last case is what makes `vcs.py log` work right after a clone
     without repeating the URL.
+
+    `key` is the branch a caller that knows which change it is working on passes
+    -- `submit-suggestion` has it from `--branch`. It matters because one
+    repository can be cloned twice here, once per card, and then the repository
+    alone names two copies. A caller that does not have it is not stuck: the
+    directory it is standing in still decides, which is what the agent following
+    the SKILL does, and the refusal at the end names the branches to choose
+    between rather than repeating the repository twice.
     """
     sessions = all_sessions()
-    if spec:
-        hits = [session for session in sessions if _matches(session, spec)]
+    if key:
+        sessions = [session for session in sessions if _key_of(session) == key]
+    named = f"{spec} on '{key}'" if spec and key else (spec or f"'{key}'")
+    if spec or key:
+        hits = [session for session in sessions if not spec or _matches(session, spec)]
         if len(hits) == 1:
             return hits[0]
         if not hits:
             raise VcsError(
-                f"no local copy of {spec}. Run `vcs.py clone {spec}` first."
+                f"no local copy of {named}. Run `vcs.py clone {spec or '<url>'}`"
+                " first."
             )
+        # More than one copy of the same repository, and the caller named no
+        # branch. Standing inside one of them is an answer.
+        standing = _standing_in(hits)
+        if standing:
+            return standing
         raise VcsError(
-            f"{spec} matches more than one local copy: "
-            + ", ".join(sorted(hit["repo"] for hit in hits))
+            f"{named} is cloned here more than once, one copy per branch. Run "
+            "this from inside the one you mean: " + _listing(hits)
         )
     if not sessions:
         raise VcsError(
             "there is no local copy of anything yet. Run `vcs.py clone <url>`."
         )
-    here = Path.cwd().resolve()
-    for session in sessions:
-        path = Path(session["path"]).resolve()
-        if here == path or path in here.parents:
-            return session
+    standing = _standing_in(sessions)
+    if standing:
+        return standing
     if len(sessions) == 1:
         return sessions[0]
     raise VcsError(
-        "several repositories are cloned here; say which with --repo: "
-        + ", ".join(sorted(session["repo"] for session in sessions))
+        "several working copies are here; name one with --repo, or run this "
+        "from inside it: " + _listing(sessions)
     )
 
 
@@ -388,7 +452,13 @@ def _refuse_to_discard(destination: Path, *, force: bool) -> None:
     )
 
 
-def clone(repository: str, branch: str | None = None, *, force: bool = False) -> dict:
+def clone(
+    repository: str,
+    branch: str | None = None,
+    *,
+    force: bool = False,
+    key: str | None = None,
+) -> dict:
     """Bring the repository down as history, not as a directory listing.
 
     One call to the broker, which clones, bundles and deletes its tree before
@@ -400,7 +470,11 @@ def clone(repository: str, branch: str | None = None, *, force: bool = False) ->
         payload["branch"] = branch
     answer = call("clone", payload)
 
-    destination = ROOT / _slug(answer["forge"], answer["repo"])
+    # `key` is for the caller that is about to cut a branch this copy is not on
+    # yet: `submit-suggestion` clones the base and then switches, and the copy
+    # belongs to that branch, not to the base every other card also clones.
+    key = key or branch or answer["branch"]
+    destination = ROOT / _slug(answer["forge"], answer["repo"], key)
     if destination.exists():
         _refuse_to_discard(destination, force=force)
         shutil.rmtree(destination)
@@ -428,6 +502,8 @@ def clone(repository: str, branch: str | None = None, *, force: bool = False) ->
         "repo": answer["repo"],
         "spec": repository,
         "branch": answer["branch"],
+        # What this copy is for, and what its directory is named after.
+        "key": key,
         # What `publish` proves its revisions descend from. Recorded at clone
         # time and never updated by a local commit: it is the last point the
         # broker and this container agreed on.
@@ -454,14 +530,16 @@ def clone(repository: str, branch: str | None = None, *, force: bool = False) ->
     }
 
 
-def branch(spec: str | None = None, name: str | None = None) -> dict:
+def branch(
+    spec: str | None = None, name: str | None = None, key: str | None = None
+) -> dict:
     """List the lines of development, or start one.
 
     Local only, and it makes no network call. A branch is a name for a revision;
     it becomes something the forge knows about when `publish` sends the
     revisions under it, not before.
     """
-    session = resolve_session(spec)
+    session = resolve_session(spec, key=key)
     tree = tree_of(session)
     if not name:
         listing = local_git(tree, "branch", "--format=%(refname:short)", check=False)
@@ -491,19 +569,60 @@ def branch(spec: str | None = None, name: str | None = None) -> dict:
     }
 
 
-def commit(message: str, paths: list[str] | tuple[str, ...] = (), spec: str | None = None) -> dict:
+def _untracked(tree: Path) -> list[str]:
+    """Paths in the working copy that git does not track, respecting ignores.
+
+    `--others --exclude-standard` is the pair: the first asks for what is not
+    tracked, the second keeps `.gitignore` honoured, so a repository that
+    already ignores its own build output does not have to be argued with.
+    """
+    found = local_git(
+        tree, "ls-files", "--others", "--exclude-standard", check=False
+    )
+    return [line for line in found.stdout.splitlines() if line.strip()]
+
+
+def commit(
+    message: str,
+    paths: list[str] | tuple[str, ...] = (),
+    spec: str | None = None,
+    key: str | None = None,
+) -> dict:
     """Record a revision, here, with the sandbox's own git.
 
     Local on purpose. The revision has a real parent and a real identifier
     before anything leaves this container, so `log` shows the work in progress,
     a branch of five changes stays five revisions rather than being flattened
     into one, and `publish` has something whose ancestry it can prove.
+
+    **With no `paths`, this records changes to files the copy already tracks
+    and nothing else.** It is not `add --all`. The working copy is a real clone
+    on a filesystem the caller also scratches in, and a blanket add is how a
+    log, a debug dump or a half-written note ends up in a public proposal --
+    `submit-suggestion/SKILL.md` forbids `git add .` for exactly that reason,
+    and a helper that does it on the caller's behalf forbids nothing. An
+    untracked file is therefore a refusal naming it rather than something
+    silently swept in or silently left out: either answer, given without
+    saying so, is one the caller would have wanted to know about.
     """
-    session = resolve_session(spec)
+    session = resolve_session(spec, key=key)
     tree = tree_of(session)
-    staged = local_git(
-        tree, "add", "--", *paths, check=False
-    ) if paths else local_git(tree, "add", "--all", check=False)
+    if paths:
+        staged = local_git(tree, "add", "--", *paths, check=False)
+    else:
+        untracked = _untracked(tree)
+        if untracked:
+            shown = ", ".join(untracked[:10])
+            more = f" (and {len(untracked) - 10} more)" if len(untracked) > 10 else ""
+            raise VcsError(
+                f"{len(untracked)} file(s) here are not tracked yet and will not "
+                f"be recorded on their own: {shown}{more}. Name the ones that "
+                "belong in the change -- `vcs.py commit --message ... <path>...` "
+                "-- and delete the rest. This never stages a file you did not "
+                "name, because a working copy is also where scratch output lands."
+            )
+        # `--update`, not `--all`: tracked files only, deletions included.
+        staged = local_git(tree, "add", "--update", check=False)
     if staged.returncode != 0:
         raise VcsError(f"nothing was staged: {staged.stderr.strip()}")
     pending = local_git(tree, "diff", "--cached", "--name-only", check=False)
@@ -529,11 +648,31 @@ def commit(message: str, paths: list[str] | tuple[str, ...] = (), spec: str | No
     }
 
 
+def already_published(session: dict, branch: str | None = None) -> bool:
+    """Is this branch's current tip already on the remote?
+
+    Read off the session, which records the tip each `publish` landed, against
+    the tip the copy holds now. It is not a question about the forge: the
+    session is written after the broker answered, so a `True` here means this
+    container watched those revisions land.
+
+    It exists for one state, and that state is reachable: `publish` succeeded
+    and whatever the caller did next did not. Without this, the retry finds
+    nothing new to send and is refused before it reaches the step that failed.
+    """
+    branch = branch or current_branch(session)
+    tip = local_git(tree_of(session), "rev-parse", "HEAD", check=False)
+    if tip.returncode != 0:
+        return False
+    return (session.get("published") or {}).get(branch) == tip.stdout.strip()
+
+
 def publish(
     spec: str | None = None,
     target: str | None = None,
     *,
     advance: bool = False,
+    key: str | None = None,
 ) -> dict:
     """Send the revisions made since `clone` to the shared repository.
 
@@ -548,7 +687,7 @@ def publish(
     It needs an explicit `target` beside it — the branch the proposal merges
     into — because the default target is the cloned branch itself.
     """
-    session = resolve_session(spec)
+    session = resolve_session(spec, key=key)
     tree = tree_of(session)
     branch = current_branch(session)
     base = base_for(session, branch)
@@ -636,16 +775,18 @@ def publish(
     return answer
 
 
-def discard(spec: str | None = None) -> dict:
+def discard(spec: str | None = None, key: str | None = None) -> dict:
     """Remove the local copy. Nothing is released on the credential side.
 
     There is nothing there to release — every broker route is one request long.
     This deletes a directory, and it is called `discard` rather than `close` for
     that reason: closing implies a counterpart that was opened.
     """
-    session = resolve_session(spec)
+    session = resolve_session(spec, key=key)
     shutil.rmtree(session["path"], ignore_errors=True)
-    session_path(session["forge"], session["repo"]).unlink(missing_ok=True)
+    session_path(
+        session["forge"], session["repo"], _key_of(session)
+    ).unlink(missing_ok=True)
     return {
         "repo": session["repo"],
         "forge": session["forge"],

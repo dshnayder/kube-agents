@@ -158,7 +158,19 @@ class GitHubForge(Forge):
         if add:
             api("POST", f"repos/{repo}/issues/{number}/labels", body={"labels": add})
         for name in remove:
-            api("DELETE", f"repos/{repo}/issues/{number}/labels/{quote(name, safe='')}")
+            try:
+                api("DELETE", f"repos/{repo}/issues/{number}/labels/{quote(name, safe='')}")
+            except WorkspaceError as exc:
+                # A label that is not on the issue is the state the caller asked
+                # for, and GitHub answers 404 for it. Letting that through would
+                # abort the whole update before the PATCH runs, so a `labelsAdd`
+                # travelling with the removal would be dropped too: the resolver
+                # sends `{labelsAdd: [status:<terminal>], labelsRemove:
+                # [status:in-progress]}` in one call, and the stale sweep may
+                # already have taken the claim label off. The `gh issue edit
+                # --remove-label` calls this replaces were tolerant of it.
+                if exc.status != 404:
+                    raise
 
     def can_write(self, api: Callable, repo: str, login: str) -> bool | None:
         # The collaborator-permission endpoint rather than `author_association`
@@ -273,6 +285,14 @@ class GitHubForge(Forge):
         # Best-effort by contract: a courtesy so the reviewer sees something
         # inside the tick. A review summary has no reaction endpoint, which is
         # `False` rather than an error.
+        #
+        # Validated although nothing here reads it: the reaction endpoint is
+        # keyed on the comment alone, but `number` is in the verb's request
+        # shape for the forges whose award-emoji route needs the proposal too.
+        # A request every forge accepts and one forge refuses is the parity the
+        # shared validators exist to hold, so it is checked where it is not
+        # used.
+        validate_number(payload.get("number"), "number")
         comment = payload.get("comment") or {}
         if not isinstance(comment, dict):
             raise WorkspaceError("comment must be the {id, kind} of a comment")

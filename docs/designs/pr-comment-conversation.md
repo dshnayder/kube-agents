@@ -80,9 +80,10 @@ Three properties are load-bearing, and each has a test:
 Each sweep resolves its own repo and makes its own credential check rather than sharing a hoisted
 one. That is deliberate: `resolver.py poll` already does both, and owns a precise reason-code
 vocabulary — the broker's own refusal codes (`FORGE_UNAUTHENTICATED` vs `FORGE_NOT_FOUND` vs
-`FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `GIT_REPO_UNPARSEABLE`
+`FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `UNMANAGED_REPOSITORY`
 vs `REPO_UNREACHABLE` vs `SANDBOX_UNREACHABLE` when the fault is on this side — that a hoisted check
-could only duplicate or flatten.
+could only duplicate or flatten. The gate keeps one code of its own, `GIT_REPO_UNPARSEABLE`, because
+it is the side that reads a repository value before there is anyone to ask about it.
 
 Consolidation removes one real thing: the per-job `enabled: false` an operator had when there were
 two roster entries. `GITHUB_WATCHER_SWEEPS` (comma-separated; unset means all) restores it. A name
@@ -336,7 +337,7 @@ deterministic lives here, so an idle tick still costs no model at all.
   text needs characters before the text — `` ` ``, `<!--`, `>`, a fence, four spaces — so there is
   no room for one ahead of a trigger that opens the comment. This is also what makes GitHub's "Quote
   reply" safe: idempotency is keyed on the comment carrying the trigger, so a quoted request is a
-  new node id with no marker on it, and `> /agent …` does not fire because `>` is not whitespace.
+  new comment with a new ref and no marker on it, and `> /agent …` does not fire because `>` is not whitespace.
   The cost is that the button is then unusable for addressing the agent at all — it puts the quote
   above the cursor, so the reviewer's own words never open the comment — which §4 lists among what
   the anchor gives up.
@@ -360,13 +361,14 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
   marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
   to stderr, like deferral.
-- **Anything the gate posts goes to `gh` on stdin, never as a path.** `gh` does not run where the
-  caller does: the gate runs in the agent pod, ssh carries the command to the sandbox, and the shim
-  forwards it to the credential broker in a third pod. A `--body-file /some/path` names a file only
-  the first of those can open. Both earlier attempts to make a path work failed — `/tmp` is a
-  per-container `emptyDir`, so every refusal died on "no such file" live, and the shared volume that
-  replaced it then needed the file made group-readable across the uid split of #955. `--body-file -`
-  needs neither, and is what the fleet audit already does (`audit_report.BODY_STDIN`).
+- **Anything the gate posts travels as a field of the verb, never as a path.** The gate runs in the
+  agent pod; the credential that can post lives in another one. There is no volume both mount, so a
+  `--body-file /some/path` names a file only the caller can open. Both earlier attempts to make a
+  path work failed — `/tmp` is a per-container `emptyDir`, so every refusal died on "no such file"
+  live, and the shared volume that replaced it then needed the file made group-readable across the
+  uid split of #955. The text is now handed to `proposal-comment` as its `body`, which crosses on
+  fd 0 as part of the request and needs neither. `audit_report.BODY_STDIN` still takes the older
+  exit on the same fd, carrying the document itself rather than a request containing it.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -384,14 +386,19 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
 
-  **Not through the credential proxy.** The reaction is a `gh api -X POST …/reactions` call, and the
-  proxy refuses mutating `gh api` — the same rule that stops the agent merging its own pull request.
-  Narrowing the rule to exempt reaction endpoints was considered and rejected: the rules match a
-  joined command string, so a path-shaped exemption is one that an argv can be built to satisfy, and
-  a recognisable emoji is not worth widening the control that keeps the review gate a gate. So a
-  brokered sweep leaves no 👀; it is best-effort by contract and the reply still lands. It logs the
-  refusal rather than dropping it silently, and the proxy logs one `SECURITY_POLICY_BLOCKED` warning
-  per acknowledgement, which is expected rather than a signal.
+  **Through the verb, and asked for first.** The reaction is the
+  [`proposal-acknowledge`](version-control-support.md) verb, naming the comment by `{id, kind}`, so
+  it is an ordinary brokered call rather than a mutating `gh api` the proxy refuses. Whether it will
+  achieve anything is asked before it is attempted: `capabilities` carries `acknowledge`, per
+  repository and with no credential spent, and a forge with nowhere to leave a 👀 is not called. That
+  flag is its own field rather than the presence of the verb in `verbs` — every forge routes the
+  verb, and one without reactions answers `{"acknowledged": false}` having done nothing.
+
+  It stays best-effort by contract: a failure is logged at INFO and the reply still lands. The
+  request shape names the proposal as well as the comment, which the shipped forge does not need —
+  a GitHub reaction endpoint is keyed on the comment alone — because a comment id is not everywhere
+  sufficient to locate a comment, and a request shape that depended on which forge answered it would
+  be the abstraction failing at the first thing it was built for.
 
 - **`--dry-run` reaches into the sweeps, not just the card filing.** The refusal and the 👀 are
   written by the sweep, so a flag that only suppressed `file_card` would still post to a public
@@ -400,9 +407,11 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   done on stderr rather than going quiet. One thing it cannot cover, and says so on stderr: the
   issues sweep runs `resolver.py poll`, whose stale-label sweep has no dry-run of its own.
 - **One card per pull request**, assigned to `platform`, keyed
-  `pr-conv-<owner>-<repo>-<n>-<node-id>-<hour>`, carrying the PR number, head ref and the triggering
-  comment node ids. The node id enters that key case-preserved: it is base64, so folding its case
-  could give two distinct comments one idempotency key and lose the second request. The hourly
+  `pr-conv-<owner>-<repo>-<n>-<comment-ref>-<hour>`, carrying the PR number, head ref and the
+  triggering comment refs. The ref enters that key case-preserved: nothing says a forge's ids are
+  case-insensitive, and one that spends base64 on them collides the moment the case is folded —
+  two distinct comments would share an idempotency key and the second request would be deduped
+  away. The hourly
   bucket is the one §2's issue sweep already uses, and it matters more here: the board matches a
   repeat key against non-archived rows whatever their state, so without it a single worker that
   ends without answering leaves a _finished_ card holding the key of the oldest unanswered request
@@ -516,7 +525,10 @@ of going the wrong way — every step checked, the direction never re-examined.
 **Status: implemented** as `pr_triggers.marker` and `pr_triggers.handled_refs`.
 
 A trigger is unanswered when no comment **written by the self identity** on that pull request
-contains `<!-- agent-answered:<node-id> -->` or `<!-- agent-refused:<node-id> -->`.
+contains `<!-- agent-answered:<comment-ref> -->` or `<!-- agent-refused:<comment-ref> -->`. The ref
+is the forge-neutral `<kind>-<id>` the verb surface reports, not a forge's own node id: the number
+alone is unique only within the endpoint that issued it, so a conversation comment and a review
+comment can share one and an answer to either would suppress the other.
 
 Three properties make this work without a watermark table:
 
@@ -541,10 +553,12 @@ prompt:
    requests too, so the worker can refuse one rather than appear to have missed it, and it returns
    the thread each request arrived in — see below.
 2. Act: answer a question directly; for a change request follow **submit-suggestion Step 5**, whose
-   `--force-with-lease` and protected-branch guards apply unchanged. Then read the branch back and
-   confirm the change is on it — see the claim check below.
+   protected-branch guard applies unchanged. Its `--force-with-lease` push does not: `publish` is
+   fast-forward only, so a second round on the branch extends it and a branch that has diverged is
+   refused by name rather than overwritten. Then read the branch back and confirm the change is on
+   it — see the claim check below.
 3. Write the reply to a file under `/opt/data/scratch`.
-4. Post it with `pr_conversation.py reply --pr N --comment-id <node-id> --body-file …`, which appends
+4. Post it with `pr_conversation.py reply --pr N --comment-id <comment-ref> --body-file …`, which appends
    the `agent-answered` marker — the helper stamps it from `--comment-id` rather than trusting the
    model to type it, because a missing marker is not a missing comment but the same request being
    answered every ten minutes forever. `refuse` is the same path with the `agent-refused` marker.
@@ -553,7 +567,7 @@ prompt:
    without answering it.
 
    `--comment-id` is checked against the forge before anything is posted, rather than trusted. A
-   numeric id in place of a node id, a truncated one, or the id of a different comment all post a
+   bare number in place of a ref, a truncated one, or the ref of a different comment all post a
    real, visible answer stamped with a marker that closes nothing — so the sweep files the card
    again on the next tick and the agent answers the same comment every ten minutes. After the post
    the comment is public, so the only place to cut that loop is before it. The same check re-applies

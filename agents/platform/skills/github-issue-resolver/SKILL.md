@@ -135,8 +135,11 @@ Once your investigation is complete:
    and sends its contents as the comment body, so nothing about your report
    passes through a shell — no escaping, no quoting, no ampersand
    backgrounding. It then transitions the ticket. The report file is removed
-   only after the comment has landed; if the forge refuses, the file is still
-   there and the command can simply be run again:
+   only after the whole transition has landed, so a refusal anywhere in it
+   leaves the investigation on disk rather than losing it. Re-running is how
+   you retry, but it is not free: the comment goes first, so a run that failed
+   on the label change or the close posts the report a second time. Say so in
+   the re-posted report, or trim it to the part that is new.
 
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 

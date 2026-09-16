@@ -142,6 +142,42 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertTrue(self.published[0]["advance"])
         self.assertEqual(self.published[0]["clonedFrom"], "main")
 
+    def test_one_repository_cloned_twice_gets_one_copy_per_branch(self):
+        # The scratch root is shared by every card in the container, so the
+        # copy is keyed on the branch as well as the repository. Keyed on the
+        # repository alone, the second clone here landed on the first one.
+        first = vcs_client.clone("acme/infra", key="fix/one")
+        second = vcs_client.clone("acme/infra", key="fix/two")
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertTrue(first["path"].endswith("local__acme__infra__fix__one"))
+        self.assertEqual(
+            vcs_client.resolve_session("acme/infra", key="fix/two")["path"],
+            second["path"],
+        )
+        # And discarding one leaves the other, session file included.
+        vcs_client.discard("acme/infra", key="fix/two")
+        self.assertFalse(Path(second["path"]).exists())
+        self.assertEqual(
+            vcs_client.resolve_session("acme/infra")["path"], first["path"]
+        )
+
+    def test_two_copies_are_ambiguous_until_one_is_named_or_stood_in(self):
+        first = vcs_client.clone("acme/infra", key="fix/one")
+        vcs_client.clone("acme/infra", key="fix/two")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.resolve_session("acme/infra")
+        # The refusal hands over paths rather than a choice: the caller is
+        # meant to be standing in the copy, and `cd` takes a path.
+        self.assertIn(first["path"], str(caught.exception))
+        self.assertIn("fix/two", str(caught.exception))
+
+        here = Path.cwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(first["path"])
+        self.assertEqual(
+            vcs_client.resolve_session("acme/infra")["path"], first["path"]
+        )
+
     def test_advance_still_refuses_a_target_that_is_the_branch_itself(self):
         cloned = vcs_client.clone("acme/infra")
         (Path(cloned["path"]) / "a.txt").write_text("b\n")
