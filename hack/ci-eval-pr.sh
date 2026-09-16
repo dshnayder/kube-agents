@@ -1581,6 +1581,19 @@ NIGHTLY_TASKS=(
   # only and earns its record here. The default unit_cost_hint fits the
   # measured runs.
   "./tasks/cluster-agent-stalled-controller-healthy-silence/task.yaml"
+  # The consumer migration's two cases. Both write to the eval GitOps
+  # repository -- an issue apiece for the first, a pull request apiece for the
+  # second -- on the same terms rca-remediation-pr already holds a presubmit
+  # seat under: a throwaway repository we own and a token scoped to it.
+  # Nightly rather than presubmit on cost: each drives a full skill procedure
+  # (poll, claim, investigate, transition; prepare, two submits, a read-back)
+  # rather than a probe, and the presubmit's wall clock is what #1202's trim
+  # was about. Measured on `dev-vcs2-20260915a`: the resolver 1424s, the
+  # read-back 546-654s. Only the read-back is red on main; the resolver passes
+  # there too and is kept as a regression guard over the largest consumer this
+  # migration rewrites -- each task.yaml header says which it is.
+  "./tasks/vcs-issue-resolver-triage/task.yaml"
+  "./tasks/vcs-review-feedback-read-back/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
