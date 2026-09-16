@@ -45,6 +45,7 @@ TERRAFORM_DIR = REPO_ROOT / "terraform"
 FULL_INSTALL = TERRAFORM_DIR / "examples" / "full-install"
 TF_MAIN = FULL_INSTALL / "main.tf"
 TF_VARIABLES = FULL_INSTALL / "variables.tf"
+IAM_MODULE_MAIN = TERRAFORM_DIR / "modules" / "kube-agents-iam" / "main.tf"
 
 # The exact set the composition grants for `read-only`. Written out rather than
 # derived so that widening it is a visible diff here too.
@@ -54,6 +55,7 @@ READ_ONLY_ROLES = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -73,6 +75,59 @@ FORBIDDEN_ROLES = {
     "roles/owner",
     "roles/editor",
     "roles/iam.serviceAccountTokenCreator",
+}
+
+# The exact permissions the module's one custom role carries. A custom role is
+# the hole in every check above it: FORBIDDEN_ROLES matches strings beginning
+# `roles/`, and a custom role's contents are bare permission ids, so a role
+# granting `container.clusters.update` passes the forbidden-role sweep without
+# being looked at. Written out for the same reason READ_ONLY_ROLES is -- so
+# widening it is a visible diff here.
+SUBNET_UTILIZATION_PERMISSIONS = [
+    "compute.subnetworks.use",
+    "recommender.networkAnalyzerIpAddressInsights.list",
+    "recommender.networkAnalyzerIpAddressInsights.get",
+]
+
+# Verbs that make a permission a read. Checked as the last dot-separated
+# segment of every permission in every custom role in the tree, so a second
+# custom role added later is covered without editing the pin above.
+#
+# An allowlist, because the denylist this replaced could only refuse the writes
+# somebody had thought of. It named `setIamPolicy`, `setMetadata` and
+# `setLabels` and so admitted `container.clusters.setMasterAuth`,
+# `compute.instances.setServiceAccount`, `compute.instances.attachDisk`,
+# `compute.networks.addPeering`, and the RBAC-escalation pair
+# `clusterRoles.bind` / `.escalate` -- a ceiling test that green-lit rewriting
+# the cluster's admin credentials. GCP's write verbs are an open set and its
+# read verbs are not, so the refusal has to be the default.
+#
+# The impersonation half is not optional garnish: FORBIDDEN_ROLES already names
+# `roles/iam.serviceAccountTokenCreator`, and a custom role holding that role's
+# permissions grants the same thing under a name this file has never heard of.
+# None of `actAs`, `getAccessToken`, `getCredentials`, `getOpenIdToken`,
+# `signBlob`, `signJwt` or `implicitDelegation` is a read, so all seven are
+# refused here without being named -- note that `getAccessToken` is its own
+# verb and not the bare `get` below.
+READ_PERMISSION_VERBS = {
+    "get",
+    "list",
+    "aggregatedList",
+    "getIamPolicy",
+    "queryTestablePermissions",
+    "search",
+    "watch",
+    "check",
+}
+
+# The one non-read this repository grants on purpose, spelled out in full
+# rather than as a verb: `use` authorizes attaching a NIC, a node pool or a
+# load balancer to a subnet, so exempting the verb would exempt it on every
+# resource type. `terraform/modules/kube-agents-iam/main.tf` and the site's
+# `reference/security-and-iam.md` both argue for this one grant; adding a
+# second entry here is the moment to make the same argument in public.
+ALLOWED_NON_READ_PERMISSIONS = {
+    "compute.subnetworks.use",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that
@@ -492,6 +547,130 @@ class TerraformRoleBundlesTest(unittest.TestCase):
         self.assertEqual(
             ACCEPTED_VALUES, re.findall(r'"([^"]*)"', condition.group(1))
         )
+
+
+class TerraformCustomRolePermissionsTest(unittest.TestCase):
+    """What a custom role anywhere in the terraform tree is allowed to contain.
+
+    Every other check in this file reads role *names*. A custom role is defined
+    by its permissions, so none of them look inside one: inserting
+    `container.clusters.update` into `subnet_utilization_reader` grants the
+    agent cluster mutation project-wide and leaves the rest of the suite green.
+
+    Scanned across every `.tf` under `terraform/` rather than just the one
+    module that has a custom role today. Scoping it to that file left the same
+    hole one directory over -- a `google_project_iam_custom_role` added to
+    `examples/full-install/main.tf` with `iam.serviceAccounts.setIamPolicy` in
+    it passed the whole suite.
+
+    Matched by resource-type *shape* rather than by naming the project-scoped
+    one, for the same reason. GCP creates custom roles at project or
+    organization scope, and the provider spells the second
+    `google_organization_iam_custom_role`; a role defined there is bound above
+    the project and reaches it by inheritance, so it is the wider grant, not a
+    lesser one. Pinning the literal `google_project_iam_custom_role` let an
+    org-scoped role carrying `resourcemanager.projects.setIamPolicy` and
+    `iam.serviceAccounts.actAs` pass this whole file. `google_\\w*_iam_custom_role`
+    covers both and whatever scope the provider adds next.
+    """
+
+    def setUp(self):
+        self.module = IAM_MODULE_MAIN.read_text(encoding="utf-8")
+        self.lists = _terraform_list_locals(self.module)
+
+    def _custom_role_permissions(self) -> dict[str, list[str]]:
+        """Every custom role's `permissions = [...]`, keyed `<path>:<address>`.
+
+        The address carries the resource type as well as the name so that two
+        roles sharing a name at different scopes are two entries rather than
+        one overwriting the other.
+        """
+        found = {}
+        for path in sorted(TERRAFORM_DIR.rglob("*.tf")):
+            source = path.read_text(encoding="utf-8")
+            for match in re.finditer(
+                r'^resource\s+"(google_\w*_iam_custom_role)"\s+"([^"]+)"\s*\{',
+                source,
+                re.M,
+            ):
+                key = f"{path.relative_to(REPO_ROOT)}:{match.group(1)}.{match.group(2)}"
+                depth, body = 0, ""
+                for ch in source[match.end() - 1 :]:
+                    body += ch
+                    depth += (ch == "{") - (ch == "}")
+                    if depth == 0 and body.strip():
+                        break
+                perms = _terraform_list_locals(body).get("permissions")
+                self.assertIsNotNone(
+                    perms, f"could not read the permissions of custom role {key}"
+                )
+                found[key] = perms
+        return found
+
+    def test_the_subnet_utilization_role_carries_exactly_three_permissions(self):
+        roles = self._custom_role_permissions()
+        key = (
+            "terraform/modules/kube-agents-iam/main.tf:"
+            "google_project_iam_custom_role.subnet_utilization_reader"
+        )
+        self.assertIn(key, roles, "the subnet-utilization custom role moved or was renamed")
+        self.assertEqual(SUBNET_UTILIZATION_PERMISSIONS, roles[key])
+
+    def test_no_custom_role_in_the_tree_carries_a_write(self):
+        roles = self._custom_role_permissions()
+        self.assertTrue(roles, "no custom role found; this test would pass vacuously")
+        for name, perms in roles.items():
+            for perm in perms:
+                with self.subTest(role=name, permission=perm):
+                    if perm in ALLOWED_NON_READ_PERMISSIONS:
+                        continue
+                    self.assertIn(
+                        perm.rsplit(".", 1)[-1],
+                        READ_PERMISSION_VERBS,
+                        f"custom role {name} grants {perm}, which is not a read and is "
+                        "not in ALLOWED_NON_READ_PERMISSIONS -- it would authorize the "
+                        "agent through IAM independently of its Kubernetes RBAC. Add it "
+                        "there with the argument for it, or drop the permission.",
+                    )
+
+    def test_the_verbs_a_denylist_would_have_missed_are_refused(self):
+        """The regression this allowlist exists for, held down by name.
+
+        Each of these passed the denylist that shipped before it. They are not
+        hypothetical shapes: `setMasterAuth` rewrites a cluster's admin
+        credentials, `setServiceAccount` re-identifies a VM, and
+        `clusterRoles.escalate` is the permission that removes the RBAC ceiling
+        the rest of this file rests on.
+        """
+        for perm in (
+            "container.clusters.setMasterAuth",
+            "compute.instances.setServiceAccount",
+            "compute.instances.attachDisk",
+            "compute.networks.addPeering",
+            "container.pods.exec",
+            "container.clusterRoles.bind",
+            "container.clusterRoles.escalate",
+            "storage.objects.setRetention",
+        ):
+            with self.subTest(permission=perm):
+                self.assertNotIn(perm, ALLOWED_NON_READ_PERMISSIONS)
+                self.assertNotIn(perm.rsplit(".", 1)[-1], READ_PERMISSION_VERBS)
+
+    def test_every_permission_the_module_grants_today_is_accounted_for(self):
+        """The allowlist must not be so tight that the shipped role fails it.
+
+        A guard that refuses the thing the repository actually installs gets
+        widened in a hurry, and widening under time pressure is how a denylist
+        got here. Pinning the current three keeps that pressure visible in a
+        diff instead.
+        """
+        for perm in SUBNET_UTILIZATION_PERMISSIONS:
+            with self.subTest(permission=perm):
+                self.assertTrue(
+                    perm in ALLOWED_NON_READ_PERMISSIONS
+                    or perm.rsplit(".", 1)[-1] in READ_PERMISSION_VERBS,
+                    f"{perm} is granted by the module but refused by this test",
+                )
 
 
 class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):

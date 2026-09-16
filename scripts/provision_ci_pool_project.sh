@@ -268,6 +268,13 @@ done
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
+#
+# One role is here by derivation rather than by measurement: `iam.roleAdmin`.
+# The kube-agents-iam module defines a custom role, and `projectIamAdmin` --
+# which is what a runner used to get -- carries no `iam.roles.*` permission, so
+# terraform apply fails PERMISSION_DENIED on a project provisioned without it.
+# A pool project provisioned before that role existed therefore needs a re-run
+# of this script, which is what verify_ci_pool_project.py reports.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow runner access to ${PROJECT_ID}..."
 for role in \
@@ -275,6 +282,7 @@ for role in \
   roles/cloudbuild.builds.viewer \
   roles/container.admin \
   roles/container.developer \
+  roles/iam.roleAdmin \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
   roles/logging.logWriter \

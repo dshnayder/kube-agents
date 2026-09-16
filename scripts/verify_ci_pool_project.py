@@ -206,6 +206,13 @@ PROW_RUNNER_ROLES = {
     "roles/cloudbuild.builds.viewer",
     "roles/container.admin",
     "roles/container.developer",
+    # Derived rather than measured, unlike the rest of this set: the
+    # kube-agents-iam module defines a custom role, and projectIamAdmin below
+    # carries no iam.roles.* permission, so a project without this fails
+    # terraform apply. A project provisioned before the role was added holds
+    # everything else and still cannot run an install -- reporting that is the
+    # point, so it is listed here rather than left to the script alone.
+    "roles/iam.roleAdmin",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
@@ -249,11 +256,28 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
 }
+
+# The one grant that cannot be a literal above: the IAM module
+# defines it as a project-scoped custom role, so its resource name carries the
+# project id and differs on every pool project. `local.read_only_roles` does
+# not list it -- the module creates and binds it alongside whatever
+# `project_roles` it was handed -- which is also why the regex in
+# `PlatformGsaRolesMatchTerraformTest` cannot see it and did not catch the
+# drift: it scans for `"roles/..."` string literals and this is a resource.
+# Left out, every correctly-provisioned project reported "holds 1 role(s)
+# beyond the read-only set" and failed verification.
+PLATFORM_GSA_CUSTOM_ROLE_ID = "kubeagentsSubnetUtilizationReader"
+
+
+def platform_gsa_roles(project_id: str) -> set:
+    """Every role the install grants the platform GSA on `project_id`."""
+    return PLATFORM_GSA_ROLES | {f"projects/{project_id}/roles/{PLATFORM_GSA_CUSTOM_ROLE_ID}"}
 
 
 class CheckResult:
@@ -826,7 +850,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so the Prow runner's twelve roles, "
+            f"Could not read the project IAM policy on {project_id}, so the Prow runner's "
+            f"{len(PROW_RUNNER_ROLES)} roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -875,8 +900,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "will fail on the first gcloud call rather than at registration"
                 )
 
-            platform_missing = PLATFORM_GSA_ROLES - platform_held
-            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            expected_platform = platform_gsa_roles(project_id)
+            platform_missing = expected_platform - platform_held
+            platform_extra = platform_held - expected_platform
             if platform_missing:
                 passed = False
                 details.append(
@@ -2543,6 +2569,13 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
     print("\n" + "-" * 80)
     if not all_passed:
         print(f"PRE-FLIGHT CHECK FAILED. Do NOT register {project_id} in Boskos until the above are resolved.")
+        # An already-registered project can start failing here without anyone
+        # touching it: this script gains an expectation, and every project
+        # provisioned before that gains a gap. The operator reading this is
+        # then holding a list of missing grants and no procedure, so name the
+        # page that carries the repair commands rather than leaving them to
+        # reconstruct it from the check names.
+        print("  Repair commands: docs/site/src/content/docs/deploy/ci-pool-projects.md")
         status = EXIT_FAILED
     elif unverified:
         print(

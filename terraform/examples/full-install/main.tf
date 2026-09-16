@@ -8,10 +8,19 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    # The third read-only telemetry signal. roles/cloudtrace.viewer is granted
+    # in both permission sets, and a role on a disabled API is inert.
+    "cloudtrace.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
     "gkebackup.googleapis.com",
+    # Network Analyzer, which publishes the only per-subnet IP-utilization
+    # figure the fleet audit's subnet-ip-exhaustion check can read: gcloud's
+    # UsableSubnetwork carries no such field on any API version. Without this
+    # the check reports a coverage gap on every run rather than failing, so
+    # the install still works -- it just cannot measure subnet exhaustion.
+    "recommender.googleapis.com",
     "developerknowledge.googleapis.com",
   ]
   pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
@@ -64,6 +73,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",

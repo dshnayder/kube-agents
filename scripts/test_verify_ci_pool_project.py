@@ -2170,7 +2170,7 @@ class IamGrantsTest(unittest.TestCase):
     ):
         """The project's own policy: all three identities holding exactly what they should."""
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
-        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        platform = checker.platform_gsa_roles(project_id) if platform_roles is None else platform_roles
         litellm = checker.LITELLM_GSA_ROLES if litellm_roles is None else litellm_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
         litellm_member = checker.LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
@@ -2481,7 +2481,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
-                    platform_roles=checker.PLATFORM_GSA_ROLES - {"roles/container.viewer"})),
+                    platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") - {"roles/container.viewer"})),
                 _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
@@ -2498,7 +2498,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
-                    platform_roles=checker.PLATFORM_GSA_ROLES | {"roles/container.admin"})),
+                    platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") | {"roles/container.admin"})),
                 _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
@@ -2640,7 +2640,7 @@ class IamGrantsTest(unittest.TestCase):
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
-    Hardcoding the nine roles is what lets this check run without a Terraform
+    Hardcoding the roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
     narrowing the granted set would leave every correctly-provisioned project
     failing verification weeks later, with nothing pointing at Terraform as the
@@ -2677,12 +2677,39 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
         )
         self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
 
+    def test_the_custom_role_the_module_also_binds_is_expected(self):
+        """The two assertions above scan for `"roles/..."` literals, so a grant
+        the module makes as a `google_project_iam_custom_role` resource is
+        invisible to them — which is how it came to be missing from the
+        expected set while every provisioned project held it, and every
+        verification reported "holds 1 role(s) beyond the read-only set".
+
+        Asserted as a join between the two sides rather than against the one
+        role that exists today. Pinning the count instead fails on a second
+        custom role even when it is wired up correctly on both sides, which
+        turns the guard into a reason not to add one; the join fails only when
+        the two sides disagree, which is the drift that produced the bug.
+        """
+        tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf").read_text()
+        role_ids = set(re.findall(r'^\s*role_id\s*=\s*"([^"]+)"', tf, re.M))
+        # Vacuity guard: with no custom role in the module the join below holds
+        # trivially, and this test would go green on the state it exists to catch.
+        self.assertTrue(role_ids, "the module defines no google_project_iam_custom_role")
+        self.assertIn("google_project_iam_member", tf)
+        expected = checker.platform_gsa_roles("kube-agents-evals-3")
+        prefix = "projects/kube-agents-evals-3/roles/"
+        self.assertEqual(
+            {role.removeprefix(prefix) for role in expected - checker.PLATFORM_GSA_ROLES},
+            role_ids,
+            "every custom role the module defines must be in platform_gsa_roles, and vice versa",
+        )
+
 
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
     """PROW_RUNNER_ROLES must equal what the two granting sites grant.
 
-    The twelve are written here, in the provisioning script's loop, and in the
-    repair block on the prerequisites page, and none reads another. Drift is
+    The thirteen are written here, in the provisioning script's loop, and in
+    the repair block on the prerequisites page, and none reads another. Drift is
     silent the worst way round: a role dropped from the script leaves a project
     the verifier still passes, registered, dying on its first lease as #966 did.
     """

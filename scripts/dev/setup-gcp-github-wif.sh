@@ -115,6 +115,13 @@ if [ "$IS_ADMIN" = true ]; then
     # The kube-agents-iam module binds and unbinds project IAM policies
     "roles/resourcemanager.projectIamAdmin"
 
+    # The same module also *defines* a custom role (kubeagentsSubnetUtilizationReader),
+    # which projectIamAdmin cannot do -- it carries no iam.roles.* permission at all, so
+    # apply and destroy both fail PERMISSION_DENIED without this. Not a privilege
+    # increase: projectIamAdmin already holds resourcemanager.projects.setIamPolicy,
+    # with which this principal can grant itself any role including Owner.
+    "roles/iam.roleAdmin"
+
     # The chat-pubsub module manages the Google Chat Pub/Sub topic and subscription
     "roles/pubsub.admin"
 
