@@ -130,6 +130,13 @@ SANDBOX_FORGE = "/opt/data/scripts/forge.py"
 #: the work inside it; this is that plus room for the connection.
 FORWARD_TIMEOUT_S = 90
 
+#: A conversation that does not fit one page. Its own code because it is not a
+#: fault anywhere -- the forge answered, the credential worked, the pull request
+#: is fine -- and an operator reading `REPO_UNREACHABLE` would go looking in the
+#: wrong three places. What it means is that this thread has outgrown what one
+#: verb call can read, and the sweep is holding rather than guessing.
+REASON_CONVERSATION_TRUNCATED = "CONVERSATION_TRUNCATED"
+
 #: The verb never ran: ssh could not connect, or the hop timed out. Its own code
 #: rather than `REPO_UNREACHABLE`, because the two send an operator to different
 #: places — one to the sandbox, one to the forge — and `resolver.py` already
@@ -275,7 +282,7 @@ class ForgeProvider(Protocol):
 
     def post_comment(self, repo: str, pr: PullRequest, body: str) -> None: ...
 
-    def acknowledge(self, repo: str, comment: Comment) -> bool: ...
+    def acknowledge(self, repo: str, pr: PullRequest, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
 
@@ -700,12 +707,30 @@ class BrokerProvider:
         The permission lookups are not part of that read. They are one call per
         distinct author, cached for the tick, and they are what turns a list of
         utterances into a list of utterances the agent may act on.
+
+        **A truncated conversation raises rather than returning short.** This is
+        the one listing where a partial answer is not merely incomplete, it is
+        wrong in the other direction: the caller subtracts the requests it has
+        already answered by finding its own markers in this list, so a marker
+        past the ceiling reads as a request nobody answered. It would file a
+        card, post a duplicate reply to a reviewer who was already answered, and
+        do it again on the next tick, because the reply it just wrote lands past
+        the ceiling too. Refusing puts the pull request in the sweep's
+        `unreadable` list, which names it in an operator warning and leaves the
+        thread alone. Losing an answer is recoverable by hand; a comment loop on
+        somebody else's review is not.
         """
         answer = self._verb(
             "proposal-view",
             {"number": pr.number, "comments": True, "limit": PAGE_SIZE},
             repo,
         )
+        if answer.get("commentsTruncated"):
+            raise ForgeError(
+                REASON_CONVERSATION_TRUNCATED,
+                f"{repo}#{pr.number} has more comments than one page of "
+                f"{PAGE_SIZE} and cannot be read completely",
+            )
         out: list[Comment] = []
         for node in answer.get("comments") or []:
             author = str(node.get("author") or "")
@@ -738,7 +763,7 @@ class BrokerProvider:
         """
         self._verb("proposal-comment", {"number": pr.number, "body": body}, repo)
 
-    def acknowledge(self, repo: str, comment: Comment) -> bool:
+    def acknowledge(self, repo: str, pr: PullRequest, comment: Comment) -> bool:
         """React 👀, returning whether the reaction landed.
 
         Best-effort by contract: the acknowledgement exists so the reviewer
@@ -750,11 +775,23 @@ class BrokerProvider:
         the same two facts, but the pair is what the verb takes, and a `ref`
         split back apart here would be this module re-deriving something it was
         handed.
+
+        The proposal is named too, and the shipped forge does not need it: a
+        GitHub reaction endpoint is keyed on the comment alone. It is in the
+        verb's request shape because a comment id is not everywhere sufficient
+        to locate a comment — the award-emoji route of at least one other forge
+        takes the merge request as well — and a verb whose request depended on
+        which forge answered it would be the abstraction failing at the first
+        thing it was built for. The caller has the proposal in hand, so passing
+        it costs nothing.
         """
         try:
             answer = self._verb(
                 "proposal-acknowledge",
-                {"comment": {"id": comment.numeric_id, "kind": comment.kind}},
+                {
+                    "number": pr.number,
+                    "comment": {"id": comment.numeric_id, "kind": comment.kind},
+                },
                 repo,
             )
         except ForgeError as error:

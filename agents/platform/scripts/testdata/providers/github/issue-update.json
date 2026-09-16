@@ -1,9 +1,7 @@
 {
   "payload": {
     "number": 719,
-    "labelsAdd": [
-      "status:in-progress"
-    ]
+    "labelsAdd": ["status:in-progress"]
   },
   "responses": [
     [

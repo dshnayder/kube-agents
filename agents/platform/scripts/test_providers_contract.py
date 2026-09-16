@@ -280,6 +280,34 @@ class ContractTest(unittest.TestCase):
                         created = [c["created"] for c in answer["comments"]]
                         self.assertEqual(created, sorted(created))
 
+    def test_a_read_conversation_declares_itself_truncated(self):
+        """The one sub-listing, held to the same promise as the listings.
+
+        A conversation read short is worse than a listing read short. The
+        caller that reads one is working out which requests it already
+        answered, by looking for its own markers in the list it got back: a
+        marker past the ceiling is a request that reads as unanswered, and
+        answering it again writes another comment that lands past the ceiling
+        too. `forge.BrokerProvider.list_comments` refuses on this flag, and it
+        can only refuse if every forge sets it.
+        """
+        for name, forge, directory in self.instances():
+            for verb in ("proposal-view", "issue-view"):
+                if verb not in forge.verbs:
+                    continue
+                fixture = self.load(directory, verb)
+                if not fixture["payload"].get("comments"):
+                    continue
+                with self.subTest(forge=name, verb=verb):
+                    full, _ = self.invoke(forge, verb, fixture)
+                    self.assertEqual(full["commentCount"], len(full["comments"]))
+                    self.assertIsInstance(full["commentsTruncated"], bool)
+
+                    payload = dict(fixture["payload"], limit=1)
+                    short, _ = self.invoke(forge, verb, {**fixture, "payload": payload})
+                    self.assertTrue(short["commentsTruncated"])
+                    self.assertGreaterEqual(len(short["comments"]), 1)
+
     # -- what the forge asked for -------------------------------------------
 
     def test_a_forge_composes_a_request_and_not_a_url(self):

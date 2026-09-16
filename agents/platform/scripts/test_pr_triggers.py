@@ -587,14 +587,46 @@ class HandledNodeIdsTest(unittest.TestCase):
         A ref is now `<kind>-<id>` -- the pair `proposal-acknowledge` takes --
         where it used to be the forge's own opaque node id, base64-ish and
         carrying `=`, `+`, `/` and `-`. The charset was not narrowed with the
-        change, on purpose: markers the agent wrote before the migration are on
-        open pull requests right now, and a pattern that stopped matching them
-        would re-answer every in-flight request once.
+        change, on purpose, but be clear about what that buys and what it does
+        not. It does **not** keep an in-flight request closed: an old marker
+        parses to `PRRC_kwDOA_b-c==`, the comment it answered now presents as
+        `review_comment-<id>`, and the sweep's `comment.ref in handled` test
+        compares those two and says no. Every request outstanding at the
+        rollout is answered a second time, once. What it buys is that
+        `refused_refs` still counts old refusals, so the per-pull-request
+        refusal budget carries over rather than resetting to zero -- see the
+        test below, which is the one that would break if the charset narrowed.
         """
         for ref in ("issue-1", "review_comment-987654321", "PRRC_kwDOA_b-c=="):
             with self.subTest(ref=ref):
                 comments = [comment(SELF, pr_triggers.marker(ref))]
                 self.assertEqual(pr_triggers.handled_refs(comments, SELF), {ref})
+
+    def test_an_old_marker_still_counts_against_the_refusal_budget(self):
+        """The thing the permissive charset actually protects.
+
+        A refusal budget that reset at the rollout would let the sweep post
+        another ten public refusals on a pull request it had already refused
+        ten times. Unlike the answered case there is nothing to compare an old
+        ref against here -- refusals are counted, not matched -- so the old
+        spelling parsing is sufficient and the carry-over is real.
+        """
+        comments = [
+            comment(SELF, pr_triggers.marker("PRRC_kwDOA_b-c==", pr_triggers.REFUSED_MARKER)),
+            comment(SELF, pr_triggers.marker("review_comment-5", pr_triggers.REFUSED_MARKER)),
+        ]
+        self.assertEqual(len(pr_triggers.refused_refs(comments, SELF)), 2)
+
+    def test_an_old_answered_marker_does_not_match_the_new_ref(self):
+        """The migration's one-round cost, pinned so it is not rediscovered as a bug.
+
+        This is the assertion the module comment at `MARKER_RE` describes. If
+        it ever starts failing, somebody has built the compatibility read that
+        comment says was declined, and the comment is what needs updating.
+        """
+        comments = [comment(SELF, pr_triggers.marker("PRRC_kwDOA_b-c=="))]
+        handled = pr_triggers.handled_refs(comments, SELF)
+        self.assertNotIn("review_comment-987654321", handled)
 
     def test_whitespace_inside_the_marker_is_tolerated(self):
         comments = [comment(SELF, "<!--   agent-answered : IC_1   -->")]

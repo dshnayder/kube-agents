@@ -88,18 +88,29 @@ class GitHubForge(Forge):
 
     # -- shared by two verbs ------------------------------------------------
 
-    def _comments(self, api: Callable, repo: str, number: int, payload: dict) -> list:
+    def _comments(
+        self, api: Callable, repo: str, number: int, payload: dict
+    ) -> tuple[list, bool]:
         # The conversation tab. For an issue that is the whole discussion; for
         # a proposal it is one of three places -- see `_proposal_comments`.
+        #
+        # The second half of the answer is whether the page filled, and it is
+        # not optional. A truncated conversation looks exactly like a complete
+        # one, and the caller that reads a conversation is deciding which
+        # requests it has already answered: a marker past the ceiling is a
+        # marker it cannot see, so it answers the same request again on every
+        # tick, forever. Saying so is what lets that caller refuse instead.
         limit = validate_limit(payload.get("limit"))
         nodes = api(
             "GET",
             f"repos/{repo}/issues/{number}/comments",
             params={"per_page": limit},
         )
-        return [translate.comment(node, "issue") for node in nodes]
+        return [translate.comment(node, "issue") for node in nodes], len(nodes) >= limit
 
-    def _proposal_comments(self, api: Callable, repo: str, number: int, payload: dict) -> list:
+    def _proposal_comments(
+        self, api: Callable, repo: str, number: int, payload: dict
+    ) -> tuple[list, bool]:
         # GitHub splits one human-visible conversation across three endpoints:
         # the conversation tab, inline review comments on the diff, and the
         # summary body of a review. A reviewer typing "please fix this" has no
@@ -110,25 +121,29 @@ class GitHubForge(Forge):
         # `line` mean anything. Oldest first, across all three.
         limit = validate_limit(payload.get("limit"))
         params = {"per_page": limit}
-        out = self._comments(api, repo, number, payload)
-        out += [
-            translate.comment(node, "review_comment")
-            for node in api("GET", f"repos/{repo}/pulls/{number}/comments", params=params)
-        ]
+        out, truncated = self._comments(api, repo, number, payload)
+        inline = api("GET", f"repos/{repo}/pulls/{number}/comments", params=params)
+        out += [translate.comment(node, "review_comment") for node in inline]
+        reviews = api("GET", f"repos/{repo}/pulls/{number}/reviews", params=params)
         out += [
             translate.comment(node, "review")
-            for node in api("GET", f"repos/{repo}/pulls/{number}/reviews", params=params)
+            for node in reviews
             # A review with no summary body is an approval or a state change,
             # not an utterance.
             if (node.get("body") or "").strip()
         ]
+        # Any one of the three filling its page truncates the conversation, and
+        # the reviews page is judged on what the forge sent rather than on what
+        # survived the body test -- a page of bodiless approvals is still a
+        # page, and there may be an utterance behind it.
+        truncated = truncated or len(inline) >= limit or len(reviews) >= limit
         # `ref` and not `id` as the tie-break: two of these three endpoints
         # number independently, so a conversation comment and a review comment
         # can share an id and the order between them would depend on which of
         # two equal keys the sort happened to see first. `ref` carries the kind
         # as well, so it is unique across the merge and the order is stable.
         out.sort(key=lambda c: (c["created"], c["ref"]))
-        return out
+        return out, truncated
 
     @staticmethod
     def _label_changes(payload: dict) -> tuple[list[str], list[str]]:
@@ -205,7 +220,10 @@ class GitHubForge(Forge):
         node = api("GET", f"repos/{repo}/pulls/{number}")
         result: dict[str, Any] = {"proposal": translate.proposal(node)}
         if payload.get("comments"):
-            result["comments"] = self._proposal_comments(api, repo, number, payload)
+            comments, truncated = self._proposal_comments(api, repo, number, payload)
+            result["comments"] = comments
+            result["commentCount"] = len(comments)
+            result["commentsTruncated"] = truncated
         if payload.get("diff"):
             result["diff"] = api(
                 "GET", f"repos/{repo}/pulls/{number}", raw=DIFF_MEDIA_TYPE
@@ -353,7 +371,10 @@ class GitHubForge(Forge):
             )
         result: dict[str, Any] = {"issue": translate.issue(node)}
         if payload.get("comments"):
-            result["comments"] = self._comments(api, repo, number, payload)
+            comments, truncated = self._comments(api, repo, number, payload)
+            result["comments"] = comments
+            result["commentCount"] = len(comments)
+            result["commentsTruncated"] = truncated
         return result
 
     def issue_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:

@@ -161,7 +161,18 @@ def handle_prepare(args) -> int:
     else:
         cloned = vcs_client.clone(repo, force=args.force)
         base = cloned["branch"]
-        vcs_client.branch(repo, branch)
+        # `branch` reports a failed switch rather than raising on one, and the
+        # JSON below would otherwise name a branch this run is not standing on.
+        # `handle_submit` does catch it -- it refuses when HEAD is somewhere
+        # other than `--branch` -- but that is a turn later, after the agent has
+        # written the whole change into a copy sitting on the base branch. Fail
+        # where the fault is.
+        switched = vcs_client.branch(repo, branch)
+        if switched["exitCode"] != 0:
+            raise vcs_client.VcsError(
+                f"could not take the branch '{branch}': "
+                f"{switched['stderr'] or 'git exited ' + str(switched['exitCode'])}"
+            )
         started_from = base
 
     print(json.dumps({

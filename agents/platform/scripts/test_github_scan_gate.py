@@ -627,7 +627,7 @@ class FakeProvider:
     """
 
     def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=(),
-                 acknowledges=True):
+                 acknowledges=True, fail_reason="REPO_UNREACHABLE"):
         self.prs = prs or []
         self.comments = comments or {}
         # Per repository, the way the real provider answers it. A plain string
@@ -635,6 +635,7 @@ class FakeProvider:
         self._viewer = viewer
         self.acknowledges = acknowledges
         self.fail_on = set(fail_on)
+        self.fail_reason = fail_reason
         self.posted = []
         self.acknowledged = []
         self.viewer_lookups = []
@@ -653,14 +654,14 @@ class FakeProvider:
 
     def list_comments(self, repo, pr):
         if pr.number in self.fail_on:
-            raise forge.ForgeError("REPO_UNREACHABLE", f"#{pr.number}")
+            raise forge.ForgeError(self.fail_reason, f"#{pr.number}")
         return list(self.comments.get(pr.number, []))
 
     def post_comment(self, repo, pr, body):
         self.posted.append((pr.number, body))
 
-    def acknowledge(self, repo, comment):
-        self.acknowledged.append(comment.ref)
+    def acknowledge(self, repo, pr, comment):
+        self.acknowledged.append((pr.number, comment.ref))
         return True
 
 
@@ -790,7 +791,9 @@ class PrCommentsSweepTest(unittest.TestCase):
             prs=[pr], comments={12: [make_comment("IC_1", "/agent bump to 4")]}
         )
         self._sweep(provider)
-        self.assertEqual(provider.acknowledged, ["IC_1"])
+        # The proposal travels with the comment: a comment id alone does not
+        # locate a comment on every forge, so the verb takes both.
+        self.assertEqual(provider.acknowledged, [(12, "IC_1")])
 
     def test_two_triggers_on_one_pr_ride_on_one_card(self):
         """One conversation gets one answer, not one per paragraph."""
@@ -1025,7 +1028,7 @@ class PrCommentsSweepTest(unittest.TestCase):
         provider = FakeProvider(prs=prs, comments=comments)
         result = self._sweep(provider, env={gate.PR_MAX_PER_TICK_ENV: "2"})
         self.assertEqual(len(result.cards), 2)
-        self.assertEqual(provider.acknowledged, ["IC_1", "IC_2"])
+        self.assertEqual(provider.acknowledged, [(1, "IC_1"), (2, "IC_2")])
 
     def test_the_default_cap_is_three(self):
         prs = [make_pr(n) for n in range(1, 6)]
@@ -1238,6 +1241,25 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(len(result.cards), 1)
         self.assertIn("acme/toolkit#12", result.warnings[0])
+
+    def test_the_warning_says_which_kind_of_unreadable(self):
+        """Two faults land here and they send an operator to different places.
+
+        A transport or credential fault clears itself and wants nothing done. A
+        conversation too long to read in one page never clears: the thread has
+        to be split, or the request repeated in a fresh comment. Without the
+        reason both read as "could not read", and the second is waited out
+        forever.
+        """
+        provider = FakeProvider(
+            prs=[make_pr(12)],
+            fail_on=(12,),
+            fail_reason=forge.REASON_CONVERSATION_TRUNCATED,
+        )
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertIn("acme/toolkit#12", result.warnings[0])
+        self.assertIn(forge.REASON_CONVERSATION_TRUNCATED, result.warnings[0])
 
     def test_a_credential_that_cannot_name_itself_is_loud(self):
         """No viewer identity means no way to tell our own PR from anyone else's.

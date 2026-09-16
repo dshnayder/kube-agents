@@ -3,12 +3,8 @@
     "number": 4321,
     "title": "ingest: raise the batch limit (v2)",
     "body": "Second revision.",
-    "labelsAdd": [
-      "agent:audit"
-    ],
-    "labelsRemove": [
-      "needs-rebase"
-    ]
+    "labelsAdd": ["agent:audit"],
+    "labelsRemove": ["needs-rebase"]
   },
   "responses": [
     [

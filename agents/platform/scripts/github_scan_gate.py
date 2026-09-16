@@ -580,7 +580,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     allowed_bots = pr_triggers.bot_allowlist()
     pending: list[_Pending] = []
     refusals: list[_Pending] = []
-    unreadable: list[tuple[str, int]] = []
+    unreadable: list[tuple[str, int, str]] = []
     indeterminate = 0
     # Refusals already on each pull request, so the bound is a total rather than
     # a per-tick allowance that resets every ten minutes.
@@ -593,11 +593,17 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         viewer = provider.viewer_login(repo)
         try:
             comments = provider.list_comments(repo, pr)
-        except forge.ForgeError:
+        except forge.ForgeError as refusal:
             # One pull request that will not load must not blind the sweep for
             # the others. Collected into a single warning below rather than one
             # line each, so a repo-wide outage is one message.
-            unreadable.append((repo, pr.number))
+            #
+            # The reason travels with it because the two that land here send an
+            # operator to different places: a transport or credential fault
+            # clears itself and needs nothing, while a conversation too long to
+            # read in one page never clears and needs the thread split or the
+            # request repeated in a new comment.
+            unreadable.append((repo, pr.number, refusal.reason))
             continue
 
         handled = pr_triggers.handled_refs(comments, viewer)
@@ -637,7 +643,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     if unreadable:
         warnings.append(
             "⚠️ **GitHub PR watcher could not read** "
-            + ", ".join(f"{repo}#{n}" for repo, n in sorted(unreadable))
+            + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
     # Oldest first, so a burst of new comments cannot starve a request that has
@@ -709,7 +715,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             )
         elif provider.supports_acknowledge(item.repo):
             try:
-                provider.acknowledge(item.repo, item.comment)
+                provider.acknowledge(item.repo, item.pr, item.comment)
             except forge.ForgeError:
                 pass
         by_pr[(item.repo, item.pr.number)].append(item)

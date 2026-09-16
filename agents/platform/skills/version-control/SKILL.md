@@ -205,26 +205,48 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 
 ## Reference
 
-| Subcommand         | What it does                                                                                                |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `capabilities`     | What this install can do for this repository's forge, before anything is spent                              |
-| `clone`            | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                   |
-| `log`              | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec |
-| `show`             | One revision, or `revision:path` for a file as of that revision                                             |
-| `diff`             | Differences in the working copy, or against `--revision`                                                    |
-| `annotate`         | Per-line last-change attribution for one path                                                               |
-| `files`            | Tracked paths with the mode the revision records                                                            |
-| `grep`             | Text search over the working copy; `--regex`, `--ignore-case`                                               |
-| `status`           | What the working copy has that its revision does not                                                        |
-| `branch`           | List lines of development, or start one. Local                                                              |
-| `commit`           | Record a revision locally, with a real parent and identifier                                                |
-| `publish`          | Send the revisions made since `clone` to the shared repository                                              |
-| `discard`          | Remove the local copy                                                                                       |
-| `proposal create`  | Open the forge's change proposal (pull request, merge request)                                              |
-| `proposal list`    | Open proposals; `--state open\|closed\|all`                                                                 |
-| `proposal view`    | One proposal; `--comments` for the discussion, `--diff` for the patch                                       |
-| `proposal comment` | Reply on a proposal                                                                                         |
-| `issue list`       | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                            |
-| `issue view`       | One issue; `--comments` for the discussion                                                                  |
-| `issue create`     | Open an issue; `--labels`                                                                                   |
-| `issue comment`    | Reply on an issue                                                                                           |
+| Subcommand             | What it does                                                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `capabilities`         | What this install can do for this repository's forge, before anything is spent                                |
+| `clone`                | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                     |
+| `log`                  | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec   |
+| `show`                 | One revision, or `revision:path` for a file as of that revision                                               |
+| `diff`                 | Differences in the working copy, or against `--revision`                                                      |
+| `annotate`             | Per-line last-change attribution for one path                                                                 |
+| `files`                | Tracked paths with the mode the revision records                                                              |
+| `grep`                 | Text search over the working copy; `--regex`, `--ignore-case`                                                 |
+| `status`               | What the working copy has that its revision does not                                                          |
+| `branch`               | List lines of development, or start one. Local                                                                |
+| `commit`               | Record a revision locally, with a real parent and identifier                                                  |
+| `publish`              | Send the revisions made since `clone` to the shared repository                                                |
+| `discard`              | Remove the local copy                                                                                         |
+| `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                |
+| `proposal list`        | Open proposals; `--state open\|closed\|all`, `--source`/`--target` to ask about one branch                    |
+| `proposal view`        | One proposal; `--comments` for the discussion, `--diff` for the patch                                         |
+| `proposal comment`     | Reply on a proposal                                                                                           |
+| `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                     |
+| `proposal close`       | Close it without merging                                                                                      |
+| `proposal commits`     | The revisions on its source branch, **oldest first** — the last entry is the newest                           |
+| `proposal acknowledge` | React to one comment so its author sees it was read; needs `--comment-id` and `--kind` from `view --comments` |
+| `issue list`           | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                              |
+| `issue view`           | One issue; `--comments` for the discussion                                                                    |
+| `issue create`         | Open an issue; `--labels`                                                                                     |
+| `issue comment`        | Reply on an issue                                                                                             |
+| `issue update`         | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                     |
+| `issue close`          | Close it; `--reason completed\|not-planned`                                                                   |
+| `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                              |
+| `identity`             | Who this install is on this forge; `--login` asks whether that account may write here                         |
+
+Every listing verb takes `-n/--limit` and answers with `count` and `truncated`.
+`truncated` is the forge's word for "there was more", judged on what it sent
+rather than on what survived filtering — so `count: 0` with `truncated: true` is
+a real answer and means ask again, more narrowly.
+
+`proposal view --comments` and `issue view --comments` say the same thing about
+the conversation they read, as `commentCount` and `commentsTruncated`. Take
+`commentsTruncated: true` seriously before you reply to anything: it means you
+are looking at the oldest page of a longer thread, so the most recent word on
+the subject — including an answer somebody already gave — is not in front of
+you. Read the rest with a narrower `-n` and a second look, or say that you could
+not read the whole thread. It is the one truncation where carrying on quietly
+produces a confidently wrong answer rather than an incomplete one.

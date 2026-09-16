@@ -334,6 +334,57 @@ class SandboxForwardingTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "SANDBOX_UNREACHABLE")
         self.assertIn("no route", payload["error"])
 
+    def test_a_hung_hop_times_out_as_an_unreachable_sandbox(self):
+        """A hop that never answers must not read as repositories with no work.
+
+        The caller's own budget does eventually kill this process, but its kill
+        does not reach the ssh child, and a subcommand the model ran from its
+        shell has no outer budget at all.
+        """
+        ran, code = self._main(
+            ["poll"],
+            enabled=True,
+            forwarded={
+                "side_effect": resolver.subprocess.TimeoutExpired(cmd="ssh", timeout=285)
+            },
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(self.stdout)
+        self.assertEqual(payload["reason"], "SANDBOX_UNREACHABLE")
+        self.assertIn("did not answer", payload["error"])
+
+    def test_only_poll_pays_a_configmap_read_to_size_its_budget(self):
+        """`claim` and `transition` name one issue, and are on the model's path.
+
+        The ceiling scales with the fleet because `github_scan_gate`'s does, and
+        only `poll` visits the fleet. Looking the count up for the other two
+        would put a ConfigMap read in front of every card the agent works.
+        """
+        with mock.patch.object(
+            resolver, "get_managed_github_repos", return_value=["a/b", "c/d", "e/f"]
+        ) as looked_up:
+            self.assertEqual(
+                resolver._forward_timeout(["claim", "--issue", "42"]),
+                resolver.FORWARD_TIMEOUT_PER_REPO_S - resolver.FORWARD_TIMEOUT_MARGIN_S,
+            )
+            looked_up.assert_not_called()
+
+            self.assertEqual(
+                resolver._forward_timeout(["poll"]),
+                3 * resolver.FORWARD_TIMEOUT_PER_REPO_S
+                - resolver.FORWARD_TIMEOUT_MARGIN_S,
+            )
+            self.assertEqual(looked_up.call_count, 1)
+
+    def test_an_unreadable_repository_list_does_not_stop_the_forward(self):
+        with mock.patch.object(
+            resolver, "get_managed_github_repos", side_effect=RuntimeError("no kubectl")
+        ):
+            self.assertEqual(
+                resolver._forward_timeout(["poll"]),
+                resolver.FORWARD_TIMEOUT_PER_REPO_S - resolver.FORWARD_TIMEOUT_MARGIN_S,
+            )
+
     def test_a_broker_refusal_leaves_by_the_front_door(self):
         """A refusal is JSON on stdout, carrying the broker's own code.
 

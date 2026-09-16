@@ -123,9 +123,21 @@ REFUSED_MARKER = "agent-refused"
 #: Deliberately permissive about the ref. It is `"{kind}-{id}"` today, but the
 #: alphabet a forge spends on the id half is not something to pin from here, and
 #: over-matching costs nothing: the ref is only ever compared for equality
-#: against one the forge just gave us. The charset also still admits the base64
-#: node ids this scheme used before the refs, so a marker written by an older
-#: build keeps parsing and the request it closed stays closed.
+#: against one the forge just gave us.
+#:
+#: The charset also still admits the base64 node ids this scheme used before the
+#: refs, which keeps an older build's markers *parsing* and does not keep the
+#: requests they closed closed. Parsing puts `IC_kwDOABC123` into the handled
+#: set; the comment being judged now carries `issue-2847263`; the two are not
+#: equal and never will be, because nothing on this side can map one to the
+#: other. So the first tick after the refs land re-answers every request that
+#: was outstanding with an old-style marker on it, exactly once — the reply it
+#: writes carries a ref-shaped marker, which does match. That is the migration's
+#: cost and it is paid in public, on somebody's review thread. It is accepted
+#: rather than fixed because the fix is to carry a forge's own id vocabulary
+#: above the boundary for a release, which is the thing this layer exists not to
+#: do. Matching the old spelling is still worth doing: it keeps `refused_refs`
+#: counting old refusals, so the ten-per-pull-request budget is not reset too.
 MARKER_RE = re.compile(
     r"<!--\s*agent-(answered|refused)\s*:\s*([A-Za-z0-9_=+/\-]+)\s*-->"
 )

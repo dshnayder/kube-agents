@@ -904,6 +904,43 @@ class ListCommentsTest(BrokerCase):
         (c,) = provider.list_comments(REPO, self.pr)
         self.assertTrue(c.is_bot)
 
+    def test_a_truncated_conversation_refuses_rather_than_returning_short(self):
+        """The one listing where a partial answer is wrong, not merely incomplete.
+
+        The caller subtracts the requests it already answered by finding its
+        own markers in this list. A marker past the ceiling reads as a request
+        nobody answered, and the reply it provokes lands past the ceiling too,
+        so the same reviewer is answered again on every tick. Refusing is what
+        turns that into one operator warning.
+        """
+        provider = self.provider(
+            **{
+                "proposal-view": {
+                    "proposal": proposal(),
+                    "comments": [comment("issue-1")],
+                    "commentsTruncated": True,
+                },
+                "identity": {"identity": {"login": VIEWER, "canWrite": True}},
+            }
+        )
+        with self.assertRaises(forge.ForgeError) as caught:
+            provider.list_comments(REPO, self.pr)
+        self.assertEqual(caught.exception.reason, forge.REASON_CONVERSATION_TRUNCATED)
+        self.assertIn(f"{REPO}#12", str(caught.exception))
+
+    def test_a_conversation_that_fits_is_not_refused(self):
+        provider = self.provider(
+            **{
+                "proposal-view": {
+                    "proposal": proposal(),
+                    "comments": [comment("issue-1")],
+                    "commentsTruncated": False,
+                },
+                "identity": {"identity": {"login": VIEWER, "canWrite": True}},
+            }
+        )
+        self.assertEqual(len(provider.list_comments(REPO, self.pr)), 1)
+
 
 class PostCommentTest(BrokerCase):
     def test_the_body_is_a_field_in_the_request(self):
@@ -926,6 +963,8 @@ class PostCommentTest(BrokerCase):
 
 
 class AcknowledgeTest(BrokerCase):
+    PR = forge.PullRequest(number=12, head_ref="platform-agent/x", author=VIEWER)
+
     def _comment(self, kind="issue", numeric_id=5):
         return forge.Comment(
             ref=f"{kind}-{numeric_id}",
@@ -940,15 +979,19 @@ class AcknowledgeTest(BrokerCase):
     def test_the_comment_is_named_by_id_and_kind(self):
         """The pair the verb takes, rather than a `ref` split back apart here."""
         provider = self.provider(**{"proposal-acknowledge": {"acknowledged": True}})
-        self.assertTrue(provider.acknowledge(REPO, self._comment("review_comment", 7)))
-        self.assertEqual(
-            self.broker.one("proposal-acknowledge")["comment"],
-            {"id": 7, "kind": "review_comment"},
+        self.assertTrue(
+            provider.acknowledge(REPO, self.PR, self._comment("review_comment", 7))
         )
+        sent = self.broker.one("proposal-acknowledge")
+        self.assertEqual(sent["comment"], {"id": 7, "kind": "review_comment"})
+        # The shipped forge does not read it. It is sent because a comment id
+        # is not everywhere sufficient to locate a comment, and a request shape
+        # that depended on which forge answered would defeat the point.
+        self.assertEqual(sent["number"], 12)
 
     def test_a_kind_with_nowhere_to_react_is_a_false_the_broker_answers(self):
         provider = self.provider(**{"proposal-acknowledge": {"acknowledged": False}})
-        self.assertFalse(provider.acknowledge(REPO, self._comment("review", 9)))
+        self.assertFalse(provider.acknowledge(REPO, self.PR, self._comment("review", 9)))
 
     def test_a_failed_reaction_never_blocks_the_answer(self):
         """Best-effort by contract: the 👀 exists so the reviewer sees something inside the tick."""
@@ -957,7 +1000,7 @@ class AcknowledgeTest(BrokerCase):
         )
         provider = forge.provider_for()
         with self.assertLogs(forge.LOGGER, logging.INFO) as logs:
-            self.assertFalse(provider.acknowledge(REPO, self._comment()))
+            self.assertFalse(provider.acknowledge(REPO, self.PR, self._comment()))
         self.assertIn("issue-5", "\n".join(logs.output))
 
 

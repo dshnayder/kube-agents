@@ -17,6 +17,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -45,6 +46,35 @@ SCRATCH_DIR = "/opt/data/scratch"
 # $HERMES_HOME, which is /opt/data there. Same arrangement, and named for the
 # same reason, as `github_token_refresh.SANDBOX_REFRESH_SCRIPT`.
 SANDBOX_RESOLVER = "/opt/data/skills/github-issue-resolver/scripts/resolver.py"
+
+# Bounds the ssh hop around a forwarded subcommand, and it is deliberately the
+# caller's own budget rather than a number of this file's choosing.
+# `github_scan_gate` allows a poll `RESOLVER_TIMEOUT_S` per managed repository,
+# because the work scales with them; a fixed ceiling here would either sit above
+# that and never fire, or below it and kill a legitimate poll of a fleet with
+# several repositories in it. The margin is what makes this one fire first, so a
+# hung hop is reported as `SANDBOX_UNREACHABLE` rather than killed from outside
+# -- an outer kill reaches this process and orphans the ssh child.
+FORWARD_TIMEOUT_PER_REPO_S = 300
+FORWARD_TIMEOUT_MARGIN_S = 15
+
+
+def _forward_timeout(argv) -> int:
+    """Seconds to allow the forwarded subcommand, sized like the caller's budget.
+
+    Only `poll` scales with the fleet -- it is the one subcommand that visits
+    every managed repository, and it is the one `github_scan_gate` budgets per
+    repository. `claim` and `transition` name a single issue, so they get the
+    one-repository ceiling and do not pay a ConfigMap read to find that out.
+    That read is not free and it is on the model's path for those two.
+    """
+    repos = 1
+    if argv and argv[0] == "poll":
+        try:
+            repos = max(1, len(get_managed_github_repos()))
+        except Exception:
+            repos = 1
+    return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
 
 IN_PROGRESS = "status:in-progress"
 ESCALATION_NEEDED = "status:escalation-needed"
@@ -153,8 +183,22 @@ def _forward_to_sandbox(argv: list) -> int:
 
     The forwarded process cannot forward again. `sandbox_enabled()` reads the
     agent pod's managed Hermes config, and the sandbox image does not carry it.
+
+    The hop is bounded, which it was not when every `gh` call crossed
+    separately. See `_forward_timeout` for why the ceiling is the caller's
+    arithmetic and not a constant. A hop that hits it is `SANDBOX_UNREACHABLE`,
+    the same answer a refused connection gives, because the two mean the same
+    thing to the poll: it has not learned that the repositories are quiet.
     """
-    completed = sandbox_exec.run(["python3", SANDBOX_RESOLVER] + list(argv))
+    timeout = _forward_timeout(list(argv))
+    try:
+        completed = sandbox_exec.run(
+            ["python3", SANDBOX_RESOLVER] + list(argv), timeout=timeout
+        )
+    except subprocess.TimeoutExpired as expired:
+        raise sandbox_exec.SandboxUnavailable(
+            f"the sandbox did not answer within {timeout}s"
+        ) from expired
     if completed.stdout:
         sys.stdout.write(completed.stdout)
     if completed.stderr:
