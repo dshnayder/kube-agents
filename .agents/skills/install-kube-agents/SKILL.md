@@ -147,7 +147,8 @@ A refusal is not a failure to route around: a `REFUSED_*` status with an unchang
 installer doing its job. Report it, relay the options above, and pass a flag only when the operator
 has chosen. When they choose `--accept-no-network-policy` and an `install.env` already exists, tell
 them to add `ACCEPT_NO_NETWORK_POLICY=true` to it (the installer prints the same instruction): the
-next `upgrade.sh` regenerates from that file and is refused without the key.
+next `upgrade.sh` regenerates from that file and is refused without the key. When they later
+confine the cluster, tell them to remove the key again; the installer warns while it lingers.
 
 ## Source verification
 
@@ -188,8 +189,11 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
 ```
 
 The full report also carries `gvisor_enabled`, `memory_mode`, and `network_policy_enforcement`. A
-report written before the interview decided them (a run that failed early) says so: `gvisor_enabled`
-is `null` and the other two are empty, rather than restating a default the run never applied.
+report written before the run decided them says so: `gvisor_enabled` is `null` before the interview,
+and the other two are empty, rather than restating a default the run never applied. For
+`network_policy_enforcement` that covers a run that failed early and also `--dry-run`, which never
+reaches the cluster step, and a `--generate-only` run under `--enable-network-policy`, which has
+not enabled anything yet.
 `network_policy_enforcement` is `enforced` (Dataplane V2 or Calico, or a cluster this run created),
 `enabled-by-install` (this run turned Calico on, under `--enable-network-policy`), or
 `absent-accepted` (installed without enforcement, under `--accept-no-network-policy`); the last is

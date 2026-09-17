@@ -86,8 +86,12 @@ The choice has to survive the run. `install.sh` writes `ACCEPT_NO_NETWORK_POLICY
 `install.env` it creates; if you already had one, add the key yourself, as the installer tells you
 to. `upgrade.sh` and the Day-2 menu regenerate `terraform.tfvars` from that file, and without the
 key the next apply is refused for the enforcement you already accepted. To confine the agent later,
-enable Dataplane V2 or the Calico addon on the cluster and re-run the installer; the annotation
-goes away on its own.
+enable Dataplane V2 or the Calico addon on the cluster (or re-run with `--enable-network-policy`,
+which overrides the recorded key for that run), then remove `ACCEPT_NO_NETWORK_POLICY` from
+`install.env`: the installer warns while the line remains, because it keeps every later apply
+waiving the check that would refuse the install if enforcement were lost again. The annotation
+goes away on its own. The installer records the key only when the cluster enforced nothing at the
+time and the run accepted that; the flag against a cluster that already enforces records nothing.
 
 Both `--accept-no-network-policy` and `--enable-network-policy` are decisions for whoever owns the
 cluster. An agent installing on your behalf is told to present the three options and ask, not to

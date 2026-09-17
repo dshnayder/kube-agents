@@ -2226,7 +2226,7 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
     `clusters update` calls is the behaviour under test.
     """
 
-    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING", accept=False):
+    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING", accept=False, preset=""):
         """Run the function against a stub gcloud that records every call.
 
         Returns (CompletedProcess, [argv-strings in call order]). The stub
@@ -2255,6 +2255,8 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
             )
             if accept:
                 opt_in_line += 'PARAM_ACCEPT_NO_NETWORK_POLICY="true"\n'
+            if preset:
+                opt_in_line += f'NETWORK_POLICY_ENFORCEMENT="{preset}"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
@@ -2310,6 +2312,17 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         self.assertIn("WITHOUT NetworkPolicy enforcement", out)
         self.assertIn("shell sandbox", out)
         self.assertIn("kubeagents.x-k8s.io/network-policy-enforcement", out)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_the_consequences_are_stated_once_per_run(self):
+        # The preflight already printed them when it recorded the decision; the
+        # pre-apply step then says only that it is proceeding as accepted.
+        proc, calls = self._run(opt_in=False, accept=True, preset="absent-accepted")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self._updates(calls), [])
+        out = proc.stderr + proc.stdout
+        self.assertIn("as accepted above", out)
+        self.assertNotIn("enforced by nothing", out)
         self.assertIn("RECORDED=absent-accepted", proc.stdout)
 
     def test_enforcement_the_install_enabled_is_recorded(self):
@@ -3100,16 +3113,21 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
             _INSTALL_SH.read_text(),
         )
 
-    def _note(self, env_contents, accept):
-        """Run note_unrecorded_network_policy_acceptance against a file with the given contents."""
+    def _note(self, env_contents, decision, func="note_unrecorded_network_policy_acceptance"):
+        """Run one of the install.env notes against a file with the given contents.
+
+        `decision` is the value NETWORK_POLICY_ENFORCEMENT holds by then: the
+        notes key off what the run decided, not off the flag, so that a flag
+        passed against a cluster that already enforces records nothing.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text(env_contents)
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
-                f"export ACCEPT_NO_NETWORK_POLICY={accept}\n"
-                f'note_unrecorded_network_policy_acceptance "{env_file}"\n'
+                f'NETWORK_POLICY_ENFORCEMENT="{decision}"\n'
+                f'{func} "{env_file}"\n'
             )
             # PARAM_NON_INTERACTIVE and no TTY: the agent-driven shape, which
             # is where the interview-answer warning deliberately stays silent.
@@ -3123,24 +3141,90 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
 
     def test_an_unrecorded_acceptance_is_reported_without_a_tty(self):
         """A pre-existing install.env without the key gets the warning, not silence."""
-        proc = self._note("PROJECT_ID=p\n", "true")
+        proc = self._note("PROJECT_ID=p\n", "absent-accepted")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
 
     def test_an_acceptance_the_file_records_as_false_is_reported(self):
-        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "true")
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "absent-accepted")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
 
     def test_a_recorded_acceptance_is_not_nagged(self):
-        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "true")
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "absent-accepted")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertNotIn("Add ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
 
-    def test_a_run_that_did_not_accept_is_not_nagged(self):
-        proc = self._note("PROJECT_ID=p\n", "false")
-        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        self.assertNotIn("ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
+    def test_a_flag_against_an_enforcing_cluster_records_nothing(self):
+        # The decision, not the flag: enforced means nothing was accepted, so
+        # the file is not asked to carry a standing waiver of the module's check.
+        for decision in ("enforced", "enabled-by-install", ""):
+            proc = self._note("PROJECT_ID=p\n", decision)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout, decision)
+
+    def test_a_stale_recorded_acceptance_is_reported_once_the_cluster_enforces(self):
+        # The converse note, so the key retires: confined later, the file still
+        # says accepted, and every later upgrade would waive the postcondition.
+        for decision in ("enforced", "enabled-by-install"):
+            proc = self._note(
+                "PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", decision,
+                func="note_stale_network_policy_acceptance",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("records ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout, decision)
+            self.assertIn("Remove that line", proc.stderr + proc.stdout, decision)
+
+    def test_the_stale_note_stays_quiet_while_the_acceptance_holds(self):
+        for contents, decision in (
+            ("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "absent-accepted"),
+            ("PROJECT_ID=p\n", "enforced"),
+            ("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "enforced"),
+        ):
+            proc = self._note(contents, decision, func="note_stale_network_policy_acceptance")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("Remove that line", proc.stderr + proc.stdout, (contents, decision))
+
+    def test_the_stale_note_runs_after_the_preflight_and_after_calico_goes_on(self):
+        text = _INSTALL_SH.read_text()
+        first = text.index('note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"')
+        second = text.index('note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"', first + 1)
+        self.assertLess(text.index('check_existing_cluster_network_policy_preflight "$project_id"'), first)
+        self.assertLess(text.index('ensure_existing_cluster_network_policy "$project_id"'), second)
+
+    def test_install_env_bootstrap_records_the_decision_not_the_flag(self):
+        """A fresh install.env carries the key only when enforcement was absent and accepted."""
+        for decision, expected in (("absent-accepted", True), ("enforced", False), ("", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                dest = pathlib.Path(tmp) / "install.env"
+                body = (
+                    f'source "{_INSTALLER_COMMON}"\n'
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                    'PARAM_DRY_RUN="false"\n'
+                    "export ACCEPT_NO_NETWORK_POLICY=true\n"
+                    f'NETWORK_POLICY_ENFORCEMENT="{decision}"\n'
+                    f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+                )
+                empty = pathlib.Path(tmp) / "loaded.env"
+                empty.write_text("")
+                proc = subprocess.run(
+                    ["bash", "-c", body],
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}),
+                    cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+                self.assertEqual(
+                    "ACCEPT_NO_NETWORK_POLICY=true" in dest.read_text(), expected, (decision, dest.read_text())
+                )
+
+    def test_the_decision_is_settled_from_the_probe_before_the_bootstrap(self):
+        text = _INSTALL_SH.read_text()
+        probe = text.index('is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?')
+        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), probe)
+        self.assertLess(probe, text.index(self._BOOTSTRAP_CALL))
 
     def test_the_note_runs_when_install_env_already_exists(self):
         text = _INSTALL_SH.read_text()

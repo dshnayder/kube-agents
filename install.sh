@@ -66,6 +66,8 @@ readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
 # The report field's key, and the value in the report until a run has decided.
 readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
+# Whether note_stale_network_policy_acceptance has spoken this run.
+NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -1140,12 +1142,38 @@ warn_unrecorded_interview_answers() {
 note_unrecorded_network_policy_acceptance() {
   local file="${1:-}"
   [ -n "$file" ] && [ -f "$file" ] || return 0
-  is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}" || return 0
+  # The decision, not the flag: a flag passed against a cluster that already
+  # enforces accepted nothing, and recording it would waive the module's check
+  # for the life of the install.
+  [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ] || return 0
   local recorded
   recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
   ! is_truthy "${recorded:-false}" || return 0
   print_warning "This run installs without NetworkPolicy enforcement, and ${file} does not record it."
   print_info "Add ACCEPT_NO_NETWORK_POLICY=true to ${file}. upgrade.sh and the Day-2 menu regenerate from the file, and without the key the next apply is refused for the enforcement this install accepted."
+}
+
+# The converse, so the key retires: a file that still records
+# ACCEPT_NO_NETWORK_POLICY=true once the cluster enforces -- confined later
+# with --enable-network-policy, moved to Dataplane V2, or a created cluster
+# under a copied install.env -- keeps every later upgrade.sh and Day-2 apply
+# emitting accept_no_network_policy = true, and the module's postcondition,
+# the one guard against policies going silently inert again, never fires for
+# that install. Nothing rewrites install.env, so the operator is told once.
+note_stale_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ "$NETWORK_POLICY_STALE_ACCEPTANCE_NOTED" != "true" ] || return 0
+  case "${NETWORK_POLICY_ENFORCEMENT:-}" in
+    "$NP_ENFORCEMENT_ENFORCED" | "$NP_ENFORCEMENT_ENABLED_BY_INSTALL") ;;
+    *) return 0 ;;
+  esac
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  is_truthy "${recorded:-false}" || return 0
+  NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="true"
+  print_warning "${file} records ACCEPT_NO_NETWORK_POLICY=true, but cluster '${CLUSTER_NAME:-}' enforces NetworkPolicy now."
+  print_info "Remove that line. While it stays, every later upgrade.sh and Day-2 apply waives the check that would refuse this install if enforcement were ever lost again."
 }
 
 bootstrap_install_env_file() {
@@ -1217,11 +1245,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  # Recorded only when this run accepted it. The key is a standing decision
-  # about this cluster, and every later generator run -- upgrade.sh, the Day-2
-  # menu -- must carry it, or it emits accept_no_network_policy = false and the
-  # module refuses the plan this install already passed.
-  if is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
+  # Recorded only when this run accepted it -- the decision, not the flag: a
+  # flag passed against a cluster that already enforces accepted nothing. The
+  # key is a standing decision about this cluster, and every later generator
+  # run -- upgrade.sh, the Day-2 menu -- must carry it, or it emits
+  # accept_no_network_policy = false and the module refuses the plan this
+  # install already passed.
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
     write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"
   fi
 
@@ -2088,11 +2118,20 @@ print_generate_only_handoff() {
   echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
   echo ""
   echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
-  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Nothing to run: this run accepted installing without enforcement, and the generated"
+    echo -e "    # terraform.tfvars carries accept_no_network_policy = true. Every NetworkPolicy kube-agents"
+    echo -e "    # ships will be inert, the agent sandbox's included. To enforce instead, run the two commands"
+    echo -e "    # below and set accept_no_network_policy = false (ACCEPT_NO_NETWORK_POLICY in install.env)."
+  else
+    echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  fi
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
-  echo -e "    # Or leave the cluster as it is: accept_no_network_policy = true in terraform.tfvars (what --accept-no-network-policy"
-  echo -e "    # writes) installs without enforcement; every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included."
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Or leave the cluster as it is: accept_no_network_policy = true in terraform.tfvars (what --accept-no-network-policy"
+    echo -e "    # writes) installs without enforcement; every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included."
+  fi
   echo ""
   echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
   echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
@@ -2540,7 +2579,13 @@ ensure_existing_cluster_network_policy() {
   fi
 
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
-    print_no_network_policy_consequences "$cluster_name"
+    # Once per run: the preflight already said this when it recorded the
+    # decision, and a real run reaches here a few lines of output later.
+    if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+      print_no_network_policy_consequences "$cluster_name"
+    else
+      print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
+    fi
     NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     return 0
   fi
@@ -2778,7 +2823,7 @@ validate_existing_cluster_opt_in_flags() {
   # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy.
   if [ "${PARAM_ENABLE_NETWORK_POLICY:-}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" = "true" ]; then
     if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
-      print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run."
+      print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
       PARAM_ACCEPT_NO_NETWORK_POLICY="false"
     elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
       print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
@@ -4532,6 +4577,17 @@ main() {
       KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
         write_tfvars_from_state "$tfvars_file" "$image_tag"
     fi
+    # What install.env records is the decision, and the decision needs the
+    # probe: the flag against a cluster that already enforces accepted
+    # nothing. The preflight below reaches the same answer and prints it; this
+    # only settles it before the bootstrap writes the file.
+    if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      local np_probe=0
+      is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
+      if [ "$np_probe" -eq 1 ]; then
+        NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+      fi
+    fi
   fi
 
   # Written once, and only when there is nothing there. The probed cluster
@@ -4669,6 +4725,7 @@ main() {
   # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
   check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
   check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
 
   if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
@@ -4714,6 +4771,9 @@ main() {
   # halts before permanent control-plane modifications (Workload Identity, CMEK).
   if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
     ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+    # Calico just went on under --enable-network-policy: a recorded acceptance
+    # is stale from here.
+    note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
     ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
     ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
   fi
