@@ -2250,6 +2250,8 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             opt_in_line = (
                 'PARAM_ENABLE_NETWORK_POLICY="true"\n' if opt_in else ""
             )
@@ -2268,7 +2270,7 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT),
             )
             calls = log.read_text().splitlines() if log.exists() else []
@@ -2303,25 +2305,15 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         self.assertIn("--accept-no-network-policy", proc.stderr + proc.stdout)
 
     def test_accepted_absence_leaves_the_cluster_alone_and_is_recorded(self):
-        # The third branch: no clusters update at all, exit 0, and the choice
-        # recorded where write_json_report reads it, with the cost stated.
+        # The third branch: no clusters update at all, exit 0, the decision
+        # recorded where write_json_report reads it, and one line saying it is
+        # proceeding as accepted -- the consequences were stated at the
+        # preflight, which is the only way a run reaches this step accepted.
         proc, calls = self._run(opt_in=False, accept=True)
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertEqual(self._updates(calls), [])
         out = proc.stderr + proc.stdout
-        self.assertIn("WITHOUT NetworkPolicy enforcement", out)
-        self.assertIn("shell sandbox", out)
-        self.assertIn("kubeagents.x-k8s.io/network-policy-enforcement", out)
-        self.assertIn("RECORDED=absent-accepted", proc.stdout)
-
-    def test_the_consequences_are_stated_once_per_run(self):
-        # The preflight already printed them when it recorded the decision; the
-        # pre-apply step then says only that it is proceeding as accepted.
-        proc, calls = self._run(opt_in=False, accept=True, preset="absent-accepted")
-        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        self.assertEqual(self._updates(calls), [])
-        out = proc.stderr + proc.stdout
-        self.assertIn("as accepted above", out)
+        self.assertIn("WITHOUT NetworkPolicy enforcement, as accepted above", out)
         self.assertNotIn("enforced by nothing", out)
         self.assertIn("RECORDED=absent-accepted", proc.stdout)
 
@@ -2329,49 +2321,6 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         proc, _ = self._run(opt_in=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RECORDED=enabled-by-install", proc.stdout)
-
-    def test_the_pre_apply_step_prompts_when_no_answer_arrived(self):
-        # The fallback gate inside the pre-apply step: with neither flag nor
-        # install.env answer and a controlling TTY, it asks rather than
-        # refuses. A real run answers earlier, in prompt_existing_cluster_opt_ins
-        # (InteractiveNetworkPolicyPromptTest drives that path); this covers the
-        # function called on its own. Stubbing the TTY probe and prompt_read
-        # stands in for a terminal.
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_dir = pathlib.Path(tmp) / "bin"
-            bin_dir.mkdir()
-            gcloud = bin_dir / "gcloud"
-            gcloud.write_text(
-                "#!/usr/bin/env bash\n"
-                'case "$*" in\n'
-                "  *datapathProvider,networkPolicy.enabled*) printf 'RUNNING,,False\\n' ;;\n"
-                "esac\n"
-                "exit 0\n"
-            )
-            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
-            body = (
-                f'source "{_INSTALLER_COMMON}"\n'
-                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
-                'PARAM_NON_INTERACTIVE="false"\n'
-                "has_controlling_tty() { return 0; }\n"
-                'prompt_read() { echo "PROMPTED: $1"; printf -v "$2" "%s" "a"; }\n'
-                "ensure_existing_cluster_network_policy proj cluster region; echo \"rc=$?\"\n"
-                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
-            )
-            empty_env = pathlib.Path(tmp) / "install.env"
-            empty_env.write_text("")
-            proc = subprocess.run(
-                ["bash", "-c", body],
-                capture_output=True,
-                text=True,
-                env=get_isolated_test_env(
-                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
-                ),
-                cwd=str(_REPO_ROOT),
-            )
-        self.assertIn("PROMPTED: Choose (e/a/N)", proc.stdout, proc.stderr)
-        self.assertIn("rc=0", proc.stdout)
-        self.assertIn("RECORDED=absent-accepted", proc.stdout)
 
     def test_accepting_on_a_cluster_that_enforces_changes_nothing(self):
         # accept is inert where there is nothing to accept: Dataplane V2 is
@@ -2943,7 +2892,9 @@ class CheckExistingClusterNodePoolsPreflightTest(unittest.TestCase):
 class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
     """check_existing_cluster_network_policy_preflight tests."""
 
-    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING", accept=""):
+    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING", accept="", install_env=None):
+        """`install_env`, when given, is the contents of a pre-existing install.env
+        the run points INSTALL_ENV_FILE at; None means no file."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -2958,9 +2909,15 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             opt_in_line = f'PARAM_ENABLE_NETWORK_POLICY="{opt_in}"\n' if opt_in else ""
             if accept:
                 opt_in_line += f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n'
+            if install_env is not None:
+                existing = pathlib.Path(tmp) / "existing.env"
+                existing.write_text(install_env)
+                opt_in_line += f'INSTALL_ENV_FILE="{existing}"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
@@ -2973,7 +2930,7 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -3003,6 +2960,18 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
         self.assertIn("WITHOUT NetworkPolicy enforcement", out)
         self.assertIn("The cluster is not modified", out)
         self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_the_preflight_repeats_the_unrecorded_key_note(self):
+        # The settle step and the preflight each describe the cluster once. If
+        # the first failed and this one succeeds, install.env was just written
+        # without the key; the preflight asks the note again so the run says so.
+        proc = self._run(dp="", legacy_np="False", accept="true", install_env="PROJECT_ID=p\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+        proc = self._run(dp="", legacy_np="False", accept="true", install_env="ACCEPT_NO_NETWORK_POLICY=true\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("Add ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
 
     def test_acceptance_is_inert_where_enforcement_exists(self):
         proc = self._run(dp="ADVANCED_DATAPATH", legacy_np="False", accept="true")
@@ -3251,14 +3220,6 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
     _BOOTSTRAP_CALL = 'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"'
     _SETTLE_CALL = 'settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"'
 
-    def test_the_prompt_runs_before_install_env_is_written(self):
-        text = _INSTALL_SH.read_text()
-        self.assertLess(
-            text.index(self._OPT_IN_PROMPT_CALL),
-            text.index(self._BOOTSTRAP_CALL),
-            "an answer given at the existing-cluster prompt must reach the install.env bootstrap",
-        )
-
     def test_the_answer_is_settled_between_the_prompt_and_the_bootstrap(self):
         """settle_network_policy_acceptance (behaviour: SettleNetworkPolicyAcceptanceTest)
         has to run after the prompt that can produce the answer and before the
@@ -3452,6 +3413,8 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             accept_line = f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n' if accept else ""
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
@@ -3463,7 +3426,7 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT),
             )
 

@@ -2568,24 +2568,12 @@ ensure_existing_cluster_network_policy() {
     return 0
   fi
 
-  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ] && \
-     [ -z "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-}}" ]; then
-    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
-      PARAM_ENABLE_NETWORK_POLICY="false"
-      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
-    else
-      prompt_network_policy_choice "$cluster_name"
-    fi
-  fi
-
+  # No prompt here: by the time a run reaches this step the answer was given,
+  # at prompt_existing_cluster_opt_ins or by a flag, and the preflight has
+  # refused a run that has neither. The consequences were stated there too;
+  # this step only says it is proceeding as accepted.
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
-    # Once per run: the preflight already said this when it recorded the
-    # decision, and a real run reaches here a few lines of output later.
-    if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
-      print_no_network_policy_consequences "$cluster_name"
-    else
-      print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
-    fi
+    print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
     NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     return 0
   fi
@@ -2811,6 +2799,11 @@ check_existing_cluster_network_policy_preflight() {
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
     print_no_network_policy_consequences "$cluster_name"
     NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    # The settle step and this preflight each describe the cluster once. If
+    # the first describe failed and this one succeeded, install.env was just
+    # written without the key and nobody said so; the note reads the decision
+    # and the file, so asking it again here closes that gap.
+    note_unrecorded_network_policy_acceptance "$INSTALL_ENV_FILE"
     return 0
   fi
 
