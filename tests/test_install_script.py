@@ -1141,6 +1141,56 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc2.returncode, 0, proc2.stderr)
         self.assertIn("NP=false", proc2.stdout)
 
+    def test_parse_args_accept_no_network_policy(self):
+        cmd = 'parse_args --accept-no-network-policy; echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("A=true", proc.stdout)
+
+        cmd2 = 'parse_args --accept-no-network-policy=false; echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc2 = self._run_install_func(cmd2)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertIn("A=false", proc2.stdout)
+
+    def test_validate_existing_cluster_opt_in_flags_rejects_both_network_policy_answers(self):
+        # Enable Calico and record that it was not enabled: two answers to one
+        # question, refused before the cluster is read.
+        cmd = 'parse_args --enable-network-policy --accept-no-network-policy; validate_existing_cluster_opt_in_flags'
+        proc = self._run_install_func(cmd)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("two answers to one question", proc.stderr + proc.stdout)
+
+        cmd2 = 'parse_args --accept-no-network-policy=maybe; validate_existing_cluster_opt_in_flags'
+        proc2 = self._run_install_func(cmd2)
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertIn("--accept-no-network-policy must be either true or false.", proc2.stderr + proc2.stdout)
+
+        cmd3 = 'parse_args --accept-no-network-policy --enable-network-policy=false; validate_existing_cluster_opt_in_flags'
+        proc3 = self._run_install_func(cmd3)
+        self.assertEqual(proc3.returncode, 0, proc3.stderr + proc3.stdout)
+
+    def test_a_flag_overrides_the_recorded_network_policy_answer_for_one_run(self):
+        # The "confine it later" path: an install that recorded
+        # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy
+        # passed one flag and is not told it passed two.
+        cmd = 'parse_args --enable-network-policy; validate_existing_cluster_opt_in_flags; echo "E=$PARAM_ENABLE_NETWORK_POLICY A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd, env={"ACCEPT_NO_NETWORK_POLICY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("E=true A=false", proc.stdout)
+        self.assertIn("overrides the ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+        cmd = 'parse_args --accept-no-network-policy; validate_existing_cluster_opt_in_flags; echo "E=$PARAM_ENABLE_NETWORK_POLICY A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd, env={"ENABLE_NETWORK_POLICY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("E=false A=true", proc.stdout)
+
+        # Both recorded, neither passed: nothing to prefer, so it is refused and
+        # the message names the file as a source.
+        cmd = 'validate_existing_cluster_opt_in_flags'
+        proc = self._run_install_func(cmd, env={"ENABLE_NETWORK_POLICY": "true", "ACCEPT_NO_NETWORK_POLICY": "true"})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("install.env", proc.stderr + proc.stdout)
+
     def test_validate_existing_cluster_opt_in_flags_rejects_typos(self):
         cmd = 'parse_args --enable-network-policy=ture; validate_existing_cluster_opt_in_flags'
         proc = self._run_install_func(cmd)
@@ -1749,6 +1799,27 @@ cat /tmp/kube-agents-install-report.json
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
 
+    def test_write_json_report_records_network_policy_enforcement(self):
+        """The choice to install without enforcement outlives the terminal (#1682)."""
+        cmd = """
+PARAM_DRY_RUN="false"
+PARAM_GENERATE_ONLY="false"
+PARAM_NON_INTERACTIVE="true"
+INSTALL_ENV_FILE="/tmp/install.env"
+NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+write_json_report "SUCCESS" >/dev/null
+cat /tmp/kube-agents-install-report.json
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"network_policy_enforcement": "absent-accepted"', proc.stdout)
+
+        # Before a run has decided, the field is present and empty rather than
+        # restating a default the run never applied.
+        proc = self._run_install_func(cmd.replace('NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"\n', ""))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"network_policy_enforcement": ""', proc.stdout)
+
 
 class InstallEnvInputTest(unittest.TestCase):
     """install.env is an input, loaded before the parameter block.
@@ -2120,6 +2191,16 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("N=true", proc.stdout)
 
+    def test_accept_no_network_policy_inherits_from_install_env(self):
+        # A standing decision about the cluster: a re-run that omits the flag
+        # must not turn the accepted install back into a refusal.
+        proc = self._params(
+            "ACCEPT_NO_NETWORK_POLICY=true\n",
+            'echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("A=true", proc.stdout)
+
 
 class SecretManagerAutoDiscoveryQuietTest(unittest.TestCase):
     """Verifies gcloud secrets versions access passes --quiet to avoid hangs."""
@@ -2145,12 +2226,13 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
     `clusters update` calls is the behaviour under test.
     """
 
-    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING"):
+    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING", accept=False):
         """Run the function against a stub gcloud that records every call.
 
         Returns (CompletedProcess, [argv-strings in call order]). The stub
         answers `clusters describe` on the --format it is given: an empty
-        string stands for a field gcloud did not print.
+        string stands for a field gcloud did not print. `accept` stands for
+        --accept-no-network-policy, the answer that leaves the cluster alone.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -2171,11 +2253,14 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
             opt_in_line = (
                 'PARAM_ENABLE_NETWORK_POLICY="true"\n' if opt_in else ""
             )
+            if accept:
+                opt_in_line += 'PARAM_ACCEPT_NO_NETWORK_POLICY="true"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f"{opt_in_line}"
                 "ensure_existing_cluster_network_policy proj cluster region\n"
+                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
             proc = subprocess.run(
                 ["bash", "-c", body],
@@ -2211,6 +2296,70 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
         self.assertEqual(self._updates(calls), [])
         self.assertIn("Explicit opt-in was not provided", proc.stderr + proc.stdout)
+        # The refusal names both ways forward; naming only the mutating one is
+        # how an agent came to read it as the instruction (#1682).
+        self.assertIn("--accept-no-network-policy", proc.stderr + proc.stdout)
+
+    def test_accepted_absence_leaves_the_cluster_alone_and_is_recorded(self):
+        # The third branch: no clusters update at all, exit 0, and the choice
+        # recorded where write_json_report reads it, with the cost stated.
+        proc, calls = self._run(opt_in=False, accept=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self._updates(calls), [])
+        out = proc.stderr + proc.stdout
+        self.assertIn("WITHOUT NetworkPolicy enforcement", out)
+        self.assertIn("shell sandbox", out)
+        self.assertIn("kubeagents.x-k8s.io/network-policy-enforcement", out)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_enforcement_the_install_enabled_is_recorded(self):
+        proc, _ = self._run(opt_in=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RECORDED=enabled-by-install", proc.stdout)
+
+    def test_the_three_way_prompt_fires_on_an_interactive_run(self):
+        # With no flag and no install.env answer, a run with a controlling TTY
+        # is asked. Stubbing the TTY probe and prompt_read stands in for one.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *datapathProvider,networkPolicy.enabled*) printf 'RUNNING,,False\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'PARAM_NON_INTERACTIVE="false"\n'
+                "has_controlling_tty() { return 0; }\n"
+                'prompt_read() { echo "PROMPTED: $1"; printf -v "$2" "%s" "a"; }\n'
+                "ensure_existing_cluster_network_policy proj cluster region; echo \"rc=$?\"\n"
+                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+        self.assertIn("PROMPTED: Choose (e/a/N)", proc.stdout, proc.stderr)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_accepting_on_a_cluster_that_enforces_changes_nothing(self):
+        # accept is inert where there is nothing to accept: Dataplane V2 is
+        # recorded as enforced, and no warning about a lost sandbox is printed.
+        proc, calls = self._run(datapath="ADVANCED_DATAPATH", opt_in=False, accept=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._updates(calls), [])
+        self.assertIn("RECORDED=enforced", proc.stdout)
+        self.assertNotIn("WITHOUT NetworkPolicy enforcement", proc.stderr + proc.stdout)
 
     def test_addon_state_is_not_probed(self):
         # Skipping the addon call when it is already on would be free, but
@@ -2773,7 +2922,7 @@ class CheckExistingClusterNodePoolsPreflightTest(unittest.TestCase):
 class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
     """check_existing_cluster_network_policy_preflight tests."""
 
-    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING"):
+    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING", accept=""):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -2789,12 +2938,15 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             opt_in_line = f'PARAM_ENABLE_NETWORK_POLICY="{opt_in}"\n' if opt_in else ""
+            if accept:
+                opt_in_line += f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 'TFVARS_CREATE_CLUSTER="false"\n'
                 f"{opt_in_line}"
                 "check_existing_cluster_network_policy_preflight p c r\n"
+                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
             return subprocess.run(
                 ["bash", "-c", body],
@@ -2808,10 +2960,41 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
         proc = self._run(dp="", legacy_np="False", opt_in="false")
         self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
         self.assertIn("enforces no NetworkPolicy", proc.stderr + proc.stdout)
+        # Both answers are named, and the cost of each; an agent reading this
+        # refusal is not handed one flag to pass.
+        self.assertIn("--enable-network-policy", proc.stderr + proc.stdout)
+        self.assertIn("--accept-no-network-policy", proc.stderr + proc.stdout)
+        self.assertIn("may recreate node pools", proc.stderr + proc.stdout)
+        self.assertIn("unconfined", proc.stderr + proc.stdout)
 
     def test_passes_when_opt_in_provided(self):
         proc = self._run(dp="", legacy_np="False", opt_in="true")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+    def test_passes_unchanged_when_absence_is_accepted(self):
+        # The acceptance criterion of #1682: an agent-driven install onto a
+        # cluster with no enforcement completes without modifying it, and not
+        # silently -- the consequences are printed and the choice recorded.
+        proc = self._run(dp="", legacy_np="False", opt_in="false", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        out = proc.stderr + proc.stdout
+        self.assertNotIn("REFUSED", out)
+        self.assertIn("WITHOUT NetworkPolicy enforcement", out)
+        self.assertIn("The cluster is not modified", out)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_acceptance_is_inert_where_enforcement_exists(self):
+        proc = self._run(dp="ADVANCED_DATAPATH", legacy_np="False", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("RECORDED=enforced", proc.stdout)
+        self.assertNotIn("WITHOUT NetworkPolicy enforcement", proc.stderr + proc.stdout)
+
+    def test_unreadable_cluster_is_refused_even_when_accepting(self):
+        # Accepting the absence of enforcement is not accepting an unknown
+        # cluster state; that refusal stands.
+        proc = self._run(status="", accept="true")
+        self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+        self.assertIn("Could not query NetworkPolicy configuration", proc.stderr + proc.stdout)
 
     def test_passes_when_dataplane_v2(self):
         proc = self._run(dp="ADVANCED_DATAPATH", legacy_np="False", opt_in="false")
@@ -2881,6 +3064,111 @@ class GenerateOnlyCrossesTheExistingClusterConsentGatesTest(unittest.TestCase):
         self.assertLess(prompt, mode_branch, "the prompt must precede the generate-only handoff")
 
 
+class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
+    """An accepted install without NetworkPolicy enforcement has to survive the run (#1682).
+
+    Three things carry it. install.env, or upgrade.sh's generator emits
+    accept_no_network_policy = false and the module refuses the plan the install
+    already passed; terraform.tfvars, which the module's postcondition reads and
+    which was generated before the interactive prompt could answer; and the
+    PlatformAgent annotation the composition stamps. These read main()'s control
+    flow, which the KUBE_AGENTS_SOURCE_ONLY harness cannot drive.
+    """
+
+    _OPT_IN_PROMPT_CALL = 'prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"'
+    _BOOTSTRAP_CALL = 'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"'
+    _REGENERATE_CALL = 'write_tfvars_from_state "$tfvars_file" "$image_tag"'
+
+    def test_the_prompt_runs_before_install_env_is_written(self):
+        text = _INSTALL_SH.read_text()
+        self.assertLess(
+            text.index(self._OPT_IN_PROMPT_CALL),
+            text.index(self._BOOTSTRAP_CALL),
+            "an answer given at the existing-cluster prompt must reach the install.env bootstrap",
+        )
+
+    def test_an_answer_at_the_prompt_regenerates_the_tfvars(self):
+        text = _INSTALL_SH.read_text()
+        first = text.index(self._REGENERATE_CALL)
+        second = text.index(self._REGENERATE_CALL, first + 1)
+        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), second)
+        self.assertLess(second, text.index(self._BOOTSTRAP_CALL))
+
+    def test_install_env_bootstrap_records_the_acceptance(self):
+        self.assertIn(
+            'write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"',
+            _INSTALL_SH.read_text(),
+        )
+
+    def _note(self, env_contents, accept):
+        """Run note_unrecorded_network_policy_acceptance against a file with the given contents."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text(env_contents)
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                f"export ACCEPT_NO_NETWORK_POLICY={accept}\n"
+                f'note_unrecorded_network_policy_acceptance "{env_file}"\n'
+            )
+            # PARAM_NON_INTERACTIVE and no TTY: the agent-driven shape, which
+            # is where the interview-answer warning deliberately stays silent.
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_an_unrecorded_acceptance_is_reported_without_a_tty(self):
+        """A pre-existing install.env without the key gets the warning, not silence."""
+        proc = self._note("PROJECT_ID=p\n", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+    def test_an_acceptance_the_file_records_as_false_is_reported(self):
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+    def test_a_recorded_acceptance_is_not_nagged(self):
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("Add ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
+
+    def test_a_run_that_did_not_accept_is_not_nagged(self):
+        proc = self._note("PROJECT_ID=p\n", "false")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
+
+    def test_the_note_runs_when_install_env_already_exists(self):
+        text = _INSTALL_SH.read_text()
+        existing_branch = text.index("Left your install configuration as you wrote it")
+        self.assertLess(
+            existing_branch,
+            text.index('note_unrecorded_network_policy_acceptance "$destination"'),
+        )
+
+    def test_an_unset_answer_is_not_exported_as_false(self):
+        """An exported "false" is an answer to the prompt gates, which read
+        ${PARAM_...:-${ACCEPT_NO_NETWORK_POLICY:-}}: unconditional export silenced
+        the interactive three-way prompt on every run without the flag."""
+        text = _INSTALL_SH.read_text()
+        self.assertNotIn('export ACCEPT_NO_NETWORK_POLICY="${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}"', text)
+        self.assertIn(
+            'if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then\n'
+            '    export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"',
+            text,
+        )
+
+    def test_the_composition_stamps_the_annotation_from_what_the_module_read(self):
+        main_tf = (_REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf").read_text()
+        self.assertIn('"kubeagents.x-k8s.io/network-policy-enforcement" = "absent-accepted"', main_tf)
+        self.assertIn("module.gke_cluster.network_policy_enforced ? {}", main_tf)
+        self.assertRegex(main_tf, r"accept_no_network_policy\s+= var\.accept_no_network_policy")
+
+
 class SummarizeExistingClusterMutationsTest(unittest.TestCase):
     """summarize_existing_cluster_mutations outputs expected lines for adoption."""
 
@@ -2893,6 +3181,7 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         dp="ADVANCED_DATAPATH",
         legacy_np="False",
         status="RUNNING",
+        accept="",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -2912,9 +3201,11 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            accept_line = f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n' if accept else ""
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                f"{accept_line}"
                 "summarize_existing_cluster_mutations p c r true\n"
             )
             return subprocess.run(
@@ -2939,6 +3230,14 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("NetworkPolicy Enforcement: Refused", proc.stdout)
         self.assertIn("install will abort", proc.stdout)
+        self.assertIn("--accept-no-network-policy", proc.stdout)
+
+    def test_summary_reflects_accepted_absence(self):
+        proc = self._run(dp="", legacy_np="False", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("NetworkPolicy Enforcement: Absent, accepted", proc.stdout)
+        self.assertIn("cluster unchanged", proc.stdout)
+        self.assertNotIn("install will abort", proc.stdout)
 
     def test_summary_reflects_refused_node_pool_migration_when_missing(self):
         proc = self._run(node_pools="default-pool,GCE_METADATA")
