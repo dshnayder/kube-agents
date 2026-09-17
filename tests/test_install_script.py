@@ -2330,9 +2330,13 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RECORDED=enabled-by-install", proc.stdout)
 
-    def test_the_three_way_prompt_fires_on_an_interactive_run(self):
-        # With no flag and no install.env answer, a run with a controlling TTY
-        # is asked. Stubbing the TTY probe and prompt_read stands in for one.
+    def test_the_pre_apply_step_prompts_when_no_answer_arrived(self):
+        # The fallback gate inside the pre-apply step: with neither flag nor
+        # install.env answer and a controlling TTY, it asks rather than
+        # refuses. A real run answers earlier, in prompt_existing_cluster_opt_ins
+        # (InteractiveNetworkPolicyPromptTest drives that path); this covers the
+        # function called on its own. Stubbing the TTY probe and prompt_read
+        # stands in for a terminal.
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -2354,11 +2358,15 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
                 "ensure_existing_cluster_network_policy proj cluster region; echo \"rc=$?\"\n"
                 'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             proc = subprocess.run(
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
+                ),
                 cwd=str(_REPO_ROOT),
             )
         self.assertIn("PROMPTED: Choose (e/a/N)", proc.stdout, proc.stderr)
@@ -3077,6 +3085,157 @@ class GenerateOnlyCrossesTheExistingClusterConsentGatesTest(unittest.TestCase):
         self.assertLess(prompt, mode_branch, "the prompt must precede the generate-only handoff")
 
 
+class InteractiveNetworkPolicyPromptTest(unittest.TestCase):
+    """prompt_existing_cluster_opt_ins on the path an interactive adoption takes.
+
+    This is the prompt a real run reaches: main() calls it before the summary,
+    against a Standard cluster with neither Dataplane V2 nor Calico, with no
+    flag and no install.env answer. The three answers each have to land in
+    the two PARAM_ variables the rest of the run reads.
+    """
+
+    def _run(self, answer, dp="", legacy_np="False", autopilot="False", preset=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *autopilot.enabled*) printf '{autopilot}\\n' ;;\n"
+                "  *node-pools*list*) printf 'default-pool,GKE_METADATA\\n' ;;\n"
+                f"  *datapathProvider,networkPolicy.enabled*) printf 'RUNNING,{dp},{legacy_np}\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'PARAM_NON_INTERACTIVE="false"\n'
+                'PARAM_DRY_RUN="false"\n'
+                f"{preset}"
+                "has_controlling_tty() { return 0; }\n"
+                f'prompt_read() {{ echo "PROMPTED: $1"; printf -v "$2" "%s" "{answer}"; }}\n'
+                "prompt_existing_cluster_opt_ins proj cluster region; echo \"rc=$?\"\n"
+                'echo "E=${PARAM_ENABLE_NETWORK_POLICY:-unset} A=${PARAM_ACCEPT_NO_NETWORK_POLICY:-unset}"\n'
+            )
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
+                ),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_accept_sets_the_accept_answer(self):
+        proc = self._run("a")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("PROMPTED: Choose (e/a/N)", proc.stdout)
+        self.assertIn("E=false A=true", proc.stdout)
+
+    def test_enable_sets_the_enable_answer(self):
+        proc = self._run("e")
+        self.assertIn("E=true A=false", proc.stdout, proc.stderr)
+
+    def test_the_default_answers_neither(self):
+        proc = self._run("")
+        self.assertIn("PROMPTED", proc.stdout, proc.stderr)
+        self.assertIn("E=false A=false", proc.stdout)
+
+    def test_a_recorded_answer_is_not_asked_again(self):
+        proc = self._run("a", preset='PARAM_ACCEPT_NO_NETWORK_POLICY="true"\n')
+        self.assertNotIn("PROMPTED", proc.stdout, proc.stderr)
+        self.assertIn("E=unset A=true", proc.stdout)
+
+    def test_an_enforcing_cluster_is_not_asked(self):
+        for dp, legacy_np in (("ADVANCED_DATAPATH", "False"), ("", "True")):
+            proc = self._run("a", dp=dp, legacy_np=legacy_np)
+            self.assertNotIn("PROMPTED", proc.stdout, (dp, legacy_np, proc.stderr))
+            self.assertIn("E=unset A=unset", proc.stdout)
+
+
+class SettleNetworkPolicyAcceptanceTest(unittest.TestCase):
+    """settle_network_policy_acceptance: the answer reaches the tfvars and the decision.
+
+    Runs between the prompt and the install.env bootstrap. An accept answered
+    at the prompt has to regenerate terraform.tfvars, since the generator ran
+    before the prompt and the module's postcondition reads the variable; and
+    what install.env then records is the decision from the probe, so a flag
+    against an enforcing cluster records nothing and an unreadable cluster
+    decides nothing.
+    """
+
+    def _run(self, param="", env_accept="", dp="", legacy_np="False", status="RUNNING"):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *datapathProvider,networkPolicy.enabled*) printf '{status},{dp},{legacy_np}\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
+            preset = f'PARAM_ACCEPT_NO_NETWORK_POLICY="{param}"\n' if param else ""
+            preset += f"export ACCEPT_NO_NETWORK_POLICY={env_accept}\n" if env_accept else ""
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                # The generator has run by then and found the cluster outside state.
+                'TFVARS_CREATE_CLUSTER="false"\n'
+                f"{preset}"
+                'write_tfvars_from_state() { echo "REGENERATED $1 $2 accept=$ACCEPT_NO_NETWORK_POLICY key=${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-}"; }\n'
+                "settle_network_policy_acceptance proj cluster region /tmp/t.tfvars 0.5.0; echo \"rc=$?\"\n"
+                'echo "DECISION=${NETWORK_POLICY_ENFORCEMENT:-none} ENV=${ACCEPT_NO_NETWORK_POLICY:-unset}"\n'
+            )
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
+                ),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_an_answer_at_the_prompt_regenerates_and_records(self):
+        proc = self._run(param="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("REGENERATED /tmp/t.tfvars 0.5.0 accept=true key=true", proc.stdout)
+        self.assertIn("DECISION=absent-accepted ENV=true", proc.stdout)
+
+    def test_a_flag_already_in_the_environment_does_not_regenerate(self):
+        # The first generator pass already saw it.
+        proc = self._run(param="true", env_accept="true")
+        self.assertNotIn("REGENERATED", proc.stdout, proc.stderr)
+        self.assertIn("DECISION=absent-accepted", proc.stdout)
+
+    def test_no_answer_touches_nothing(self):
+        proc = self._run()
+        self.assertNotIn("REGENERATED", proc.stdout, proc.stderr)
+        self.assertIn("DECISION=none ENV=unset", proc.stdout)
+
+    def test_the_flag_against_an_enforcing_cluster_decides_nothing(self):
+        for dp, legacy_np in (("ADVANCED_DATAPATH", "False"), ("", "True")):
+            proc = self._run(param="true", dp=dp, legacy_np=legacy_np)
+            self.assertIn("DECISION=none", proc.stdout, (dp, legacy_np, proc.stderr))
+
+    def test_an_unreadable_cluster_decides_nothing(self):
+        # The preflight refuses it a few steps on; recording an acceptance
+        # for a cluster nobody read would be a waiver with no decision behind it.
+        proc = self._run(param="true", status="")
+        self.assertIn("DECISION=none", proc.stdout, proc.stderr)
+
+
 class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
     """An accepted install without NetworkPolicy enforcement has to survive the run (#1682).
 
@@ -3090,7 +3249,7 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
 
     _OPT_IN_PROMPT_CALL = 'prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"'
     _BOOTSTRAP_CALL = 'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"'
-    _REGENERATE_CALL = 'write_tfvars_from_state "$tfvars_file" "$image_tag"'
+    _SETTLE_CALL = 'settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"'
 
     def test_the_prompt_runs_before_install_env_is_written(self):
         text = _INSTALL_SH.read_text()
@@ -3100,18 +3259,14 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
             "an answer given at the existing-cluster prompt must reach the install.env bootstrap",
         )
 
-    def test_an_answer_at_the_prompt_regenerates_the_tfvars(self):
+    def test_the_answer_is_settled_between_the_prompt_and_the_bootstrap(self):
+        """settle_network_policy_acceptance (behaviour: SettleNetworkPolicyAcceptanceTest)
+        has to run after the prompt that can produce the answer and before the
+        bootstrap that records it."""
         text = _INSTALL_SH.read_text()
-        first = text.index(self._REGENERATE_CALL)
-        second = text.index(self._REGENERATE_CALL, first + 1)
-        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), second)
-        self.assertLess(second, text.index(self._BOOTSTRAP_CALL))
-
-    def test_install_env_bootstrap_records_the_acceptance(self):
-        self.assertIn(
-            'write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"',
-            _INSTALL_SH.read_text(),
-        )
+        settle = text.index(self._SETTLE_CALL)
+        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), settle)
+        self.assertLess(settle, text.index(self._BOOTSTRAP_CALL))
 
     def _note(self, env_contents, decision, func="note_unrecorded_network_policy_acceptance"):
         """Run one of the install.env notes against a file with the given contents.
@@ -3220,19 +3375,31 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
                     "ACCEPT_NO_NETWORK_POLICY=true" in dest.read_text(), expected, (decision, dest.read_text())
                 )
 
-    def test_the_decision_is_settled_from_the_probe_before_the_bootstrap(self):
-        text = _INSTALL_SH.read_text()
-        probe = text.index('is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?')
-        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), probe)
-        self.assertLess(probe, text.index(self._BOOTSTRAP_CALL))
 
     def test_the_note_runs_when_install_env_already_exists(self):
-        text = _INSTALL_SH.read_text()
-        existing_branch = text.index("Left your install configuration as you wrote it")
-        self.assertLess(
-            existing_branch,
-            text.index('note_unrecorded_network_policy_acceptance "$destination"'),
-        )
+        """Behaviour: bootstrap against a file that exists calls the note and writes nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "install.env"
+            dest.write_text("PROJECT_ID=p\n")
+            empty = pathlib.Path(tmp) / "loaded.env"
+            empty.write_text("")
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'PARAM_DRY_RUN="false"\n'
+                'NETWORK_POLICY_ENFORCEMENT="absent-accepted"\n'
+                f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+            self.assertEqual(dest.read_text(), "PROJECT_ID=p\n")
 
     def test_an_unset_answer_is_not_exported_as_false(self):
         """An exported "false" is an answer to the prompt gates, which read

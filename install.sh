@@ -2680,6 +2680,34 @@ prompt_existing_cluster_opt_ins() {
   fi
 }
 
+# After the existing-cluster prompt and before install.env is written: carry
+# an "install without NetworkPolicy enforcement" answer into the files.
+#
+# The answer arrives after the generator ran, and the generated tfvars must
+# hold it -- the module's postcondition reads accept_no_network_policy, not
+# the flag -- so regenerate from the same inputs plus the answer. The
+# generator reuses the API_SERVER_KEY it exported on the first pass, so
+# nothing new is minted. Then settle what install.env will record, which is
+# the decision rather than the flag: the flag against a cluster that already
+# enforces accepted nothing, and an unreadable cluster decides nothing (the
+# preflight refuses it a few steps on). The preflight reaches the same answer
+# and prints it; this only settles it before the bootstrap writes the file.
+settle_network_policy_acceptance() {
+  local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
+    export ACCEPT_NO_NETWORK_POLICY="true"
+    KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      write_tfvars_from_state "$tfvars_file" "$image_tag"
+  fi
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    local np_probe=0
+    is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
+    if [ "$np_probe" -eq 1 ]; then
+      NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    fi
+  fi
+}
+
 is_existing_cluster_node_pools_satisfied() {
   local project_id="$1" cluster_name="$2" region="$3"
   [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
@@ -4567,27 +4595,7 @@ main() {
   # is recorded there.
   if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
     prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
-    # "Install without NetworkPolicy enforcement", answered at the prompt,
-    # arrives after the generator ran, and the generated tfvars must carry it:
-    # the module's postcondition reads accept_no_network_policy, not the flag.
-    # Regenerate from the same inputs plus the answer. The generator reuses the
-    # API_SERVER_KEY it exported on the first pass, so nothing new is minted.
-    if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
-      export ACCEPT_NO_NETWORK_POLICY="true"
-      KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
-        write_tfvars_from_state "$tfvars_file" "$image_tag"
-    fi
-    # What install.env records is the decision, and the decision needs the
-    # probe: the flag against a cluster that already enforces accepted
-    # nothing. The preflight below reaches the same answer and prints it; this
-    # only settles it before the bootstrap writes the file.
-    if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
-      local np_probe=0
-      is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
-      if [ "$np_probe" -eq 1 ]; then
-        NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
-      fi
-    fi
+    settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
   fi
 
   # Written once, and only when there is nothing there. The probed cluster
