@@ -10,7 +10,7 @@ sets the script carried at the split -- what runs on every pull request and
 what blocks did not move -- and the nightly file holds the script's nightly
 array plus the nine cases the TASKS array held commented out, which the
 same decision moved into the nightly (#1546, #1564), plus whatever landed
-there since, in ADDED_AFTER_SPLIT. A later roster change edits the expected
+there since, in ADDED_AFTER_THE_SPLIT and ADDED_AFTER_THE_MOVED_BLOCK. A later roster change edits the expected
 sets here in the same pull request; that is the point of pinning them, since the files are what the eval-crew rule in hack/OWNERS
 guards.
 
@@ -84,6 +84,11 @@ NIGHTLY_AT_SPLIT = [
 # obtainability-declared-intent-no-finding (#1341) and vcs-history-only-fact
 # (#1253) -- have no fixture at all and wait in the validator's
 # FIXTURE_NOT_READY instead.
+# Registered in the nightly file after the split, in file order, each by the
+# pull request that authored the case (a new case lands in the nightly first).
+ADDED_AFTER_THE_SPLIT = [
+    "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625
+]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
     "obtainability-refusal-direct-mutation",
@@ -95,11 +100,13 @@ MOVED_TO_NIGHTLY = [
     "upgrades-api-deprecation-clean-repo",
     "cluster-agent-crashloop-fix-request",
 ]
-# Added to the nightly file after the split, newest last. The consumer
+# Registered after the moved-in nine, which is why this is a second list and
+# not more entries in ADDED_AFTER_THE_SPLIT: those nine sit between the two in
+# the file, so file order is not registration order. Newest last. The consumer
 # migration's two cases (#1246 PR-2): a full issue-resolver run and a
 # read-back on an existing proposal's branch, both writing to the eval GitOps
 # repository, both nightly on measured cost.
-ADDED_AFTER_SPLIT = [
+ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-issue-resolver-triage",
     "vcs-review-feedback-read-back",
 ]
@@ -158,7 +165,10 @@ class SplitLostNothingTest(unittest.TestCase):
         self.assertEqual(eval_rosters.blocking_roster(), ROSTER_AT_SPLIT)
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases(self):
-        self.assertEqual(eval_rosters.nightly_cases(), NIGHTLY_AT_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_SPLIT)
+        self.assertEqual(
+            eval_rosters.nightly_cases(),
+            NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK,
+        )
 
     def test_the_script_no_longer_carries_the_arrays(self):
         # A literal array creeping back in would be a second source of truth
