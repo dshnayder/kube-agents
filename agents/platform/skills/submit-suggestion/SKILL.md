@@ -189,7 +189,11 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py sub
 ```
 
 `--base <branch>` names what the change merges into, for the rare case where it
-is not the `base` Step 1 reported.
+is not the `base` Step 1 reported. It may not name the branch you are
+submitting: a head branch that is its own base carries nothing for anyone to
+review, and `prepare`, `submit` and the broker each refuse it. That covers the
+repository whose trunk is called something other than `main` — the name is read
+from the remote, not from a list.
 
 The script returns the clean, live pull request URL. If a pull request for this
 branch is already open, it updates that one's title and body in place and

@@ -63,6 +63,7 @@ from github_token_refresh import log
 # forge's branch protection refuses whatever the broker lets through. This one
 # is here to fail early, in the container the agent can read the message in.
 PROTECTED_BRANCHES = {"main", "master", "production"}
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 # The one directory `--body-file` may name. The same bound `pr_conversation.py`
 # and `github-issue-resolver`'s resolver put on their own body paths, for the
@@ -71,19 +72,59 @@ PROTECTED_BRANCHES = {"main", "master", "production"}
 SCRATCH_DIR = "/opt/data/scratch"
 
 
-def check_branch(branch_name: str) -> str:
+def _short_branch(branch: str) -> str:
+    """The comparable form of a branch name.
+
+    `refs/heads/main` is not the string `main`, but pushing it moves main all
+    the same, and a fleet that writes `heads/main` means the same branch again.
+    Case-folded because a forge that treats `Main` and `main` as one branch
+    would otherwise let a guard be walked past by capitalising it.
+    """
+    short = (branch or "").strip().lower()
+    for prefix in ("refs/heads/", "heads/"):
+        if short.startswith(prefix):
+            return short[len(prefix):]
+    return short
+
+
+def refuse_branch_on_its_own_base(branch: str, base: str, verb: str) -> None:
+    """Refuse a head branch that is its own base.
+
+    `check_branch` refuses the names a fleet protects by convention. This
+    refuses the branch this particular run is proposing onto, which is only
+    known once the base has been resolved -- and which, on a repository whose
+    default branch is neither `main` nor `master`, is the only name that
+    matters. The broker refuses it again on publish (`PROTECTED_BRANCH`) and
+    that is the authority; this is the early half, before a revision has been
+    recorded against a branch that can never carry a proposal.
+    """
+    if _short_branch(branch) == _short_branch(base):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: Cannot {verb} on branch '{branch}': it is "
+            f"the same as the base branch '{base}', so there is nothing to propose "
+            "this onto. Use a separate feature branch."
+        )
+
+
+def check_branch(branch_name: str, base_branch: str | None = None) -> str:
     branch = (branch_name or "").strip()
     if not branch:
         raise ValueError("--branch is required and must not be empty")
-    # Compare the short name: "refs/heads/main" is not in PROTECTED_BRANCHES,
-    # but pushing it moves main all the same.
-    short = branch.lower()
-    if short.startswith("refs/heads/"):
-        short = short[len("refs/heads/"):]
-    if short in PROTECTED_BRANCHES:
+
+    short = _short_branch(branch)
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if override:
+        protected.add(_short_branch(override))
+    if base_branch:
+        protected.add(_short_branch(base_branch))
+    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
-            f"CRITICAL SECURITY REFUSAL: Publishing to protected branch "
-            f"'{branch_name}' is strictly blocked by GKE SRE guardrails!"
+            f"CRITICAL SECURITY REFUSAL: Target branch '{branch_name}' is a protected "
+            "base or run branch; changes must be submitted on a separate feature branch."
         )
     return branch
 
@@ -157,6 +198,7 @@ def handle_prepare(args) -> int:
         log(f"'{branch}' already has an open proposal; taking a copy of it.")
         cloned = vcs_client.clone(repo, branch=branch, force=args.force, key=branch)
         base = proposal["target"]
+        refuse_branch_on_its_own_base(branch, base, "prepare")
         started_from = branch
     else:
         # `key=branch` although the copy is of the base: the tree belongs to
@@ -164,6 +206,10 @@ def handle_prepare(args) -> int:
         # same repository gets a tree of its own rather than colliding here.
         cloned = vcs_client.clone(repo, force=args.force, key=branch)
         base = cloned["branch"]
+        # Before the switch below, not after it. The branch the copy came down
+        # on is the remote's default, and `check_branch` cannot know its name:
+        # a fleet whose trunk is `release-trunk` gets past the list of three.
+        refuse_branch_on_its_own_base(branch, base, "prepare")
         # `branch` reports a failed switch rather than raising on one, and the
         # JSON below would otherwise name a branch this run is not standing on.
         # `handle_submit` does catch it -- it refuses when HEAD is somewhere
@@ -252,12 +298,12 @@ def handle_submit(args) -> int:
     # because that is where it already says it is going and moving it is not
     # this script's call; from the branch the copy came down on otherwise.
     base = args.base or (proposal or {}).get("target") or session["branch"]
-    if base == branch:
-        raise ValueError(
-            f"the base and the branch are both '{branch}', so there is nothing "
-            "to propose this onto. Pass --base <branch> naming what it merges "
-            "into."
-        )
+    # `session["branch"]` is deliberately not checked here as well: on the
+    # second round of an open proposal the copy was taken of the branch itself,
+    # so it equals `branch` by design -- that equality is what `advance` below
+    # reads. The branch-is-the-trunk case that check would have caught is
+    # refused at `prepare`, and again by the broker on publish.
+    refuse_branch_on_its_own_base(branch, base, "submit")
 
     pending = pending_changes(session)
     if pending:

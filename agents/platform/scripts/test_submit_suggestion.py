@@ -28,11 +28,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 import unittest
 from contextlib import redirect_stdout
 from itertools import count
 from pathlib import Path
-from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -88,6 +88,10 @@ class FakeBroker:
     def __init__(self, origin: Path, scratch: Path):
         self.origin = origin
         self.scratch = scratch
+        # What the remote calls its default. The real broker reads it from the
+        # remote's HEAD, and a fleet whose trunk is not `main` is exactly the
+        # case the protected-branch list cannot cover.
+        self.default_branch = "main"
         self.proposals: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.numbers = count(101)
@@ -109,7 +113,7 @@ class FakeBroker:
         return work
 
     def clone(self, payload):
-        branch = payload.get("branch") or "main"
+        branch = payload.get("branch") or self.default_branch
         work = self._serving_copy()
         git(work, "checkout", "--quiet", "-B", branch, f"origin/{branch}")
         bundle = work.parent / f"{work.name}.bundle"
@@ -297,12 +301,51 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         git(self.origin, "branch", branch, "main")
         self.assertEqual(self.prepare(branch)["base"], "release")
 
+    def test_check_branch_refuses_a_run_branch(self):
+        # `run/**` is the harness's own namespace. A suggestion pushed there is
+        # not reviewed by anyone; it is picked up as if a run had produced it.
+        for branch in ("run/nightly", "refs/heads/run/1234", "RUN/Loud"):
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.check_branch(branch)
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_check_branch_refuses_the_configured_base_branch(self):
+        # A fleet that renamed its trunk says so in one of these two, and the
+        # list of three would otherwise wave the rename straight through.
+        for variable in ("GITOPS_BASE_BRANCH", "CREDENTIAL_PROXY_BASE_BRANCH"):
+            with mock.patch.dict(os.environ, {variable: "custom-trunk"}):
+                for branch in ("custom-trunk", "refs/heads/custom-trunk", "heads/custom-trunk"):
+                    with self.assertRaises(ValueError) as caught:
+                        submit_suggestion.check_branch(branch)
+                    self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_check_branch_refuses_a_base_branch_passed_in(self):
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.check_branch("custom-base", base_branch="custom-base")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(
+            submit_suggestion.check_branch("platform-agent/x", base_branch="custom-base"),
+            "platform-agent/x",
+        )
+
     def test_prepare_refuses_a_protected_branch(self):
         for branch in ("main", "MASTER", "refs/heads/production"):
             with self.assertRaises(ValueError) as caught:
                 self.run_subject("prepare", "--branch", branch)
             self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
         self.assertEqual(self.broker.calls, [])
+
+    def test_prepare_refuses_the_branch_it_would_be_proposing_onto(self):
+        # The list of three cannot name a fleet's own trunk. This is the guard
+        # that can: the base comes back from the broker's clone, so a repository
+        # whose default branch is `trunk` refuses `--branch trunk` here rather
+        # than at the push.
+        git(self.origin, "branch", "trunk", "main")
+        self.broker.default_branch = "trunk"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("prepare", "--branch", "trunk")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertIn("same as the base branch", str(caught.exception))
 
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(
@@ -477,6 +520,20 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self.run_subject("submit", "--branch", "main", "--title", "t", "--body", "b")
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_submit_refuses_a_base_that_is_the_branch_itself(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--base", "platform-agent/scale-web",
+                "--title", "t",
+                "--body", "b",
+            )
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
 
     def test_submit_commits_the_tracked_changes_the_copy_holds_under_the_title(self):
         prepared = self.prepare()
