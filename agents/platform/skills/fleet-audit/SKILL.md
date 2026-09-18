@@ -309,6 +309,12 @@ collector-manifest design says what the manifest holds): `--manifest-file` names
 collector wrote and `--no-collector-manifest` publishes without one, reporting the reason as a
 coverage gap. An SOP that mentions neither runs `finish` without them, exactly as before.
 
+A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
+and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
+and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
+`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+says how to read its manifest and what is still yours to write.
+
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one

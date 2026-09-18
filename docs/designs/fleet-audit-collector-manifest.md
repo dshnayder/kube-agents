@@ -1,9 +1,10 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented.** `audit_report.py finish` accepts
-> a manifest through `--manifest-file` and applies every rule in §3. No collector that emits one
-> ships in this repository yet, and no SOP passes the flag; until a stream's collector lands, that
-> stream publishes on the document's own attestation, exactly as it did before the flag existed.
+> **STATUS — design of record; the `finish` side is implemented, one collector ships.**
+> `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
+> §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
+> `fleet-consistency-drift` stream, whose SOP runs it and passes the flag; every other stream
+> publishes on the document's own attestation, exactly as it did before the flag existed.
 
 **Scope:** the machine boundary between a per-stream collector script and the fleet-audit harness.
 The ledger itself, the delta, coverage gaps, and remediation pull requests are
@@ -90,7 +91,8 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].candidates[]`             | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read: the model re-judges it against fleet context.                                           |
 | `audit`                               | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                        |
 | `version`, `checks_revision`, timing  | carried          | Shape version, digest of the check logic, and the collector's wall-clock. Reserved for a run-over-run comparison and the timing view that a later change adds; `finish` does not read them today.                                                                                                                                                                       |
-| `clusters[].autopilot`, `.project`, … | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive.                                                                                                                                                                                                                                                                       |
+| `clusters[].autopilot`, `.project`, … | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap.                                                                    |
+| `error` (top level)                   | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                         |
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte
 or truncated read) is `outcome: "gate-failed"`, never a shorter candidate list; a candidate is
@@ -98,7 +100,12 @@ identified by the same four fields as a finding, so
 `derive_finding_id({check, cluster, namespace, object})` on a candidate equals the id of the finding it
 would become, and wherever `finish` prints or compares it against the ledger it is clipped the way a
 finding id is; `excerpt` is cut from the collector's own output under the same credential-projection
-rules the SOPs mandate, with the harness redactor as the backstop.
+rules the SOPs mandate, with the harness redactor as the backstop; and a run that enumerated
+nothing says so in the top-level `error` rather than emitting an empty `clusters` array, which
+would otherwise be indistinguishable from a fleet holding no clusters. A target name is unique
+within the manifest, so a collector sweeping several projects qualifies a colliding cluster name
+as `<project>/<name>` — the drift collector does, and the SOP carries the qualified form into
+`scope.clusters[].name`, which is the key §3.1 matches on.
 
 ## 3. What `finish` does with it
 
