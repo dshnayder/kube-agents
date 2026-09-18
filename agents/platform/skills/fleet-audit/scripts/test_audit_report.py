@@ -2212,6 +2212,116 @@ class TestAuditCatalogue(unittest.TestCase):
                 if sop_dir.is_dir():
                     self.assertTrue((sop_dir / spec.sop).is_file())
 
+    def collector_streams(self):
+        """The audit ids whose SOP tells the worker to run a collector.
+
+        Keyed on the SOP's own "Run the collector" step rather than on a list
+        kept here, so a stream that gains a collector joins the two tests
+        below the moment its SOP says so, and a stream without one is held to
+        nothing about a script it does not have.
+        """
+        sop_dir = self.sop_dir()
+        return [
+            audit_id
+            for audit_id in sorted(audit_report.AUDITS)
+            if "Run the collector" in (sop_dir / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
+        ]
+
+    def test_cron_prompts_name_the_real_collector_invocation(self):
+        """A prompt pointing at a renamed or moved collector script is worse
+        than one that says nothing about it.
+
+        The prompt's named collector must be the exact one the SOP's own
+        "Run the collector" instruction documents, re-derived from the SOP
+        file each run, so an SOP edited without also updating the prompt (or
+        vice versa) fails here rather than at 08:20 in production.
+        """
+        jobs = self.cron_jobs()
+        sop_dir = self.sop_dir()
+        streams = self.collector_streams()
+        self.assertTrue(streams, "no SOP runs a collector; this test guards nothing")
+        for audit_id in streams:
+            prompt = jobs[audit_id]["prompt"]
+            name = SOP_FILENAMES[audit_id]
+            sop_text = (sop_dir / name).read_text(encoding="utf-8")
+            with self.subTest(audit=audit_id):
+                idx = sop_text.index("Run the collector")
+                fence_marker = "```bash\n"
+                fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
+                fence_end = sop_text.index("\n```", fence_start)
+                invocation_line = sop_text[fence_start:fence_end].splitlines()[0].strip()
+                # The script, not the first word: the documented invocation
+                # names an interpreter first, and the prompt cites the
+                # collector rather than a runnable command line.
+                script_token = next(
+                    token for token in invocation_line.split() if token.endswith(".py")
+                ).lstrip("./")
+                self.assertIn(
+                    script_token,
+                    prompt,
+                    f"the {audit_id} prompt does not name {script_token}, the "
+                    f"collector {name} actually documents",
+                )
+
+    def test_every_collector_prompt_names_a_command_argparse_accepts(self):
+        """Naming the right script is not the same as naming a runnable command.
+
+        The test above checks the script token and stops there, so it would
+        pass a prompt whose literal command exits 2 on argparse before a
+        single check ran -- a missing required flag, say. A test that reads
+        the prompt cannot see that; only the real parser can.
+
+        So run each prompt's own argv through the real script. `gcloud` is
+        stubbed to a failing no-op, so nothing reaches the network and no
+        collector gets past enumeration -- which is the point, because
+        argparse rejects before that and everything else fails after it.
+        Exit 2 with `usage:` on stderr is argparse and nothing else; whatever
+        follows a stubbed `gcloud` is a pass.
+        """
+        jobs = self.cron_jobs()
+        profile = Path(__file__).resolve().parents[4] / "platform"
+        pattern = re.compile(r"`([^`]*scripts/[a-z_]+\.py[^`]*)`")
+
+        stub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, stub, True)
+        gcloud = stub / "gcloud"
+        gcloud.write_text("#!/bin/sh\nexit 1\n")
+        gcloud.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{stub}{os.pathsep}{env.get('PATH', '')}"
+
+        streams = self.collector_streams()
+        checked = 0
+        for audit_id in streams:
+            invocations = pattern.findall(jobs[audit_id]["prompt"])
+            self.assertTrue(
+                invocations,
+                f"the {audit_id} prompt names no collector command",
+            )
+            for invocation in invocations:
+                argv = invocation.split()
+                # The prompt may name an interpreter first; drop it and run the
+                # script under this suite's own Python.
+                argv = argv[1:] if argv[0].endswith("python3") else argv
+                script = profile / argv[0]
+                with self.subTest(audit=audit_id, command=invocation):
+                    self.assertTrue(script.is_file(), f"{script} does not exist")
+                    done = subprocess.run(
+                        [sys.executable, str(script), *argv[1:]],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=120,
+                    )
+                    self.assertFalse(
+                        done.returncode == 2 and "usage:" in done.stderr,
+                        f"the {audit_id} prompt's command is rejected by its own "
+                        f"parser:\n  {invocation}\n{done.stderr.strip()[:400]}",
+                    )
+                    checked += 1
+        self.assertEqual(checked, len(streams))
+
     def test_cron_prompts_cite_the_real_sop_geography(self):
         """A stale line number is worse than no line number.
 
@@ -2455,12 +2565,13 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
-        self.assertIn("reads as complete at eight of eight", text)
-        self.assertIn("logging-components", text)
-        self.assertIn("monitoring-components", text)
-        self.assertIn("intra-node-visibility", text)
-        self.assertIn("managed-prometheus", text)
+        self.assertIn("five §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("reads as complete at fifteen of fifteen", text)
+        self.assertIn("secure-boot", text)
+        self.assertIn("integrity-monitoring", text)
+        self.assertIn("pool-autoscaling", text)
+        self.assertIn("node-autoprovisioning", text)
+        self.assertIn("image-type", text)
 
     def test_gke_sops_declare_autopilot_inapplicable_checks(self):
         """Every GKE SOP whose checks cannot run on Autopilot must declare them in checks_not_applicable.
@@ -2487,18 +2598,16 @@ class TestAuditCatalogue(unittest.TestCase):
             "fleet-wide-cost-analysis": [
                 "idle-nodepool",
             ],
+            # The five `standard_only` facets in fleet_drift.FACETS: every
+            # one reads `.nodePools[]` or a node-management setting Google
+            # owns on Autopilot. The cluster-level facets the list used to
+            # carry are compared on Autopilot cohorts too.
             "fleet-consistency-drift": [
                 "secure-boot",
                 "integrity-monitoring",
                 "pool-autoscaling",
                 "node-autoprovisioning",
                 "image-type",
-                "shielded-nodes",
-                "datapath-provider",
-                "intra-node-visibility",
-                "managed-prometheus",
-                "logging-components",
-                "monitoring-components",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
