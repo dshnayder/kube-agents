@@ -513,8 +513,10 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # The trusted principal's own copy of the forwarded scripts. Root-owned.
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
-# credential, and do their forge work by sshing in as `hermes` and running
-# forge.py here (agents/platform/scripts/forge.py, `_forward`). The copy under
+# credential, and do their forge work by sshing in as `hermes` and running a
+# script here. Two of them cross: forge.py for every forge verb
+# (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
+# sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is the model's: uid 1000 owns that mount, can rewrite any file in
 # it, and the edit lives until the next restart -- section 4b of
 # deploy/sandbox/smoke-test.sh plants one on purpose. Forwarding to that copy
@@ -524,18 +526,34 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # model's own copy stays where its instructions say it is; nothing about what
 # an agent runs changes here.
 #
-# The whole import closure is staged, not just forge.py: `sys.path[0]` is the
-# script's own directory, so a module missing here would be found under
-# /opt/data instead and the boundary would be gone with nothing to show for it.
-# The guard below imports it with `-P` and `PYTHONPATH` naming this directory
-# alone, so the import can only resolve inside it -- the closure check and a
-# syntax check in one, failing the build rather than the first cron tick.
+# The whole import closure is staged, not just the two entry points:
+# `sys.path[0]` is the script's own directory, so a module missing here would be
+# found under /opt/data instead and the boundary would be gone with nothing to
+# show for it.
+#
+# `-P` and a `PYTHONPATH` of this directory alone did not prove that, which an
+# earlier version of this comment claimed they did. resolver.py, vcs_client.py
+# and github_token_refresh.py each append /opt/defaults/scripts and
+# /opt/data/scripts to `sys.path`, which is how a copy in the agent pod finds
+# its siblings -- so a module loading after them could come from an agent-owned
+# directory with an import-only check still passing. Two things answer that now.
+# The three of them leave the appends off when the file they are running from is
+# this copy, so the trusted process has no agent-writable directory on its path
+# at all; and the guard below imports both entry points and then reads
+# `__file__` off every module that got loaded, which is the check that was
+# meant: where the code actually came from, at build time rather than at the
+# first cron tick.
 COPY agents/platform/scripts/forge.py \
+     agents/platform/skills/github-issue-resolver/scripts/resolver.py \
+     agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/repo_ref.py \
      agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/github_token_refresh.py \
+     agents/platform/scripts/wif_credentials.py \
      /opt/vcs/libexec/platform/
+COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
 RUN set -e; \
     chown -R root:root /opt/vcs/libexec/platform; \
     chmod 0755 /opt/vcs/libexec/platform; \
@@ -546,15 +564,10 @@ RUN set -e; \
         echo "$loose" >&2; \
         exit 1; \
     fi; \
-    export PYTHONPATH=/opt/vcs/libexec/platform PYTHONDONTWRITEBYTECODE=1; \
-    if ! python3 -P -c "import forge"; then \
-        echo "the trusted copy does not import from its own directory alone" >&2; \
-        exit 1; \
-    fi; \
-    if ! python3 -P -c "import forge; raise SystemExit(forge.SANDBOX_FORGE != '/opt/vcs/libexec/platform/forge.py')"; then \
-        echo "forge.SANDBOX_FORGE does not name the root-owned copy" >&2; \
-        exit 1; \
-    fi
+    PYTHONPATH=/opt/vcs/libexec/platform PYTHONDONTWRITEBYTECODE=1 \
+        python3 -P /opt/vcs/libexec/trusted-closure-guard.py; \
+    rm -f /opt/vcs/libexec/trusted-closure-guard.py; \
+    find /opt/vcs/libexec -name '__pycache__' -type d -prune -exec rm -rf {} +
 
 # The same guard the agent image runs, for the same reason and with more at
 # stake: a real gcloud or kubectl in this image is a credential path out of the

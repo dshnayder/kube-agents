@@ -171,7 +171,7 @@ exceptions and is fail-open, so such a hook must catch internally and decide exp
 
 **Status: implemented** as `agents/platform/scripts/forge.py`.
 
-Seven operations are the complete set this feature needs from a forge:
+Eight operations are the complete set this feature needs from a forge:
 
 ```python
 class ForgeProvider(Protocol):
@@ -186,9 +186,15 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo, pr, comment) -> bool      # optional; see supports_acknowledge
     def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
                                                           # backs the reply claim check
+    def truncations(self) -> list[str]                    # listings that filled their page this
+                                                          # tick; drained once, per instance
 ```
 
-Every member takes the repository, including the two that read as install-wide. Identity and
+`truncations` is the one member that takes no repository. A listing that fills its page is not a
+failure the sweep can recover from — it simply did not see everything — so the provider records a
+note per listing instead of raising, and the caller drains them all at the end of a tick into one
+operator warning rather than interrupting the repository it happened on. The other seven take the
+repository, including the two that read as install-wide. Identity and
 capability are properties of a forge, and the repository is how the caller names which one: an
 install serving two forges authenticates as two accounts, and only one of them can write here.
 

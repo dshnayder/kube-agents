@@ -55,12 +55,15 @@ else. Each concurrent operation gets its own clone, keyed by a lease it owns.
 separate processes — find the same tree with no lookup state between them.
 
 **Lease key.** The fleet audit uses the audit id, which `validate_audit_id` already constrains to a
-closed enum, so it is a safe directory name by construction. It is the only caller that leases a
-clone here; the write skills take their working copies through the version-control verbs instead,
-which key a copy on the repository and the branch and need no lease to keep two of them apart —
-see §4. What the generic path still offers a caller that has no id of its own is `resolve_lease`:
-an explicit `--lease` → `$HERMES_KANBAN_TASK` (pinned into every dispatcher-spawned worker) →
-`$HERMES_SESSION_ID` → a generated `adhoc-<8 hex>`. The identifier must be stable across
+closed enum, so it is a safe directory name by construction. It is the only caller whose key is
+constrained that way, not the only caller that leases a clone: two read-only scans lease here too —
+`api_deprecation_scan.py`'s directory mode and `inspect-repository`'s `clone-directory` — and
+neither has an id of its own. The write skills are the ones that do not appear here at all; they
+take their working copies through the version-control verbs instead, which key a copy on the
+repository and the branch and need no lease to keep two of them apart — see §4. What the generic
+path offers the callers with no id is `lease_id`: an explicit `--lease` → `$HERMES_KANBAN_TASK`
+(pinned into every dispatcher-spawned worker) → `$HERMES_SESSION_ID` → a generated
+`adhoc-<8 hex>`. The identifier must be stable across
 invocations, because the agent runs each shell command in a fresh process: a pid would hand
 `git commit` and the submit that follows it two different clones. Every id is reduced to
 `[A-Za-z0-9._-]{1,64}`; one that sanitises to nothing is refused rather than defaulted, because a

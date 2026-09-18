@@ -642,7 +642,8 @@ class FakeProvider:
         self.acknowledged = []
         self.viewer_lookups = []
         #: What the real provider records when a listing fills its page.
-        #: Set by the tests that pin the operator warning.
+        #: Set by `test_a_truncated_listing_becomes_one_operator_warning` and
+        #: the two tests beside it, which pin the operator warning.
         self.truncated = []
 
     def truncations(self):
@@ -762,6 +763,47 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
         self.assertEqual(provider.acknowledged, [])
+
+    # -- the page ceiling --------------------------------------------------
+    def test_a_truncated_listing_becomes_one_operator_warning(self):
+        """The one output of `truncations()`, which the sweep drains every tick.
+
+        A listing read short is not a failure the sweep can recover from -- it
+        simply did not see everything -- so the only evidence an operator gets
+        that a request may have been missed is this line.
+        """
+        provider = FakeProvider()
+        provider.truncated = ["acme/toolkit#12 reviews"]
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        warning = result.warnings[0]
+        self.assertIn("read only the first page of", warning)
+        self.assertIn("acme/toolkit#12 reviews", warning)
+        self.assertIn(str(forge.PAGE_SIZE), warning)
+
+    def test_the_same_listing_truncating_twice_is_reported_once(self):
+        """Two repositories fill the same page on the same tick, routinely.
+
+        De-duplicated on the note rather than counted, so the warning names what
+        was cut short and not how many times the sweep noticed.
+        """
+        provider = FakeProvider()
+        provider.truncated = [
+            "acme/toolkit#12 reviews",
+            "acme/toolkit#12 reviews",
+            "acme/toolkit#13 comments",
+        ]
+        result = self._sweep(provider)
+        self.assertEqual(len(result.warnings), 1)
+        warning = result.warnings[0]
+        self.assertEqual(warning.count("acme/toolkit#12 reviews"), 1)
+        self.assertIn("acme/toolkit#13 comments", warning)
+
+    def test_nothing_truncated_is_silence(self):
+        """The ordinary tick. `truncations()` is called on every one of them."""
+        result = self._sweep(FakeProvider())
+        self.assertEqual(result.warnings, [])
 
     # -- scope -------------------------------------------------------------
     def test_a_pr_the_agent_did_not_author_is_out_of_scope(self):

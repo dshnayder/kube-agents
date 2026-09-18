@@ -1224,7 +1224,12 @@ rather than holding a forge CLI themselves, and running the model's copy over th
 session would be the credential handed to whatever the model last wrote there. The whole
 import closure is staged, because `sys.path[0]` is the script's own directory and a
 module missing from the root-owned copy would be found in the model's one instead. The
-image build fails if the import can resolve any other way.
+build proves the staging is complete by importing each entry point and reading `__file__`
+off every module that loaded: one that resolved outside the root-owned copy and the
+standard library fails the image. What those scripts put on `sys.path` themselves — the
+two agent-pod directories they use to find their siblings — is left off when the file
+they are running from is the root-owned copy, so a gap a later edit opens has nothing
+model-writable to fall through to.
 
 `volumeClaimTemplates` is immutable, so an install that already ran the single-volume
 layout does not roll into this one. The StatefulSet has to be deleted with

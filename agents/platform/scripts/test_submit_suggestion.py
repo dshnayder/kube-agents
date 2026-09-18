@@ -65,13 +65,13 @@ GIT_ENV = {
 }
 
 
-def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
-        check=True,
+        check=check,
         env={**os.environ, **GIT_ENV},
     )
 
@@ -97,6 +97,7 @@ class FakeBroker:
         self.numbers = count(101)
         self.serial = count()
         self.create_fails_with: Exception | None = None
+        self.update_fails_with: Exception | None = None
 
     def __call__(self, verb: str, payload: dict) -> dict:
         self.calls.append((verb, dict(payload)))
@@ -171,12 +172,36 @@ class FakeBroker:
         return {"proposal": proposal}
 
     def proposal_update(self, payload):
+        if self.update_fails_with:
+            raise self.update_fails_with
         for proposal in self.proposals:
             if proposal["number"] == payload["number"]:
                 for field in ("title", "body"):
                     if payload.get(field) is not None:
                         proposal[field] = payload[field]
                 return {"proposal": proposal}
+        raise AssertionError(f"no proposal {payload['number']}")
+
+    def proposal_commits(self, payload):
+        """The revisions on a proposal's source branch, tip last.
+
+        Read off the origin rather than recorded, so a test that closes a
+        proposal and moves the branch gets the answer the forge would give.
+        """
+        for proposal in self.proposals:
+            if proposal["number"] != payload["number"]:
+                continue
+            shown = git(
+                self.origin, "rev-list", "--reverse",
+                f"main..refs/heads/{proposal['source']}",
+                check=False,
+            )
+            shas = shown.stdout.split() if shown.returncode == 0 else []
+            return {
+                "commits": [{"sha": sha, "committed": "2026-09-15T00:00:00Z"} for sha in shas],
+                "count": len(shas),
+                "truncated": False,
+            }
         raise AssertionError(f"no proposal {payload['number']}")
 
 
@@ -292,6 +317,66 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(
             git(Path(again["workspace"]), "rev-parse", "HEAD").stdout.strip(), reviewed
         )
+
+    def test_prepare_refuses_a_branch_name_whose_squash_merged_branch_is_still_there(self):
+        """The reuse the docstring promises, on the forge default that breaks it.
+
+        Squash-merge leaves the source branch on the remote at a revision the
+        base does not contain, so a branch cut fresh from the base does not
+        build on it and `publish` is refused as `BRANCH_DIVERGED` -- after the
+        agent has written the whole change. Refused here instead, where the
+        fault is and before the work.
+        """
+        branch = "platform-agent/scale-web"
+        # The first round: a branch with a commit on it, and a proposal that is
+        # then squash-merged -- the content lands on main as a new revision and
+        # the branch is left where it was.
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        message = str(caught.exception)
+        self.assertIn("BRANCH_DIVERGED", message)
+        self.assertIn(merged["url"], message)
+        self.assertIn("has not used", message)
+
+    def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):
+        """The case that works, and it must keep working.
+
+        A proposal merged with a merge commit leaves its tip reachable from the
+        base, so a fresh cut descends from what the remote holds and `publish`
+        fast-forwards it. Refusing here on the mere existence of a spent
+        proposal would stop the reuse the naming convention is built on.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        git(self.origin, "merge", "--quiet", "--no-ff", "-m", "merge round one", branch)
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        prepared = self.prepare(branch)
+        self.assertEqual(prepared["branch"], branch)
+        self.assertEqual(prepared["base"], "main")
+
+    def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
+        """The ordinary card, and the one the extra lookup must not cost anything.
+
+        One `proposal-list` for the history, one for the open proposal, and no
+        commit listing at all -- that last only happens when a spent proposal
+        turns up.
+        """
+        self.prepare()
+        self.assertEqual(self.broker.payloads("proposal-commits"), [])
 
     def test_prepare_reads_the_base_off_the_open_proposal_not_the_default_branch(self):
         git(self.origin, "checkout", "--quiet", "-b", "release")
@@ -616,6 +701,71 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(url, self.broker.proposals[0]["url"])
         # And it did not publish a second time: there was nothing new to send.
         self.assertEqual(len(self.broker.payloads("publish")), 1)
+
+    def test_a_retry_after_the_second_round_update_failed_reaches_the_update(self):
+        """The same shape one round later, and it used to have no route at all.
+
+        Publish lands, `proposal-update` fails -- the rate limit or 5xx the
+        first-round comment already names. Reading `already_published` only when
+        no proposal was open meant the retry went back through `publish`, which
+        answers "there are no new revisions to publish" because the tip it is
+        being asked to send is the one it just sent. The description update the
+        retry exists for is on the far side of that refusal.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.assertEqual(len(self.broker.proposals), 1)
+
+        second = self.prepare(force=True)
+        self.edit(second, "replicas: 4\n")
+        self.broker.update_fails_with = vcs_client.VcsError(
+            "secondary rate limit", code="FORGE_RATE_LIMITED"
+        )
+        with self.assertRaises(vcs_client.VcsError):
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "round two", "--body", "b",
+            )
+        self.assertEqual(len(self.broker.payloads("publish")), 2)
+
+        self.broker.update_fails_with = None
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "round two", "--body", "b",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "round two")
+        # And it did not publish a third time: there was nothing new to send.
+        self.assertEqual(len(self.broker.payloads("publish")), 2)
+
+    def test_resubmitting_an_open_proposal_with_nothing_new_is_not_an_error(self):
+        """SKILL.md L198-L200 says so, and a card retry is the ordinary way there.
+
+        Under the `git push --force-with-lease` + `gh pr edit` pair this
+        replaced it was true; the publish refusal made it false for one round.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        second = self.prepare(force=True)
+        self.edit(second, "replicas: 4\n")
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t2", "--body", "b"
+        )
+        published = len(self.broker.payloads("publish"))
+
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "t3", "--body", "b",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "t3")
+        self.assertEqual(len(self.broker.payloads("publish")), published)
 
     def test_a_proposal_opened_by_a_racing_run_is_updated_not_reported_as_failure(self):
         prepared = self.prepare()

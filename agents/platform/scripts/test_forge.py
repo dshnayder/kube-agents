@@ -36,9 +36,11 @@ What is left, and carries the weight:
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +48,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forge  # noqa: E402
 import sandbox_exec  # noqa: E402
 import vcs_client  # noqa: E402
+
+
+def protocol_members() -> set[str]:
+    """The operations `forge.ForgeProvider` declares.
+
+    Taken off the Protocol rather than written out, so a member added to it is
+    in scope for the conformance checks the moment it is added.
+    """
+    return {
+        name
+        for name, value in vars(forge.ForgeProvider).items()
+        if callable(value) and not name.startswith("_")
+    }
+
 
 REPO = "acme/toolkit"
 OTHER_REPO = "gitlab.example/acme/toolkit"
@@ -82,6 +98,11 @@ def comment(ref="issue-1", **fields):
     }
     node.update(fields)
     return node
+
+
+def _a_pull_request() -> "forge.PullRequest":
+    """A pull request the retry tests can pass around. Its fields do not matter."""
+    return forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
 
 
 class FakeBroker:
@@ -354,6 +375,107 @@ class CallTest(BrokerCase):
             forge.call("proposal-list", {}, REPO)
         self.assertEqual(ctx.exception.reason, "REPO_UNREACHABLE")
         self.assertEqual(ctx.exception.value, "the proxy fell over")
+
+    # -- the one retry -----------------------------------------------------
+    def test_a_transient_failure_on_a_read_is_tried_once_more(self):
+        """What `_call(..., retry_transient=True)` gave the reads before the port.
+
+        A 502 on `proposal-list` that is not retried aborts the whole tick: the
+        sweep catches one `ForgeError` for the repository loop and posts a
+        "watcher is not running" card, so a blip costs every repository ten
+        minutes rather than costing one call a second attempt.
+        """
+        for code in sorted(forge.TRANSIENT_CODES):
+            with self.subTest(code=code):
+                broker = FakeBroker()
+                attempts = []
+
+                def answer(payload, _attempts=attempts):
+                    _attempts.append(payload)
+                    if len(_attempts) == 1:
+                        raise vcs_client.VcsError("blip", code=code)
+                    return {"proposals": [], "truncated": False}
+
+                broker.answers["proposal-list"] = answer
+                with mock.patch.object(vcs_client, "call", broker):
+                    result = forge.call(
+                        "proposal-list", {}, REPO, retry_transient=True
+                    )
+                self.assertEqual(result, {"proposals": [], "truncated": False})
+                self.assertEqual(len(attempts), 2)
+
+    def test_the_second_attempt_is_the_last_one(self):
+        """One retry, not a loop. A forge that is down stays down for this tick."""
+        self.broker.refuse["proposal-list"] = vcs_client.VcsError(
+            "still down", code="FORGE_UNAVAILABLE"
+        )
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("proposal-list", {}, REPO, retry_transient=True)
+        self.assertEqual(ctx.exception.reason, "FORGE_UNAVAILABLE")
+        self.assertEqual(len(self.broker.payloads("proposal-list")), 2)
+
+    def test_a_definitive_refusal_is_not_retried(self):
+        """Nothing changes between two calls that a bad credential would survive.
+
+        `FORGE_RATE_LIMITED` is in here deliberately: the broker's guidance for
+        it says to wait, and an immediate second call spends the quota it is
+        asking for back.
+        """
+        for code in (
+            "FORGE_UNAUTHENTICATED",
+            "FORGE_NOT_FOUND",
+            "FORGE_FORBIDDEN",
+            "FORGE_RATE_LIMITED",
+            "FORGE_CONFLICT",
+            forge.REASON_SANDBOX_UNREACHABLE,
+        ):
+            with self.subTest(code=code):
+                broker = FakeBroker(
+                    refuse={"proposal-list": vcs_client.VcsError("no", code=code)}
+                )
+                with mock.patch.object(vcs_client, "call", broker):
+                    with self.assertRaises(forge.ForgeError):
+                        forge.call("proposal-list", {}, REPO, retry_transient=True)
+                self.assertEqual(len(broker.payloads("proposal-list")), 1)
+
+    def test_a_write_is_never_retried(self):
+        """`retry_transient` is off by default, and the writes leave it off.
+
+        `proposal-comment` that failed after the forge accepted it would post
+        the reviewer's answer a second time; there is no idempotency key on that
+        route to make the repeat a no-op.
+        """
+        self.broker.refuse["proposal-comment"] = vcs_client.VcsError(
+            "blip", code="FORGE_UNAVAILABLE"
+        )
+        provider = self.provider()
+        with self.assertRaises(forge.ForgeError):
+            provider.post_comment(REPO, _a_pull_request(), "hello")
+        self.assertEqual(len(self.broker.payloads("proposal-comment")), 1)
+
+    def test_every_read_the_sweep_makes_asks_for_the_retry(self):
+        """The reads, named here so a new one does not quietly go without it.
+
+        Checked by running each and counting the calls, rather than by reading
+        the argument off the source: what matters is that the second attempt
+        happens, not that a keyword appears.
+        """
+        pr = _a_pull_request()
+        reads = {
+            "identity": lambda p: p.viewer_login(REPO),
+            "proposal-list": lambda p: p.list_open_prs(REPO),
+            "proposal-view": lambda p: p.list_comments(REPO, pr),
+            "proposal-commits": lambda p: p.list_commits(REPO, pr),
+        }
+        for verb, read in reads.items():
+            with self.subTest(verb=verb):
+                broker = FakeBroker(
+                    refuse={verb: vcs_client.VcsError("blip", code="FORGE_UNAVAILABLE")}
+                )
+                with mock.patch.object(vcs_client, "call", broker):
+                    with self.assertRaises(forge.ForgeError):
+                        read(forge.provider_for())
+                self.assertEqual(len(broker.payloads(verb)), 2, verb)
 
     def test_detail_is_truncated_so_a_warning_stays_readable(self):
         """The warnings go in a Chat card; a page of JSON pushes the rest out of it."""
@@ -1102,17 +1224,42 @@ class ListCommitsTest(BrokerCase):
 
 class ProtocolConformanceTest(unittest.TestCase):
     def test_the_provider_implements_every_operation(self):
+        """Read off the Protocol, not copied from it.
+
+        The hand-kept list here was seven names while `ForgeProvider` had eight,
+        so `truncations` -- which the sweep calls on every tick -- was outside
+        every conformance check in the suite. A list that has to be edited
+        alongside the Protocol is a list that will be a member short again.
+        """
+        members = protocol_members()
+        self.assertIn("truncations", members)
         provider = forge.BrokerProvider()
-        for name in (
-            "viewer_login",
-            "supports_acknowledge",
-            "list_open_prs",
-            "list_comments",
-            "post_comment",
-            "acknowledge",
-            "list_commits",
-        ):
-            self.assertTrue(callable(getattr(provider, name)), name)
+        for name in members:
+            self.assertTrue(callable(getattr(provider, name, None)), name)
+
+    def test_the_design_document_names_the_same_operations(self):
+        """`docs/README.md` points a reader at §3 of that document for this protocol.
+
+        It reproduced seven of the eight members and called them "the complete
+        set", which is how a second provider written from the document would
+        miss one and raise `AttributeError` mid-sweep. The document is the
+        published surface; this keeps it honest without anyone re-reading it.
+        """
+        design = (
+            Path(__file__).resolve().parents[3]
+            / "docs/designs/pr-comment-conversation.md"
+        )
+        block = re.search(
+            r"class ForgeProvider\(Protocol\):(.*?)```", design.read_text(), re.S
+        )
+        self.assertIsNotNone(block, "the protocol block is no longer in §3")
+        documented = set(re.findall(r"def (\w+)\(", block.group(1)))
+        self.assertEqual(
+            protocol_members(),
+            documented,
+            "docs/designs/pr-comment-conversation.md §3 and forge.ForgeProvider "
+            "disagree about the protocol",
+        )
 
     def test_nothing_here_branches_on_which_forge_it_is(self):
         """One class, every forge -- the reason it is no longer `GitHubProvider`.

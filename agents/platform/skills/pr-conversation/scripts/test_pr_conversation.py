@@ -76,8 +76,11 @@ class FakeProvider:
         self.posted = []
         self.acknowledges = acknowledges
         self.viewer_lookups = []
-        #: What the real provider records when a listing fills its page.
-        #: Set by the tests that pin the operator warning.
+        #: What the real provider records when a listing fills its page. Nothing
+        #: in this skill reads it -- `github_scan_gate` is the only caller of
+        #: `truncations()`, and `test_github_scan_gate.py` is where the operator
+        #: warning is pinned. It is here because the fake stands in for the whole
+        #: Protocol, not because a test in this file sets it.
         self.truncated = []
 
     def truncations(self):

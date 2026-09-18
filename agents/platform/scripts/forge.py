@@ -149,6 +149,19 @@ REASON_CONVERSATION_TRUNCATED = "CONVERSATION_TRUNCATED"
 #: reports the same distinction under the same name.
 REASON_SANDBOX_UNREACHABLE = "SANDBOX_UNREACHABLE"
 
+#: The refusals worth one more attempt, and only these. Both are the broker's
+#: own reading of a failure on the forge's side of the call, and both say so in
+#: the guidance it returns: `FORGE_UNAVAILABLE` is "wait a few minutes and retry
+#: the same call unchanged", `FORGE_CALL_FAILED` is "one retry is reasonable;
+#: two is not". Everything else is definitive or needs a wait this module has no
+#: business taking inside a ten-minute tick — `FORGE_RATE_LIMITED` in particular
+#: gets worse when it is retried at once, and `FORGE_CONFLICT` says to re-read
+#: before trying again, which is a decision for the caller.
+#:
+#: `SANDBOX_UNREACHABLE` is deliberately not here. It is the transport, not the
+#: forge, and the timeout it usually means has already spent the budget once.
+TRANSIENT_CODES = frozenset({"FORGE_UNAVAILABLE", "FORGE_CALL_FAILED"})
+
 #: How much of a refusal's detail reaches the operator warning. The warnings go
 #: into a Chat card, and a forge that answers a rejected write with a page of
 #: JSON would otherwise push everything else in the card out of sight.
@@ -394,7 +407,7 @@ def _host_of(repo: str) -> str:
         return ""
 
 
-def call(verb: str, payload: dict, repo: str) -> dict:
+def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) -> dict:
     """One version-control verb against one repository, wherever this is running.
 
     Every forge call in this module and its consumers goes through here, so
@@ -421,11 +434,31 @@ def call(verb: str, payload: dict, repo: str) -> dict:
     the install that turned the sandbox off — the call then fails saying there
     is no broker, which is the honest report — and the normal case for a skill
     script the model runs, since that is already across the boundary.
+
+    **`retry_transient` is for reads, and the callers set it, not this.** One
+    more attempt on a failure the broker itself calls retryable
+    (`TRANSIENT_CODES`) is what the `gh`-era `_call(..., retry_transient=True)`
+    gave the three read paths, and losing it silently made a single 502 on
+    `proposal-list` enough to skip every repository for a tick and post a
+    "watcher is not running" card. It is off by default because a write is not
+    safe to repeat: `proposal-comment` that failed after the forge accepted it
+    would post the reviewer's answer twice, and there is no idempotency key on
+    that route to make the second call a no-op.
     """
-    with _as_forge_error(repo):
-        if sandbox_exec.sandbox_enabled():
-            return _forward(verb, payload, repo)
-        return vcs_client.forge(verb, dict(payload), repository=repo)
+    attempts = 2 if retry_transient else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            with _as_forge_error(repo):
+                if sandbox_exec.sandbox_enabled():
+                    return _forward(verb, payload, repo)
+                return vcs_client.forge(verb, dict(payload), repository=repo)
+        except ForgeError as error:
+            if attempt == attempts or error.reason not in TRANSIENT_CODES:
+                raise
+            LOGGER.warning(
+                "%s on %s failed with %s; retrying once", verb, repo, error.reason
+            )
+    raise AssertionError("unreachable")  # pragma: no cover -- the loop returns or raises
 
 
 def _forward(verb: str, payload: dict, repo: str) -> dict:
@@ -555,8 +588,10 @@ class BrokerProvider:
         self._truncations: list[str] = []
 
     # -- the seam ----------------------------------------------------------
-    def _verb(self, verb: str, payload: dict, repo: str) -> dict:
-        return call(verb, payload, repo)
+    def _verb(
+        self, verb: str, payload: dict, repo: str, *, retry_transient: bool = False
+    ) -> dict:
+        return call(verb, payload, repo, retry_transient=retry_transient)
 
     def _page(self, answer: dict, key: str, repo: str, what: str) -> list:
         """One listing's items, with a truncated page reported rather than hidden.
@@ -628,7 +663,7 @@ class BrokerProvider:
     def _identity(self, repo: str, login: Optional[str]) -> dict:
         """One `identity` call, normalised. `login` absent asks about the credential."""
         payload = {"login": login} if login else {}
-        answer = self._verb("identity", payload, repo)
+        answer = self._verb("identity", payload, repo, retry_transient=True)
         identity = answer.get("identity") or {}
         viewer = normalise_login(identity.get("login") or "")
         # The viewer rides along on every `identity` answer, including one
@@ -711,7 +746,12 @@ class BrokerProvider:
         branch on somebody's fork, and telling those apart is the first of the
         three things `is_agent_pull_request` checks.
         """
-        answer = self._verb("proposal-list", {"state": "open", "limit": PAGE_SIZE}, repo)
+        answer = self._verb(
+            "proposal-list",
+            {"state": "open", "limit": PAGE_SIZE},
+            repo,
+            retry_transient=True,
+        )
         return [
             PullRequest(
                 number=int(node.get("number") or 0),
@@ -758,6 +798,7 @@ class BrokerProvider:
             "proposal-view",
             {"number": pr.number, "comments": True, "limit": PAGE_SIZE},
             repo,
+            retry_transient=True,
         )
         if answer.get("commentsTruncated"):
             raise ForgeError(
@@ -854,7 +895,10 @@ class BrokerProvider:
         verb reports as `committed`.
         """
         answer = self._verb(
-            "proposal-commits", {"number": pr.number, "limit": PAGE_SIZE}, repo
+            "proposal-commits",
+            {"number": pr.number, "limit": PAGE_SIZE},
+            repo,
+            retry_transient=True,
         )
         commits = []
         for node in self._page(answer, "commits", repo, f"the commits on #{pr.number}"):

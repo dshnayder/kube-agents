@@ -34,8 +34,18 @@ import tempfile
 import urllib.error
 from pathlib import Path
 
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
+# `/opt/defaults/scripts` and `/opt/data/scripts` are how a script in the agent
+# pod finds its siblings. They are left off when this file *is* the trusted copy
+# the sandbox runs as `hermes`: the entrypoint chowns both to `agent`, and a
+# root-owned process must not carry a directory uid 1000 can write on its import
+# path at all, even behind site-packages. Nothing is lost by dropping them there
+# -- `sys.path[0]` is the trusted directory itself, the closure staged in it is
+# complete, and deploy/sandbox/trusted-closure-guard.py fails the build if it
+# ever stops being.
+TRUSTED_CLOSURE = "/opt/vcs/libexec/platform"
+if not str(Path(__file__).resolve()).startswith(TRUSTED_CLOSURE + "/"):
+    sys.path.append("/opt/defaults/scripts")
+    sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parent))
 
 import credential_proxy_client  # noqa: E402

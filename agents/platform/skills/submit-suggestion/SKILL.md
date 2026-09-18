@@ -77,8 +77,11 @@ In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the reposi
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
 `/opt/data/scratch` is shared with every other card: another card suggesting a
-change to the same repository right now has a copy of its own, and neither of
-you can reach into the other's.
+change to the same repository right now derives a different branch name for it,
+so it works in a different directory. Different, not protected — every card here
+runs as the same account and the whole tree is readable and writable from all of
+them. What keeps two suggestions apart is that no two of them share a branch
+name, which is why the name has to describe the change.
 
 ```json
 {
@@ -106,9 +109,18 @@ base.
 There is one working copy per repository **and branch**, so preparing a second
 change to the same repository does not disturb the first. If the copy for this
 branch holds revisions that were never published, `prepare` refuses to replace
-it and names `--force` as the way past.
-Read that refusal before reaching for the flag — it usually means the previous
-run's work never got submitted, and `--force` is how it stops existing.
+it. Finishing them is the way past, not the flag: go to the copy the refusal
+names, publish what is in it and open the proposal, and this `prepare` becomes a
+second round on that branch instead of a replacement. `--force` deletes those
+revisions; it is the answer only once you have read them and decided they should
+not exist.
+
+`prepare` refuses the name for a second reason: the proposal it was last used
+for is closed, and its revisions are not in the history you just cloned. That is
+what a squash merge leaves behind — the change is in the trunk under a different
+revision, the branch is still on the forge, and building on it again would
+re-propose work that has already landed. Choose a different name; the derived
+one is a default, not a requirement.
 
 ### Step 2: Make the Changes
 

@@ -25,8 +25,11 @@ from pathlib import Path
 # scripts shared across profiles rather than copying them into each one). The
 # third entry is the same directory in a source checkout. Mirrors fleet-audit's
 # audit_report, which needs the same modules for the same reason.
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
+# Off when this file is the trusted copy -- see the same block in vcs_client.py.
+TRUSTED_CLOSURE = "/opt/vcs/libexec/platform"
+if not str(Path(__file__).resolve()).startswith(TRUSTED_CLOSURE + "/"):
+    sys.path.append("/opt/defaults/scripts")
+    sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 # `sandbox_exec` has no import-time dependency on anything under /opt — the yaml
@@ -41,11 +44,19 @@ from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
 
 SCRATCH_DIR = "/opt/data/scratch"
 
-# Where this file lands inside the sandbox. The image bakes the skills tree into
+# Which copy of this file the forwarded `poll` runs, and it is deliberately not
+# the one the model has. The image also bakes the skills tree into
 # /opt/defaults/skills and the entrypoint syncs it onto the volume under
-# $HERMES_HOME, which is /opt/data there. Same arrangement, and named for the
-# same reason, as `github_token_refresh.SANDBOX_REFRESH_SCRIPT`.
-SANDBOX_RESOLVER = "/opt/data/skills/github-issue-resolver/scripts/resolver.py"
+# $HERMES_HOME (/opt/data in the sandbox), but that tree is `chown agent:agent`:
+# uid 1000 can rewrite it and the edit stands until the next restart. `_forward`
+# crosses as `hermes`, which holds the cron's credential and a 0700 home the
+# model must not be able to author into, so it must not execute anything the
+# model can write -- the rule deploy/sandbox/Dockerfile states above its
+# /opt/defaults chown. So the forwarded path is the root-owned staging the
+# Dockerfile builds, whose whole import closure is staged with it and checked at
+# build time by deploy/sandbox/trusted-closure-guard.py. Same constant, same
+# reason and the same directory as `forge.SANDBOX_FORGE`.
+SANDBOX_RESOLVER = "/opt/vcs/libexec/platform/resolver.py"
 
 # Bounds the ssh hop around a forwarded subcommand, and it is deliberately the
 # caller's own budget rather than a number of this file's choosing.

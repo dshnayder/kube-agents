@@ -131,9 +131,13 @@ there is, or from the directory you are standing in; `--repo` says which when
 there are several.
 
 One repository can be cloned more than once here — the copy is named for its
-branch as well as its repository, so a second card working the same repository
-gets a copy of its own rather than yours. When two copies of one repository
-exist, `--repo` no longer picks between them: **run the verb from inside the
+branch as well as its repository, so a card working a _different_ branch of the
+same repository gets a copy of its own rather than yours. That is naming, not a
+permission boundary, and it does not separate two cards reading the _same_
+branch: with no `--branch` every reader asks for the trunk and every reader
+lands on the one directory. The second `clone` replaces what is there, and
+refuses to when that copy holds work that was never published. When two copies
+of one repository exist, `--repo` no longer picks between them: **run the verb from inside the
 copy you mean.** The refusal names the paths.
 
 ## Write
@@ -259,6 +263,8 @@ the conversation they read, as `commentCount` and `commentsTruncated`. Take
 `commentsTruncated: true` seriously before you reply to anything: it means you
 are looking at the oldest page of a longer thread, so the most recent word on
 the subject — including an answer somebody already gave — is not in front of
-you. Read the rest with a narrower `-n` and a second look, or say that you could
-not read the whole thread. It is the one truncation where carrying on quietly
+you. There is no way to read the rest from here: `-n` can only make the page
+smaller, and it is the same oldest page either way. Say that you could not read
+the whole thread, and do not answer anything that turns on what the rest of it
+says. It is the one truncation where carrying on quietly
 produces a confidently wrong answer rather than an incomplete one.

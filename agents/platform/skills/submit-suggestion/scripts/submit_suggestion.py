@@ -141,6 +141,13 @@ def validate_repo(repo: str) -> str:
     return gitops_workspace.validate_repo_org(repo)
 
 
+#: How far back the branch-name history is read. A name is looked up to find
+#: out whether the remote still holds a spent branch under it; one answer
+#: settles that, and the verbs answer newest first. The handful above one is
+#: slack for a forge that orders differently, not a page to walk.
+PROPOSAL_HISTORY_LIMIT = 5
+
+
 def open_proposal(repo: str, branch: str) -> dict | None:
     """The open change proposal whose source is `branch`, or None.
 
@@ -149,9 +156,10 @@ def open_proposal(repo: str, branch: str) -> dict | None:
     `gh pr view <branch>` it replaces did not.
 
     It does not count a merged or closed proposal. Branch names here are
-    derived from the change (`platform-agent/<type>-<target>`), so a branch is
-    reused after its proposal merges, and asking for "the proposal on this
-    branch" answered with that one.
+    derived from the change (`platform-agent/<type>-<target>`), so a name
+    recurs after its proposal is done with, and asking for "the proposal on
+    this branch" answered with that one. Whether the *branch* can be reused is
+    a separate question with a different answer -- see `spent_proposal`.
 
     It does not read a failed lookup as an empty one. An expired credential and
     "this branch has no proposal" are opposite answers, and collapsing them
@@ -168,6 +176,71 @@ def open_proposal(repo: str, branch: str) -> dict | None:
     )
     proposals = answer.get("proposals") or []
     return proposals[0] if proposals else None
+
+
+def spent_proposal(repo: str, branch: str) -> dict | None:
+    """A closed or merged proposal whose source was `branch`, or None.
+
+    Asked because the branch name outlives the proposal. On a forge that does
+    not delete the branch when its proposal is merged -- the default on GitHub,
+    and not something this install controls on somebody else's repository --
+    the remote still holds the old tip afterwards, and a branch cut afresh from
+    the base does not build on it. `publish` is then refused with
+    `BRANCH_DIVERGED`, and the refusal arrives after the whole change has been
+    written.
+
+    `state: "all"` minus the open ones rather than a `closed` filter: "closed"
+    and "merged" are two states on every forge and one word on none of them.
+    The newest is the one that matters, and the verbs answer newest first.
+
+    Whether the old tip is actually in the way is a second question, which
+    `stale_tip` answers. This one is cheap and is asked first, because a branch
+    with no history behind it -- every card's ordinary case -- stops here.
+    """
+    answer = vcs_client.forge(
+        "proposal-list",
+        {"source": branch, "state": "all", "limit": PROPOSAL_HISTORY_LIMIT},
+        repository=repo,
+    )
+    spent = [
+        proposal
+        for proposal in (answer.get("proposals") or [])
+        if proposal.get("state") != "open"
+    ]
+    return spent[0] if spent else None
+
+
+def stale_tip(repo: str, proposal: dict, session: dict) -> str:
+    """The spent proposal's last revision, when the fresh copy does not contain it.
+
+    "" when it does, which is the case that is fine and is not rare: a proposal
+    merged with a merge commit leaves its tip reachable from the base, so a
+    branch cut from the base descends from what the remote holds and `publish`
+    fast-forwards it. A squash-merge or a close leaves it unreachable, and that
+    is the one this refuses.
+
+    Answered against the copy in hand rather than by asking the forge a second
+    question, because "is this revision an ancestor of what I am standing on"
+    is a question about history and the history is right here. A revision the
+    copy has never heard of is reported as in the way -- `merge-base` exits
+    non-zero on an unknown revision, and the honest reading of that is that the
+    base does not contain it.
+    """
+    commits = vcs_client.forge(
+        "proposal-commits",
+        {"number": proposal["number"], "limit": PROPOSAL_HISTORY_LIMIT},
+        repository=repo,
+    ).get("commits") or []
+    tip = str((commits[-1] or {}).get("sha") or "") if commits else ""
+    if not tip:
+        # Nothing to compare. A proposal whose commits cannot be read is not
+        # evidence that the branch is in the way, and refusing on it would stop
+        # every card on a forge whose commit listing is unavailable.
+        return ""
+    contained = vcs_client.local(
+        session, ["merge-base", "--is-ancestor", tip, "HEAD"], "merge-base"
+    )
+    return "" if contained.get("exitCode") == 0 else tip
 
 
 def handle_prepare(args) -> int:
@@ -201,11 +274,34 @@ def handle_prepare(args) -> int:
         refuse_branch_on_its_own_base(branch, base, "prepare")
         started_from = branch
     else:
+        # Before the copy comes down, because it is one call and it is the only
+        # thing that reads the name's history. What it costs on the ordinary
+        # card -- a name nobody has used -- is that one call.
+        spent = spent_proposal(repo, branch)
         # `key=branch` although the copy is of the base: the tree belongs to
         # this card's change, and a sibling card preparing another branch of the
         # same repository gets a tree of its own rather than colliding here.
         cloned = vcs_client.clone(repo, force=args.force, key=branch)
         base = cloned["branch"]
+        if spent:
+            # After the clone, not before it: the question is whether the base
+            # this copy is standing on already contains the old tip, and that is
+            # answered in the copy.
+            in_the_way = stale_tip(repo, spent, vcs_client.resolve_session(repo, key=branch))
+            if in_the_way:
+                raise ValueError(
+                    f"'{branch}' was the source of "
+                    f"{spent.get('url') or 'an earlier proposal'}, which is "
+                    f"{spent.get('state') or 'no longer open'}, and the remote "
+                    f"still holds that branch at {in_the_way[:12]} — a revision "
+                    f"'{base}' does not contain, so it was squash-merged or "
+                    "closed rather than merged whole. A change cut fresh from "
+                    f"'{base}' does not build on it, and publishing it would be "
+                    "refused as BRANCH_DIVERGED after the whole change had been "
+                    "written. Submit this one under a branch name the repository "
+                    "has not used: the derived name is a default, not a "
+                    "requirement."
+                )
         # Before the switch below, not after it. The branch the copy came down
         # on is the remote's default, and `check_branch` cannot know its name:
         # a fleet whose trunk is `release-trunk` gets past the list of three.
@@ -316,19 +412,28 @@ def handle_submit(args) -> int:
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=branch)
 
-    if proposal is None and vcs_client.already_published(session, branch):
-        # The one state a retry has to be able to walk back into: the publish
-        # landed and the `proposal-create` after it did not — a rate limit, a
-        # 5xx, a body the forge rejected. Re-running `submit` would otherwise
-        # find nothing new to send and be refused before reaching the step that
-        # actually failed, and re-running `prepare` would cut the branch afresh
-        # and be refused by the broker as `BRANCH_DIVERGED`. The pair this
-        # replaced — `git push --force-with-lease` then `gh pr create` — was
-        # idempotent on retry, and this is what keeps that true.
-        log(
-            f"'{branch}' is already on {repo} at this revision; opening the "
-            "proposal that never landed."
+    if vcs_client.already_published(session, branch):
+        # The state a retry has to be able to walk back into: the publish landed
+        # and the forge call after it did not — a rate limit, a 5xx, a body the
+        # forge rejected. Re-running `submit` would otherwise find nothing new
+        # to send and be refused before reaching the step that actually failed,
+        # and re-running `prepare` would cut the branch afresh and be refused by
+        # the broker as `BRANCH_DIVERGED`. The pair this replaced — `git push
+        # --force-with-lease` then `gh pr create` — was idempotent on retry, and
+        # this is what keeps that true.
+        #
+        # Both rounds, not just the first. The second round's failure lands in
+        # the same place with a different verb after it — publish, then
+        # `proposal-update` — and reading `already_published` only when no
+        # proposal was open left that retry with no route at all: `publish`
+        # answers "there are no new revisions to publish", and the description
+        # update it was retrying for is on the far side of that refusal. It is
+        # also what makes SKILL.md's "resubmitting is not an error" true of a
+        # re-run that has nothing new to commit.
+        landed = "opening the proposal that never landed." if proposal is None else (
+            "refreshing the proposal it belongs to."
         )
+        log(f"'{branch}' is already on {repo} at this revision; {landed}")
     else:
         log(f"Publishing '{branch}' to {repo}...")
         # `advance` exactly when the copy was taken of this branch rather than
