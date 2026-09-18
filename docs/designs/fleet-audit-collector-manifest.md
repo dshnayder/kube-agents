@@ -266,7 +266,10 @@ The rows a manifest-less run carries render under the same heading with their ow
 from a previous run's manifest, this run passed none and cannot release them, and a
 _Last recorded_ line naming the collector's last recorded command where the previous row had one
 (omitted where none was recorded). The collector wording — "the collector ran … there this run and
-still flags this object" — is used only for rows this run's manifest vouches for. The readers
+still flags this object" — is used only for rows this run's manifest vouches for. The note tier
+carries the same three spellings in one paragraph, so a body squeezed out of its rows claims no
+more than a roomy one did: a manifest-less carry does not say a collector emits anything this run,
+and the dry run's note says it is previewing rather than holding. The readers
 locate the held section by two comment markers the renderer owns (`<!-- audit-held:begin -->` /
 `<!-- audit-held:end -->`), never by Markdown headings, so a model-written line beginning `## `, an
 unbalanced fence, or the held heading's own text inside an excerpt changes nothing. A body main

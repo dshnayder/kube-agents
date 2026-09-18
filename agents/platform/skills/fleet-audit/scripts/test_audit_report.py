@@ -15225,6 +15225,36 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn(audit_report.HELD_SECTION_BEGIN, edited)
         self.assertNotIn(derived_id(fid="first"), audit_report.parse_delta_block(edited))
 
+    def note_tier_body(self, **kwargs):
+        """A body squeezed to the third tier: `MAX_HELD_IDS` held findings put
+        even the identity-lines tier over the budget, and the note fits."""
+        held = [self.held_entry(i) for i in range(audit_report.MAX_HELD_IDS)]
+        body = audit_report.render_issue_body(
+            make_doc(findings=[]), generated_at=NOW, audit_id=AUDIT, held=held, **kwargs
+        ).body
+        self.assertIn("## Held by the collector", body)
+        self.assertIn("The body had no room for their rows", body)
+        self.assertEqual(
+            audit_report.parse_held_ids(body), [e["id"] for e in held]
+        )
+        return body
+
+    def test_the_note_tier_says_only_what_its_run_observed(self):
+        """The third tier is the row tiers' sentence in one paragraph, so it
+        makes the same three claims: a manifest run says the collector still
+        emits each, a carry says the hold is a previous run's, and a dry run
+        says it is previewing. A squeezed body that claims an observation the
+        run never made is read back by next run's worker as one."""
+        observed = "the collector still emits a candidate for"
+        fresh = self.note_tier_body()
+        self.assertIn(observed, fresh)
+        carried = self.note_tier_body(held_carried=True)
+        self.assertIn("held from a previous run's manifest; this run passed none", carried)
+        self.assertNotIn(observed, carried)
+        preview = self.note_tier_body(held_preview=True)
+        self.assertIn("the real run holds only if the ledger's hidden marker carries them", preview)
+        self.assertNotIn("kept on this ledger", preview)
+
     def test_the_fourth_tier_still_carries_its_ids(self):
         """With no room for even the note, the span and its list are written,
         nothing visible; the next flagless run and the next manifest run both

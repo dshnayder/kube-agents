@@ -6375,7 +6375,9 @@ def _render_collector_held(
     return out + _render_held_overflow(overflow) + _held_span_close(held)
 
 
-def _render_held_note(held: list[dict], *, overflow: int = 0) -> list[str]:
+def _render_held_note(
+    held: list[dict], *, overflow: int = 0, preview: bool = False, carried: bool = False
+) -> list[str]:
     """The third tier for the held section: the count, and where the ids are.
 
     Rendered only when not even the identity lines fit beside the document's
@@ -6387,20 +6389,44 @@ def _render_held_note(held: list[dict], *, overflow: int = 0) -> list[str]:
     have given: a manifest run recovers the identity from the candidate, a
     manifest-less run carries the id alone. The fourth tier, when not even
     this fits, is the span and the list with nothing visible.
+
+    The three spellings are the row tiers': a squeezed body says no more than
+    a roomy one did, so a carry over a run that passed no manifest does not
+    claim a collector observed anything this run, and a dry run does not claim
+    the ledger holds what it is only previewing.
     """
     if not held:
         return []
+    if carried:
+        opening = (
+            f"{len(held)} previous finding(s) held from a previous run's manifest; this "
+            "run passed none and cannot release them. The body had no room for their "
+            "rows; their ids are in the hidden block below, which is what the next run "
+            "reads them back from, and each stays until a manifest run no longer emits "
+            "it or a `declared` entry covers it."
+        )
+    elif preview:
+        opening = (
+            f"{len(held)} candidate(s) the real run holds only if the ledger's hidden "
+            "marker carries them — the collector still emits each and this document does "
+            "not carry it. The body had no room for their rows; they are shown from the "
+            "manifest, and the real run intersects them with the marker it reads back."
+        )
+    else:
+        opening = (
+            f"{len(held)} previous finding(s) this run's document did not carry are "
+            "kept on this ledger because the collector still emits a candidate for "
+            "each. The body had no room for their rows; their ids are in the hidden "
+            "block below, which is what the next run reads them back from, and each "
+            "stays held until the collector stops emitting it or a `declared` entry "
+            "covers it."
+        )
     return [
         "",
         HELD_SECTION_BEGIN,
         HELD_SECTION_HEADING,
         "",
-        f"{len(held)} previous finding(s) this run's document did not carry are "
-        "kept on this ledger because the collector still emits a candidate for "
-        "each. The body had no room for their rows; their ids are in the hidden "
-        "block below, which is what the next run reads them back from, and each "
-        "stays held until the collector stops emitting it or a `declared` entry "
-        "covers it.",
+        opening,
     ] + _render_held_overflow(overflow) + _held_span_close(held)
 
 
@@ -6784,7 +6810,9 @@ def render_issue_body(
             preview=held_preview,
             carried=held_carried,
         ),
-        _render_held_note(held_entries, overflow=held_overflow),
+        _render_held_note(
+            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+        ),
     ):
         if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
             held_section = candidate_section
