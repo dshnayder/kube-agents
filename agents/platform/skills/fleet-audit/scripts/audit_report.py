@@ -3127,9 +3127,19 @@ def collector_held_entries(
         marker_ids, _ = previous_marker_ids(previous_body)
         held_ids = [fid for fid in marker_ids if fid in flagged]
         respelled = _respelled_rows(previous_body)
+        # Titles from the rows that recorded a location, not from every
+        # heading. `held_row_from_id` renders a heading too -- "<id> (carried
+        # by id; location not recorded on the previous ledger)" -- and it is a
+        # placeholder for the one thing this branch already has: the candidate
+        # the collector still emits, with the real cluster and object on it.
+        # Reading it back pinned that sentence over a row whose `Where:` line
+        # names the location it says was not recorded, on every run after, and
+        # sent it out again as the finding's name in the delta comment and in
+        # the stale-close pass. A row with no `Where:` line has no title worth
+        # carrying, so the fallback below builds one from the candidate.
         titles = {
-            respelled.get(raw, raw): title
-            for raw, title in parse_finding_titles(previous_body).items()
+            respelled.get(raw, raw): where["title"]
+            for raw, where in parse_finding_locations(previous_body).items()
         }
     if not held_ids:
         return []

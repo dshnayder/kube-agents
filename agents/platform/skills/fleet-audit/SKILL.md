@@ -351,12 +351,15 @@ something else broke.
 
 ### Partial coverage
 
-`partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
-`scope.skipped`, any cluster carrying a `limitations` note, any cluster whose `checks_run` is
-short of the checks that _apply_ to it, or — on a stream with a declared-intent step — posture
-checks that ran without a complete search record ([`declared_intent_searched`](#declared_intent_searched)).
-`coverage_gaps` says which, and why — so `partial` is `true` if and only if `coverage_gaps` is
-non-empty, and you can report from either.
+`partial` is `true` exactly when the run could not speak for the whole fleet. Four of the six
+sources are in the document: any entry in `scope.skipped`, any cluster carrying a `limitations`
+note, any cluster whose `checks_run` is short of the checks that _apply_ to it, or — on a stream
+with a declared-intent step — posture checks that ran without a complete search record
+([`declared_intent_searched`](#declared_intent_searched)). The other two belong to the run rather
+than to the document, so a document that reads as complete can still produce them: a collector
+manifest waived with `--no-collector-manifest`, whose reason becomes the gap, and a previous ledger
+body `finish` could not read and therefore left as it was. `coverage_gaps` says which, and why — so
+`partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
 
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
@@ -373,9 +376,11 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run;
-- does **not** close the ledger, even with zero findings — `status` is still `CLEAN`, but the issue
-  stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
-  readable again.
+- does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
+  naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
+  ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
+  nor prevents (see [The clean run](#the-clean-run)). The stream self-heals the day the fleet is
+  fully readable again.
 
 A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
 and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.

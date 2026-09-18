@@ -15283,6 +15283,45 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         self.assertEqual([e["id"] for e in via_manifest], held_ids)
 
+    def test_a_row_carried_by_id_stops_naming_the_finding_once_it_is_recovered(self):
+        """Fourth tier, then a flagless run, then a manifest run: the chain the
+        id-only row's placeholder heading used to survive. Run C has the
+        candidate and so the real location; the heading it writes must be the
+        candidate's and not run B's sentence saying no location was recorded."""
+        entry = self.held_entry(0)
+        fid = entry["id"]
+        # Run B carries the id alone, because run A's body was squeezed past
+        # the row that would have recorded where the finding is.
+        body_b = audit_report.render_issue_body(
+            make_doc(findings=[]),
+            generated_at=NOW,
+            audit_id=AUDIT,
+            held=[audit_report.held_row_from_id(fid)],
+            held_carried=True,
+        ).body
+        placeholder = "carried by id; location not recorded"
+        self.assertIn(placeholder, body_b)
+        self.assertIn(fid, audit_report.parse_delta_block(body_b))
+        # Run C: a manifest still emitting the candidate.
+        manifest = _full_manifest(
+            candidates=[self.netpol_candidate(object=entry["object"])]
+        )
+        recovered = audit_report.collector_held_entries(
+            manifest, make_doc(findings=[]), exclude=set(), previous_body=body_b
+        )
+        self.assertEqual([e["id"] for e in recovered], [fid])
+        self.assertEqual(recovered[0]["title"], f"netpol-missing on {entry['object']}")
+        body_c = audit_report.render_issue_body(
+            make_doc(findings=[]), generated_at=NOW, audit_id=AUDIT, held=recovered
+        ).body
+        self.assertNotIn(placeholder, body_c)
+        # And the run after C reads that heading back, so the name stays put
+        # rather than reverting on the next carry.
+        self.assertEqual(
+            audit_report.parse_finding_titles(body_c)[fid],
+            f"netpol-missing on {entry['object']}",
+        )
+
     def test_an_inline_begin_marker_does_not_open_a_held_span(self):
         """Part 1. The renderer writes each bracket alone on its line, so one
         quoted mid-heading is text; reading it as a span would let a heading
