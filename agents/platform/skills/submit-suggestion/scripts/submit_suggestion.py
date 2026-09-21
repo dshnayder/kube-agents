@@ -293,19 +293,36 @@ def handle_prepare(args) -> int:
             # this copy is standing on already contains the old tip, and that is
             # answered in the copy.
             in_the_way = stale_tip(repo, spent, vcs_client.resolve_session(repo, key=branch))
-            if in_the_way:
+            spent_named = (
+                f"'{branch}' was the source of "
+                f"{spent.get('url') or 'an earlier proposal'}, which is "
+                f"{spent.get('state') or 'no longer open'}. That proposal's last "
+                f"revision, {in_the_way[:12]}, is not in '{base}', so it was "
+                "squash-merged or closed rather than merged whole"
+            ) if in_the_way else ""
+            if in_the_way and getattr(args, "allow_reused_branch", False):
+                # Said, not silent. If the caller is wrong about the branch
+                # being gone, `publish` refuses BRANCH_DIVERGED at the end of
+                # the turn, and this line is what makes that refusal legible
+                # rather than a surprise.
+                log(
+                    f"{spent_named}. --allow-reused-branch says the repository "
+                    "no longer holds the branch, so the name is free; if it "
+                    "does still hold it, publishing will be refused as "
+                    "BRANCH_DIVERGED."
+                )
+            elif in_the_way:
                 raise ValueError(
-                    f"'{branch}' was the source of "
-                    f"{spent.get('url') or 'an earlier proposal'}, which is "
-                    f"{spent.get('state') or 'no longer open'}, and the remote "
-                    f"still holds that branch at {in_the_way[:12]} — a revision "
-                    f"'{base}' does not contain, so it was squash-merged or "
-                    "closed rather than merged whole. A change cut fresh from "
+                    f"{spent_named}. If the remote still holds the branch "
+                    "there, a change cut fresh from "
                     f"'{base}' does not build on it, and publishing it would be "
                     "refused as BRANCH_DIVERGED after the whole change had been "
                     "written. Submit this one under a branch name the repository "
                     "has not used: the derived name is a default, not a "
-                    "requirement."
+                    "requirement. If the repository deletes a branch when it "
+                    "merges it, the name is already free — nothing here can see "
+                    "that, because no read verb reports whether a branch exists "
+                    "— so say so with --allow-reused-branch."
                 )
         # Before the switch below, not after it. The branch the copy came down
         # on is the remote's default, and `check_branch` cannot know its name:
@@ -598,6 +615,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Replace an existing copy even if it holds unpublished work",
+    )
+    prepare.add_argument(
+        "--allow-reused-branch",
+        action="store_true",
+        help="The repository deleted this branch when it merged it, so the name "
+        "is free to use again",
     )
 
     submit = subparsers.add_parser(

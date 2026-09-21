@@ -362,6 +362,41 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # The revision named is the one the remote's branch is actually at.
         self.assertIn(merged["sourceRevision"][:12], message)
 
+    def test_a_repository_that_deletes_merged_branches_can_reuse_the_name(self):
+        """The refusal above is right only while the remote still holds the branch.
+
+        GitHub's "automatically delete head branches" is on in plenty of
+        repositories, and there it deletes the branch as it squash-merges. The
+        name is then free, `publish` would create it and succeed, and the check
+        cannot tell the two cases apart: no read verb in the vocabulary reports
+        whether a branch exists. So the caller says which it is, and is told
+        what it is being trusted about.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+        # What deleting the head branch looks like from here: the remote no
+        # longer has it, and the revision it was at is still unreachable from
+        # the base, so `stale_tip` answers exactly as it does above.
+        git(self.origin, "branch", "--quiet", "-D", branch)
+
+        prepared = self.prepare(branch, allow_reused_branch=True)
+
+        self.assertEqual(prepared["branch"], branch)
+        standing = git(Path(prepared["workspace"]), "rev-parse", "--abbrev-ref", "HEAD")
+        self.assertEqual(standing.stdout.strip(), branch)
+        # Trusted, not silently. If the caller was wrong, this line is what
+        # makes the BRANCH_DIVERGED at the end of the turn legible.
+        said = "\n".join(self.logged)
+        self.assertIn("BRANCH_DIVERGED", said)
+        self.assertIn(merged["url"], said)
+
     def test_prepare_names_the_real_tip_of_a_long_spent_branch(self):
         """The tip is the proposal's `sourceRevision`, not the last commit of a page.
 

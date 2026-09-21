@@ -122,6 +122,15 @@ revision, the branch is still on the forge, and building on it again would
 re-propose work that has already landed. Choose a different name; the derived
 one is a default, not a requirement.
 
+That refusal holds only while the forge still has the branch, and many
+repositories delete it as they merge it. Nothing here can tell the two apart:
+no read verb reports whether a branch exists, so a name whose branch is gone
+looks exactly like a name whose branch is in the way. If you know the
+repository deletes merged branches, `--allow-reused-branch` says so and
+`prepare` proceeds on the name. It is a claim, not a check — get it wrong and
+`submit` is refused as `BRANCH_DIVERGED` at the end of the turn, after the
+change is written.
+
 ### Step 2: Make the Changes
 
 Generate or edit the files **inside the returned `workspace`**.
