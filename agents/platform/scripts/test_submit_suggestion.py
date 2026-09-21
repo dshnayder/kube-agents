@@ -420,8 +420,14 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self.prepare(branch)
         self.assertIn(tip[:12], str(caught.exception))
-        # Answered off the proposal itself: no commit listing is read.
-        self.assertEqual(self.broker.payloads("proposal-commits"), [])
+        # Answered off the proposal itself. Asserting the whole sequence and
+        # not the absence of one verb: `submit_suggestion` issues no
+        # `proposal-commits` on any path, so a check for that alone passes
+        # however many calls `prepare` makes.
+        self.assertEqual(
+            [verb for verb, _ in self.broker.calls],
+            ["proposal-list", "proposal-list", "clone"],
+        )
 
     def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):
         """The case that works, and it must keep working.
@@ -461,12 +467,15 @@ class SubmitSuggestionTestCase(unittest.TestCase):
     def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
         """The ordinary card, and the one the extra lookup must not cost anything.
 
-        One `proposal-list` for the history, one for the open proposal, and no
-        commit listing at all -- that last only happens when a spent proposal
-        turns up.
+        One `proposal-list` for the history, one for the open proposal, and
+        nothing else across the seam -- the spent-name lookup is the first of
+        the two, and it is the whole of what the check costs here.
         """
         self.prepare()
-        self.assertEqual(self.broker.payloads("proposal-commits"), [])
+        self.assertEqual(
+            [verb for verb, _ in self.broker.calls],
+            ["proposal-list", "proposal-list", "clone"],
+        )
 
     def test_prepare_reads_the_base_off_the_open_proposal_not_the_default_branch(self):
         git(self.origin, "checkout", "--quiet", "-b", "release")
