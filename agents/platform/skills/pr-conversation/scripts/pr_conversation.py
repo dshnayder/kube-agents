@@ -324,24 +324,57 @@ def handle_poll(args) -> int:
         provider = forge.provider_for(repo=repos[0])
         prs: list[tuple[str, forge.PullRequest]] = []
         nameless: list[str] = []
+        # Repositories the poll could not read at all, with the reason. A
+        # different thing from `nameless`: that is a credential that answered
+        # and could not name itself, this is a call that did not come back.
+        refused: list[tuple[str, forge.ForgeError]] = []
         for r in repos:
             # Per repository, because identity belongs to a forge rather than
             # to this install: two configured forges are two accounts. The
             # provider caches per repository, so repositories on one forge
             # share a single lookup.
-            viewer = provider.viewer_login(r)
-            if not viewer:
-                # Without it the agent cannot tell its own pull requests from a
-                # stranger's, nor its own comments from a reviewer's — both of
-                # which fail dangerously — so this repository is skipped rather
-                # than swept half-blind.
-                nameless.append(r)
-                continue
-            for pr in provider.list_open_prs(r):
-                if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
-                    if not args.pr or pr.number == args.pr:
-                        prs.append((r, pr))
-        if len(nameless) == len(repos):
+            #
+            # The refusal is caught here and not by the guard around this whole
+            # block. `viewer_login` raises for a credential the forge rejected
+            # and for a host no provider module claims, and out there one such
+            # repository ended the poll for every other one — the worker was
+            # handed an ERROR and none of the requests waiting on a repository
+            # that was working, every tick until somebody fixed the other.
+            try:
+                viewer = provider.viewer_login(r)
+                if not viewer:
+                    # Without it the agent cannot tell its own pull requests
+                    # from a stranger's, nor its own comments from a
+                    # reviewer's — both of which fail dangerously — so this
+                    # repository is skipped rather than swept half-blind.
+                    nameless.append(r)
+                    continue
+                for pr in provider.list_open_prs(r):
+                    if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
+                        if not args.pr or pr.number == args.pr:
+                            prs.append((r, pr))
+            except forge.ForgeError as error:
+                refused.append((r, error))
+        # Before either decision below, so a repository dropped for one reason
+        # is still named when the poll ends for the other. stderr for the same
+        # reason `nameless` uses it: out of the JSON the SKILL parses, in front
+        # of whoever is debugging a request that never arrived.
+        for name, error in sorted(refused, key=lambda item: item[0]):
+            sys.stderr.write(
+                f"pr_conversation: {name} not swept — {error.reason}"
+                f"{f' ({error.value})' if error.value else ''}\n"
+            )
+        if refused and not prs and not nameless:
+            # Nothing was read and nothing else to report, so there is no
+            # partial poll to qualify and the first refusal is the whole
+            # story — the same single ERROR this printed before it read
+            # repositories one at a time.
+            first = refused[0][1]
+            print(json.dumps(
+                {"status": "ERROR", "reason": first.reason, "value": first.value}
+            ))
+            return 0
+        if nameless and len(nameless) + len(refused) == len(repos):
             # Every one of them: this is the credential, not a repository, and
             # the model is told so rather than shown an empty poll it would
             # read as "nothing to do".
@@ -354,8 +387,7 @@ def handle_poll(args) -> int:
         if nameless:
             # Some but not all. The poll goes on with what it can read, but a
             # repository dropped in silence reads as one with nothing on it, so
-            # it is named on stderr — out of the JSON the SKILL parses, in
-            # front of whoever is debugging a request that never arrived.
+            # it is named on stderr too.
             sys.stderr.write(
                 f"pr_conversation: {len(nameless)} repository(ies) not swept — "
                 f"the credential cannot name itself there: {', '.join(nameless)}\n"

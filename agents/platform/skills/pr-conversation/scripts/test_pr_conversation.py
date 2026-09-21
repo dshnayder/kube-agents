@@ -89,8 +89,15 @@ class FakeProvider:
     def viewer_login(self, repo):
         self.viewer_lookups.append(repo)
         if isinstance(self._viewer, dict):
-            return self._viewer.get(repo, "")
-        return self._viewer
+            answer = self._viewer.get(repo, "")
+        else:
+            answer = self._viewer
+        # A forge that refuses the credential outright, as against one that
+        # answers with no name. The two are different outcomes for the sweep,
+        # so the fake has to be able to produce either.
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     def supports_acknowledge(self, repo):
         return self.acknowledges
@@ -255,6 +262,49 @@ class PollTest(_Harness):
         # `FakeProvider` answers the same proposal for either repository, and
         # only the readable one's contributed a request.
         self.assertEqual(len(payload["requests"]), 1)
+
+    def test_a_repository_whose_identity_refuses_is_skipped_not_the_sweep(self):
+        """One dead credential must not stand down the poll everywhere else.
+
+        `viewer_login` raises for a credential the forge rejected and for a host
+        no provider module claims. Asked per repository, that refusal ended the
+        whole poll: the worker got an ERROR and none of the requests waiting on
+        a forge that was answering, every tick until somebody fixed the other
+        one. The sibling of this test lives in `test_github_scan_gate.py`; the
+        same loop was written twice.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_AUTH", "HTTP 401"),
+            },
+        )
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(len(payload["requests"]), 1)
+        # Skipped, but not in silence: a repository dropped without a word reads
+        # as one with nothing on it.
+        self.assertIn(OTHER_REPO, err.getvalue())
+        self.assertIn("FORGE_AUTH", err.getvalue())
+
+    def test_every_repository_refusing_is_still_one_error(self):
+        """Nothing was read, so there is no partial poll to qualify."""
+        refusal = forge.ForgeError("FORGE_AUTH", "HTTP 401")
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={REPO: refusal, OTHER_REPO: refusal},
+        )
+        with redirect_stderr(StringIO()):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "FORGE_AUTH")
 
     def test_no_credential_anywhere_names_itself_is_an_error_not_a_quiet_poll(self):
         """The model must not read "the credential is broken" as "nothing to do"."""
