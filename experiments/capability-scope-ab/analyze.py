@@ -130,6 +130,8 @@ def score_arm(runs: list[dict], scenarios: dict[str, dict], record: dict[str, li
         searches.append(_count(run, SEARCH_TOOL))
         wall.append(run.get("wall_seconds"))
         sess = run.get("session") or {}
+        if isinstance(sess.get("session"), dict):  # the API wraps the row in {"object": ..., "session": {...}}
+            sess = sess["session"]
         tin = sess.get("input_tokens")
         tout = sess.get("output_tokens")
         cr = sess.get("cache_read_tokens") or 0
