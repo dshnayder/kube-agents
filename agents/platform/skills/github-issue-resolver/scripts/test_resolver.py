@@ -395,6 +395,42 @@ class SandboxForwardingTest(unittest.TestCase):
                 resolver.FORWARD_TIMEOUT_PER_REPO_S - resolver.FORWARD_TIMEOUT_MARGIN_S,
             )
 
+    def test_a_codeless_refusal_at_the_front_door_is_the_brokers_not_the_forges(self):
+        """`claim` and `transition` share `main()`'s catch-all, and it said `FORGE_CALL_FAILED`.
+
+        The same connection-refused error was `BROKER_UNREACHABLE` from `poll`
+        and a forge outage from the other two subcommands, and the SKILL tells
+        the model to relay `reason` verbatim.
+        """
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(
+                mock.patch.object(sys, "argv", ["resolver.py", "claim", "--issue", "7", "--repo", "acme/toolkit"])
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    resolver.sandbox_exec, "sandbox_enabled", return_value=False
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    resolver,
+                    "handle_claim",
+                    mock.Mock(
+                        side_effect=vcs_client.VcsError(
+                            "the broker at http://127.0.0.1:1 could not be reached"
+                        )
+                    ),
+                )
+            )
+            with self.assertRaises(SystemExit):
+                resolver.main()
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["reason"], "BROKER_UNREACHABLE")
+        self.assertIn("could not be reached", payload["error"])
+        self.assertNotIn("code", payload)
+
     def test_a_broker_refusal_leaves_by_the_front_door(self):
         """A refusal is JSON on stdout, carrying the broker's own code.
 

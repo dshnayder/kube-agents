@@ -882,8 +882,11 @@ def main():
     except vcs_client.VcsError as refusal:
         # The broker's own code, unflattened. `FORGE_UNAUTHENTICATED` and
         # `FORGE_NOT_FOUND` send an operator to different places, and the
-        # skill's rules are written against these names.
-        refuse(refusal.code or "FORGE_CALL_FAILED", str(refusal), code=refusal.code)
+        # skill's rules are written against these names. A refusal with no
+        # code is the transport's, not the forge's, and gets this side's name
+        # for it -- the same one `poll` uses, so `claim` and `transition` do
+        # not call a restarting broker a forge outage.
+        refuse(refusal.code or BROKER_UNREACHABLE, str(refusal), code=refusal.code)
 
 
 if __name__ == "__main__":
