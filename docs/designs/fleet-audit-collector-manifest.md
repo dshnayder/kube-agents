@@ -109,7 +109,10 @@ within the manifest and stable between runs, so a collector sweeping clusters na
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
 finding announced resolved and refiled as new. The drift collector does this, and the SOP carries
-the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on.
+the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
+target name: a candidate's `object` names the bare resource, because the identity tuple
+already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
+then truncates.
 
 ## 3. What `finish` does with it
 

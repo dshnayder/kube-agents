@@ -1222,11 +1222,60 @@ class CollectFleetTest(unittest.TestCase):
         )
         self.assertEqual(by_name[T("only-here", project="other")]["project"], "other")
         found = by_name[T("seeded-c", project="other")]["candidates"]
-        self.assertEqual([c["object"] for c in found], [f"Cluster/{T('seeded-c', project='other')}"])
+        # The entry name carries the qualification; the candidate's `object`
+        # carries the leaf, because `derive_finding_id` already keys on the
+        # entry name and a second copy costs the id its readable tail.
+        self.assertEqual([c["object"] for c in found], ["Cluster/seeded-c"])
         # The `peers:` line names the clusters holding the baseline, and an
         # unqualified `seeded-a` there points at two different clusters.
         self.assertIn(T("seeded-a"), found[0]["excerpt"])
         self.assertNotIn("peers: seeded-a", found[0]["excerpt"])
+
+    def test_a_candidate_derives_a_finding_id_that_still_names_its_cluster(self):
+        """The id a candidate becomes is what an operator types into
+        `/remediate` and what `compute_delta` joins on next week. It has a
+        100-character ceiling, and `_shorten_id` spends the overflow on the
+        longest segment -- so spelling the project and location in the
+        candidate's `object` as well as in the entry name took the cluster's own
+        name off the end and left
+        `authorized-networks.agentic-harness-demo-us-central1-a._.cluster-agentic-harness-demo-us-cen-3284a2`,
+        which names no cluster at all. Three live runs filed that before this
+        test existed.
+        """
+        import audit_report
+
+        project = "agentic-harness-demo"
+        fleet = [cluster(f"fa2-seeded-{x}", project=project, location="us-central1-a") for x in "abc"]
+        fleet[2]["masterAuthorizedNetworksConfig"] = {"enabled": False}
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, project + "\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, project + "\n")
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, json.dumps(fleet))
+            return run_of(0)
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        entry = {c["name"]: c for c in manifest["clusters"]}[
+            T("fa2-seeded-c", project=project, location="us-central1-a")
+        ]
+        self.assertTrue(entry["candidates"], "no candidate to derive an id from")
+        for candidate in entry["candidates"]:
+            with self.subTest(check=candidate["check"]):
+                fid = audit_report.derive_finding_id(
+                    {
+                        "check": candidate["check"],
+                        "cluster": entry["name"],
+                        "namespace": candidate["namespace"],
+                        "object": candidate["object"],
+                    }
+                )
+                short = audit_report._shorten_id(fid)
+                self.assertLessEqual(len(short), audit_report.MAX_FINDING_ID)
+                self.assertEqual(short, fid, "the id was truncated, so it lost its tail")
+                self.assertIn("fa2-seeded-c", short)
 
     def test_every_project_failing_to_list_is_an_error_on_the_manifest(self):
         """Each loss is already a `gate-failed` row, but a run that read no

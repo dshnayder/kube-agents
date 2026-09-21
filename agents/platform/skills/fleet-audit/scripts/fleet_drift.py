@@ -835,11 +835,25 @@ IMPACT = {
 }
 
 
-def _emit(slug: str, cluster_name: str, excerpt: str, severity: str) -> dict:
+def _emit(slug: str, leaf_name: str, excerpt: str, severity: str) -> dict:
+    """One candidate. `leaf_name` is the cluster's bare GKE name, not the
+    qualified target.
+
+    `derive_finding_id` keys on `(check, cluster, namespace, object)` and the
+    entry this candidate hangs under already supplies the qualified cluster, so
+    `Cluster/<project>/<location>/<name>` would spell the location twice in one
+    id. That is not merely redundant: the id has a 100-character ceiling and
+    `_shorten_id` eats the longest segment first, so the second copy pushed the
+    pair over it and took the cluster's own name off the end --
+    `authorized-networks.agentic-harness-demo-us-central1-a._.cluster-agentic-harness-demo-us-cen-3284a2`
+    names no cluster a reader or a `/remediate` caller can recognise. The leaf
+    keeps the id under the ceiling and readable, and loses no identity, because
+    the segment before it already says which project and location this is.
+    """
     return {
         "check": slug,
         "namespace": "",
-        "object": f"Cluster/{cluster_name}",
+        "object": f"Cluster/{leaf_name}",
         "severity": severity,
         "excerpt": excerpt,
         "impact": IMPACT[slug],
@@ -1195,7 +1209,7 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
             f"reaches the floor with this one{alternatives}. Any value no peer holds "
             f"opens a new cohort of one and leaves the gap exactly as it is."
         )
-        candidates[key] = [_emit(UNLABELLED_SLUG, target_name(c), excerpt, UNLABELLED_SEVERITY)]
+        candidates[key] = [_emit(UNLABELLED_SLUG, c.get("name", ""), excerpt, UNLABELLED_SEVERITY)]
     return checks_run, candidates, not_applicable
 
 
@@ -1483,7 +1497,7 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                 # it is the gate that already took this difference.
                 missing = _missing_tokens(observed, t_star) if facet.should_flag is _flag_not_superset else None
                 excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r, missing, read_path(facet, c))
-                candidates[ckey(c)].append(_emit(facet.slug, name, excerpt, sev))
+                candidates[ckey(c)].append(_emit(facet.slug, c.get("name", ""), excerpt, sev))
                 outlier_facet_count[ckey(c)] += 1
 
     # §3.6 split-cluster guard
@@ -1492,7 +1506,7 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
             facet_names = sorted({cand["check"] for cand in candidates[cluster_key]})
             candidates[cluster_key] = [
                 _emit(
-                    UNCOHORTED_SLUG, targets.get(cluster_key, cluster_key[-1]),
+                    UNCOHORTED_SLUG, cluster_key[-1],
                     f"outlier on {count} facets in one run: {', '.join(facet_names)} -- likely a cohort-labelling problem, not {count} independent drifts.",
                     UNCOHORTED_SEVERITY,
                 )
