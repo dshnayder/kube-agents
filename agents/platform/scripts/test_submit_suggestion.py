@@ -681,6 +681,35 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("is on branch 'platform-agent/scale-web'", str(caught.exception))
         self.assertEqual(self.broker.payloads("publish"), [])
 
+    def test_submit_finds_a_copy_whose_key_is_not_the_branch_it_is_standing_on(self):
+        """The fallback lookup has a proceed path, and it used to end in "no local copy".
+
+        `prepare --branch A` keys the copy on A. An agent that then cuts B
+        inside that tree and submits B resolves through the keyless fallback,
+        gets past the "you are on another branch" check because it is standing
+        on B -- and then `commit` and `publish` asked for the copy keyed on B,
+        which is the lookup that had already failed.
+        """
+        prepared = self.prepare()
+        workspace = Path(prepared["workspace"])
+        git(workspace, "checkout", "--quiet", "-b", "platform-agent/second-thought")
+        self.edit(prepared)
+
+        _, out = self.run_subject(
+            "submit",
+            "--branch",
+            "platform-agent/second-thought",
+            "--title",
+            "second thought",
+            "--body",
+            "why",
+        )
+
+        self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
+        published = self.broker.payloads("publish")
+        self.assertEqual([item["branch"] for item in published], ["platform-agent/second-thought"])
+        self.assertEqual(self.broker.proposals[0]["source"], "platform-agent/second-thought")
+
     def test_submit_refuses_without_a_title_and_a_body(self):
         self.prepare()
         for argv in (

@@ -147,16 +147,39 @@ class ProposingLocalForge(LocalForge):
 
     verbs = ("proposal-list",)
 
-    def __init__(self, root, minted=None, open_sources=()):
+    def __init__(self, root, minted=None, open_sources=(), author=""):
         super().__init__(root, minted)
         self.open_sources = set(open_sources)
+        self.author = author
         self.listed: list[dict] = []
 
     def proposal_list(self, api, repo, payload):
         self.listed.append(dict(payload))
         source = payload.get("source")
-        found = [{"id": 1, "source": source}] if source in self.open_sources else []
+        found = (
+            [{"id": 1, "source": source, "author": self.author}]
+            if source in self.open_sources
+            else []
+        )
         return {"proposals": found, "truncated": False}
+
+
+class SelfAware:
+    """A transport that can say who the credential is. `LocalForge` declares none.
+
+    The directory-backed forge the rest of these tests run against builds no
+    transport at all, which is the "cannot say" arm of the author comparison.
+    This is the other arm.
+    """
+
+    def __init__(self, login: str) -> None:
+        self.login = login
+
+    def whoami(self) -> str:
+        return self.login
+
+    def api(self, *_args, **_kwargs):
+        raise AssertionError("the author check makes no API call of its own")
 
 
 class Recorder:
@@ -1061,6 +1084,76 @@ class RepositoryVerbTest(unittest.TestCase):
             }
         )
         self.assertEqual(self.remote_tip("topic"), second)
+
+    def _advance_onto(self, forge, branch="release-1.2"):
+        """Clone, commit on `branch`, and publish it with `advance` set."""
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "checkout", "--quiet", "-b", branch)
+        git(self.seed, "push", "--quiet", "origin", branch)
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", branch)
+        made = self.commit_in(work, "b.txt", "b\n", "onto the shared branch")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": branch,
+                "target": "main",
+                "clonedFrom": branch,
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, branch, answer["revision"]),
+            }
+        )
+        return made
+
+    def test_advance_is_refused_when_the_open_proposal_is_somebody_elses(self):
+        """The bar is a pull request under the install's own name, so the name is read.
+
+        `release-1.2 -> main` with a human's open back-merge proposal on it is
+        the ordinary shape of a GitOps repository, and a bar that asks only
+        whether *some* proposal is open is cleared by it -- leaving the live
+        incident the refusal was added for reachable with nothing under this
+        install's name at all.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+        self.assertIn("a-colleague", str(caught.exception))
+        self.assertIn("kube-agents[bot]", str(caught.exception))
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_is_honoured_when_the_open_proposal_is_the_installs_own(self):
+        """And the marking a forge puts on an automation's login is not a difference.
+
+        The provider strips `[bot]` off every author it emits; the credential
+        store keeps it. Compared raw, the install is a stranger to the proposal
+        it opened itself an hour ago.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="Kube-Agents"
+        )
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
+
+    def test_advance_keeps_the_weaker_bar_when_the_credential_cannot_say_who_it_is(self):
+        """A forge this broker builds no transport for still gets the check it can have.
+
+        `whoami` is documented to answer "" for a credential that cannot
+        introspect itself, and `LocalForge` declares no transport at all.
+        Refusing there would turn the author comparison into an outage for
+        every install whose forge cannot answer the question.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
 
     def test_advance_does_not_reach_the_default_branch(self):
         # Everything else still applies to it. The default-branch refusal is

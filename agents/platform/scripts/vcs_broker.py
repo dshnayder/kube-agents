@@ -63,6 +63,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -133,6 +134,20 @@ def _remove_tree(path: Path) -> None:
         path.rmdir()
     except OSError:
         pass
+
+
+_AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
+
+
+def _login_key(login: str) -> str:
+    """One spelling for two sources that mark an automation differently.
+
+    A provider's translation strips the marking a forge puts on an automation's
+    login before it emits an author; a transport's `whoami` reports whatever the
+    credential store holds, marking and all. Compared raw, an install is a
+    stranger to its own proposals.
+    """
+    return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
 
 
 class Binding:
@@ -570,10 +585,20 @@ class VcsBroker:
                 # under the install's own name, open on the forge for anyone
                 # to see, and it stops being something a worker does by
                 # mistake because the refusal text named a flag. Without the
-                # check the field was simply that flag. The refusals that do
-                # not come from the request -- the remote's default branch, the
-                # protected names, the base override, `run/**` -- stand
-                # regardless, which is the part that is a proof.
+                # check the field was simply that flag.
+                #
+                # "Under the install's own name" is a claim about the author,
+                # so the author is what is compared -- otherwise the ordinary
+                # `release-1.2` back-merge, open on the forge under somebody
+                # else's name, clears the bar and the cost is zero. It is
+                # compared only where both halves can be read: a credential
+                # that cannot introspect itself leaves the weaker bar, which is
+                # why this is still a bar and not a proof.
+                #
+                # The refusals that do not come from the request -- the
+                # remote's default branch, the protected names, the base
+                # override, `run/**` -- stand regardless, which is the part
+                # that is a proof.
                 #
                 # After the default-branch check, not before it. That refusal is
                 # the one the broker establishes for itself, and it must stay
@@ -731,9 +756,12 @@ class VcsBroker:
         One extra read on the `advance` path only, which is the second and
         later rounds of a proposal the caller already opened -- not the first
         publish of anything. What it establishes is that such a proposal is
-        open on the forge, not who opened it: the caller could have, one verb
-        earlier. See the comment at the call site for what that does and does
-        not buy.
+        open on the forge and that this install is the one who opened it, the
+        second only where the credential can say who it is and the forge names
+        the proposal's author. It does not establish that the install opened it
+        *before* this request: the same caller can call `proposal-create` one
+        verb earlier. See the comment at the call site for what that does and
+        does not buy.
 
         A forge that does not serve `proposal-list` is left alone. `publish`
         holds no forge otherwise -- it is git against a URL, which is what makes
@@ -745,9 +773,10 @@ class VcsBroker:
         if "proposal-list" not in getattr(bound.forge, "verbs", ()):
             return
         answer = bound.forge.proposal_list(
-            bound.api, bound.repo, {"state": "open", "source": branch, "limit": 1}
+            bound.api, bound.repo, {"state": "open", "source": branch, "limit": 10}
         )
-        if not (answer.get("proposals") or []):
+        proposals = answer.get("proposals") or []
+        if not proposals:
             raise WorkspaceError(
                 f"`advance` says {branch} is a proposal branch this copy was "
                 "cloned in order to add to, but no open proposal on this "
@@ -756,6 +785,44 @@ class VcsBroker:
                 status=409,
                 code="CLONED_BRANCH",
             )
+        # Whose proposal it is, when both halves of the question can be
+        # answered. A long-lived branch carrying somebody else's open proposal
+        # -- the `release-1.2` back-merge every GitOps repository has one of --
+        # otherwise satisfies the bar with nothing under this install's name at
+        # all, which is the incident with an extra step rather than a cost.
+        viewer = self._viewer(bound)
+        authors = {str(item.get("author") or "") for item in proposals}
+        authors.discard("")
+        keys = {_login_key(author) for author in authors}
+        if viewer and authors and _login_key(viewer) not in keys:
+            # Named as the forge spells them, not as they were compared: the
+            # normalisation is this broker's business, and a refusal that
+            # reports a login nobody can search for is a worse refusal.
+            named = ", ".join(sorted(authors))
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                f"cloned in order to add to, but the open proposal on it is "
+                f"{named}'s, not this install's ({viewer}). Adding to it moves "
+                "a branch whose proposal this install does not own. Publish a "
+                "branch of your own and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
+
+    def _viewer(self, bound: Binding) -> str:
+        """The login this credential authenticates as, or "" when it cannot say.
+
+        Empty is a real answer and not a failure: `whoami` is documented to
+        return it for a credential that cannot introspect itself, and a forge
+        that declares no transport this broker builds -- the directory-backed
+        one the tests run against -- has nowhere to ask. The caller treats "" as
+        "do not compare", which leaves the weaker bar in place rather than
+        refusing every `advance` on such an install.
+        """
+        try:
+            return bound.transport().whoami()
+        except (ForgeUnsupported, WorkspaceError):
+            return ""
 
     def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
         bound = self._bind(payload)

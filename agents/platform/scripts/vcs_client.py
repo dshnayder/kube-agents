@@ -223,7 +223,7 @@ def _slug(forge: str, repo: str, key: str) -> str:
     return f"{forge}__{repo.replace('/', '__')}__{key.replace('/', '__')}"
 
 
-def _key_of(session: dict) -> str:
+def key_of(session: dict) -> str:
     """Which branch the copy is *for*, which is not always the one it is *of*.
 
     A branch this run is starting does not exist on the forge yet, so the copy
@@ -240,7 +240,7 @@ def session_path(forge: str, repo: str, key: str) -> Path:
 
 def save_session(data: dict) -> None:
     SESSIONS.mkdir(parents=True, exist_ok=True)
-    path = session_path(data["forge"], data["repo"], _key_of(data))
+    path = session_path(data["forge"], data["repo"], key_of(data))
     path.write_text(json.dumps(_recorded(data), indent=2))
 
 
@@ -267,7 +267,7 @@ def all_sessions() -> list[dict]:
         # Where it was read from, so that removing it does not depend on the
         # name still being derivable from its contents. Records written before
         # the branch was part of the name are the case that proved this: their
-        # file is `{forge}__{repo}.json`, `_key_of` answers with the base branch
+        # file is `{forge}__{repo}.json`, `key_of` answers with the base branch
         # they were standing on, and a `discard` that recomputed the name
         # deleted the working copy and left the record behind for good -- an
         # entry that every later resolution had to disambiguate against and no
@@ -305,7 +305,7 @@ def _listing(sessions: list[dict]) -> str:
     """
     return ", ".join(
         sorted(
-            f"{session['path']} ({session['repo']} on {_key_of(session)})"
+            f"{session['path']} ({session['repo']} on {key_of(session)})"
             for session in sessions
         )
     )
@@ -339,7 +339,7 @@ def resolve_session(spec: str | None = None, key: str | None = None) -> dict:
     """
     sessions = all_sessions()
     if key:
-        sessions = [session for session in sessions if _key_of(session) == key]
+        sessions = [session for session in sessions if key_of(session) == key]
     named = f"{spec} on '{key}'" if spec and key else (spec or f"'{key}'")
     if spec or key:
         hits = [session for session in sessions if not spec or _matches(session, spec)]
@@ -837,7 +837,7 @@ def discard(spec: str | None = None, key: str | None = None) -> dict:
     session = resolve_session(spec, key=key)
     shutil.rmtree(session["path"], ignore_errors=True)
     record = session.get("_file") or str(
-        session_path(session["forge"], session["repo"], _key_of(session))
+        session_path(session["forge"], session["repo"], key_of(session))
     )
     Path(record).unlink(missing_ok=True)
     return {

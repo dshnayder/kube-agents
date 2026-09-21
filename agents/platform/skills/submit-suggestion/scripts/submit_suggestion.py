@@ -376,6 +376,12 @@ def handle_submit(args) -> int:
         session = vcs_client.resolve_session(args.repo, key=branch)
     except vcs_client.VcsError:
         session = vcs_client.resolve_session(args.repo)
+    # Whichever lookup answered, the rest of this run is about *that* copy.
+    # `commit` and `publish` resolve again, and asking them for `branch` would
+    # repeat the lookup the fallback already failed -- so a copy cut by hand
+    # inside a prepared tree, standing on the right branch under another key,
+    # got past the check below and then died on "no local copy".
+    copy_key = vcs_client.key_of(session)
     repo = args.repo or session["spec"]
     validate_repo(repo)
 
@@ -432,7 +438,7 @@ def handle_submit(args) -> int:
                 "`vcs.py commit --message ...` before submitting."
             )
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
-        vcs_client.commit(args.title, spec=repo, key=branch)
+        vcs_client.commit(args.title, spec=repo, key=copy_key)
 
     if vcs_client.already_published(session, branch):
         # The state a retry has to be able to walk back into: the publish landed
@@ -475,7 +481,7 @@ def handle_submit(args) -> int:
         # to write to the branch a copy came down on otherwise, and that refusal
         # is the one that caught a worker fast-forwarding a branch it had cloned.
         vcs_client.publish(
-            repo, target=base, advance=session["branch"] == branch, key=branch
+            repo, target=base, advance=session["branch"] == branch, key=copy_key
         )
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
