@@ -58,6 +58,9 @@ AUDIT = "compliance-audit"
 # which a `declared` list validates. Every other stream rejects the list.
 DECLARING_AUDIT = "obtainability-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+# How far the run-record stamp may sit from wall-clock and still be this run's.
+# Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
+STAMP_TOLERANCE_SECONDS = 300
 
 # Which SOP owns each stream's check roster. Spelled out rather than derived
 # from the audit id so that renaming a file breaks this mapping loudly instead
@@ -615,6 +618,17 @@ class BaseTestCase(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("# remediation\n", encoding="utf-8")
         return target
+
+    def record_without_stamp(self, audit):
+        """The run record, minus the wall-clock `start` stamped it with.
+
+        The stamp is what `load_manifest` compares a collector manifest
+        against, so it is asserted where that matters rather than here, where
+        a whole-dict comparison would only be asserting that the clock moved.
+        """
+        record = audit_report.read_run_record(audit)
+        self.assertTrue(record.pop(audit_report.RUN_RECORD_STARTED_KEY))
+        return record
 
     def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT):
         """Leave the run record `start` would have, under the scratch directory."""
@@ -5067,7 +5081,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         # nothing, so the harness's own search read neither repository and
         # the record says so: `TestDeclaredIntentDiscovery` is where it reads.
         self.assertEqual(
-            audit_report.read_run_record(DECLARING_AUDIT),
+            self.record_without_stamp(DECLARING_AUDIT),
             {
                 "repo": "acme/fleet",
                 "context_repos": ["acme/terraform-live", "acme/fleet"],
@@ -5256,7 +5270,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.record_run(context=("acme/old-context",))
         self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(
-            audit_report.read_run_record(DECLARING_AUDIT),
+            self.record_without_stamp(DECLARING_AUDIT),
             {"repo": "acme/fleet", "context_repos": [], "searched": [], "sources": []},
         )
 
@@ -12474,10 +12488,35 @@ def _full_manifest(names=("prod-us-east", "stage-eu"), candidates=(), audit=AUDI
 
 
 class TestLoadManifest(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        # The staleness guard reads the run record, so the scratch directory
+        # has to be this test's own rather than the pod path the module names.
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
     def write(self, text):
         path = self.tmp_path / "manifest.json"
         path.write_text(text, encoding="utf-8")
         return str(path)
+
+    def manifest_finished(self, when):
+        return self.write(json.dumps({"audit": AUDIT, "finished_at": when}))
+
+    def run_started(self, when):
+        """The record `start` wrote, back-dated to `when` (None writes no stamp)."""
+        record = {
+            "audit": AUDIT,
+            "repo": "acme/fleet",
+            "context_repos": [],
+            audit_report.RUN_RECORD_SEARCHED_KEY: [],
+            audit_report.RUN_RECORD_SOURCES_KEY: [],
+        }
+        if when is not None:
+            record[audit_report.RUN_RECORD_STARTED_KEY] = when
+        Path(audit_report.run_record_path_for(AUDIT)).write_text(
+            json.dumps(record), encoding="utf-8"
+        )
 
     def test_a_missing_file_is_a_validation_error(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
@@ -12500,6 +12539,86 @@ class TestLoadManifest(BaseTestCase):
 
     def test_an_empty_envelope_loads(self):
         self.assertEqual(audit_report.load_manifest(self.write("{}")), {})
+
+    def test_last_weeks_manifest_at_the_same_path_is_refused(self):
+        """The failure the guard exists for: the worker skipped the collector.
+
+        `--manifest-file` names a fixed path the SOP gives in prose, so `start`
+        cannot scrub it. Without this check the run cross-checks against a
+        collection of the fleet as it stood a week ago and publishes with the
+        manifest's authority behind it.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-11T06:03:30Z")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(path, AUDIT)
+        message = str(ctx.exception)
+        self.assertIn("2026-09-11T06:03:30Z", message)
+        self.assertIn("2026-09-18T06:00:00Z", message)
+        self.assertIn("--no-collector-manifest", message)
+
+    def test_this_runs_own_collection_loads(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-18T06:03:30Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_manifest_finishing_on_the_second_start_wrote_is_this_runs(self):
+        """The boundary is not a staleness signal: equal stamps are one run.
+
+        The collector cannot finish before it was launched, so a second-level
+        tie is clock granularity, and refusing it would fail a fast collector
+        on a coarse clock rather than catch a stale document.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-18T06:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_start_from_before_the_stamp_existed_lets_the_manifest_through(self):
+        """Back-compat, and `parse_gh_timestamp`'s rule about missing stamps.
+
+        A run whose `start` predates `RUN_RECORD_STARTED_KEY` cannot say when
+        it opened. That is unknown, never old: failing here would red every run
+        that straddles the upgrade, for no evidence about the manifest at all.
+        """
+        self.run_started(None)
+        path = self.manifest_finished("2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_collector_that_stamps_nothing_is_not_called_stale(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.write(json.dumps({"audit": AUDIT, "clusters": []}))
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["clusters"], [])
+
+    def test_an_unparseable_finished_at_is_not_called_stale(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("last Tuesday")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_with_no_run_record_there_is_nothing_to_compare_against(self):
+        path = self.manifest_finished("2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_without_an_audit_id_the_guard_does_not_run(self):
+        """`remediate --manifest-file` and the unit callers pass no audit id.
+
+        There is no run record to look up without one, so the manifest loads on
+        its envelope alone, exactly as it did before the guard.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.write(json.dumps({"finished_at": "2020-01-01T00:00:00Z"}))
+        self.assertEqual(audit_report.load_manifest(path)["finished_at"], "2020-01-01T00:00:00Z")
+
+    def test_start_stamps_the_run_it_opened(self):
+        audit_report.write_run_record(AUDIT, "acme/fleet", [])
+        record = json.loads(
+            Path(audit_report.run_record_path_for(AUDIT)).read_text(encoding="utf-8")
+        )
+        stamped = audit_report.parse_gh_timestamp(record[audit_report.RUN_RECORD_STARTED_KEY])
+        self.assertIsNotNone(stamped)
+        self.assertLess(
+            abs((stamped - datetime.now(timezone.utc)).total_seconds()),
+            STAMP_TOLERANCE_SECONDS,
+        )
 
 
 class TestCrossCheckManifest(unittest.TestCase):
@@ -16037,6 +16156,12 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     captured from the harness *before* the contract was added. A key added
     unconditionally to the payload, a log line that now prints on every run,
     a renderer that reorders a section -- each fails here, naming the byte.
+
+    One deviation is deliberate and is recorded in the transcripts rather than
+    excused: `ID_SCHEME` went from 2 to 3 because the drift collector now
+    qualifies cluster names, and the stamp is global, so every stream's bodies
+    carry the new number. That is the whole of the change here -- five lines,
+    one per body -- and this class is what proves it.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

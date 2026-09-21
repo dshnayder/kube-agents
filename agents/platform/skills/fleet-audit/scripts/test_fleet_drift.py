@@ -25,6 +25,25 @@ def run_of(rc: int, stdout: str = "", stderr: str = "") -> fd.Run:
     return fd.Run(["x"], rc, stdout, stderr, 0.01)
 
 
+def collected(run, *, project="acme", **kwargs) -> dict:
+    """`collect_fleet` over a fleet of one project that discovery *found*.
+
+    Passing the project to `collect_fleet` directly is `--project`, which is a
+    deliberately narrowed scope and leaves an `UNENUMERATED_PROJECTS` row for
+    the projects it did not name. Every test that wants "one project, nothing
+    lost" has to answer discovery instead, and answering it in one place keeps
+    that row out of assertions that are not about it.
+    """
+    def discovering(argv, **kw):
+        if argv[:3] == ["gcloud", "projects", "list"]:
+            return run_of(0, project)
+        if argv[:4] == ["gcloud", "config", "get-value", "project"]:
+            return run_of(0, project)
+        return run(argv, **kw)
+
+    return fd.collect_fleet(run=discovering, **kwargs)
+
+
 def cluster(name, project="acme", location="us-central1", autopilot=False, status="RUNNING", created="2020-01-01T00:00:00Z", labels=None, **overrides):
     doc = {
         "name": name, "_project": project, "location": location, "status": status, "createTime": created,
@@ -1035,7 +1054,7 @@ class EligibilityCreateTimeTest(unittest.TestCase):
                 return run_of(0, json.dumps(docs))
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 3)
         self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
 
@@ -1056,7 +1075,7 @@ class EligibilityCreateTimeTest(unittest.TestCase):
                 return run_of(0, json.dumps(docs))
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 3)
         self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
 
@@ -1070,7 +1089,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual(manifest["audit"], "fleet-consistency-drift")
         self.assertEqual(len(manifest["clusters"]), 4)
         self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
@@ -1086,12 +1105,153 @@ class CollectFleetTest(unittest.TestCase):
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual([c["name"] for c in manifest["clusters"]], ["project/acme"])
         entry = manifest["clusters"][0]
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("denied", entry["error"])
         self.assertIn("1 of 1 project(s) in scope failed", manifest["error"])
+
+    def test_the_uncohorted_candidate_carries_the_listing_command(self):
+        """§3.6's `uncohorted` is derived from other facets' verdicts rather
+        than voted on, so its slug is in no cohort's `checks_run` and the
+        per-slug `commands` hold no record for it. `adopt_collector_evidence`
+        moves excerpt and command together and adopts neither without one, so
+        without the candidate's own `command` the one finding that replaces six
+        is published on the model's paraphrase of the collector's words --
+        silently, run after run. Deleting the two lines that set it left the
+        whole suite green before this test existed."""
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(20)]
+        for path, value in [
+            ("shieldedNodes.enabled", False),
+            ("privateClusterConfig.enablePrivateNodes", False),
+            ("privateClusterConfig.enablePrivateEndpoint", False),
+            ("networkConfig.enableIntraNodeVisibility", False),
+            ("monitoringConfig.managedPrometheusConfig", {"enabled": False}),
+            ("databaseEncryption.state", "DECRYPTED"),
+        ]:
+            target = clusters[-1]
+            keys = path.split(".")
+            for key in keys[:-1]:
+                target = target.setdefault(key, {})
+            target[keys[-1]] = value
+        clusters_json = json.dumps(clusters)
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = collected(run, now=NOW)
+        entry = next(c for c in manifest["clusters"] if c["name"].endswith("/c19"))
+        candidate = next(c for c in entry["candidates"] if c["check"] == "uncohorted")
+        listing = next(
+            c["command"] for c in manifest["clusters"][0]["commands"] if c["check"] == "release-channel"
+        )
+        self.assertEqual(candidate["command"], listing)
+        self.assertIn("gcloud container clusters list", candidate["command"])
+        # The premise the command is needed for: no per-slug record backs it.
+        self.assertNotIn("uncohorted", [c["check"] for c in entry["commands"]])
+
+    def test_a_scoped_run_says_it_never_looked_at_the_rest_of_the_fleet(self):
+        """`--project` reads one project and names no other, which is the loss
+        a failed `projects list` produces minus the failure. Without a row
+        saying so the manifest is a fleet of one project, `finish` finds no
+        coverage gap, and every ledger finding on a cluster in another project
+        is announced resolved and its remediation pull request closed -- the
+        same outcome `UNENUMERATED_PROJECTS` was added to stop one rung up."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("project/UNENUMERATED_PROJECTS", by_name)
+        entry = by_name["project/UNENUMERATED_PROJECTS"]
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("--project", entry["error"])
+        self.assertIn("acme", entry["error"])
+        # The fleet itself is still collected; the row is about the projects
+        # nobody named, not about this one.
+        self.assertEqual(len([c for c in manifest["clusters"] if c["outcome"] == "collected"]), 3)
+        self.assertNotIn("error", manifest)
+
+    def test_a_fleet_discovery_found_leaves_no_unenumerated_row(self):
+        """The counterpart: one project reached by discovery rather than by
+        `--project` is the whole fleet, so nothing is unread and the row would
+        be a coverage gap on a run that has none."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = collected(run, now=NOW)
+        self.assertNotIn("project/UNENUMERATED_PROJECTS", [c["name"] for c in manifest["clusters"]])
+
+    def test_a_project_with_the_gke_api_off_reads_as_empty_not_as_lost(self):
+        """A project whose Kubernetes Engine API is disabled cannot hold a GKE
+        cluster, and the condition does not change between runs. Reading its
+        403 as a lost project put a `gate-failed` row in every manifest for as
+        long as the project existed: a coverage gap on every run, `resolved`
+        pinned at 0, and no stale remediation pull request ever closed. A
+        credential that can see an organisation's projects sees mostly
+        projects without GKE, so that is the ordinary case."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)])
+        disabled = (
+            "ERROR: (gcloud.container.clusters.list) ResponseError: code=403, "
+            "message=Kubernetes Engine API has not been used in project logs-only before "
+            "or it is disabled."
+        )
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "acme\nlogs-only\n")
+            if "list" in argv and "clusters" in argv:
+                if "logs-only" in argv:
+                    return run_of(1, "", disabled)
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        self.assertEqual(
+            [c["name"] for c in manifest["clusters"] if c["outcome"] != "collected"], []
+        )
+        self.assertNotIn("error", manifest)
+        self.assertEqual(len(manifest["clusters"]), 3)
+
+    def test_a_project_the_credential_may_not_read_is_still_a_loss(self):
+        """The other 403. A project this credential cannot list may well hold
+        clusters, so it stays a `gate-failed` row -- the disabled-API test
+        above must not have widened into "any 403 is an empty project"."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)])
+        denied = (
+            "ERROR: (gcloud.container.clusters.list) ResponseError: code=403, "
+            "message=Required \"container.clusters.list\" permission(s) for \"projects/locked\"."
+        )
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "acme\nlocked\n")
+            if "list" in argv and "clusters" in argv:
+                if "locked" in argv:
+                    return run_of(1, "", denied)
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("project/locked", by_name)
+        self.assertEqual(by_name["project/locked"]["outcome"], "gate-failed")
+        self.assertIn("permission", by_name["project/locked"]["error"])
 
     def test_one_project_crashing_costs_that_project_and_no_other(self):
         """`future.result()` re-raises, and the SOP redirects this collector's
@@ -1168,7 +1328,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        names = [c["name"] for c in fd.collect_fleet("acme", run=run, now=NOW)["clusters"]]
+        names = [c["name"] for c in collected(run, now=NOW)["clusters"]]
         self.assertEqual(sorted(names), sorted([T("prod"), T("prod", location="europe-west1"), T("other")]))
 
     def test_a_uncolliding_name_is_qualified_anyway(self):
@@ -1184,7 +1344,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        names = [c["name"] for c in fd.collect_fleet("acme", run=run, now=NOW)["clusters"]]
+        names = [c["name"] for c in collected(run, now=NOW)["clusters"]]
         self.assertEqual(names, [T("only-one")])
 
     def test_every_target_is_qualified_by_project_and_location(self):
@@ -1230,6 +1390,35 @@ class CollectFleetTest(unittest.TestCase):
         # unqualified `seeded-a` there points at two different clusters.
         self.assertIn(T("seeded-a"), found[0]["excerpt"])
         self.assertNotIn("peers: seeded-a", found[0]["excerpt"])
+
+    def test_qualifying_the_cluster_name_moved_every_id_and_needed_a_scheme_bump(self):
+        """`derive_finding_id` joins `cluster` as its second segment, so
+        qualifying the name re-spells every id this stream already carries.
+        The delta is a set difference over strings and cannot tell a rename
+        from a fix: without a new `ID_SCHEME` stamp the first run after this
+        merge announces every carried finding resolved, re-files it as new,
+        and closes its remediation pull request -- the identity rule §3.7
+        calls the Red Line. The function did not change; its input did, which
+        is exactly what the stamp rather than the id's shape is there for."""
+        import audit_report
+
+        def fid(cluster_name):
+            return audit_report.derive_finding_id(
+                {
+                    "check": "authorized-networks",
+                    "cluster": cluster_name,
+                    "namespace": "",
+                    "object": "Cluster/seeded-c",
+                }
+            )
+
+        self.assertNotEqual(fid("seeded-c"), fid(T("seeded-c")))
+        self.assertGreaterEqual(
+            audit_report.ID_SCHEME,
+            3,
+            "the collector qualifies cluster names, so ledgers written under scheme 2 "
+            "hold ids this stream can no longer mint; the stamp has to say so",
+        )
 
     def test_a_candidate_derives_a_finding_id_that_still_names_its_cluster(self):
         """The id a candidate becomes is what an operator types into
@@ -1377,7 +1566,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual([c for c in manifest["clusters"] if c["name"].startswith("project/")], [])
 
     def test_every_cluster_publishes_the_mode(self):
@@ -1392,7 +1581,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps(clusters))
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual(
             {c["name"]: c["autopilot"] for c in manifest["clusters"]},
             {T("a0"): True, T("a1"): True, T("s0"): False, T("s1"): False},
@@ -1406,7 +1595,7 @@ class CollectFleetTest(unittest.TestCase):
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
-        entry = fd.collect_fleet("acme", run=run, now=NOW)["clusters"][0]
+        entry = collected(run, now=NOW)["clusters"][0]
         self.assertEqual(entry["name"], "project/acme")
         self.assertNotIn("autopilot", entry)
 
@@ -1431,7 +1620,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        return fd.collect_fleet("acme", run=run, now=NOW)
+        return collected(run, now=NOW)
 
     def autopilot_cohort(self, n=4):
         return [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(n)]
@@ -1507,7 +1696,7 @@ class UnvotedFacetsTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        return {c["name"]: c for c in fd.collect_fleet("acme", run=run, now=NOW)["clusters"]}
+        return {c["name"]: c for c in collected(run, now=NOW)["clusters"]}
 
     def test_a_cluster_with_no_node_pools_declares_the_pool_facets(self):
         """The Autopilot position on a Standard cluster: nothing to read, so
@@ -1731,7 +1920,7 @@ class CohortLimitationsTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 4)
         for entry in manifest["clusters"]:
             # `no-environment-label` is the one check that runs without a
@@ -1749,7 +1938,7 @@ class CohortLimitationsTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         for entry in manifest["clusters"]:
             self.assertNotIn("limitations", entry)
             self.assertTrue(entry["commands"])
@@ -1940,7 +2129,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         host = next(e for e in manifest["clusters"] if e["name"] == T("host"))
         self.assertEqual([c["check"] for c in host["candidates"]], [fd.UNLABELLED_SLUG])
         self.assertIn(fd.UNLABELLED_SLUG, [c["check"] for c in host["commands"]])
@@ -1971,7 +2160,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         data = {
             "audit": "fleet-consistency-drift",
             "scope": {
@@ -2002,7 +2191,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
 
         def document(extra_checks):
             return {
@@ -2087,7 +2276,7 @@ class CandidateSummaryTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        manifest = collected(run, now=NOW)
         lines = fd.candidate_summary(manifest)
         self.assertIn(f"no-environment-label: 1 ({T('c0')})", lines[0])
 

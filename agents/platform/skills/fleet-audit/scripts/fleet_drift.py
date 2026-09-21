@@ -83,6 +83,29 @@ QUALIFIED_TARGET_SEPARATOR = "/"
 # never named. Uppercase because a GCP project id cannot be, so no real project
 # can collide with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+# What that same target stands for when the operator narrowed the scope on
+# purpose. `--project` skips discovery, so a scoped run reads one project and
+# names no other -- which is the loss a failed `projects list` produces, minus
+# the failure. Without a row saying so the manifest is indistinguishable from a
+# fleet of one project, and `finish` resolves every ledger finding on a cluster
+# the run never looked at, and closes its remediation pull request.
+SCOPED_RUN_NOTE = (
+    "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
+    "project in this fleet was named or read, and this run cannot speak for their clusters."
+)
+
+# gcloud's own words for a project whose Kubernetes Engine API is off. Such a
+# project holds no GKE cluster by construction -- enabling the API is what
+# creates the ability to hold one -- so reading its `clusters list` failure as
+# a lost project puts a `gate-failed` row in every manifest for as long as the
+# project exists: a coverage gap on every run, `resolved` pinned at 0, and no
+# stale remediation pull request ever closed. A credential that can see an
+# organisation's projects sees mostly projects without GKE, so that is the
+# ordinary case rather than the exotic one. Permission denied is *not* in here
+# on purpose: a project this credential may not list may well hold clusters,
+# and that one is a real loss. `terraform/examples/full-install/lifecycle.sh`
+# matches the same three forms for the same reason.
+API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
 
 # SOP §1: only a cluster with a settled configuration votes, and a cluster
 # younger than this has not settled.
@@ -230,7 +253,7 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     A project holding no clusters contributes no manifest entry either way, so
     nothing was bought with that round trip."""
     if base_project:
-        return Discovery([base_project], None)
+        return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -284,10 +307,24 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
     `clusters` is `[]`, `command_record` is `None` and `error` carries what
     gcloud said when the call itself failed, so the caller knows this project
     contributed nothing rather than that it genuinely has no clusters, and can
-    say so in the manifest rather than only in a log line."""
+    say so in the manifest rather than only in a log line.
+
+    One failure is not a loss: a project whose Kubernetes Engine API is off
+    cannot hold a GKE cluster, so it answers with zero clusters and no error.
+    §1.1 puts every project the credential can see in scope "whether or not
+    they hold a cluster", and that sentence only reads as intended if a project
+    that cannot hold one reads as empty rather than as unread -- otherwise a
+    credential with organisation-wide visibility turns every non-GKE project
+    into a permanent coverage gap. See `API_DISABLED_MARKERS`."""
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
+        if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
+            log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
+            # No command record either: the call failed, so it backs no
+            # finding, and a project contributing no cluster entry has nothing
+            # for `commands` to hang on.
+            return [], None, None
         log(f"{project}: clusters list gate failed (rc={result.rc}); no clusters known from this project")
         return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
     for c in parsed:

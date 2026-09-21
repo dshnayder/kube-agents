@@ -352,7 +352,11 @@ the message names and re-run; never delete the finding that tripped it. What rea
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, or `--no-collector-manifest` was given a blank reason. Exit 1 is fatal and means
+empty path, or `--no-collector-manifest` was given a blank reason. A manifest that finished before
+this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
+scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
+there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
+against nothing. Re-run the collector. Exit 1 is fatal and means
 something else broke.
 
 ### Partial coverage
