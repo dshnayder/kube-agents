@@ -166,6 +166,58 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertFalse(legacy_record.exists())
         self.assertEqual(vcs_client.all_sessions(), [])
 
+    def test_publishing_from_a_pre_rollout_record_does_not_leave_two_of_them(self):
+        """`discard` was taught the record's own name. `save_session` was not.
+
+        `publish` is the one caller that saves a record it did not create, so
+        the first publish out of a copy an install had open at rollout wrote a
+        second file under the derived name beside the original. One working
+        copy, two records: every later `resolve_session` is ambiguous and the
+        reader sorts the older name first, so the publish after that reads the
+        half with no `published` map and re-bundles from the clone point.
+        """
+        cloned = vcs_client.clone("acme/infra")
+        vcs_client.branch("acme/infra", "fix/one")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("change a", spec="acme/infra")
+
+        # Age the record by hand into the shape this rolls out onto: the file
+        # name without the branch, and no `key` to derive it back from.
+        current = vcs_client.SESSIONS / "local__acme__infra__main.json"
+        record = json.loads(current.read_text())
+        record.pop("key", None)
+        legacy = vcs_client.SESSIONS / "local__acme__infra.json"
+        legacy.write_text(json.dumps(record))
+        current.unlink()
+
+        vcs_client.publish("acme/infra")
+
+        self.assertEqual(
+            sorted(path.name for path in vcs_client.SESSIONS.glob("*.json")),
+            ["local__acme__infra.json"],
+        )
+        self.assertIn("fix/one", json.loads(legacy.read_text()).get("published", {}))
+        self.assertEqual(len(vcs_client.all_sessions()), 1)
+
+    def test_a_record_derived_from_another_does_not_write_over_it(self):
+        """The stamp says where *that* record came from, not where this one goes.
+
+        A caller that reads a record and saves a changed copy of it -- a second
+        working copy, another repository -- would overwrite the one it meant to
+        sit beside if the stamp were honoured blindly, which is a worse failure
+        than the duplicate record it is there to prevent. So it is honoured only
+        while the record still names the same repository on the same forge.
+        """
+        vcs_client.clone("acme/infra")
+        derived = dict(vcs_client.all_sessions()[0])
+        derived.update({"repo": "acme/other", "spec": "acme/other"})
+        vcs_client.save_session(derived)
+
+        self.assertEqual(
+            sorted(path.name for path in vcs_client.SESSIONS.glob("*.json")),
+            ["local__acme__infra__main.json", "local__acme__other__main.json"],
+        )
+
     def test_where_a_record_was_read_from_is_not_written_back_into_it(self):
         vcs_client.clone("acme/infra")
         vcs_client.branch("acme/infra", "fix/one")

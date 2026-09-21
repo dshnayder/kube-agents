@@ -128,10 +128,17 @@ REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
 #: module's own reason code rather than passed through as a generic failure.
 BROKER_UNSUPPORTED = "FORGE_UNSUPPORTED"
 
-#: What a failed verb is called when the broker named no code. The honest
-#: reading of a call that reached the broker and came back wrong, and the code
-#: this module used to raise for every failure alike.
-REASON_UNREACHABLE = "REPO_UNREACHABLE"
+#: What a failed verb is called when the broker named no code. Every one of
+#: those is a fault on this side of the seam and the call never reached a forge
+#: at all -- `CREDENTIAL_PROXY_URL` unset, the socket refused, the projected
+#: token missing, a broker image that does not serve the routes, an answer that
+#: is not JSON. `REPO_UNREACHABLE` was the older reading and it sent an
+#: operator to the repository and the credential for a broker that was down.
+#: `resolver.py` reports this class under this name already, and the two sweeps
+#: have to agree: an operator's glossary keys on the code, so a restarting
+#: broker cannot be one thing in the issues card and another in the
+#: PR-watcher's.
+REASON_UNREACHABLE = "BROKER_UNREACHABLE"
 
 #: Where this same file lands in the shell sandbox, in the copy the model cannot
 #: reach. There are two: `/opt/data/scripts/forge.py` is the agent's own, on a
@@ -155,10 +162,12 @@ FORWARD_TIMEOUT_S = 90
 #: verb call can read, and the sweep is holding rather than guessing.
 REASON_CONVERSATION_TRUNCATED = "CONVERSATION_TRUNCATED"
 
-#: The verb never ran: ssh could not connect, or the hop timed out. Its own code
-#: rather than `REPO_UNREACHABLE`, because the two send an operator to different
-#: places — one to the sandbox, one to the forge — and `resolver.py` already
-#: reports the same distinction under the same name.
+#: The verb did not come back: ssh could not connect, the hop timed out, or the
+#: far side itself failed — no interpreter, no file, an answer that is not JSON.
+#: Its own code rather than the broker's or the forge's, because all three send
+#: an operator to different places, and a sandbox image missing its copy of this
+#: file is not a broker that is down. `resolver.py` already reports the
+#: transport under this name.
 REASON_SANDBOX_UNREACHABLE = "SANDBOX_UNREACHABLE"
 
 #: The refusals worth one more attempt, and only these. Both are the broker's
@@ -400,7 +409,9 @@ def _as_forge_error(repo: str):
     repository and a rate limit alike, and the operator warning it produced
     could not tell an operator which of the three to go and fix. The codes are
     the ones `github-issue-resolver` already reports, so the two sweeps now
-    need one glossary between them rather than one each.
+    need one glossary between them rather than one each -- which is why the
+    codeless fallback is `BROKER_UNREACHABLE` and not a repository's name. See
+    `REASON_UNREACHABLE`.
     """
     try:
         yield
@@ -515,13 +526,18 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
         detail = (completed.stderr or completed.stdout or "").strip().splitlines()
         raise vcs_client.VcsError(
             f"{SANDBOX_FORGE} exited {completed.returncode}: "
-            f"{detail[-1] if detail else 'no output'}"
+            f"{detail[-1] if detail else 'no output'}",
+            code=REASON_SANDBOX_UNREACHABLE,
         )
     try:
         answer = json.loads(completed.stdout or "")
     except ValueError as exc:
+        # The sandbox's, not the broker's. Left codeless these two fell through
+        # to the fallback above, which names the broker, and would send an
+        # operator to a component that answered fine.
         raise vcs_client.VcsError(
-            f"{verb} on {repo} answered with something that is not JSON: {exc}"
+            f"{verb} on {repo} answered with something that is not JSON: {exc}",
+            code=REASON_SANDBOX_UNREACHABLE,
         ) from exc
     refusal = answer.get("refusal")
     if refusal:

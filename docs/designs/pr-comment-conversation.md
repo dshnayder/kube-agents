@@ -81,7 +81,7 @@ Each sweep resolves its own repo and makes its own credential check rather than 
 one. That is deliberate: `resolver.py poll` already does both, and owns a precise reason-code
 vocabulary — the broker's own refusal codes (`FORGE_UNAUTHENTICATED` vs `FORGE_NOT_FOUND` vs
 `FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `UNMANAGED_REPOSITORY`
-vs `REPO_UNREACHABLE` vs `SANDBOX_UNREACHABLE` when the fault is on this side — that a hoisted check
+vs `BROKER_UNREACHABLE` vs `SANDBOX_UNREACHABLE` vs `REPO_UNREACHABLE` when the fault is on this side — that a hoisted check
 could only duplicate or flatten. The gate keeps one code of its own, `GIT_REPO_UNPARSEABLE`, because
 it is the side that reads a repository value before there is anyone to ask about it.
 

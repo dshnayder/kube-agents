@@ -239,8 +239,29 @@ def session_path(forge: str, repo: str, key: str) -> Path:
 
 
 def save_session(data: dict) -> None:
+    """Write the record back where it came from, or mint a name for a new one.
+
+    Back where it came from, because a record written before the branch was
+    part of the file name has a name this cannot derive: `key_of` answers with
+    the base branch the copy was standing on, so recomputing writes a *second*
+    file beside the first for one working copy. `publish` is the caller that
+    saves an existing record, so the first publish out of a copy an install had
+    open at rollout is where that happened -- the same copies `discard` was
+    fixed for, and the same reason. Two records for one tree make every later
+    `resolve_session` ambiguous, and the reader sorts the older name first, so
+    the next publish reads the half with no `published` map and re-bundles from
+    the clone point.
+    """
     SESSIONS.mkdir(parents=True, exist_ok=True)
-    path = session_path(data["forge"], data["repo"], key_of(data))
+    derived = session_path(data["forge"], data["repo"], key_of(data))
+    # The stamp is honoured only for a record still naming the same repository
+    # on the same forge. A caller that derives a *new* record from one it read
+    # -- a second copy, another repository -- would otherwise write over the
+    # one it meant to sit beside, and that is a worse failure than the one this
+    # is fixing.
+    read_from = Path(data.get("_file") or "")
+    prefix = f"{data['forge']}__{data['repo'].replace('/', '__')}"
+    path = read_from if read_from.name.startswith(f"{prefix}.") or read_from.name.startswith(f"{prefix}__") else derived
     path.write_text(json.dumps(_recorded(data), indent=2))
 
 

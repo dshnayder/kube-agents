@@ -369,11 +369,21 @@ class CallTest(BrokerCase):
                 self.assertEqual(ctx.exception.reason, code)
                 self.assertEqual(ctx.exception.value, "the forge said so")
 
-    def test_a_refusal_with_no_code_is_reported_as_unreachable(self):
+    def test_a_refusal_with_no_code_is_the_brokers_and_is_named_so(self):
+        """The same fault must not be two codes in two sweeps.
+
+        A codeless `VcsError` out of `vcs_client.call` is always a fault on
+        this side of the seam -- `CREDENTIAL_PROXY_URL` unset, the socket
+        refused, the token unprojected, an answer that is not JSON -- and the
+        call never reached a forge. `resolver.py handle_poll` reports that
+        class as `BROKER_UNREACHABLE`; this reported it as `REPO_UNREACHABLE`,
+        so a restarting broker was one code in the issues card and another in
+        the PR-watcher's, and the code is what an operator's glossary keys on.
+        """
         self.broker.refuse["proposal-list"] = vcs_client.VcsError("the proxy fell over")
         with self.assertRaises(forge.ForgeError) as ctx:
             forge.call("proposal-list", {}, REPO)
-        self.assertEqual(ctx.exception.reason, "REPO_UNREACHABLE")
+        self.assertEqual(ctx.exception.reason, "BROKER_UNREACHABLE")
         self.assertEqual(ctx.exception.value, "the proxy fell over")
 
     # -- the one retry -----------------------------------------------------
@@ -592,7 +602,9 @@ class ForwardTest(unittest.TestCase):
         )
         with self.assertRaises(forge.ForgeError) as ctx:
             forge.call("capabilities", {}, REPO)
-        self.assertEqual(ctx.exception.reason, "REPO_UNREACHABLE")
+        # The sandbox's own code. It used to fall through to the codeless
+        # fallback, which names the broker -- a component that answered fine.
+        self.assertEqual(ctx.exception.reason, "SANDBOX_UNREACHABLE")
         self.assertIn("exited 127", ctx.exception.value)
         self.assertIn("No such file", ctx.exception.value)
 
@@ -602,6 +614,7 @@ class ForwardTest(unittest.TestCase):
         with self.assertRaises(forge.ForgeError) as ctx:
             forge.call("proposal-list", {}, REPO)
         self.assertIn("not JSON", ctx.exception.value)
+        self.assertEqual(ctx.exception.reason, "SANDBOX_UNREACHABLE")
 
 
 class MainTest(unittest.TestCase):

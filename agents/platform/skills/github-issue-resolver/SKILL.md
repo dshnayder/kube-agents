@@ -77,10 +77,13 @@ API call. It also performs the stale sweep, which the card cannot.
   forge refused — `FORGE_UNAUTHENTICATED` is a credential this install must
   have re-issued, `FORGE_NOT_FOUND` is a repository that is registered but not
   reachable with this credential, `FORGE_RATE_LIMITED` will clear on its own —
-  and `CONFIGMAP_READ_FAILED`, `REPO_UNREACHABLE`, `SANDBOX_UNREACHABLE` or
-  `BROKER_UNREACHABLE` when the fault was on this side (`BROKER_UNREACHABLE` is
+  and `CONFIGMAP_READ_FAILED`, `SANDBOX_UNREACHABLE`, `BROKER_UNREACHABLE` or
+  `REPO_UNREACHABLE` when the fault was on this side (`BROKER_UNREACHABLE` is
   the credential broker not answering at all, or not in a form the script could
-  read; `error` carries its own words). Pass it through as it is written,
+  read; `SANDBOX_UNREACHABLE` is the shell sandbox, which is a different pod;
+  `REPO_UNREACHABLE` is every managed repository refusing for reasons that do
+  not agree, so the per-repository codes are the ones to read; `error` carries
+  its own words). Pass it through as it is written,
   `error` included. This is a fault
   that would otherwise recur silently on every poll, so it is never silent: alert the chat room with
   `⚠️ **GitHub issue resolver is not running:** <reason>` (including `unreachable_repos` if listed), then end the turn per
