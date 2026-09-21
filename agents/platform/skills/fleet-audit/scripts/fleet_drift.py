@@ -66,11 +66,11 @@ MAX_WORKERS = 8
 ERROR_EXCERPT_CHARS = 300
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-# How many cluster names the end-of-run summary spells out per check before it
+# How many cluster names the closing summary spells out per check before it
 # counts the rest. The summary is read in a terminal beside a manifest too
 # large to scan, so one check with forty outliers must not push the total off
 # the top of the screen.
-SUMMARY_MAX_OBJECTS = 5
+SUMMARY_MAX_CLUSTER_NAMES = 5
 
 # The manifest contract's outcomes and the target name for a project whose
 # `clusters list` failed (`project/<id>`, one of the three name shapes §2 of
@@ -1563,23 +1563,28 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
 
 def candidate_summary(manifest: dict) -> list[str]:
-    """The stderr lines naming how many candidates the document owes, printed last.
+    """The closing stderr lines: how many candidates this run produced, and where.
 
     `candidates` is nested under each cluster, so the number a worker has to
-    carry into `findings` is spread across a file that runs to tens of
-    kilobytes on a fleet of eleven, and nothing else in the run states it. On
-    2026-09-21 a run whose manifest carried three candidates published
-    `findings: []` with a `resolved_because` for each, reasoning that "the
-    collector found 0 drift findings on this run". `finish` held the close on
-    the manifest cross-check, which is what that guard is for, but the run had
-    already reported an all-clear over two unlabelled clusters and an
-    authorized-networks outlier. Stating the count costs one line.
+    account for is spread across a file of tens of kilobytes, and nothing else
+    in the run states it. On 2026-09-21 a run whose manifest carried three
+    candidates published `findings: []` with a `resolved_because` for each,
+    reasoning that "the collector found 0 drift findings on this run". `finish`
+    held the close on the manifest cross-check, which is what that guard is
+    for, but the run had already reported an all-clear over two unlabelled
+    clusters and an authorized-networks outlier.
 
-    stderr, because the SOP redirects stdout into the manifest file; last,
-    because that is what a worker reading back its own terminal sees first.
+    Accounting for a candidate is not the same as publishing it: §4.1's
+    pin/freeze marker and §4.3's young burst or spot pool are judgements the
+    collector cannot make, so the second line says report *or* drop with the
+    exclusion named, which is what the procedure asks. Projects whose listing
+    failed are counted too — the cluster total alone reads like a whole fleet.
+
+    stderr, because stdout is redirected into the manifest file.
     """
     clusters = [c for c in manifest.get("clusters") or [] if isinstance(c, dict)]
     collected = [c for c in clusters if c.get("outcome") == OUTCOME_COLLECTED]
+    unread = [c for c in clusters if c.get("outcome") == OUTCOME_GATE_FAILED]
     by_check: dict[str, list[str]] = {}
     for cluster in collected:
         for candidate in cluster.get("candidates") or []:
@@ -1588,20 +1593,24 @@ def candidate_summary(manifest: dict) -> list[str]:
                     str(cluster.get("name", ""))
                 )
     total = sum(len(names) for names in by_check.values())
-    head = f"{len(collected)} cluster(s) collected; "
+    head = f"{len(collected)} cluster(s) collected"
+    if unread:
+        head += f", {len(unread)} project(s) unread"
+    head += f"; {total} candidate(s) to report"
     if not total:
-        return [head + "0 candidates"]
+        return [head]
     parts = []
     for check in sorted(by_check):
         names = sorted(by_check[check])
-        shown = ", ".join(names[:SUMMARY_MAX_OBJECTS])
-        if len(names) > SUMMARY_MAX_OBJECTS:
-            shown += f", and {len(names) - SUMMARY_MAX_OBJECTS} more"
+        shown = ", ".join(names[:SUMMARY_MAX_CLUSTER_NAMES])
+        if len(names) > SUMMARY_MAX_CLUSTER_NAMES:
+            shown += f", and {len(names) - SUMMARY_MAX_CLUSTER_NAMES} more"
         parts.append(f"{check}: {len(names)} ({shown})")
     return [
-        head + f"{total} candidate(s) to report -- " + "; ".join(parts),
-        "every candidate above is a finding this run reports; a resolved_because "
-        "for one contradicts this manifest and `finish` holds the close on it",
+        head + " -- " + "; ".join(parts),
+        "report each candidate above as a finding, or drop it with the hand "
+        "exclusion named in its note; a resolved_because for one contradicts "
+        "this manifest",
     ]
 
 

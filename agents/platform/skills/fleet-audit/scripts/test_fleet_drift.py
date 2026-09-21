@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Tests for fleet_drift.py, the fleet-consistency-drift collector."""
 
+import contextlib
 import copy
+import io
 import inspect
 import json
 import os
@@ -10,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1791,17 +1794,22 @@ class CandidateSummaryTest(unittest.TestCase):
             ]
         }
         lines = fd.candidate_summary(manifest)
-        self.assertIn("2 cluster(s) collected; 3 candidate(s) to report", lines[0])
+        self.assertIn(
+            "2 cluster(s) collected, 1 project(s) unread; 3 candidate(s) to report", lines[0]
+        )
         self.assertIn("no-environment-label: 2 (a, b)", lines[0])
         self.assertIn("authorized-networks: 1 (b)", lines[0])
         self.assertIn("resolved_because", lines[1])
+        self.assertIn("drop it with the hand exclusion named", lines[1])
 
     def test_a_fleet_with_no_candidates_says_zero(self):
         manifest = {"clusters": [{"name": "a", "outcome": "collected", "candidates": []}]}
-        self.assertEqual(fd.candidate_summary(manifest), ["1 cluster(s) collected; 0 candidates"])
+        self.assertEqual(
+            fd.candidate_summary(manifest), ["1 cluster(s) collected; 0 candidate(s) to report"]
+        )
 
     def test_it_caps_the_cluster_names_it_spells_out(self):
-        over = fd.SUMMARY_MAX_OBJECTS + 2
+        over = fd.SUMMARY_MAX_CLUSTER_NAMES + 2
         manifest = {
             "clusters": [
                 {"name": f"c{i}", "outcome": "collected", "candidates": [{"check": "no-environment-label"}]}
@@ -1825,6 +1833,41 @@ class CandidateSummaryTest(unittest.TestCase):
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
         lines = fd.candidate_summary(manifest)
         self.assertIn("no-environment-label: 1 (c0)", lines[0])
+
+    def test_a_project_that_could_not_be_listed_is_counted(self):
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": "collected", "candidates": []},
+                {"name": "project/p", "outcome": "gate-failed"},
+                {"name": "project/q", "outcome": "gate-failed"},
+            ]
+        }
+        self.assertEqual(
+            fd.candidate_summary(manifest),
+            ["1 cluster(s) collected, 2 project(s) unread; 0 candidate(s) to report"],
+        )
+
+    def test_main_prints_the_summary_after_the_manifest(self):
+        manifest = {
+            "clusters": [{"name": "a", "outcome": "collected", "candidates": [{"check": "shielded-nodes"}]}]
+        }
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = fd.main([])
+        self.assertEqual(rc, 0)
+        self.assertIn('"clusters"', out.getvalue())
+        self.assertIn("1 cluster(s) collected; 1 candidate(s) to report", err.getvalue())
+        self.assertIn("shielded-nodes: 1 (a)", err.getvalue())
+
+    def test_main_says_nothing_about_candidates_when_the_run_failed(self):
+        manifest = {"clusters": [], "error": "project discovery failed"}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = fd.main([])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("candidate(s) to report", err.getvalue())
 
 
 if __name__ == "__main__":
