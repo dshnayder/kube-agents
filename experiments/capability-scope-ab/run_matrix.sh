@@ -16,6 +16,8 @@ readonly CTX=${CTX:-csc-adc}
 readonly NS=kubeagents-system
 readonly BASE=${BASE:-http://127.0.0.1:8643}
 readonly SCENARIOS=${SCENARIOS:-$HERE/scenarios.json}
+# Same framing on every arm: keeps a probe from turning into a fleet-wide sweep.
+readonly PREFIX=${PREFIX:-"Keep this short: work only on the cluster you run on, run at most a few commands, then answer. "}
 readonly GATEWAY_DEPLOY=${GATEWAY_DEPLOY:-platform-agent-gateway}
 # Priority order: the two comparisons that decide the question first, the isolating arms after.
 readonly DEFAULT_MATRIX="stock:shipped scoped-all:shipped stock:grown scoped-all:grown fulldesc:shipped scoped-skills:shipped fulldesc:grown scoped-skills:grown"
@@ -28,7 +30,7 @@ for cell in $MATRIX; do
   echo "== $(date -u +%FT%TZ) cell $label"
   CTX=$CTX "$HERE/switch_arm.sh" "$arm" "$rung" 2>&1 | tee -a "$OUT_ROOT/switch.log"
   python3 "$HERE/run_ab.py" --base "$BASE" --token "$PLATFORM_AGENT_TOKEN" --scenarios "$SCENARIOS" \
-    --out "$OUT_ROOT/$label" --label "$label" --reps "$REPS" --parallel "$PARALLEL" 2>&1 | tee -a "$OUT_ROOT/$label.log"
+    --out "$OUT_ROOT/$label" --label "$label" --reps "$REPS" --parallel "$PARALLEL" --prefix "$PREFIX" 2>&1 | tee -a "$OUT_ROOT/$label.log"
   pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | head -1 | sed 's#pod/##')
   kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- cat "/opt/data/capability_scope-$label.jsonl" > "$OUT_ROOT/$label/capability_scope.jsonl" 2>/dev/null || echo "no record for $label"
   echo "== $(date -u +%FT%TZ) done $label ($(ls "$OUT_ROOT/$label"/*.json 2>/dev/null | wc -l) run files)"

@@ -32,7 +32,7 @@ MESSAGES_PATH = "/api/sessions/{sid}/messages?limit=500&order=oldest"
 SESSION_HEADER = "X-Hermes-Session-Id"
 MODEL_NAME = "model-default"
 HTTP_TIMEOUT_SECONDS = 900
-RETRY_STATUSES = (429, 502, 503, 504)
+RETRY_STATUSES = (0, 429, 503, 504)
 RETRY_ATTEMPTS = 4
 RETRY_SLEEP_SECONDS = 20
 DEFAULT_REPS = 3
@@ -59,6 +59,8 @@ def _request(method: str, url: str, token: str, body: dict | None = None) -> tup
         except json.JSONDecodeError:
             parsed = {"raw": payload}
         return exc.code, parsed, dict(exc.headers or {})
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+        return 0, {"raw": f"transport error: {exc}"}, {}
 
 
 def run_one(base: str, token: str, scenario: dict, rep: int, label: str, out_dir: pathlib.Path, prefix: str) -> dict:
@@ -91,6 +93,18 @@ def run_one(base: str, token: str, scenario: dict, rep: int, label: str, out_dir
                 except json.JSONDecodeError:
                     pass
             calls.append({"name": item.get("name"), "arguments": args})
+    if not calls and isinstance(messages, dict):
+        for msg in messages.get("messages") or messages.get("data") or []:
+            for tc in (msg.get("tool_calls") or []) if isinstance(msg, dict) else []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(fn, dict):
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            pass
+                    calls.append({"name": fn.get("name"), "arguments": args, "from": "messages"})
     result = {
         "label": label,
         "scenario": scenario["id"],
@@ -112,7 +126,8 @@ def run_one(base: str, token: str, scenario: dict, rep: int, label: str, out_dir
         ),
         "session": session,
         "messages": messages,
-        "raw_error": payload if status >= 400 else None,
+        "raw_error": payload if status >= 400 or status == 0 else None,
+        "incomplete": bool(status == 502 and session_id),
     }
     out_path.write_text(json.dumps(result, indent=1, default=str), encoding="utf-8")
     return {"id": scenario["id"], "rep": rep, "status": status, "calls": [c["name"] for c in calls], "seconds": result["wall_seconds"]}
@@ -140,7 +155,10 @@ def main() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = [pool.submit(run_one, args.base, args.token, s, rep, args.label, out_dir, args.prefix) for s, rep in jobs]
         for fut in concurrent.futures.as_completed(futures):
-            print(json.dumps(fut.result()), flush=True)
+            try:
+                print(json.dumps(fut.result()), flush=True)
+            except Exception as exc:  # noqa: BLE001 - keep the matrix moving
+                print(json.dumps({"error": str(exc)}), flush=True)
 
 
 if __name__ == "__main__":

@@ -93,15 +93,18 @@ def score_arm(runs: list[dict], scenarios: dict[str, dict], record: dict[str, li
     ttft: list[float] = []
     loaded_outside_ws = loaded_total = 0
     errors = 0
+    incomplete = 0
     per_scenario: dict[str, list[str]] = collections.defaultdict(list)
     for run in runs:
         sc = scenarios.get(run["scenario"])
         if sc is None:
             continue
-        if run.get("http_status", 0) >= 400 or run.get("http_status") == 0:
+        if run.get("http_status") == 0 or (run.get("http_status", 0) >= 400 and not run.get("session_id")):
             errors += 1
             continue
         n += 1
+        if run.get("incomplete"):
+            incomplete += 1
         gold = set(sc["gold"])
         acceptable = set(sc["acceptable"]) | (set(sc.get("acceptable_grown", [])) if grown else set())
         first = _first_skill(run)
@@ -158,6 +161,7 @@ def score_arm(runs: list[dict], scenarios: dict[str, dict], record: dict[str, li
     return {
         "runs": n,
         "errors": errors,
+        "incomplete_runs": incomplete,
         "probes": probes,
         "first_skill_gold_pct": round(100.0 * first_gold / probes, 1) if probes else None,
         "first_skill_acceptable_pct": round(100.0 * first_acc / probes, 1) if probes else None,
