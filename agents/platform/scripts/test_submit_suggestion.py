@@ -1006,6 +1006,27 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertTrue(any("--workspace is no longer read" in line for line in self.logged))
         self.assertTrue(any("--lease is no longer read" in line for line in self.logged))
 
+    def test_a_submit_with_no_copy_is_sent_to_prepare_and_not_to_clone(self):
+        """What the retired flags promise the caller will be told instead.
+
+        A command written against the old shape reaches `submit` with nothing
+        on the volume. `vcs_client`'s own refusal ends "Run `vcs.py clone
+        <url>` first", which is the wrong verb here: it brings the repository
+        down without cutting the branch, so the next `submit` is refused again
+        for standing on the trunk and there is a stray copy to clean up. The
+        refusal has to name `prepare`, which does both.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "t", "--body", "b",
+                "--workspace", "/opt/data/gitops/t_9f3c/acme__infra",
+            )
+        said = str(caught.exception)
+        self.assertIn("prepare", said)
+        self.assertIn("platform-agent/scale-web", said)
+        self.assertNotIn("vcs.py clone", said.split("(")[0])
+
     def test_an_argv_with_no_subcommand_is_read_as_submit(self):
         self.assertEqual(
             submit_suggestion.normalise_argv(["--branch", "b", "--title", "t"]),

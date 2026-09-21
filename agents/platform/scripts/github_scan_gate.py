@@ -397,11 +397,14 @@ REFUSAL_BODY = (
 )
 
 
-def _forge_warning(error: Exception) -> str:
+def _forge_detail(error: Exception) -> str:
     reason = getattr(error, "reason", type(error).__name__)
     value = getattr(error, "value", "")
-    detail = reason + (f" ({value})" if value else "")
-    return f"⚠️ **GitHub PR watcher is not running:** {detail}"
+    return reason + (f" ({value})" if value else "")
+
+
+def _forge_warning(error: Exception) -> str:
+    return f"⚠️ **GitHub PR watcher is not running:** {_forge_detail(error)}"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -549,14 +552,26 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     # a stranger's, nor its own comments from a reviewer's; both readings fail
     # dangerously, so the repository is skipped rather than half-swept.
     nameless: list[str] = []
-    try:
-        for r in repos:
-            # Per repository and not once for the sweep, because identity is a
-            # property of a forge and an install serving two of them
-            # authenticates as two accounts. Repositories on one forge still
-            # cost one lookup between them: the provider caches per repository
-            # and every `identity` answer carries the viewer, so the first
-            # permission check on each forge has already paid for this.
+    # Repositories the sweep could not read at all, with the reason. Separate
+    # from `nameless` because they are a different message: one is a credential
+    # that answered and could not name itself, the other is a call that did not
+    # come back.
+    refused: list[tuple[str, forge.ForgeError]] = []
+    for r in repos:
+        # Per repository and not once for the sweep, because identity is a
+        # property of a forge and an install serving two of them
+        # authenticates as two accounts. Repositories on one forge still
+        # cost one lookup between them: the provider caches per repository
+        # and every `identity` answer carries the viewer, so the first
+        # permission check on each forge has already paid for this.
+        #
+        # The refusal is caught per repository and not around the loop. Around
+        # it, a dead credential on the second repository -- or one on a host
+        # the broker has no module for, which raises rather than answering --
+        # discarded the pull requests already collected from the first and
+        # filed no cards for a repository that was working, every tick until
+        # somebody fixed the other one.
+        try:
             viewer = provider.viewer_login(r)
             if not viewer:
                 nameless.append(r)
@@ -564,8 +579,13 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             for pr in provider.list_open_prs(r):
                 if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
                     prs.append((r, pr))
-    except forge.ForgeError as error:
-        return SweepResult(warnings=[_forge_warning(error)])
+        except forge.ForgeError as error:
+            refused.append((r, error))
+    if refused and not prs and not nameless:
+        # Nothing was swept, so there is no partial result to report and the
+        # first refusal is the whole story -- the same single warning the
+        # sweep returned before it read repositories one at a time.
+        return SweepResult(warnings=[_forge_warning(refused[0][1])])
     if nameless:
         warnings.append(
             "⚠️ **The PR watcher is not running on** "
@@ -573,6 +593,12 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             + " — the credential there could not name the account it "
             "authenticates as, so the agent cannot recognise its own pull "
             "requests."
+        )
+    for name, error in sorted(refused, key=lambda item: item[0]):
+        warnings.append(
+            f"⚠️ **The PR watcher is not running on** `{name}` — "
+            f"{_forge_detail(error)}. The other managed repositories were "
+            "swept."
         )
 
     cap = _max_per_tick()

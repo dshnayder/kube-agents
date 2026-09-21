@@ -1633,6 +1633,13 @@ unit_cost_hint() {
     # repetitions (737/599/1357s, build 2099969322708373504); the 200s
     # default under-packs it by 3x.
     incident-triage-oom-event-probe) echo 700 ;;
+    # Nightly-only since this change (#1246 PR-2). Measured on
+    # `dev-vcs2-20260915a`: the resolver 1424s a repetition, the read-back
+    # 546-654s there and 683-982s in the later runs. The resolver is the most
+    # expensive unit in the nightly, so at the 200s default it launched in the
+    # last cost tier and was what the deadline truncated first.
+    vcs-issue-resolver-triage) echo 1400 ;;
+    vcs-review-feedback-read-back) echo 700 ;;
     *) echo 200 ;;
   esac
 }

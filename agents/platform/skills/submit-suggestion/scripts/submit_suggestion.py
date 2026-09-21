@@ -375,7 +375,25 @@ def handle_submit(args) -> int:
     try:
         session = vcs_client.resolve_session(args.repo, key=branch)
     except vcs_client.VcsError:
-        session = vcs_client.resolve_session(args.repo)
+        try:
+            session = vcs_client.resolve_session(args.repo)
+        except vcs_client.VcsError as missing:
+            # Re-raised rather than let through. `vcs_client`'s own refusal
+            # ends "Run `vcs.py clone <url>` first", which is right for a
+            # caller driving the verbs directly and wrong for this one: an
+            # agent that obeys it gets a copy of the trunk keyed on the trunk,
+            # its next `submit` is refused again for standing on the wrong
+            # branch, and there is now a stray copy on the volume. `prepare` is
+            # the verb that brings the repository down *and* cuts the branch,
+            # and it is what the retired flags above promise this refusal will
+            # say.
+            named = f" --repo {args.repo}" if args.repo else ""
+            raise ValueError(
+                f"there is no working copy for '{branch}' here. Take the "
+                f"branch first: `submit_suggestion.py prepare{named} --branch "
+                f"{branch}`, make the changes inside the `workspace` it "
+                f"prints, then submit. ({missing})"
+            ) from missing
     # Whichever lookup answered, the rest of this run is about *that* copy.
     # `commit` and `publish` resolve again, and asking them for `branch` would
     # repeat the lookup the fallback already failed -- so a copy cut by hand

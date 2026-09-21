@@ -1690,6 +1690,19 @@ class CollaborationTest(unittest.TestCase):
             ("gh: API rate limit exceeded (HTTP 403)", 429, "FORGE_RATE_LIMITED"),
             ("gh: secondary rate limit (HTTP 429)", 429, "FORGE_RATE_LIMITED"),
             ("gh: Not Found (HTTP 404)", 404, "FORGE_NOT_FOUND"),
+            # 422 is the other status GitHub spends twice. `search/issues`
+            # answers it, not 404, for a repository that is gone or that this
+            # credential cannot see -- so the filtered half of `issue_list`
+            # has to report the same fault as the unfiltered half, or an
+            # operator is told to fix a field that does not exist.
+            (
+                "gh: The listed users and repositories cannot be searched "
+                "either because the resources do not exist or you do not have "
+                "permission to view them. (HTTP 422)",
+                404,
+                "FORGE_NOT_FOUND",
+            ),
+            ("gh: Validation Failed (HTTP 422)", 422, "FORGE_REJECTED"),
             ("gh: Conflict (HTTP 409)", 409, "FORGE_CONFLICT"),
             ("gh: Server Error (HTTP 500)", 503, "FORGE_UNAVAILABLE"),
             ("gh: Bad Gateway (HTTP 502)", 503, "FORGE_UNAVAILABLE"),

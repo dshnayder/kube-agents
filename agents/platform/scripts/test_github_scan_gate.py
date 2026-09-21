@@ -652,7 +652,15 @@ class FakeProvider:
     def viewer_login(self, repo):
         self.viewer_lookups.append(repo)
         if isinstance(self._viewer, dict):
-            return self._viewer.get(repo, "")
+            answer = self._viewer.get(repo, "")
+            # The real `BrokerProvider.viewer_login` raises for a call that did
+            # not happen or was refused -- a dead credential, or a host no
+            # provider module claims -- rather than answering "". A test that
+            # can only express the empty answer cannot see what a raise does to
+            # the repositories beside it.
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
         return self._viewer
 
     def supports_acknowledge(self, repo):
@@ -1383,6 +1391,50 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(len(result.cards), 1)
         self.assertTrue(any(OTHER_REPO in w for w in result.warnings))
         self.assertFalse(any(f"`{REPO}`" in w for w in result.warnings))
+
+    def test_a_repository_whose_identity_refuses_is_skipped_not_the_sweep(self):
+        """The same claim for the answer the real provider actually gives.
+
+        `viewer_login` raises for a credential the forge rejected and for a
+        host no provider module claims; it does not answer "". With the catch
+        around the whole loop, the second repository's refusal discarded the
+        first repository's pull requests and the tick filed no cards for a
+        repository that was working.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(len(result.cards), 1)
+        named = [w for w in result.warnings if OTHER_REPO in w]
+        self.assertEqual(len(named), 1)
+        self.assertIn("FORGE_UNAUTHENTICATED", named[0])
+        self.assertFalse(any(f"`{REPO}`" in w for w in result.warnings))
+
+    def test_every_repository_refusing_is_still_one_warning(self):
+        """Nothing was swept, so there is no partial result to qualify.
+
+        The per-repository catch must not turn the ordinary total outage --
+        one forge, one dead credential, every repository on it -- into a
+        warning per repository saying the others were fine.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={
+                REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("FORGE_UNAUTHENTICATED", result.warnings[0])
 
 
 class ResolverPathTest(unittest.TestCase):

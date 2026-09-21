@@ -224,6 +224,8 @@
 # resolver 1424s, the read-back 546-654s. Only the read-back is red on main;
 # the resolver passes there too and is kept as a regression guard over the
 # largest consumer this migration rewrites -- each task.yaml header says
-# which it is and shows its run ids.
+# which it is and shows its run ids. Priced at 1400 and 700 respectively in
+# unit_cost_hint, so the resolver -- the most expensive unit in the nightly --
+# launches in the first cost tier rather than the last.
 ./tasks/vcs-issue-resolver-triage/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml
