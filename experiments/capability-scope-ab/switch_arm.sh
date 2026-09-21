@@ -26,6 +26,7 @@ readonly MAX_ITERATIONS=${MAX_ITERATIONS:-8}
 readonly ROLLOUT_TIMEOUT=600s
 readonly GATEWAY_DEPLOY=${GATEWAY_DEPLOY:-platform-agent-gateway}
 readonly SETTLE_SECONDS=45
+readonly CONTROL_FILE=/opt/data/capability_scope.env
 
 index_mode=""; desc_limit=""; scope_mode="off"
 case "$ARM" in
@@ -42,27 +43,24 @@ case "$RUNG" in
   *) echo "unknown rung $RUNG" >&2; exit 2 ;;
 esac
 
-env_json=$(python3 - "$index_mode" "$desc_limit" "$scope_mode" "$extra_dirs" "$K_SKILLS" "$N_TOOLS" "$MAX_ITERATIONS" "$ARM-$RUNG" <<'EOF'
-import json, sys
-index_mode, desc_limit, scope_mode, extra_dirs, k, n, max_it, label = sys.argv[1:]
-env = [
-    {"name": "KA_SKILLS_INDEX_MODE", "value": index_mode},
-    {"name": "KA_SKILL_DESC_LIMIT", "value": desc_limit},
-    {"name": "KA_SCOPE_MODE", "value": scope_mode},
-    {"name": "KA_EXTRA_SKILLS_DIRS", "value": extra_dirs},
-    {"name": "KA_SCOPE_K_SKILLS", "value": k},
-    {"name": "KA_SCOPE_N_TOOLS", "value": n},
-    {"name": "KA_SCOPE_RECORD", "value": "/opt/data/capability_scope-%s.jsonl" % label},
-    {"name": "HERMES_MAX_ITERATIONS", "value": max_it},
-]
-print(json.dumps({"spec": {"deployment": {"env": env}}}))
-EOF
-)
-kubectl --context "$CTX" -n "$NS" patch platformagent "$CR" --type merge -p "$env_json"
+pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | grep -v Terminating | head -1 | sed 's#pod/##')
+label="$ARM-$RUNG"
+# The operator does not pass spec.deployment.env to the gateway container, so the arm lives in a
+# control file on the data volume that the plugin loads into the environment at start-up.
+kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- sh -c "cat > $CONTROL_FILE" <<CTRL
+KA_SKILLS_INDEX_MODE=$index_mode
+KA_SKILL_DESC_LIMIT=$desc_limit
+KA_SCOPE_MODE=$scope_mode
+KA_EXTRA_SKILLS_DIRS=$extra_dirs
+KA_SCOPE_K_SKILLS=$K_SKILLS
+KA_SCOPE_N_TOOLS=$N_TOOLS
+KA_SCOPE_RECORD=/opt/data/capability_scope-$label.jsonl
+HERMES_MAX_ITERATIONS=$MAX_ITERATIONS
+CTRL
+kubectl --context "$CTX" -n "$NS" rollout restart "deploy/$GATEWAY_DEPLOY"
 sleep 5
 kubectl --context "$CTX" -n "$NS" rollout status "deploy/$GATEWAY_DEPLOY" --timeout="$ROLLOUT_TIMEOUT"
 sleep "$SETTLE_SECONDS"
-pod=$(kubectl --context "$CTX" -n "$NS" get pod -l app.kubernetes.io/name="$GATEWAY_DEPLOY" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-[ -n "$pod" ] || pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | head -1 | sed 's#pod/##')
+pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | grep -v Terminating | head -1 | sed 's#pod/##')
 echo "arm=$ARM rung=$RUNG pod=$pod"
-kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- env 2>/dev/null | grep -E '^KA_|^HERMES_MAX_ITERATIONS' || true
+kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- cat "$CONTROL_FILE"
