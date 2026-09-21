@@ -135,9 +135,9 @@ def score_arm(runs: list[dict], scenarios: dict[str, dict], record: dict[str, li
         tin = sess.get("input_tokens")
         tout = sess.get("output_tokens")
         cr = sess.get("cache_read_tokens") or 0
-        if tin:
-            tokens_in.append(tin)
-            cache_share.append(round(100.0 * cr / tin, 1))
+        if tin or cr:  # the session row keeps cached prompt tokens out of input_tokens
+            tokens_in.append((tin or 0) + cr)
+            cache_share.append(round(100.0 * cr / ((tin or 0) + cr), 1))
         if tout:
             tokens_out.append(tout)
         if sess.get("api_call_count"):
