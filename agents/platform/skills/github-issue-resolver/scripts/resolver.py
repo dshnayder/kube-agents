@@ -44,6 +44,14 @@ from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
 
 SCRATCH_DIR = "/opt/data/scratch"
 
+#: The reason reported for a broker failure that carries no code of its own:
+#: the broker unreachable, its token volume unprojected, `CREDENTIAL_PROXY_URL`
+#: unset, an answer that is not JSON. Every one of those is a fault on this side
+#: of the seam, and none of them is `FORGE_CALL_FAILED` -- that is the broker's
+#: own word for a forge that did not answer *it*, and reporting it here sent an
+#: operator to the forge for a broker that was restarting.
+BROKER_UNREACHABLE = "BROKER_UNREACHABLE"
+
 # Which copy of this file the forwarded `poll` runs, and it is deliberately not
 # the one the model has. The image also bakes the skills tree into
 # /opt/defaults/skills and the entrypoint syncs it onto the volume under
@@ -274,7 +282,15 @@ def sweep_stale_issues(repo: str):
         found = forge(
             "issue-list", {"labels": [IN_PROGRESS], "limit": POLL_WINDOW}, repo
         )
-    except vcs_client.VcsError:
+    except vcs_client.VcsError as refusal:
+        # Not fatal, as the docstring says -- but not silent either. The poll
+        # that follows reports the same refusal by code; this is where the
+        # message itself survives, for whoever reads the worker's stderr.
+        print(
+            f"resolver: stale-issue sweep skipped for {repo}: "
+            f"{refusal.code or BROKER_UNREACHABLE}: {refusal}",
+            file=sys.stderr,
+        )
         return
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -561,6 +577,11 @@ def handle_poll(args):
     # forge has stopped accepting from an install pointed at a repository that
     # does not exist, and those two faults belong to different people.
     refusals: dict = {}
+    # Repository -> the refusal's own words. The code is what the rules branch
+    # on; the message is what names the broker and the errno when there is no
+    # code, and throwing it away left "every managed repository refused the
+    # listing" as the whole of what an operator got for a broker restart.
+    errors: dict = {}
 
     for repo in repos:
         # Sweep stale issues first, so an investigation that crashed since the
@@ -585,7 +606,14 @@ def handle_poll(args):
             # pre-flight guessed at the difference from a second call. The
             # broker answers it directly, in the refusal, which is why there is
             # no pre-flight here any more.
-            refusals[repo] = refusal.code or "FORGE_CALL_FAILED"
+            #
+            # A refusal with no code is not the forge's: it is the transport's
+            # -- the broker unreachable, its token missing, an answer that was
+            # not JSON -- and it gets a code of this side's rather than the
+            # broker's word for a forge fault.
+            refusals[repo] = refusal.code or BROKER_UNREACHABLE
+            errors[repo] = str(refusal)
+            print(f"resolver: {repo}: {refusals[repo]}: {refusal}", file=sys.stderr)
             continue
 
         for issue in found.get("issues") or []:
@@ -604,11 +632,19 @@ def handle_poll(args):
             # status stays the generic one.
             codes = set(refusals.values())
             reason = codes.pop() if len(codes) == 1 else "REPO_UNREACHABLE"
+            # The message travels with the code. One message when every
+            # repository said the same thing -- a broker down is one sentence,
+            # not N -- and the generic line with the per-repository words
+            # beside it otherwise.
+            messages = set(errors.values())
             refuse(
                 reason,
-                "every managed repository refused the listing",
+                messages.pop() if len(messages) == 1 else (
+                    "every managed repository refused the listing"
+                ),
                 unreachable_repos=unreachable_repos,
                 refusals=refusals,
+                errors=errors,
             )
         print(
             json.dumps(

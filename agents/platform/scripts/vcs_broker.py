@@ -554,17 +554,26 @@ class VcsBroker:
                     code="PROTECTED_BRANCH",
                 )
             if advance:
-                # The waived refusal, verified against the forge rather than
-                # taken on the caller's word. `advance` says one thing -- this
-                # copy was cloned *of* a proposal branch in order to add to
-                # it -- and an open proposal whose source is this branch is
-                # that thing, stated in a fact the sandbox does not author.
-                # Without the check the field is simply a flag that turns the
-                # refusal off, and the client's own refusal text names it to
-                # every worker that meets one: a worker that clones
-                # `release-1.2`, commits, and publishes `--target main
-                # --advance` fast-forwards a long-lived shared branch, which is
-                # the live incident the refusal was added for.
+                # The waived refusal, checked against the forge rather than
+                # taken on the caller's word alone. `advance` says one thing --
+                # this copy was cloned *of* a proposal branch in order to add
+                # to it -- and an open proposal whose source is this branch is
+                # that thing, read off the forge.
+                #
+                # A bar, not a proof, and worth being exact about which. The
+                # same caller can open that proposal first: `proposal-create`
+                # is on the same route table, gated on the same managed list a
+                # caller already passed to reach `publish`. So the sequence
+                # this stops -- clone `release-1.2`, commit, `publish --target
+                # main --advance`, the live incident the refusal was added for
+                # -- is not made impossible; it is made to cost a pull request
+                # under the install's own name, open on the forge for anyone
+                # to see, and it stops being something a worker does by
+                # mistake because the refusal text named a flag. Without the
+                # check the field was simply that flag. The refusals that do
+                # not come from the request -- the remote's default branch, the
+                # protected names, the base override, `run/**` -- stand
+                # regardless, which is the part that is a proof.
                 #
                 # After the default-branch check, not before it. That refusal is
                 # the one the broker establishes for itself, and it must stay
@@ -721,7 +730,10 @@ class VcsBroker:
 
         One extra read on the `advance` path only, which is the second and
         later rounds of a proposal the caller already opened -- not the first
-        publish of anything.
+        publish of anything. What it establishes is that such a proposal is
+        open on the forge, not who opened it: the caller could have, one verb
+        earlier. See the comment at the call site for what that does and does
+        not buy.
 
         A forge that does not serve `proposal-list` is left alone. `publish`
         holds no forge otherwise -- it is git against a URL, which is what makes

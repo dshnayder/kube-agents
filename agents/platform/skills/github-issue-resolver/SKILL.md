@@ -77,8 +77,11 @@ API call. It also performs the stale sweep, which the card cannot.
   forge refused — `FORGE_UNAUTHENTICATED` is a credential this install must
   have re-issued, `FORGE_NOT_FOUND` is a repository that is registered but not
   reachable with this credential, `FORGE_RATE_LIMITED` will clear on its own —
-  and `CONFIGMAP_READ_FAILED`, `REPO_UNREACHABLE` or `SANDBOX_UNREACHABLE` when
-  the fault was on this side. Pass it through as it is written. This is a fault
+  and `CONFIGMAP_READ_FAILED`, `REPO_UNREACHABLE`, `SANDBOX_UNREACHABLE` or
+  `BROKER_UNREACHABLE` when the fault was on this side (`BROKER_UNREACHABLE` is
+  the credential broker not answering at all, or not in a form the script could
+  read; `error` carries its own words). Pass it through as it is written,
+  `error` included. This is a fault
   that would otherwise recur silently on every poll, so it is never silent: alert the chat room with
   `⚠️ **GitHub issue resolver is not running:** <reason>` (including `unreachable_repos` if listed), then end the turn per
   [Ending the turn](#ending-the-turn) — on a card, `kanban_block` rather than

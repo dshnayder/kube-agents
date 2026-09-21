@@ -1001,13 +1001,18 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(self.remote_tip("topic"), second)
 
     def test_advance_is_refused_on_a_branch_carrying_no_open_proposal(self):
-        """The waiver is for a proposal branch, and the forge is what says so.
+        """The waiver is for a proposal branch, and the forge is asked whether it is one.
 
         Without this, `advance` is a field that turns the refusal off: a worker
         that clones `release-1.2`, commits, and publishes `--target main
         --advance` fast-forwards a long-lived shared branch -- the live incident
         the refusal was added for -- and the client's own refusal text names the
-        flag to any worker that meets one.
+        flag to any worker that meets one. What the check buys is exactly that
+        much: the same caller could open the proposal first with
+        `proposal-create`, so this is a bar (a visible pull request under the
+        install's name) rather than a proof, and the default- and
+        protected-branch refusals above it are the ones that do not depend on
+        the request.
         """
         forge = ProposingLocalForge(self.forges, self.refreshed, open_sources=())
         self.broker.registry.hosts["local.test"] = forge

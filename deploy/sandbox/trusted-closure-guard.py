@@ -16,9 +16,18 @@ check still passes. What proves the closure is where each module actually came
 from, so that is what is checked: import the entry points, then read `__file__`
 off everything that got loaded.
 
-A failure here means a module in the closure was not added to the COPY list.
-`test_sandbox_delivery.py` catches the same gap at review time by AST walk; this
-catches the case the walk cannot see, an import that only resolves at runtime.
+The second thing checked is `sys.path` itself, after everything has loaded.
+The trusted copies drop `/opt/defaults/scripts` and `/opt/data/scripts` from
+the path when they find themselves under the trusted directory; a module that
+put either back -- under any spelling -- would leave a uid-1000-writable
+directory for a *deferred* import to resolve from, which the `__file__` walk
+above cannot see because that import has not happened yet.
+
+A failure here means a module in the closure was not added to the COPY list,
+or one of them reaches back out to an agent-owned directory.
+`test_sandbox_delivery.py` checks both at review time, by loading the staged
+modules as the trusted copy on a tree nobody has to build; this is the same
+check where the files really are.
 """
 
 import importlib
@@ -32,6 +41,10 @@ import sysconfig
 # directory it is asserting about, which the `chown`/`find` half of the same
 # RUN would then fail on.
 TRUSTED = os.environ.get("TRUSTED_CLOSURE_DIR", "/opt/vcs/libexec/platform")
+
+# The directories the entrypoint chowns to `agent`. A trusted process must not
+# carry either on its import path, even behind site-packages.
+AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
 
 # Each forwarded script and the constant naming the path its caller forwards to.
 # The constant is checked as well as the closure: staging a root-owned copy that
@@ -73,6 +86,9 @@ def main() -> int:
         if module.__name__ == "__main__" or not origin or origin.startswith(ALLOWED):
             continue
         failures.append(f"{module.__name__} resolved from {origin}, outside {TRUSTED}")
+    for entry in sys.path:
+        if entry.startswith(AGENT_WRITABLE):
+            failures.append(f"{entry} is on sys.path after the trusted copies loaded")
 
     if failures:
         print("the trusted copy is not closed under import:", file=sys.stderr)

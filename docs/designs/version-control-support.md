@@ -209,7 +209,7 @@ transport rather than the reason for the work.
 
 Two things exist and do not need designing again.
 
-**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as seven
+**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as eight
 operations, normalises three GitHub-isms behind them (`can_write` as a boolean rather than
 `author_association`, `supports_acknowledge` as a capability rather than an assumption,
 `normalise_login` folding the spellings one account gets), and funnels every call through one
@@ -217,7 +217,7 @@ operations, normalises three GitHub-isms behind them (`can_write` as a boolean r
 of them; this document does not restate it.
 
 **Provider selection.** There is one implementation of that protocol and it serves every forge:
-each of its seven operations is a version-control verb, and which forge answers is decided from the
+each of its eight operations is a version-control verb, and which forge answers is decided from the
 repository on the credential side by `providers/registry.py`. Adding a forge is a registration
 there rather than a branch in a sweep — and, as [One provider implementation, not
 two](#one-provider-implementation-not-two) argues, a second host table on the agent side would be a
@@ -560,7 +560,14 @@ the target is. The client, which alone knows which branch its copy was cloned
 from, refuses to publish that branch under any target, and tells the broker
 which branch that was (`clonedFrom`) so the broker refuses it too,
 `CLONED_BRANCH` — defence in depth for a confused caller, since a client that
-lied would gain nothing it could not get by omitting the field. In addition to
+lied would gain nothing it could not get by omitting the field. `advance` is
+the one waiver of that last refusal, for the copy that was cloned *of* a
+proposal branch in order to add a round to it, and the broker does not take it
+on the caller's word alone: it asks the forge for an open proposal whose source
+is that branch and refuses without one. That is a bar rather than a proof — the
+same caller can open a proposal with `proposal-create` first — but the bar is a
+pull request under the install's own name, visible on the forge, and the
+default-branch and protected-branch refusals do not depend on it. In addition to
 the remote's default branch, the broker enforces protected branch policy on
 `/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
 override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`

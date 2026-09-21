@@ -607,6 +607,45 @@ class HandlePollTest(ResolverTest):
         self.assertEqual(payload["reason"], "FORGE_UNAUTHENTICATED")
         self.assertEqual(payload["unreachable_repos"], ["acme/one", "acme/two"])
 
+    def test_a_codeless_broker_failure_is_named_as_the_brokers_and_keeps_its_words(self):
+        """The transport failing is this side's fault, and its message is the diagnosis.
+
+        Every failure `vcs_client.call` raises for the broker being unreachable,
+        its token unprojected or its answer not JSON is codeless. Reported as
+        `FORGE_CALL_FAILED` -- the broker's own word for a forge that did not
+        answer it -- with "every managed repository refused the listing" as
+        the whole message, a broker restart read as a forge outage and the
+        string naming the broker and the errno was nowhere.
+        """
+        down = "the broker at http://127.0.0.1:1 could not be reached: Connection refused"
+
+        class BrokerDown(FakeForge):
+            def __call__(self, verb, payload):
+                if verb == "issue-list":
+                    raise vcs_client.VcsError(down)
+                return super().__call__(verb, payload)
+
+        payload, code = self.poll(forge=BrokerDown(), repos=("acme/one", "acme/two"))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], "BROKER_UNREACHABLE")
+        self.assertEqual(
+            payload["refusals"], {"acme/one": "BROKER_UNREACHABLE", "acme/two": "BROKER_UNREACHABLE"}
+        )
+        # One message, because every repository said the same thing -- a broker
+        # down is one sentence, not N.
+        self.assertEqual(payload["error"], down)
+        self.assertEqual(payload["errors"], {"acme/one": down, "acme/two": down})
+        # And the words reach stderr as they happen, not only in the envelope.
+        self.assertIn(f"acme/two: BROKER_UNREACHABLE: {down}", self.stderr)
+
+    def test_a_refused_repository_keeps_its_message_beside_the_code(self):
+        forge = FakeForge(
+            issues={"healthy/repo": []}, refuse={"broken/repo": "FORGE_NOT_FOUND"}
+        )
+        payload, _ = self.poll(forge=forge, repos=("broken/repo", "healthy/repo"))
+        self.assertEqual(payload["status"], "NO_ISSUES")
+        self.assertIn("broken/repo: FORGE_NOT_FOUND: the forge refused", self.stderr)
+
     def test_when_they_refuse_differently_the_reason_stays_generic(self):
         forge = FakeForge(
             refuse={
@@ -621,6 +660,9 @@ class HandlePollTest(ResolverTest):
             payload["refusals"],
             {"acme/one": "FORGE_NOT_FOUND", "acme/two": "FORGE_RATE_LIMITED"},
         )
+        # Two different messages: the generic line, with each one beside it.
+        self.assertEqual(payload["error"], "every managed repository refused the listing")
+        self.assertIn("acme/one", payload["errors"]["acme/one"])
 
 
 class SweepStaleIssuesTest(ResolverTest):

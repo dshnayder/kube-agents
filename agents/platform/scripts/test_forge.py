@@ -1338,6 +1338,21 @@ class ProtocolConformanceTest(unittest.TestCase):
             "docs/designs/pr-comment-conversation.md §3 and forge.ForgeProvider "
             "disagree about the protocol",
         )
+        # The other design that names the count, in prose rather than in a
+        # block: it said "seven" for a round after the eighth member landed,
+        # and contradicted the document it defers to in the same sentence.
+        words = {7: "seven", 8: "eight", 9: "nine", 10: "ten"}
+        word = words[len(protocol_members())]
+        prose = " ".join(
+            (design.parent / "version-control-support.md").read_text().split()
+        )
+        for phrase in (f"`ForgeProvider` as {word} operations", f"each of its {word} operations"):
+            self.assertIn(
+                phrase,
+                prose,
+                "docs/designs/version-control-support.md counts the protocol's "
+                f"operations differently from forge.ForgeProvider ({word})",
+            )
 
     def test_nothing_here_branches_on_which_forge_it_is(self):
         """One class, every forge -- the reason it is no longer `GitHubProvider`.

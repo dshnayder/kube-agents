@@ -153,14 +153,20 @@ the edit can miss the file it was aimed at. So after `submit`, read the branch
 back and confirm the change is on it:
 
 ```bash
-python3 "$HERMES_HOME"/skills/version-control/scripts/vcs.py \
-  proposal commits <N> --repo <owner>/<repo>
+V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+python3 "$V" proposal view <N> --repo <owner>/<repo>
+python3 "$V" proposal commits <N> --repo <owner>/<repo>
 ```
 
-`commits` is oldest first, so the revision you just pushed is the **last**
-entry: read its `sha` and the first line of its `message`. Then check the value
-you were asked to change actually reads that way now, on that branch — the
-file, not your memory of having edited it.
+`view` answers `sourceRevision`: the branch's tip as the forge holds it right
+now, which is the revision you just pushed if the push landed. `commits` is
+oldest first and one page long, so the tip is the **last** entry only when
+that page says `"truncated": false`; when it says `true`, ask again with
+`--page 2`, `--page 3`, … until it does not, and take the last entry of that
+last page. Its `sha` must equal `sourceRevision` — if it does not, you are not
+looking at the tip yet. Read that entry's `sha` and the first line of its
+`message`. Then check the value you were asked to change actually reads that
+way now, on that branch — the file, not your memory of having edited it.
 
 > [!CAUTION] **Never describe a change you have not read back.** A reply is
 > stamped `agent-answered`, which closes the request for good: no later sweep
