@@ -427,13 +427,33 @@ def decide_cohort_strategy(clusters: list[dict]) -> str:
     return "mode-only"
 
 
-def cohort_key(c: dict, strategy: str, env: str) -> tuple:
-    mode = cluster_mode(c)
+# The cohort a cluster-level facet compares in when the fleet gives no
+# environment and no second project to split on: one cohort holding the whole
+# fleet, both modes together. `mode-only` names the node-level counterpart,
+# which still splits, so the two cannot share a label.
+ALL_CLUSTERS_COHORT = "all"
+
+
+def cohort_key(c: dict, strategy: str, env: str, *, standard_only: bool) -> tuple:
+    """§2.3's key, which is not the same key for every facet.
+
+    `standard_only` is the facet class, not a property of the cluster. Mode
+    belongs in the key only for the eleven facets Autopilot leaves nothing to
+    compare -- there, an Autopilot cluster and a Standard one genuinely are not
+    peers. For the other eight the setting is configurable on both modes, so
+    keying on mode buys nothing and costs the comparison: it strands every
+    Autopilot cluster on a fleet with fewer than three of them in a cohort
+    under the floor, which is a `limitations` string per facet, a `partial`
+    run, and `resolved` pinned at 0 for as long as the fleet stays that shape.
+    That is the degradation #1226 fixed, and this argument is the fix.
+    """
     if strategy == "environment":
-        return (mode, env)
-    if strategy == "project":
-        return (mode, c.get("_project", ""))
-    return (mode,)
+        axis: tuple = (env,)
+    elif strategy == "project":
+        axis = (c.get("_project", ""),)
+    else:
+        axis = () if standard_only else (ALL_CLUSTERS_COHORT,)
+    return (cluster_mode(c), *axis) if standard_only else axis
 
 
 # --------------------------------------------------------------------------- #
@@ -690,32 +710,38 @@ class Facet(NamedTuple):
     slug: str
     field_path: str
     base_severity: str | Callable[[str], str]
+    # Node-level or Google-fixed on Autopilot: #1226's eleven. Two things
+    # follow from the one flag, and they have to travel together. The facet is
+    # not computed on an Autopilot cluster and is declared
+    # `checks_not_applicable` there instead; and it is the only class of facet
+    # whose cohort key carries the mode, because it is the only class where an
+    # Autopilot cluster and a Standard one are not comparable. Every other
+    # facet is configurable on both modes and is compared across them.
     standard_only: bool
-    autopilot_excluded: bool  # never flagged in an autopilot cohort, though still computed
     normalize: Callable[[dict], str | None]
     should_flag: Callable[[str, str], bool]
 
 
 FACETS: tuple[Facet, ...] = (
-    Facet("release-channel", ".releaseChannel.channel", "minor", False, False, norm_release_channel, _flag_ne),
-    Facet("shielded-nodes", ".shieldedNodes.enabled", "major", False, False, norm_shielded_nodes, _flag_off_only),
-    Facet("secure-boot", ".nodePools[].config.shieldedInstanceConfig.enableSecureBoot", "major", True, False, norm_secure_boot, _flag_less_only),
-    Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, False, norm_integrity_monitoring, _flag_less_only),
-    Facet("network-policy", ".networkConfig.datapathProvider / .networkPolicy.enabled", "major", False, False, norm_network_policy, _flag_off_only),
-    Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes / .networkConfig.defaultEnablePrivateNodes", "critical", False, False, norm_private_nodes, _flag_off_only),
-    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, False, norm_private_endpoint, _flag_off_only),
-    Facet("authorized-networks", ".masterAuthorizedNetworksConfig / .controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig", "critical", False, False, norm_authorized_networks, _flag_off_only),
-    Facet("logging-components", ".loggingConfig.componentConfig.enableComponents", _logging_severity, False, False, norm_logging_components, _flag_not_superset),
-    Facet("monitoring-components", ".monitoringConfig.componentConfig.enableComponents", "minor", False, False, norm_monitoring_components, _flag_not_superset),
-    Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", False, False, norm_managed_prometheus, _flag_off_only),
-    Facet("binary-authorization", ".binaryAuthorization.evaluationMode", "major", False, False, norm_binary_authorization, _flag_off_only),
-    Facet("node-autoprovisioning", ".autoscaling.enableNodeAutoprovisioning", "minor", True, False, norm_node_autoprovisioning, _flag_off_only),
-    Facet("pool-autoscaling", ".nodePools[].autoscaling.enabled", "minor", True, False, norm_pool_autoscaling, _flag_less_only),
-    Facet("intra-node-visibility", ".networkConfig.enableIntraNodeVisibility", "minor", False, False, norm_intra_node_visibility, _flag_ne),
-    Facet("datapath-provider", ".networkConfig.datapathProvider", "major", False, True, norm_datapath_provider, _flag_ne),
-    Facet("label-keys", ".resourceLabels", "minor", False, False, norm_label_keys, _flag_not_superset),
-    Facet("image-type", ".nodePools[].config.imageType", "minor", True, False, norm_image_type, _flag_not_superset),
-    Facet("database-encryption", ".databaseEncryption.state", "critical", False, False, norm_database_encryption, _flag_off_only),
+    Facet("release-channel", ".releaseChannel.channel", "minor", False, norm_release_channel, _flag_ne),
+    Facet("shielded-nodes", ".shieldedNodes.enabled", "major", True, norm_shielded_nodes, _flag_off_only),
+    Facet("secure-boot", ".nodePools[].config.shieldedInstanceConfig.enableSecureBoot", "major", True, norm_secure_boot, _flag_less_only),
+    Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, norm_integrity_monitoring, _flag_less_only),
+    Facet("network-policy", ".networkConfig.datapathProvider / .networkPolicy.enabled", "major", False, norm_network_policy, _flag_off_only),
+    Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes / .networkConfig.defaultEnablePrivateNodes", "critical", False, norm_private_nodes, _flag_off_only),
+    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, norm_private_endpoint, _flag_off_only),
+    Facet("authorized-networks", ".masterAuthorizedNetworksConfig / .controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig", "critical", False, norm_authorized_networks, _flag_off_only),
+    Facet("logging-components", ".loggingConfig.componentConfig.enableComponents", _logging_severity, True, norm_logging_components, _flag_not_superset),
+    Facet("monitoring-components", ".monitoringConfig.componentConfig.enableComponents", "minor", True, norm_monitoring_components, _flag_not_superset),
+    Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", True, norm_managed_prometheus, _flag_off_only),
+    Facet("binary-authorization", ".binaryAuthorization.evaluationMode", "major", False, norm_binary_authorization, _flag_off_only),
+    Facet("node-autoprovisioning", ".autoscaling.enableNodeAutoprovisioning", "minor", True, norm_node_autoprovisioning, _flag_off_only),
+    Facet("pool-autoscaling", ".nodePools[].autoscaling.enabled", "minor", True, norm_pool_autoscaling, _flag_less_only),
+    Facet("intra-node-visibility", ".networkConfig.enableIntraNodeVisibility", "minor", True, norm_intra_node_visibility, _flag_ne),
+    Facet("datapath-provider", ".networkConfig.datapathProvider", "major", True, norm_datapath_provider, _flag_ne),
+    Facet("label-keys", ".resourceLabels", "minor", False, norm_label_keys, _flag_not_superset),
+    Facet("image-type", ".nodePools[].config.imageType", "minor", True, norm_image_type, _flag_not_superset),
+    Facet("database-encryption", ".databaseEncryption.state", "critical", False, norm_database_encryption, _flag_off_only),
 )
 FACETS_BY_SLUG = {f.slug: f for f in FACETS}
 
@@ -973,13 +999,35 @@ def ckey(c: dict) -> tuple[str, str, str]:
     return (c.get("_project", ""), c.get("location") or c.get("zone") or "", c.get("name", ""))
 
 
-def cohort_layout(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, str], dict[tuple, list[dict]], dict[tuple, tuple[str, str]], str]:
-    """§1's eligibility and §2's cohorting, as `(ineligible, cohorts, env_of,
-    strategy)`, the first three keyed by `ckey`.
+class Layout(NamedTuple):
+    """§1's eligibility and §2's cohorting, keyed by `ckey` where per-cluster.
 
-    Shared by the vote and by `cohort_limitations`, which has to agree with it
-    exactly: a cluster the vote skipped and the limitations did not explain is
-    the silent-clean failure this stream is most prone to.
+    Two cohortings, not one, because §2.3 keys the eleven node-level facets on
+    mode and the other eight across it. `cohorts_for` is how a caller picks;
+    reaching for the wrong member is the whole failure mode this type exists to
+    make visible, so nothing here is called `cohorts`.
+    """
+
+    ineligible: dict[tuple, str]
+    node_cohorts: dict[tuple, list[dict]]
+    cluster_cohorts: dict[tuple, list[dict]]
+    env_of: dict[tuple, tuple[str, str]]
+    strategy: str
+
+    def cohorts_for(self, standard_only: bool) -> dict[tuple, list[dict]]:
+        return self.node_cohorts if standard_only else self.cluster_cohorts
+
+    def key_for(self, c: dict, standard_only: bool) -> tuple:
+        return cohort_key(c, self.strategy, self.env_of[ckey(c)][0], standard_only=standard_only)
+
+    def cohort_of(self, c: dict, standard_only: bool) -> list[dict]:
+        return self.cohorts_for(standard_only).get(self.key_for(c, standard_only)) or []
+
+
+def cohort_layout(clusters: list[dict], *, now: datetime) -> Layout:
+    """Shared by the vote and by `cohort_limitations`, which has to agree with
+    it exactly: a cluster the vote skipped and the limitations did not explain
+    is the silent-clean failure this stream is most prone to.
     """
     ineligible: dict[tuple, str] = {}
     eligible: list[dict] = []
@@ -993,11 +1041,13 @@ def cohort_layout(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, s
     strategy = decide_cohort_strategy(eligible)
     env_of: dict[tuple, tuple[str, str]] = {ckey(c): environment_of(c) for c in eligible}
 
-    cohorts: dict[tuple, list[dict]] = {}
+    node_cohorts: dict[tuple, list[dict]] = {}
+    cluster_cohorts: dict[tuple, list[dict]] = {}
     for c in eligible:
         env, _ = env_of[ckey(c)]
-        cohorts.setdefault(cohort_key(c, strategy, env), []).append(c)
-    return ineligible, cohorts, env_of, strategy
+        node_cohorts.setdefault(cohort_key(c, strategy, env, standard_only=True), []).append(c)
+        cluster_cohorts.setdefault(cohort_key(c, strategy, env, standard_only=False), []).append(c)
+    return Layout(ineligible, node_cohorts, cluster_cohorts, env_of, strategy)
 
 
 def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, str]:
@@ -1021,11 +1071,26 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
     is `unvoted_facets`' business rather than this one's: the sentence here is
     "nothing compared this cluster", and a cluster compared on fifteen facets
     out of nineteen needs the four named instead.
+
+    §2.3 gives a cluster two cohorts, so there are two sentences. An undersized
+    *cluster-level* cohort is the one above: no facet of either class compared
+    it. An undersized *node-level* cohort on a cluster whose cluster-level
+    cohort is fine is the narrower case #1226 names -- the eight configurable
+    facets ran and the eleven node-level ones did not -- and it is a
+    `limitations` string rather than a `checks_not_applicable` entry because
+    those eleven could have been compared and were not.
+
+    An Autopilot cluster never earns the narrow sentence. Its eleven are
+    already declared inapplicable by `autopilot_not_applicable`, so an
+    undersized Autopilot node cohort leaves nothing uncompared and saying it
+    did would put a gap in the denominator that the mode, not the fleet's
+    size, had already settled.
     """
-    ineligible, cohorts, env_of, _strategy = cohort_layout(clusters, now=now)
-    out = dict(ineligible)
+    layout = cohort_layout(clusters, now=now)
+    out = dict(layout.ineligible)
+    env_of = layout.env_of
     labelled = sum(1 for _, source in env_of.values() if source == "label")
-    for key, members in cohorts.items():
+    for key, members in layout.cluster_cohorts.items():
         if len(members) >= COHORT_FLOOR:
             continue
         label = "/".join(str(k) for k in key)
@@ -1037,14 +1102,27 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
             out[ckey(c)] = (
                 f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
-                f"{_unlabelled_cause(key, labelled, len(env_of), cohorts)}"
+                f"{_unlabelled_cause(key, labelled, len(env_of), layout.cluster_cohorts)}"
+            )
+    node_level = sum(1 for f in FACETS if f.standard_only)
+    for key, members in layout.node_cohorts.items():
+        if len(members) >= COHORT_FLOOR or key[0] == "autopilot":
+            continue
+        label = "/".join(str(k) for k in key)
+        noun = "cluster" if len(members) == 1 else "clusters"
+        for c in members:
+            if ckey(c) in out:
+                continue
+            out[ckey(c)] = (
+                f"cohort {label} has only {len(members)} comparable {noun} "
+                f"(minimum {COHORT_FLOOR}); {node_level} node-level facets uncompared"
             )
     return out
 
 
-def joinable_environments(mode: str, cohorts: dict[tuple, list[dict]]) -> list[tuple[str, int]]:
-    """The environment values that would actually put a cluster of this mode
-    into a cohort that reaches the floor, commonest first.
+def joinable_environments(cohorts: dict[tuple, list[dict]]) -> list[tuple[str, int]]:
+    """The environment values that would actually put a cluster into a
+    cluster-level cohort that reaches the floor, commonest first.
 
     Shared by the coverage-gap sentence and by `no-environment-label`'s
     finding, which is the whole point of it being a function. The gap says
@@ -1056,10 +1134,17 @@ def joinable_environments(mode: str, cohorts: dict[tuple, list[dict]]) -> list[t
     `COHORT_FLOOR - 1` and not `COHORT_FLOOR`, because the cluster being
     advised is the one that would join: a value held by two peers reaches
     three with it.
+
+    Mode is not a parameter, and under §2.3 it must not become one. The cohorts
+    read here are the cluster-level ones, which do not carry a mode, so a peer
+    of either mode counts toward the label's floor -- and it should: the eight
+    facets a label unlocks are the ones configurable on Autopilot and Standard
+    alike. Filtering by mode here was what made the advice narrower than the
+    comparison it was advising about.
     """
     return sorted(
         ((k[-1], len(m)) for k, m in cohorts.items()
-         if k[0] == mode and k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
+         if k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
         key=lambda t: (-t[1], t[0]),
     )
 
@@ -1087,13 +1172,13 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     named `unknown`.
 
     Naming the values is the rest of it. "Label it to compare it" is true of
-    exactly one value per mode on most fleets and silently false of the rest:
-    a cohort key is `(mode, environment)`, so a label only reaches the floor
-    if `COHORT_FLOOR - 1` clusters *at the same mode* already carry it.
-    kube-agents-host is Standard on a fleet whose ten other Standard clusters
-    are all `test`, so `environment=test` compares it and `prod`, `platform`
-    and `hub` -- the three an operator would actually reach for on an install's
-    own host cluster -- each open a new cohort of one and change nothing. The
+    exactly one value on most fleets and silently false of the rest: a
+    cluster-level cohort key is `(environment)`, so a label only reaches the
+    floor if `COHORT_FLOOR - 1` clusters already carry it.
+    kube-agents-host sits on a fleet whose ten other clusters are all `test`,
+    so `environment=test` compares it and `prod`, `platform` and `hub` -- the
+    three an operator would actually reach for on an install's own host
+    cluster -- each open a new cohort of one and change nothing. The
     second run then says less than the first: `prod` is not `unknown`, so the
     guard above drops this whole clause and the operator who did what the
     sentence asked is told only that the cohort is too small. Advice whose
@@ -1103,11 +1188,10 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     """
     if key[-1:] != ("unknown",) or not labelled:
         return ""
-    mode = key[0]
-    joinable = joinable_environments(mode, cohorts)
+    joinable = joinable_environments(cohorts)
     if joinable:
         named = " or ".join(f"`environment={v}`" for v, _ in joinable)
-        peers = ", ".join(f"{n} other {mode} cluster{'' if n == 1 else 's'} carry `{v}`"
+        peers = ", ".join(f"{n} other cluster{'' if n == 1 else 's'} carry `{v}`"
                           for v, n in joinable)
         remedy = (
             f" Only {named} would reach the floor here -- {peers}. Any other"
@@ -1118,7 +1202,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     else:
         remedy = (
             f" No environment value on this fleet has the {COHORT_FLOOR - 1}"
-            f" other {mode} clusters a label would need to reach the floor, so"
+            " other clusters a label would need to reach the floor, so"
             " no label compares this cluster until the fleet grows."
         )
     return (
@@ -1135,8 +1219,9 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
 
     Every `Facet` is comparative, so `compute_drift` only evaluates one inside
     a cohort that reached `COHORT_FLOOR`, and under the `environment` strategy
-    a cohort key is `(mode, environment)` -- which an unlabelled cluster cannot
-    match, because §2.3 keeps `unknown` out of every named cohort. The cluster
+    a cluster-level cohort key is `(environment)` -- which an unlabelled
+    cluster cannot match, because §2.3 keeps `unknown` out of every named
+    cohort. The cluster
     with the fleet's one divergent label set is therefore the one cluster
     `label-keys` structurally cannot see, and the same holds for the other
     eighteen facets. `cohort_limitations` already says so in a sentence, and a
@@ -1170,7 +1255,8 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
     candidates: dict[tuple, list[dict]] = {}
     not_applicable: dict[tuple, list[dict]] = {}
 
-    _ineligible, cohorts, env_of, strategy = cohort_layout(clusters, now=now)
+    layout = cohort_layout(clusters, now=now)
+    cohorts, env_of, strategy = layout.cluster_cohorts, layout.env_of, layout.strategy
     if strategy != "environment":
         reason = (
             f"§2.3 cohorts this fleet by `{strategy}`, not by environment, so no cohort key holds "
@@ -1191,10 +1277,10 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         _env, source = env_of[key]
         if source != "unknown":
             continue
-        cohort = cohorts.get(cohort_key(c, strategy, "unknown")) or []
+        cohort = cohorts.get(cohort_key(c, strategy, "unknown", standard_only=False)) or []
         if len(cohort) >= COHORT_FLOOR:
             continue
-        joinable = joinable_environments(mode, cohorts)
+        joinable = joinable_environments(cohorts)
         if not joinable:
             continue
         value, peers = joinable[0]
@@ -1218,7 +1304,7 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         # resolved value, however it resolved -- so only the verb changes.
         peer_source = (
             "carry it"
-            if any(env_of[ckey(p)][1] == "label" for p in cohorts.get((mode, value)) or [])
+            if any(env_of[ckey(p)][1] == "label" for p in cohorts.get((value,)) or [])
             else "resolve to it from their names"
         )
         # Every facet minus the ones Autopilot withholds, which is the same
@@ -1237,12 +1323,12 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         excerpt = (
             f"carries no environment label -- `resourceLabels` sets none of "
             f"`environment`, `env`, `stage` or `tier` -- {others}. Cohorts are keyed "
-            f"`(mode, environment)` and an unlabelled cluster never joins a named "
-            f"cohort, so this one cohorts alone as `{mode}/unknown` against a "
+            f"`(environment)` and an unlabelled cluster never joins a named "
+            f"cohort, so this one cohorts alone as `unknown` against a "
             f"minimum of {COHORT_FLOOR}, and all {abstaining} comparative checks in "
             f"this audit abstain for it -- on this run and on every future run until "
             f"it is labelled. Set `resourceLabels.environment` to `{value}`: "
-            f"{peers} other {mode} cluster{'' if peers == 1 else 's'} {peer_source}, which "
+            f"{peers} other cluster{'' if peers == 1 else 's'} {peer_source}, which "
             f"reaches the floor with this one{alternatives}. Any value no peer holds "
             f"opens a new cohort of one and leaves the gap exactly as it is."
         )
@@ -1254,27 +1340,31 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
     compute on Autopilot.
 
-    Five facets carry `standard_only`, and `compute_drift` drops each of them for an
-    Autopilot cohort. Dropping them is right — every one reads a field under
-    `.nodePools[]` or names a node-management setting Google owns there — but
-    dropping them silently is not: a slug missing from `commands` is exactly
+    Eleven facets carry `standard_only` — #1226's list — and `compute_drift`
+    drops each of them for an Autopilot cohort. Dropping them is right: every
+    one reads a field under `.nodePools[]`, or names a node-management or
+    dataplane setting Google owns on Autopilot and no operator can diverge on.
+    Dropping them silently is not: a slug missing from `commands` is exactly
     how a check nobody ran looks, so §6 counts it as a coverage gap unless the
     model happens to know which GKE settings Autopilot withholds and excuses
     it by hand. Declaring them here is what makes the denominator right
     without that knowledge.
 
+    This is also the half of §2.3 that keeps an Autopilot minority from pinning
+    the ledger. The eight facets that are configurable on both modes compare
+    across them, so a lone Autopilot cluster is never in an undersized cohort
+    for those; the eleven it cannot be compared on are declared here and leave
+    the denominator. Neither half works without the other: declare fewer than
+    eleven while keying every cohort on mode, and the difference becomes a
+    `limitations` string that makes every run `partial`.
+
     Keyed off the cluster's own mode rather than its cohort's. The two agree
     wherever `compute_drift` drops them — an Autopilot cohort's members are all Autopilot —
     but the roster arithmetic in §6 is per-cluster, so an Autopilot cluster
-    whose cohort floored out has the same five inapplicable checks and should
-    have the same five in its `checks_not_applicable`. Its `limitations`
+    whose cohort floored out has the same eleven inapplicable checks and should
+    have the same eleven in its `checks_not_applicable`. Its `limitations`
     sentence then accounts for the checks that remain instead of overstating
     the full roster.
-
-    `datapath-provider` is deliberately absent. It carries `autopilot_excluded`
-    rather than `standard_only`: the facet is computed and recorded in
-    `checks_run`, and only the flagging is suppressed, so the manifest already
-    makes a claim about it that this table would contradict.
     """
     standard_only_slugs = [f.slug for f in FACETS if f.standard_only]
     out: dict[tuple, list[dict]] = {}
@@ -1285,9 +1375,9 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
             {
                 "check": slug,
                 "reason": (
-                    "GKE Autopilot: Google manages the nodes and exposes no user node pool, "
-                    f"so `{FACETS_BY_SLUG[slug].field_path}` has no value to compare against "
-                    "the cohort."
+                    "GKE Autopilot: Google manages the nodes and the dataplane and exposes "
+                    f"no user node pool, so `{FACETS_BY_SLUG[slug].field_path}` holds no "
+                    "operator-chosen value to compare against the cohort."
                 ),
             }
             for slug in standard_only_slugs
@@ -1335,20 +1425,29 @@ def unvoted_facets(
     """
     not_applicable: dict[tuple, list[dict]] = {}
     limitations: dict[tuple, str] = {}
-    _ineligible, cohorts, env_of, strategy = cohort_layout(clusters, now=now)
+    layout = cohort_layout(clusters, now=now)
+    env_of = layout.env_of
     for c in clusters:
         key = ckey(c)
         if key not in env_of:
-            continue
-        cohort = cohorts.get(cohort_key(c, strategy, env_of[key][0])) or []
-        if len(cohort) < COHORT_FLOOR:
             continue
         mode = cluster_mode(c)
         ran = set(checks_run.get(key, ()))
         abstained: list[str] = []
         no_baseline: list[str] = []
+        # Per facet class, because §2.3 gives the two classes different
+        # cohorts and either can be under the floor while the other is not.
+        # `cohort_limitations` owns the sentence for a class that floored out
+        # wholesale; what is left for this loop is the facets a cohort that
+        # *did* reach the floor still failed to compare.
+        floored = {
+            standard_only: len(layout.cohort_of(c, standard_only)) < COHORT_FLOOR
+            for standard_only in (True, False)
+        }
         for facet in FACETS:
             if facet.slug in ran or (facet.standard_only and mode == "autopilot"):
+                continue
+            if floored[facet.standard_only]:
                 continue
             if facet.normalize(c) is None:
                 reason = _shape_rules_out(facet, c)
@@ -1366,22 +1465,30 @@ def unvoted_facets(
                 + ", ".join(f"`{slug}` (`{FACETS_BY_SLUG[slug].field_path}`)" for slug in abstained)
             )
         if no_baseline:
-            label = "/".join(str(k) for k in cohort_key(c, strategy, env_of[key][0]))
-            detail = []
-            for slug in no_baseline:
-                tokens = facet_tokens(FACETS_BY_SLUG[slug], cohort)
-                top = Counter(tokens.values()).most_common(1)
-                detail.append(
-                    f"`{slug}` ({len(tokens)} readable value(s)"
-                    + (f", commonest on {top[0][1]}" if top else "")
-                    + ")"
+            # Grouped by cohort, since the two classes no longer share one: a
+            # single sentence naming one label over facets compared in two
+            # different cohorts would misattribute half of them.
+            for standard_only in (True, False):
+                slugs = [s for s in no_baseline if FACETS_BY_SLUG[s].standard_only == standard_only]
+                if not slugs:
+                    continue
+                cohort = layout.cohort_of(c, standard_only)
+                label = "/".join(str(k) for k in layout.key_for(c, standard_only))
+                detail = []
+                for slug in slugs:
+                    tokens = facet_tokens(FACETS_BY_SLUG[slug], cohort)
+                    top = Counter(tokens.values()).most_common(1)
+                    detail.append(
+                        f"`{slug}` ({len(tokens)} readable value(s)"
+                        + (f", commonest on {top[0][1]}" if top else "")
+                        + ")"
+                    )
+                parts.append(
+                    f"{len(slugs)} facet(s) reached no baseline in cohort {label} and were "
+                    f"compared for none of its {len(cohort)} members -- §3.3 needs {COHORT_FLOOR} "
+                    f"readable values with one token on {BASELINE_MIN_RATIO:.0%} of them: "
+                    + ", ".join(detail)
                 )
-            parts.append(
-                f"{len(no_baseline)} facet(s) reached no baseline in cohort {label} and were "
-                f"compared for none of its {len(cohort)} members -- §3.3 needs {COHORT_FLOOR} "
-                f"readable values with one token on {BASELINE_MIN_RATIO:.0%} of them: "
-                + ", ".join(detail)
-            )
         if parts:
             limitations[key] = "; ".join(parts) + "."
     return not_applicable, limitations
@@ -1466,7 +1573,8 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     # needs the same name the per-facet emits used.
     targets: dict[tuple, str] = {ckey(c): target_name(c) for c in clusters}
 
-    _, cohorts, env_of, strategy = cohort_layout(clusters, now=now)
+    layout = cohort_layout(clusters, now=now)
+    env_of, strategy = layout.env_of, layout.strategy
     # §3.5 downgrades a finding whose "cohort membership rests on an inferred
     # environment". Under the `project` and `mode-only` strategies no cohort key
     # holds an environment at all, so no membership rests on one -- but
@@ -1478,64 +1586,70 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     # and a dropped one.
     env_matters = strategy == "environment"
 
-    for key, members in cohorts.items():
-        if len(members) < COHORT_FLOOR:
-            continue
-        mode = key[0]
-        cohort_label = "/".join(str(k) for k in key)
-        for facet in FACETS:
-            if facet.standard_only and mode == "autopilot":
+    # §2.3's two cohortings, each voted separately. The node-level pass keys on
+    # mode and the cluster-level pass across it, so the same cluster votes in
+    # two different groups of peers -- which is the point: `image-type` on an
+    # Autopilot cluster has no meaning, while `binary-authorization` on one is
+    # the same setting its Standard peers carry.
+    for standard_only in (True, False):
+        facets = [f for f in FACETS if f.standard_only == standard_only]
+        for key, members in layout.cohorts_for(standard_only).items():
+            if len(members) < COHORT_FLOOR:
                 continue
-            tokens = facet_tokens(facet, members)
-            baseline = compute_baseline(tokens)
-            if baseline is None:
+            # Only the node-level key carries a mode; the cluster-level pass
+            # runs for every mode by construction, so there is nothing to skip.
+            if standard_only and key[0] == "autopilot":
                 continue
-            t_star, m, n, r = baseline
-            voters = [c for c in members if ckey(c) in tokens]
-            for c in voters:
-                checks_run[ckey(c)].append(facet.slug)
-            if facet.autopilot_excluded and mode == "autopilot":
-                continue
-            baseline_clusters = [c for c in voters if tokens[ckey(c)] == t_star]
-            baseline_inferred = env_matters and any(env_of[ckey(c)][1] == "inferred" for c in baseline_clusters)
-            # The clusters that hold the baseline, not every cluster that voted.
-            # `peers:` sits one line under "in {m}/{n} clusters" and one line
-            # over the outlier's own `observed:`, so listing all `n` names
-            # contradicted both of its neighbours: it printed 10 names beside a
-            # claim that 9 clusters agree, and among them the very cluster the
-            # finding is about. A reader checking the comparison against
-            # `drift-peer-std-4 emits no logging components` found
-            # `drift-peer-std-4` in the list of clusters that do.
-            peer_names = sorted(target_name(c) for c in baseline_clusters)
-            # §3.2 defines `k` as `n - m`, the count of voting members not on
-            # the baseline token -- how split the cohort is. `len(outliers)` is
-            # a different number wherever `should_flag` is narrower than "differs
-            # from `t*`", which is every facet except the two on `_flag_ne`: a
-            # cluster that diverges upward is not flagged but is still divergent.
-            # `len(outliers) <= n - m` always, so reading it here under-counted
-            # the split and under-applied §3.5's `k >= 3` step -- publishing at a
-            # severity above the one the SOP specifies, and keeping findings the
-            # SOP would have dropped below `minor`.
-            k = n - m
-            for c in voters:
-                observed = tokens[ckey(c)]
-                if not facet.should_flag(observed, t_star):
+            cohort_label = "/".join(str(k) for k in key)
+            for facet in facets:
+                tokens = facet_tokens(facet, members)
+                baseline = compute_baseline(tokens)
+                if baseline is None:
                     continue
-                if _shape_mismatch(facet, c, baseline_clusters):
-                    continue
-                name = target_name(c)
-                inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
-                base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
-                sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
-                if sev is None:
-                    continue
-                # Only the set-valued facets have a "missing" to name, and
-                # `_flag_not_superset` is exactly the predicate that says so:
-                # it is the gate that already took this difference.
-                missing = _missing_tokens(observed, t_star) if facet.should_flag is _flag_not_superset else None
-                excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r, missing, read_path(facet, c))
-                candidates[ckey(c)].append(_emit(facet.slug, c.get("name", ""), excerpt, sev))
-                outlier_facet_count[ckey(c)] += 1
+                t_star, m, n, r = baseline
+                voters = [c for c in members if ckey(c) in tokens]
+                for c in voters:
+                    checks_run[ckey(c)].append(facet.slug)
+                baseline_clusters = [c for c in voters if tokens[ckey(c)] == t_star]
+                baseline_inferred = env_matters and any(env_of[ckey(c)][1] == "inferred" for c in baseline_clusters)
+                # The clusters that hold the baseline, not every cluster that voted.
+                # `peers:` sits one line under "in {m}/{n} clusters" and one line
+                # over the outlier's own `observed:`, so listing all `n` names
+                # contradicted both of its neighbours: it printed 10 names beside a
+                # claim that 9 clusters agree, and among them the very cluster the
+                # finding is about. A reader checking the comparison against
+                # `drift-peer-std-4 emits no logging components` found
+                # `drift-peer-std-4` in the list of clusters that do.
+                peer_names = sorted(target_name(c) for c in baseline_clusters)
+                # §3.2 defines `k` as `n - m`, the count of voting members not on
+                # the baseline token -- how split the cohort is. `len(outliers)` is
+                # a different number wherever `should_flag` is narrower than "differs
+                # from `t*`", which is every facet except the two on `_flag_ne`: a
+                # cluster that diverges upward is not flagged but is still divergent.
+                # `len(outliers) <= n - m` always, so reading it here under-counted
+                # the split and under-applied §3.5's `k >= 3` step -- publishing at a
+                # severity above the one the SOP specifies, and keeping findings the
+                # SOP would have dropped below `minor`.
+                k = n - m
+                for c in voters:
+                    observed = tokens[ckey(c)]
+                    if not facet.should_flag(observed, t_star):
+                        continue
+                    if _shape_mismatch(facet, c, baseline_clusters):
+                        continue
+                    name = target_name(c)
+                    inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
+                    base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
+                    sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
+                    if sev is None:
+                        continue
+                    # Only the set-valued facets have a "missing" to name, and
+                    # `_flag_not_superset` is exactly the predicate that says so:
+                    # it is the gate that already took this difference.
+                    missing = _missing_tokens(observed, t_star) if facet.should_flag is _flag_not_superset else None
+                    excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r, missing, read_path(facet, c))
+                    candidates[ckey(c)].append(_emit(facet.slug, c.get("name", ""), excerpt, sev))
+                    outlier_facet_count[ckey(c)] += 1
 
     # §3.6 split-cluster guard
     for cluster_key, count in outlier_facet_count.items():

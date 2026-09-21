@@ -728,12 +728,12 @@ class ComputeDriftTest(unittest.TestCase):
         self.assertNotIn("secure-boot", checks_run[K("a0")])
         self.assertNotIn("image-type", checks_run[K("a0")])
 
-    def test_datapath_provider_is_computed_but_never_flagged_on_autopilot(self):
+    def test_datapath_provider_is_not_compared_on_autopilot(self):
         # n=20, so r=0.95 and k=1: nothing on the severity ladder touches this
-        # finding, and `autopilot_excluded` is the only thing between the
+        # finding, and the `standard_only` flag is the only thing between the
         # outlier and a `major`. A four-cluster cohort read r=0.75 and lost the
-        # finding to two ratio downgrades instead, which passed whether the
-        # facet was excluded or not. The standard cohort below is the control:
+        # finding to two ratio downgrades instead, which would pass whether the
+        # facet was skipped or not. The standard cohort below is the control:
         # the same shape at the same size, published.
         def fleet(autopilot):
             members = [cluster(f"a{i}", autopilot=autopilot, labels={"environment": "prod"}) for i in range(19)]
@@ -747,7 +747,7 @@ class ComputeDriftTest(unittest.TestCase):
             return members
 
         checks_run, candidates = fd.compute_drift(fleet(True), now=NOW)
-        self.assertIn("datapath-provider", checks_run[K("a-outlier")])
+        self.assertNotIn("datapath-provider", checks_run[K("a-outlier")])
         self.assertEqual(candidates[K("a-outlier")], [])
 
         _, standard = fd.compute_drift(fleet(False), now=NOW)
@@ -1601,16 +1601,26 @@ class CollectFleetTest(unittest.TestCase):
 
 
 class AutopilotNotApplicableTest(unittest.TestCase):
-    """The five `standard_only` facets have to be declared, not just dropped.
+    """The eleven `standard_only` facets have to be declared, not just dropped.
 
     `compute_drift` skips them for an Autopilot cohort, which is right — each
-    reads a `.nodePools[]` field or a node-management setting Google owns. But
-    dropping a slug leaves it missing from `commands`, which is also how a check
-    nobody ran looks, so §6 counts it as a coverage gap unless the model excuses
-    it by hand.
+    reads a `.nodePools[]` field, or a node-management or dataplane setting
+    Google owns and no operator can diverge on. But dropping a slug leaves it
+    missing from `commands`, which is also how a check nobody ran looks, so §6
+    counts it as a coverage gap unless the model excuses it by hand.
+
+    The list is #1226's, and its length is load-bearing in both directions.
+    Declaring too few leaves the difference as a `limitations` string on every
+    Autopilot cluster; declaring too many claims a configurable setting cannot
+    be compared when it can, and the eight that are configurable on both modes
+    are exactly the ones §2.3 compares across them.
     """
 
-    NA = ("secure-boot", "integrity-monitoring", "node-autoprovisioning", "pool-autoscaling", "image-type")
+    NA = (
+        "secure-boot", "integrity-monitoring", "node-autoprovisioning", "pool-autoscaling",
+        "image-type", "shielded-nodes", "datapath-provider", "intra-node-visibility",
+        "managed-prometheus", "logging-components", "monitoring-components",
+    )
 
     def manifest(self, clusters):
         clusters_json = json.dumps(clusters)
@@ -1625,14 +1635,14 @@ class AutopilotNotApplicableTest(unittest.TestCase):
     def autopilot_cohort(self, n=4):
         return [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(n)]
 
-    def test_the_five_are_declared_with_a_reason(self):
+    def test_the_eleven_are_declared_with_a_reason(self):
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
         declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
         self.assertEqual(sorted(declared), sorted(self.NA))
         for reason in declared.values():
             self.assertIn("Autopilot", reason)
 
-    def test_none_of_the_five_is_also_claimed_as_a_check_that_ran(self):
+    def test_none_of_the_eleven_is_also_claimed_as_a_check_that_ran(self):
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
         ran = {c["check"] for c in entry["commands"]}
         self.assertEqual(ran & set(self.NA), set())
@@ -1658,13 +1668,32 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertIn("no facet compared", entry["limitations"])
         self.assertEqual(sorted(n["check"] for n in entry["checks_not_applicable"]), sorted(self.NA))
 
-    def test_datapath_provider_is_not_declared(self):
-        """It carries `autopilot_excluded`, not `standard_only`: the facet is
-        computed and recorded in `checks_run`, and only the flagging is
-        suppressed. Declaring it too would have the manifest assert both."""
+    def test_datapath_provider_is_declared_rather_than_computed_and_ignored(self):
+        """It used to carry an `autopilot_excluded` flag of its own: computed,
+        recorded in `checks_run`, and silently never flagged. That is a claim
+        the manifest should not make -- the facet reads a dataplane Google
+        chooses on Autopilot, so there is nothing operator-chosen to compare
+        and `checks_not_applicable` is where it belongs. #1226 put it there and
+        the separate flag is gone."""
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
-        self.assertNotIn("datapath-provider", [n["check"] for n in entry["checks_not_applicable"]])
-        self.assertIn("datapath-provider", {c["check"] for c in entry["commands"]})
+        self.assertIn("datapath-provider", [n["check"] for n in entry["checks_not_applicable"]])
+        self.assertNotIn("datapath-provider", {c["check"] for c in entry["commands"]})
+        self.assertFalse(hasattr(fd.Facet, "autopilot_excluded"))
+
+    def test_an_autopilot_cluster_is_compared_on_the_eight_that_are_configurable(self):
+        """The other half of #1226, and the reason the eleven can be declared
+        at all. An Autopilot cluster is a full member of its cluster-level
+        cohort, so `binary-authorization` and the seven like it run on it --
+        against Standard peers where those are what the fleet holds."""
+        fleet = [cluster("a0", autopilot=True, labels={"environment": "prod"})]
+        fleet += [cluster(f"s{i}", labels={"environment": "prod"}) for i in range(3)]
+        entry = next(e for e in self.manifest(fleet)["clusters"]
+                     if e["name"].endswith("a0"))
+        ran = {c["check"] for c in entry["commands"]}
+        configurable = {f.slug for f in fd.FACETS if not f.standard_only}
+        self.assertEqual(len(configurable), 8)
+        self.assertLessEqual(configurable, ran)
+        self.assertNotIn("limitations", entry)
 
     def test_the_two_together_account_for_the_whole_roster(self):
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
@@ -1792,23 +1821,48 @@ class CohortLimitationsTest(unittest.TestCase):
         ]
 
     def test_every_member_of_an_undersized_cohort_is_explained(self):
+        """§2.3's two cohortings give this fleet three different answers.
+
+        `auto-a`, `auto-b` and `std-a` all carry `prod`, so the cluster-level
+        cohort `prod` holds three and reaches the floor -- which is the whole
+        of what #1226 bought: before it, mode split them 2 and 1 and every one
+        of the eight configurable facets went uncompared on all three.
+        """
         lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
-        self.assertEqual(len(lim), 4)
-        self.assertIn("only 2 comparable clusters", lim[K("auto-a")])
-        self.assertIn("only 2 comparable clusters", lim[K("auto-b")])
-        # Singular for a one-member cohort: the sentence a lone cluster like
-        # kube-agents-host gets on every run.
+        # Only `auto-test`, alone in the cluster-level cohort `test`.
         self.assertIn("only 1 comparable cluster ", lim[K("auto-test")])
-        self.assertIn("only 1 comparable cluster ", lim[K("std-a")])
+        self.assertIn("no facet compared", lim[K("auto-test")])
         for text in lim.values():
             self.assertIn(f"minimum {fd.COHORT_FLOOR}", text)
-            self.assertIn("no facet compared", text)
+
+    def test_a_standard_cluster_short_of_node_level_peers_says_which_class_it_lost(self):
+        """The narrow sentence #1226 specifies. `std-a` is compared on the
+        eight configurable facets in cohort `prod` and on none of the eleven
+        node-level ones, because it is the only Standard cluster there -- so
+        the sentence has to say that rather than "no facet compared", which
+        would understate the coverage the run actually got."""
+        lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
+        text = lim[K("std-a")]
+        self.assertIn("cohort standard/prod has only 1 comparable cluster", text)
+        self.assertIn("11 node-level facets uncompared", text)
+        self.assertNotIn("no facet compared", text)
+
+    def test_an_autopilot_cluster_short_of_node_level_peers_has_nothing_to_report(self):
+        """The asymmetry that keeps an Autopilot minority from pinning the
+        ledger. `auto-a` and `auto-b` are two in `(autopilot, prod)`, under the
+        floor -- but the eleven facets that cohort would have compared are
+        already `checks_not_applicable` on Autopilot, so nothing went
+        uncompared and a `limitations` string here would invent a coverage gap
+        the mode had already settled."""
+        lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
+        self.assertNotIn(K("auto-a"), lim)
+        self.assertNotIn(K("auto-b"), lim)
 
     def test_the_sentence_names_the_cohort_it_floored_out_of(self):
         lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
-        self.assertIn("cohort autopilot/prod", lim[K("auto-a")])
-        self.assertIn("cohort autopilot/test", lim[K("auto-test")])
-        self.assertIn("cohort standard/prod", lim[K("std-a")])
+        # No mode on a cluster-level key, and a mode on a node-level one.
+        self.assertIn("cohort test ", lim[K("auto-test")])
+        self.assertIn("cohort standard/prod ", lim[K("std-a")])
 
     def test_the_lone_unlabelled_cluster_is_told_a_label_is_the_difference(self):
         # The live fleet's shape: fifteen of sixteen carry `environment=test`,
@@ -1820,7 +1874,7 @@ class CohortLimitationsTest(unittest.TestCase):
         fleet.append(cluster("host", labels={}))
         lim = fd.cohort_limitations(fleet, now=NOW)
         self.assertEqual(list(lim), [K("host")])
-        self.assertIn("cohort standard/unknown has only 1 comparable cluster",
+        self.assertIn("cohort unknown has only 1 comparable cluster",
                       lim[K("host")])
         self.assertIn("no environment label while 3 of 4 do", lim[K("host")])
 
@@ -1834,13 +1888,14 @@ class CohortLimitationsTest(unittest.TestCase):
         return fleet
 
     def test_the_advice_names_the_only_label_that_would_reach_the_floor(self):
-        # A cohort key is (mode, environment), so a label compares this cluster
-        # only if COHORT_FLOOR - 1 clusters *at its own mode* already carry it.
-        # On the live fleet that is `test` and nothing else.
+        # A cluster-level cohort key is (environment), so a label compares this
+        # cluster if COHORT_FLOOR - 1 clusters of any mode already carry it. On
+        # the live fleet that is `test` and nothing else -- and all fifteen
+        # peers count toward it, not just the ten that share the host's mode.
         lim = fd.cohort_limitations(self._live_shape({}), now=NOW)
         text = lim[K("host")]
         self.assertIn("Only `environment=test` would reach the floor here", text)
-        self.assertIn("10 other standard clusters carry `test`", text)
+        self.assertIn("15 other clusters carry `test`", text)
         self.assertIn("Any other value opens a new cohort of one", text)
 
     def test_a_label_that_describes_the_cluster_is_the_no_op_the_advice_warns_of(self):
@@ -1852,7 +1907,7 @@ class CohortLimitationsTest(unittest.TestCase):
                 lim = fd.cohort_limitations(
                     self._live_shape({"environment": env}), now=NOW)
                 text = lim[K("host")]
-                self.assertIn(f"cohort standard/{env} has only 1 comparable cluster",
+                self.assertIn(f"cohort {env} has only 1 comparable cluster",
                               text)
                 # Not `unknown` any more, so the whole cause clause drops: the
                 # operator who did what the sentence asked is told strictly
@@ -1865,16 +1920,36 @@ class CohortLimitationsTest(unittest.TestCase):
             {})
 
     def test_a_fleet_where_no_label_would_help_says_so_instead(self):
-        """Naming values must not become naming none of them silently. Two
-        Standard clusters share `test`, so the third would reach the floor --
-        but the lone unlabelled cluster here is Autopilot, and a cohort key is
-        mode-first, so no environment value on the fleet has same-mode peers."""
+        """Naming values must not become naming none of them silently. Every
+        named value here is held by one cluster, so none of them has the two
+        peers a label would need and no label closes the gap.
+
+        The fleet this used to use -- three Standard clusters on `test` and a
+        lone unlabelled Autopilot one -- no longer reaches this branch, and
+        that is the fix rather than a weakening of the test: mode is out of the
+        cluster-level key, so `test` has three holders of any mode and the
+        advice now names it. `test_an_autopilot_cluster_joins_a_standard_
+        cohort` covers that directly.
+        """
+        fleet = [cluster("p", labels={"environment": "prod"}),
+                 cluster("t", labels={"environment": "test"}),
+                 cluster("host", labels={})]
+        text = fd.cohort_limitations(fleet, now=NOW)[K("host")]
+        self.assertIn("No environment value on this fleet has the 2 other"
+                      " clusters", text)
+        self.assertNotIn("would reach the floor here", text)
+
+    def test_an_autopilot_cluster_joins_a_standard_cohort(self):
+        """#1226's point, as a sentence an operator reads. An Autopilot cluster
+        with no label on a fleet of labelled Standard ones is told to set the
+        label, because the cohort it would join is cluster-level and does not
+        care about the mode. Under a mode-first key it was told instead that no
+        label on the fleet would help it, which was true and permanent."""
         fleet = [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(3)]
         fleet.append(cluster("host", autopilot=True, labels={}))
         text = fd.cohort_limitations(fleet, now=NOW)[K("host")]
-        self.assertIn("No environment value on this fleet has the 2 other"
-                      " autopilot clusters", text)
-        self.assertNotIn("would reach the floor here", text)
+        self.assertIn("Only `environment=test` would reach the floor here", text)
+        self.assertIn("3 other clusters carry `test`", text)
 
     def test_two_joinable_values_are_both_named(self):
         fleet = [cluster(f"p{i}", labels={"environment": "prod"}) for i in range(2)]
@@ -1922,11 +1997,20 @@ class CohortLimitationsTest(unittest.TestCase):
 
         manifest = collected(run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 4)
-        for entry in manifest["clusters"]:
-            # `no-environment-label` is the one check that runs without a
-            # cohort, so it is in `commands` even here; every facet abstained.
-            self.assertEqual([c["check"] for c in entry["commands"]], [fd.UNLABELLED_SLUG])
-            self.assertIn("no facet compared", entry["limitations"])
+        by_name = {e["name"].rsplit("/", 1)[-1]: e for e in manifest["clusters"]}
+        # `auto-test` is alone in the cluster-level cohort `test`, so nothing
+        # compared it and `no-environment-label` -- the one check that runs
+        # without a cohort -- is all its `commands` holds.
+        entry = by_name["auto-test"]
+        self.assertEqual([c["check"] for c in entry["commands"]], [fd.UNLABELLED_SLUG])
+        self.assertIn("no facet compared", entry["limitations"])
+        # The other three share `prod` and reach the cluster-level floor
+        # together, so the eight configurable facets ran on all three across
+        # both modes -- the comparison a mode-first key threw away.
+        for name in ("auto-a", "auto-b", "std-a"):
+            slugs = [c["check"] for c in by_name[name]["commands"]]
+            self.assertIn("binary-authorization", slugs)
+            self.assertNotIn("image-type", slugs)
 
     def test_a_compared_fleet_gets_no_limitations_key_at_all(self):
         clusters_json = json.dumps(
@@ -1967,8 +2051,13 @@ class CohortLimitationsTest(unittest.TestCase):
             "findings": [],
         }
         gaps = audit_report.coverage_gaps(doc)
-        self.assertEqual(len(gaps), 4)
-        self.assertTrue(all("no facet compared" in g for g in gaps))
+        # Two sentences, two gaps: `auto-test`, which nothing compared, and
+        # `std-a`, which lost the eleven node-level facets. The two Autopilot
+        # clusters produce neither, because what their undersized node cohort
+        # would have compared is inapplicable on their mode.
+        self.assertEqual(len(gaps), 2)
+        self.assertTrue(any("no facet compared" in g for g in gaps))
+        self.assertTrue(any("node-level facets uncompared" in g for g in gaps))
 
 
 class NoEnvironmentLabelTest(unittest.TestCase):
@@ -2006,7 +2095,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         _run, candidates, _na = self.check(self._live_shape({}))
         excerpt = candidates[K("host")][0]["excerpt"]
         self.assertIn("Set `resourceLabels.environment` to `test`", excerpt)
-        self.assertIn("10 other standard clusters carry it", excerpt)
+        self.assertIn("15 other clusters carry it", excerpt)
 
     def test_a_fleet_that_cohorts_on_inferred_names_claims_no_labels(self):
         """§2.3 takes the `environment` strategy from a naming convention too,
@@ -2021,7 +2110,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertNotIn("0 of 4", excerpt)
         self.assertIn("nor does any of the other 3 eligible clusters", excerpt)
         # And the peers do not *carry* the label the finding asks for, either.
-        self.assertIn("3 other standard clusters resolve to it from their names", excerpt)
+        self.assertIn("3 other clusters resolve to it from their names", excerpt)
 
     def test_the_finding_and_the_coverage_gap_prescribe_the_same_value(self):
         """The reason `joinable_environments` is a function. The gap sentence
@@ -2063,10 +2152,17 @@ class NoEnvironmentLabelTest(unittest.TestCase):
 
     def test_no_finding_where_no_label_would_close_the_gap(self):
         """The §3.7 rule: withhold a finding whose own remediation is a no-op.
-        Here the unlabelled cluster is Autopilot and every labelled peer is
-        Standard, so mode-first cohorting means no value has same-mode peers.
-        The check still ran -- the gap is real, a label just is not the fix."""
-        fleet = [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(3)]
+        Here the fleet's two labels are held by one cluster each, so whichever
+        value the unlabelled cluster took it would land in a cohort of two and
+        stay under the floor. The check still ran -- the gap is real, a label
+        just is not the fix.
+
+        Mode is not what makes this fleet unfixable, and under #1226 it cannot
+        be: the eight cluster-level facets cohort on `(environment)` alone, so
+        an Autopilot cluster taking `test` joins its Standard peers there and a
+        label would work."""
+        fleet = [cluster("std-prod", labels={"environment": "prod"}),
+                 cluster("std-test", labels={"environment": "test"})]
         fleet.append(cluster("host", autopilot=True, labels={}))
         run, candidates, na = self.check(fleet)
         self.assertEqual(candidates, {})
@@ -2083,7 +2179,7 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertIn("(`prod` would also reach it, on 2)", excerpt)
 
     def test_the_abstaining_count_is_the_clusters_own_roster(self):
-        """An Autopilot cluster owes fourteen facets, not nineteen — the five
+        """An Autopilot cluster owes eight facets, not nineteen — the eleven
         `standard_only` ones are declared inapplicable elsewhere and counting
         them here would overstate what the label buys."""
         fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "test"})

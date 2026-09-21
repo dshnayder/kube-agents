@@ -8,24 +8,25 @@
 # check in the drift stream that fires outside a cohort. The stream's other
 # nineteen checks are majority votes, so a cluster with too few peers is
 # compared on nothing -- and an unlabelled cluster has no peers by
-# construction, because §2.3 keys cohorts on (mode, environment) and never
-# merges `unknown` into a named cohort. The collector
+# construction, because §2.3 keys the cluster-level cohorts on (environment)
+# and never merges `unknown` into a named cohort. The collector
 # (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
 # gap into a finding naming the label to set.
 #
 # Planted state: none of its own. The seeded fleet labels seeded-a/-b/-c
 # `environment = seeded` (bench/tf/fleet/main.tf) so that they cohort alone,
 # and the install's own host cluster carries no environment label. The
-# collector fires §4.14 for an unlabelled Standard cluster beside the three
-# labelled Standard peers; the fixture role below is the one this fleet
+# collector fires §4.14 for the unlabelled host beside the three labelled
+# peers -- mode is not part of that key, so what makes the host uncompared is
+# the missing label alone; the fixture role below is the one this fleet
 # carries for the drift stream, and the two sibling objectives bind the run
 # to it the way consistency-drift-outlier does.
 #
 # Two dependencies on pool hygiene, neither of them this case's to fix:
-#   -- The host must be the ONLY unlabelled Standard cluster older than 24h
-#      in the project. A stale eval-pr* cluster (a crashed run's, not swept)
-#      that ages past the collector's 24h exclusion joins (standard, unknown);
-#      two of them take that cohort to the floor of 3, the host is then
+#   -- The host must be the ONLY unlabelled cluster older than 24h in the
+#      project, of either mode. A stale eval-pr* cluster (a crashed run's, not
+#      swept) that ages past the collector's 24h exclusion joins the `unknown`
+#      cohort; two of them take it to the floor of 3, the host is then
 #      compared and §4.14 abstains -- the check reads as ran-and-clean, and
 #      this case reds on a fleet the agent audited correctly.
 #   -- The finding recommends `environment=seeded`, the one value that

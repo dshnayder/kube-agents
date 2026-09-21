@@ -2584,13 +2584,12 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("five §4 facets marked _Standard cohorts only_", text)
-        self.assertIn("reads as complete at fifteen of fifteen", text)
-        self.assertIn("secure-boot", text)
-        self.assertIn("integrity-monitoring", text)
-        self.assertIn("pool-autoscaling", text)
-        self.assertIn("node-autoprovisioning", text)
-        self.assertIn("image-type", text)
+        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("reads as complete at eight of eight", text)
+        self.assertIn("logging-components", text)
+        self.assertIn("monitoring-components", text)
+        self.assertIn("intra-node-visibility", text)
+        self.assertIn("managed-prometheus", text)
 
     def test_gke_sops_declare_autopilot_inapplicable_checks(self):
         """Every GKE SOP whose checks cannot run on Autopilot must declare them in checks_not_applicable.
@@ -2617,16 +2616,18 @@ class TestAuditCatalogue(unittest.TestCase):
             "fleet-wide-cost-analysis": [
                 "idle-nodepool",
             ],
-            # The five `standard_only` facets in fleet_drift.FACETS: every
-            # one reads `.nodePools[]` or a node-management setting Google
-            # owns on Autopilot. The cluster-level facets the list used to
-            # carry are compared on Autopilot cohorts too.
             "fleet-consistency-drift": [
                 "secure-boot",
                 "integrity-monitoring",
                 "pool-autoscaling",
                 "node-autoprovisioning",
                 "image-type",
+                "shielded-nodes",
+                "datapath-provider",
+                "intra-node-visibility",
+                "managed-prometheus",
+                "logging-components",
+                "monitoring-components",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
