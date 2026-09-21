@@ -12,9 +12,9 @@ readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
 readonly HERE=$(cd "$(dirname "$0")" && pwd)
-readonly CTX=${CTX:-csc-adc}
+CTX=${CTX:-csc-adc}; export CTX
 readonly NS=kubeagents-system
-readonly BASE=${BASE:-http://127.0.0.1:8643}
+BASE=${BASE:-http://127.0.0.1:18642}
 readonly SCENARIOS=${SCENARIOS:-$HERE/scenarios.json}
 # Same framing on every arm: keeps a probe from turning into a fleet-wide sweep.
 readonly PREFIX=${PREFIX:-"Work only on the cluster you run on and keep the investigation brief. "}
@@ -30,7 +30,7 @@ mkdir -p "$OUT_ROOT"
 for cell in $MATRIX; do
   arm=${cell%%:*}; rung=${cell##*:}; label="$arm-$rung"
   echo "== $(date -u +%FT%TZ) cell $label"
-  CTX=$CTX "$HERE/switch_arm.sh" "$arm" "$rung" 2>&1 | tee -a "$OUT_ROOT/switch.log"
+  "$HERE/switch_arm.sh" "$arm" "$rung" 2>&1 | tee -a "$OUT_ROOT/switch.log"
   python3 "$HERE/run_ab.py" --base "$BASE" --token "$PLATFORM_AGENT_TOKEN" --scenarios "$SCENARIOS" \
     --out "$OUT_ROOT/$label" --label "$label" --reps "$REPS" --parallel "$PARALLEL" --prefix "$PREFIX" 2>&1 | tee -a "$OUT_ROOT/$label.log"
   pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | head -1 | sed 's#pod/##')

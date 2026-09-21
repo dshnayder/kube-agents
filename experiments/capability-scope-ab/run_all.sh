@@ -8,7 +8,7 @@ readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
 readonly HERE=$(cd "$(dirname "$0")" && pwd)
-readonly CTX=${CTX:-csc-adc}
+CTX=${CTX:-csc-adc}; export CTX
 readonly NS=kubeagents-system
 readonly LOCAL_PORT=${LOCAL_PORT:-18642}
 readonly SERVICE=svc/platform-agent
@@ -21,4 +21,5 @@ export PLATFORM_AGENT_TOKEN
 PF_LOOP=$!
 trap 'kill $PF_LOOP 2>/dev/null; pkill -P $PF_LOOP 2>/dev/null' EXIT
 sleep 5
-CTX=$CTX BASE="http://127.0.0.1:$LOCAL_PORT" "$HERE/run_matrix.sh" "$OUT_ROOT" "$REPS" "$PARALLEL"
+BASE="http://127.0.0.1:$LOCAL_PORT"; export BASE
+"$HERE/run_matrix.sh" "$OUT_ROOT" "$REPS" "$PARALLEL"
