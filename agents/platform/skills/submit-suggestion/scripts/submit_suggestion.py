@@ -19,9 +19,9 @@ because their absence is what makes the rest simple.
 
 **The lease is gone.** It existed because clones lived on a volume six audit
 crons and every kanban worker shared, so "which clone is mine" was a real
-question with a wrong answer. `clone` writes one copy per repository under this
-container's own scratch root and refuses to replace a copy holding work that
-was never published — which is the same protection, taken from the thing being
+question with a wrong answer. `clone` writes one copy per repository *and
+branch* under this container's own scratch root -- the root is shared, the name
+is not -- and refuses to replace a copy holding work that was never published — which is the same protection, taken from the thing being
 protected rather than from a file beside it. `--force` is the way past it.
 
 **Content mode is gone.** It was the other answer to "the agent must not author

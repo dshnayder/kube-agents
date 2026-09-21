@@ -101,6 +101,18 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    **Keep that whole line — every step from here works inside `workspace`.**
 
+   **If `prepare` refuses the branch name**, it is because an earlier
+   remediation pull request for this same workload was closed, or merged in a
+   way that did not carry its last revision into the base — a squash merge, the
+   ordinary setting on a GitOps repository. The name is one per workload, so a
+   repeat alert reaches this every time. Step 1 has already established that no
+   pull request for this workload is open, so nothing is being overwritten;
+   what is unknown is whether the forge still holds the branch, and no read verb
+   can say. Re-run the command with `--allow-reused-branch` if this repository
+   deletes branches as it merges them. Otherwise add something that distinguishes
+   this alert to the end of the name — the issue number is the obvious choice —
+   and keep that branch for the rest of the turn.
+
    > [!CAUTION]
    > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Export it once — `export G=/opt/vcs/libexec/git` — and use `$G` for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not alias it: each command arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
 

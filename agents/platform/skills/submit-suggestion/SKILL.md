@@ -269,13 +269,17 @@ no token to refresh.
    (**never `git add .` / `-A`**).
 
    Pass `--title` and `--body-file` again so the description matches the
-   revisions now on the branch — or `--keep-description` and no body, when what
-   you were asked for does not alter what the pull request is for. That flag
-   keeps the title along with the body, so a `--title` passed beside it is
-   ignored and says so. It needs the pull request to still be open: a merged or
-   closed one is not a description to keep, and the script refuses before
-   publishing anything rather than opening a fresh pull request with no
-   description at all.
+   revisions now on the branch — or `--keep-description` and no body-file, when
+   what you were asked for does not alter what the pull request is for. That
+   flag keeps the title along with the body, so a `--title` passed beside it
+   does **not** reach the pull request, and the run says so. It is not inert,
+   though: it is still the message any uncommitted edits are recorded under, so
+   pass the one you would want on that revision and not a placeholder. Pass one
+   whenever you left edits uncommitted at Step 2 — without it the run is refused
+   for having changes and no message to record them under. `--keep-description`
+   also needs the pull request to still be open: a merged or closed one is not a
+   description to keep, and the script refuses before publishing anything rather
+   than opening a fresh pull request with no description at all.
 
 3. **Reply on the PR** summarizing what changed, then relay a clean
    confirmation (PR URL + what you changed) back through your kanban result.

@@ -211,6 +211,46 @@ class CloneTest(VcsTestCase):
         self.assertEqual(answer["remotes"], [])
         self.assertEqual(git(Path(answer["path"]), "remote").stdout.strip(), "")
 
+    def test_the_agent_can_commit_in_the_copy_with_no_identity_of_its_own(self):
+        """SKILL Step 2 has the agent run the sandbox git directly, not this module.
+
+        That git reads no global or system config -- the image has neither --
+        and `local_git` passes `user.name` and `user.email` as `-c` flags,
+        which covers only what this module itself runs. So the pair is written
+        into the copy at clone time, and this runs git the way the agent's
+        shell does: no `GIT_AUTHOR_*`, no config files.
+
+        The defect wears two faces and this is red for both. Without the
+        repository-local pair, git falls back to the account: on a developer
+        machine that succeeds and records somebody's personal name on an
+        automation's commit, and on the sandbox image it does not succeed at
+        all -- `useradd --create-home ... --uid 1000 agent` passes no
+        `--comment`, so the GECOS is empty and git refuses with "empty ident
+        name" after the "Please tell me who you are" hint. The Dockerfile's own
+        commit guard passes `-c user.name=g -c user.email=g@x` for that reason.
+        Asserting on the author covers both; asserting on the exit code would
+        pass on the machine this suite usually runs on.
+        """
+        answer = self.clone()
+        tree = Path(answer["path"])
+        (tree / "inventory/clusters.yaml").write_text("replicas: 4\n")
+        bare = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.root / "no-home"),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        for verb in (("add", "inventory/clusters.yaml"), ("commit", "-m", "by hand")):
+            done = subprocess.run(
+                [REAL_GIT, *verb], cwd=str(tree), capture_output=True, text=True, env=bare
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+        who = subprocess.run(
+            [REAL_GIT, "log", "-1", "--format=%an <%ae>"],
+            cwd=str(tree), capture_output=True, text=True, env=bare,
+        )
+        self.assertEqual(who.stdout.strip(), f"{vcs_client.AUTHOR_NAME} <{vcs_client.AUTHOR_EMAIL}>")
+
     def test_the_executable_bit_survives_the_bundle(self):
         answer = self.clone()
         self.assertTrue(os.access(Path(answer["path"]) / "rotate-keys.sh", os.X_OK))

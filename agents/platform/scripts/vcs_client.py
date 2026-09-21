@@ -534,6 +534,16 @@ def clone(
             "--branch", answer["branch"], str(bundle_file), str(destination),
         )
         local_git(destination, "remote", "remove", "origin", check=False)
+        # Into the copy, not just onto this script's own invocations. SKILL
+        # Step 2 has the agent run the sandbox git directly, and that git reads
+        # no global config -- the image deliberately has none -- so with no
+        # repository-local entry `git commit` dies on "Please tell me who you
+        # are", or, where the account's GECOS is empty as the sandbox `agent`
+        # user's is, on "empty ident name". `local_git` passes the same two as
+        # `-c` flags, which covers what this module runs and nothing the agent
+        # runs beside it.
+        local_git(destination, "config", "user.name", AUTHOR_NAME)
+        local_git(destination, "config", "user.email", AUTHOR_EMAIL)
     finally:
         bundle_file.unlink(missing_ok=True)
 
