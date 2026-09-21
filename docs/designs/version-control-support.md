@@ -561,7 +561,7 @@ from, refuses to publish that branch under any target, and tells the broker
 which branch that was (`clonedFrom`) so the broker refuses it too,
 `CLONED_BRANCH` — defence in depth for a confused caller, since a client that
 lied would gain nothing it could not get by omitting the field. `advance` is
-the one waiver of that last refusal, for the copy that was cloned *of* a
+the one waiver of that last refusal, for the copy that was cloned _of_ a
 proposal branch in order to add a round to it, and the broker does not take it
 on the caller's word alone: it asks the forge for an open proposal whose source
 is that branch and refuses without one. That is a bar rather than a proof — the
