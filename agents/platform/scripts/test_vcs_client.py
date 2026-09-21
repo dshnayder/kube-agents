@@ -9,6 +9,7 @@ never builds an argparse namespace. These tests are that caller.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -131,6 +132,47 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertEqual(self.published[0]["baseRevision"], self.head)
         removed = vcs_client.discard("acme/infra")
         self.assertFalse(Path(removed["removed"]).exists())
+
+    def test_a_record_written_before_the_branch_was_in_its_name_can_be_discarded(self):
+        """The copies an install already had when this landed are not zombies.
+
+        Their file is `{forge}__{repo}.json`; the name derived from their
+        contents is `{forge}__{repo}__{branch}.json`. Removing the derived name
+        deleted the working copy and left the record, which then had to be
+        disambiguated against forever and could not be cleared by any verb.
+        """
+        legacy_tree = vcs_client.ROOT / "local__acme__infra"
+        legacy_tree.mkdir(parents=True)
+        (legacy_tree / "a.txt").write_text("a\n")
+        vcs_client.SESSIONS.mkdir(parents=True, exist_ok=True)
+        legacy_record = vcs_client.SESSIONS / "local__acme__infra.json"
+        legacy_record.write_text(
+            json.dumps(
+                {
+                    "forge": "local",
+                    "repo": "acme/infra",
+                    "spec": "acme/infra",
+                    "branch": "main",
+                    "baseRevision": self.head,
+                    "path": str(legacy_tree),
+                }
+            )
+        )
+
+        removed = vcs_client.discard("acme/infra", key="main")
+
+        self.assertEqual(removed["removed"], str(legacy_tree))
+        self.assertFalse(legacy_tree.exists())
+        self.assertFalse(legacy_record.exists())
+        self.assertEqual(vcs_client.all_sessions(), [])
+
+    def test_where_a_record_was_read_from_is_not_written_back_into_it(self):
+        vcs_client.clone("acme/infra")
+        vcs_client.branch("acme/infra", "fix/one")
+        written = json.loads(
+            (vcs_client.SESSIONS / "local__acme__infra__main.json").read_text()
+        )
+        self.assertNotIn("_file", written)
 
     def test_publishing_the_cloned_branch_is_refused_before_any_call(self):
         cloned = vcs_client.clone("acme/infra")

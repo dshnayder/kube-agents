@@ -87,7 +87,7 @@ def verb_publish(arguments) -> dict:
 
 
 def verb_discard(arguments) -> dict:
-    return client.discard(arguments.repo)
+    return client.discard(arguments.repo, key=arguments.branch)
 
 
 def _collaboration(arguments, verb: str, payload: dict) -> dict:
@@ -468,6 +468,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     discard = verbs.add_parser(
         "discard", aliases=["close"], help="remove the local copy"
+    )
+    # Naming the copy matters more here than on the read verbs. The others can
+    # be run from inside the copy they are about; a copy whose directory is
+    # already gone cannot be stood in, and without a name there is no way to
+    # say which of two records to remove.
+    discard.add_argument(
+        "--branch", help="which copy, when the repository is cloned once per branch"
     )
     repo_option(discard).set_defaults(run=verb_discard)
 

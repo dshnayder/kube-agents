@@ -241,7 +241,16 @@ def session_path(forge: str, repo: str, key: str) -> Path:
 def save_session(data: dict) -> None:
     SESSIONS.mkdir(parents=True, exist_ok=True)
     path = session_path(data["forge"], data["repo"], _key_of(data))
-    path.write_text(json.dumps(data, indent=2))
+    path.write_text(json.dumps(_recorded(data), indent=2))
+
+
+def _recorded(session: dict) -> dict:
+    """The record without this side's bookkeeping.
+
+    `_file` is put on by the reader, not by the writer, so it must come back off
+    before the record is written or the next reader inherits a stale path.
+    """
+    return {name: value for name, value in session.items() if not name.startswith("_")}
 
 
 def all_sessions() -> list[dict]:
@@ -250,9 +259,21 @@ def all_sessions() -> list[dict]:
     found = []
     for path in sorted(SESSIONS.glob("*.json")):
         try:
-            found.append(json.loads(path.read_text()))
+            session = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(session, dict):
+            continue
+        # Where it was read from, so that removing it does not depend on the
+        # name still being derivable from its contents. Records written before
+        # the branch was part of the name are the case that proved this: their
+        # file is `{forge}__{repo}.json`, `_key_of` answers with the base branch
+        # they were standing on, and a `discard` that recomputed the name
+        # deleted the working copy and left the record behind for good -- an
+        # entry that every later resolution had to disambiguate against and no
+        # verb could clear.
+        session["_file"] = str(path)
+        found.append(session)
     return found
 
 
@@ -815,9 +836,10 @@ def discard(spec: str | None = None, key: str | None = None) -> dict:
     """
     session = resolve_session(spec, key=key)
     shutil.rmtree(session["path"], ignore_errors=True)
-    session_path(
-        session["forge"], session["repo"], _key_of(session)
-    ).unlink(missing_ok=True)
+    record = session.get("_file") or str(
+        session_path(session["forge"], session["repo"], _key_of(session))
+    )
+    Path(record).unlink(missing_ok=True)
     return {
         "repo": session["repo"],
         "forge": session["forge"],
