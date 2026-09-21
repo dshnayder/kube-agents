@@ -1777,5 +1777,55 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             audit_report.cross_check_manifest(data, manifest)
 
 
+class CandidateSummaryTest(unittest.TestCase):
+    def test_it_counts_candidates_per_check_and_names_the_clusters(self):
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": "collected", "candidates": [{"check": "no-environment-label"}]},
+                {
+                    "name": "b",
+                    "outcome": "collected",
+                    "candidates": [{"check": "no-environment-label"}, {"check": "authorized-networks"}],
+                },
+                {"name": "project/p", "outcome": "gate-failed"},
+            ]
+        }
+        lines = fd.candidate_summary(manifest)
+        self.assertIn("2 cluster(s) collected; 3 candidate(s) to report", lines[0])
+        self.assertIn("no-environment-label: 2 (a, b)", lines[0])
+        self.assertIn("authorized-networks: 1 (b)", lines[0])
+        self.assertIn("resolved_because", lines[1])
+
+    def test_a_fleet_with_no_candidates_says_zero(self):
+        manifest = {"clusters": [{"name": "a", "outcome": "collected", "candidates": []}]}
+        self.assertEqual(fd.candidate_summary(manifest), ["1 cluster(s) collected; 0 candidates"])
+
+    def test_it_caps_the_cluster_names_it_spells_out(self):
+        over = fd.SUMMARY_MAX_OBJECTS + 2
+        manifest = {
+            "clusters": [
+                {"name": f"c{i}", "outcome": "collected", "candidates": [{"check": "no-environment-label"}]}
+                for i in range(over)
+            ]
+        }
+        line = fd.candidate_summary(manifest)[0]
+        self.assertIn(f"no-environment-label: {over}", line)
+        self.assertIn("and 2 more", line)
+
+    def test_the_summary_follows_a_real_collection(self):
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)]
+        clusters[0]["resourceLabels"] = {}
+        clusters_json = json.dumps(clusters)
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        lines = fd.candidate_summary(manifest)
+        self.assertIn("no-environment-label: 1 (c0)", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()
