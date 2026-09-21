@@ -192,6 +192,15 @@ COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gat
 # chain measured against Docker's layer-depth ceiling, which a build from here
 # broke through once already (f9f1747c, 2026-08-07). A new build gate does not
 # buy a layer.
+# capability_scope experiment (experiments/capability-scope-ab/): environment-gated seams for
+# a names-only skill index, the description limit, extra skill dirs, and a per-turn tool filter.
+# Inert unless the KA_* variables are set.
+COPY deploy/docker/patches/apply_capability_scope.py /tmp/capability-scope/
+RUN /opt/hermes/.venv/bin/python3 /tmp/capability-scope/apply_capability_scope.py /opt/hermes && \
+    grep -qF 'ka_capability_scope' /opt/hermes/agent/conversation_loop.py && \
+    grep -qF 'KA_SKILLS_INDEX_MODE' /opt/hermes/agent/prompt_builder.py && \
+    rm -rf /tmp/capability-scope
+
 COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
      deploy/docker/patches/patchlib.py \

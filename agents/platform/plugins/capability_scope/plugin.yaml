@@ -1,0 +1,5 @@
+name: capability_scope
+version: 0.1.0
+kind: standalone
+description: Experiment prototype of per-turn tool and skill scoping (docs/designs/context-scoped-capabilities.md). Records what the model was shown and used; scopes only when KA_SCOPE_MODE is set.
+provides_hooks: [pre_llm_call, pre_tool_call, post_api_request, on_session_end]

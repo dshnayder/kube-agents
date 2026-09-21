@@ -1,0 +1,181 @@
+{
+  "_comment": "Probes for the capability-scoping A/B. `gold` is the skill the prompt is for; `acceptable` skills are credited as correct but reported separately; `acceptable_grown` extends `acceptable` on the grown-catalogue rung where an upstream skill added as a distractor is a defensible answer. `gold: []` marks a control probe where loading any skill is spurious. Prompts avoid quoting a skill description verbatim so that lexical ranking is not handed the answer.",
+  "scenarios": [
+    {
+      "id": "pvc-pending",
+      "prompt": "On the cluster you run on, the PersistentVolumeClaim data-postgres-0 in namespace kubeagents-system has been Pending for twenty minutes. Work out why and tell me how to fix it.",
+      "gold": ["gke-storage"],
+      "acceptable": ["gke-workload-troubleshooting"],
+      "acceptable_grown": ["gke-storage-troubleshooting"],
+      "domain": "storage"
+    },
+    {
+      "id": "crashloop",
+      "prompt": "Pods of the checkout deployment in namespace shop went into CrashLoopBackOff right after the last rollout. Find the cause.",
+      "gold": ["gke-workload-troubleshooting"],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "workloads"
+    },
+    {
+      "id": "hpa",
+      "prompt": "Set up autoscaling for the api deployment in namespace shop so it runs between 2 and 10 replicas and scales on 60% CPU.",
+      "gold": ["gke-workload-scaling"],
+      "acceptable": ["gke-manifest-generation"],
+      "acceptable_grown": [],
+      "domain": "scaling"
+    },
+    {
+      "id": "nodepool-no-scaleup",
+      "prompt": "The gpu-pool node pool is not adding nodes even though several pods have been waiting for a GPU for an hour. Why, and what should change?",
+      "gold": ["gke-cluster-autoscaler"],
+      "acceptable": ["gke-workload-troubleshooting", "gke-compute-classes"],
+      "acceptable_grown": [],
+      "domain": "scaling"
+    },
+    {
+      "id": "namespace-cost",
+      "prompt": "How much did the ml-training namespace cost us last month across all our clusters, and which workloads drove it?",
+      "gold": ["gke-cost-analysis"],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "cost"
+    },
+    {
+      "id": "cut-the-bill",
+      "prompt": "Our GKE bill grew thirty percent this quarter. Recommend concrete changes to bring it down.",
+      "gold": ["gke-cost-optimization"],
+      "acceptable": ["gke-cost-analysis"],
+      "acceptable_grown": [],
+      "domain": "cost"
+    },
+    {
+      "id": "pdb-probes",
+      "prompt": "Node upgrades keep taking the payments deployment down. Give me a PodDisruptionBudget and health probes that stop that.",
+      "gold": ["gke-reliability"],
+      "acceptable": ["gke-manifest-generation", "gke-upgrades"],
+      "acceptable_grown": [],
+      "domain": "reliability"
+    },
+    {
+      "id": "https-gateway",
+      "prompt": "Expose the web service in namespace shop on the internet over HTTPS using the Gateway API, with a Google-managed certificate.",
+      "gold": ["gke-service-networking"],
+      "acceptable": ["gke-networking", "gke-manifest-generation"],
+      "acceptable_grown": ["google-cloud-global-frontend-configuration"],
+      "domain": "networking"
+    },
+    {
+      "id": "pod-ip-exhaustion",
+      "prompt": "Cluster prod-east is running out of pod IP addresses. How should I plan the secondary ranges and what are my options without recreating the cluster?",
+      "gold": ["gke-networking"],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "networking"
+    },
+    {
+      "id": "upgrade-plan",
+      "prompt": "Plan the upgrade of cluster prod-east from 1.32 to 1.33 so that stateful workloads see the least disruption.",
+      "gold": ["gke-upgrades"],
+      "acceptable": ["fleet-upgrade-verification"],
+      "acceptable_grown": [],
+      "domain": "upgrades"
+    },
+    {
+      "id": "fleet-behind-channel",
+      "prompt": "Which of our clusters are running a version older than their release channel's default right now?",
+      "gold": ["fleet-upgrade-verification"],
+      "acceptable": ["gke-upgrades"],
+      "acceptable_grown": [],
+      "domain": "upgrades"
+    },
+    {
+      "id": "daily-backups",
+      "prompt": "Set up a daily backup of everything in the orders namespace with thirty days of retention, and tell me how a restore would work.",
+      "gold": ["gke-backup-dr"],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "backup"
+    },
+    {
+      "id": "manifest-go-api",
+      "prompt": "Write a production-grade Deployment and Service for the image us-docker.pkg.dev/example/api:1.2, a Go HTTP server on port 8080, for an Autopilot cluster.",
+      "gold": ["gke-manifest-generation"],
+      "acceptable": ["gke-app-onboarding"],
+      "acceptable_grown": [],
+      "domain": "workloads"
+    },
+    {
+      "id": "pod-403-gcs",
+      "prompt": "Pods in the billing namespace get 403 permission denied when they read from a Cloud Storage bucket. They run under a Kubernetes service account. What is wrong?",
+      "gold": ["gke-workload-security"],
+      "acceptable": ["gke-platform-security", "gke-workload-troubleshooting"],
+      "acceptable_grown": ["gke-workload-identity"],
+      "domain": "security"
+    },
+    {
+      "id": "harden-cluster",
+      "prompt": "Harden cluster prod-east: shielded nodes, a review of cluster-wide RBAC, and binary authorization. Where do I start?",
+      "gold": ["gke-platform-security"],
+      "acceptable": ["gke-workload-security"],
+      "acceptable_grown": [],
+      "domain": "security"
+    },
+    {
+      "id": "prometheus-alerts",
+      "prompt": "Get managed Prometheus scraping the api namespace and add an alert when its error rate goes above one percent for five minutes.",
+      "gold": ["gke-observability"],
+      "acceptable": [],
+      "acceptable_grown": ["gke-alert-configuration"],
+      "domain": "observability"
+    },
+    {
+      "id": "tpu-vbar",
+      "prompt": "Our TPU v6e nodes keep crashing during training startup with vbar_control_agent segfaults. What is going on?",
+      "gold": ["gke-ai-troubleshooting-tpu-vbar-oom"],
+      "acceptable": ["gke-ai-troubleshooting-handle-disruption-gpu-tpu"],
+      "acceptable_grown": [],
+      "domain": "ai"
+    },
+    {
+      "id": "vllm-l4",
+      "prompt": "Deploy vLLM serving Llama 3 70B on this cluster using L4 GPUs. What does the setup look like?",
+      "gold": ["gke-inference"],
+      "acceptable": ["gke-compute-classes"],
+      "acceptable_grown": [],
+      "domain": "ai"
+    },
+    {
+      "id": "gitops-pr",
+      "prompt": "In our gitops repository raise the maximum replicas of the api HPA from 5 to 8 and open a pull request for review.",
+      "gold": ["submit-suggestion"],
+      "acceptable": ["version-control"],
+      "acceptable_grown": [],
+      "domain": "gitops"
+    },
+    {
+      "id": "inspect-repo",
+      "prompt": "What is in the deploy directory of github.com/gke-labs/kube-agents, and what is each subdirectory for?",
+      "gold": ["inspect-repository"],
+      "acceptable": ["version-control"],
+      "acceptable_grown": [],
+      "domain": "gitops"
+    },
+    {
+      "id": "control-capabilities",
+      "prompt": "In three sentences, what kinds of tasks can you help me with?",
+      "gold": [],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "control"
+    },
+    {
+      "id": "control-list-nodes",
+      "prompt": "List the nodes of the cluster you run on with their Kubernetes versions.",
+      "gold": [],
+      "acceptable": [],
+      "acceptable_grown": [],
+      "domain": "control"
+    }
+  ]
+}
