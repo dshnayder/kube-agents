@@ -11,13 +11,18 @@ readonly HERE=$(cd "$(dirname "$0")" && pwd)
 CTX=${CTX:-csc-adc}; export CTX
 readonly NS=kubeagents-system
 readonly LOCAL_PORT=${LOCAL_PORT:-18642}
-readonly SERVICE=svc/platform-agent
-readonly SERVICE_PORT=8642
+# Straight to the Hermes API server on the gateway pod's loopback, not through the Service: the
+# Service fronts the credential proxy's authenticated door, which drops any turn longer than
+# 300 seconds with an HTML 502 and no session id. Forwarding to the Deployment re-resolves the
+# pod after every arm switch. The key is the gateway container's own API_SERVER_KEY.
+readonly TARGET=deploy/platform-agent-gateway
+readonly TARGET_PORT=8642
 readonly PF_RESTART_SECONDS=3
 mkdir -p "$OUT_ROOT"
-PLATFORM_AGENT_TOKEN=$(kubectl --context "$CTX" -n "$NS" get secret platform-agent-secrets -o jsonpath='{.data.API_SERVER_KEY}' | base64 -d)
+gateway_pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep platform-agent-gateway | grep -v Terminating | head -1 | sed 's#pod/##')
+PLATFORM_AGENT_TOKEN=$(kubectl --context "$CTX" -n "$NS" exec "$gateway_pod" -c platform-agent -- sh -c 'env | grep ^API_SERVER_KEY= | cut -d= -f2-')
 export PLATFORM_AGENT_TOKEN
-( while true; do kubectl --context "$CTX" -n "$NS" port-forward "$SERVICE" "$LOCAL_PORT:$SERVICE_PORT" >> "$OUT_ROOT/port-forward.log" 2>&1; sleep "$PF_RESTART_SECONDS"; done ) &
+( while true; do kubectl --context "$CTX" -n "$NS" port-forward "$TARGET" "$LOCAL_PORT:$TARGET_PORT" >> "$OUT_ROOT/port-forward.log" 2>&1; sleep "$PF_RESTART_SECONDS"; done ) &
 PF_LOOP=$!
 trap 'kill $PF_LOOP 2>/dev/null; pkill -P $PF_LOOP 2>/dev/null' EXIT
 sleep 5
