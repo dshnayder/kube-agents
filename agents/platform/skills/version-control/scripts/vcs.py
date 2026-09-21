@@ -222,6 +222,7 @@ def verb_proposal_list(arguments) -> dict:
         {
             "state": arguments.state,
             "limit": arguments.limit,
+            "page": arguments.page,
             "source": arguments.source,
             "target": arguments.target,
         },
@@ -317,7 +318,7 @@ def verb_proposal_commits(arguments) -> dict:
     return _collaboration(
         arguments,
         "proposal-commits",
-        {"number": arguments.number, "limit": arguments.limit},
+        {"number": arguments.number, "limit": arguments.limit, "page": arguments.page},
     )
 
 
@@ -367,7 +368,11 @@ def verb_label_ensure(arguments) -> dict:
 
 
 def verb_identity(arguments) -> dict:
-    return _collaboration(arguments, "identity", {"login": arguments.login})
+    return _collaboration(
+        arguments,
+        "identity",
+        {"login": arguments.login, "bot": True if arguments.bot else None},
+    )
 
 
 # ---- command line ---------------------------------------------------------
@@ -484,6 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     plist.add_argument("--source", help="only proposals from this branch")
     plist.add_argument("--target", help="only proposals onto this branch")
     plist.add_argument("-n", "--limit", type=int)
+    plist.add_argument("--page", type=int, help="the next page, when the last answer said truncated")
     repo_option(plist).set_defaults(run=verb_proposal_list)
 
     pview = actions.add_parser("view")
@@ -513,6 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcommits = actions.add_parser("commits", help="the revisions on a proposal's source branch")
     pcommits.add_argument("number", type=int)
     pcommits.add_argument("-n", "--limit", type=int)
+    pcommits.add_argument("--page", type=int, help="the next page, when the last answer said truncated")
     repo_option(pcommits).set_defaults(run=verb_proposal_commits)
 
     pack = actions.add_parser(
@@ -578,6 +585,10 @@ def build_parser() -> argparse.ArgumentParser:
         "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"
     )
     identity.add_argument("--login", help="ask about this login instead of the credential's own")
+    identity.add_argument(
+        "--bot", action="store_true",
+        help="the login is an automation's, as `view --comments` reported it; ask about its App account",
+    )
     repo_option(identity).set_defaults(run=verb_identity)
 
     return parser

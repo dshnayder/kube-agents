@@ -99,8 +99,20 @@ class WorkingCopyTest(unittest.TestCase):
                     "size": len(blob), "bundleBase64": base64.b64encode(blob).decode("ascii")}
         if verb == "publish":
             self.published.append(payload)
-            return {"forge": "local", "repo": "acme/infra", "branch": payload["branch"], "revision": "f" * 40}
+            return {"forge": "local", "repo": "acme/infra", "branch": payload["branch"], "revision": self._tip_of(payload)}
         raise AssertionError(verb)
+
+    def _tip_of(self, payload) -> str:
+        """The revision the broker would report: the tip of the branch in the bundle.
+
+        A real sha rather than a placeholder, because `publish` records it as the
+        branch's base and the guards that read it back run `rev-list` against it.
+        """
+        import base64
+        scratch = Path(self.tmp.name) / "received.bundle"
+        scratch.write_bytes(base64.b64decode(payload["bundleBase64"]))
+        listed = git(self.origin, "bundle", "list-heads", str(scratch)).stdout
+        return listed.split()[0]
 
     def test_the_library_round_trip(self):
         cloned = vcs_client.clone("acme/infra")
@@ -160,6 +172,44 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertEqual(
             vcs_client.resolve_session("acme/infra")["path"], first["path"]
         )
+
+    def test_a_second_clone_refuses_to_discard_work_on_a_branch_it_is_not_standing_on(self):
+        """Every branch the copy holds, not the one that is checked out.
+
+        Branch `A` published, branch `B` committed and never published, and the
+        copy switched back to `A`: a clean status and nothing past `A`'s
+        published tip, so a guard that read HEAD alone waved the re-clone
+        through and `B` went with the tree, with no message.
+        """
+        cloned = vcs_client.clone("acme/infra", key="work")
+        tree = Path(cloned["path"])
+        vcs_client.branch("acme/infra", "fix/a", key="work")
+        (tree / "a.txt").write_text("a2\n")
+        vcs_client.commit("published work", spec="acme/infra", key="work")
+        vcs_client.publish("acme/infra", key="work")
+        vcs_client.branch("acme/infra", "fix/b", key="work")
+        (tree / "b.txt").write_text("b\n")
+        vcs_client.commit("work that never left", ["b.txt"], spec="acme/infra", key="work")
+        git(tree, "checkout", "--quiet", "fix/a")
+        self.assertEqual(git(tree, "status", "--porcelain").stdout, "")
+
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.clone("acme/infra", key="work")
+        self.assertIn("unpublished revision", str(caught.exception))
+        self.assertIn("fix/b", str(caught.exception))
+        self.assertTrue((tree / "b.txt").exists() or git(tree, "rev-parse", "fix/b").stdout)
+        # `--force` is still the way past it.
+        vcs_client.clone("acme/infra", key="work", force=True)
+
+    def test_a_second_clone_of_a_copy_with_everything_published_is_not_refused(self):
+        cloned = vcs_client.clone("acme/infra", key="work")
+        tree = Path(cloned["path"])
+        vcs_client.branch("acme/infra", "fix/a", key="work")
+        (tree / "a.txt").write_text("a2\n")
+        vcs_client.commit("published work", spec="acme/infra", key="work")
+        vcs_client.publish("acme/infra", key="work")
+        again = vcs_client.clone("acme/infra", key="work")
+        self.assertEqual(again["path"], cloned["path"])
 
     def test_two_copies_are_ambiguous_until_one_is_named_or_stood_in(self):
         first = vcs_client.clone("acme/infra", key="fix/one")

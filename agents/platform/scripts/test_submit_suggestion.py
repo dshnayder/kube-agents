@@ -163,6 +163,10 @@ class FakeBroker:
             "draft": False,
             "author": "kube-agents",
             "source": payload["source"],
+            # Where the branch is when the proposal is read, which is what
+            # `translate.proposal` reports as the forge does: the last
+            # revision the branch was at, merged or not.
+            "sourceRevision": self._tip(payload["source"]),
             "target": payload["target"],
             "url": f"https://forge.test/acme/infra/pull/{number}",
             "created": "2026-09-15T00:00:00Z",
@@ -182,11 +186,18 @@ class FakeBroker:
                 return {"proposal": proposal}
         raise AssertionError(f"no proposal {payload['number']}")
 
-    def proposal_commits(self, payload):
-        """The revisions on a proposal's source branch, tip last.
+    def _tip(self, branch: str) -> str:
+        shown = git(self.origin, "rev-parse", f"refs/heads/{branch}", check=False)
+        return shown.stdout.strip() if shown.returncode == 0 else ""
 
-        Read off the origin rather than recorded, so a test that closes a
-        proposal and moves the branch gets the answer the forge would give.
+    def proposal_commits(self, payload):
+        """The revisions on a proposal's source branch, oldest first, one page.
+
+        `limit` is honoured, as the forge honours it: a proposal with more
+        revisions than the page holds answers with the oldest ones and says
+        `truncated`. Read off the origin rather than recorded, so a test that
+        closes a proposal and moves the branch gets the answer the forge would
+        give.
         """
         for proposal in self.proposals:
             if proposal["number"] != payload["number"]:
@@ -197,10 +208,12 @@ class FakeBroker:
                 check=False,
             )
             shas = shown.stdout.split() if shown.returncode == 0 else []
+            limit = payload.get("limit") or 30
+            page = shas[:limit]
             return {
-                "commits": [{"sha": sha, "committed": "2026-09-15T00:00:00Z"} for sha in shas],
-                "count": len(shas),
-                "truncated": False,
+                "commits": [{"sha": sha, "committed": "2026-09-15T00:00:00Z"} for sha in page],
+                "count": len(page),
+                "truncated": len(shas) >= limit,
             }
         raise AssertionError(f"no proposal {payload['number']}")
 
@@ -346,6 +359,34 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("BRANCH_DIVERGED", message)
         self.assertIn(merged["url"], message)
         self.assertIn("has not used", message)
+        # The revision named is the one the remote's branch is actually at.
+        self.assertIn(merged["sourceRevision"][:12], message)
+
+    def test_prepare_names_the_real_tip_of_a_long_spent_branch(self):
+        """The tip is the proposal's `sourceRevision`, not the last commit of a page.
+
+        `proposal-commits` is oldest first and bounded, so for a proposal past
+        the page its last entry was an old revision -- one the base may well
+        contain while the real tip is not. Six commits, then a squash-merge:
+        the refusal has to name the sixth, and it has to refuse at all.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        for n in range(6):
+            (self.origin / "app.yaml").write_text(f"replicas: {n + 2}\n")
+            git(self.origin, "commit", "--quiet", "-am", f"round one, step {n}")
+        tip = git(self.origin, "rev-parse", "HEAD").stdout.strip()
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 7\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        self.assertIn(tip[:12], str(caught.exception))
+        # Answered off the proposal itself: no commit listing is read.
+        self.assertEqual(self.broker.payloads("proposal-commits"), [])
 
     def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):
         """The case that works, and it must keep working.
@@ -354,19 +395,33 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         base, so a fresh cut descends from what the remote holds and `publish`
         fast-forwards it. Refusing here on the mere existence of a spent
         proposal would stop the reuse the naming convention is built on.
+
+        The accepting direction of the `merge-base` check, and the test has to
+        show the check ran: an earlier shape of this test passed because the
+        fake answered an empty commit list and `stale_tip` returned before
+        comparing anything.
         """
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)
         (self.origin / "app.yaml").write_text("replicas: 2\n")
         git(self.origin, "commit", "--quiet", "-am", "round one")
+        tip = git(self.origin, "rev-parse", "HEAD").stdout.strip()
         git(self.origin, "checkout", "--quiet", "main")
         git(self.origin, "merge", "--quiet", "--no-ff", "-m", "merge round one", branch)
         merged = self.existing_proposal(branch)
         merged["state"] = "merged"
 
-        prepared = self.prepare(branch)
+        with mock.patch.object(
+            submit_suggestion.vcs_client, "local", wraps=vcs_client.local
+        ) as local:
+            prepared = self.prepare(branch)
         self.assertEqual(prepared["branch"], branch)
         self.assertEqual(prepared["base"], "main")
+        compared = [
+            call.args[1] for call in local.call_args_list
+            if call.args[1][:2] == ["merge-base", "--is-ancestor"]
+        ]
+        self.assertEqual(compared, [["merge-base", "--is-ancestor", tip, "HEAD"]])
 
     def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
         """The ordinary card, and the one the extra lookup must not cost anything.
@@ -740,6 +795,40 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.proposals[0]["title"], "round two")
         # And it did not publish a third time: there was nothing new to send.
         self.assertEqual(len(self.broker.payloads("publish")), 2)
+
+    def test_a_second_round_that_changes_only_the_description_reaches_the_update(self):
+        """Step 5 with nothing to commit: a corrected title or body.
+
+        A fresh `prepare` is a copy *of* the branch with nothing published from
+        it, so `already_published` cannot see the earlier publish, and `publish`
+        refuses a copy with no new revisions. The proposal is open and the
+        branch is where it should be; the update is what the round is for.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.prepare(force=True)
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "the title the reviewer asked for", "--body", "and the body",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "the title the reviewer asked for")
+        self.assertEqual(self.broker.proposals[0]["body"], "and the body")
+        self.assertEqual(len(self.broker.payloads("publish")), 1)
+        self.assertTrue(any("nothing" in line and "refreshing" in line for line in self.logged))
+
+    def test_a_first_submission_with_nothing_to_publish_is_still_refused(self):
+        """The same state with no proposal open is a mistake, and stays one."""
+        self.prepare()
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        self.assertIn("no new revisions", str(caught.exception))
+        self.assertEqual(self.broker.payloads("proposal-create"), [])
 
     def test_resubmitting_an_open_proposal_with_nothing_new_is_not_an_error(self):
         """SKILL.md L198-L200 says so, and a card retry is the ordinary way there.

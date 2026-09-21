@@ -807,7 +807,10 @@ class VcsBroker:
         proposals and comments from a stranger's stays above the provider.
 
         `login` in the payload asks about that login; absent, about the
-        credential itself.
+        credential itself. `bot` beside it says the login is an automation's,
+        as the forge reported it on the comment being asked about: the
+        translation strips the App marking off every author it emits, so the
+        caller hands the fact back rather than a spelling it does not know.
         """
         bound = self._bind(payload)
         bound.ensure()
@@ -816,6 +819,9 @@ class VcsBroker:
         login = payload.get("login")
         if login is not None and not isinstance(login, str):
             raise WorkspaceError("login must be a string")
+        bot = payload.get("bot", False)
+        if not isinstance(bot, bool):
+            raise WorkspaceError("bot must be true or false")
         # `canWrite` is answered for a login the caller named, never for the
         # credential itself: on the shipped forge an App's own bot login is
         # not a collaborator, so the permission endpoint answers 404 for it
@@ -823,7 +829,9 @@ class VcsBroker:
         # callers that ask this ask about comment authors; the credential's own
         # standing is what `publish` proves by doing it.
         subject = (login or "").strip()
-        can_write = bound.forge.can_write(bound.api, bound.repo, subject) if subject else None
+        can_write = (
+            bound.forge.can_write(bound.api, bound.repo, subject, bot=bot) if subject else None
+        )
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
 

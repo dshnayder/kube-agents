@@ -121,6 +121,9 @@ expected_output: >-
   `eval: confirmed from the forge`. The agent reached the forge through the
   version-control verbs rather than a forge CLI, and the final answer gives the
   pull request URL together with that revision's sha and its subject line.
+  A run that opened a second pull request for the "review feedback", or put
+  the second revision on a branch other than the first pull request's, did
+  not do what was asked, however complete its report reads.
 infrastructure:
   deployer: noop
 validated: false
@@ -161,7 +164,20 @@ verification_spec:
       # `report_contains` is a normalised substring test with no notion of
       # negation, and the prompt hands the worker the words: a compliant report
       # saying "no second pull request was opened" would fail the objective for
-      # having done exactly what was asked. The one-pull-request requirement is
-      # carried positively instead: the commit subject above can only be
-      # reported off a second revision of the proposal the fixture already
-      # opened, which a worker that opened its own would not have.
+      # having done exactly what was asked.
+      #
+      # Be clear about what this check therefore does NOT see. The three
+      # phrases say a second revision with the dictated subject exists on
+      # *some* pull request -- a worker that misread "review feedback" as a
+      # fresh change, cut a second branch, committed under the same subject and
+      # opened a second pull request produces a report that passes this and the
+      # route check both. Nothing objective here observes the one-pull-request
+      # half: `worker_commands` records only the first command of a compound
+      # block, so a second `prepare`/`submit` may not be in the log to forbid,
+      # and there is no fixture whose pull request the second revision could be
+      # required to land on -- the prompt's first paragraph is what opens it.
+      # That half is graded by the judge against `expected_output`, which names
+      # a second pull request or a second branch as a failure in so many words.
+      # The three green runs in the pull request that added this case were
+      # checked by hand against the forge (one pull request, two revisions,
+      # eval PRs #196-#199 closed afterwards); the nightly relies on the judge.

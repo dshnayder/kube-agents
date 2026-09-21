@@ -143,8 +143,8 @@ def validate_repo(repo: str) -> str:
 
 #: How far back the branch-name history is read. A name is looked up to find
 #: out whether the remote still holds a spent branch under it; one answer
-#: settles that, and the verbs answer newest first. The handful above one is
-#: slack for a forge that orders differently, not a page to walk.
+#: settles that, and `proposal-list` answers newest first. The handful above
+#: one is slack for a forge that orders differently, not a page to walk.
 PROPOSAL_HISTORY_LIMIT = 5
 
 
@@ -191,7 +191,8 @@ def spent_proposal(repo: str, branch: str) -> dict | None:
 
     `state: "all"` minus the open ones rather than a `closed` filter: "closed"
     and "merged" are two states on every forge and one word on none of them.
-    The newest is the one that matters, and the verbs answer newest first.
+    The newest is the one that matters, and `proposal-list` answers newest
+    first.
 
     Whether the old tip is actually in the way is a second question, which
     `stale_tip` answers. This one is cheap and is asked first, because a branch
@@ -219,6 +220,15 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
     fast-forwards it. A squash-merge or a close leaves it unreachable, and that
     is the one this refuses.
 
+    The tip is the proposal's own `sourceRevision`, which every forge reports
+    on the proposal itself and which is the last revision its branch was at
+    when the proposal was read. Not the last entry of `proposal-commits`: that
+    listing is oldest first and bounded by `limit`, so a proposal with more
+    revisions than the page held answered with the oldest handful and the
+    "tip" was whichever of them came last -- a revision the base may well
+    contain while the real tip is not, which is the wrong answer in the
+    direction this check exists to catch.
+
     Answered against the copy in hand rather than by asking the forge a second
     question, because "is this revision an ancestor of what I am standing on"
     is a question about history and the history is right here. A revision the
@@ -226,16 +236,11 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
     non-zero on an unknown revision, and the honest reading of that is that the
     base does not contain it.
     """
-    commits = vcs_client.forge(
-        "proposal-commits",
-        {"number": proposal["number"], "limit": PROPOSAL_HISTORY_LIMIT},
-        repository=repo,
-    ).get("commits") or []
-    tip = str((commits[-1] or {}).get("sha") or "") if commits else ""
+    tip = str(proposal.get("sourceRevision") or "")
     if not tip:
-        # Nothing to compare. A proposal whose commits cannot be read is not
-        # evidence that the branch is in the way, and refusing on it would stop
-        # every card on a forge whose commit listing is unavailable.
+        # Nothing to compare. A proposal that does not say where its branch
+        # was is not evidence that the branch is in the way, and refusing on
+        # it would stop every card on a forge that leaves the field empty.
         return ""
     contained = vcs_client.local(
         session, ["merge-base", "--is-ancestor", tip, "HEAD"], "merge-base"
@@ -434,6 +439,18 @@ def handle_submit(args) -> int:
             "refreshing the proposal it belongs to."
         )
         log(f"'{branch}' is already on {repo} at this revision; {landed}")
+    elif proposal and vcs_client.unpublished_revisions(session, branch) == 0:
+        # The second round that changes only the description. Step 5 of the
+        # SKILL runs `prepare` afresh -- a new copy *of* the branch, with
+        # nothing published from it yet -- and then `submit`, and a reviewer
+        # who asked for a corrected title or body gives the copy nothing to
+        # commit. `already_published` above cannot see this: it reads what
+        # this copy published, and this copy published nothing. `publish`
+        # would refuse it as "no new revisions", which is the right answer for
+        # a first submission and the wrong one here, where the proposal to
+        # refresh is already open and the branch is already where it should
+        # be. So the publish is skipped and the update below is reached.
+        log(f"'{branch}' holds nothing {repo} does not have; refreshing the proposal it belongs to.")
     else:
         log(f"Publishing '{branch}' to {repo}...")
         # `advance` exactly when the copy was taken of this branch rather than

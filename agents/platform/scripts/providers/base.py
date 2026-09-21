@@ -208,7 +208,9 @@ class Forge:
             "missing": [],
         }
 
-    def can_write(self, api: Callable, repo: str, login: str) -> bool | None:
+    def can_write(
+        self, api: Callable, repo: str, login: str, bot: bool = False
+    ) -> bool | None:
         """Whether `login` may write to `repo`: True, False, or None for unknown.
 
         The normalised answer to a question every forge spells differently and
@@ -217,6 +219,13 @@ class Forge:
         must not be read as a refusal, because the caller that asks this writes
         a permanent refusal marker on a `False`. A forge that cannot answer at
         all leaves this alone and callers treat every login as unknown.
+
+        `bot` says the login is an automation's, as this forge reported it on
+        the comment the caller is asking about. The translation strips whatever
+        marks an automation's login apart from a person's, so the caller cannot
+        put it back; a forge whose App accounts are a different principal from
+        a same-named user re-applies its own spelling here. A forge with no
+        such distinction ignores it.
         """
         return None
 

@@ -826,25 +826,47 @@ class PermissionTest(BrokerCase):
         self.assertEqual(len(self.broker.payloads("identity")), 2)
 
     def test_a_bot_and_a_user_of_the_same_name_are_two_accounts(self):
-        """`normalise_login` would collapse them, and it must not be the cache key.
+        """Two questions to the forge, and the App one says so.
 
-        It strips a trailing `[bot]` and a leading `app/` so a typed mention
-        matches a handle. Keyed on that, the App `foo[bot]` and the user `foo`
-        share one slot: whichever commented first decides trust for both, which
+        They arrive spelled the same: the forge module strips `[bot]` from
+        every author it emits and reports the fact beside the author as `bot`.
+        Keyed on the login alone the App `foo[bot]` and the user `foo` share
+        one slot -- whichever commented first decides trust for both, which
         either clears the sweep's only trust gate for a non-collaborator or
-        writes a permanent `agent-refused` marker at a maintainer.
+        writes a permanent `agent-refused` marker at a maintainer. And the
+        question has to *carry* the flag: asked about the bare `foo`, the forge
+        answers for the user, an unrelated principal or a 404, never the App.
+        Through `list_comments`, because `_has_write` handed `foo[bot]` directly
+        is a spelling that can no longer arrive there.
         """
-        answers = {"foo": True, "foo[bot]": False}
+        answers = {("foo", False): True, ("foo", True): False}
         provider = self.provider(
-            identity=lambda payload: {
-                "identity": {
-                    "login": VIEWER,
-                    "canWrite": answers[payload["login"]],
-                }
+            **{
+                "proposal-view": {
+                    "proposal": proposal(),
+                    "comments": [
+                        comment("issue-1", author="foo"),
+                        comment("issue-2", author="foo", bot=True),
+                    ],
+                },
+                "identity": lambda payload: {
+                    "identity": {
+                        "login": VIEWER,
+                        "canWrite": answers[(payload["login"], payload.get("bot", False))],
+                    }
+                },
             }
         )
-        self.assertIs(provider._has_write(REPO, "foo"), True)
-        self.assertIs(provider._has_write(REPO, "foo[bot]"), False)
+        human, app = provider.list_comments(REPO, _a_pull_request())
+        self.assertIs(human.can_write, True)
+        self.assertIs(app.can_write, False)
+        asked = self.broker.payloads("identity")
+        self.assertEqual(len(asked), 2)
+        self.assertNotIn("bot", asked[0])
+        self.assertIs(asked[1]["bot"], True)
+        # Cached per account, not per login: the same two again cost nothing.
+        provider.list_comments(REPO, _a_pull_request())
+        self.assertEqual(len(self.broker.payloads("identity")), 2)
 
 
 class CapabilityTest(BrokerCase):
@@ -889,6 +911,7 @@ class ListOpenPrsTest(BrokerCase):
         sent = self.broker.one("proposal-list")
         self.assertEqual(sent["state"], "open")
         self.assertEqual(sent["limit"], forge.PAGE_SIZE)
+        self.assertEqual(sent["page"], 1)
         self.assertEqual(sent["repository"], REPO)
 
     def test_rows_are_normalised(self):
@@ -924,14 +947,47 @@ class ListOpenPrsTest(BrokerCase):
         (pr,) = provider.list_open_prs(REPO)
         self.assertEqual((pr.number, pr.head_ref, pr.author, pr.labels), (0, "", "", ()))
 
-    def test_a_truncated_page_is_reported_rather_than_hidden(self):
-        """It looks exactly like a complete one, and a proposal past it is never answered."""
+    def test_a_truncated_page_is_followed_by_the_next(self):
+        """The provider this replaced paginated, and its test said why.
+
+        "Human pull requests share that budget, so on a busy repository the
+        agent's own would fall out of the window." GitHub lists newest first,
+        so the proposals that fall out are the oldest -- the ones that have
+        waited longest for an answer -- and every tick loses the same ones.
+        """
+        pages = {
+            1: {"proposals": [proposal(1)], "truncated": True},
+            2: {"proposals": [proposal(2)], "truncated": True},
+            3: {"proposals": [proposal(3)], "truncated": False},
+        }
+        provider = self.provider(**{"proposal-list": lambda payload: pages[payload["page"]]})
+        with mock.patch.object(forge.LOGGER, "warning") as warn:
+            numbers = [pr.number for pr in provider.list_open_prs(REPO)]
+        self.assertEqual(numbers, [1, 2, 3])
+        self.assertEqual(
+            [sent["page"] for sent in self.broker.payloads("proposal-list")], [1, 2, 3]
+        )
+        # Read to the end, so nothing to warn about and nothing for the sweep.
+        warn.assert_not_called()
+        self.assertEqual(provider.truncations(), [])
+
+    def test_a_listing_that_never_ends_is_reported_rather_than_hidden(self):
+        """A bound on the walk, and the walk says when it hit it.
+
+        A forge whose `truncated` was wrong would otherwise be paged forever on
+        every ten-minute tick; past the bound the listing is read short, and a
+        short listing that looks complete is the thing the deleted test guarded
+        against -- so it is logged and recorded for the operator warning.
+        """
         provider = self.provider(
             **{"proposal-list": {"proposals": [proposal()], "truncated": True}}
         )
         with self.assertLogs(forge.LOGGER, logging.WARNING) as logs:
-            provider.list_open_prs(REPO)
-        self.assertIn("filled a page of 100", "\n".join(logs.output))
+            listed = provider.list_open_prs(REPO)
+        self.assertEqual(len(listed), forge.MAX_PAGES)
+        self.assertEqual(len(self.broker.payloads("proposal-list")), forge.MAX_PAGES)
+        self.assertIn(f"ran past {forge.MAX_PAGES} pages", "\n".join(logs.output))
+        self.assertEqual(provider.truncations(), [f"the open proposals on {REPO}"])
 
     def test_a_complete_page_says_nothing(self):
         provider = self.provider(
@@ -1200,8 +1256,29 @@ class ListCommitsTest(BrokerCase):
         )
         self.assertEqual(provider.list_commits(REPO, self.pr), [])
 
-    def test_a_truncated_page_names_the_proposal(self):
-        """An amendment is checked against these; a commit past the page is one it will not find."""
+    def test_the_newest_commit_is_on_the_last_page_and_is_read(self):
+        """An amendment is checked against these, and the amendment is the newest.
+
+        The forge lists oldest first, so a pull request past one page keeps its
+        newest commit -- the one a reply is about -- on the last page. "A
+        long-lived pull request outruns one page, and a missed commit reads as
+        a false claim", as the deleted test put it.
+        """
+        pages = {
+            1: {"commits": [{"sha": "a" * 40}], "truncated": True},
+            2: {"commits": [{"sha": "b" * 40}], "truncated": False},
+        }
+        provider = self.provider(
+            **{"proposal-commits": lambda payload: pages[payload["page"]]}
+        )
+        commits = provider.list_commits(REPO, self.pr)
+        self.assertEqual([c.sha for c in commits], ["a" * 40, "b" * 40])
+        self.assertEqual(
+            [sent["page"] for sent in self.broker.payloads("proposal-commits")], [1, 2]
+        )
+        self.assertEqual(provider.truncations(), [])
+
+    def test_a_listing_read_past_the_bound_names_the_proposal(self):
         provider = self.provider(
             **{
                 "proposal-commits": {
@@ -1213,6 +1290,7 @@ class ListCommitsTest(BrokerCase):
         with self.assertLogs(forge.LOGGER, logging.WARNING) as logs:
             provider.list_commits(REPO, self.pr)
         self.assertIn("#12", "\n".join(logs.output))
+        self.assertEqual(provider.truncations(), [f"the commits on #12 on {REPO}"])
 
     def test_a_failure_raises_rather_than_reporting_no_commits(self):
         """An empty list is "you did not amend the branch", posted publicly."""

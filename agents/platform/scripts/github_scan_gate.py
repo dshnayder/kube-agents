@@ -653,10 +653,9 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     truncated = provider.truncations()
     if truncated:
         warnings.append(
-            "⚠️ **GitHub PR watcher read only the first page of** "
+            f"⚠️ **GitHub PR watcher read only the first {forge.LISTING_CEILING} of** "
             + ", ".join(f"{note}" for note in sorted(set(truncated)))
-            + f" — a page is {forge.PAGE_SIZE}, and anything past it was not "
-            "swept this tick."
+            + " — anything past that was not swept this tick."
         )
     # Oldest first, so a burst of new comments cannot starve a request that has
     # been waiting. Ordering is global rather than per pull request because the

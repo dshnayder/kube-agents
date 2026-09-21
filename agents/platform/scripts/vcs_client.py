@@ -419,10 +419,10 @@ def _refuse_to_discard(destination: Path, *, force: bool) -> None:
     because `publish` used to answer a moved target by saying to clone again,
     which pointed the caller straight at it.
 
-    Anything at all is enough to refuse: a commit past the recorded base, or an
-    uncommitted change, or a git that cannot answer either question. Refusing on
-    the third is deliberate -- a tree this cannot read is exactly the one whose
-    contents cannot be vouched for.
+    Anything at all is enough to refuse: a commit past the recorded base on any
+    branch the copy holds, or an uncommitted change, or a git that cannot answer
+    either question. Refusing on the third is deliberate -- a tree this cannot
+    read is exactly the one whose contents cannot be vouched for.
     """
     if force:
         return
@@ -435,24 +435,33 @@ def _refuse_to_discard(destination: Path, *, force: bool) -> None:
         reasons.append("its state could not be read")
     elif dirty.stdout.strip():
         reasons.append(f"{len(dirty.stdout.strip().splitlines())} uncommitted change(s)")
-    # The base for the branch that is checked out, not the clone point: a branch
-    # whose work has been published is not work this would lose, and asking the
-    # clone point would count those revisions again and refuse to replace a copy
-    # with nothing left in it.
-    head = local_git(destination, "rev-parse", "--abbrev-ref", "HEAD", check=False)
-    base = (
-        base_for(session, (head.stdout or "").strip())
-        if session and session.get("baseRevision")
-        else None
-    )
-    if base:
-        ahead = local_git(
-            destination, "rev-list", "--count", f"{base}..HEAD", check=False
+    # Every branch the copy holds, not the one that happens to be checked out.
+    # `base_for` calls a copy carrying several branches the ordinary case, and a
+    # copy switched back to a published branch has a clean status and nothing
+    # past that branch's published tip -- while the branch it was switched away
+    # from can hold a day's work that never left this container. Each branch is
+    # measured against its own base: a branch whose work has been published is
+    # not work this would lose, and asking the clone point for it would count
+    # those revisions again and refuse to replace a copy with nothing left in
+    # it. A branch that was never published is measured from the clone point,
+    # which may count a sibling's published revisions too; over-refusing is the
+    # safe direction here, and `--force` is the way past it.
+    if session and session.get("baseRevision"):
+        listed = local_git(
+            destination, "for-each-ref", "--format=%(refname:short)", "refs/heads/",
+            check=False,
         )
-        if ahead.returncode != 0:
-            reasons.append("its revisions could not be counted")
-        elif (ahead.stdout or "0").strip() not in ("", "0"):
-            reasons.append(f"{ahead.stdout.strip()} unpublished revision(s)")
+        if listed.returncode != 0:
+            reasons.append("its branches could not be listed")
+        for name in (listed.stdout or "").split():
+            ahead = local_git(
+                destination, "rev-list", "--count",
+                f"{base_for(session, name)}..refs/heads/{name}", check=False,
+            )
+            if ahead.returncode != 0:
+                reasons.append(f"the revisions on {name} could not be counted")
+            elif (ahead.stdout or "0").strip() not in ("", "0"):
+                reasons.append(f"{ahead.stdout.strip()} unpublished revision(s) on {name}")
     if not reasons:
         return
     raise VcsError(
@@ -658,6 +667,23 @@ def commit(
     }
 
 
+def unpublished_revisions(session: dict, branch: str | None = None) -> int:
+    """How many revisions the copy's branch holds past what it last published.
+
+    Zero is the state a second-round `submit` with nothing new to send stands
+    in; `publish` refuses it, because sending nothing is a mistake there, and a
+    caller that has a proposal to refresh regardless asks this first.
+    """
+    branch = branch or current_branch(session)
+    base = base_for(session, branch)
+    ahead = local_git(tree_of(session), "rev-list", "--count", f"{base}..HEAD", check=False)
+    if ahead.returncode != 0:
+        raise VcsError(
+            f"cannot compare against {base[:12]}: {ahead.stderr.strip()}"
+        )
+    return int((ahead.stdout or "0").strip() or "0")
+
+
 def already_published(session: dict, branch: str | None = None) -> bool:
     """Is this branch's current tip already on the remote?
 
@@ -702,12 +728,7 @@ def publish(
     branch = current_branch(session)
     base = base_for(session, branch)
     target = target or session["branch"]
-    ahead = local_git(tree, "rev-list", "--count", f"{base}..HEAD", check=False)
-    if ahead.returncode != 0:
-        raise VcsError(
-            f"cannot compare against {base[:12]}: {ahead.stderr.strip()}"
-        )
-    count = int((ahead.stdout or "0").strip() or "0")
+    count = unpublished_revisions(session, branch)
     if count == 0:
         raise VcsError(
             "there are no new revisions to publish. `vcs.py commit` records "

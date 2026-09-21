@@ -1443,6 +1443,51 @@ class CollaborationTest(unittest.TestCase):
         broker, _ = self.broker(status, broken)
         self.assertIsNone(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
 
+    def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
+        """`bot` puts the suffix back that the translation took off.
+
+        Asked about the bare `renovate`, the permission endpoint answers for
+        the *user* of that name -- "is not a user" (404), or a stranger's
+        permission -- and never for the App `renovate[bot]` that wrote the
+        comment. Seen against the real API: `github-actions[bot]` answers
+        `none`; `github-actions` answers 404.
+        """
+        status = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
+        )
+        broker, recorder = self.broker(status, {"permission": "none"})
+        answer = broker.identity({"repository": "acme/infra", "login": "renovate", "bot": True})
+        self.assertFalse(answer["identity"]["canWrite"])
+        self.assertIn("collaborators/renovate%5Bbot%5D/permission", recorder.calls[1][4])
+        # Not doubled when the caller already had the suffix.
+        broker, recorder = self.broker(status, {"permission": "none"})
+        broker.identity({"repository": "acme/infra", "login": "renovate[bot]", "bot": True})
+        self.assertIn("collaborators/renovate%5Bbot%5D/permission", recorder.calls[1][4])
+        # And without the flag, the user is the one asked about.
+        broker, recorder = self.broker(status, {"permission": "write"})
+        broker.identity({"repository": "acme/infra", "login": "renovate"})
+        self.assertIn("collaborators/renovate/permission", recorder.calls[1][4])
+        broker, _ = self.broker(status)
+        with self.assertRaises(WorkspaceError):
+            broker.identity({"repository": "acme/infra", "login": "renovate", "bot": "yes"})
+
+    def test_a_listing_asks_for_the_page_it_was_given(self):
+        """The two listings a caller reads to the end take a page; the first is implicit."""
+        broker, recorder = self.broker([])
+        broker.proposal_commits({"repository": "acme/infra", "number": 9})
+        self.assertNotIn("&page=", recorder.path)
+        broker, recorder = self.broker([])
+        broker.proposal_commits({"repository": "acme/infra", "number": 9, "page": 3})
+        self.assertIn("&page=3", recorder.path)
+        self.assertIn("per_page=", recorder.path)
+        broker, recorder = self.broker([])
+        broker.proposal_list({"repository": "acme/infra", "page": 2})
+        self.assertIn("&page=2", recorder.path)
+        broker, recorder = self.broker([])
+        with self.assertRaises(WorkspaceError):
+            broker.proposal_list({"repository": "acme/infra", "page": 0})
+        self.assertEqual(recorder.calls, [])
+
     def test_proposal_list_asks_for_one_branch_rather_than_filtering_a_page(self):
         broker, recorder = self.broker([])
         broker.proposal_list({"repository": "acme/infra", "source": "platform-agent/fix"})

@@ -374,10 +374,10 @@ class ContractTest(unittest.TestCase):
             "proposal-create": {"title": "t", "source": "--upload-pack=x", "target": "main"},
             "issue-create": {"title": "", "body": "b"},
             "issue-list": {"labels": "bug"},
-            "proposal-list": {"state": "merged"},
+            "proposal-list": [{"state": "merged"}, {"page": 0}],
             "proposal-update": {"number": 4321, "labelsAdd": ["ok", ""]},
             "proposal-close": {"number": -1},
-            "proposal-commits": {"number": "x"},
+            "proposal-commits": [{"number": "x"}, {"number": 1, "page": "2"}],
             # Two, because this verb carries two identifiers and a forge that
             # checked only the one it happens to use would refuse a different
             # set of requests from its neighbours.

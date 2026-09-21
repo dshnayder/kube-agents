@@ -778,9 +778,8 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(result.cards, [])
         self.assertEqual(len(result.warnings), 1)
         warning = result.warnings[0]
-        self.assertIn("read only the first page of", warning)
+        self.assertIn(f"read only the first {forge.LISTING_CEILING} of", warning)
         self.assertIn("acme/toolkit#12 reviews", warning)
-        self.assertIn(str(forge.PAGE_SIZE), warning)
 
     def test_the_same_listing_truncating_twice_is_reported_once(self):
         """Two repositories fill the same page on the same tick, routinely.

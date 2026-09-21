@@ -640,6 +640,28 @@ class CollaborationTest(VcsTestCase):
         self.assertTrue(payload["diff"])
         self.assertEqual(payload["limit"], 5)
 
+    def test_the_two_listings_read_to_the_end_take_a_page(self):
+        code, _ = self.run_vcs("proposal", "list", "--page", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("proposal-list")["page"], 2)
+        code, _ = self.run_vcs("proposal", "commits", "7", "--page", "3")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-commits")
+        self.assertEqual((payload["number"], payload["page"]), (7, 3))
+        # Absent, it is not sent as a null: the first page is the default.
+        code, _ = self.run_vcs("proposal", "commits", "7")
+        self.assertEqual(code, 0)
+        self.assertNotIn("page", self.broker.payload("proposal-commits"))
+
+    def test_identity_says_when_the_login_is_an_automations(self):
+        code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("identity")
+        self.assertEqual((payload["login"], payload["bot"]), ("renovate", True))
+        code, _ = self.run_vcs("identity", "--login", "renovate")
+        self.assertEqual(code, 0)
+        self.assertNotIn("bot", self.broker.payload("identity"))
+
     def test_issue_list_carries_state_and_labels(self):
         code, _ = self.run_vcs(
             "issue", "list", "--state", "closed", "--labels", "bug", "p1"

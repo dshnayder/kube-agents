@@ -29,6 +29,7 @@ from ..validate import (
     validate_labels,
     validate_limit,
     validate_number,
+    validate_page,
     validate_state,
     validate_text,
 )
@@ -191,14 +192,27 @@ class GitHubForge(Forge):
                 if exc.status != 404:
                     raise
 
-    def can_write(self, api: Callable, repo: str, login: str) -> bool | None:
+    def can_write(
+        self, api: Callable, repo: str, login: str, bot: bool = False
+    ) -> bool | None:
         # The collaborator-permission endpoint rather than `author_association`
         # off a comment: an App installation token sees every association as
         # NONE, which is the blindness forge.py's history records. A 404 is a
         # definitive no; any other failure is not an answer and says so.
+        #
+        # An automation's login gets its App spelling back before it is asked
+        # about. `translate.actor` took `[bot]` off every author this forge
+        # emitted, so a caller relaying a comment author has `renovate` in hand
+        # for the App `renovate[bot]`, and the endpoint answers for whichever
+        # principal it is given: bare, it is the permission of the *user*
+        # `renovate` -- a stranger, or nobody (404, "is not a user") -- and
+        # never the App's. The caller cannot re-add a suffix it was never
+        # allowed to know about, which is why it says `bot` and this side
+        # spells it.
         if not login:
             return False
-        quoted = quote(login, safe="")
+        subject = login if not bot or login.endswith("[bot]") else f"{login}[bot]"
+        quoted = quote(subject, safe="")
         try:
             data = api("GET", f"repos/{repo}/collaborators/{quoted}/permission")
         except WorkspaceError as exc:
@@ -226,6 +240,12 @@ class GitHubForge(Forge):
             "state": validate_state(payload.get("state")),
             "per_page": limit,
         }
+        # Sent only when it says something. The first page is what an
+        # unqualified `GET /pulls` answers, and the recorded requests every
+        # forge is tested against were taken without it.
+        page = validate_page(payload.get("page"))
+        if page > 1:
+            params["page"] = page
         source = payload.get("source")
         if source is not None:
             # Asked as a filter rather than by listing everything and matching
@@ -295,9 +315,15 @@ class GitHubForge(Forge):
     def proposal_commits(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))
         limit = validate_limit(payload.get("limit"))
-        nodes = api(
-            "GET", f"repos/{repo}/pulls/{number}/commits", params={"per_page": limit}
-        )
+        params: dict[str, Any] = {"per_page": limit}
+        # Oldest first, which is GitHub's order for this endpoint and the one
+        # the verb promises. The commit a caller most often wants is the newest,
+        # so the caller that needs it walks to the last page; GitHub stops
+        # serving at 250 commits, and past that `truncated` stays true.
+        page = validate_page(payload.get("page"))
+        if page > 1:
+            params["page"] = page
+        nodes = api("GET", f"repos/{repo}/pulls/{number}/commits", params=params)
         return listing([translate.commit(node) for node in nodes], limit, "commits")
 
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:

@@ -86,11 +86,23 @@ import vcs_client
 LOGGER = logging.getLogger(__name__)
 
 #: How many proposals, comments or commits one read asks for. The verbs cap a
-#: page at 100 and report `truncated` rather than silently cutting the list, so
-#: this is the ceiling rather than a first page — see `BrokerProvider._page`,
-#: which turns a truncated answer into a log line instead of letting a partial
-#: read look like a complete one.
+#: page at 100 and report `truncated` rather than silently cutting the list.
+#: For the conversation that is the ceiling — see `list_comments`, which
+#: refuses a truncated one. For the two listings the sweep has to read to the
+#: end, the proposals and a proposal's commits, a truncated page is followed by
+#: the next: see `BrokerProvider._pages`.
 PAGE_SIZE = 100
+
+#: How many pages `_pages` will walk before it stops and says so. Ten pages of
+#: a hundred is a thousand open proposals, or a proposal with a thousand
+#: commits — past what any GitOps repository this runs against holds, and the
+#: shipped forge stops serving a proposal's commits at 250 anyway. A bound
+#: rather than "until the forge stops", because a forge whose `truncated` is
+#: wrong would otherwise be walked forever on every ten-minute tick.
+MAX_PAGES = 10
+
+#: The most items one listing reads, in the words the operator warning uses.
+LISTING_CEILING = PAGE_SIZE * MAX_PAGES
 
 #: The branch prefix the agent's own pull requests carry. Only one place writes
 #: it in code — `audit_report.group_branch_for` — and `submit-suggestion`'s
@@ -571,10 +583,11 @@ class BrokerProvider:
     """
 
     def __init__(self) -> None:
-        # Keyed on (repository, login), because writing is a permission on a
-        # repository and not a property of the account. None is a cached
-        # "nothing answered", which is not the same as False -- see `_has_write`.
-        self._permissions: dict[tuple[str, str], Optional[bool]] = {}
+        # Keyed on (repository, login, bot), because writing is a permission on
+        # a repository and not a property of the account, and an automation and
+        # a person can share a login. None is a cached "nothing answered", which
+        # is not the same as False -- see `_has_write`.
+        self._permissions: dict[tuple[str, str, bool], Optional[bool]] = {}
         # Per repository for the same reason the credential is: two forges in
         # one install authenticate as two different accounts. "" is a real
         # answer, meaning the credential could not name itself, and is cached.
@@ -593,40 +606,53 @@ class BrokerProvider:
     ) -> dict:
         return call(verb, payload, repo, retry_transient=retry_transient)
 
-    def _page(self, answer: dict, key: str, repo: str, what: str) -> list:
-        """One listing's items, with a truncated page reported rather than hidden.
+    def _pages(self, verb: str, payload: dict, key: str, repo: str, what: str) -> list:
+        """Every item of one listing, page after page, until the forge says it is done.
 
         A truncated list looks exactly like a complete one, and every reading
         the sweep makes of a complete one is wrong if it is not: a pull request
         past the ceiling is one the agent never answers, and a commit past it
         is one an amendment claim is checked against and does not find. The
-        verbs say `truncated` rather than leaving that to be guessed at, and
-        this is the one place the flag is read.
+        provider this replaced paginated both reads and its tests said why --
+        "human pull requests share that budget, so on a busy repository the
+        agent's own would fall out of the window", and "a long-lived pull
+        request outruns one page, and a missed commit reads as a false claim".
+        So a page that says `truncated` is followed by the next, up to
+        `MAX_PAGES`.
 
-        It is recorded as well as logged. `list_comments` refuses outright,
-        because a short conversation is read *backwards* rather than merely
-        short; these two are read short, which is recoverable -- but only if
-        somebody knows it happened, so the note also goes where an operator
-        will see it, through `truncations()`.
+        Past that bound the listing is read short, and that is reported rather
+        than hidden: logged, and recorded for `truncations()`, because the
+        sweep's only channel to a human is the warnings list it prints and a
+        listing read short is recoverable only if somebody knows it happened.
+        `list_comments` is different and refuses outright -- a short
+        conversation is read *backwards* rather than merely short.
         """
-        if answer.get("truncated"):
-            LOGGER.warning(
-                "%s on %s filled a page of %d; anything past it is not being "
-                "read this tick",
-                what,
-                repo,
-                PAGE_SIZE,
+        items: list = []
+        for page in range(1, MAX_PAGES + 1):
+            answer = self._verb(
+                verb, {**payload, "page": page}, repo, retry_transient=True
             )
-            self._truncations.append(f"{what} on {repo}")
-        return answer.get(key) or []
+            items.extend(answer.get(key) or [])
+            if not answer.get("truncated"):
+                return items
+        LOGGER.warning(
+            "%s on %s ran past %d pages of %d; anything past that is not being "
+            "read this tick",
+            what,
+            repo,
+            MAX_PAGES,
+            PAGE_SIZE,
+        )
+        self._truncations.append(f"{what} on {repo}")
+        return items
 
     def truncations(self) -> list[str]:
         """Every listing this instance read short, in the order it read them.
 
         The sweep drains this into its operator warnings at the end of a tick.
-        One list rather than one warning apiece: a repository over the ceiling
-        produces the same note on every tick and on more than one listing, and
-        an operator reads one line more reliably than five.
+        One list rather than one warning apiece: a repository over
+        `LISTING_CEILING` produces the same note on every tick and on more than
+        one listing, and an operator reads one line more reliably than five.
         """
         return list(self._truncations)
 
@@ -660,9 +686,17 @@ class BrokerProvider:
             self._viewers[repo] = self._identity(repo, None)["login"]
         return self._viewers[repo]
 
-    def _identity(self, repo: str, login: Optional[str]) -> dict:
-        """One `identity` call, normalised. `login` absent asks about the credential."""
-        payload = {"login": login} if login else {}
+    def _identity(self, repo: str, login: Optional[str], bot: bool = False) -> dict:
+        """One `identity` call, normalised. `login` absent asks about the credential.
+
+        `bot` travels only when it is true and only beside a login: it says the
+        login is an automation's, as the forge reported it on the comment, and
+        the forge module puts its own App spelling back before asking. This
+        side never learned that spelling and must not guess one.
+        """
+        payload: dict = {"login": login} if login else {}
+        if login and bot:
+            payload["bot"] = True
         answer = self._verb("identity", payload, repo, retry_transient=True)
         identity = answer.get("identity") or {}
         viewer = normalise_login(identity.get("login") or "")
@@ -672,7 +706,7 @@ class BrokerProvider:
         self._viewers.setdefault(repo, viewer)
         return {"login": viewer, "canWrite": identity.get("canWrite")}
 
-    def _has_write(self, repo: str, login: str) -> Optional[bool]:
+    def _has_write(self, repo: str, login: str, bot: bool = False) -> Optional[bool]:
         """May `login` write to `repo`? None when nothing answered.
 
         A non-member is a definitive no. Any other failure — a proxy fault, a
@@ -686,27 +720,32 @@ class BrokerProvider:
         """
         if not login:
             return False
-        # Keyed on the login this actually asks about, not on `normalise_login`,
-        # which exists to make a mention match a handle and collapses accounts
-        # that are not the same account: it strips a trailing `[bot]` and a
-        # leading `app/`, so the App `foo[bot]` and the user `foo` shared one
-        # slot and whichever comment arrived first decided trust for both. One
+        # Keyed on the login *and* on whether it is an automation's, because
+        # the two together are what this actually asks about. The App
+        # `foo[bot]` and the user `foo` are two accounts, and they arrive here
+        # spelled the same: the forge module strips the `[bot]` suffix from
+        # every author it emits and reports the fact beside the author as
+        # `bot` instead. Keyed on the login alone they shared one slot and
+        # whichever comment arrived first decided trust for both. One
         # direction hands a non-collaborator `can_write=True` and clears the
         # sweep's only trust gate; the other refuses a maintainer and writes a
         # public `agent-refused` marker that `refused_refs` treats as
         # permanent. Neither needs timing luck — permission is resolved for
         # every comment author on every swept pull request, so once both
         # accounts have commented the wrong answer is re-derived every tick.
+        # And the flag is *sent*, not only keyed on: asked about the bare
+        # login, the forge answers for the user, which for an allowlisted App
+        # is an unrelated principal's permission or a 404.
         #
         # Case is folded because logins are case-insensitive on the forges this
         # runs against, so `Foo` and `foo` are one account and one lookup.
         # Nothing else is folded: the `app/` and bare-name spellings
         # `normalise_login` handles come out of mention text, which never
         # reaches here.
-        key = (repo, login.lower())
+        key = (repo, login.lower(), bool(bot))
         if key not in self._permissions:
             try:
-                self._permissions[key] = self._identity(repo, login)["canWrite"]
+                self._permissions[key] = self._identity(repo, login, bot)["canWrite"]
             except ForgeError as error:
                 LOGGER.info("permission for %s on %s unreadable: %s", login, repo, error)
                 self._permissions[key] = None
@@ -746,12 +785,6 @@ class BrokerProvider:
         branch on somebody's fork, and telling those apart is the first of the
         three things `is_agent_pull_request` checks.
         """
-        answer = self._verb(
-            "proposal-list",
-            {"state": "open", "limit": PAGE_SIZE},
-            repo,
-            retry_transient=True,
-        )
         return [
             PullRequest(
                 number=int(node.get("number") or 0),
@@ -765,7 +798,13 @@ class BrokerProvider:
                 labels=tuple(str(name) for name in (node.get("labels") or [])),
                 url=str(node.get("url") or ""),
             )
-            for node in self._page(answer, "proposals", repo, "the open proposals")
+            for node in self._pages(
+                "proposal-list",
+                {"state": "open", "limit": PAGE_SIZE},
+                "proposals",
+                repo,
+                "the open proposals",
+            )
         ]
 
     def list_comments(self, repo: str, pr: PullRequest) -> list[Comment]:
@@ -809,7 +848,7 @@ class BrokerProvider:
         out: list[Comment] = []
         for node in answer.get("comments") or []:
             author = str(node.get("author") or "")
-            access = self._has_write(repo, author)
+            access = self._has_write(repo, author, bool(node.get("bot")))
             out.append(
                 Comment(
                     ref=str(node.get("ref") or ""),
@@ -894,14 +933,14 @@ class BrokerProvider:
         the committer date is the one that answers it — which is the date the
         verb reports as `committed`.
         """
-        answer = self._verb(
+        commits = []
+        for node in self._pages(
             "proposal-commits",
             {"number": pr.number, "limit": PAGE_SIZE},
+            "commits",
             repo,
-            retry_transient=True,
-        )
-        commits = []
-        for node in self._page(answer, "commits", repo, f"the commits on #{pr.number}"):
+            f"the commits on #{pr.number}",
+        ):
             sha = str(node.get("sha") or "")
             # A commit with no sha is not a commit. Dropped rather than carried
             # as an empty one, which would match no claim and read as a forge
