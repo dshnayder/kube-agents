@@ -48,17 +48,18 @@
 # (#1023, ~45min at its measured 737s/599s/1357s). 2026-09-21 added #1103's
 # two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
-# the infra lock with the two incumbents). Forty-one cases, ~893-913min
+# the infra lock with the two incumbents) and consistency-no-environment-label
+# (#1818, ~7min at its measured 342s/414s/456s). Forty-two cases, ~903-923min
 # serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~775-795min, over the deadline; 480m holds only if the nightly,
+# would be ~785-805min, over the deadline; 480m holds only if the nightly,
 # alone on the model quota at that hour and two lanes wider, realises ~1.9x
 # or better. Night one (2026-09-16, build 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the two additions are priced inside its headroom. The first nights after this change measure it:
+# so the three additions are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue

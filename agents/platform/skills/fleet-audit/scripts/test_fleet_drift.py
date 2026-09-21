@@ -77,6 +77,18 @@ def K(name, project="acme", location="us-central1"):
     return (project, location, name)
 
 
+def T(name, project="acme", location="us-central1"):
+    """The manifest target name for a cluster built by `cluster()` above.
+
+    `qualify_targets` names every cluster `<project>/<location>/<name>`,
+    because a name is unique only inside one project and location, and because
+    a name that is qualified only when it collides moves when the rest of the
+    fleet changes -- and a finding whose cluster moves is announced resolved
+    and refiled as new.
+    """
+    return f"{project}/{location}/{name}"
+
+
 class DiscoverProjectsTest(unittest.TestCase):
     @staticmethod
     def _discovery_run(projects_stdout, clusters_by_project=None):
@@ -137,19 +149,6 @@ class DiscoverProjectsTest(unittest.TestCase):
         self.assertEqual(fd.discover_projects(None, run=run), ["acme", "acme-staging"])
         self.assertEqual([a for a in calls if "clusters" in a], [])
 
-    def test_keeps_a_project_whose_clusters_list_could_not_be_read(self):
-        """`[]` and `None` are different answers: an unreadable project stays
-        in scope so the manifest records the loss."""
-
-        def run(argv, **_):
-            if argv[:4] == ["gcloud", "config", "get-value", "project"]:
-                return run_of(0, "acme\n")
-            if argv[:3] == ["gcloud", "projects", "list"]:
-                return run_of(0, "acme\ndenied-proj\n")
-            return run_of(1, "", "PERMISSION_DENIED")
-
-        self.assertEqual(fd.discover_projects(None, run=run), ["acme", "denied-proj"])
-
     def test_an_unlistable_fleet_falls_back_to_the_base_project(self):
         def run(argv, **_):
             if argv[:4] == ["gcloud", "config", "get-value", "project"]:
@@ -157,6 +156,35 @@ class DiscoverProjectsTest(unittest.TestCase):
             return run_of(1, "", "PERMISSION_DENIED")
 
         self.assertEqual(fd.discover_projects(None, run=run), ["acme"])
+
+    def test_an_unlistable_fleet_says_the_scope_is_short(self):
+        """The fallback above is a narrowing, and a narrowing nobody records
+        is one `finish` reads as a clean fleet. Every previous ledger finding
+        on a cluster in a project this run never saw is then absent from the
+        document, absent from the manifest, announced resolved and its
+        remediation pull request stale-closed."""
+
+        def run(argv, **_):
+            if argv[:4] == ["gcloud", "config", "get-value", "project"]:
+                return run_of(0, "acme\n")
+            return run_of(1, "", "PERMISSION_DENIED")
+
+        discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["acme"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("PERMISSION_DENIED", discovery.partial)
+
+    def test_a_fleet_of_no_projects_at_all_is_an_error(self):
+        """Both calls answered rc 0 and named nothing. Without the key, the
+        manifest is `{"clusters": []}` with exit 0 -- a fleet holding no
+        clusters and a run that could not look are then the same document."""
+
+        def run(argv, **_):
+            return run_of(0, "")
+
+        discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("named no project", discovery.error)
 
     def test_english_prose_is_no_longer_a_source_of_project_ids(self):
         """The scrape read `/opt/data/INVENTORY.raw.md` -- model-written prose
@@ -562,6 +590,22 @@ class FacetNormalizeTest(unittest.TestCase):
         c = cluster("c", nodePools=[{"name": "pinned", "autoscaling": {"enabled": False}, "config": {"taints": [{"key": "dedicated"}]}}])
         self.assertIsNone(fd.norm_pool_autoscaling(c))
 
+    def test_a_gke_accelerator_taint_is_not_an_owner_pinning_a_pool(self):
+        """GKE taints a GPU pool itself, so "any taint" dropped every pool of
+        a GPU-only cluster from the vote. `_pool_fraction` then returned
+        `None`, `unvoted_facets` wrote a `limitations` sentence,
+        `coverage_gaps` read it as a gap on every run, and the stream stayed
+        `partial` with `resolved` pinned at 0 -- over a taint §4.0's "its
+        owner can revisit it" does not describe, because the owner did not
+        apply it."""
+        gpu = {"name": "gpu", "autoscaling": {"enabled": False},
+               "config": {"taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        self.assertEqual(fd.norm_pool_autoscaling(cluster("c", nodePools=[gpu])), "NONE")
+        # An owner-applied taint beside it still pins the pool.
+        gpu_and_dedicated = dict(gpu, config={"taints": [
+            {"key": "nvidia.com/gpu"}, {"key": "dedicated", "value": "batch"}]})
+        self.assertIsNone(fd.norm_pool_autoscaling(cluster("c", nodePools=[gpu_and_dedicated])))
+
     def test_intra_node_visibility(self):
         base, out, flagged = self.hit("intra-node-visibility", cluster("c"), {"networkConfig.enableIntraNodeVisibility": False})
         self.assertTrue(flagged)
@@ -646,12 +690,18 @@ class ComputeDriftTest(unittest.TestCase):
         self.assertEqual(fd.compute_drift(clusters, now=NOW)[0][K("a")], [])
 
     def test_autopilot_and_standard_are_never_compared_together(self):
-        clusters = self.cohort(n=3, outlier_overrides={"shieldedNodes.enabled": False})
+        # 20 clean Standard clusters and one Autopilot cluster with shielded
+        # nodes off. Merged into one cohort that is r=0.95 with k=1 -- no rung
+        # of the severity ladder touches it -- so the Autopilot cluster would
+        # be published as a `major`. What keeps it silent is the mode in the
+        # cohort key: it cohorts alone, under the floor. At the four-cluster
+        # size this test used to run, the merged cohort read r=0.50 and
+        # reached no baseline at all, so it passed with the mode dropped.
+        clusters = self.cohort(n=20)
         clusters.append(cluster("c-auto", autopilot=True, labels={"environment": "prod"}, **{"shieldedNodes.enabled": False}))
         _, candidates = fd.compute_drift(clusters, now=NOW)
-        # the autopilot cluster is alone in its mode's cohort -- under the
-        # floor, so it gets no findings regardless of its shielded-nodes value
         self.assertEqual(candidates[K("c-auto")], [])
+        self.assertEqual(candidates[K("c0")], [])
 
     def test_standard_only_facets_are_never_computed_for_autopilot(self):
         clusters = [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(4)]
@@ -660,11 +710,30 @@ class ComputeDriftTest(unittest.TestCase):
         self.assertNotIn("image-type", checks_run[K("a0")])
 
     def test_datapath_provider_is_computed_but_never_flagged_on_autopilot(self):
-        clusters = [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(3)]
-        clusters.append(cluster("a-outlier", autopilot=True, labels={"environment": "prod"}, **{"networkConfig.datapathProvider": "LEGACY_DATAPATH"}))
-        checks_run, candidates = fd.compute_drift(clusters, now=NOW)
+        # n=20, so r=0.95 and k=1: nothing on the severity ladder touches this
+        # finding, and `autopilot_excluded` is the only thing between the
+        # outlier and a `major`. A four-cluster cohort read r=0.75 and lost the
+        # finding to two ratio downgrades instead, which passed whether the
+        # facet was excluded or not. The standard cohort below is the control:
+        # the same shape at the same size, published.
+        def fleet(autopilot):
+            members = [cluster(f"a{i}", autopilot=autopilot, labels={"environment": "prod"}) for i in range(19)]
+            # `networkPolicy.enabled` comes with it: `network-policy` reads
+            # the same `datapathProvider` key, and a bare switch to
+            # `LEGACY_DATAPATH` drops enforcement too, so the outlier would
+            # carry a second finding this test is not about.
+            members.append(cluster("a-outlier", autopilot=autopilot, labels={"environment": "prod"},
+                                   **{"networkConfig.datapathProvider": "LEGACY_DATAPATH",
+                                      "networkPolicy.enabled": True}))
+            return members
+
+        checks_run, candidates = fd.compute_drift(fleet(True), now=NOW)
         self.assertIn("datapath-provider", checks_run[K("a-outlier")])
         self.assertEqual(candidates[K("a-outlier")], [])
+
+        _, standard = fd.compute_drift(fleet(False), now=NOW)
+        self.assertEqual([c["check"] for c in standard[K("a-outlier")]], ["datapath-provider"])
+        self.assertEqual(standard[K("a-outlier")][0]["severity"], "major")
 
     def test_ineligible_cluster_gets_no_facets_compared(self):
         clusters = self.cohort(n=3)
@@ -704,10 +773,15 @@ class ComputeDriftTest(unittest.TestCase):
         self.assertEqual(candidates[K(outlier["name"])][0]["check"], "uncohorted")
 
     def test_environment_strategy_separates_cohorts(self):
-        prod = self.cohort(n=4)
-        staging = [cluster(f"s{i}", labels={"environment": "staging"}, **{"shieldedNodes.enabled": False}) for i in range(4)]
+        # staging's own majority is DECRYPTED, so none of its three members is
+        # an outlier there. Merged into prod's cohort they are: r=20/23=0.87
+        # and k=3 cost two rungs, and `database-encryption` is base-critical,
+        # so the finding survives as a `minor` rather than falling off the
+        # ladder. A four-and-four split, which is what this test used to
+        # build, merged to r=0.50 and reached no baseline either way.
+        prod = self.cohort(n=20)
+        staging = [cluster(f"s{i}", labels={"environment": "staging"}, **{"databaseEncryption.state": "DECRYPTED"}) for i in range(3)]
         _, candidates = fd.compute_drift(prod + staging, now=NOW)
-        # staging's own majority is shieldedNodes=False, so none of them are outliers there
         self.assertEqual(candidates[K("s0")], [])
 
     def test_baseline_at_exactly_two_thirds_still_fires_for_a_critical_facet(self):
@@ -939,6 +1013,32 @@ class EligibilityCreateTimeTest(unittest.TestCase):
     def test_an_unparseable_create_time_is_treated_as_settled(self):
         self.assertIsNone(fd.cluster_eligibility(cluster("c", created="not-a-date"), now=NOW))
 
+    def test_a_create_time_with_no_timezone_is_treated_as_settled(self):
+        """The one unreadable `createTime` that gets past `fromisoformat`.
+        `2020-01-01` and `2020-01-01T00:00:00` both parse, and both return a
+        *naive* datetime, so it is the subtraction against an aware `now` a
+        line later that raises -- a `TypeError`, which an `except ValueError`
+        does not catch. Nothing between here and `main` catches it either, and
+        the SOP runs this module as `fleet_drift.py > manifest.json`, so the
+        shell has already truncated the manifest by the time the traceback
+        prints."""
+        for created in ("2020-01-01T00:00:00", "2020-01-01"):
+            with self.subTest(created=created):
+                self.assertIsNone(fd.cluster_eligibility(cluster("c", created=created), now=NOW))
+
+    def test_a_naive_create_time_does_not_truncate_the_manifest(self):
+        docs = [cluster(f"c{i}", labels={"team": "x"}) for i in range(3)]
+        docs[1]["createTime"] = "2020-01-01T00:00:00"
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, json.dumps(docs))
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        self.assertEqual(len(manifest["clusters"]), 3)
+        self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
+
     def test_a_genuinely_fresh_cluster_is_still_excluded(self):
         why = fd.cluster_eligibility(cluster("c", created="2026-07-31T18:00:00Z"), now=NOW)
         self.assertIn("under 24h", why or "")
@@ -991,7 +1091,7 @@ class CollectFleetTest(unittest.TestCase):
         entry = manifest["clusters"][0]
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("denied", entry["error"])
-        self.assertIn("all 1 project(s) in scope failed", manifest["error"])
+        self.assertIn("1 of 1 project(s) in scope failed", manifest["error"])
 
     def test_one_project_crashing_costs_that_project_and_no_other(self):
         """`future.result()` re-raises, and the SOP redirects this collector's
@@ -1014,15 +1114,86 @@ class CollectFleetTest(unittest.TestCase):
 
         manifest = fd.collect_fleet(run=run, now=NOW)
         by_name = {c["name"]: c for c in manifest["clusters"]}
-        self.assertEqual({f"c{i}" for i in range(4)} - set(by_name), set())
+        self.assertEqual({T(f"c{i}") for i in range(4)} - set(by_name), set())
         self.assertEqual(by_name["project/boom"]["outcome"], "gate-failed")
         self.assertIn("TypeError", by_name["project/boom"]["error"])
 
-    def test_a_name_two_projects_share_is_qualified_by_project(self):
-        """A GKE cluster name is unique inside its project, and the manifest is
-        fleet-wide: `audit_report._vouching_clusters` keys a dict by it, so two
-        `seeded-a`s used to leave one entry and one cluster nobody reported on.
-        Every project in the evaluation pool carries the same three names."""
+    def test_a_fleet_narrowed_to_one_project_says_so_in_the_manifest(self):
+        """`projects list` failing is a coverage loss one rung above a project
+        whose own `clusters list` failed, and it used to be a stderr warning
+        and nothing else: exit 0, every entry `collected`, no gap for the
+        document to carry, and `finish` free to resolve every previous
+        finding in the projects nobody read."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)])
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(1, "", "PERMISSION_DENIED")
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        entry = by_name[fd.UNENUMERATED_PROJECTS_TARGET]
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", entry["error"])
+        # A coverage loss, not a failed run: the project that did answer is
+        # still collected and still reported on.
+        self.assertNotIn("error", manifest)
+        self.assertEqual(by_name[T("c0")]["outcome"], "collected")
+        self.assertIn("1 project(s) unread", fd.candidate_summary(manifest)[0])
+
+    def test_a_scope_of_no_projects_is_an_error_not_an_empty_fleet(self):
+        def run(argv, **kwargs):
+            return run_of(0, "")
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("named no project", manifest["error"])
+
+    def test_one_name_in_two_locations_of_one_project_stays_two_targets(self):
+        """A GKE name is unique per project *and* location, so the
+        multi-region `prod` pair comes back from one `clusters list` and
+        qualifying by project alone leaves both called `acme/prod`."""
+        fleet = [cluster("prod", labels={"environment": "prod"}),
+                 cluster("prod", location="europe-west1", labels={"environment": "prod"}),
+                 cluster("other", labels={"environment": "prod"})]
+        clusters_json = json.dumps(fleet)
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        names = [c["name"] for c in fd.collect_fleet("acme", run=run, now=NOW)["clusters"]]
+        self.assertEqual(sorted(names), sorted([T("prod"), T("prod", location="europe-west1"), T("other")]))
+
+    def test_a_uncolliding_name_is_qualified_anyway(self):
+        """Qualifying only a colliding name makes a cluster's identity depend
+        on the rest of the fleet: `Cluster/only-one` becomes
+        `Cluster/acme/only-one` the week a second project gains the name, and
+        `finish` reads the old id as resolved and refiles the same drift as
+        new. §3.7's red line, broken by the collector."""
+        clusters_json = json.dumps([cluster("only-one", labels={"environment": "prod"})])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        names = [c["name"] for c in fd.collect_fleet("acme", run=run, now=NOW)["clusters"]]
+        self.assertEqual(names, [T("only-one")])
+
+    def test_every_target_is_qualified_by_project_and_location(self):
+        """A GKE cluster name is unique inside one project and location, and
+        the manifest is fleet-wide: `audit_report._vouching_clusters` keys a
+        dict by it, so two `seeded-a`s used to leave one entry and one cluster
+        nobody reported on. Every project in the evaluation pool carries the
+        same three names. A name unique today is qualified too -- see
+        `test_a_uncolliding_name_is_qualified_anyway`."""
         fleets = {
             "acme": [cluster(f"seeded-{x}") for x in "abc"],
             "other": [cluster(f"seeded-{x}", project="other") for x in "abc"]
@@ -1043,18 +1214,18 @@ class CollectFleetTest(unittest.TestCase):
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertEqual(
             sorted(by_name),
-            ["acme/seeded-a", "acme/seeded-b", "acme/seeded-c", "only-here",
-             "other/seeded-a", "other/seeded-b", "other/seeded-c"],
+            sorted(
+                [T(f"seeded-{x}") for x in "abc"]
+                + [T(f"seeded-{x}", project="other") for x in "abc"]
+                + [T("only-here", project="other")]
+            ),
         )
-        # A name only one project holds stays bare: the qualified form is the
-        # harder one to paste into `gcloud`, so it is paid only where it buys
-        # something.
-        self.assertEqual(by_name["only-here"]["project"], "other")
-        found = by_name["other/seeded-c"]["candidates"]
-        self.assertEqual([c["object"] for c in found], ["Cluster/other/seeded-c"])
+        self.assertEqual(by_name[T("only-here", project="other")]["project"], "other")
+        found = by_name[T("seeded-c", project="other")]["candidates"]
+        self.assertEqual([c["object"] for c in found], [f"Cluster/{T('seeded-c', project='other')}"])
         # The `peers:` line names the clusters holding the baseline, and an
         # unqualified `seeded-a` there points at two different clusters.
-        self.assertIn("acme/seeded-a", found[0]["excerpt"])
+        self.assertIn(T("seeded-a"), found[0]["excerpt"])
         self.assertNotIn("peers: seeded-a", found[0]["excerpt"])
 
     def test_every_project_failing_to_list_is_an_error_on_the_manifest(self):
@@ -1074,7 +1245,7 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual(
             [c["outcome"] for c in manifest["clusters"]], ["gate-failed", "gate-failed"]
         )
-        self.assertIn("all 2 project(s) in scope failed", manifest["error"])
+        self.assertIn("2 of 2 project(s) in scope failed", manifest["error"])
         self.assertIn("PERMISSION_DENIED", manifest["error"])
 
     def test_a_project_holding_nothing_is_not_an_error(self):
@@ -1175,7 +1346,7 @@ class CollectFleetTest(unittest.TestCase):
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual(
             {c["name"]: c["autopilot"] for c in manifest["clusters"]},
-            {"a0": True, "a1": True, "s0": False, "s1": False},
+            {T("a0"): True, T("a1"): True, T("s0"): False, T("s1"): False},
         )
 
     def test_the_project_level_entry_claims_no_mode(self):
@@ -1294,7 +1465,7 @@ class UnvotedFacetsTest(unittest.TestCase):
         `autopilot_not_applicable`'s call applies for the same slugs."""
         fleet = [cluster(f"c{i}") for i in range(4)]
         fleet[0]["nodePools"] = []
-        entry = self.manifest(fleet)["c0"]
+        entry = self.manifest(fleet)[T("c0")]
         declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
         self.assertEqual(sorted(declared), self.POOL_FACETS)
         for reason in declared.values():
@@ -1313,24 +1484,26 @@ class UnvotedFacetsTest(unittest.TestCase):
         # dropped by the severity ladder instead of by the fix.
         fleet = [cluster(f"c{i}") for i in range(11)]
         fleet[0]["nodePools"] = [pool("win", image="WINDOWS_LTSC_CONTAINERD")]
-        entry = self.manifest(fleet)["c0"]
+        entry = self.manifest(fleet)[T("c0")]
         self.assertEqual(entry["candidates"], [])
         declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
         self.assertIn("image-type", declared)
         self.assertIn("every node pool runs Windows", declared["image-type"])
 
-    def test_a_release_channel_nobody_set_is_a_gap_not_a_declaration(self):
-        """§3.1 is narrow: `checks_not_applicable` leaves the coverage
-        denominator, so it is for what the cluster's *shape* rules out. A
-        cluster pinned to a static version is a configuration this audit did
-        not compare, which is a gap and has to count as one."""
+    def test_a_cluster_on_no_release_channel_declares_the_facet(self):
+        """A gap forces `partial` and pins `resolved` at 0 on every run, and
+        §4.1 hands enrolment to the Upgrade & Patch Readiness audit -- so a
+        gap here is one nothing this stream may recommend would ever close.
+        One static-version cluster would keep the whole fleet's remediation
+        pull requests open for as long as it ran."""
         fleet = [cluster(f"c{i}") for i in range(4)]
         fleet[0]["releaseChannel"] = {}
-        entry = self.manifest(fleet)["c0"]
+        entry = self.manifest(fleet)[T("c0")]
         self.assertNotIn("release-channel", {c["check"] for c in entry["commands"]})
-        self.assertNotIn("release-channel", {n["check"] for n in entry.get("checks_not_applicable", [])})
-        self.assertIn("held no readable value on this cluster", entry["limitations"])
-        self.assertIn("`release-channel`", entry["limitations"])
+        declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
+        self.assertIn("release-channel", declared)
+        self.assertIn("Upgrade & Patch Readiness", declared["release-channel"])
+        self.assertNotIn("`release-channel`", entry.get("limitations", ""))
 
     def test_a_cohort_that_reached_no_baseline_says_so_for_every_member(self):
         """§3.3 wants one token on two thirds of the readable values. An evenly
@@ -1338,7 +1511,7 @@ class UnvotedFacetsTest(unittest.TestCase):
         uncompared for all four members and not one of them said so."""
         fleet = [cluster(f"c{i}", **{"networkConfig.enableIntraNodeVisibility": i < 2}) for i in range(4)]
         entries = self.manifest(fleet)
-        for name in ("c0", "c3"):
+        for name in (T("c0"), T("c3")):
             entry = entries[name]
             self.assertNotIn("intra-node-visibility", {c["check"] for c in entry["commands"]})
             self.assertIn("reached no baseline in cohort standard/prod", entry["limitations"])
@@ -1361,13 +1534,15 @@ class UnvotedFacetsTest(unittest.TestCase):
 class CohortLimitationsTest(unittest.TestCase):
     """A cluster no facet compared has to say so.
 
-    The live four-cluster fleet: two autopilot clusters with no environment
-    label, one autopilot labelled `test`, one standard. Cohorts of 2, 1 and 1
-    against a floor of 3, so every cohort abstained and not one facet was
-    compared — and the manifest called all four `collected` with an empty
-    `commands` list, four seconds after it started. `collected` is what tells
-    the model the target needs no manual fallback, so nothing downstream had
-    any way to know the comparison never happened.
+    The live four-cluster fleet, as `_floored_fleet` below builds it: two
+    autopilot clusters labelled `environment=prod`, one autopilot labelled
+    `test`, one standard labelled `prod`. A cohort key is (mode, environment),
+    so that is cohorts of 2, 1 and 1 against a floor of 3 — every cohort
+    abstained and not one facet was compared, and the manifest called all four
+    `collected` with a `commands` list holding only `no-environment-label`,
+    four seconds after it started. `collected` is what tells the model the
+    target needs no manual fallback, so nothing downstream had any way to know
+    the comparison never happened.
     """
 
     def _floored_fleet(self):
@@ -1717,11 +1892,11 @@ class NoEnvironmentLabelTest(unittest.TestCase):
             return run_of(0)
 
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
-        host = next(e for e in manifest["clusters"] if e["name"] == "host")
+        host = next(e for e in manifest["clusters"] if e["name"] == T("host"))
         self.assertEqual([c["check"] for c in host["candidates"]], [fd.UNLABELLED_SLUG])
         self.assertIn(fd.UNLABELLED_SLUG, [c["check"] for c in host["commands"]])
         # The compared clusters ran it too, and none of them failed it.
-        peer = next(e for e in manifest["clusters"] if e["name"] == "std-0")
+        peer = next(e for e in manifest["clusters"] if e["name"] == T("std-0"))
         self.assertIn(fd.UNLABELLED_SLUG, [c["check"] for c in peer["commands"]])
         self.assertEqual(peer["candidates"], [])
 
@@ -1761,6 +1936,13 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         audit_report.cross_check_manifest(data, manifest)  # must not raise
 
     def test_a_check_absent_from_the_manifest_is_rejected(self):
+        """The document is otherwise complete and correct: every cluster the
+        manifest collected is named, under the manifest's own qualified name,
+        with exactly the checks the collector recorded. The one difference is
+        the fabricated `shielded-nodes` entry, so the rejection can only be
+        the one this test is about -- an earlier version documented a single
+        cluster as `c0` and was rejected for omitting both qualified names
+        before `checks_run` was read at all."""
         import audit_report
 
         clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(2)]  # under the floor
@@ -1772,12 +1954,38 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             return run_of(0)
 
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
-        data = {
-            "audit": "fleet-consistency-drift",
-            "scope": {"clusters": [{"name": "c0", "checks_run": [{"check": "shielded-nodes", "command": "x"}]}]},
-        }
-        with self.assertRaises(audit_report.ValidationError):
-            audit_report.cross_check_manifest(data, manifest)
+
+        def document(extra_checks):
+            return {
+                "audit": "fleet-consistency-drift",
+                "scope": {
+                    "clusters": [
+                        {
+                            "name": entry["name"],
+                            "project": entry["project"],
+                            "location": entry["location"],
+                            "checks_run": [
+                                {"check": c["check"], "command": c["command"]} for c in entry["commands"]
+                            ] + (extra_checks if entry["name"] == T("c0") else []),
+                            "limitations": entry["limitations"],
+                        }
+                        for entry in manifest["clusters"]
+                    ],
+                    "skipped": [],
+                },
+                "findings": [],
+            }
+
+        # The control: under the floor no facet ran, so `no-environment-label`
+        # is the whole of each cluster's `checks_run` and the document is honest.
+        audit_report.cross_check_manifest(document([]), manifest)
+
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(
+                document([{"check": "shielded-nodes", "command": "x"}]), manifest
+            )
+        self.assertIn("shielded-nodes", str(caught.exception))
+        self.assertIn("records no successful command for that check", str(caught.exception))
 
 
 class CandidateSummaryTest(unittest.TestCase):
@@ -1832,7 +2040,7 @@ class CandidateSummaryTest(unittest.TestCase):
 
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
         lines = fd.candidate_summary(manifest)
-        self.assertIn("no-environment-label: 1 (c0)", lines[0])
+        self.assertIn(f"no-environment-label: 1 ({T('c0')})", lines[0])
 
     def test_a_project_that_could_not_be_listed_is_counted(self):
         manifest = {

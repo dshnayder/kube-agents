@@ -2292,7 +2292,8 @@ class TestAuditCatalogue(unittest.TestCase):
         env["PATH"] = f"{stub}{os.pathsep}{env.get('PATH', '')}"
 
         streams = self.collector_streams()
-        checked = 0
+        self.assertTrue(streams, "no SOP runs a collector; this test guards nothing")
+        exercised = set()
         for audit_id in streams:
             invocations = pattern.findall(jobs[audit_id]["prompt"])
             self.assertTrue(
@@ -2305,6 +2306,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 # script under this suite's own Python.
                 argv = argv[1:] if argv[0].endswith("python3") else argv
                 script = profile / argv[0]
+                exercised.add(audit_id)
                 with self.subTest(audit=audit_id, command=invocation):
                     self.assertTrue(script.is_file(), f"{script} does not exist")
                     done = subprocess.run(
@@ -2319,8 +2321,11 @@ class TestAuditCatalogue(unittest.TestCase):
                         f"the {audit_id} prompt's command is rejected by its own "
                         f"parser:\n  {invocation}\n{done.stderr.strip()[:400]}",
                     )
-                    checked += 1
-        self.assertEqual(checked, len(streams))
+        # Every stream reached the parser, not one command per stream: the
+        # loop above runs each invocation a prompt names, and a prompt naming
+        # two is a longer run rather than a failure. A closing count of
+        # invocations said the opposite, and would have failed on the second.
+        self.assertEqual(exercised, set(streams))
 
     def test_cron_prompts_cite_the_real_sop_geography(self):
         """A stale line number is worse than no line number.

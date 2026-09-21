@@ -79,6 +79,10 @@ OUTCOME_COLLECTED = "collected"
 OUTCOME_GATE_FAILED = "gate-failed"
 PROJECT_TARGET_PREFIX = "project/"
 QUALIFIED_TARGET_SEPARATOR = "/"
+# The manifest target standing for the projects a failed `gcloud projects list`
+# never named. Uppercase because a GCP project id cannot be, so no real project
+# can collide with it.
+UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 
 # SOP §1: only a cluster with a settled configuration votes, and a cluster
 # younger than this has not settled.
@@ -109,6 +113,13 @@ EXCERPT_PEER_NAMES = 6
 # prefix, the image-type suffix that is a rename rather than a divergence,
 # and the image family secure boot cannot cover.
 GOOGLE_LABEL_PREFIX = "goog"
+# Taint keys GKE applies to a node pool on the owner's behalf, so a pool
+# carrying only these is an ordinary pool rather than one pinned by hand.
+# `_is_pinned_pool` says why that distinction decides whether a ledger closes.
+GKE_MANAGED_TAINT_KEYS = ("nvidia.com/gpu", "google.com/tpu")
+# The one facet whose absent value is another audit's to act on; see
+# `_shape_rules_out`.
+RELEASE_CHANNEL_SLUG = "release-channel"
 IMAGE_TYPE_RUNTIME_SUFFIX = "_CONTAINERD"
 WINDOWS_IMAGE_PREFIX = "WINDOWS"
 
@@ -192,6 +203,18 @@ class Discovery(NamedTuple):
     # project nor `projects list` answered. An empty fleet is then a failure
     # to look, not a fleet with nothing in it, and the manifest says so.
     error: str | None
+    # Set when discovery resolved part of the fleet and lost the rest: the
+    # active project answered and `projects list` did not, so the scope is one
+    # project out of an unknown number. A warning on stderr was all this used
+    # to be, and stderr is not in the manifest -- so the run read one project,
+    # marked every entry `collected`, and the document that followed carried no
+    # coverage gap. `finish` then has no reason to hold a previous ledger
+    # finding on a cluster in any other project: it is absent from the
+    # document, absent from the manifest, and therefore announced resolved and
+    # its remediation pull request stale-closed. `collect_fleet` turns this
+    # into a `gate-failed` target so the loss is a row the document must
+    # account for, the way a project whose `clusters list` failed already is.
+    partial: str | None = None
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
@@ -223,12 +246,30 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
             )
             log(f"WARNING: {error}; no project to audit")
             return Discovery([], error)
-        log(f"WARNING: projects list rc={list_result.rc}; the active project {base!r} is the whole scope")
-        return Discovery(projects, None)
+        partial = (
+            f"`gcloud projects list` rc={list_result.rc}: "
+            f"{list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}. The scope "
+            f"fell back to the active project {base!r}; how many other projects the fleet "
+            f"holds is unknown, so every cohort here was compared against part of it."
+        )
+        log(f"WARNING: {partial}")
+        return Discovery(projects, None, partial)
 
     for candidate in (p.strip() for p in (list_result.stdout or "").splitlines()):
         if candidate and candidate not in projects:
             projects.append(candidate)
+    if not projects:
+        # Both calls answered rc 0 and neither named a project: the `project`
+        # property is unset and the credential can list none. An empty
+        # `clusters` array with no `error` is indistinguishable from a fleet
+        # holding no clusters, which is the one thing the manifest contract
+        # says this key exists to prevent.
+        error = (
+            "project discovery named no project: `gcloud config get-value project` is unset "
+            "and `gcloud projects list` returned nothing"
+        )
+        log(f"WARNING: {error}; no project to audit")
+        return Discovery([], error)
     return Discovery(projects, None)
 
 
@@ -378,6 +419,31 @@ def _pool_fraction(cluster: dict, get_flag: Callable[[dict], bool], exclude_pool
     return "SOME"
 
 
+def _is_pinned_pool(p: dict) -> bool:
+    """§4.8's exclusion from the `pool-autoscaling` vote: a pool whose taints
+    mark it dedicated or pinned capacity, which its owner deliberately keeps a
+    fixed size.
+
+    Not "carries any taint". GKE taints an accelerator pool itself -- a GPU
+    pool comes up with `nvidia.com/gpu=present:NoSchedule` whether or not its
+    owner asked for one -- and reading that as a pin drops every pool of a
+    GPU-only cluster from the vote. `_pool_fraction` then returns `None`,
+    `_shape_rules_out` declines (pools exist and are not Windows), and
+    `unvoted_facets` writes a `limitations` sentence that `coverage_gaps` turns
+    into a gap on every run: the stream never leaves `partial`, `resolved`
+    stays 0, and no stale remediation pull request is ever closed. §4.0 defends
+    that outcome on the grounds that "a taint is a configuration choice its
+    owner can revisit", which is true of a taint an owner applied and false of
+    one GKE applies for them.
+    """
+    taints = (p.get("config") or {}).get("taints") or []
+    return any(
+        str(t.get("key", "")) not in GKE_MANAGED_TAINT_KEYS
+        for t in taints
+        if isinstance(t, dict)
+    )
+
+
 def _is_windows_pool(p: dict) -> bool:
     return ((p.get("config") or {}).get("imageType") or "").upper().startswith(WINDOWS_IMAGE_PREFIX)
 
@@ -483,7 +549,7 @@ def norm_node_autoprovisioning(c: dict) -> str:
 
 
 def norm_pool_autoscaling(c: dict) -> str | None:
-    return _pool_fraction(c, lambda p: (p.get("autoscaling") or {}).get("enabled"), lambda p: bool((p.get("config") or {}).get("taints")))
+    return _pool_fraction(c, lambda p: (p.get("autoscaling") or {}).get("enabled"), _is_pinned_pool)
 
 
 def norm_intra_node_visibility(c: dict) -> str:
@@ -784,9 +850,9 @@ def _emit(slug: str, cluster_name: str, excerpt: str, severity: str) -> dict:
 def qualify_targets(clusters: list[dict]) -> None:
     """Give every cluster the name the manifest will call it by, in `_target`.
 
-    A GKE cluster name is unique inside its project and nothing else, but the
-    manifest is fleet-wide and everything downstream keys on the name it
-    carries: `audit_report._vouching_clusters` builds a dict of it, so two
+    A GKE cluster name is unique inside one project *and location* and nothing
+    wider, but the manifest is fleet-wide and everything downstream keys on the
+    name it carries: `audit_report._vouching_clusters` builds a dict of it, so two
     clusters called `seeded-a` in two projects collapse into whichever entry
     the loop wrote last. The document that follows either names the cluster
     that lost (cross-checked against a manifest that no longer holds it, and
@@ -795,23 +861,43 @@ def qualify_targets(clusters: list[dict]) -> None:
     rather than a corner: every project there carries `seeded-a`, `-b` and
     `-c`.
 
-    Only a colliding name is qualified, so a fleet whose names happen to be
-    unique reads exactly as it did -- the qualified form is harder to paste
-    into `gcloud`, and paying that everywhere to fix the fleets where it
-    matters is a bad trade. `commands[]` carries the real `--project` either
-    way, so the qualification renames the target and not the call.
+    Every cluster is qualified, not only one whose name collides today. Two
+    reasons, and the second is the one that costs a ledger:
+
+    - A name is unique per project *and location*, not per project. `ckey`
+      already says so by keying on all three, and `prod` in `us-central1`
+      beside `prod` in `europe-west1` is one project's ordinary multi-region
+      shape. Qualifying by project alone leaves that pair collapsed.
+    - Qualifying only a colliding name makes a cluster's identity depend on
+      what the *rest* of the fleet contains. `Cluster/seeded-a` becomes
+      `Cluster/acme/seeded-a` the week a second project gains a `seeded-a`,
+      and reverts when that cluster is deleted; `finish` derives a finding's
+      id from its cluster and object, so the old id vanishes from the
+      document, is announced resolved, and the same drift is refiled as new.
+      That is §3.7's "no unstable identity" red line, broken by the collector
+      rather than by the model.
+
+    The cost is a longer name in `peers:` lines and finding objects. It buys a
+    target that is unique by construction and moves for no reason short of the
+    cluster being rebuilt somewhere else -- and the three segments are exactly
+    what `gcloud container clusters describe` asks for, so the qualified form
+    is no harder to act on than the bare one. `commands[]` carries the real
+    `--project` regardless: this renames the target, not the call.
     """
-    counts = Counter(c.get("name", "") for c in clusters)
     for c in clusters:
         name = c.get("name", "")
-        if counts[name] > 1:
-            c["_target"] = f"{c.get('_project', '')}{QUALIFIED_TARGET_SEPARATOR}{name}"
+        project = c.get("_project", "")
+        location = c.get("location") or c.get("zone") or ""
+        parts = [p for p in (project, location) if p]
+        if parts:
+            c["_target"] = QUALIFIED_TARGET_SEPARATOR.join([*parts, name])
 
 
 def target_name(c: dict) -> str:
     """What to call this cluster in the manifest, in a candidate's `object`,
-    and in a `peers:` list. `qualify_targets` sets `_target` only where the
-    bare name is ambiguous; everywhere else the bare name is the answer."""
+    and in a `peers:` list. `qualify_targets` sets `_target` on every cluster
+    whose project and location are known; the bare name is the fallback for a
+    listing that carried neither."""
     return c.get("_target") or c.get("name", "")
 
 
@@ -1180,16 +1266,17 @@ def unvoted_facets(
 
     Both are `limitations` rather than `checks_not_applicable`, because §3.1 is
     narrow about which is which: `checks_not_applicable` leaves the coverage
-    denominator, so it is for "facets the cluster's shape rules out", and a
-    facet you could have compared and did not is a real gap. A release channel
-    nobody set is a configuration this audit did not manage to compare, not a
-    shape -- so it is a gap, and the arithmetic says so.
+    denominator, so it is for a facet the cluster leaves nothing for this
+    stream to compare, and a facet you could have compared and did not is a
+    real gap.
 
-    The one exception is the shape the pool facets read. A cluster with no node
-    pool at all, or none this facet looks at, has no
+    `_shape_rules_out` holds that line, and holds it in two places. A cluster
+    with no node pool at all, or none this facet looks at, has no
     `.nodePools[]…` to compare in the same sense an Autopilot cluster does not,
     and `autopilot_not_applicable` already makes that call for the same five
-    slugs on the other mode.
+    slugs on the other mode. A cluster on no release channel is the other:
+    §4.1 assigns enrolment to another audit, so a gap here is one nothing this
+    stream may recommend would ever close.
 
     Clusters `cohort_limitations` already covers -- ineligible ones and those
     whose cohort floored out -- are skipped here: their sentence is that
@@ -1253,11 +1340,26 @@ def _shape_rules_out(facet: Facet, c: dict) -> str | None:
     """The `checks_not_applicable` reason for a facet this cluster's shape
     leaves nothing to read, or `None` where the abstention is a gap instead.
 
-    Only the node-pool surface qualifies, and it is the same surface
+    Two surfaces qualify. The node-pool one is the same
     `autopilot_not_applicable` names on the other mode: a Standard cluster
     running no node pool the facet reads is in the position Autopilot puts
     every cluster in.
+
+    The other is a cluster on no release channel. §4.1 hands enrolment to the
+    Upgrade & Patch Readiness audit and tells this stream to emit nothing, so
+    calling it a coverage gap instead asks the ledger to stay open on a
+    recommendation this stream is forbidden to make. `coverage_gaps` reads a
+    `limitations` sentence as a gap, a gap forces `resolved` to 0 and
+    `partial` true, and one static-version cluster would therefore keep every
+    remediation pull request in the fleet from ever being closed -- for as
+    long as it runs, which nothing here can shorten.
     """
+    if facet.slug == RELEASE_CHANNEL_SLUG:
+        return (
+            "the cluster is on no release channel, so it has no upgrade cadence to compare "
+            "against the cohort; enrolling it is the Upgrade & Patch Readiness audit's "
+            "recommendation to make, not this one's (§4.1)."
+        )
     if not facet.standard_only or ".nodePools[]" not in facet.field_path:
         return None
     pools = c.get("nodePools") or []
@@ -1274,9 +1376,9 @@ def _shape_rules_out(facet: Facet, c: dict) -> str | None:
 
 def _autoscaling_countable_pools(c: dict) -> list[dict]:
     """The pools `norm_pool_autoscaling` actually votes over -- the same
-    `exclude_pool` predicate it hands `_pool_fraction`, which drops the tainted
-    pools §4.8 calls deliberately fixed-size."""
-    return [p for p in c.get("nodePools") or [] if not (p.get("config") or {}).get("taints")]
+    `exclude_pool` predicate it hands `_pool_fraction`, which drops the pools
+    §4.8 calls deliberately fixed-size."""
+    return [p for p in c.get("nodePools") or [] if not _is_pinned_pool(p)]
 
 
 def _shape_mismatch(facet: Facet, cluster: dict, baseline_clusters: list[dict]) -> bool:
@@ -1534,6 +1636,22 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         for project_name, error in sorted(failed_projects.items())
     ]
 
+    # The same argument one rung up. A project that failed its own `clusters
+    # list` is named above; a `projects list` that failed took the names with
+    # it, so the row stands for every project nobody enumerated and is named
+    # for the call rather than for a project. `UNENUMERATED_PROJECTS` cannot
+    # collide with a real id -- project ids are lowercase.
+    if discovery.partial:
+        entries.append(
+            {
+                "name": UNENUMERATED_PROJECTS_TARGET,
+                "project": "",
+                "location": "global",
+                "outcome": OUTCOME_GATE_FAILED,
+                "error": discovery.partial[:ERROR_EXCERPT_CHARS],
+            }
+        )
+
     manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
@@ -1548,16 +1666,19 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         # this key set means: do not publish, report the failure.
         manifest["error"] = discovery.error
     elif failed_projects and not all_clusters:
-        # Discovery succeeded and every project it named then failed to list.
-        # The gate-failed entries above record each loss, but the stop rule
-        # §4 gives the worker reads this key, and without it a run that read
-        # no cluster at all differs from a healthy empty fleet only by rows
-        # the worker has to notice and add up. `main` exits non-zero on it too,
-        # so the SOP's `|| exit` catches the run before it writes a document.
+        # Discovery named projects and the run read no cluster from any of
+        # them. The gate-failed entries above record each loss, but the stop
+        # rule §4 gives the worker reads this key, and without it a run that
+        # read no cluster at all differs from a healthy empty fleet only by
+        # rows the worker has to notice and add up. The SOP redirects this
+        # script's stdout into the manifest without checking its status, so
+        # the non-zero exit `main` also returns is not what stops the run:
+        # this key is.
         first, error = sorted(failed_projects.items())[0]
         manifest["error"] = (
-            f"no cluster could be read: all {len(failed_projects)} project(s) in scope "
-            f"failed `clusters list`; {first}: {error}"
+            f"no cluster could be read: {len(failed_projects)} of "
+            f"{len(discovery.projects)} project(s) in scope failed `clusters list` "
+            f"and the rest held none; {first}: {error}"
         )[:ERROR_EXCERPT_CHARS]
     return manifest
 

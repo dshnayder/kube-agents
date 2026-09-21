@@ -100,12 +100,16 @@ identified by the same four fields as a finding, so
 `derive_finding_id({check, cluster, namespace, object})` on a candidate equals the id of the finding it
 would become, and wherever `finish` prints or compares it against the ledger it is clipped the way a
 finding id is; `excerpt` is cut from the collector's own output under the same credential-projection
-rules the SOPs mandate, with the harness redactor as the backstop; and a run that enumerated
+rules the SOPs mandate, with the harness redactor as the backstop; a run that enumerated
 nothing says so in the top-level `error` rather than emitting an empty `clusters` array, which
-would otherwise be indistinguishable from a fleet holding no clusters. A target name is unique
-within the manifest, so a collector sweeping several projects qualifies a colliding cluster name
-as `<project>/<name>` — the drift collector does, and the SOP carries the qualified form into
-`scope.clusters[].name`, which is the key §3.1 matches on.
+would otherwise be indistinguishable from a fleet holding no clusters; and a run that enumerated
+_part_ of the fleet carries the rest as a `gate-failed` target, because a scope that silently
+narrowed reads as a complete one and lets `finish` resolve every finding outside it. A target name is unique
+within the manifest and stable between runs, so a collector sweeping clusters names each one
+`<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
+name qualified only where it collides today moves when the rest of the fleet changes, which is a
+finding announced resolved and refiled as new. The drift collector does this, and the SOP carries
+the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on.
 
 ## 3. What `finish` does with it
 
