@@ -17,10 +17,12 @@ readonly NS=kubeagents-system
 readonly BASE=${BASE:-http://127.0.0.1:8643}
 readonly SCENARIOS=${SCENARIOS:-$HERE/scenarios.json}
 # Same framing on every arm: keeps a probe from turning into a fleet-wide sweep.
-readonly PREFIX=${PREFIX:-"Keep this short: work only on the cluster you run on, run at most a few commands, then answer. "}
+readonly PREFIX=${PREFIX:-"Work only on the cluster you run on and keep the investigation brief. "}
 readonly GATEWAY_DEPLOY=${GATEWAY_DEPLOY:-platform-agent-gateway}
-# Priority order: the two comparisons that decide the question first, the isolating arms after.
-readonly DEFAULT_MATRIX="stock:shipped scoped-all:shipped stock:grown scoped-all:grown fulldesc:shipped scoped-skills:shipped fulldesc:grown scoped-skills:grown"
+# Priority order: the two comparisons that decide the question first, the isolating arm after.
+# scoped-skills is left out by default: under the API server the platform profile exposes 21
+# tools, of which the tool filter hides one, so it would not differ from scoped-all.
+readonly DEFAULT_MATRIX="stock:shipped scoped-all:shipped stock:grown scoped-all:grown fulldesc:shipped fulldesc:grown"
 readonly MATRIX=${MATRIX:-$DEFAULT_MATRIX}
 
 : "${PLATFORM_AGENT_TOKEN:?PLATFORM_AGENT_TOKEN}"
