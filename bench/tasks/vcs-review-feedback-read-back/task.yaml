@@ -19,6 +19,10 @@
 #     'gh pr view 189 --repo dshnayder-org/infra --json title,url,headRefName,body,commits'
 #   one-pull-request-with-two-revisions-reported   pass
 #
+# (That second check has since been split in two -- `pull_request_opened`
+# over the URL and `report_contains` over the subject -- when main stopped
+# accepting a substring test over "/pull/"; the run above predates it.)
+#
 # That is the shape to notice: the ANSWER was right -- one pull request, two
 # revisions, the dictated subject, the sha reported -- and the only thing wrong
 # was how the worker got it. Green on `dev-vcs2-20260915a` three times
@@ -148,36 +152,48 @@ verification_spec:
       forbidden_patterns:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
-  - name: one-pull-request-with-two-revisions-reported
+  - name: the-pull-request-is-real-and-this-runs
+    role: objective
+    mode: assert
+    check:
+      # Not `report_contains` over "github.com/" and "/pull/": a substring
+      # passes on an invented URL and on the pull request an earlier rep left
+      # behind (#1755, and `test_no_task_still_grades_a_pull_request_by_substring`
+      # refuses the old shape). This resolves the URL the report names through
+      # GitHub and requires a pull request that was created or updated during
+      # this run and is not closed unmerged.
+      type: pull_request_opened
+      # Any organisation, deliberately, where the remediation cases pin
+      # `gke-agentic`: this case is also run by hand against the dev install,
+      # whose GitOps repository is not under that organisation, and the
+      # question here is "this run's pull request", not "which org".
+      owner: ""
+  - name: the-second-revision-carries-the-dictated-subject
     role: objective
     mode: assert
     check:
       type: report_contains
-      # Both halves of the URL, as rca-remediation-pr does: "/pull/" alone is
-      # satisfied by any pull request link. The third phrase is the commit
-      # subject the prompt dictates, which only a second revision can carry.
+      # The commit subject the prompt dictates, which only a second revision
+      # can carry. No `forbidden_phrases` for the second pull request the
+      # prompt forbids: `report_contains` is a normalised substring test with no
+      # notion of negation, and the prompt hands the worker the words, so a
+      # compliant report saying "no second pull request was opened" would fail
+      # the objective for having done exactly what was asked.
       required_phrases:
-        - "github.com/"
-        - "/pull/"
         - "eval: confirmed from the forge"
-      # No `forbidden_phrases` for the second pull request the prompt forbids.
-      # `report_contains` is a normalised substring test with no notion of
-      # negation, and the prompt hands the worker the words: a compliant report
-      # saying "no second pull request was opened" would fail the objective for
-      # having done exactly what was asked.
-      #
-      # Be clear about what this check therefore does NOT see. The three
-      # phrases say a second revision with the dictated subject exists on
-      # *some* pull request -- a worker that misread "review feedback" as a
+      # Be clear about what the objective checks therefore do NOT see. Together
+      # they say: a real pull request this run wrote to, and a report naming
+      # the dictated subject. A worker that misread "review feedback" as a
       # fresh change, cut a second branch, committed under the same subject and
-      # opened a second pull request produces a report that passes this and the
-      # route check both. Nothing objective here observes the one-pull-request
-      # half: `worker_commands` records only the first command of a compound
-      # block, so a second `prepare`/`submit` may not be in the log to forbid,
-      # and there is no fixture whose pull request the second revision could be
-      # required to land on -- the prompt's first paragraph is what opens it.
-      # That half is graded by the judge against `expected_output`, which names
-      # a second pull request or a second branch as a failure in so many words.
-      # The three green runs in the pull request that added this case were
-      # checked by hand against the forge (one pull request, two revisions,
-      # eval PRs #196-#199 closed afterwards); the nightly relies on the judge.
+      # opened a second pull request passes both -- the second pull request is
+      # real and this run's too -- and passes the route check. Nothing
+      # objective here observes the one-pull-request half: `worker_commands`
+      # records only the first command of a compound block, so a second
+      # `prepare`/`submit` may not be in the log to forbid, and there is no
+      # fixture whose pull request the second revision could be required to
+      # land on -- the prompt's first paragraph is what opens it. That half is
+      # graded by the judge against `expected_output`, which names a second pull
+      # request or a second branch as a failure in so many words. The three
+      # green runs in the pull request that added this case were checked by
+      # hand against the forge (one pull request each, two revisions, eval PRs
+      # #196-#199 closed afterwards); the nightly relies on the judge.
