@@ -47,7 +47,7 @@ pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY"
 label="$ARM-$RUNG"
 # The operator does not pass spec.deployment.env to the gateway container, so the arm lives in a
 # control file on the data volume that the plugin loads into the environment at start-up.
-kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- sh -c "cat > $CONTROL_FILE" <<CTRL
+kubectl --context "$CTX" -n "$NS" exec -i "$pod" -c platform-agent -- sh -c "cat > $CONTROL_FILE" <<CTRL
 KA_SKILLS_INDEX_MODE=$index_mode
 KA_SKILL_DESC_LIMIT=$desc_limit
 KA_SCOPE_MODE=$scope_mode
