@@ -40,8 +40,11 @@ From each run's response and session row, and from the plugin's per-turn record:
   which is the case the names-only shelf has to rescue.
 - **Tokens**: input and output per run, cache-read share, prompt tokens of the first model call.
 - **Time**: wall time per run and time to first tool call.
-- **Incomplete runs**: the harness caps a run at 8 model iterations; a run that hits the cap
-  without a final message is kept for the selection metrics and counted.
+- **Incomplete runs**: the profile is capped at 10 model iterations per turn
+  (`spec.harness.tuning.platform.maxTurns: 10` on the CR; the config value wins over the
+  `HERMES_MAX_ITERATIONS` environment variable, which the API server re-derives from it). A run
+  that hits the cap without a final message returns 502 `agent_incomplete` with its session id;
+  it is kept for the selection metrics and counted.
 
 `analyze.py` prints the table; `--json` gives the raw numbers.
 
@@ -64,6 +67,10 @@ The prototype is the `capability_scope` plugin (`agents/platform/plugins/capabil
 `switch_arm.sh` writes the arm into `/opt/data/capability_scope.env` and restarts the gateway;
 the plugin loads that file into the environment at start-up. The operator does not pass
 `spec.deployment.env` to the gateway container, which is why the arm lives in a file.
+
+The first attempt ran uncapped: probes ran up to 52 tool calls and 430 seconds, one consuming
+1.7M cached tokens, and the cell pace was two hours. The cap was added and the matrix restarted
+from zero.
 
 Every probe is prefixed with the same sentence ("Work only on the cluster you run on and keep
 the investigation brief.") on every arm, so a probe about a workload that does not exist does not
