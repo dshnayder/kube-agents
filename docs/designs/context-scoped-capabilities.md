@@ -25,8 +25,9 @@ This document proposes a **capability-scoping layer** that sits between the cata
 model request and decides, per turn, which capabilities the model sees in full, which it sees by
 name only, and which it must search for. The layer is harness-independent: it is specified as
 four interfaces (catalogue, scope policy, ranker, working set) and one record (what was shown and
-what was used). §8 maps it onto Hermes with the hooks that exist today and the one upstream change
-it needs; §9 says what a replacement harness implements natively.
+what was used). §8 reports the first run of the prototype; §9 maps the layer onto Hermes with the hooks that
+exist today and the one upstream change it needs; §10 says what a replacement harness implements
+natively.
 
 The design borrows its shape from the memory design that already runs on the chat profile: stop
 injecting the corpus and start searching it, pay for the corpus once at build time and per turn
@@ -40,8 +41,9 @@ carefully as it is bounded above.
 §1 states the problem with the numbers behind it. §2 sets goals and non-goals. §3 is the
 vocabulary. §4 is the design: the layer, its interfaces, and the working-set policy. §5 weighs
 the alternatives. §6 is the failure modes and what bounds each. §7 is the evaluation plan and the
-rollout, in that order, because the rollout is gated on the evaluation. §8 is the Hermes
-integration; §9 the custom-harness contract. §10 lists what is unresolved.
+rollout, in that order, because the rollout is gated on the evaluation. §8 is what the prototype
+measured when the plan was run once. §9 is the Hermes integration; §10 the custom-harness
+contract. §11 lists what is unresolved.
 
 ## 1. The problem
 
@@ -318,7 +320,7 @@ ranker is built.
 by rule 2 and by the risk class: a write-class capability never appears on the shelf as a
 search result for a read-class query without its name being explicit in the query. Detected in
 bench by verifiers that assert which capability produced the outcome, which is a bench-format
-change (§10).
+change (§11).
 
 **Flapping.** The working set churns turn to turn, and with it the request. Bounded by rule 3's
 hysteresis and rule 4's boundary; measured as working-set churn per session in the record.
@@ -404,7 +406,100 @@ missing. Each is a description or trigger fix in the catalogue, and for synced s
 description change proposed to `google/skills`, which improves the chooser for every consumer of
 those skills. This is the loop that keeps running after the design is done.
 
-## 8. Integration with Hermes
+## 8. What the prototype run showed
+
+The plan in §7 was run once, on 2026-09-21, against a dedicated install with the Platform Agent
+as the front door. The method, code and probes are in
+[`experiments/capability-scope-ab/`](../../experiments/capability-scope-ab/README.md); the raw
+runs and per-turn records are on the machine that ran them, and the scored table is committed
+beside the code. Every number below comes from that table.
+
+### 8.1 What was run
+
+Three arms and two catalogue sizes, 22 probes, three repetitions each, one prompt per session,
+the same image and model throughout. `stock` is the shipped index (every skill, description cut
+at 60 characters). `fulldesc` is the same index with full descriptions, the cheapest fix in §5.
+`scoped` is the design's stage 3: names only in the system prompt, the top six skills by a
+BM25 ranker injected with full descriptions per turn, and the tool array filtered to a pinned
+set plus six. The `shipped` rung is the 44 skills in the repository; the `grown` rung adds 60
+real skills from the upstream repository the sync reads, five of which the next sync will pull
+in unasked. Twenty probes name a gold skill; two are controls where loading any skill is wrong.
+Each run was capped at ten model iterations and prefixed with one sentence keeping it on the
+local cluster. The model was Gemini 3.1 Pro through the install's LiteLLM; a repeat on Gemini
+3.5 Flash is reported where it is available.
+
+The offline ranker alone, before any model saw it, put the gold skill in its top six for 16 of
+20 probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10.
+Those misses are carried into the run, not tuned away.
+
+### 8.2 Selection
+
+| First skill loaded               | stock, shipped | scoped, shipped | stock, grown | scoped, grown |
+| -------------------------------- | -------------- | --------------- | ------------ | ------------- |
+| gold                             | 55.0%          | 68.3%           | 53.3%        | 77.2%         |
+| acceptable                       | 1.7%           | 1.7%            | 0.0%         | 5.3%          |
+| wrong                            | 1.7%           | 3.3%            | 1.7%         | 0.0%          |
+| none loaded                      | 41.7%          | 26.7%           | 45.0%        | 17.5%         |
+| gold loaded at any point         | 56.7%          | 71.7%           | 53.3%        | 77.2%         |
+| spurious loads on control probes | 0 of 6         | 0 of 6          | 0 of 6       | 0 of 5        |
+
+Sixty probe runs per cell. On the grown catalogue the gain in gold-first is significant
+(two-proportion test, p = 0.007; 95% intervals 41 to 65 against 65 to 86) and so is the drop in
+runs that load no skill at all (p = 0.001). On the shipped catalogue the same movements are
+present at the same direction and roughly half the size, and do not reach significance at this
+sample (p = 0.13 for gold-first). Wrong picks are rare in every arm; the crowded-list failure in
+this run is not a wrong skill but no skill, and scoping reduces that most.
+
+The failure mode §6 predicted appears in the per-probe table: the repository-inspection probe
+went from three gold picks under `stock` to none under `scoped`, because the ranker leaves that
+skill out of the top six and the names-only shelf did not bring the model to it. Under `stock`,
+one run on the grown catalogue loaded a skill that does not exist, a plausible name assembled
+from the neighbours in the list. Under `scoped`, 25 of 78 skill loads on the shipped rung were
+of skills outside the injected six, so the shelf carried a third of the loads; without it those
+would have been misses.
+
+### 8.3 Cost
+
+Tokens per model call did not move: about 28k prompt tokens on every arm, over 87% of them
+cache reads on every arm. The skill index, at 60 characters a line, is under a thousand tokens
+of that; the tool array under the API server is 21 to 35 tools, of which the filter hid one to
+a dozen; the MCP tools were already behind the harness's own search bridge. On this profile the
+prompt is the persona and the harness's standing instructions, and scoping the catalogue cannot
+shrink it. Wall time per run rose slightly under `scoped` (median 74 s against 70 s on the
+shipped rung, 86 s against 77 s on the grown), which is the cost of loading a skill more often.
+The token claim in §1 therefore does not hold for this profile as shipped; it holds where the
+tool schemas are in the prompt and where the catalogue keeps growing, and the run measured
+neither.
+
+### 8.4 What the shadow record said before enforcement
+
+Phase 0's exit test asked whether the would-be miss rate under the default budget is under 5%.
+In the `stock` arms, where the plugin only recorded, 16 of 50 skill loads on the shipped rung
+and 28 of 58 on the grown rung were outside the working set the ranker would have shown. That
+is a third to a half, far past the threshold, and it is the number that says the v1 ranker
+needs the metadata it does not yet have (triggers, domain tags) before it could be the only
+route to a skill. It is also why the shelf is not optional.
+
+### 8.5 What changed in the design because of the run
+
+- The token argument moves from §1's headline to a conditional: it depends on the tool array
+  being in the prompt and on catalogue growth, and is not a reason to scope this profile today.
+- The shelf is load-bearing, measured at a third of loads, and a names-only index with no
+  per-turn descriptions would have been a regression, which matches the upstream finding cited
+  in §1.3.
+- The chooser problem on this profile is under-use of skills, not wrong use. Injected full
+  descriptions for a handful of candidates is what moved it; the `fulldesc` arm (§8.6) is the
+  test of whether descriptions alone do the same.
+- The ranker's offline misses reproduce in the run as the probes that regress. The metadata
+  sidecar in §4.2 is the fix and is now the first item of the next phase, ahead of tools.
+
+### 8.6 Pending cells
+
+The `fulldesc` arm on both rungs and the Gemini 3.5 Flash repeat of every cell were still
+running when this section was written; this subsection is replaced by their numbers when they
+land.
+
+## 9. Integration with Hermes
 
 Hermes at the pinned version has most of the pieces and one gap. The facts, then the mapping.
 
@@ -456,7 +551,28 @@ side; the layer emits the "shown" side. Phase 0 needs nothing else.
 relax it. Phase 0 proposes the change upstream and, if it is slow, carries a build-time patch as
 the image already does for other constants.
 
-## 9. What a replacement harness implements
+**What the prototype learned about this install.** The run in §8 used exactly the shape above:
+a plugin on the pre-LLM-call, pre-tool-call and post-API-request hooks, plus a build-time patch
+with four environment-gated seams (names-only index, description limit, extra skill directories,
+a tool filter in the conversation loop). Four facts about the deployment, not the harness, cost
+most of the integration time and belong here so the next attempt does not rediscover them:
+
+- The operator passes `spec.deployment.env` to the sandbox allowlist and the credential proxy,
+  never to the gateway container, so a runtime switch has to reach the process another way; the
+  prototype reads a file on the data volume at plugin load. A supported switch needs an operator
+  field or an AgentPlugin.
+- With the Platform Agent as the front door, its `config.yaml` on the data volume is not
+  re-synced from the image at start, so an image-side change to `plugins.enabled` does not reach
+  an existing install; the operator's overlay appends its own plugins to whatever list is there.
+- The per-turn iteration cap comes from `agent.max_turns` in the profile config, which the API
+  server re-derives into the environment on every request; setting the variable directly does
+  nothing. `spec.harness.tuning.platform.maxTurns` is the supported knob.
+- The authenticated door in front of the API server drops any turn over 300 seconds with an HTML
+  502 and no session id. The bench harness uses that door, so a case whose single turn runs
+  longer reads as a failure there; the experiment drove the API server on the pod's loopback
+  instead.
+
+## 10. What a replacement harness implements
 
 The Hermes section is a shim over channels that were built for other purposes. A harness built
 for this design provides the four interfaces of §4.2 as first-class request-assembly steps:
@@ -473,7 +589,7 @@ the caveat its tracker records that per-step toolset evaluation is not yet suppo
 is the point of specifying the layer as interfaces: the shim is disposable and the policy, the
 ranker, the golden set, and the record survive the harness change.
 
-## 10. Open questions
+## 11. Open questions
 
 1. **Bench verifier for capability use.** The wrong-capability incidents are only detectable by
    a verifier that asserts which skill or tool produced the outcome. The case format has no such

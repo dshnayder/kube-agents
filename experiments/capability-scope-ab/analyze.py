@@ -21,6 +21,8 @@ import argparse
 import collections
 import json
 import pathlib
+import csv
+import math
 import statistics
 
 SKILL_TOOL = "skill_view"
@@ -28,10 +30,14 @@ LIST_TOOL = "skills_list"
 SEARCH_TOOL = "tool_search"
 CONTROL_DOMAIN = "control"
 SKILL_ARG = "name"
+CELL_RECORD_NAME = "capability_scope.jsonl"
+GROWN_SUFFIX = "-grown"
+Z_95 = 1.96
+CSV_FIELDS = ("label", "scenario", "rep", "http_status", "incomplete", "first_skill", "skills_loaded", "tool_calls", "api_calls", "input_tokens", "cache_read_tokens", "output_tokens", "wall_seconds")
 
 
 def _load_runs(run_dir: pathlib.Path) -> list[dict]:
-    return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(run_dir.glob("*.json"))]
+    return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(run_dir.glob("*-r[0-9]*.json"))]
 
 
 def _first_skill(run: dict) -> str | None:
@@ -185,6 +191,49 @@ def score_arm(runs: list[dict], scenarios: dict[str, dict], record: dict[str, li
     }
 
 
+def wilson(k: int, n: int) -> tuple[float, float]:
+    """95% Wilson interval for a proportion, as percentages."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    denom = 1 + Z_95 ** 2 / n
+    centre = (p + Z_95 ** 2 / (2 * n)) / denom
+    half = Z_95 * math.sqrt(p * (1 - p) / n + Z_95 ** 2 / (4 * n * n)) / denom
+    return (round(100 * (centre - half), 1), round(100 * (centre + half), 1))
+
+
+def two_proportion_p(k1: int, n1: int, k2: int, n2: int) -> float:
+    """Two-sided p-value of a pooled two-proportion z-test (normal approximation)."""
+    if min(n1, n2) == 0:
+        return 1.0
+    p1, p2, p = k1 / n1, k2 / n2, (k1 + k2) / (n1 + n2)
+    se = math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
+    if se == 0:
+        return 1.0
+    z = abs(p1 - p2) / se
+    return round(2 * (1 - 0.5 * (1 + math.erf(z / math.sqrt(2)))), 4)
+
+
+def write_csv(run_dirs: list[pathlib.Path], out: pathlib.Path) -> None:
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        for d in run_dirs:
+            for run in _load_runs(d):
+                sess = run.get("session") or {}
+                if isinstance(sess.get("session"), dict):
+                    sess = sess["session"]
+                w.writerow({
+                    "label": run.get("label"), "scenario": run.get("scenario"), "rep": run.get("rep"),
+                    "http_status": run.get("http_status"), "incomplete": run.get("incomplete"),
+                    "first_skill": _first_skill(run) or "", "skills_loaded": " ".join(_skills_loaded(run)),
+                    "tool_calls": " ".join(str(c.get("name")) for c in run.get("tool_calls") or []),
+                    "api_calls": sess.get("api_call_count"), "input_tokens": sess.get("input_tokens"),
+                    "cache_read_tokens": sess.get("cache_read_tokens"), "output_tokens": sess.get("output_tokens"),
+                    "wall_seconds": run.get("wall_seconds"),
+                })
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="+", required=True)
@@ -192,6 +241,8 @@ def main() -> None:
     ap.add_argument("--scenarios", required=True)
     ap.add_argument("--grown", default="")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--csv", default=None, help="write one row per run to this file")
+    ap.add_argument("--compare", nargs=2, metavar=("BASELINE", "TREATMENT"), help="report intervals and a p-value for first-skill-gold")
     args = ap.parse_args()
     scenarios = {s["id"]: s for s in json.loads(pathlib.Path(args.scenarios).read_text(encoding="utf-8"))["scenarios"]}
     record = _record_by_session(pathlib.Path(args.record) if args.record else None)
@@ -200,10 +251,19 @@ def main() -> None:
     for run_dir in args.runs:
         p = pathlib.Path(run_dir)
         runs = _load_runs(p)
-        report[p.name] = score_arm(runs, scenarios, record, p.name in grown_labels)
+        cell_record = record or _record_by_session(p / CELL_RECORD_NAME)  # run_matrix.sh drops it beside the runs
+        report[p.name] = score_arm(runs, scenarios, cell_record, p.name in grown_labels or p.name.endswith(GROWN_SUFFIX))
+    if args.csv:
+        write_csv([pathlib.Path(r) for r in args.runs], pathlib.Path(args.csv))
     if args.json:
         print(json.dumps(report, indent=1))
         return
+    if args.compare:
+        base, treat = (report[x] for x in args.compare)
+        for key in ("first_skill_gold_pct", "any_gold_loaded_pct", "no_skill_loaded_pct"):
+            kb = round(base[key] * base["probes"] / 100); kt = round(treat[key] * treat["probes"] / 100)
+            print(f"{key}: {args.compare[0]} {base[key]}% {wilson(kb, base['probes'])} vs {args.compare[1]} {treat[key]}% {wilson(kt, treat['probes'])}; p={two_proportion_p(kb, base['probes'], kt, treat['probes'])}")
+        print()
     keys = [k for k in next(iter(report.values())).keys() if k != "first_skill_by_scenario"] if report else []
     arms = list(report.keys())
     print("| metric | " + " | ".join(arms) + " |")

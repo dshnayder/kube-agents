@@ -12,15 +12,15 @@ An **arm** is a harness configuration; a **rung** is a catalogue size. Every cel
 probes ([`scenarios.json`](scenarios.json)), three repetitions each, one prompt per session, on the
 same install, image and model.
 
-| Arm             | Skill index in the system prompt                | Per-turn injection                                     | Tool array                      |
-| --------------- | ----------------------------------------------- | ------------------------------------------------------ | ------------------------------- |
-| `stock`         | every skill, description cut at 60 characters   | none                                                   | as shipped                      |
-| `fulldesc`      | every skill, full description                   | none                                                   | as shipped                      |
-| `scoped-all`    | every skill by name only                        | top-6 skills by BM25 with full descriptions            | pinned set plus top-6 by BM25   |
+| Arm          | Skill index in the system prompt              | Per-turn injection                          | Tool array                    |
+| ------------ | --------------------------------------------- | ------------------------------------------- | ----------------------------- |
+| `stock`      | every skill, description cut at 60 characters | none                                        | as shipped                    |
+| `fulldesc`   | every skill, full description                 | none                                        | as shipped                    |
+| `scoped-all` | every skill by name only                      | top-6 skills by BM25 with full descriptions | pinned set plus top-6 by BM25 |
 
-| Rung      | Catalogue                                                                                            |
-| --------- | ---------------------------------------------------------------------------------------------------- |
-| `shipped` | the 44 skills in `agents/platform/skills/`                                                           |
+| Rung      | Catalogue                                                                                                                                                    |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `shipped` | the 44 skills in `agents/platform/skills/`                                                                                                                   |
 | `grown`   | those plus 60 real skills from `google/skills` `skills/cloud/` that the sync does not ship (5 `gke-*` it will ship next run, 55 other Google Cloud products) |
 
 `stock` versus `fulldesc` isolates the description fix from scoping; `fulldesc` versus `scoped-all`
