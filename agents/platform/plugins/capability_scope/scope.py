@@ -42,6 +42,7 @@ RECORD_PATH_ENV = "KA_SCOPE_RECORD"
 PINNED_TOOLS_ENV = "KA_SCOPE_PINNED_TOOLS"
 PINNED_SKILLS_ENV = "KA_SCOPE_PINNED_SKILLS"
 EXTRA_SKILLS_DIRS_ENV = "KA_EXTRA_SKILLS_DIRS"
+SKILLS_DIR_ENV = "KA_SKILLS_DIR"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 DEFAULT_K_SKILLS = 6
@@ -165,9 +166,20 @@ def _parse_frontmatter(text: str) -> Dict[str, Any]:
         return out
 
 
+def _hermes_home() -> Path:
+    """The profile's home. `hermes --profile X` resolves it internally; the env var may still
+    name the parent, so ask Hermes first and fall back to the environment."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME))
+
+
 def _skills_dirs() -> List[Path]:
-    home = Path(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME))
-    dirs = [home / SKILLS_SUBDIR]
+    explicit = os.environ.get(SKILLS_DIR_ENV)
+    dirs = [Path(explicit)] if explicit else [_hermes_home() / SKILLS_SUBDIR]
     extra = os.environ.get(EXTRA_SKILLS_DIRS_ENV, "")
     for d in extra.split(os.pathsep):
         if d.strip():
@@ -224,7 +236,7 @@ def _record_path() -> Path:
     explicit = os.environ.get(RECORD_PATH_ENV)
     if explicit:
         return Path(explicit)
-    return Path(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME)) / DEFAULT_RECORD_NAME
+    return _hermes_home() / DEFAULT_RECORD_NAME
 
 
 def record(event: str, **fields: Any) -> None:
