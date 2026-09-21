@@ -102,10 +102,15 @@ capability to shorten the list:
   Deployment through the hosted GKE MCP server on the ambient credential) a search for
   `kanban_create` returned `mcp__gke__create_cluster`, and the agent went on to use the GKE tools.
 
-The harness's own documentation records the same pattern in benchmarking: with deferred tools
-invisible, models substitute a visible core tool or declare the capability nonexistent rather than
-search. An upstream issue measures that a names-only skill index breaks discovery because the
-model does not fall back to listing.
+The harness's own documentation records the same pattern in benchmarking. Its tool-search page at
+the pinned version
+([`website/docs/user-guide/features/tool-search.md`, "Why the listing exists"](https://github.com/NousResearch/hermes-agent/blob/v2026.8.19/website/docs/user-guide/features/tool-search.md))
+says that without the names listing "deferred capabilities are _invisible_ — live benchmarking
+showed models substituting visible core tools (running `gh` in the terminal instead of searching
+for the deferred GitHub tool) or declaring a capability nonexistent instead of calling
+`tool_search`". An upstream issue,
+[hermes-agent#71481](https://github.com/NousResearch/hermes-agent/issues/71481), measures that a
+names-only skill index breaks discovery because the model does not take the listing fallback.
 
 So the target is not the smallest working set. It is the working set that contains what the turn
 needs, with a discovery path the model actually takes when it does not, and a measurement that
