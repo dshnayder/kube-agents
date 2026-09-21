@@ -8,8 +8,9 @@
 # check in the drift stream that fires outside a cohort. The stream's other
 # nineteen checks are majority votes, so a cluster with too few peers is
 # compared on nothing -- and an unlabelled cluster has no peers by
-# construction, because §2.3 keys the cluster-level cohorts on (environment)
-# and never merges `unknown` into a named cohort. The collector
+# construction, because §2.3 keys the eight configurable facets on
+# (environment) and the eleven node-level ones on (mode, environment) and
+# merges `unknown` into no named cohort under either. The collector
 # (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
 # gap into a finding naming the label to set.
 #
@@ -23,12 +24,17 @@
 # to it the way consistency-drift-outlier does.
 #
 # Two dependencies on pool hygiene, neither of them this case's to fix:
-#   -- The host must be the ONLY unlabelled cluster older than 24h in the
-#      project, of either mode. A stale eval-pr* cluster (a crashed run's, not
-#      swept) that ages past the collector's 24h exclusion joins the `unknown`
-#      cohort; two of them take it to the floor of 3, the host is then
-#      compared and §4.14 abstains -- the check reads as ran-and-clean, and
-#      this case reds on a fleet the agent audited correctly.
+#   -- Fewer than three unlabelled STANDARD clusters older than 24h may exist
+#      in the project, the host included. §4.14 fires where either of §2.3's
+#      cohorts is short, and for the Standard host the binding one is
+#      (standard, unknown): two stale eval-pr* Standard clusters (a crashed
+#      run's, not swept) that age past the collector's 24h exclusion take it
+#      to the floor of 3, the host is then compared on all nineteen and §4.14
+#      abstains -- the check reads as ran-and-clean, and this case reds on a
+#      fleet the agent audited correctly. Unlabelled AUTOPILOT clusters do not
+#      bind: they raise the cluster-level `unknown` cohort past the floor, but
+#      the node-level one they are counted in is (autopilot, unknown), and
+#      §4.14 still fires on the Standard host's own short cohort.
 #   -- The finding recommends `environment=seeded`, the one value that
 #      reaches the floor. Nobody may APPLY it to the host: bench/tf/fleet
 #      reserves that value for the trio, and a fourth voter changes the

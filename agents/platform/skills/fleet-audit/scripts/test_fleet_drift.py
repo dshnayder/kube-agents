@@ -2169,6 +2169,84 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertEqual(na, {})
         self.assertEqual(run[K("host")], [fd.UNLABELLED_SLUG])
 
+    def _straddling_shape(self):
+        """The fleet shape #1226's two cohortings make possible and Adam's one
+        did not: enough unlabelled clusters to reach the floor on
+        `(environment)`, but not at either mode on `(mode, environment)`.
+
+        Three unlabelled Autopilot clusters and two unlabelled Standard ones
+        put five in the cluster-level `unknown` cohort, so the eight
+        configurable facets compare -- against a group whose only shared
+        property is the omission. The Standard pair's node-level cohort is two,
+        so the eleven node-level facets compare nothing for them. A Standard
+        `seeded` trio gives a value that closes both.
+        """
+        fleet = [cluster(f"ap-{i}", autopilot=True, labels={}) for i in range(3)]
+        fleet += [cluster(f"std-{i}", labels={}) for i in range(2)]
+        fleet += [cluster(f"seeded-{i}", labels={"environment": "seeded"}) for i in range(3)]
+        return fleet
+
+    def test_a_short_node_cohort_fires_even_where_the_cluster_cohort_does_not(self):
+        """The defect a live run found on the restored cohorting, and the
+        reason this check reads both cohorts rather than one.
+
+        Before this, §4.14 asked only whether the cluster-level cohort reached
+        the floor. On the fleet above it does, so the check abstained -- while
+        the run's own `limitations` said "11 node-level facets uncompared" for
+        the same cluster. The audit held both halves of the contradiction and
+        published neither as a finding, on a gap the label it declines to
+        recommend would have closed.
+        """
+        _run, candidates, _na = self.check(self._straddling_shape())
+        self.assertEqual(sorted(candidates), [K("std-0"), K("std-1")])
+
+    def test_an_autopilot_cluster_on_that_fleet_gets_no_finding(self):
+        """Its eleven are `checks_not_applicable`, so a short
+        `(autopilot, unknown)` cohort withholds nothing from it and no label
+        would be closing a gap. It is compared on all eight it owes."""
+        candidates = self.check(self._straddling_shape())[1]
+        self.assertNotIn(K("ap-0"), candidates)
+
+    def test_the_excerpt_does_not_claim_all_nineteen_abstained(self):
+        """`abstaining` counts the cluster's whole roster, which is the right
+        number only when both cohorts are short. Printed against a cluster
+        being compared on eight, it overstates the gap by the eight it is
+        wrong about -- and an operator who checks finds the finding contradicted
+        by the same ledger's coverage column."""
+        excerpt = self.check(self._straddling_shape())[1][K("std-0")][0]["excerpt"]
+        self.assertIn("11 facets keyed `(mode, environment)` compare nothing", excerpt)
+        self.assertIn("the other 8 reach a baseline", excerpt)
+        self.assertNotIn("all 19 comparative checks", excerpt)
+
+    def test_the_peers_named_are_the_ones_at_this_clusters_mode(self):
+        """Where the gap is node-level, the floor being described is the
+        node-level one, so the count beside the prescribed value has to be the
+        peers at this mode. Quoting the cluster-level count names a number that
+        does not reach the floor the sentence is about: here six clusters
+        resolve to `seeded` but only the three Standard ones close this gap."""
+        fleet = self._straddling_shape()
+        fleet += [cluster(f"ap-seeded-{i}", autopilot=True,
+                          labels={"environment": "seeded"}) for i in range(3)]
+        excerpt = self.check(fleet)[1][K("std-0")][0]["excerpt"]
+        self.assertIn("Set `resourceLabels.environment` to `seeded`", excerpt)
+        self.assertIn("3 other clusters carry it", excerpt)
+
+    def test_a_value_closing_only_one_of_two_gaps_is_not_prescribed(self):
+        """With both cohorts short the advised value has to reach both floors.
+        `ap` is held by two Autopilot clusters, so it reaches the cluster-level
+        floor for the Standard host and closes nothing node-level; `seeded` is
+        held by two Standard ones and closes both. Prescribing `ap` would be
+        the no-op §3.7 of the cost SOP withholds, and worse than the no-op
+        because the operator would see eight facets start comparing and take
+        the other eleven for a different problem."""
+        fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "ap"})
+                 for i in range(2)]
+        fleet += [cluster(f"seeded-{i}", labels={"environment": "seeded"}) for i in range(2)]
+        fleet.append(cluster("host", labels={}))
+        excerpt = self.check(fleet)[1][K("host")][0]["excerpt"]
+        self.assertIn("Set `resourceLabels.environment` to `seeded`", excerpt)
+        self.assertNotIn("`ap` would also reach it", excerpt)
+
     def test_a_second_joinable_value_is_offered_but_not_prescribed(self):
         fleet = [cluster(f"p{i}", labels={"environment": "prod"}) for i in range(2)]
         fleet += [cluster(f"t{i}", labels={"environment": "test"}) for i in range(4)]

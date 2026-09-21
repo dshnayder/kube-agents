@@ -1120,9 +1120,11 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
     return out
 
 
-def joinable_environments(cohorts: dict[tuple, list[dict]]) -> list[tuple[str, int]]:
-    """The environment values that would actually put a cluster into a
-    cluster-level cohort that reaches the floor, commonest first.
+def joinable_environments(
+    cohorts: dict[tuple, list[dict]], *, mode: str | None = None
+) -> list[tuple[str, int]]:
+    """The environment values that would actually put a cluster into a cohort
+    that reaches the floor, commonest first.
 
     Shared by the coverage-gap sentence and by `no-environment-label`'s
     finding, which is the whole point of it being a function. The gap says
@@ -1135,16 +1137,25 @@ def joinable_environments(cohorts: dict[tuple, list[dict]]) -> list[tuple[str, i
     advised is the one that would join: a value held by two peers reaches
     three with it.
 
-    Mode is not a parameter, and under §2.3 it must not become one. The cohorts
-    read here are the cluster-level ones, which do not carry a mode, so a peer
-    of either mode counts toward the label's floor -- and it should: the eight
-    facets a label unlocks are the ones configurable on Autopilot and Standard
-    alike. Filtering by mode here was what made the advice narrower than the
-    comparison it was advising about.
+    `mode` picks which of §2.3's two cohortings is being asked about, and the
+    caller passes the cohort dict to match. Omitted, this reads the
+    cluster-level cohorts, whose keys carry no mode: a peer of either mode
+    counts toward the label's floor, and it should, because the eight facets
+    that key on `(environment)` are the ones configurable on Autopilot and
+    Standard alike. Filtering those by mode is what made the advice narrower
+    than the comparison it was advising about, which is the defect #1226 fixed.
+
+    Passed a mode, it reads the node-level cohorts, whose keys are
+    `(mode, environment)`, and counts only peers at that mode -- because the
+    eleven facets those cohorts carry are compared within a mode and a label
+    that reaches the floor across both modes closes nothing for them. The two
+    answers differ on any fleet whose unlabelled clusters straddle the split,
+    and a cluster can need a value that satisfies both.
     """
     return sorted(
         ((k[-1], len(m)) for k, m in cohorts.items()
-         if k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
+         if k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1
+         and (mode is None or k[0] == mode)),
         key=lambda t: (-t[1], t[0]),
     )
 
@@ -1219,9 +1230,10 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
 
     Every `Facet` is comparative, so `compute_drift` only evaluates one inside
     a cohort that reached `COHORT_FLOOR`, and under the `environment` strategy
-    a cluster-level cohort key is `(environment)` -- which an unlabelled
-    cluster cannot match, because §2.3 keeps `unknown` out of every named
-    cohort. The cluster
+    neither of §2.3's two keys -- `(environment)` for the eight configurable
+    facets, `(mode, environment)` for the eleven node-level ones -- is one an
+    unlabelled cluster can match, because §2.3 keeps `unknown` out of every
+    named cohort. The cluster
     with the fleet's one divergent label set is therefore the one cluster
     `label-keys` structurally cannot see, and the same holds for the other
     eighteen facets. `cohort_limitations` already says so in a sentence, and a
@@ -1241,9 +1253,15 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
       cohort on a name token; that membership is a guess and §3.5 downgrades
       what rests on it, but it is not this defect and "joins no cohort" would
       be false of it.
-    - **Its cohort is under the floor.** Enough unlabelled clusters at one mode
-      pile into `(mode, unknown)` to reach three and they compare each other,
-      which is the coverage this finding claims is missing.
+    - **One of its two cohorts is under the floor.** Both are asked, because
+      §2.3 draws both from the environment and a missing label can leave
+      either short. Enough unlabelled clusters pile into `(unknown)` to reach
+      three and they compare each other on the eight, which is coverage this
+      finding would otherwise be claiming is missing -- but `(mode, unknown)`
+      can still be short underneath it, and the eleven it carries compare
+      nothing. On an Autopilot cluster the node-level cohort is not asked:
+      those eleven are `checks_not_applicable` there, so its floor withholds
+      nothing.
 
     And it publishes only where `joinable_environments` names a value that
     reaches the floor. Where none does, no label closes the gap, so the
@@ -1277,10 +1295,37 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         _env, source = env_of[key]
         if source != "unknown":
             continue
-        cohort = cohorts.get(cohort_key(c, strategy, "unknown", standard_only=False)) or []
-        if len(cohort) >= COHORT_FLOOR:
+        # §2.3 draws two cohorts and a missing label can leave either one
+        # short, so both are asked. The cluster-level cohort merges the modes,
+        # which means a fleet with three unlabelled clusters spread across the
+        # split reaches the floor there and compares the eight configurable
+        # facets against a bag of clusters that have nothing in common but the
+        # absent label -- while the node-level cohort, keyed `(mode, unknown)`,
+        # is still short and the other eleven compare nothing. Reading only the
+        # cluster-level cohort made the check silent on exactly that fleet,
+        # which is the larger half of the gap and the one a label still closes.
+        node_short = mode != "autopilot" and len(layout.cohort_of(c, True)) < COHORT_FLOOR
+        cluster_short = len(layout.cohort_of(c, False)) < COHORT_FLOOR
+        if not (node_short or cluster_short):
             continue
-        joinable = joinable_environments(cohorts)
+        # An Autopilot cluster's eleven are `checks_not_applicable`, so its
+        # node-level cohort being short is not a gap and no label would be
+        # closing one; `node_short` is false for it above rather than here, so
+        # the value search below never has to satisfy a constraint that does
+        # not apply.
+        #
+        # A value has to close every gap this cluster actually has. Where both
+        # are short that is an intersection, and it can be empty while either
+        # axis alone offers a value -- advising a label that fixes one half and
+        # leaves the other is the no-op §3.7 of the cost SOP withholds.
+        joinable = joinable_environments(cohorts) if cluster_short else []
+        if node_short:
+            by_mode = joinable_environments(layout.node_cohorts, mode=mode)
+            joinable = (
+                [(v, n) for v, n in joinable if v in {w for w, _ in by_mode}]
+                if cluster_short
+                else by_mode
+            )
         if not joinable:
             continue
         value, peers = joinable[0]
@@ -1302,9 +1347,18 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         # inferred does not *carry* the label the finding is telling the
         # operator to set. Setting it still works -- a cohort key holds the
         # resolved value, however it resolved -- so only the verb changes.
+        # The peers the sentence names are the ones whose cohort the label
+        # would reach. Where the gap is node-level alone, that is the peers at
+        # this cluster's mode -- naming the cluster-level count there would
+        # quote a number that does not reach the floor being described.
+        peer_members = (
+            layout.node_cohorts.get((mode, value)) or []
+            if node_short and not cluster_short
+            else cohorts.get((value,)) or []
+        )
         peer_source = (
             "carry it"
-            if any(env_of[ckey(p)][1] == "label" for p in cohorts.get((value,)) or [])
+            if any(env_of[ckey(p)][1] == "label" for p in peer_members)
             else "resolve to it from their names"
         )
         # Every facet minus the ones Autopilot withholds, which is the same
@@ -1313,6 +1367,25 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         # written down, so a facet added to `FACETS` is in this sentence
         # without anyone remembering to change it.
         abstaining = sum(1 for f in FACETS if not (f.standard_only and mode == "autopilot"))
+        # Which gap this is, in the excerpt's own words. Under §2.3 a cluster
+        # short on the node-level cohort alone is still compared on the eight,
+        # so "all nineteen abstain" would be false of it -- and the eight it
+        # does get are drawn from the `unknown` cohort, which is not a peer
+        # group so much as the set of clusters that share the same omission.
+        # Saying so is what stops the finding from reading as the smaller
+        # complaint it is not.
+        node_level = sum(1 for f in FACETS if f.standard_only)
+        scope = (
+            f"so its node-level cohort holds fewer than {COHORT_FLOOR} and the "
+            f"{node_level} facets keyed `(mode, environment)` compare nothing for "
+            f"it; the other {len(FACETS) - node_level} reach a baseline only "
+            f"because `unknown` is a cohort in its own right, drawn from the "
+            f"clusters that share no property but the missing label"
+            if node_short and not cluster_short
+            else f"so this one cohorts alone as `unknown` against a minimum of "
+            f"{COHORT_FLOOR}, and all {abstaining} comparative checks in this "
+            f"audit abstain for it"
+        )
         alternatives = (
             ""
             if len(joinable) == 1
@@ -1322,11 +1395,9 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         )
         excerpt = (
             f"carries no environment label -- `resourceLabels` sets none of "
-            f"`environment`, `env`, `stage` or `tier` -- {others}. Cohorts are keyed "
-            f"`(environment)` and an unlabelled cluster never joins a named "
-            f"cohort, so this one cohorts alone as `unknown` against a "
-            f"minimum of {COHORT_FLOOR}, and all {abstaining} comparative checks in "
-            f"this audit abstain for it -- on this run and on every future run until "
+            f"`environment`, `env`, `stage` or `tier` -- {others}. An unlabelled "
+            f"cluster joins no named cohort under either of §2.3's two keys, "
+            f"{scope} -- on this run and on every future run until "
             f"it is labelled. Set `resourceLabels.environment` to `{value}`: "
             f"{peers} other cluster{'' if peers == 1 else 's'} {peer_source}, which "
             f"reaches the floor with this one{alternatives}. Any value no peer holds "
