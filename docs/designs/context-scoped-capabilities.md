@@ -12,10 +12,14 @@ An agent sees its whole capability catalogue on every turn: every tool schema in
 every skill in a system-prompt index. The Platform Agent's catalogue is 44 skills and roughly 90
 tools, and it grows without a gate, because 29 of those skills are synced from an upstream
 repository and every new MCP server adds its tools to the same list. Published measurements put
-the point where tool selection accuracy starts to fall at 30 to 50 tools, and this repository has
-already recorded the two failure modes a catalogue of this size produces: the model choosing the
-wrong capability from a crowded list, and the model failing to find a capability the harness hid
-to keep the list short.
+the point where tool selection accuracy starts to fall at 30 to 50 tools. This repository has
+recorded two incidents from the other direction, where the harness hid capabilities to keep the
+list short: the model failing to find a hidden capability
+([#1703](https://github.com/gke-labs/kube-agents/issues/1703)), and the model acting on the wrong
+one after a search returned it
+([#1699](https://github.com/gke-labs/kube-agents/issues/1699)). The crowded-list failure has no
+recorded incident here yet; §1.2 gives the published evidence and the persona prose that routes
+around it, and phase 0 measures it.
 
 This document proposes a **capability-scoping layer** that sits between the catalogue and the
 model request and decides, per turn, which capabilities the model sees in full, which it sees by
@@ -77,19 +81,26 @@ The evidence that a large catalogue costs accuracy, not only tokens, is consiste
 
 The failure is not confined to the tool array. A skill index is a selection problem with the same
 shape, and this repository's personas already carry the evidence that the choice is hard: the
-platform persona names which of two skills owns the write path and forbids the fallback, and a
-bench case spells out that remediation goes through one skill and "not" its neighbour. Prose in a
-persona is the routing lever available today.
+platform persona ([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md), "Authorized Commits
+& Change Flow") names which of two skills owns the write path, and a bench case
+([`bench/tasks/rca-remediation-pr/task.yaml`](../../bench/tasks/rca-remediation-pr/task.yaml))
+spells out that remediation goes through `submit-suggestion` and not `github-issue-resolver`,
+which "was retargeted out of this scenario". Prose in a persona is the routing lever available
+today, and neither file is an incident record: no run in this repository is documented as having
+picked the wrong skill from the index.
 
 ### 1.3 Hiding is the other failure
 
 Deferral is not free. Two incidents in this repository show what happens when the harness hides a
 capability to shorten the list:
 
-- In #1703 the front-door agent's `kanban_create` was absent in 25 of 32 runs; a search for
-  "kanban" returned nothing, and the model reported that only the four bridge tools existed.
-- In #1699 a search for `kanban_create` returned `mcp__gke__create_cluster`, and the agent went on
-  to patch a Deployment through the GKE tools on the ambient credential.
+- In [#1703](https://github.com/gke-labs/kube-agents/issues/1703) (delegation broken on a
+  kustomize dev install) the front-door agent's `kanban_create` was absent in 25 of 32 runs; a
+  search for "kanban" returned nothing, and the model reported that only the four bridge tools
+  existed.
+- In [#1699](https://github.com/gke-labs/kube-agents/issues/1699) (the front-door agent patched a
+  Deployment through the hosted GKE MCP server on the ambient credential) a search for
+  `kanban_create` returned `mcp__gke__create_cluster`, and the agent went on to use the GKE tools.
 
 The harness's own documentation records the same pattern in benchmarking: with deferred tools
 invisible, models substitute a visible core tool or declare the capability nonexistent rather than
