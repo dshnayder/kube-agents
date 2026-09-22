@@ -410,6 +410,24 @@ class SandboxForwardingTest(unittest.TestCase):
         )
         self.assertEqual(exit_code, 2)
 
+    def test_the_per_repository_budget_is_the_gate_s_own(self):
+        """The two numbers are one number, and nothing else pins them equal.
+
+        `resolver` copies the value rather than importing `github_scan_gate`:
+        it is forwarded into the sandbox, where every import has to be a
+        root-owned file in the trusted closure, and pulling the scanner in to
+        read one integer would put the whole of it there. The copy is what this
+        catches -- raise the gate's budget and leave the resolver's behind and
+        the margin inverts, so the outer kill lands first and orphans the ssh
+        child the margin exists to avoid.
+        """
+        import github_scan_gate
+
+        self.assertEqual(
+            resolver.FORWARD_TIMEOUT_PER_REPO_S, github_scan_gate.RESOLVER_TIMEOUT_S
+        )
+        self.assertGreater(resolver.FORWARD_TIMEOUT_MARGIN_S, 0)
+
     def test_the_hop_is_bounded_and_the_ceiling_is_sized_by_the_sweep(self):
         """The reason it may cross once: one budget, not one per forge call.
 

@@ -35,13 +35,16 @@ import os
 import sys
 import sysconfig
 
-# Where the Dockerfile stages the root-owned copies. Overridable only so the
-# guard can be exercised against a staging directory outside a container --
-# nothing in the image sets it, and a build that did would be changing the
-# directory it is asserting about, which the `chown`/`find` half of the same
-# RUN would then fail on.
-IN_THE_IMAGE = "/opt/vcs/libexec/platform"
-TRUSTED = os.environ.get("TRUSTED_CLOSURE_DIR", IN_THE_IMAGE)
+# Where the Dockerfile stages the root-owned copies, and not overridable. An
+# earlier shape read a `TRUSTED_CLOSURE_DIR` out of the environment so the
+# guard could be pointed at a staging directory outside a container; it could
+# never have passed there. The trusted copies drop `/opt/defaults/scripts` and
+# `/opt/data/scripts` from `sys.path` only when they find themselves under this
+# literal path, so under any other directory they leave both on it and the
+# `AGENT_WRITABLE` check below fails on modules that are behaving correctly.
+# `test_sandbox_delivery.py` is the check that runs outside a container, and it
+# loads the staged modules itself rather than through this file.
+TRUSTED = IN_THE_IMAGE = "/opt/vcs/libexec/platform"
 
 # The directories the entrypoint chowns to `agent`. A trusted process must not
 # carry either on its import path, even behind site-packages.
@@ -49,12 +52,7 @@ AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
 
 # Each forwarded script and the constant naming the path its caller forwards to.
 # The constant is checked as well as the closure: staging a root-owned copy that
-# nothing points at buys nothing. It is checked against `IN_THE_IMAGE` and not
-# against `TRUSTED`, because the constants are literals compiled into the
-# modules -- what they have to say is where the image puts the copies, which a
-# staging directory does not change. Only the closure walk follows the
-# override, which is the half that is about where these particular files were
-# read from.
+# nothing points at buys nothing.
 FORWARDED = {"forge": "SANDBOX_FORGE", "resolver": "SANDBOX_RESOLVER"}
 
 # The interpreter's own files. Everything else a trusted process imports has to

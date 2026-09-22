@@ -289,8 +289,18 @@ no token to refresh.
 3. **Reply on the PR** summarizing what changed, then relay a clean
    confirmation (PR URL + what you changed) back through your kanban result.
 
+   Through a file, for the reason Step 3 gives. A reply is a summary of edits
+   you just made and often quotes the comment you are answering — backticks in
+   your own text, and `$(...)` in somebody else's. `proposal comment` takes no
+   `--body-file`, so the file is read by a command substitution you write
+   yourself; what it expands to is an argument and is not expanded again.
+
    ```bash
-   python3 "$V" proposal comment <PR_NUMBER> --repo "<owner>/<repo>" --body "<what changed>"
+   REPLY=$(mktemp -p /opt/data/scratch pr_reply.XXXXXX.md)
+   cat > "$REPLY" <<'EOF'
+   <what changed>
+   EOF
+   python3 "$V" proposal comment <PR_NUMBER> --repo "<owner>/<repo>" --body "$(cat "$REPLY")"
    ```
 
 Never ask the requester to paste the comment text — fetching it and addressing it is your job.

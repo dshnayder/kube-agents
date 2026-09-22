@@ -39,6 +39,7 @@ sys.path.insert(0, str(HERE))
 
 import gitops_workspace  # noqa: E402
 import vcs_client  # noqa: E402
+from providers import validate_branch  # noqa: E402
 
 SUBJECT = (
     HERE.parent / "skills" / "submit-suggestion" / "scripts" / "submit_suggestion.py"
@@ -98,6 +99,10 @@ class FakeBroker:
         self.serial = count()
         self.create_fails_with: Exception | None = None
         self.update_fails_with: Exception | None = None
+        # Who the credential authenticates as, which is what `proposal_create`
+        # records as the author. Set it to somebody else and the proposals this
+        # fake already holds become a stranger's.
+        self.viewer = "kube-agents"
 
     def __call__(self, verb: str, payload: dict) -> dict:
         self.calls.append((verb, dict(payload)))
@@ -159,6 +164,9 @@ class FakeBroker:
 
     # -- collaboration verbs ---------------------------------------------
 
+    def identity(self, payload):
+        return {"identity": {"login": self.viewer, "canWrite": True}}
+
     def proposal_list(self, payload):
         found = [
             proposal
@@ -179,7 +187,7 @@ class FakeBroker:
             "body": payload.get("body", ""),
             "state": "open",
             "draft": False,
-            "author": "kube-agents",
+            "author": self.viewer,
             "source": payload["source"],
             # Where the branch is when the proposal is read, which is what
             # `translate.proposal` reports as the forge does: the last
@@ -352,6 +360,49 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             git(Path(again["workspace"]), "rev-parse", "HEAD").stdout.strip(), reviewed
         )
 
+    def test_prepare_refuses_a_branch_whose_open_proposal_is_somebody_elses(self):
+        """The refusal the broker makes at `publish`, made before the work.
+
+        `prepare` reads an open proposal on the branch as "this run is adding
+        to it" and never asked whose it was; `publish --advance` is then
+        refused `CLONED_BRANCH` by the broker because the author is not this
+        credential. Between them the whole turn is written into a copy of
+        somebody else's branch and thrown away at the end of it. Reachable
+        because branch names here are derived, so a human can have opened a
+        pull request from one.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        # The same branch, the same open proposal -- and now the credential is
+        # somebody else, which is the collision seen from this side.
+        self.broker.viewer = "a-colleague"
+
+        cloned = len(self.broker.payloads("clone"))
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("prepare", "--branch", branch, "--force")
+        self.assertIn("a-colleague", str(caught.exception))
+        self.assertIn("kube-agents", str(caught.exception))
+        self.assertIn("branch name of your own", str(caught.exception))
+        # And it stopped before the copy: nothing was cloned for this call.
+        self.assertEqual(len(self.broker.payloads("clone")), cloned)
+
+    def test_prepare_still_adds_to_the_install_s_own_proposal_under_another_spelling(self):
+        """`kube-agents[bot]` and `kube-agents` are one account.
+
+        The provider strips an automation's marking off every author it emits
+        and the credential store keeps it, so the raw comparison makes an
+        install a stranger to its own proposals and refuses every second round
+        on an App-authenticated install -- which is all of them.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        self.broker.viewer = "kube-agents[bot]"
+
+        again = self.prepare(branch, force=True)
+        self.assertEqual(again["started_from"], branch)
+
     def test_prepare_refuses_a_branch_name_whose_squash_merged_branch_is_still_there(self):
         """The reuse the docstring promises, on the forge default that breaks it.
 
@@ -508,6 +559,35 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         git(self.origin, "branch", branch, "main")
         self.assertEqual(self.prepare(branch)["base"], "release")
 
+    def test_check_branch_refuses_an_empty_name_before_the_protected_list(self):
+        # `--branch ""` and `--branch "  "` reach here as a falsy name. Without
+        # this arm `_short_branch("")` is "", which is in no protected set, and
+        # the empty name goes on to be a directory key and a `switch --create`.
+        for branch in ("", "   ", None):
+            with self.subTest(branch=branch):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.check_branch(branch)
+                self.assertIn("must not be empty", str(caught.exception))
+
+    def test_check_branch_refuses_the_standing_protected_names(self):
+        # The list that needs no environment to be set, and the `refs/heads/`
+        # and `heads/` spellings of it -- a caller that passes a full ref would
+        # otherwise walk straight past a set holding only the short names.
+        for name in submit_suggestion.PROTECTED_BRANCHES:
+            for branch in (name, f"refs/heads/{name}", f"heads/{name}"):
+                with self.subTest(branch=branch):
+                    with self.assertRaises(ValueError) as caught:
+                        submit_suggestion.check_branch(branch)
+                    self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_check_branch_accepts_a_suggestion_branch_and_hands_back_a_trimmed_name(self):
+        # The accepting direction, and the return value: every caller uses what
+        # comes back rather than what it passed in, so the trim is load-bearing.
+        self.assertEqual(
+            submit_suggestion.check_branch("  platform-agent/scale-web  "),
+            "platform-agent/scale-web",
+        )
+
     def test_check_branch_refuses_a_run_branch(self):
         # `run/**` is the harness's own namespace. A suggestion pushed there is
         # not reviewed by anyone; it is picked up as if a run had produced it.
@@ -558,18 +638,28 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         """The guard on the switch's exit status, reached without a mock.
 
         `check_branch` validates the protected-name list, not git's ref syntax,
-        so a space -- or `..`, or a trailing `.lock` -- gets past it, the clone
-        happens, and `git switch --create` exits 128. `branch` reports that
-        rather than raising, so without the guard `prepare` prints a JSON line
-        naming a branch the copy is not standing on and the whole turn is spent
-        editing the base.
+        so a name git will not take gets past it, the clone happens, and `git
+        switch --create` exits 128. `branch` reports that rather than raising,
+        so without the guard `prepare` prints a JSON line naming a branch the
+        copy is not standing on and the whole turn is spent editing the base.
+
+        The names are chosen to reach that guard against the real broker and
+        not only this fake. A space, `..` or a trailing `.lock` would not: the
+        GitHub provider runs `validate_branch` over the `source` of the
+        `proposal-list` that `open_proposal` sends first, and refuses all three
+        there, before anything is cloned. `BRANCH_RE` is a character class, so
+        a name whose characters it allows can still be one git rejects for
+        where they sit -- a trailing separator, an empty component, a component
+        ending in a dot. Those are the ones below, and the assertion that they
+        clear `validate_branch` is what keeps them that way.
         """
         for branch in (
-            "platform-agent/bad name",
-            "platform-agent/a..b",
-            "platform-agent/x.lock",
+            "platform-agent/x/",
+            "platform-agent/a//b",
+            "platform-agent/x.",
         ):
             with self.subTest(branch=branch):
+                self.assertEqual(validate_branch(branch), branch)
                 with self.assertRaises(vcs_client.VcsError) as caught:
                     self.run_subject("prepare", "--branch", branch)
                 self.assertIn("could not take the branch", str(caught.exception))

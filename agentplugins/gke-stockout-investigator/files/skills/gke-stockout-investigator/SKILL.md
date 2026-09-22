@@ -198,7 +198,7 @@ _CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions de
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
-Inspect the target `ComputeClass` and workload manifests in the leased workspace, checking against the following debugging rules:
+Inspect the target `ComputeClass` and workload manifests in the printed `workspace`, checking against the following debugging rules:
 
 #### Rule A: Lack of Zone/Family Fallbacks
 

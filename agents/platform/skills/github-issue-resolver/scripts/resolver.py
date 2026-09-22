@@ -74,6 +74,12 @@ SANDBOX_RESOLVER = "/opt/vcs/libexec/platform/resolver.py"
 # several repositories in it. The margin is what makes this one fire first, so a
 # hung hop is reported as `SANDBOX_UNREACHABLE` rather than killed from outside
 # -- an outer kill reaches this process and orphans the ssh child.
+#
+# It is a copy of the number rather than an import: this module is forwarded
+# into the sandbox, where every import it makes has to be a root-owned file in
+# the trusted closure, and pulling the gate in to read one integer would put
+# the whole scanner there. `test_resolver` pins the two equal instead, so the
+# copy cannot drift.
 FORWARD_TIMEOUT_PER_REPO_S = 300
 FORWARD_TIMEOUT_MARGIN_S = 15
 

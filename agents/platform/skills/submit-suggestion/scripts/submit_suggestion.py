@@ -41,6 +41,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -177,6 +178,77 @@ def validate_repo(repo: str) -> str:
 PROPOSAL_HISTORY_LIMIT = 5
 
 
+#: The marking a forge puts on an automation's login, which the provider
+#: strips off every author it emits and the credential store keeps. Comparing
+#: the two raw makes an install a stranger to its own proposals, so this folds
+#: them together -- `vcs_broker._login_key`'s rule, restated here because the
+#: broker runs on the other side of the proxy and this side cannot import it.
+_AUTOMATION_MARKING = re.compile(r"\[bot\]$", re.IGNORECASE)
+
+
+def _login_key(login: str) -> str:
+    return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
+def this_install(repo: str) -> str:
+    """The login this install authenticates as on `repo`'s forge, or "".
+
+    Empty for a credential that cannot introspect itself and for a forge with
+    no way to ask. Both are real answers and both mean "do not compare", which
+    is the bar `vcs_broker._require_open_proposal` keeps on the same question.
+
+    A lookup that *failed* is empty here too, and that is the one place this is
+    deliberately weaker than the broker. The broker refuses an `advance` whose
+    ownership it could not establish, because by then the change is written and
+    the push is the next thing to happen. This call is the early warning in
+    front of that refusal, not a second gate: a transient failure costs the
+    warning and leaves the protection where it already was.
+    """
+    try:
+        answer = vcs_client.forge("identity", {}, repository=repo)
+    except vcs_client.VcsError as failed:
+        log(
+            f"could not ask {repo}'s forge who this install is ({failed}); "
+            "whether the open proposal on this branch is ours is unknown here, "
+            "and publishing will settle it."
+        )
+        return ""
+    return str((answer.get("identity") or {}).get("login") or "")
+
+
+def refuse_a_proposal_that_is_not_ours(branch: str, proposal: dict, viewer: str) -> None:
+    """Refuse before the copy comes down when the open proposal is a stranger's.
+
+    `prepare` reads "this branch carries an open proposal" as "this run is
+    adding to it", and `publish --advance` -- which is what Step 3 sends
+    afterwards -- is read by the broker as a claim that the proposal is this
+    install's. The broker refuses `CLONED_BRANCH` when it is not. Each half is
+    right on its own; together they put the refusal at the end of the turn,
+    after the whole change has been written into a copy of somebody else's
+    branch, which is the shape this skill removes everywhere else.
+
+    Branch names here are derived from the change
+    (`platform-agent/<type>-<target>`, and a fixed name in some callers), so a
+    human who opened a pull request from one collides with it. Rare, and total
+    when it happens.
+
+    The same bar as the broker's: compared only when the forge named an author
+    and the credential could say who it is, and compared on `_login_key` rather
+    than raw, for the reason that function gives.
+    """
+    author = str(proposal.get("author") or "")
+    if not author or not viewer or _login_key(author) == _login_key(viewer):
+        return
+    named = proposal.get("url") or "#%s" % (proposal.get("number"),)
+    raise ValueError(
+        f"'{branch}' carries an open proposal, {named}, and it is "
+        f"{author}'s rather than this install's ({viewer}). Adding to it would "
+        "move a branch whose proposal we do not own, and publishing is refused "
+        "for exactly that -- so this refuses now, before the change is written. "
+        "Use a branch name of your own."
+    )
+
+
 def open_proposal(repo: str, branch: str) -> dict | None:
     """The open change proposal whose source is `branch`, or None.
 
@@ -302,6 +374,9 @@ def handle_prepare(args) -> int:
 
     proposal = open_proposal(repo, branch)
     if proposal:
+        # Before the copy, because the copy is what the change gets written
+        # into and the refusal it would otherwise wait for arrives at `publish`.
+        refuse_a_proposal_that_is_not_ours(branch, proposal, this_install(repo))
         log(f"'{branch}' already has an open proposal; taking a copy of it.")
         cloned = vcs_client.clone(repo, branch=branch, force=args.force, key=branch)
         with _nothing_left_behind(repo, branch):

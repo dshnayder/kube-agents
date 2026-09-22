@@ -108,17 +108,18 @@ RUN pip install --no-cache-dir pyyaml requests
 # See docs/designs/version-control-support.md.
 #
 # The binary lives at /opt/vcs/libexec/git and is on no PATH at all. It is
-# reached by absolute path from vcs.py -- see KUBE_AGENTS_LOCAL_GIT there -- and
+# reached by absolute path from vcs_client.py -- see LOCAL_GIT there, and the
+# KUBE_AGENTS_LOCAL_GIT it reads -- and
 # by /usr/lib/git-core, which is git's compiled-in exec path rather than a PATH
 # directory. A bare `git` typed by the model still resolves to the credential
 # shim, exactly as it did before this layer existed.
 #
 # Giving the local binary the name `git` instead is the better arrangement and
-# it is deliberately not done here. Every shipped caller of bare `git` today --
-# gitops_workspace.py, submit_suggestion.py, audit_report.py -- means the shim,
-# so the rename has to travel with those callers moving onto the verbs. It goes
-# in the consumer-migration change; this one adds a binary and takes nothing
-# away. docs/designs/version-control-support.md carries the reasoning, including
+# it is still not done here. The rename has to travel with the last caller of
+# bare `git` moving onto the verbs, because until then the name has to keep
+# meaning the shim. submit_suggestion.py is off it as of this change;
+# gitops_workspace.py and fleet-audit's audit_report.py are not, so the rename
+# waits on them. docs/designs/version-control-support.md carries the reasoning, including
 # the measurement that motivates it: given the version-control skill and a shim
 # still owning the name, an agent answered 8 of 60 read probes through the shim
 # alone and issued 4 credentialed clones through it.

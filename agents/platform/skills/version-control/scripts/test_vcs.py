@@ -979,7 +979,12 @@ class LocalGitTest(VcsTestCase):
         (hooks / "post-commit").write_text(f"#!/bin/sh\ntouch {marker}\n")
         os.chmod(hooks / "post-commit", 0o755)
         (tree / "x.txt").write_text("x\n")
-        self.run_vcs("commit", "-m", "with a hook present")
+        # Named, and the exit code checked. `commit` with no paths refuses a
+        # working copy holding an untracked file, so the pathless form would
+        # never reach `git commit` here and the assertion below would hold
+        # whatever `core.hooksPath` said.
+        code, answer = self.run_vcs("commit", "x.txt", "-m", "with a hook present")
+        self.assertEqual(code, 0, answer)
         self.assertFalse(marker.exists())
 
     def test_the_copy_inherits_no_user_configuration(self):
@@ -1038,14 +1043,35 @@ class AbstractionTest(unittest.TestCase):
                     self.assertNotIn(f"import {module}", source)
 
     def test_every_verb_the_broker_serves_has_a_command(self):
+        """Read off the broker's own route table rather than a list kept here.
+
+        The hand-kept list this replaces had gone stale in exactly the way a
+        hand-kept list does: `label-ensure` and `identity` were being served
+        and did have commands, and the test that says "every verb" said nothing
+        about either. Deriving the names means a verb added to the broker with
+        no command fails here on the day it is added.
+
+        `route_table` is built from a broker instance only to name its bound
+        methods, so a stand-in that answers every attribute is enough.
+        """
+        import vcs_broker  # local: the broker is the other side of the proxy
+
         parser = vcs.build_parser()
-        actions = [
-            action
-            for action in parser._subparsers._group_actions[0].choices  # noqa: SLF001
-        ]
+        commands = parser._subparsers._group_actions[0].choices  # noqa: SLF001
+        for verb in vcs_broker.route_table(mock.Mock()):
+            # `proposal-create` is `proposal create`: the hyphen is the space.
+            command, _, action = verb.partition("-")
+            with self.subTest(verb=verb):
+                self.assertIn(command, commands)
+                if not action:
+                    continue
+                under = commands[command]._subparsers  # noqa: SLF001
+                self.assertIsNotNone(under, f"`{command}` takes no action")
+                self.assertIn(action, under._group_actions[0].choices)  # noqa: SLF001
+
+        # And the local verbs, which no broker route covers because they never
+        # leave the container.
         for verb in (
-            "capabilities",
-            "clone",
             "log",
             "show",
             "diff",
@@ -1055,13 +1081,10 @@ class AbstractionTest(unittest.TestCase):
             "status",
             "branch",
             "commit",
-            "publish",
             "discard",
-            "proposal",
-            "issue",
         ):
             with self.subTest(verb=verb):
-                self.assertIn(verb, actions)
+                self.assertIn(verb, commands)
 
     def test_the_familiar_spelling_is_an_alias_of_the_concept(self):
         parser = vcs.build_parser()
