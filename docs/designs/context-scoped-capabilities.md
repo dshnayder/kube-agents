@@ -410,94 +410,115 @@ those skills. This is the loop that keeps running after the design is done.
 
 The plan in §7 was run once, on 2026-09-21, against a dedicated install with the Platform Agent
 as the front door. The method, code and probes are in
-[`experiments/capability-scope-ab/`](../../experiments/capability-scope-ab/README.md); the raw
-runs and per-turn records are on the machine that ran them, and the scored table is committed
-beside the code. Every number below comes from that table.
+[`experiments/capability-scope-ab/`](../../experiments/capability-scope-ab/README.md), and the
+scored tables, one row per run, are committed under its `results/` directory; the raw transcripts
+and per-turn records stayed on the machine that ran them. Every number below is in those files.
 
 ### 8.1 What was run
 
 Three arms and two catalogue sizes, 22 probes, three repetitions each, one prompt per session,
-the same image and model throughout. `stock` is the shipped index (every skill, description cut
-at 60 characters). `fulldesc` is the same index with full descriptions, the cheapest fix in §5.
-`scoped` is the design's stage 3: names only in the system prompt, the top six skills by a
-BM25 ranker injected with full descriptions per turn, and the tool array filtered to a pinned
-set plus six. The `shipped` rung is the 44 skills in the repository; the `grown` rung adds 60
-real skills from the upstream repository the sync reads, five of which the next sync will pull
-in unasked. Twenty probes name a gold skill; two are controls where loading any skill is wrong.
-Each run was capped at ten model iterations and prefixed with one sentence keeping it on the
-local cluster. The model was Gemini 3.1 Pro through the install's LiteLLM; a repeat on Gemini
-3.5 Flash is reported where it is available.
+the same image and model throughout. `stock` is the shipped index: every skill, description cut
+at 60 characters. `fulldesc` is the same index with full descriptions, the cheapest fix in §5.
+`scoped` is the design's stage 3: names only in the system prompt, the top six skills by a BM25
+ranker injected with full descriptions per turn, and the tool array filtered to a pinned set plus
+six. The `shipped` rung is the 44 skills in the repository; the `grown` rung adds 60 real skills
+from the upstream repository the sync reads, five of which the next sync will pull in unasked.
+Twenty probes name a gold skill; two are controls where loading any skill is wrong. Each run was
+capped at ten model iterations and prefixed with one sentence keeping it on the local cluster.
+The model was Gemini 3.1 Pro through the install's LiteLLM; §8.6 covers the repeat on Gemini 3.5
+Flash.
 
 The offline ranker alone, before any model saw it, put the gold skill in its top six for 16 of
-20 probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10.
-Those misses are carried into the run, not tuned away.
+20 probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10. Those
+misses are carried into the run, not tuned away.
 
 ### 8.2 Selection
 
-| First skill loaded               | stock, shipped | scoped, shipped | stock, grown | scoped, grown |
-| -------------------------------- | -------------- | --------------- | ------------ | ------------- |
-| gold                             | 55.0%          | 68.3%           | 53.3%        | 77.2%         |
-| acceptable                       | 1.7%           | 1.7%            | 0.0%         | 5.3%          |
-| wrong                            | 1.7%           | 3.3%            | 1.7%         | 0.0%          |
-| none loaded                      | 41.7%          | 26.7%           | 45.0%        | 17.5%         |
-| gold loaded at any point         | 56.7%          | 71.7%           | 53.3%        | 77.2%         |
-| spurious loads on control probes | 0 of 6         | 0 of 6          | 0 of 6       | 0 of 5        |
+Sixty probe runs per cell; the two controls are reported separately.
 
-Sixty probe runs per cell. On the grown catalogue the gain in gold-first is significant
-(two-proportion test, p = 0.007; 95% intervals 41 to 65 against 65 to 86) and so is the drop in
-runs that load no skill at all (p = 0.001). On the shipped catalogue the same movements are
-present at the same direction and roughly half the size, and do not reach significance at this
-sample (p = 0.13 for gold-first). Wrong picks are rare in every arm; the crowded-list failure in
-this run is not a wrong skill but no skill, and scoping reduces that most.
+| First skill loaded               | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
+| -------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
+| catalogue                        | 44     | 44       | 44     | 104    | 104      | 104    |
+| gold                             | 55.0%  | 60.0%    | 68.3%  | 53.3%  | 58.3%    | 78.3%  |
+| acceptable                       | 1.7%   | 0.0%     | 1.7%   | 0.0%   | 8.3%     | 5.0%   |
+| wrong                            | 1.7%   | 0.0%     | 3.3%   | 1.7%   | 3.3%     | 0.0%   |
+| none loaded                      | 41.7%  | 40.0%    | 26.7%  | 45.0%  | 30.0%    | 16.7%  |
+| gold loaded at any point         | 56.7%  | 60.0%    | 71.7%  | 53.3%  | 61.7%    | 78.3%  |
+| spurious loads on control probes | 0 of 6 | 0 of 6   | 0 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
 
-The failure mode §6 predicted appears in the per-probe table: the repository-inspection probe
-went from three gold picks under `stock` to none under `scoped`, because the ranker leaves that
-skill out of the top six and the names-only shelf did not bring the model to it. Under `stock`,
-one run on the grown catalogue loaded a skill that does not exist, a plausible name assembled
-from the neighbours in the list. Under `scoped`, 25 of 78 skill loads on the shipped rung were
-of skills outside the injected six, so the shelf carried a third of the loads; without it those
-would have been misses.
+On the grown catalogue the gain in gold-first under `scoped` is significant against both other
+arms (two-proportion test: p = 0.004 against `stock`, p = 0.019 against `fulldesc`; 95% interval
+66 to 87 against 41 to 65 and 46 to 70), and so is the drop in runs that load no skill at all
+(p = 0.001 against `stock`). On the shipped catalogue every movement has the same direction and
+about half the size, and none reaches significance at sixty probes (p = 0.13 for gold-first
+against `stock`). `fulldesc` alone moves gold-first by five points on both rungs and does not
+move the no-skill rate on the shipped one; the descriptions are necessary for the gain and not
+sufficient for it. Wrong picks are rare in every arm. The crowded-list failure in this run is
+not the wrong skill; it is no skill, and scoping reduces that most where the list is longest.
+
+Three details from the per-probe table qualify the averages:
+
+- The regression §6 predicted appears once: the repository-inspection probe went from three gold
+  picks under `stock` to none under `scoped` on the shipped rung, because the ranker leaves that
+  skill out of its top six and the names-only shelf did not bring the model to it.
+- Under `scoped`, a third of all skill loads were of skills outside the injected six (25 of 78
+  on the shipped rung, 20 of 82 on the grown), so the shelf carried them; without it those would
+  have been misses. The shelf is load-bearing.
+- Under `stock` on the grown catalogue one run loaded a skill that does not exist, a plausible
+  name assembled from its neighbours in the list; no scoped run did. Four of the six wrong picks
+  across all cells were the write-path skill chosen for a configuration change, which the
+  persona's own routing rule half-endorses; the scoring kept them wrong.
 
 ### 8.3 Cost
 
-Tokens per model call did not move: about 28k prompt tokens on every arm, over 87% of them
-cache reads on every arm. The skill index, at 60 characters a line, is under a thousand tokens
-of that; the tool array under the API server is 21 to 35 tools, of which the filter hid one to
-a dozen; the MCP tools were already behind the harness's own search bridge. On this profile the
-prompt is the persona and the harness's standing instructions, and scoping the catalogue cannot
-shrink it. Wall time per run rose slightly under `scoped` (median 74 s against 70 s on the
-shipped rung, 86 s against 77 s on the grown), which is the cost of loading a skill more often.
-The token claim in §1 therefore does not hold for this profile as shipped; it holds where the
-tool schemas are in the prompt and where the catalogue keeps growing, and the run measured
-neither.
+| Per run, medians                | stock | fulldesc | scoped | stock | fulldesc | scoped |
+| ------------------------------- | ----- | -------- | ------ | ----- | -------- | ------ |
+| catalogue                       | 44    | 44       | 44     | 104   | 104      | 104    |
+| prompt tokens, first model call | 28.4k | 31.3k    | 28.3k  | 30.4k | 38.6k    | 29.7k  |
+| input tokens, whole run         | 309k  | 328k     | 306k   | 318k  | 399k     | 321k   |
+| cache-read share of input       | 92%   | 94%      | 88%    | 93%   | 93%      | 88%    |
+| wall seconds                    | 70    | 120      | 74     | 77    | 129      | 92     |
+| seconds to first tool call      | 8.7   | 15.5     | 7.3    | 8.4   | 17.9     | 7.5    |
+
+The prompt is about 28k tokens on every arm because it is the persona and the harness's standing
+instructions; the skill index at 60 characters a line is under a thousand tokens of that, the
+tool array under the API server is 21 to 35 tools of which the filter hid one to a dozen, and the
+MCP tools were already behind the harness's own search bridge. What the table does show is the
+cost of the obvious alternative: full descriptions for every skill add 3k tokens to every call on
+the shipped catalogue and 10k on the grown one, and double the time to the first tool call.
+`scoped` delivers the descriptions that matter at the token cost of `stock`, and at 104 skills it
+is already 800 tokens a call cheaper than the truncated index. The token claim in §1 therefore
+holds as a function of catalogue size and of where the tool schemas sit, and on this profile as
+shipped it is small; the accuracy claim is what the run supports.
 
 ### 8.4 What the shadow record said before enforcement
 
 Phase 0's exit test asked whether the would-be miss rate under the default budget is under 5%.
-In the `stock` arms, where the plugin only recorded, 16 of 50 skill loads on the shipped rung
-and 28 of 58 on the grown rung were outside the working set the ranker would have shown. That
-is a third to a half, far past the threshold, and it is the number that says the v1 ranker
-needs the metadata it does not yet have (triggers, domain tags) before it could be the only
-route to a skill. It is also why the shelf is not optional.
+In the `stock` arms, where the plugin only recorded, 16 of 50 skill loads on the shipped rung and
+28 of 58 on the grown rung were outside the working set the ranker would have shown. That is a
+third to a half, far past the threshold, and it is the number that says the v1 ranker needs the
+metadata it does not yet have (triggers, domain tags) before it could be the only route to a
+skill. It is also why the shelf is not optional.
 
 ### 8.5 What changed in the design because of the run
 
-- The token argument moves from §1's headline to a conditional: it depends on the tool array
-  being in the prompt and on catalogue growth, and is not a reason to scope this profile today.
+- The token argument moves from §1's headline to a conditional on catalogue size and tool-schema
+  placement; on this profile today the case for scoping is accuracy, and the case against the
+  full-description fix on its own is cost.
 - The shelf is load-bearing, measured at a third of loads, and a names-only index with no
-  per-turn descriptions would have been a regression, which matches the upstream finding cited
-  in §1.3.
+  per-turn descriptions would have been a regression, which matches the upstream finding cited in
+  §1.3.
 - The chooser problem on this profile is under-use of skills, not wrong use. Injected full
-  descriptions for a handful of candidates is what moved it; the `fulldesc` arm (§8.6) is the
-  test of whether descriptions alone do the same.
+  descriptions for a handful of candidates moved it; full descriptions for all of them did not.
 - The ranker's offline misses reproduce in the run as the probes that regress. The metadata
   sidecar in §4.2 is the fix and is now the first item of the next phase, ahead of tools.
+- The bench-side verifier gap in §11 has a concrete shape: every number above came from a driver
+  that reads the tool-call trace, and the harness records the same trace today.
 
-### 8.6 Pending cells
+### 8.6 The repeat on Gemini 3.5 Flash
 
-The `fulldesc` arm on both rungs and the Gemini 3.5 Flash repeat of every cell were still
-running when this section was written; this subsection is replaced by their numbers when they
-land.
+Pending: the same six cells were re-run on `gemini/gemini-3.5-flash`, the model production
+answers with today, and this subsection is replaced by their numbers when the run completes.
 
 ## 9. Integration with Hermes
 
