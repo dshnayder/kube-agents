@@ -49,14 +49,14 @@
 # two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
 # the infra lock with the two incumbents) and consistency-no-environment-label
-# (#1818, ~32min at its measured 390s/946s/603s -- a full fleet audit, and the
-# spread is the audit band's, not this case's). Forty-two cases, ~925-945min
-# serial. The
+# (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
+# spread is the audit band's, not this case's, so it takes the 900s hint the
+# band uses rather than its mean). Forty-two cases, ~921-941min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~805-825min, over the deadline; 480m holds only if the nightly,
+# would be ~800-820min, over the deadline; 480m holds only if the nightly,
 # alone on the model quota at that hour and two lanes wider, realises ~1.9x
 # or better. Night one (2026-09-16, build 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
