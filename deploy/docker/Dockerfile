@@ -192,20 +192,19 @@ COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gat
 # chain measured against Docker's layer-depth ceiling, which a build from here
 # broke through once already (f9f1747c, 2026-08-07). A new build gate does not
 # buy a layer.
-# capability_scope experiment (experiments/capability-scope-ab/): environment-gated seams for
-# a names-only skill index, the description limit, extra skill dirs, and a per-turn tool filter.
-# Inert unless the KA_* variables are set.
-COPY deploy/docker/patches/apply_capability_scope.py /tmp/capability-scope/
-RUN /opt/hermes/.venv/bin/python3 /tmp/capability-scope/apply_capability_scope.py /opt/hermes && \
-    grep -qF 'ka_capability_scope' /opt/hermes/agent/conversation_loop.py && \
-    grep -qF 'KA_SKILLS_INDEX_MODE' /opt/hermes/agent/prompt_builder.py && \
-    rm -rf /tmp/capability-scope
-
+# The capability_scope experiment's applier and verifier ride in this COPY and RUN so they add
+# no layers: environment-gated seams for a names-only skill index, the description limit, extra
+# skill dirs, and a per-turn tool filter (bench/experiments/capability-scope-ab/). Inert unless
+# the KA_* variables are set; the verifier exercises each seam both ways before the layer lands.
 COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
+     deploy/docker/patches/apply_capability_scope.py \
+     deploy/docker/patches/verify_capability_scope.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-progress/
-RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_capability_scope.py /opt/hermes && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/verify_capability_scope.py && cd / && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers.py && \
     grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
@@ -1300,7 +1299,7 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
-RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel --ref b7ece46a5c883a619686b6c698b0316d9fd50962 && \
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 

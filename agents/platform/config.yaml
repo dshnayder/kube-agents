@@ -262,4 +262,3 @@ plugins:
     - hermes_otel
     - tool_call_audit
     - incident_context
-    - capability_scope

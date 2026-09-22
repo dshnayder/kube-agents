@@ -7,7 +7,7 @@ export PATH=$HOME/bin:$PATH
 readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
-readonly HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$0")" && pwd); readonly HERE
 CTX=${CTX:-csc-adc}; export CTX
 readonly NS=kubeagents-system
 readonly LOCAL_PORT=${LOCAL_PORT:-18642}
@@ -18,6 +18,7 @@ readonly LOCAL_PORT=${LOCAL_PORT:-18642}
 readonly TARGET=deploy/platform-agent-gateway
 readonly TARGET_PORT=8642
 readonly PF_RESTART_SECONDS=3
+readonly PF_WARMUP_SECONDS=5
 mkdir -p "$OUT_ROOT"
 gateway_pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep platform-agent-gateway | grep -v Terminating | head -1 | sed 's#pod/##')
 PLATFORM_AGENT_TOKEN=$(kubectl --context "$CTX" -n "$NS" exec "$gateway_pod" -c platform-agent -- sh -c 'env | grep ^API_SERVER_KEY= | cut -d= -f2-')
@@ -25,6 +26,6 @@ export PLATFORM_AGENT_TOKEN
 ( while true; do kubectl --context "$CTX" -n "$NS" port-forward "$TARGET" "$LOCAL_PORT:$TARGET_PORT" >> "$OUT_ROOT/port-forward.log" 2>&1; sleep "$PF_RESTART_SECONDS"; done ) &
 PF_LOOP=$!
 trap 'kill $PF_LOOP 2>/dev/null; pkill -P $PF_LOOP 2>/dev/null' EXIT
-sleep 5
+sleep "$PF_WARMUP_SECONDS"
 BASE="http://127.0.0.1:$LOCAL_PORT"; export BASE
 "$HERE/run_matrix.sh" "$OUT_ROOT" "$REPS" "$PARALLEL"

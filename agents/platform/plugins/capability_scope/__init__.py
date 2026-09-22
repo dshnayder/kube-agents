@@ -1,4 +1,7 @@
-"""Hermes plugin entry point for the capability-scoping prototype (see scope.py)."""
+"""Hermes plugin entry point for the capability-scoping prototype (see scope.py).
+
+Inert unless KA_SCOPE_MODE is set, whether in the environment or in the control file below.
+"""
 
 import logging
 import os
@@ -7,33 +10,37 @@ import sys
 
 CONTROL_FILE_ENV = "KA_SCOPE_CONTROL_FILE"
 DEFAULT_CONTROL_FILE = "/opt/data/capability_scope.env"
-CONTROL_PREFIXES = ("KA_", "HERMES_MAX_ITERATIONS")
+CONTROL_PREFIX = "KA_"
 
 logger = logging.getLogger("hermes.plugin.capability_scope")
 
 
-def _load_control_file() -> None:
-    """Load the arm's variables from a file on the data volume.
+def load_control_file(path: pathlib.Path | None = None, environ: dict | None = None) -> list[str]:
+    """Load the arm's variables from a file on the data volume; return the keys it set.
 
     The operator does not pass spec.deployment.env to the gateway container, so the experiment
-    switches arms by rewriting this file and restarting the gateway. Only experiment keys are
-    read, and a value already present in the environment wins.
+    switches arms by rewriting this file and restarting the gateway. Only KA_* keys are read, and
+    a value already present in the environment wins.
     """
-    path = pathlib.Path(os.environ.get(CONTROL_FILE_ENV, DEFAULT_CONTROL_FILE))
+    env = os.environ if environ is None else environ
+    path = path or pathlib.Path(env.get(CONTROL_FILE_ENV, DEFAULT_CONTROL_FILE))
     if not path.is_file():
-        return
+        return []
+    applied: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        if key.startswith(CONTROL_PREFIXES) and key not in os.environ:
-            os.environ[key] = value.strip()
-    logger.info("capability_scope: control file %s loaded", path)
+        if key.startswith(CONTROL_PREFIX) and key not in env:
+            env[key] = value.strip()
+            applied.append(key)
+    logger.info("capability_scope: control file %s loaded (%d keys)", path, len(applied))
+    return applied
 
 
-_load_control_file()
+load_control_file()
 
 from . import scope  # noqa: E402  (after the control file so scope reads the arm's values)
 
@@ -46,7 +53,6 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", scope.handle_pre_llm_call)
     ctx.register_hook("pre_tool_call", scope.handle_pre_tool_call)
     ctx.register_hook("post_api_request", scope.handle_post_api_request)
-    ctx.register_hook("on_session_end", scope.handle_session_end)
 
 
-__all__ = ["register", "scope"]
+__all__ = ["register", "scope", "load_control_file"]

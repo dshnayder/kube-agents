@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-time patch for the capability-scoping experiment (experiments/capability-scope-ab/).
+"""Build-time patch for the capability-scoping experiment (bench/experiments/capability-scope-ab/).
 
 Four small, environment-gated changes to the Hermes runtime. With none of the variables set the
 runtime behaves exactly as shipped, which is what makes one image serve every arm of the A/B.
@@ -98,8 +98,9 @@ replace_once(
 """
     % (INDEX_MODE_ENV, DESC_LIMIT_ENV),
 )
-# The disk snapshot is keyed on the skills directory manifest alone; skip it when the experiment
-# variables are set so an arm never reads the previous arm's render.
+# The disk snapshot is keyed on the skills directory manifest alone and stores descriptions
+# already cut to the limit, so both sides are gated: an arm with the variables set neither reads
+# a snapshot another arm wrote nor writes one for the next arm to read.
 replace_once(
     PROMPT_BUILDER,
     """    snapshot_path = _skills_prompt_snapshot_path()
@@ -112,6 +113,21 @@ replace_once(
         return None
     if not snapshot_path.exists():
         return None
+"""
+    % (INDEX_MODE_ENV, DESC_LIMIT_ENV),
+)
+replace_once(
+    PROMPT_BUILDER,
+    """    \"\"\"Persist skill metadata to disk for fast cold-start reuse.\"\"\"
+    payload = {
+        "version": _SKILLS_SNAPSHOT_VERSION,
+""",
+    """    \"\"\"Persist skill metadata to disk for fast cold-start reuse.\"\"\"
+    import os as _ka_os
+    if _ka_os.environ.get("%s") or _ka_os.environ.get("%s"):
+        return
+    payload = {
+        "version": _SKILLS_SNAPSHOT_VERSION,
 """
     % (INDEX_MODE_ENV, DESC_LIMIT_ENV),
 )

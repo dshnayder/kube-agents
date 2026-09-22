@@ -40,6 +40,8 @@ DEFAULT_PARALLEL = 3
 CONVERSATION_PREFIX = "csc-ab"
 POST_TURN_SETTLE_SECONDS = 2
 DEFAULT_PROMPT_PREFIX = ""
+CONVERSATION_SUFFIX_HEX = 6
+WALL_SECONDS_DECIMALS = 2
 
 
 def _request(method: str, url: str, token: str, body: dict | None = None) -> tuple[int, dict, dict]:
@@ -67,7 +69,7 @@ def run_one(base: str, token: str, scenario: dict, rep: int, label: str, out_dir
     out_path = out_dir / f"{scenario['id']}-r{rep}.json"
     if out_path.exists():
         return {"id": scenario["id"], "rep": rep, "skipped": True}
-    conversation = f"{CONVERSATION_PREFIX}-{label}-{scenario['id']}-r{rep}-{uuid.uuid4().hex[:6]}"
+    conversation = f"{CONVERSATION_PREFIX}-{label}-{scenario['id']}-r{rep}-{uuid.uuid4().hex[:CONVERSATION_SUFFIX_HEX]}"
     body = {"model": MODEL_NAME, "conversation": conversation, "input": prefix + scenario["prompt"]}
     started = time.time()
     status, payload, headers = 0, {}, {}
@@ -114,7 +116,7 @@ def run_one(base: str, token: str, scenario: dict, rep: int, label: str, out_dir
         "http_status": status,
         "started": started,
         "ended": ended,
-        "wall_seconds": round(ended - started, 2),
+        "wall_seconds": round(ended - started, WALL_SECONDS_DECIMALS),
         "tool_calls": calls,
         "usage": payload.get("usage") if isinstance(payload, dict) else None,
         "final_text": "\n".join(

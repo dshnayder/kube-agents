@@ -1,17 +1,20 @@
 """Prototype of the capability-scoping layer in docs/designs/context-scoped-capabilities.md.
 
 Experiment code, not a shipped feature. It runs as a Hermes plugin on the Platform Agent profile
-and does three things, all controlled by environment variables so one image serves every arm of
-the A/B in experiments/capability-scope-ab/:
+and does nothing at all unless KA_SCOPE_MODE is set. With it set, one image serves every arm of
+the A/B in bench/experiments/capability-scope-ab/:
 
-* Records, for every turn, what the model was shown and what it used (the design's scoping
-  record) as JSON lines. With KA_SCOPE_MODE=off this is the whole effect: shadow mode.
-* With KA_SCOPE_MODE=skills, ranks the skill catalogue against the turn's user message and
-  injects the top-K full descriptions into the user message through the pre_llm_call hook. The
-  system-prompt index is expected to be names-only (KA_SKILLS_INDEX_MODE=names, applied by
-  deploy/docker/patches/apply_capability_scope.py), so this block is where descriptions come from.
-* With KA_SCOPE_MODE=skills+tools, also filters the tool array sent to the model to a pinned set
-  plus the top-N ranked tools. The conversation loop calls filter_tools() through the same patch.
+* KA_SCOPE_MODE=off        shadow mode: rank skills and tools against each turn's user message,
+                           record what the model was shown and what it used (the design's scoping
+                           record) as JSON lines, and change nothing the model sees.
+* KA_SCOPE_MODE=skills     also inject the top-K skills' full descriptions into the user message
+                           through the pre_llm_call hook. The system-prompt index is expected to be
+                           names-only (KA_SKILLS_INDEX_MODE=names, applied by
+                           deploy/docker/patches/apply_capability_scope.py).
+* KA_SCOPE_MODE=skills+tools  also filter the tool array sent to the model to a pinned set plus the
+                           top-N ranked tools, with the hidden names carried as a shelf on the search
+                           tool's description. The conversation loop calls filter_tools() through
+                           the same patch.
 
 The ranker is BM25 over catalogue metadata (skill name and description; tool name, description
 and parameter names). No model call, no side effects, per the design's constraint.
@@ -36,6 +39,7 @@ MODE_ENV = "KA_SCOPE_MODE"
 MODE_OFF = "off"
 MODE_SKILLS = "skills"
 MODE_SKILLS_TOOLS = "skills+tools"
+MODES = (MODE_OFF, MODE_SKILLS, MODE_SKILLS_TOOLS)
 K_SKILLS_ENV = "KA_SCOPE_K_SKILLS"
 N_TOOLS_ENV = "KA_SCOPE_N_TOOLS"
 RECORD_PATH_ENV = "KA_SCOPE_RECORD"
@@ -53,9 +57,13 @@ DEFAULT_PINNED_TOOLS = (
     "skills_list", "skill_view", "skill_manage", "execute_code",
     "tool_search", "tool_describe", "tool_call", "clarify", "todo",
 )
+# The shelf rides on the first of these that survives filtering; tool_search is pinned by default.
+SHELF_CARRIER_TOOLS = ("tool_search", "skills_list", "terminal")
 SKILL_FILE = "SKILL.md"
 SKILLS_SUBDIR = "skills"
 STICKY_TURNS = 5
+SESSION_TTL_SECONDS = 3600
+CATALOGUE_TTL_SECONDS = 300
 BM25_K1 = 1.5
 BM25_B = 0.75
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -64,6 +72,15 @@ STOPWORDS = frozenset(
     "your our my we i how what which do does can should would will not no into over under".split()
 )
 MIN_TOKEN_LEN = 2
+# The stemmer is pinned to what the recorded run used (results/ in the experiment directory); it
+# does not fold `upgrades` and `upgrade`, and test_scope.py pins that so a change to it is a
+# deliberate re-run rather than a silent drift of the record.
+STEM_SUFFIXES = ("ations", "ation", "ings", "ing", "ers", "er", "ies", "es", "s")
+MIN_STEM_LEN = 4
+NAME_BOOST = 3
+SCORE_DECIMALS = 3
+SIGNAL_HASH_LEN = 16
+MAX_SIGNAL_CHARS = 4000
 SKILLS_HEADER = "[SKILLS RELEVANT TO THIS REQUEST]"
 SKILLS_PREAMBLE = (
     "The system prompt lists every skill by name. These are the ones most relevant to the "
@@ -73,25 +90,18 @@ SKILLS_FOOTER = (
     "If one of these fits, load it with skill_view(name) before acting. If none fits, "
     "call skills_list to see every skill with its description."
 )
-TOOLS_SHELF_HEADER = "[TOOLS NOT LOADED THIS TURN]"
 TOOLS_SHELF_TEXT = (
-    "These tools exist but are not loaded for this request; say which one you need and it "
-    "will be available on the next turn: "
+    " Tools that exist but are not loaded for this request: {names}. Name the one you need in "
+    "your reply and it loads on the next turn."
 )
 DESCRIPTION_KEY = "description"
 NAME_KEY = "name"
 FRONTMATTER_DELIM = "---"
-SIGNAL_HASH_LEN = 16
-MAX_SIGNAL_CHARS = 4000
-
-
-STEM_SUFFIXES = ("ations", "ation", "ings", "ing", "ers", "er", "ies", "es", "s")
-MIN_STEM_LEN = 4
-NAME_BOOST = 3
 
 
 def _stem(token: str) -> str:
-    """A crude suffix stripper: enough to fold PVCs/PVC, autoscaling/autoscaler, upgrades/upgrade."""
+    """A crude single-suffix stripper (v1): folds autoscaling/autoscaler and pods/pod, and not
+    upgrades/upgrade or PVCs/PVC. Known weakness, kept as the run had it."""
     for suffix in STEM_SUFFIXES:
         if token.endswith(suffix) and len(token) - len(suffix) >= MIN_STEM_LEN:
             return token[: -len(suffix)]
@@ -188,7 +198,11 @@ def _skills_dirs() -> List[Path]:
 
 
 def load_skill_catalogue() -> List[Dict[str, str]]:
-    """Every SKILL.md under the profile's skills dir and any extra dirs, as name/description."""
+    """Every SKILL.md under the profile's skills dir and any extra dirs, as name/description.
+
+    This walks the directories directly; Hermes's own environment and platform gates on skills
+    are not applied, so the catalogue can be a superset of the rendered index.
+    """
     seen: Dict[str, Dict[str, str]] = {}
     for base in _skills_dirs():
         if not base.is_dir():
@@ -218,11 +232,16 @@ class _State:
 
 
 _state = _State()
-CATALOGUE_TTL_SECONDS = 300
 
 
-def _mode() -> str:
-    return (os.environ.get(MODE_ENV) or MODE_OFF).strip().lower()
+def mode() -> Optional[str]:
+    """The arm, or None when the plugin is inert. Unset means inert; an unknown value is inert too."""
+    raw = (os.environ.get(MODE_ENV) or "").strip().lower()
+    return raw if raw in MODES else None
+
+
+def enabled() -> bool:
+    return mode() is not None
 
 
 def _int_env(name: str, default: int) -> int:
@@ -240,7 +259,9 @@ def _record_path() -> Path:
 
 
 def record(event: str, **fields: Any) -> None:
-    payload = {"event": event, "ts": time.time(), "mode": _mode(), **fields}
+    if not enabled():
+        return
+    payload = {"event": event, "ts": time.time(), "mode": mode(), **fields}
     line = json.dumps(payload, default=str)
     try:
         path = _record_path()
@@ -266,25 +287,35 @@ def _ensure_skills_index() -> None:
 
 
 def _session(session_id: str) -> Dict[str, Any]:
+    """Per-session working-set state; callers hold the lock. Evicts sessions idle past the TTL,
+    which is the bound on memory: Hermes fires on_session_end after every message, so that hook
+    cannot be used to clear state without losing the sticky set between turns."""
+    now = time.time()
+    for sid in [sid for sid, st in _state.sessions.items() if now - st["last_seen"] > SESSION_TTL_SECONDS]:
+        del _state.sessions[sid]
     s = _state.sessions.get(session_id)
     if s is None:
-        s = {"turn": 0, "signal": "", "skills": {}, "tools": {}, "turn_id": "", "recorded_tools_turn": -1}
+        s = {"turn": 0, "signal": "", "skills": {}, "tools": {}, "hidden_tools": [], "turn_id": "",
+             "recorded_tools_turn": -1, "turn_started": 0.0}
         _state.sessions[session_id] = s
+    s["last_seen"] = now
     return s
 
 
 def _sticky_update(active: Dict[str, int], ranked: Iterable[str], turn: int, budget: int) -> List[str]:
-    """Sticky working set: new entries by rank, eviction by disuse, budget as an upper bound."""
-    for name in ranked:
-        if len([n for n, t in active.items() if turn - t < STICKY_TURNS]) >= budget and name not in active:
-            break
+    """Sticky working set. This turn's top entries always enter; entries from earlier turns are
+    carried while they are younger than STICKY_TURNS, most recent first, up to as many again as
+    the fresh budget, so the working set is at most twice `budget` and a stale set can never
+    crowd out what this turn ranked. `active` maps a name to the turn it last ranked in."""
+    fresh = list(dict.fromkeys(ranked))[:budget]
+    for name in fresh:
         active[name] = turn
     for name in [n for n, t in list(active.items()) if turn - t >= STICKY_TURNS]:
         del active[name]
-    while len(active) > budget:
-        oldest = min(active.items(), key=lambda kv: kv[1])[0]
-        del active[oldest]
-    return sorted(active, key=lambda n: -active[n])
+    carried = sorted((n for n in active if n not in fresh), key=lambda n: -active[n])[: max(0, 2 * budget - len(fresh))]
+    for name in [n for n in active if n not in fresh and n not in carried]:
+        del active[name]
+    return fresh + carried
 
 
 def _pinned(env: str, default: Sequence[str]) -> List[str]:
@@ -301,11 +332,12 @@ def rank_skills(signal: str, k: int) -> List[Tuple[str, float]]:
 
 
 def handle_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
+    if not enabled():
+        return None
     session_id = str(kw.get("session_id") or "")
     user_message = kw.get("user_message")
     signal = (user_message if isinstance(user_message, str) else json.dumps(user_message, default=str))[:MAX_SIGNAL_CHARS]
     k = _int_env(K_SKILLS_ENV, DEFAULT_K_SKILLS)
-    mode = _mode()
     with _state.lock:
         s = _session(session_id)
         s["turn"] += 1
@@ -313,6 +345,10 @@ def handle_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
         s["turn_id"] = str(kw.get("turn_id") or "")
         s["turn_started"] = time.time()
         turn = s["turn"]
+        # A tool the model was told about on the shelf and named in this message joins the set.
+        named = [t for t in s["hidden_tools"] if t in signal]
+        for t in named:
+            s["tools"][t] = turn
     ranked = rank_skills(signal, max(k, 1))
     pinned = _pinned(PINNED_SKILLS_ENV, ())
     with _state.lock:
@@ -325,11 +361,12 @@ def handle_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
         turn_id=s["turn_id"],
         signal_sha=hashlib.sha256(signal.encode("utf-8")).hexdigest()[:SIGNAL_HASH_LEN],
         catalogue_skills=len(_state.skills),
-        skills_ranked=[[n, round(sc, 3)] for n, sc in ranked],
+        skills_ranked=[[n, round(sc, SCORE_DECIMALS)] for n, sc in ranked],
         skills_shown=shown,
+        tools_named_from_shelf=named,
         k=k,
     )
-    if mode not in (MODE_SKILLS, MODE_SKILLS_TOOLS):
+    if mode() not in (MODE_SKILLS, MODE_SKILLS_TOOLS):
         return None
     lines = [SKILLS_HEADER, SKILLS_PREAMBLE]
     for name in shown:
@@ -360,33 +397,47 @@ def _tool_doc(tool: Dict[str, Any]) -> str:
     return f"{(name.replace('_', ' ') + ' ') * NAME_BOOST}{desc} {ptext}"
 
 
+def _with_shelf(tool: Dict[str, Any], hidden: List[str]) -> Dict[str, Any]:
+    """A copy of `tool` whose description carries the names of the tools not loaded this turn."""
+    shelf = TOOLS_SHELF_TEXT.format(names=", ".join(hidden))
+    copy = json.loads(json.dumps(tool))
+    target = copy.get("function") if isinstance(copy.get("function"), dict) else copy
+    target["description"] = str(target.get("description") or "") + shelf
+    return copy
+
+
 def filter_tools(agent: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Called by the patched conversation loop before each model request."""
-    if _mode() != MODE_SKILLS_TOOLS or not tools:
+    """Called by the patched conversation loop before each model request.
+
+    Ranks and records in every mode so the shadow record covers tools; enforces only in
+    skills+tools. Returns `tools` unchanged whenever it cannot or should not scope.
+    """
+    if not enabled() or not tools:
         return tools
     session_id = str(getattr(agent, "session_id", "") or "")
+    names = [_tool_name(t) for t in tools]
+    key = tuple(names)
     with _state.lock:
         s = _session(session_id)
         signal = s["signal"]
         turn = s["turn"]
-    if not signal:
+        if _state.tools_index_key != key:
+            _state.tools_index = BM25([(n, _tool_doc(t)) for n, t in zip(names, tools)])
+            _state.tools_index_key = key
+        index = _state.tools_index
+    if not signal or index is None:
         return tools
-    names = [_tool_name(t) for t in tools]
-    key = tuple(names)
-    if _state.tools_index_key != key:
-        _state.tools_index = BM25([(n, _tool_doc(t)) for n, t in zip(names, tools)])
-        _state.tools_index_key = key
-    assert _state.tools_index is not None
     pinned = set(_pinned(PINNED_TOOLS_ENV, DEFAULT_PINNED_TOOLS))
     n = _int_env(N_TOOLS_ENV, DEFAULT_N_TOOLS)
-    ranked = [name for name, _ in _state.tools_index.score(signal) if name not in pinned][:n]
+    ranked = [name for name, _ in index.score(signal) if name not in pinned][:n]
     with _state.lock:
         extra = _sticky_update(s["tools"], ranked, turn, n)
         already = s["recorded_tools_turn"] == turn
         s["recorded_tools_turn"] = turn
-    keep = pinned | set(extra)
-    shown = [t for t, name in zip(tools, names) if name in keep]
-    hidden = [name for name in names if name not in keep]
+        keep = pinned | set(extra)
+        hidden = [name for name in names if name not in keep]
+        s["hidden_tools"] = hidden
+    enforce = mode() == MODE_SKILLS_TOOLS
     if not already:
         record(
             "tools",
@@ -395,54 +446,59 @@ def filter_tools(agent: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]
             tools_total=len(tools),
             tools_shown=[name for name in names if name in keep],
             tools_hidden=hidden,
+            enforced=enforce,
             n=n,
         )
+    if not enforce or not hidden:
+        return tools
+    shown = [t for t, name in zip(tools, names) if name in keep]
+    shown_names = [_tool_name(t) for t in shown]
+    for carrier in SHELF_CARRIER_TOOLS:  # preference order, not array order
+        if carrier in shown_names:
+            i = shown_names.index(carrier)
+            shown[i] = _with_shelf(shown[i], hidden)
+            break
     return shown
 
 
 def handle_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **kw: Any) -> None:
+    if not enabled():
+        return None
     session_id = str(kw.get("session_id") or "")
     with _state.lock:
         s = _state.sessions.get(session_id)
         turn = s["turn"] if s else None
         started = s.get("turn_started") if s else None
         shown_skills = list(s["skills"]) if s else []
-        shown_tools = list(s["tools"]) if s else []
+        shown_tools = set(s["tools"]) if s else set()
     skill = None
     if tool_name == "skill_view" and isinstance(args, dict):
         skill = args.get("name")
+    pinned = set(_pinned(PINNED_TOOLS_ENV, DEFAULT_PINNED_TOOLS))
     record(
         "tool_call",
         session_id=session_id,
         turn=turn,
         tool_name=tool_name,
         skill=skill,
-        since_turn_start=(round(time.time() - started, 3) if started else None),
+        since_turn_start=(round(time.time() - started, SCORE_DECIMALS) if started else None),
         skill_in_working_set=(skill in shown_skills) if skill else None,
-        tool_in_working_set=(tool_name in shown_tools or tool_name in set(_pinned(PINNED_TOOLS_ENV, DEFAULT_PINNED_TOOLS))),
-        query=(args.get("query") if isinstance(args, dict) and tool_name == "tool_search" else None),
+        tool_in_working_set=(tool_name in shown_tools or tool_name in pinned),
     )
     return None
 
 
 def handle_post_api_request(**kw: Any) -> None:
+    if not enabled():
+        return None
     usage = kw.get("usage")
     record(
         "api",
         session_id=str(kw.get("session_id") or ""),
         api_call_count=kw.get("api_call_count"),
         api_duration=kw.get("api_duration"),
-        started_at=kw.get("started_at"),
-        ended_at=kw.get("ended_at"),
         model=kw.get("model"),
         finish_reason=kw.get("finish_reason"),
         usage=usage if isinstance(usage, dict) else None,
     )
-    return None
-
-
-def handle_session_end(**kw: Any) -> None:
-    session_id = str(kw.get("session_id") or "")
-    with _state.lock:
-        _state.sessions.pop(session_id, None)
     return None

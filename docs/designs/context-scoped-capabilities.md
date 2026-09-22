@@ -410,7 +410,7 @@ those skills. This is the loop that keeps running after the design is done.
 
 The plan in §7 was run once, on 2026-09-21, against a dedicated install with the Platform Agent
 as the front door. The method, code and probes are in
-[`experiments/capability-scope-ab/`](../../experiments/capability-scope-ab/README.md), and the
+[`experiments/capability-scope-ab/`](../../bench/experiments/capability-scope-ab/README.md), and the
 scored tables, one row per run, are committed under its `results/` directory; the raw transcripts
 and per-turn records stayed on the machine that ran them. Every number below is in those files.
 

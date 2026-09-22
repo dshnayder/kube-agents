@@ -5,11 +5,13 @@
 #   arm:  stock | fulldesc | scoped-skills | scoped-all
 #   rung: shipped | grown
 #
-# The arm is a set of environment variables on the PlatformAgent CR (spec.deployment.env), read
-# by the capability_scope plugin and by the build-time patch in the image. The rung adds the
-# distractor skills directory (already copied onto the agent's data volume) to the catalogue.
-# Every switch rolls the gateway, and the skills-index render is rebuilt because the patch keys
-# its cache on these variables and skips the disk snapshot while they are set.
+# The arm is a set of KA_* variables written to a control file on the agent's data volume, which
+# the capability_scope plugin loads into the environment at start-up (the operator does not pass
+# spec.deployment.env to the gateway container). The rung adds the distractor skills directory
+# (already copied onto the data volume) to the catalogue. Every switch restarts the gateway, and
+# the skills-index render is rebuilt because the patch keys its cache on these variables and
+# skips the disk snapshot while they are set. The per-turn cap is not set here: it comes from
+# spec.harness.tuning.platform.maxTurns on the CR.
 set -euo pipefail
 export PATH=$HOME/bin:$PATH
 
@@ -22,10 +24,10 @@ readonly DISTRACTOR_DIR=/opt/data/distractor-skills
 readonly DESC_UNLIMITED=100000
 readonly K_SKILLS=${K_SKILLS:-6}
 readonly N_TOOLS=${N_TOOLS:-6}
-readonly MAX_ITERATIONS=${MAX_ITERATIONS:-8}
 readonly ROLLOUT_TIMEOUT=600s
 readonly GATEWAY_DEPLOY=${GATEWAY_DEPLOY:-platform-agent-gateway}
 readonly SETTLE_SECONDS=45
+readonly RESTART_SETTLE_SECONDS=5
 readonly CONTROL_FILE=/opt/data/capability_scope.env
 
 index_mode=""; desc_limit=""; scope_mode="off"
@@ -55,10 +57,9 @@ KA_EXTRA_SKILLS_DIRS=$extra_dirs
 KA_SCOPE_K_SKILLS=$K_SKILLS
 KA_SCOPE_N_TOOLS=$N_TOOLS
 KA_SCOPE_RECORD=/opt/data/capability_scope-$label.jsonl
-HERMES_MAX_ITERATIONS=$MAX_ITERATIONS
 CTRL
 kubectl --context "$CTX" -n "$NS" rollout restart "deploy/$GATEWAY_DEPLOY"
-sleep 5
+sleep "$RESTART_SETTLE_SECONDS"
 kubectl --context "$CTX" -n "$NS" rollout status "deploy/$GATEWAY_DEPLOY" --timeout="$ROLLOUT_TIMEOUT"
 sleep "$SETTLE_SECONDS"
 pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | grep -v Terminating | head -1 | sed 's#pod/##')

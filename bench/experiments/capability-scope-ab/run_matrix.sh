@@ -11,7 +11,7 @@ export PATH=$HOME/bin:$PATH
 readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
-readonly HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$0")" && pwd); readonly HERE
 CTX=${CTX:-csc-adc}; export CTX
 readonly NS=kubeagents-system
 BASE=${BASE:-http://127.0.0.1:18642}
@@ -21,7 +21,7 @@ readonly PREFIX=${PREFIX:-"Work only on the cluster you run on and keep the inve
 readonly GATEWAY_DEPLOY=${GATEWAY_DEPLOY:-platform-agent-gateway}
 # Priority order: the two comparisons that decide the question first, the isolating arm after.
 # scoped-skills is left out by default: under the API server the platform profile exposes 21
-# tools, of which the tool filter hides one, so it would not differ from scoped-all.
+# tools, of which the tool filter hides one (web_extract), so it would not differ from scoped-all.
 readonly DEFAULT_MATRIX="stock:shipped scoped-all:shipped stock:grown scoped-all:grown fulldesc:shipped fulldesc:grown"
 readonly MATRIX=${MATRIX:-$DEFAULT_MATRIX}
 
@@ -35,6 +35,6 @@ for cell in $MATRIX; do
     --out "$OUT_ROOT/$label" --label "$label" --reps "$REPS" --parallel "$PARALLEL" --prefix "$PREFIX" 2>&1 | tee -a "$OUT_ROOT/$label.log"
   pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | head -1 | sed 's#pod/##')
   kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- cat "/opt/data/capability_scope-$label.jsonl" > "$OUT_ROOT/$label/capability_scope.jsonl" 2>/dev/null || echo "no record for $label"
-  echo "== $(date -u +%FT%TZ) done $label ($(ls "$OUT_ROOT/$label"/*.json 2>/dev/null | wc -l) run files)"
+  echo "== $(date -u +%FT%TZ) done $label ($(find "$OUT_ROOT/$label" -name "*-r[0-9]*.json" 2>/dev/null | wc -l) run files)"
 done
 echo "== $(date -u +%FT%TZ) MATRIX DONE"

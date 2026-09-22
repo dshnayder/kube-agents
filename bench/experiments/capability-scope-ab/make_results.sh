@@ -4,9 +4,10 @@
 set -euo pipefail
 readonly RUN_ROOT=${1:?run root}
 readonly NAME=${2:?result name}
-readonly HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$0")" && pwd); readonly HERE
 readonly OUT="$HERE/results"
 readonly CELLS="stock-shipped fulldesc-shipped scoped-all-shipped stock-grown fulldesc-grown scoped-all-grown"
+readonly COMPARE_LINES=3   # the three first-skill lines --compare prints
 mkdir -p "$OUT"
 dirs=()
 for c in $CELLS; do [ -d "$RUN_ROOT/$c" ] && dirs+=("$RUN_ROOT/$c"); done
@@ -15,11 +16,11 @@ python3 "$HERE/analyze.py" --runs "${dirs[@]}" --scenarios "$HERE/scenarios.json
 {
   echo; echo "## Comparisons"; echo
   for rung in shipped grown; do
-    for pair in "stock fulldesc" "stock scoped-all" "fulldesc scoped-all"; do
-      set -- $pair
-      [ -d "$RUN_ROOT/$1-$rung" ] && [ -d "$RUN_ROOT/$2-$rung" ] || continue
-      echo "### $1-$rung vs $2-$rung"; echo
-      python3 "$HERE/analyze.py" --runs "$RUN_ROOT/$1-$rung" "$RUN_ROOT/$2-$rung" --scenarios "$HERE/scenarios.json" --compare "$1-$rung" "$2-$rung" | head -3 | sed 's/^/- /'
+    for pair in "stock:fulldesc" "stock:scoped-all" "fulldesc:scoped-all"; do
+      base=${pair%%:*}; treat=${pair##*:}
+      [ -d "$RUN_ROOT/$base-$rung" ] && [ -d "$RUN_ROOT/$treat-$rung" ] || continue
+      echo "### $base-$rung vs $treat-$rung"; echo
+      python3 "$HERE/analyze.py" --runs "$RUN_ROOT/$base-$rung" "$RUN_ROOT/$treat-$rung" --scenarios "$HERE/scenarios.json" --compare "$base-$rung" "$treat-$rung" | head -"$COMPARE_LINES" | sed 's/^/- /'
       echo
     done
   done

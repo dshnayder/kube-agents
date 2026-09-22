@@ -1,6 +1,6 @@
 # Capability-scoping A/B
 
-The experiment behind [`docs/designs/context-scoped-capabilities.md`](../../docs/designs/context-scoped-capabilities.md)
+The experiment behind [`docs/designs/context-scoped-capabilities.md`](../../../docs/designs/context-scoped-capabilities.md)
 §7. It asks one question: when the Platform Agent sees only the skills a turn needs, with the
 rest by name, does it pick the right one more often and cost less than when it sees everything?
 The design document reads the results; this directory holds the method, the code, and under
@@ -25,9 +25,11 @@ same install, image and model.
 | `grown`   | those plus 60 real skills from `google/skills` `skills/cloud/` that the sync does not ship (5 `gke-*` it will ship next run, 55 other Google Cloud products) |
 
 `stock` versus `fulldesc` isolates the description fix from scoping; `fulldesc` versus `scoped-all`
-isolates scoping. A `scoped-skills` arm (skills only, tools untouched) exists in `switch_arm.sh`
-but is not in the default matrix: under the API server the profile exposes 21 tools and the filter
-hides one, so it would not differ from `scoped-all`.
+isolates scoping. The design document calls the `scoped-all` arm `scoped`. A `scoped-skills` arm
+(skills only, tools untouched) exists in `switch_arm.sh` but is not in the default matrix: under
+the API server the profile exposes 21 tools and the filter hides one (`web_extract`, in every
+recorded turn), so it would not differ from `scoped-all`. The measured `scoped-all` arm carried no
+shelf for hidden tools; the plugin gained one after the run.
 
 ## What is measured
 
@@ -37,8 +39,9 @@ From each run's response and session row, and from the plugin's per-turn record:
   `scenarios.json`; on the grown rung an added upstream skill that is a defensible answer counts as
   acceptable (`acceptable_grown`).
 - **Any gold loaded** during the run, and **spurious loads** on the two control probes.
-- **Working-set misses**: on scoped arms, skill loads whose skill was not in the injected top-6,
-  which is the case the names-only shelf has to rescue.
+- **Working-set misses**: on every arm, skill loads whose skill was not in the ranker's top-6.
+  On the stock and full-description arms that is the shadow measurement phase 0 asks for; on the
+  scoped arm it is the case the names-only shelf had to rescue.
 - **Tokens**: input and output per run, cache-read share, prompt tokens of the first model call.
 - **Time**: wall time per run and time to first tool call.
 - **Incomplete runs**: the profile is capped at 10 model iterations per turn
@@ -57,11 +60,12 @@ The prototype is the `capability_scope` plugin (`agents/platform/plugins/capabil
 
 1. Build the image from this branch and install kube-agents with it (the run used a dedicated
    cluster with `platformFrontDoor: true`, so the API server serves the Platform Agent directly,
-   and `--memory=off`).
+   and `--memory=off`). Building needs the hermes-otel plugin pinned to a manifest-v1 commit,
+   which pull request #1820 carries; until it merges, apply that pin locally first.
 2. Copy the distractor skills onto the agent's data volume at `/opt/data/distractor-skills`.
-3. Enable the plugin in the profile's `plugins.enabled` list. In front-door mode the profile's
-   `config.yaml` on the data volume is not re-synced from the image, so an image-side change to the
-   list does not reach an existing install; edit the file on the volume once.
+3. Enable the plugin in the profile's `plugins.enabled` list on the data volume; it is not enabled
+   in the image. In front-door mode the profile's `config.yaml` on the data volume is not re-synced
+   from the image, so edit the file there once.
 4. `run_all.sh <out-root> 3 3` keeps a port-forward to the agent API alive and runs
    `run_matrix.sh`, which for each cell calls `switch_arm.sh <arm> <rung>` and then `run_ab.py`.
 
