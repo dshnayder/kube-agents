@@ -442,24 +442,28 @@ the run, not tuned away, and the prefix effect is a finding in its own right (§
 
 ### 8.2 Selection
 
-Sixty probe runs per cell; the two controls are reported separately.
+Each probe is a request that one skill in the catalogue is written for; that skill is the probe's
+gold skill. The agent reads a skill by calling `skill_view`, so each run is scored by the first
+skill it read: the gold skill, an acceptable alternative listed in the probe, a wrong skill, or
+none at all. Each column is 60 runs: 20 probes, three times each. The two control probes, where
+reading any skill is wrong, are scored separately in the last row.
 
-| First skill loaded               | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
-| -------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
-| catalogue                        | 44     | 44       | 44     | 104    | 104      | 104    |
-| gold                             | 55.0%  | 60.0%    | 68.3%  | 53.3%  | 58.3%    | 78.3%  |
-| acceptable                       | 1.7%   | 0.0%     | 1.7%   | 0.0%   | 8.3%     | 5.0%   |
-| wrong                            | 1.7%   | 0.0%     | 3.3%   | 1.7%   | 3.3%     | 0.0%   |
-| none loaded                      | 41.7%  | 40.0%    | 26.7%  | 45.0%  | 30.0%    | 16.7%  |
-| gold loaded at any point         | 56.7%  | 60.0%    | 71.7%  | 53.3%  | 61.7%    | 78.3%  |
-| spurious loads on control probes | 0 of 6 | 0 of 6   | 0 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
+| Share of runs where the agent...          | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
+| ----------------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
+| skills in the catalogue                   | 44     | 44       | 44     | 104    | 104      | 104    |
+| read the gold skill first                 | 55.0%  | 60.0%    | 68.3%  | 53.3%  | 58.3%    | 78.3%  |
+| read an acceptable alternative first      | 1.7%   | 0.0%     | 1.7%   | 0.0%   | 8.3%     | 5.0%   |
+| read a wrong skill first                  | 1.7%   | 0.0%     | 3.3%   | 1.7%   | 3.3%     | 0.0%   |
+| read no skill                             | 41.7%  | 40.0%    | 26.7%  | 45.0%  | 30.0%    | 16.7%  |
+| read the gold skill at any point          | 56.7%  | 60.0%    | 71.7%  | 53.3%  | 61.7%    | 78.3%  |
+| read any skill on a control probe (count) | 0 of 6 | 0 of 6   | 0 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
 
-On the grown catalogue the gain in gold-first under `scoped` is significant against both other
+On the 104-skill catalogue the rise in runs that read the gold skill first under `scoped` is significant against both other
 arms (two-proportion test: p = 0.004 against `stock`, p = 0.019 against `fulldesc`; 95% interval
 66 to 87 against 41 to 65 and 46 to 70), and so is the drop in runs that load no skill at all
 (p = 0.001 against `stock`). On the shipped catalogue every movement has the same direction and
-about half the size, and none reaches significance at sixty probes (p = 0.13 for gold-first
-against `stock`). `fulldesc` alone moves gold-first by five points on both rungs and does not
+about half the size, and none reaches significance at sixty probes (p = 0.13 for gold skill
+first against `stock`). `fulldesc` alone moves gold skill first by five points on both catalogues and does not
 move the no-skill rate on the shipped one; the descriptions are necessary for the gain and not
 sufficient for it. Wrong picks are rare in every arm. The crowded-list failure in this run is
 not the wrong skill; it is no skill, and scoping reduces that most where the list is longest.
@@ -467,10 +471,10 @@ not the wrong skill; it is no skill, and scoping reduces that most where the lis
 Three details from the per-probe table qualify the averages:
 
 - The regression §6 predicted appears once: the repository-inspection probe went from three gold
-  picks under `stock` to none under `scoped` on the shipped rung, because the ranker leaves that
+  picks under `stock` to none under `scoped` on the 44-skill catalogue, because the ranker leaves that
   skill out of its top six and the names-only shelf did not bring the model to it.
 - Under `scoped`, a quarter to a third of all skill loads were of skills outside the injected six
-  (25 of 78 on the shipped rung, 20 of 82 on the grown), so the shelf carried them; without it
+  (25 of 78 with 44 skills, 20 of 82 with 104), so the shelf carried them; without it
   those would have been misses. The shelf is load-bearing.
 - Under `stock` on the grown catalogue one run loaded a skill that does not exist, a plausible
   name assembled from its neighbours in the list; no scoped run did. Four of the six wrong picks
@@ -482,7 +486,7 @@ Three details from the per-probe table qualify the averages:
 
 | Per run, medians                | stock | fulldesc | scoped | stock | fulldesc | scoped |
 | ------------------------------- | ----- | -------- | ------ | ----- | -------- | ------ |
-| catalogue                       | 44    | 44       | 44     | 104   | 104      | 104    |
+| skills in the catalogue         | 44    | 44       | 44     | 104   | 104      | 104    |
 | prompt tokens, first model call | 28.4k | 31.3k    | 28.3k  | 30.4k | 38.6k    | 29.7k  |
 | input tokens, whole run         | 309k  | 328k     | 306k   | 318k  | 399k     | 321k   |
 | cache-read share of input       | 92%   | 94%      | 88%    | 93%   | 93%      | 88%    |
@@ -504,8 +508,8 @@ shipped it is small; the accuracy claim is what the run supports.
 ### 8.4 What the shadow record said before enforcement
 
 Phase 0's exit test asked whether the would-be miss rate under the default budget is under 5%.
-In the `stock` arms, where the plugin only recorded, 16 of 50 skill loads on the shipped rung and
-28 of 58 on the grown rung were outside the working set the ranker would have shown. That is a
+In the `stock` arms, where the plugin only recorded, 16 of 50 skill loads with 44 skills and
+28 of 58 with 104 were outside the working set the ranker would have shown. That is a
 third to a half, far past the threshold, and it is the number that says the v1 ranker needs the
 metadata it does not yet have (triggers, domain tags) before it could be the only route to a
 skill. It is also why the shelf is not optional.
@@ -525,7 +529,7 @@ skill. It is also why the shelf is not optional.
 - The bench-side verifier gap in §11 has a concrete shape: every number above came from a driver
   that reads the tool-call trace, and the harness records the same trace today.
 - The scoping signal should be the user's ask, not the message as the harness composed it. The
-  driver's framing prefix cut the lexical ranker's gold-first from 13 to 5 probes offline; any
+  driver's framing prefix cut the probes where the lexical ranker put the gold skill first from 13 to 5 offline; any
   text a harness or a channel adapter prepends to the user turn does the same. The signal in
   §4.2 is therefore the user's text before injection, and the design says so.
 
@@ -534,29 +538,31 @@ skill. It is also why the shelf is not optional.
 The same six cells were re-run on `gemini/gemini-3.5-flash`, the model production answers with
 today, through the same install and driver, three hours after the first matrix.
 
-| First skill loaded, Flash        | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
-| -------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
-| catalogue                        | 44     | 44       | 44     | 104    | 104      | 104    |
-| gold                             | 70.0%  | 76.7%    | 76.7%  | 65.0%  | 63.3%    | 73.3%  |
-| acceptable                       | 1.7%   | 3.3%     | 8.3%   | 10.0%  | 13.3%    | 8.3%   |
-| wrong                            | 0.0%   | 1.7%     | 0.0%   | 1.7%   | 1.7%     | 0.0%   |
-| none loaded                      | 28.3%  | 18.3%    | 15.0%  | 23.3%  | 21.7%    | 18.3%  |
-| spurious loads on control probes | 0 of 6 | 0 of 6   | 1 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
-| prompt tokens, first model call  | 29.9k  | 32.9k    | 29.8k  | 34.9k  | 40.1k    | 31.2k  |
-| seconds to first tool call       | 6.1    | 12.1     | 4.7    | 7.2    | 12.2     | 6.5    |
+Scored the same way as §8.2.
 
-Flash loads skills more readily than Pro at baseline (70% gold-first against 55%), so there is
-less headroom, and every movement is smaller: seven to eight points of gold-first on either
-rung, and half the no-skill runs removed on the shipped one. None of the Flash differences is
-significant on its own. The direction is the same in all four model-by-rung comparisons, and
+| Flash: share of runs where the agent...   | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
+| ----------------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
+| skills in the catalogue                   | 44     | 44       | 44     | 104    | 104      | 104    |
+| read the gold skill first                 | 70.0%  | 76.7%    | 76.7%  | 65.0%  | 63.3%    | 73.3%  |
+| read an acceptable alternative first      | 1.7%   | 3.3%     | 8.3%   | 10.0%  | 13.3%    | 8.3%   |
+| read a wrong skill first                  | 0.0%   | 1.7%     | 0.0%   | 1.7%   | 1.7%     | 0.0%   |
+| read no skill                             | 28.3%  | 18.3%    | 15.0%  | 23.3%  | 21.7%    | 18.3%  |
+| read any skill on a control probe (count) | 0 of 6 | 0 of 6   | 1 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
+| prompt tokens, first model call (median)  | 29.9k  | 32.9k    | 29.8k  | 34.9k  | 40.1k    | 31.2k  |
+| seconds to first tool call (median)       | 6.1    | 12.1     | 4.7    | 7.2    | 12.2     | 6.5    |
+
+Flash loads skills more readily than Pro at baseline (70% of runs read the gold skill first, against 55%), so there is
+less headroom, and every movement is smaller: seven to eight points of gold skill first on either
+catalogue, and half the no-skill runs removed on the shipped one. None of the Flash differences is
+significant on its own. The direction is the same in all four model-and-catalogue comparisons, and
 pooling the two models (120 probe runs per arm) gives:
 
-| Pooled, both models      | stock | fulldesc | scoped | scoped vs stock | scoped vs fulldesc |
-| ------------------------ | ----- | -------- | ------ | --------------- | ------------------ |
-| shipped, gold first      | 62.5% | 68.3%    | 72.5%  | p = 0.10        | p = 0.48           |
-| shipped, no skill loaded | 35.0% | 29.2%    | 20.8%  | p = 0.014       | p = 0.14           |
-| grown, gold first        | 59.2% | 60.8%    | 75.8%  | p = 0.006       | p = 0.013          |
-| grown, no skill loaded   | 34.2% | 25.8%    | 17.5%  | p = 0.003       | p = 0.12           |
+| Both models pooled                | stock | fulldesc | scoped | scoped vs stock | scoped vs fulldesc |
+| --------------------------------- | ----- | -------- | ------ | --------------- | ------------------ |
+| 44 skills, read gold skill first  | 62.5% | 68.3%    | 72.5%  | p = 0.10        | p = 0.48           |
+| 44 skills, read no skill          | 35.0% | 29.2%    | 20.8%  | p = 0.014       | p = 0.14           |
+| 104 skills, read gold skill first | 59.2% | 60.8%    | 75.8%  | p = 0.006       | p = 0.013          |
+| 104 skills, read no skill         | 34.2% | 25.8%    | 17.5%  | p = 0.003       | p = 0.12           |
 
 The reading that survives both models: on the catalogue as shipped, scoping's reliable effect is
 that the agent stops skipping skills, and its effect on which skill it picks is positive and

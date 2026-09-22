@@ -52,6 +52,40 @@ From each run's response and session row, and from the plugin's per-turn record:
 
 `analyze.py` prints the table; `--json` gives the raw numbers.
 
+## Results
+
+The matrix ran on 2026-09-21 on Gemini 3.1 Pro and again on Gemini 3.5 Flash: 792 runs. Each
+probe asks for something one skill is written for, its gold skill. A run is scored by the first
+skill the agent read with `skill_view`. The full tables, per-probe picks, and the reading of them
+are in `results/` and in the design document's §8.
+
+Both models pooled, 120 runs per cell. The p-values are a two-proportion test of `scoped-all`
+against the arm named.
+
+| Share of runs where the agent...  | stock | fulldesc | scoped-all | vs stock  | vs fulldesc |
+| --------------------------------- | ----- | -------- | ---------- | --------- | ----------- |
+| 44 skills, read gold skill first  | 62.5% | 68.3%    | 72.5%      | p = 0.10  | p = 0.48    |
+| 44 skills, read no skill          | 35.0% | 29.2%    | 20.8%      | p = 0.014 | p = 0.14    |
+| 104 skills, read gold skill first | 59.2% | 60.8%    | 75.8%      | p = 0.006 | p = 0.013   |
+| 104 skills, read no skill         | 34.2% | 25.8%    | 17.5%      | p = 0.003 | p = 0.12    |
+
+Cost per first model call, Gemini 3.1 Pro medians:
+
+| Prompt tokens, first model call | stock | fulldesc | scoped-all |
+| ------------------------------- | ----- | -------- | ---------- |
+| 44 skills                       | 28.4k | 31.3k    | 28.3k      |
+| 104 skills                      | 30.4k | 38.6k    | 29.7k      |
+
+- With 44 skills, scoping reliably stopped the agent skipping skills. Its gain in picking the gold
+  skill first points the same way but is not significant at this sample.
+- With 104 skills, scoping raised gold-skill-first picks by about a sixth against both other arms.
+  Full descriptions for every skill did not.
+- Wrong picks were rare in every arm. One control run out of 72 read a skill it should not have.
+- Scoping cost what `stock` costs. Full descriptions added 3k to 8k tokens a call and doubled the
+  time to the first tool call.
+- Picks were scored, not outcomes, every probe was one turn, and the filter hid only one tool.
+  The design document's §8.7 lists what the run does not show.
+
 ## How it runs
 
 The prototype is the `capability_scope` plugin (`agents/platform/plugins/capability_scope/`) plus
