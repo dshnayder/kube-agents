@@ -1,0 +1,397 @@
+label,scenario,rep,http_status,incomplete,first_skill,skills_loaded,tool_calls,api_calls,input_tokens,cache_read_tokens,output_tokens,wall_seconds
+stock-shipped,control-capabilities,1,200,False,,,,1,2,29859,1205,7.43
+stock-shipped,control-capabilities,2,200,False,,,,0,0,0,0,22.92
+stock-shipped,control-capabilities,3,200,False,,,,1,2,29859,1150,9.24
+stock-shipped,control-list-nodes,1,200,False,,,terminal,2,195,59718,1443,9.71
+stock-shipped,control-list-nodes,2,200,False,,,terminal,2,195,59718,1182,11.17
+stock-shipped,control-list-nodes,3,200,False,,,terminal,2,195,59718,1154,10.31
+stock-shipped,crashloop,1,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal,9,26959,268564,1165,77.53
+stock-shipped,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal search_files terminal terminal terminal terminal,10,44671,298396,1490,53.41
+stock-shipped,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,39763,298396,1593,34.26
+stock-shipped,cut-the-bill,1,200,False,gke-cost-optimization,gke-cost-optimization,tool_search skill_view terminal terminal terminal terminal terminal,7,22998,208886,1779,55.99
+stock-shipped,cut-the-bill,2,200,False,,,,0,0,0,0,22.44
+stock-shipped,cut-the-bill,3,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,61888,298351,1483,37.72
+stock-shipped,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal,7,10615,208902,1339,47.51
+stock-shipped,daily-backups,2,200,False,,,,0,0,0,0,23.8
+stock-shipped,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,22370,298398,1739,51.46
+stock-shipped,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal terminal terminal,7,40155,208888,1647,60.31
+stock-shipped,fleet-behind-channel,2,200,False,,,,0,0,0,0,25.39
+stock-shipped,fleet-behind-channel,3,200,False,,,,0,0,0,0,23.78
+stock-shipped,gitops-pr,1,200,False,submit-suggestion,submit-suggestion,skill_view terminal search_files terminal terminal terminal terminal terminal terminal terminal,10,51742,298402,1559,35.12
+stock-shipped,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,terminal skill_view search_files search_files search_files terminal terminal,7,25663,208906,1509,55.88
+stock-shipped,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,terminal tool_search search_files terminal terminal terminal skill_view terminal search_files terminal,10,29652,298402,2810,61.32
+stock-shipped,harden-cluster,1,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal,8,14188,238736,2234,70.89
+stock-shipped,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal terminal terminal terminal terminal,8,26650,238736,2545,59.45
+stock-shipped,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,skill_view execute_code terminal terminal terminal tool_search tool_describe terminal,8,58487,238736,2345,110.49
+stock-shipped,hpa,1,200,False,gke-workload-scaling,gke-workload-scaling,execute_code execute_code terminal skill_view terminal,5,3208,149248,1986,78.25
+stock-shipped,hpa,2,200,False,gke-workload-scaling,gke-workload-scaling,terminal skill_view terminal terminal terminal terminal terminal terminal terminal,9,27450,268576,3060,75.71
+stock-shipped,hpa,3,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal terminal terminal terminal terminal terminal terminal,8,19344,238744,1877,49.5
+stock-shipped,https-gateway,1,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal terminal terminal search_files terminal,9,23633,268564,1277,55.75
+stock-shipped,https-gateway,2,200,False,gke-service-networking,gke-service-networking,terminal skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,35123,298396,991,34.05
+stock-shipped,https-gateway,3,200,False,gke-service-networking,gke-service-networking,skill_view search_files terminal terminal terminal terminal tool_search,7,18292,208900,1602,54.59
+stock-shipped,inspect-repo,1,200,False,,,search_files search_files search_files search_files,5,11516,149240,2046,16.32
+stock-shipped,inspect-repo,2,200,False,,,search_files search_files search_files search_files execute_code search_files search_files,7,12979,208904,1134,54.19
+stock-shipped,inspect-repo,3,200,False,,,search_files search_files search_files search_files search_files,6,12296,179072,2502,32.74
+stock-shipped,manifest-go-api,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,terminal skill_view skill_view terminal tool_search tool_call write_file,8,39186,238772,6643,94.63
+stock-shipped,manifest-go-api,2,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view write_file terminal,5,19442,149276,5409,39.76
+stock-shipped,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal search_files read_file search_files search_files terminal,9,43973,268604,3704,64.81
+stock-shipped,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal search_files terminal terminal terminal terminal,8,29089,238728,958,78.16
+stock-shipped,namespace-cost,2,200,False,,,,0,0,0,0,26.11
+stock-shipped,namespace-cost,3,200,False,,,,0,0,0,0,22.77
+stock-shipped,nodepool-no-scaleup,1,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,49355,298408,1273,61.33
+stock-shipped,nodepool-no-scaleup,2,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal terminal terminal,8,27026,238744,955,51.75
+stock-shipped,nodepool-no-scaleup,3,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal,4,10564,119416,1096,39.55
+stock-shipped,pdb-probes,1,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal terminal terminal search_files read_file,8,30520,238728,1243,56.53
+stock-shipped,pdb-probes,2,200,False,,,terminal terminal terminal terminal search_files search_files read_file terminal terminal terminal,10,27513,298392,925,32.77
+stock-shipped,pdb-probes,3,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal terminal terminal terminal terminal search_files terminal,10,45322,298392,918,42.82
+stock-shipped,pod-403-gcs,1,200,False,,,terminal search_files terminal terminal terminal terminal terminal terminal,8,12530,238750,1314,71.56
+stock-shipped,pod-403-gcs,2,200,False,,,terminal search_files search_files terminal terminal terminal terminal terminal,8,20156,238750,2436,58.72
+stock-shipped,pod-403-gcs,3,200,False,,,terminal terminal terminal terminal terminal search_files search_files terminal terminal terminal,10,18873,298414,1436,49.51
+stock-shipped,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,skill_view terminal terminal tool_search tool_describe tool_search tool_describe tool_call terminal,9,29207,268572,1510,54.39
+stock-shipped,pod-ip-exhaustion,2,200,False,gke-networking,gke-networking,skill_view tool_search tool_call tool_call tool_call,5,14468,149244,837,58.58
+stock-shipped,pod-ip-exhaustion,3,200,False,,,tool_search terminal terminal tool_call tool_call,5,3769,149244,2007,55.36
+stock-shipped,prometheus-alerts,1,200,False,gke-observability,gke-observability,terminal skill_view search_files terminal terminal terminal terminal search_files read_file search_files,10,31992,298392,1455,37.41
+stock-shipped,prometheus-alerts,2,200,False,gke-observability,gke-observability,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,36431,298392,1590,37.0
+stock-shipped,prometheus-alerts,3,200,False,gke-observability,gke-observability,skill_view tool_search terminal terminal terminal terminal,6,16284,179064,2215,69.87
+stock-shipped,pvc-pending,1,200,False,gke-storage,gke-storage,skill_view tool_describe terminal terminal terminal tool_call terminal terminal,8,19400,238762,2408,76.16
+stock-shipped,pvc-pending,2,200,False,gke-storage,gke-storage,skill_view,1,2,29885,870,30.22
+stock-shipped,pvc-pending,3,200,False,gke-storage,gke-storage,skill_view terminal terminal terminal terminal terminal terminal terminal,8,15077,238762,2310,51.96
+stock-shipped,tpu-vbar,1,200,False,,,,0,0,0,0,25.86
+stock-shipped,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,40507,298400,1009,59.71
+stock-shipped,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,28064,298400,1321,46.71
+stock-shipped,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades gke-upgrades gke-upgrades,skill_view skill_view skill_view terminal terminal terminal terminal,7,44797,208910,1472,53.72
+stock-shipped,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal terminal terminal terminal,6,30218,179078,2233,52.38
+stock-shipped,upgrade-plan,3,200,False,,,,0,0,0,0,22.3
+stock-shipped,vllm-l4,1,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,43666,298402,2863,85.59
+stock-shipped,vllm-l4,2,200,False,gke-inference,gke-inference,todo terminal terminal search_files terminal terminal skill_view read_file terminal,9,18902,268570,1482,74.72
+stock-shipped,vllm-l4,3,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal,5,11447,149242,1594,52.69
+fulldesc-shipped,control-capabilities,1,200,False,,,,1,2,32837,1140,10.74
+fulldesc-shipped,control-capabilities,2,200,False,,,,1,2,32837,895,5.0
+fulldesc-shipped,control-capabilities,3,200,False,,,,1,2,32837,1113,7.42
+fulldesc-shipped,control-list-nodes,1,200,False,,,terminal,2,195,65674,1263,16.37
+fulldesc-shipped,control-list-nodes,2,200,False,,,terminal,2,276,65674,1721,28.55
+fulldesc-shipped,control-list-nodes,3,200,False,,,,0,0,0,0,24.28
+fulldesc-shipped,crashloop,1,200,False,,,terminal terminal terminal terminal terminal terminal,6,7728,196936,1401,74.21
+fulldesc-shipped,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,29942,328176,993,42.72
+fulldesc-shipped,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal,8,25423,262556,1179,47.02
+fulldesc-shipped,cut-the-bill,1,200,False,gke-cost-optimization,gke-cost-optimization,terminal terminal terminal skill_view terminal terminal,6,8794,196922,1593,53.49
+fulldesc-shipped,cut-the-bill,2,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view skill_view terminal terminal terminal terminal,6,25010,196922,928,48.35
+fulldesc-shipped,cut-the-bill,3,200,False,gke-cost-optimization,gke-cost-optimization,skill_view terminal terminal terminal terminal terminal terminal,7,18430,229732,612,55.97
+fulldesc-shipped,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal,7,9734,229748,1264,60.05
+fulldesc-shipped,daily-backups,2,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal terminal,8,11391,262558,1163,55.83
+fulldesc-shipped,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view execute_code terminal terminal terminal terminal,6,7834,196938,1277,57.68
+fulldesc-shipped,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal,5,26104,164114,1641,60.35
+fulldesc-shipped,fleet-behind-channel,2,200,False,fleet-upgrade-verification,fleet-upgrade-verification,search_files skill_view terminal terminal terminal,5,22355,164114,1953,64.04
+fulldesc-shipped,fleet-behind-channel,3,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal,4,17150,131304,1434,57.85
+fulldesc-shipped,gitops-pr,1,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal terminal terminal terminal terminal,7,34776,229752,1361,59.45
+fulldesc-shipped,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal search_files terminal terminal terminal,7,31842,229752,1321,68.45
+fulldesc-shipped,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,terminal search_files skill_view search_files terminal terminal terminal,7,21969,229752,1905,63.38
+fulldesc-shipped,harden-cluster,1,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal terminal terminal search_files search_files,8,25534,262560,1051,58.85
+fulldesc-shipped,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal terminal terminal terminal,7,22269,229750,1858,51.97
+fulldesc-shipped,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal terminal search_files search_files,5,14481,164090,1506,54.59
+fulldesc-shipped,hpa,1,200,False,gke-workload-scaling,gke-workload-scaling,skill_view search_files terminal terminal terminal terminal terminal,7,19689,229758,1513,70.26
+fulldesc-shipped,hpa,2,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal search_files terminal terminal terminal,6,14686,196948,974,49.45
+fulldesc-shipped,hpa,3,200,False,,,terminal terminal,2,49,65708,733,31.83
+fulldesc-shipped,https-gateway,1,200,False,gke-service-networking,gke-service-networking,search_files skill_view terminal terminal terminal terminal terminal,7,22153,229746,1803,46.87
+fulldesc-shipped,https-gateway,2,200,False,,,,0,0,0,0,26.9
+fulldesc-shipped,https-gateway,3,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal terminal terminal terminal terminal,9,20384,295366,721,47.31
+fulldesc-shipped,inspect-repo,1,200,False,inspect-repository,inspect-repository,skill_view execute_code execute_code execute_code execute_code,5,21329,164130,1097,59.37
+fulldesc-shipped,inspect-repo,2,200,False,inspect-repository,inspect-repository,skill_view terminal terminal terminal terminal terminal,7,56580,229750,3170,41.78
+fulldesc-shipped,inspect-repo,3,200,False,,,search_files search_files terminal,4,8148,131320,1930,23.55
+fulldesc-shipped,manifest-go-api,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal terminal terminal tool_search tool_call,8,34561,262596,1269,63.25
+fulldesc-shipped,manifest-go-api,2,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal terminal terminal terminal,7,28072,229786,1384,65.15
+fulldesc-shipped,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal tool_search,5,17674,164166,1691,61.63
+fulldesc-shipped,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal,8,20400,262552,1260,51.4
+fulldesc-shipped,namespace-cost,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal,5,11414,164122,862,62.98
+fulldesc-shipped,namespace-cost,3,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal,6,13831,196932,1100,55.45
+fulldesc-shipped,nodepool-no-scaleup,1,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal terminal terminal,8,29845,262568,996,70.22
+fulldesc-shipped,nodepool-no-scaleup,2,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,45293,328188,1506,72.95
+fulldesc-shipped,nodepool-no-scaleup,3,200,False,,,,0,0,0,0,23.46
+fulldesc-shipped,pdb-probes,1,200,False,,,terminal terminal terminal search_files read_file search_files terminal terminal terminal,9,16325,295362,1377,54.26
+fulldesc-shipped,pdb-probes,2,200,False,gke-reliability,gke-reliability,skill_view tool_search tool_call terminal terminal terminal terminal terminal,8,21786,262552,726,48.54
+fulldesc-shipped,pdb-probes,3,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal terminal terminal search_files terminal terminal,9,25867,295362,1238,55.23
+fulldesc-shipped,pod-403-gcs,1,200,False,,,terminal terminal terminal terminal search_files search_files terminal,7,7075,229764,1130,60.78
+fulldesc-shipped,pod-403-gcs,2,200,False,,,terminal search_files search_files terminal terminal terminal terminal,6,11648,196954,1743,56.32
+fulldesc-shipped,pod-403-gcs,3,200,False,,,terminal terminal search_files terminal terminal terminal,6,11324,196954,1156,55.18
+fulldesc-shipped,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,skill_view terminal tool_search tool_call tool_call,5,11361,164134,1292,63.28
+fulldesc-shipped,pod-ip-exhaustion,2,200,False,gke-networking,gke-networking,terminal terminal skill_view tool_search tool_describe tool_search tool_describe tool_call terminal terminal,10,30354,328184,1224,52.05
+fulldesc-shipped,pod-ip-exhaustion,3,200,False,gke-networking,gke-networking,skill_view execute_code terminal tool_search tool_search tool_describe terminal tool_call tool_search,9,30450,295374,1503,60.31
+fulldesc-shipped,prometheus-alerts,1,200,False,gke-observability,gke-observability,skill_view terminal terminal terminal terminal search_files terminal,7,24401,229742,1535,57.53
+fulldesc-shipped,prometheus-alerts,2,200,False,gke-observability,gke-observability,skill_view tool_search terminal terminal terminal terminal terminal,7,20158,229742,2483,50.11
+fulldesc-shipped,prometheus-alerts,3,200,False,gke-observability,gke-observability,skill_view terminal terminal search_files terminal terminal terminal,7,23450,229742,1119,53.87
+fulldesc-shipped,pvc-pending,1,200,False,,,terminal terminal terminal terminal terminal terminal,6,2657,196966,1357,70.24
+fulldesc-shipped,pvc-pending,2,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal,9,16429,295396,1426,61.71
+fulldesc-shipped,pvc-pending,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal,8,23180,262586,1467,47.4
+fulldesc-shipped,tpu-vbar,1,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view execute_code terminal terminal terminal terminal,7,19314,229750,1114,63.44
+fulldesc-shipped,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal terminal terminal terminal,9,24408,295370,983,69.87
+fulldesc-shipped,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,55435,328180,1620,95.25
+fulldesc-shipped,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal terminal terminal terminal terminal terminal,8,42065,262566,968,60.44
+fulldesc-shipped,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view execute_code terminal terminal terminal terminal,6,28677,196946,1476,61.92
+fulldesc-shipped,upgrade-plan,3,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal terminal terminal terminal terminal terminal,8,42388,262566,882,55.25
+fulldesc-shipped,vllm-l4,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,terminal terminal terminal skills_list terminal terminal terminal skill_view skill_view,9,32393,295372,1346,60.36
+fulldesc-shipped,vllm-l4,2,200,False,gke-inference,gke-inference gke-manifest-generation gke-manifest-generation,execute_code execute_code skill_view execute_code execute_code skills_list skill_view skill_view execute_code execute_code,10,65000,328182,1943,101.38
+fulldesc-shipped,vllm-l4,3,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal terminal,8,21643,262562,912,64.84
+scoped-all-shipped,control-capabilities,1,200,False,,,,1,2,29737,1280,14.37
+scoped-all-shipped,control-capabilities,2,200,False,,,,1,2,29737,1351,16.57
+scoped-all-shipped,control-capabilities,3,200,False,,,,1,2,29737,1207,7.96
+scoped-all-shipped,control-list-nodes,1,200,False,gke-basics,gke-basics,skill_view terminal,3,3641,88993,2744,137.49
+scoped-all-shipped,control-list-nodes,2,200,False,,,terminal,2,195,59914,1625,60.1
+scoped-all-shipped,control-list-nodes,3,200,False,,,terminal terminal terminal,4,3449,118072,1805,22.53
+scoped-all-shipped,crashloop,1,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,tool_search skill_view tool_search tool_search tool_search tool_describe terminal terminal terminal terminal,10,37227,291334,2142,58.58
+scoped-all-shipped,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,44524,291334,2015,48.88
+scoped-all-shipped,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,45498,291334,2130,40.69
+scoped-all-shipped,cut-the-bill,1,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view terminal terminal terminal terminal skill_view terminal terminal terminal terminal,10,51265,291592,1274,107.37
+scoped-all-shipped,cut-the-bill,2,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,84654,290821,1704,74.65
+scoped-all-shipped,cut-the-bill,3,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,64922,291592,2095,92.74
+scoped-all-shipped,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view tool_search execute_code terminal terminal terminal terminal terminal terminal terminal,10,28215,290952,2144,76.73
+scoped-all-shipped,daily-backups,2,200,False,gke-backup-dr,gke-backup-dr,skill_view,1,2,29628,840,30.1
+scoped-all-shipped,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal terminal,8,20009,233028,1379,89.61
+scoped-all-shipped,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,tool_search skill_view terminal terminal terminal terminal terminal terminal,9,59173,263529,6454,71.39
+scoped-all-shipped,fleet-behind-channel,2,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal,5,26075,147213,1264,51.99
+scoped-all-shipped,fleet-behind-channel,3,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal search_files terminal terminal,6,34272,176292,1927,59.6
+scoped-all-shipped,gitops-pr,1,200,False,,,terminal terminal,2,68,56448,574,30.86
+scoped-all-shipped,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,skill_view execute_code search_files terminal terminal terminal terminal search_files terminal terminal,10,62867,277224,2979,91.83
+scoped-all-shipped,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal search_files terminal terminal terminal terminal,8,40435,222030,1833,50.6
+scoped-all-shipped,harden-cluster,1,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal terminal terminal search_files search_files terminal terminal,10,46616,291868,3612,77.45
+scoped-all-shipped,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,skill_view terminal,2,2723,59828,1465,64.34
+scoped-all-shipped,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,skill_view,1,2,29914,345,26.5
+scoped-all-shipped,hpa,1,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal terminal terminal search_files terminal terminal terminal terminal terminal,10,35895,291464,2189,81.7
+scoped-all-shipped,hpa,2,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,40420,291464,1978,32.99
+scoped-all-shipped,hpa,3,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal terminal terminal terminal terminal,6,12843,175444,2485,52.04
+scoped-all-shipped,https-gateway,1,200,False,gke-service-networking,gke-service-networking,skill_view,1,2,28460,773,28.17
+scoped-all-shipped,https-gateway,2,200,False,gke-service-networking,gke-service-networking,tool_search skill_view terminal terminal search_files terminal,6,13434,167308,1507,49.02
+scoped-all-shipped,https-gateway,3,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal terminal terminal search_files,8,23983,222502,2016,62.38
+scoped-all-shipped,inspect-repo,1,200,False,,,,0,0,0,0,24.71
+scoped-all-shipped,inspect-repo,2,200,False,,,search_files search_files search_files search_files execute_code search_files execute_code execute_code execute_code read_file,10,30131,291150,2381,83.64
+scoped-all-shipped,inspect-repo,3,200,False,,,search_files search_files search_files search_files terminal,6,11685,175130,2957,37.38
+scoped-all-shipped,manifest-go-api,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal search_files read_file terminal terminal terminal terminal,10,68994,291556,3023,69.27
+scoped-all-shipped,manifest-go-api,2,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,57201,291556,929,47.37
+scoped-all-shipped,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal,3,8881,88521,2014,40.38
+scoped-all-shipped,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal search_files terminal terminal terminal terminal,7,29617,204641,1965,50.73
+scoped-all-shipped,namespace-cost,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,41562,291656,1379,64.73
+scoped-all-shipped,namespace-cost,3,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal,4,11253,117626,1376,42.55
+scoped-all-shipped,nodepool-no-scaleup,1,200,False,,,tool_search terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,22983,291818,2194,80.23
+scoped-all-shipped,nodepool-no-scaleup,2,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view execute_code execute_code execute_code search_files execute_code execute_code execute_code execute_code execute_code,10,118820,291818,3736,131.87
+scoped-all-shipped,nodepool-no-scaleup,3,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view execute_code execute_code terminal terminal terminal terminal terminal terminal,9,45692,262813,1784,109.88
+scoped-all-shipped,pdb-probes,1,200,False,gke-reliability,gke-reliability,skill_view,1,2,29861,347,27.11
+scoped-all-shipped,pdb-probes,2,200,False,gke-reliability,gke-reliability,skill_view search_files search_files search_files terminal terminal search_files terminal terminal search_files terminal terminal,10,50488,290906,1592,79.98
+scoped-all-shipped,pdb-probes,3,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,33575,291762,933,92.2
+scoped-all-shipped,pod-403-gcs,1,200,False,,,terminal terminal terminal terminal search_files search_files terminal search_files terminal terminal,10,19207,292266,1819,104.26
+scoped-all-shipped,pod-403-gcs,2,200,False,,,terminal terminal terminal search_files search_files terminal terminal terminal terminal terminal,10,31654,292266,1643,110.71
+scoped-all-shipped,pod-403-gcs,3,200,False,,,terminal,1,2,29817,1295,32.14
+scoped-all-shipped,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,skill_view terminal tool_search tool_call tool_call terminal terminal terminal terminal terminal,10,58716,292624,1699,114.68
+scoped-all-shipped,pod-ip-exhaustion,2,200,False,gke-networking,gke-networking,skill_view terminal tool_search tool_describe tool_call tool_call,6,17497,176308,1131,76.81
+scoped-all-shipped,pod-ip-exhaustion,3,200,False,gke-networking,gke-networking,skill_view terminal terminal tool_search tool_search tool_describe terminal tool_call tool_search tool_describe,10,46797,292624,1462,86.12
+scoped-all-shipped,prometheus-alerts,1,200,False,gke-observability,gke-observability,tool_search terminal skill_view terminal terminal terminal terminal terminal terminal terminal,10,39520,291666,2601,59.39
+scoped-all-shipped,prometheus-alerts,2,200,False,gke-observability,gke-observability,skill_view terminal terminal terminal terminal search_files search_files read_file read_file terminal,10,51555,291666,1196,51.27
+scoped-all-shipped,prometheus-alerts,3,200,False,gke-observability,gke-observability,skill_view tool_search terminal terminal search_files terminal,6,22016,175646,2120,50.56
+scoped-all-shipped,pvc-pending,1,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,48566,292234,901,78.85
+scoped-all-shipped,pvc-pending,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,50470,292234,1357,85.53
+scoped-all-shipped,pvc-pending,3,200,False,,,,0,0,0,0,23.22
+scoped-all-shipped,tpu-vbar,1,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal terminal,7,24141,204665,1422,72.65
+scoped-all-shipped,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal terminal terminal terminal terminal,10,44977,291680,1604,66.88
+scoped-all-shipped,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal,6,18439,175660,1086,53.57
+scoped-all-shipped,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades gke-upgrades,skill_view terminal search_files terminal skill_view terminal terminal terminal terminal terminal,10,76425,291934,1936,80.06
+scoped-all-shipped,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal terminal,4,18071,117904,1388,51.79
+scoped-all-shipped,upgrade-plan,3,200,False,gke-upgrades,gke-upgrades,skill_view execute_code tool_describe tool_search terminal tool_call tool_search tool_call terminal tool_describe,10,95484,291934,1581,87.67
+scoped-all-shipped,vllm-l4,1,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal,4,9254,117862,967,39.35
+scoped-all-shipped,vllm-l4,2,200,False,gke-inference,gke-inference gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal terminal terminal terminal terminal skill_view tool_search,9,73540,261966,3271,126.18
+scoped-all-shipped,vllm-l4,3,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal,7,24011,204877,995,53.01
+stock-grown,control-capabilities,1,200,False,,,,1,2,34873,1008,6.97
+stock-grown,control-capabilities,2,200,False,,,,1,2,34873,1022,16.38
+stock-grown,control-capabilities,3,200,False,,,,1,2,34873,1049,6.42
+stock-grown,control-list-nodes,1,200,False,,,terminal,2,195,69746,1343,10.08
+stock-grown,control-list-nodes,2,200,False,,,terminal terminal terminal,4,1745,139438,1141,17.19
+stock-grown,control-list-nodes,3,200,False,,,terminal,2,399,69746,1061,8.47
+stock-grown,crashloop,1,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal search_files terminal terminal terminal terminal terminal,10,30575,348536,969,87.88
+stock-grown,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal,5,12708,174306,1950,50.89
+stock-grown,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal,2,2768,69768,1068,41.52
+stock-grown,cut-the-bill,1,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,terminal terminal skill_view skill_view terminal terminal terminal terminal terminal terminal terminal,10,51485,348522,1352,61.57
+stock-grown,cut-the-bill,2,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,execute_code execute_code terminal terminal skill_view skill_view terminal terminal terminal terminal,10,33300,348522,1464,107.43
+stock-grown,cut-the-bill,3,200,False,gke-cost-optimization,gke-cost-optimization,terminal skill_view terminal terminal terminal terminal terminal,7,22390,243984,1657,107.14
+stock-grown,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal search_files terminal terminal terminal terminal terminal terminal,10,21166,348538,1213,46.89
+stock-grown,daily-backups,2,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal,3,2135,104616,835,39.06
+stock-grown,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal,6,6954,209154,1296,60.28
+stock-grown,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal terminal terminal terminal,9,60331,313678,6131,96.58
+stock-grown,fleet-behind-channel,2,200,False,fleet-upgrade-verification,fleet-upgrade-verification,terminal skill_view terminal terminal terminal terminal terminal,8,50317,278832,5280,83.88
+stock-grown,fleet-behind-channel,3,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal,5,24367,174294,1360,61.12
+stock-grown,gitops-pr,1,200,False,,,terminal search_files search_files search_files terminal read_file terminal terminal terminal,9,20416,313696,2351,55.39
+stock-grown,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,131495,348542,1275,140.19
+stock-grown,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal search_files search_files search_files read_file,7,36769,244004,1226,58.64
+stock-grown,harden-cluster,1,200,False,gke-platform-security,gke-platform-security,execute_code skill_view execute_code execute_code execute_code execute_code,6,21936,209156,2563,139.46
+stock-grown,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,skill_view execute_code execute_code terminal terminal terminal terminal terminal terminal terminal,10,48549,348540,1403,145.17
+stock-grown,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,skill_view execute_code terminal terminal,4,9701,139464,2294,64.38
+stock-grown,hpa,1,200,False,,,terminal search_files terminal terminal terminal search_files terminal terminal terminal terminal,10,22305,348548,1484,75.66
+stock-grown,hpa,2,200,False,submit-suggestion,submit-suggestion,terminal search_files terminal terminal terminal skill_view terminal,7,17379,244010,1930,47.26
+stock-grown,hpa,3,200,False,,,,0,0,0,0,25.21
+stock-grown,https-gateway,1,200,False,gke-service-networking,gke-service-networking,skill_view execute_code terminal terminal terminal terminal terminal terminal terminal terminal,10,42705,348536,2378,117.48
+stock-grown,https-gateway,2,200,False,gke-service-networking,gke-service-networking,search_files terminal skill_view terminal terminal terminal,6,14379,209152,1621,71.95
+stock-grown,https-gateway,3,200,False,,,terminal terminal search_files terminal terminal terminal terminal,7,12233,243998,1486,58.87
+stock-grown,inspect-repo,1,200,False,inspect-repository,inspect-repository,skill_view execute_code execute_code execute_code execute_code,5,10482,174310,1224,57.52
+stock-grown,inspect-repo,2,200,False,,,,0,0,0,0,23.93
+stock-grown,inspect-repo,3,200,False,inspect-repository,inspect-repository,skill_view terminal terminal search_files search_files,5,14897,174310,1528,59.13
+stock-grown,manifest-go-api,1,200,False,,,,0,0,0,0,26.61
+stock-grown,manifest-go-api,2,200,False,,,,0,0,0,0,23.16
+stock-grown,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view tool_call search_files terminal terminal,6,30386,209192,1479,60.36
+stock-grown,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal,8,24852,278840,900,80.21
+stock-grown,namespace-cost,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal,6,15976,209148,851,43.1
+stock-grown,namespace-cost,3,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,31646,348532,1060,48.77
+stock-grown,nodepool-no-scaleup,1,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,36912,348548,1391,81.28
+stock-grown,nodepool-no-scaleup,2,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal,8,52339,278856,992,49.21
+stock-grown,nodepool-no-scaleup,3,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,16130,348548,1924,88.1
+stock-grown,pdb-probes,1,200,False,,,terminal terminal search_files search_files terminal,5,6469,174302,1430,70.08
+stock-grown,pdb-probes,2,200,False,gke-reliability,gke-reliability,skill_view terminal search_files search_files read_file terminal terminal terminal terminal terminal,10,43148,348532,935,56.92
+stock-grown,pdb-probes,3,200,False,,,terminal terminal search_files terminal terminal search_files search_files,7,14738,243994,1363,56.55
+stock-grown,pod-403-gcs,1,200,False,,,,0,0,0,0,24.29
+stock-grown,pod-403-gcs,2,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal terminal terminal search_files terminal terminal,10,59050,348554,1492,88.41
+stock-grown,pod-403-gcs,3,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal search_files terminal terminal,5,23995,174324,1585,68.5
+stock-grown,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,terminal search_files skill_view tool_search tool_call tool_call tool_call tool_call,8,30147,278852,1493,137.33
+stock-grown,pod-ip-exhaustion,2,200,False,gke-networking,gke-networking,skill_view terminal tool_search tool_describe terminal terminal terminal terminal terminal terminal web_search,10,30880,348502,1102,88.51
+stock-grown,pod-ip-exhaustion,3,200,False,,,,0,0,0,0,24.65
+stock-grown,prometheus-alerts,1,200,False,gke-observability,gke-observability,skill_view terminal terminal terminal terminal terminal terminal terminal,8,26562,278840,596,54.06
+stock-grown,prometheus-alerts,2,200,False,gke-observability,gke-observability,skill_view terminal search_files terminal terminal terminal terminal terminal search_files terminal,10,44362,348532,1532,46.1
+stock-grown,prometheus-alerts,3,200,False,gke-observability,gke-observability,terminal terminal skill_view terminal terminal terminal terminal terminal,8,18506,278840,1238,57.37
+stock-grown,pvc-pending,1,200,False,gke-storage-troubleshooting,gke-storage-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,44586,348566,1086,88.2
+stock-grown,pvc-pending,2,200,False,,,terminal,1,2,34899,882,31.25
+stock-grown,pvc-pending,3,200,False,gke-storage-troubleshooting,gke-storage-troubleshooting,skill_view terminal terminal terminal terminal,5,15487,174336,1466,47.89
+stock-grown,tpu-vbar,1,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal terminal,7,19923,244002,1477,54.28
+stock-grown,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,41292,348540,1208,55.48
+stock-grown,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,31864,348540,1422,42.1
+stock-grown,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades gke-upgrades gke-upgrades,skill_view terminal terminal terminal terminal terminal skill_view skill_view terminal terminal,10,60304,348546,1451,104.92
+stock-grown,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view execute_code terminal,3,10448,104624,888,73.24
+stock-grown,upgrade-plan,3,200,False,gke-upgrades,gke-upgrades gke-upgrades,skill_view terminal terminal terminal terminal skill_view terminal,7,36495,244008,1068,69.42
+stock-grown,vllm-l4,1,200,False,gke-inference,gke-inference,terminal terminal terminal skill_view terminal terminal terminal,7,15247,244004,1968,58.92
+stock-grown,vllm-l4,2,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal terminal terminal tool_search,10,29431,348542,1061,55.45
+stock-grown,vllm-l4,3,200,False,gke-inference,gke-inference,skill_view execute_code terminal terminal terminal terminal,6,14128,209158,1510,76.67
+fulldesc-grown,control-capabilities,1,200,False,,,,1,2,40094,1301,18.72
+fulldesc-grown,control-capabilities,2,200,False,,,,1,2,40094,1384,14.34
+fulldesc-grown,control-capabilities,3,200,False,,,,1,2,40094,968,24.02
+fulldesc-grown,control-list-nodes,1,200,False,,,terminal,2,195,80188,939,17.36
+fulldesc-grown,control-list-nodes,2,200,False,,,terminal,2,195,80188,1506,20.05
+fulldesc-grown,control-list-nodes,3,200,False,,,terminal,2,195,80188,1915,21.47
+fulldesc-grown,crashloop,1,200,False,,,terminal terminal terminal terminal search_files terminal terminal terminal terminal terminal,10,25700,400746,1137,71.43
+fulldesc-grown,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal,4,9572,160344,870,38.97
+fulldesc-grown,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal,5,12636,200411,1032,37.92
+fulldesc-grown,cut-the-bill,1,200,False,gke-cost-analysis,gke-cost-analysis,terminal terminal skill_view,3,802,120263,910,41.88
+fulldesc-grown,cut-the-bill,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal,6,15200,240464,1003,46.0
+fulldesc-grown,cut-the-bill,3,200,False,,,terminal terminal terminal terminal terminal terminal,6,4109,240464,1499,60.21
+fulldesc-grown,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal,5,6611,200413,1034,67.16
+fulldesc-grown,daily-backups,2,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal,7,9647,280547,1542,61.65
+fulldesc-grown,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view execute_code terminal terminal terminal terminal,6,8620,240480,1421,59.37
+fulldesc-grown,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal,3,15712,120265,1456,67.04
+fulldesc-grown,fleet-behind-channel,2,200,False,,,,0,0,0,0,22.72
+fulldesc-grown,fleet-behind-channel,3,200,False,fleet-upgrade-verification,fleet-upgrade-verification,terminal terminal skill_view terminal terminal,5,13277,200399,1596,60.45
+fulldesc-grown,gitops-pr,1,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal search_files terminal terminal terminal terminal,8,42672,320618,1043,64.49
+fulldesc-grown,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,search_files terminal skill_view terminal search_files search_files terminal,7,31876,280551,1792,55.08
+fulldesc-grown,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,skill_view terminal search_files terminal terminal terminal terminal,7,34556,280551,1480,52.37
+fulldesc-grown,harden-cluster,1,200,False,gke-platform-security,gke-platform-security,skill_view terminal terminal terminal,4,9345,160348,1540,54.07
+fulldesc-grown,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,search_files skill_view terminal terminal terminal terminal,6,20171,240482,1255,51.42
+fulldesc-grown,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,terminal search_files search_files terminal skills_list skill_view terminal terminal,8,57091,320616,2244,56.14
+fulldesc-grown,hpa,1,200,False,gke-workload-scaling,gke-workload-scaling,skill_view search_files terminal terminal terminal terminal terminal terminal terminal terminal,10,35111,400758,1534,74.91
+fulldesc-grown,hpa,2,200,False,,,terminal terminal terminal terminal terminal,5,2430,200423,2134,54.21
+fulldesc-grown,hpa,3,200,False,,,terminal search_files,2,663,80222,1048,30.73
+fulldesc-grown,https-gateway,1,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal search_files,6,11382,240478,1188,45.96
+fulldesc-grown,https-gateway,2,200,False,gke-service-networking,gke-service-networking,skill_view tool_search tool_call terminal terminal terminal terminal,7,25376,280545,902,63.06
+fulldesc-grown,https-gateway,3,200,False,gke-service-networking,gke-service-networking submit-suggestion,skill_view terminal terminal terminal terminal terminal terminal skill_view terminal,9,25710,360679,1428,64.78
+fulldesc-grown,inspect-repo,1,200,False,inspect-repository,inspect-repository,skill_view terminal terminal search_files,4,9469,160348,1009,60.81
+fulldesc-grown,inspect-repo,2,200,False,inspect-repository,inspect-repository,skill_view terminal terminal terminal terminal search_files search_files terminal,8,18689,320616,1072,57.71
+fulldesc-grown,inspect-repo,3,200,False,inspect-repository,inspect-repository,skill_view terminal terminal search_files search_files terminal,7,23269,280549,2451,47.08
+fulldesc-grown,manifest-go-api,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal search_files terminal,5,20281,200451,1267,64.67
+fulldesc-grown,manifest-go-api,2,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal tool_search tool_call,5,18405,200451,1333,57.62
+fulldesc-grown,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view tool_search tool_call web_search web_search,6,24901,240518,1347,57.55
+fulldesc-grown,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal,2,2483,80206,526,42.79
+fulldesc-grown,namespace-cost,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal,7,20982,280541,1054,50.62
+fulldesc-grown,namespace-cost,3,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal,6,15964,240474,918,61.12
+fulldesc-grown,nodepool-no-scaleup,1,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,39103,400758,1862,100.92
+fulldesc-grown,nodepool-no-scaleup,2,200,False,gke-cluster-autoscaler,gke-cluster-autoscaler,skill_view terminal terminal terminal terminal terminal,6,18035,240490,1267,54.87
+fulldesc-grown,nodepool-no-scaleup,3,200,False,,,terminal terminal terminal terminal terminal,5,1273,200423,1107,63.98
+fulldesc-grown,pdb-probes,1,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal,4,9109,160340,848,59.72
+fulldesc-grown,pdb-probes,2,200,False,,,terminal terminal search_files read_file search_files terminal terminal terminal read_file,9,15921,360675,1288,68.64
+fulldesc-grown,pdb-probes,3,200,False,gke-reliability,gke-reliability inspect-repository,skill_view terminal terminal terminal terminal terminal terminal skill_view terminal,9,27823,360675,1247,59.66
+fulldesc-grown,pod-403-gcs,1,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal terminal terminal,7,36213,280563,1023,62.16
+fulldesc-grown,pod-403-gcs,2,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal terminal,6,28915,240496,1008,53.37
+fulldesc-grown,pod-403-gcs,3,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal,5,20711,200429,855,53.51
+fulldesc-grown,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,skill_view tool_search tool_describe tool_describe execute_code terminal tool_call,7,17104,280553,938,47.55
+fulldesc-grown,pod-ip-exhaustion,2,200,False,,,tool_search tool_call,3,2491,120285,3066,46.54
+fulldesc-grown,pod-ip-exhaustion,3,200,False,,,tool_describe terminal terminal terminal terminal tool_call,6,4663,240486,1471,63.0
+fulldesc-grown,prometheus-alerts,1,200,False,,,terminal search_files terminal terminal terminal,5,7303,200407,1641,54.54
+fulldesc-grown,prometheus-alerts,2,200,False,,,search_files terminal tool_search terminal search_files,5,7384,200407,1846,60.13
+fulldesc-grown,prometheus-alerts,3,200,False,,,terminal terminal terminal terminal terminal terminal,6,6942,240474,1339,50.59
+fulldesc-grown,pvc-pending,1,200,False,gke-storage-troubleshooting,gke-storage-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal,7,24678,280575,1500,114.43
+fulldesc-grown,pvc-pending,2,200,False,gke-storage-troubleshooting,gke-storage-troubleshooting,skill_view terminal terminal terminal,4,11266,160374,1104,40.11
+fulldesc-grown,pvc-pending,3,200,False,gke-storage-troubleshooting,gke-storage-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal,7,24180,280575,1316,56.3
+fulldesc-grown,tpu-vbar,1,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal,5,10113,200415,1146,51.62
+fulldesc-grown,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal,6,13790,240482,754,56.33
+fulldesc-grown,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal,6,14605,240482,1035,52.67
+fulldesc-grown,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal,3,12682,120287,1475,43.15
+fulldesc-grown,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view search_files terminal terminal terminal terminal terminal,7,35415,280555,1971,62.39
+fulldesc-grown,upgrade-plan,3,200,False,gke-upgrades,gke-upgrades gke-upgrades,execute_code skill_view execute_code skill_view,4,14367,160354,1903,58.81
+fulldesc-grown,vllm-l4,1,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal,7,17338,280551,806,52.38
+fulldesc-grown,vllm-l4,2,200,False,gke-inference,gke-inference,terminal skill_view terminal terminal terminal terminal,6,13111,240484,1532,54.68
+fulldesc-grown,vllm-l4,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,search_files terminal terminal skill_view skill_view tool_search tool_search,7,25025,280551,1382,49.03
+scoped-all-grown,control-capabilities,1,200,False,,,,1,2,31009,996,6.68
+scoped-all-grown,control-capabilities,2,200,False,,,,1,2,31026,734,5.78
+scoped-all-grown,control-capabilities,3,200,False,,,terminal terminal,3,1486,92376,1175,28.75
+scoped-all-grown,control-list-nodes,1,200,False,,,terminal,2,402,62410,1390,28.72
+scoped-all-grown,control-list-nodes,2,200,False,,,terminal,2,195,62444,1964,18.85
+scoped-all-grown,control-list-nodes,3,200,False,,,terminal,2,195,62466,2322,15.45
+scoped-all-grown,crashloop,1,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,46598,304620,2032,112.66
+scoped-all-grown,crashloop,2,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,42367,304620,1410,150.64
+scoped-all-grown,crashloop,3,200,False,gke-workload-troubleshooting,gke-workload-troubleshooting,skill_view terminal terminal terminal terminal,5,15342,153335,797,53.59
+scoped-all-grown,cut-the-bill,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal,3,6053,92430,1204,36.65
+scoped-all-grown,cut-the-bill,2,200,False,,,terminal terminal terminal,3,1547,92430,993,54.77
+scoped-all-grown,cut-the-bill,3,200,False,gke-cost-analysis,gke-cost-analysis gke-cost-optimization,skill_view terminal terminal skill_view terminal terminal terminal terminal terminal terminal,10,53709,304628,1103,49.32
+scoped-all-grown,daily-backups,1,200,False,gke-backup-dr,gke-backup-dr,skill_view execute_code terminal terminal terminal terminal search_files terminal terminal terminal,10,26742,303830,1971,81.08
+scoped-all-grown,daily-backups,2,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal terminal,8,18861,243504,978,59.09
+scoped-all-grown,daily-backups,3,200,False,gke-backup-dr,gke-backup-dr,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,26788,304110,2219,55.98
+scoped-all-grown,fleet-behind-channel,1,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal terminal terminal terminal,9,62998,274644,5151,129.43
+scoped-all-grown,fleet-behind-channel,2,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal,5,33206,153337,1027,59.04
+scoped-all-grown,fleet-behind-channel,3,200,False,fleet-upgrade-verification,fleet-upgrade-verification,skill_view terminal terminal terminal terminal terminal terminal,8,58458,244520,5074,78.04
+scoped-all-grown,gitops-pr,1,200,False,submit-suggestion,submit-suggestion,skill_view tool_search terminal search_files tool_search terminal terminal terminal terminal terminal,10,63662,289964,1814,51.99
+scoped-all-grown,gitops-pr,2,200,False,submit-suggestion,submit-suggestion,skill_view terminal terminal search_files tool_search terminal terminal terminal terminal terminal,10,58535,290134,1342,73.18
+scoped-all-grown,gitops-pr,3,200,False,submit-suggestion,submit-suggestion,skill_view execute_code search_files terminal terminal terminal terminal search_files,8,46984,232456,2263,65.43
+scoped-all-grown,harden-cluster,1,200,False,gke-platform-security,gke-platform-security,execute_code tool_search skill_view execute_code execute_code execute_code execute_code execute_code execute_code execute_code,10,45575,304850,2811,407.3
+scoped-all-grown,harden-cluster,2,200,False,gke-platform-security,gke-platform-security,skill_view execute_code search_files tool_search tool_describe tool_describe tool_search tool_describe,8,34895,244438,1649,54.83
+scoped-all-grown,harden-cluster,3,200,False,gke-platform-security,gke-platform-security,skill_view terminal tool_search tool_describe terminal,5,15460,153620,1416,50.53
+scoped-all-grown,hpa,1,200,False,gke-workload-scaling,gke-workload-scaling,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,33271,304272,2207,79.32
+scoped-all-grown,hpa,2,200,False,gke-workload-scaling,gke-workload-scaling,skill_view search_files terminal terminal terminal terminal terminal terminal search_files terminal,10,73499,304272,2195,57.66
+scoped-all-grown,hpa,3,200,False,gke-workload-scaling,gke-workload-scaling,skill_view,1,2,31068,154,26.87
+scoped-all-grown,https-gateway,1,200,False,,,,0,0,0,0,24.77
+scoped-all-grown,https-gateway,2,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal terminal,6,15511,175024,1300,72.09
+scoped-all-grown,https-gateway,3,200,False,gke-service-networking,gke-service-networking,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,30231,290666,1180,102.3
+scoped-all-grown,inspect-repo,1,200,False,,,search_files search_files search_files terminal terminal,6,14475,183068,2315,62.45
+scoped-all-grown,inspect-repo,2,200,False,,,search_files search_files search_files execute_code execute_code execute_code execute_code execute_code execute_code execute_code,10,55917,304334,3503,68.09
+scoped-all-grown,inspect-repo,3,200,False,,,search_files search_files search_files search_files search_files terminal terminal read_file read_file terminal,10,53371,304444,2097,42.92
+scoped-all-grown,manifest-go-api,1,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view,2,3524,62174,662,32.06
+scoped-all-grown,manifest-go-api,2,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view terminal terminal terminal terminal terminal,7,34584,213663,1150,59.41
+scoped-all-grown,manifest-go-api,3,200,False,gke-manifest-generation,gke-manifest-generation gke-manifest-generation,skill_view skill_view search_files terminal terminal terminal,6,30292,183438,1533,73.58
+scoped-all-grown,namespace-cost,1,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal search_files,10,40892,304524,1186,41.76
+scoped-all-grown,namespace-cost,2,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal search_files terminal terminal,8,36129,243976,1500,78.92
+scoped-all-grown,namespace-cost,3,200,False,gke-cost-analysis,gke-cost-analysis,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,41677,304804,1814,46.03
+scoped-all-grown,nodepool-no-scaleup,1,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal,9,15926,274350,1514,151.13
+scoped-all-grown,nodepool-no-scaleup,2,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal,8,16747,244076,1083,146.1
+scoped-all-grown,nodepool-no-scaleup,3,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,30535,304904,1219,88.91
+scoped-all-grown,pdb-probes,1,200,False,gke-reliability,gke-reliability,skill_view,1,2,31117,318,30.57
+scoped-all-grown,pdb-probes,2,200,False,gke-reliability,gke-reliability,skill_view terminal terminal terminal terminal terminal,6,14189,183330,855,53.33
+scoped-all-grown,pdb-probes,3,200,False,gke-reliability,gke-reliability submit-suggestion,terminal skill_view terminal terminal terminal terminal terminal terminal terminal skill_view,10,39853,304706,1053,116.91
+scoped-all-grown,pod-403-gcs,1,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal search_files terminal terminal terminal terminal terminal,10,62954,305578,1112,154.14
+scoped-all-grown,pod-403-gcs,2,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal,5,25479,153923,816,60.75
+scoped-all-grown,pod-403-gcs,3,200,False,gke-workload-identity,gke-workload-identity,skill_view terminal terminal terminal terminal,5,25327,153978,1394,68.21
+scoped-all-grown,pod-ip-exhaustion,1,200,False,gke-networking,gke-networking,skill_view tool_call terminal terminal terminal terminal terminal terminal,9,46176,275138,4344,102.12
+scoped-all-grown,pod-ip-exhaustion,2,200,False,gke-networking,gke-networking,skill_view tool_call tool_call,3,6985,93101,717,66.39
+scoped-all-grown,pod-ip-exhaustion,3,200,False,gke-networking,gke-networking,skill_view execute_code tool_describe tool_describe tool_search,5,12607,153886,1022,65.17
+scoped-all-grown,prometheus-alerts,1,200,False,gke-observability,gke-observability gke-alert-configuration,skill_view terminal terminal skill_view terminal terminal terminal search_files terminal terminal,10,76823,304670,1732,166.48
+scoped-all-grown,prometheus-alerts,2,200,False,gke-observability,gke-observability gke-alert-configuration,tool_search skill_view skill_view search_files terminal terminal terminal terminal terminal terminal terminal,10,91782,304840,2900,124.77
+scoped-all-grown,prometheus-alerts,3,200,False,gke-observability,gke-observability gke-alert-configuration,skill_view skill_view,1,2,31267,561,29.76
+scoped-all-grown,pvc-pending,1,200,False,,,terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,21847,305410,1926,108.75
+scoped-all-grown,pvc-pending,2,200,False,,,terminal terminal terminal terminal terminal terminal terminal tool_search terminal terminal,10,16646,305410,1570,182.26
+scoped-all-grown,pvc-pending,3,200,False,,,terminal terminal terminal,3,1428,93025,951,66.2
+scoped-all-grown,tpu-vbar,1,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal search_files terminal terminal terminal terminal terminal terminal,10,45894,304670,1371,198.33
+scoped-all-grown,tpu-vbar,2,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,53613,304840,1066,233.55
+scoped-all-grown,tpu-vbar,3,200,False,gke-ai-troubleshooting-tpu-vbar-oom,gke-ai-troubleshooting-tpu-vbar-oom gke-ai-troubleshooting-tpu-vbar-oom,skill_view skill_view terminal terminal terminal terminal,6,18867,183742,1002,62.82
+scoped-all-grown,upgrade-plan,1,200,False,gke-upgrades,gke-upgrades fleet-upgrade-verification,skill_view skill_view terminal terminal terminal search_files terminal terminal terminal read_file terminal,10,121196,303708,3789,99.73
+scoped-all-grown,upgrade-plan,2,200,False,gke-upgrades,gke-upgrades,skill_view terminal terminal terminal search_files,5,24775,153391,1406,64.83
+scoped-all-grown,upgrade-plan,3,200,False,gke-upgrades,gke-upgrades,skill_view terminal,2,5111,62540,666,33.6
+scoped-all-grown,vllm-l4,1,200,False,gke-inference,gke-inference,skill_view terminal terminal tool_search tool_describe terminal tool_call terminal terminal terminal,10,58181,304386,1241,49.65
+scoped-all-grown,vllm-l4,2,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal terminal terminal terminal,10,36869,304556,1612,84.94
+scoped-all-grown,vllm-l4,3,200,False,gke-inference,gke-inference,skill_view terminal terminal terminal terminal terminal terminal terminal,8,29799,244062,1624,64.29

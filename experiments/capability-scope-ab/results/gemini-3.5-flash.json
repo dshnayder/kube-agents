@@ -1,0 +1,806 @@
+{
+ "stock-shipped": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 70.0,
+  "first_skill_acceptable_pct": 1.7,
+  "first_skill_wrong_pct": 0.0,
+  "no_skill_loaded_pct": 28.3,
+  "any_gold_loaded_pct": 71.7,
+  "control_spurious_loads": "0/6",
+  "skill_views_per_run": 0.8,
+  "tool_searches_per_run": 0.2,
+  "api_calls_per_run": 7.4,
+  "input_tokens_per_run_median": 258906,
+  "output_tokens_per_run_median": 1509,
+  "cache_read_share_pct_mean": 91.2,
+  "first_call_prompt_tokens_median": 29874,
+  "wall_seconds_median": 51.9,
+  "time_to_first_tool_call_median": 6.1,
+  "skill_loads_outside_working_set": "9/52",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "-",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-optimization",
+    "-",
+    "gke-cost-analysis"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "-",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "-",
+    "-"
+   ],
+   "gitops-pr": [
+    "submit-suggestion",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "-",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "gke-workload-scaling",
+    "gke-workload-scaling",
+    "gke-workload-scaling"
+   ],
+   "https-gateway": [
+    "gke-service-networking",
+    "gke-service-networking",
+    "gke-service-networking"
+   ],
+   "inspect-repo": [
+    "-",
+    "-",
+    "-"
+   ],
+   "manifest-go-api": [
+    "gke-manifest-generation",
+    "gke-manifest-generation",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "-",
+    "-"
+   ],
+   "nodepool-no-scaleup": [
+    "gke-cluster-autoscaler",
+    "gke-cluster-autoscaler",
+    "gke-cluster-autoscaler"
+   ],
+   "pdb-probes": [
+    "gke-reliability",
+    "-",
+    "gke-reliability"
+   ],
+   "pod-403-gcs": [
+    "-",
+    "-",
+    "-"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "gke-networking",
+    "-"
+   ],
+   "prometheus-alerts": [
+    "gke-observability",
+    "gke-observability",
+    "gke-observability"
+   ],
+   "pvc-pending": [
+    "gke-storage",
+    "gke-storage",
+    "gke-storage"
+   ],
+   "tpu-vbar": [
+    "-",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "-"
+   ],
+   "vllm-l4": [
+    "gke-inference",
+    "gke-inference",
+    "gke-inference"
+   ]
+  }
+ },
+ "fulldesc-shipped": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 76.7,
+  "first_skill_acceptable_pct": 3.3,
+  "first_skill_wrong_pct": 1.7,
+  "no_skill_loaded_pct": 18.3,
+  "any_gold_loaded_pct": 78.3,
+  "control_spurious_loads": "0/6",
+  "skill_views_per_run": 0.9,
+  "tool_searches_per_run": 0.2,
+  "api_calls_per_run": 6.6,
+  "input_tokens_per_run_median": 251721,
+  "output_tokens_per_run_median": 1277,
+  "cache_read_share_pct_mean": 92.0,
+  "first_call_prompt_tokens_median": 32852,
+  "wall_seconds_median": 56.1,
+  "time_to_first_tool_call_median": 12.1,
+  "skill_loads_outside_working_set": "8/59",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "-",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "-",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-optimization",
+    "gke-cost-analysis",
+    "gke-cost-optimization"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "gke-backup-dr",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification"
+   ],
+   "gitops-pr": [
+    "submit-suggestion",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "gke-platform-security",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "gke-workload-scaling",
+    "gke-workload-scaling",
+    "-"
+   ],
+   "https-gateway": [
+    "gke-service-networking",
+    "-",
+    "gke-service-networking"
+   ],
+   "inspect-repo": [
+    "inspect-repository",
+    "inspect-repository",
+    "-"
+   ],
+   "manifest-go-api": [
+    "gke-manifest-generation",
+    "gke-manifest-generation",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "nodepool-no-scaleup": [
+    "gke-cluster-autoscaler",
+    "gke-cluster-autoscaler",
+    "-"
+   ],
+   "pdb-probes": [
+    "-",
+    "gke-reliability",
+    "gke-reliability"
+   ],
+   "pod-403-gcs": [
+    "-",
+    "-",
+    "-"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "gke-networking",
+    "gke-networking"
+   ],
+   "prometheus-alerts": [
+    "gke-observability",
+    "gke-observability",
+    "gke-observability"
+   ],
+   "pvc-pending": [
+    "-",
+    "-",
+    "gke-workload-troubleshooting"
+   ],
+   "tpu-vbar": [
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "gke-upgrades"
+   ],
+   "vllm-l4": [
+    "gke-manifest-generation",
+    "gke-inference",
+    "gke-inference"
+   ]
+  }
+ },
+ "scoped-all-shipped": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 76.7,
+  "first_skill_acceptable_pct": 8.3,
+  "first_skill_wrong_pct": 0.0,
+  "no_skill_loaded_pct": 15.0,
+  "any_gold_loaded_pct": 81.7,
+  "control_spurious_loads": "1/6",
+  "skill_views_per_run": 1.0,
+  "tool_searches_per_run": 0.3,
+  "api_calls_per_run": 7.1,
+  "input_tokens_per_run_median": 309989.0,
+  "output_tokens_per_run_median": 1634.0,
+  "cache_read_share_pct_mean": 89.2,
+  "first_call_prompt_tokens_median": 29815.0,
+  "wall_seconds_median": 59.9,
+  "time_to_first_tool_call_median": 4.7,
+  "skill_loads_outside_working_set": "12/74",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "gke-basics",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "gke-backup-dr",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification"
+   ],
+   "gitops-pr": [
+    "-",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "gke-platform-security",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "gke-workload-scaling",
+    "gke-workload-scaling",
+    "gke-workload-scaling"
+   ],
+   "https-gateway": [
+    "gke-service-networking",
+    "gke-service-networking",
+    "gke-service-networking"
+   ],
+   "inspect-repo": [
+    "-",
+    "-",
+    "-"
+   ],
+   "manifest-go-api": [
+    "gke-manifest-generation",
+    "gke-manifest-generation",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "nodepool-no-scaleup": [
+    "-",
+    "gke-cluster-autoscaler",
+    "gke-cluster-autoscaler"
+   ],
+   "pdb-probes": [
+    "gke-reliability",
+    "gke-reliability",
+    "gke-reliability"
+   ],
+   "pod-403-gcs": [
+    "-",
+    "-",
+    "-"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "gke-networking",
+    "gke-networking"
+   ],
+   "prometheus-alerts": [
+    "gke-observability",
+    "gke-observability",
+    "gke-observability"
+   ],
+   "pvc-pending": [
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting",
+    "-"
+   ],
+   "tpu-vbar": [
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "gke-upgrades"
+   ],
+   "vllm-l4": [
+    "gke-inference",
+    "gke-inference",
+    "gke-inference"
+   ]
+  }
+ },
+ "stock-grown": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 65.0,
+  "first_skill_acceptable_pct": 10.0,
+  "first_skill_wrong_pct": 1.7,
+  "no_skill_loaded_pct": 23.3,
+  "any_gold_loaded_pct": 68.3,
+  "control_spurious_loads": "0/6",
+  "skill_views_per_run": 0.8,
+  "tool_searches_per_run": 0.0,
+  "api_calls_per_run": 7.0,
+  "input_tokens_per_run_median": 273438.5,
+  "output_tokens_per_run_median": 1361.5,
+  "cache_read_share_pct_mean": 91.9,
+  "first_call_prompt_tokens_median": 34887.5,
+  "wall_seconds_median": 58.1,
+  "time_to_first_tool_call_median": 7.2,
+  "skill_loads_outside_working_set": "11/54",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "-",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-optimization"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "gke-backup-dr",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification"
+   ],
+   "gitops-pr": [
+    "-",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "gke-platform-security",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "-",
+    "submit-suggestion",
+    "-"
+   ],
+   "https-gateway": [
+    "gke-service-networking",
+    "gke-service-networking",
+    "-"
+   ],
+   "inspect-repo": [
+    "inspect-repository",
+    "-",
+    "inspect-repository"
+   ],
+   "manifest-go-api": [
+    "-",
+    "-",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "nodepool-no-scaleup": [
+    "gke-cluster-autoscaler",
+    "-",
+    "-"
+   ],
+   "pdb-probes": [
+    "-",
+    "gke-reliability",
+    "-"
+   ],
+   "pod-403-gcs": [
+    "-",
+    "gke-workload-identity",
+    "gke-workload-identity"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "gke-networking",
+    "-"
+   ],
+   "prometheus-alerts": [
+    "gke-observability",
+    "gke-observability",
+    "gke-observability"
+   ],
+   "pvc-pending": [
+    "gke-storage-troubleshooting",
+    "-",
+    "gke-storage-troubleshooting"
+   ],
+   "tpu-vbar": [
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "gke-upgrades"
+   ],
+   "vllm-l4": [
+    "gke-inference",
+    "gke-inference",
+    "gke-inference"
+   ]
+  }
+ },
+ "fulldesc-grown": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 63.3,
+  "first_skill_acceptable_pct": 13.3,
+  "first_skill_wrong_pct": 1.7,
+  "no_skill_loaded_pct": 21.7,
+  "any_gold_loaded_pct": 63.3,
+  "control_spurious_loads": "0/6",
+  "skill_views_per_run": 0.8,
+  "tool_searches_per_run": 0.1,
+  "api_calls_per_run": 5.5,
+  "input_tokens_per_run_median": 249100,
+  "output_tokens_per_run_median": 1288,
+  "cache_read_share_pct_mean": 94.2,
+  "first_call_prompt_tokens_median": 40109,
+  "wall_seconds_median": 54.8,
+  "time_to_first_tool_call_median": 12.2,
+  "skill_loads_outside_working_set": "11/56",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "-",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "-",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "-"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "gke-backup-dr",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "-",
+    "fleet-upgrade-verification"
+   ],
+   "gitops-pr": [
+    "submit-suggestion",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "gke-platform-security",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "gke-workload-scaling",
+    "-",
+    "-"
+   ],
+   "https-gateway": [
+    "gke-service-networking",
+    "gke-service-networking",
+    "gke-service-networking"
+   ],
+   "inspect-repo": [
+    "inspect-repository",
+    "inspect-repository",
+    "inspect-repository"
+   ],
+   "manifest-go-api": [
+    "gke-manifest-generation",
+    "gke-manifest-generation",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "nodepool-no-scaleup": [
+    "-",
+    "gke-cluster-autoscaler",
+    "-"
+   ],
+   "pdb-probes": [
+    "gke-reliability",
+    "-",
+    "gke-reliability"
+   ],
+   "pod-403-gcs": [
+    "gke-workload-identity",
+    "gke-workload-identity",
+    "gke-workload-identity"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "-",
+    "-"
+   ],
+   "prometheus-alerts": [
+    "-",
+    "-",
+    "-"
+   ],
+   "pvc-pending": [
+    "gke-storage-troubleshooting",
+    "gke-storage-troubleshooting",
+    "gke-storage-troubleshooting"
+   ],
+   "tpu-vbar": [
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "gke-upgrades"
+   ],
+   "vllm-l4": [
+    "gke-inference",
+    "gke-inference",
+    "gke-manifest-generation"
+   ]
+  }
+ },
+ "scoped-all-grown": {
+  "runs": 66,
+  "errors": 0,
+  "incomplete_runs": 0,
+  "probes": 60,
+  "first_skill_gold_pct": 73.3,
+  "first_skill_acceptable_pct": 8.3,
+  "first_skill_wrong_pct": 0.0,
+  "no_skill_loaded_pct": 18.3,
+  "any_gold_loaded_pct": 75.0,
+  "control_spurious_loads": "0/6",
+  "skill_views_per_run": 0.9,
+  "tool_searches_per_run": 0.2,
+  "api_calls_per_run": 7,
+  "input_tokens_per_run_median": 279440,
+  "output_tokens_per_run_median": 1390,
+  "cache_read_share_pct_mean": 89.6,
+  "first_call_prompt_tokens_median": 31168,
+  "wall_seconds_median": 64.6,
+  "time_to_first_tool_call_median": 6.5,
+  "skill_loads_outside_working_set": "13/74",
+  "first_skill_by_scenario": {
+   "control-capabilities": [
+    "-",
+    "-",
+    "-"
+   ],
+   "control-list-nodes": [
+    "-",
+    "-",
+    "-"
+   ],
+   "crashloop": [
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting",
+    "gke-workload-troubleshooting"
+   ],
+   "cut-the-bill": [
+    "gke-cost-analysis",
+    "-",
+    "gke-cost-analysis"
+   ],
+   "daily-backups": [
+    "gke-backup-dr",
+    "gke-backup-dr",
+    "gke-backup-dr"
+   ],
+   "fleet-behind-channel": [
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification",
+    "fleet-upgrade-verification"
+   ],
+   "gitops-pr": [
+    "submit-suggestion",
+    "submit-suggestion",
+    "submit-suggestion"
+   ],
+   "harden-cluster": [
+    "gke-platform-security",
+    "gke-platform-security",
+    "gke-platform-security"
+   ],
+   "hpa": [
+    "gke-workload-scaling",
+    "gke-workload-scaling",
+    "gke-workload-scaling"
+   ],
+   "https-gateway": [
+    "-",
+    "gke-service-networking",
+    "gke-service-networking"
+   ],
+   "inspect-repo": [
+    "-",
+    "-",
+    "-"
+   ],
+   "manifest-go-api": [
+    "gke-manifest-generation",
+    "gke-manifest-generation",
+    "gke-manifest-generation"
+   ],
+   "namespace-cost": [
+    "gke-cost-analysis",
+    "gke-cost-analysis",
+    "gke-cost-analysis"
+   ],
+   "nodepool-no-scaleup": [
+    "-",
+    "-",
+    "-"
+   ],
+   "pdb-probes": [
+    "gke-reliability",
+    "gke-reliability",
+    "gke-reliability"
+   ],
+   "pod-403-gcs": [
+    "gke-workload-identity",
+    "gke-workload-identity",
+    "gke-workload-identity"
+   ],
+   "pod-ip-exhaustion": [
+    "gke-networking",
+    "gke-networking",
+    "gke-networking"
+   ],
+   "prometheus-alerts": [
+    "gke-observability",
+    "gke-observability",
+    "gke-observability"
+   ],
+   "pvc-pending": [
+    "-",
+    "-",
+    "-"
+   ],
+   "tpu-vbar": [
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom",
+    "gke-ai-troubleshooting-tpu-vbar-oom"
+   ],
+   "upgrade-plan": [
+    "gke-upgrades",
+    "gke-upgrades",
+    "gke-upgrades"
+   ],
+   "vllm-l4": [
+    "gke-inference",
+    "gke-inference",
+    "gke-inference"
+   ]
+  }
+ }
+}

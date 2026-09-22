@@ -425,8 +425,8 @@ six. The `shipped` rung is the 44 skills in the repository; the `grown` rung add
 from the upstream repository the sync reads, five of which the next sync will pull in unasked.
 Twenty probes name a gold skill; two are controls where loading any skill is wrong. Each run was
 capped at ten model iterations and prefixed with one sentence keeping it on the local cluster.
-The model was Gemini 3.1 Pro through the install's LiteLLM; §8.6 covers the repeat on Gemini 3.5
-Flash.
+The model was Gemini 3.1 Pro through the install's LiteLLM; §8.6 covers the repeat of every
+cell on Gemini 3.5 Flash.
 
 The offline ranker alone, before any model saw it, put the gold skill in its top six for 16 of
 20 probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10. Those
@@ -517,8 +517,53 @@ skill. It is also why the shelf is not optional.
 
 ### 8.6 The repeat on Gemini 3.5 Flash
 
-Pending: the same six cells were re-run on `gemini/gemini-3.5-flash`, the model production
-answers with today, and this subsection is replaced by their numbers when the run completes.
+The same six cells were re-run on `gemini/gemini-3.5-flash`, the model production answers with
+today, through the same install and driver, three hours after the first matrix.
+
+| First skill loaded, Flash        | stock  | fulldesc | scoped | stock  | fulldesc | scoped |
+| -------------------------------- | ------ | -------- | ------ | ------ | -------- | ------ |
+| catalogue                        | 44     | 44       | 44     | 104    | 104      | 104    |
+| gold                             | 70.0%  | 76.7%    | 76.7%  | 65.0%  | 63.3%    | 73.3%  |
+| acceptable                       | 1.7%   | 3.3%     | 8.3%   | 10.0%  | 13.3%    | 8.3%   |
+| wrong                            | 0.0%   | 1.7%     | 0.0%   | 1.7%   | 1.7%     | 0.0%   |
+| none loaded                      | 28.3%  | 18.3%    | 15.0%  | 23.3%  | 21.7%    | 18.3%  |
+| spurious loads on control probes | 0 of 6 | 0 of 6   | 1 of 6 | 0 of 6 | 0 of 6   | 0 of 6 |
+| prompt tokens, first model call  | 29.9k  | 32.9k    | 29.8k  | 34.9k  | 40.1k    | 31.2k  |
+| seconds to first tool call       | 6.1    | 12.1     | 4.7    | 7.2    | 12.2     | 6.5    |
+
+Flash loads skills more readily than Pro at baseline (70% gold-first against 55%), so there is
+less headroom, and every movement is smaller: seven to eight points of gold-first on either
+rung, and half the no-skill runs removed on the shipped one. None of the Flash differences is
+significant on its own. The direction is the same in all four model-by-rung comparisons, and
+pooling the two models (120 probe runs per arm) gives:
+
+| Pooled, both models      | stock | fulldesc | scoped | scoped vs stock | scoped vs fulldesc |
+| ------------------------ | ----- | -------- | ------ | --------------- | ------------------ |
+| shipped, gold first      | 62.5% | 68.3%    | 72.5%  | p = 0.10        | p = 0.48           |
+| shipped, no skill loaded | 35.0% | 29.2%    | 20.8%  | p = 0.014       | p = 0.14           |
+| grown, gold first        | 59.2% | 60.8%    | 75.8%  | p = 0.006       | p = 0.013          |
+| grown, no skill loaded   | 34.2% | 25.8%    | 17.5%  | p = 0.003       | p = 0.12           |
+
+The reading that survives both models: on the catalogue as shipped, scoping's reliable effect is
+that the agent stops skipping skills, and its effect on which skill it picks is positive and
+unproven at this sample; on a catalogue twice the size, scoping improves the pick by a sixth
+against either alternative and full descriptions alone do nothing for it. The cost picture is
+the same on Flash as on Pro: `fulldesc` adds 3k to 5k tokens to every call and doubles the time
+to the first tool call, `scoped` costs what `stock` costs, and at 104 skills it is 3.7k tokens a
+call cheaper than the truncated index. The one spurious load on a control probe is the only
+false positive in 792 runs.
+
+### 8.7 What the run does not show
+
+- Whether the picked skill produced a better outcome. The probes were scored on the pick, not on
+  the answer; a bench verifier that asserts the capability behind an outcome is still the gap in
+  §11.
+- Multi-turn behaviour: stickiness, hysteresis and the turn-boundary rule ran but were never
+  exercised by a second turn.
+- Tool scoping: the tool array on this profile is small and the filter hid one to a dozen tools,
+  so the run says nothing about the 30-to-50 knee the literature reports for tools.
+- Anything about a ranker with metadata. The v1 ranker had names and descriptions only; the
+  regressions it caused are the argument for the sidecar, not a measurement of it.
 
 ## 9. Integration with Hermes
 
