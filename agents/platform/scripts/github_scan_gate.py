@@ -47,9 +47,11 @@ than inheriting one from here. That is not an oversight: ``resolver.py poll``
 already does both and already reports precise reason codes — the broker's own
 refusal codes (``FORGE_UNAUTHENTICATED`` vs ``FORGE_NOT_FOUND`` vs
 ``FORGE_RATE_LIMITED``) when the forge refused, and ``CONFIGMAP_READ_FAILED``
-vs ``GIT_REPO_UNPARSEABLE`` vs ``BROKER_UNREACHABLE`` vs ``SANDBOX_UNREACHABLE``
-vs ``REPO_UNREACHABLE`` when the fault was on this side — that a hoisted preflight here could only
-flatten or duplicate. ``reason`` is rendered through verbatim, so the set is
+vs ``BROKER_UNREACHABLE`` vs ``REPO_UNREACHABLE`` when the fault was on this
+side — that a hoisted preflight here could only flatten or duplicate. This side
+adds two of its own, ``GIT_REPO_UNPARSEABLE`` for a repository value read
+before there is anyone to ask about it and ``SANDBOX_UNREACHABLE`` for a
+command that never ran. ``reason`` is rendered through verbatim, so the set is
 open by design and a sweep may add to it without a change here.
 
 Consolidating did take something away: an operator could previously stop one

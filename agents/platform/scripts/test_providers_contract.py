@@ -369,6 +369,16 @@ class ContractTest(unittest.TestCase):
         # The transport owns the host. A forge that returned an absolute URL
         # would be choosing where the credential is presented, which is the one
         # decision the host allowlist exists to keep away from it.
+        #
+        # `assertIn("acme/infra", path)` is the fixtures' repository, and it is
+        # why the route a filtered `issue-list` takes is not covered here: with
+        # a `query` or an `excludeLabels` GitHub's module leaves the listing
+        # endpoint for `search/issues`, which carries the repository as a `q`
+        # qualifier rather than in the path. The fixtures hold the unfiltered
+        # request, and a contract shared by every forge cannot prescribe one
+        # forge's search grammar. That route is pinned per forge instead --
+        # `test_vcs_broker.py`'s `test_issue_list_with_a_query_goes_through_search`
+        # and `test_issue_list_excludes_labels_at_the_forge_not_on_the_page`.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
                 fixture = self.load(directory, verb)

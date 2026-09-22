@@ -137,6 +137,15 @@ SKIP_LABELS = [
 # because the comments are fetched once, for the winner, by `_fetch_comments`
 # below: one list call plus one view call, against the ten issues' worth of
 # comment round trips the old projection paid every tick.
+#
+# It is a window and not the backlog, and the edge is at the old end. The
+# exclusions make this a search query, which is ordered `created desc`, so the
+# hundred the poll ranks are the hundred newest unaddressed issues: on a
+# repository holding more than that, the oldest fall outside the window and no
+# tick considers them until enough newer ones are closed or labelled. A larger
+# number does not remove that edge, only moves it -- what removes it is
+# ordering the query by what the ranking is for, which the search grammar does
+# not express.
 POLL_WINDOW = 100
 
 

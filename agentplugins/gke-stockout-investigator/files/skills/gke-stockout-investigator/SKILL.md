@@ -75,7 +75,7 @@ A stockout alert is a "false signal" if the cluster has already recovered (e.g. 
    - Do NOT run any further commands, do NOT search the workspace, and do NOT propose any configuration changes.
    - Output a clear message to the user explaining that the stockout is a false signal and the workload pods are currently healthy and running.
 
-### 3. Parse Alert Details & Lease a GitOps Workspace
+### 3. Parse Alert Details & Take a Working Copy
 
 If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stockout issue):
 
@@ -105,8 +105,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    remediation pull request for this same workload was closed, or merged in a
    way that did not carry its last revision into the base — a squash merge, the
    ordinary setting on a GitOps repository. The name is one per workload, so a
-   repeat alert reaches this every time. Step 1 has already established that no
-   pull request for this workload is open, so nothing is being overwritten;
+   repeat alert reaches this every time. Step 2's duplicate check has already
+   established that no pull request for this workload is open, so nothing is
+   being overwritten;
    what is unknown is whether the forge still holds the branch, and no read verb
    can say. Re-run the command with `--allow-reused-branch`, which says the
    name is free; if the remote does still hold the branch, Step 7 refuses the
@@ -252,7 +253,7 @@ Inspect the target `ComputeClass` and workload manifests in the leased workspace
 
 Do not modify the live GKE cluster directly. Instead, propose the change as a commit on the branch `prepare` already checked out for you.
 
-Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g. `/opt/data/gitops/t_9f3c1e07/acme__fleet`). It is already on `platform-agent/remediate-stockout-<workload_name>`, so there is no branch to create.
+Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g. `/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app`). It is already on `platform-agent/remediate-stockout-<workload_name>`, so there is no branch to create.
 
 1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
    - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.

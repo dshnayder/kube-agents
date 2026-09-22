@@ -163,7 +163,9 @@ now, which is the revision you just pushed if the push landed. `commits` is
 oldest first and one page long, so the tip is the **last** entry only when
 that page says `"truncated": false`; when it says `true`, ask again with
 `--page 2`, `--page 3`, … until it does not, and take the last entry of that
-last page. Its `sha` must equal `sourceRevision` — if it does not, you are not
+last page. A branch whose commit count is an exact multiple of the page size
+ends on a page that is empty and says `"truncated": false` — there the tip is
+the last entry of the page before it, not nothing. Its `sha` must equal `sourceRevision` — if it does not, you are not
 looking at the tip yet. Read that entry's `sha` and the first line of its
 `message`. Then check the value you were asked to change actually reads that
 way now, on that branch — the file, not your memory of having edited it.

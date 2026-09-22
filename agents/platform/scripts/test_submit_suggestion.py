@@ -208,33 +208,6 @@ class FakeBroker:
         shown = git(self.origin, "rev-parse", f"refs/heads/{branch}", check=False)
         return shown.stdout.strip() if shown.returncode == 0 else ""
 
-    def proposal_commits(self, payload):
-        """The revisions on a proposal's source branch, oldest first, one page.
-
-        `limit` is honoured, as the forge honours it: a proposal with more
-        revisions than the page holds answers with the oldest ones and says
-        `truncated`. Read off the origin rather than recorded, so a test that
-        closes a proposal and moves the branch gets the answer the forge would
-        give.
-        """
-        for proposal in self.proposals:
-            if proposal["number"] != payload["number"]:
-                continue
-            shown = git(
-                self.origin, "rev-list", "--reverse",
-                f"main..refs/heads/{proposal['source']}",
-                check=False,
-            )
-            shas = shown.stdout.split() if shown.returncode == 0 else []
-            limit = payload.get("limit") or 30
-            page = shas[:limit]
-            return {
-                "commits": [{"sha": sha, "committed": "2026-09-15T00:00:00Z"} for sha in page],
-                "count": len(page),
-                "truncated": len(shas) >= limit,
-            }
-        raise AssertionError(f"no proposal {payload['number']}")
-
 
 @unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
 class SubmitSuggestionTestCase(unittest.TestCase):
@@ -331,6 +304,36 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             git(copy, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
             "platform-agent/scale-web",
         )
+
+    def test_prepare_leaves_nothing_behind_when_it_refuses_the_name(self):
+        """The refusal says to use another name, so this one must be free to retry.
+
+        The copy has to come down before the spent-branch question can be
+        answered -- it is a question about the copy. Keeping it after the
+        refusal left a tree and a session record under the very name the caller
+        was just told to stop using, and the next `prepare` of it refused for
+        having found a copy instead.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 9\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 7\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        self.existing_proposal(branch)["state"] = "merged"
+        for proposal in self.broker.proposals:
+            proposal["state"] = "merged"
+
+        with self.assertRaises(ValueError):
+            self.prepare(branch)
+        self.assertEqual(list(vcs_client.ROOT.glob("*/.git")), [])
+        with self.assertRaises(vcs_client.VcsError):
+            vcs_client.resolve_session("acme/infra", key=branch)
+        # And the name works on the next attempt, which is what the refusal
+        # told the caller to do -- with the flag, since the branch is genuinely
+        # still there.
+        self.assertEqual(self.prepare(branch, allow_reused_branch=True)["branch"], branch)
 
     def test_prepare_takes_a_copy_of_a_branch_that_already_has_a_proposal(self):
         # Step 5 of the SKILL: another round on a proposal under review. The
@@ -485,9 +488,11 @@ class SubmitSuggestionTestCase(unittest.TestCase):
     def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
         """The ordinary card, and the one the extra lookup must not cost anything.
 
-        One `proposal-list` for the history, one for the open proposal, and
-        nothing else across the seam -- the spent-name lookup is the first of
-        the two, and it is the whole of what the check costs here.
+        One `proposal-list` for the open proposal, one for the name's history,
+        and nothing else across the seam. The open-proposal lookup is the first
+        of the two -- it decides which arm `prepare` takes -- and the
+        spent-name lookup is the second, which is the whole of what the check
+        added here.
         """
         self.prepare()
         self.assertEqual(
@@ -1097,6 +1102,36 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         )
         self.assertEqual(self.broker.payloads("proposal-create")[0]["target"], "release")
         self.assertEqual(self.broker.payloads("publish")[0]["target"], "release")
+
+    def test_base_on_a_second_round_says_the_proposal_does_not_move(self):
+        """`--base` is read as a base, and is not a retarget.
+
+        It is what a caller reaches for when they mean "publish this onto
+        `release` instead", and the publish does honour it -- but no forge in
+        this protocol lets `proposal-update` move an open proposal's target, so
+        the proposal goes on pointing where it was opened. Silence there reads
+        as agreement, which is a round published against a base nobody is
+        reviewing it against.
+        """
+        git(self.origin, "branch", "release", "main")
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        proposal = self.broker.proposals[-1]
+        self.edit(self.prepare(branch, force=True), "replicas: 4\n")
+        self.logged.clear()
+
+        self.run_subject("submit", "--branch", branch, "--title", "second round", "--body", "b",
+                         "--base", "release")
+
+        said = "\n".join(self.logged)
+        self.assertIn("--base release", said)
+        self.assertIn(proposal["url"], said)
+        self.assertIn("still targets main", said)
+        # Said, not done: the publish goes where the flag says and the proposal
+        # stays where it was opened.
+        self.assertEqual(self.broker.payloads("publish")[-1]["target"], "release")
+        self.assertEqual(proposal["target"], "main")
 
     # -- the description file ---------------------------------------------
 

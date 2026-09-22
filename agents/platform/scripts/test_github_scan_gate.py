@@ -863,6 +863,25 @@ class PrCommentsSweepTest(unittest.TestCase):
         # locate a comment on every forge, so the verb takes both.
         self.assertEqual(provider.acknowledged, [(12, "IC_1")])
 
+    def test_a_forge_with_no_reactions_is_still_answered(self):
+        """`supports_acknowledge` False is a courtesy skipped, not a card lost.
+
+        Bitbucket Cloud has no reactions on pull-request comments. The 👀 is
+        the only thing that goes missing there -- the trigger is still accepted
+        and the card is still filed -- and the verb is not called at all, so a
+        forge that answers the request by doing nothing is never asked.
+        """
+        pr = make_pr()
+        provider = FakeProvider(
+            prs=[pr],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            acknowledges=False,
+        )
+        result = self._sweep(provider)
+        self.assertEqual(provider.acknowledged, [])
+        self.assertEqual(len(result.cards), 1)
+        self.assertIn("IC_1", result.cards[0].body)
+
     def test_two_triggers_on_one_pr_ride_on_one_card(self):
         """One conversation gets one answer, not one per paragraph."""
         pr = make_pr()

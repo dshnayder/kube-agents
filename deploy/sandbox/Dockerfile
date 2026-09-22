@@ -405,7 +405,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          a forge module answers it, so it imports vcs_client
 #                          rather than anything that speaks HTTP
 #   pr_triggers.py         imported by pr_conversation, imports forge
-#   github_token_refresh.py  invoked directly by submit-suggestion Step 5
+#   github_token_refresh.py  named by SOUL.md as the token refresher the agent
+#                          runs by hand (`python3 ./scripts/github_token_refresh.py
+#                          <owner>/<repo>`), and imported for its `log` by
+#                          submit_suggestion
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves

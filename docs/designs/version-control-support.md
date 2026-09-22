@@ -818,7 +818,7 @@ another for no property gained.
 | `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
 
-The first eight are the version-control skill's. The rest are the union of
+The rows down to `issue-create` are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather

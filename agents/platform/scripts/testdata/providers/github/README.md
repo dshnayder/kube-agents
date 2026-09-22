@@ -20,10 +20,13 @@ Each file is one JSON object:
 ```
 
 `payload` is the request the broker would receive on `POST /v1/vcs/<verb>`.
-`responses` are the API answers, in the order the forge asks for them — two
-entries for the `view` verbs, which fetch the object and then its comments.
-The harness raises on any call the file does not cover, so an implementation
-that grew a third request fails rather than quietly reading `None`.
+`responses` are the API answers, in the order the forge asks for them — one
+entry per request, so the count is however many requests the verb makes:
+`issue-view` fetches the issue and then its comments and has two,
+`proposal-view` fetches the pull request, its issue comments, its review
+comments and its reviews and has four. The harness raises on any call the file
+does not cover, so an implementation that grew one more request fails rather
+than quietly reading `None`.
 
 ## Provenance
 

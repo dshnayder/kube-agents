@@ -57,7 +57,8 @@ separate processes — find the same tree with no lookup state between them.
 **Lease key.** The fleet audit uses the audit id, which `validate_audit_id` already constrains to a
 closed enum, so it is a safe directory name by construction. It is the only caller whose key is
 constrained that way, not the only caller that leases a clone: two read-only scans lease here too —
-`api_deprecation_scan.py`'s directory mode and `inspect-repository`'s `clone-directory` — and
+`api_deprecation_scan.py`'s directory mode and `inspect-repository`'s `clone`, on the branch it
+takes when content mode is unavailable — and
 neither has an id of its own. The write skills are the ones that do not appear here at all; they
 take their working copies through the version-control verbs instead, which key a copy on the
 repository and the branch and need no lease to keep two of them apart — see §4. What the generic

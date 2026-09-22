@@ -198,8 +198,11 @@ expands the same constructs the argument would have. `mktemp` matters because
 `/opt/data/scratch` is shared with every other card running right now, and a
 fixed name there is two cards writing one file — one card's description on the
 other's pull request. Keep the file directly in `/opt/data/scratch`, the only
-directory `--body-file` reads from, and **not** inside the `workspace` — a file
-there is part of the change.
+directory `--body-file` reads from, and **not** inside the `workspace`: a file
+written there is untracked, and `commit` refuses rather than guess — it names
+the file and tells you to name the paths that belong in the change — so a
+description left in the working copy stops the submit instead of riding along
+in it.
 
 ```bash
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \

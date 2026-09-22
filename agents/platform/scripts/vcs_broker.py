@@ -89,6 +89,14 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
 
+# How many open proposals the `advance` check reads off a branch. One would
+# settle whether any is open; the rest are read because the second half of the
+# check asks whose they are, and a forge that lets two proposals share a source
+# branch would otherwise have the answer decided by whichever came back first.
+# Not a page to walk: a branch with more than this many open proposals on it is
+# not a case this refusal is trying to be exact about.
+OPEN_PROPOSALS_ON_A_BRANCH = 10
+
 # The ref an incoming bundle is fetched into. Under `refs/vcs/` rather than
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
@@ -773,7 +781,9 @@ class VcsBroker:
         if "proposal-list" not in getattr(bound.forge, "verbs", ()):
             return
         answer = bound.forge.proposal_list(
-            bound.api, bound.repo, {"state": "open", "source": branch, "limit": 10}
+            bound.api,
+            bound.repo,
+            {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
         )
         proposals = answer.get("proposals") or []
         if not proposals:

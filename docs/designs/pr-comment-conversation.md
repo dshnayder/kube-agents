@@ -80,10 +80,13 @@ Three properties are load-bearing, and each has a test:
 Each sweep resolves its own repo and makes its own credential check rather than sharing a hoisted
 one. That is deliberate: `resolver.py poll` already does both, and owns a precise reason-code
 vocabulary — the broker's own refusal codes (`FORGE_UNAUTHENTICATED` vs `FORGE_NOT_FOUND` vs
-`FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `UNMANAGED_REPOSITORY`
-vs `BROKER_UNREACHABLE` vs `SANDBOX_UNREACHABLE` vs `REPO_UNREACHABLE` when the fault is on this side — that a hoisted check
-could only duplicate or flatten. The gate keeps one code of its own, `GIT_REPO_UNPARSEABLE`, because
-it is the side that reads a repository value before there is anyone to ask about it.
+`FORGE_RATE_LIMITED`) when the forge refused, and `CONFIGMAP_READ_FAILED` vs `BROKER_UNREACHABLE`
+vs `REPO_UNREACHABLE` when the fault is on this side — that a hoisted check could only duplicate or
+flatten. `poll` has no `UNMANAGED_REPOSITORY` of its own, because it reads the managed list and
+sweeps what is in it; that code belongs to the verbs that are handed a repository
+(`claim`, `transition`). The gate keeps two codes of its own: `GIT_REPO_UNPARSEABLE`, because it is
+the side that reads a repository value before there is anyone to ask about it, and
+`SANDBOX_UNREACHABLE`, because it is the side that runs a command in the sandbox.
 
 Consolidation removes one real thing: the per-job `enabled: false` an operator had when there were
 two roster entries. `GITHUB_WATCHER_SWEEPS` (comma-separated; unset means all) restores it. A name
@@ -224,7 +227,9 @@ Three shapes exist because of a forge that is not GitHub:
   came back `CONTRIBUTOR`, so the gate refused the one person most entitled to direct the agent.
   The membership question is therefore asked outright, over the `identity` verb, which the broker's
   GitHub module answers from `repos/{repo}/collaborators/{user}/permission`. `BrokerProvider` caches
-  the answer per `(repository, login)` for the life of the instance — the sweep builds one per tick,
+  the answer per `(repository, case-folded login, is-an-app)` for the life of the instance —
+  case-folded because logins are case-insensitive on these forges, and carrying the App flag because
+  a bot and a person can share a login and the forge answers for whichever of them is asked about — the sweep builds one per tick,
   and a collaborator added between two ticks must not stay refused. The shape the section prescribed
   for other forges turned out to be the shape GitHub needed as well; only the claim that GitHub was
   exempt was mistaken.

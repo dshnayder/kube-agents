@@ -318,8 +318,14 @@ class GitHubForge(Forge):
         params: dict[str, Any] = {"per_page": limit}
         # Oldest first, which is GitHub's order for this endpoint and the one
         # the verb promises. The commit a caller most often wants is the newest,
-        # so the caller that needs it walks to the last page; GitHub stops
-        # serving at 250 commits, and past that `truncated` stays true.
+        # so the caller that needs it walks to the last page -- and on a
+        # proposal past 250 commits it never arrives at one. GitHub stops
+        # serving there, so the page that reaches the cap is short, `listing`
+        # reads a short page as the end and answers `truncated: false`, and the
+        # last entry of it is the 250th commit rather than the branch tip. A
+        # caller that needs the tip reads `sourceRevision` off the proposal
+        # instead; `submit_suggestion.stale_tip` says why, and is the one that
+        # was bitten.
         page = validate_page(payload.get("page"))
         if page > 1:
             params["page"] = page

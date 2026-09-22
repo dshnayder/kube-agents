@@ -40,7 +40,8 @@ import sysconfig
 # nothing in the image sets it, and a build that did would be changing the
 # directory it is asserting about, which the `chown`/`find` half of the same
 # RUN would then fail on.
-TRUSTED = os.environ.get("TRUSTED_CLOSURE_DIR", "/opt/vcs/libexec/platform")
+IN_THE_IMAGE = "/opt/vcs/libexec/platform"
+TRUSTED = os.environ.get("TRUSTED_CLOSURE_DIR", IN_THE_IMAGE)
 
 # The directories the entrypoint chowns to `agent`. A trusted process must not
 # carry either on its import path, even behind site-packages.
@@ -48,7 +49,12 @@ AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
 
 # Each forwarded script and the constant naming the path its caller forwards to.
 # The constant is checked as well as the closure: staging a root-owned copy that
-# nothing points at buys nothing.
+# nothing points at buys nothing. It is checked against `IN_THE_IMAGE` and not
+# against `TRUSTED`, because the constants are literals compiled into the
+# modules -- what they have to say is where the image puts the copies, which a
+# staging directory does not change. Only the closure walk follows the
+# override, which is the half that is about where these particular files were
+# read from.
 FORWARDED = {"forge": "SANDBOX_FORGE", "resolver": "SANDBOX_RESOLVER"}
 
 # The interpreter's own files. Everything else a trusted process imports has to
@@ -74,7 +80,7 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001 -- any failure is a build failure
             failures.append(f"{name} does not import from the trusted copy: {error!r}")
             continue
-        want = f"{TRUSTED}/{name}.py"
+        want = f"{IN_THE_IMAGE}/{name}.py"
         got = getattr(module, const, None)
         if got != want:
             failures.append(f"{name}.{const} is {got!r}, not {want!r}")

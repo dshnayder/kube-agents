@@ -451,7 +451,9 @@ def build_parser() -> argparse.ArgumentParser:
     repo_option(branch).set_defaults(run=verb_branch)
 
     commit = verbs.add_parser("commit", help="record a revision locally")
-    commit.add_argument("paths", nargs="*", help="default: everything that changed")
+    commit.add_argument(
+        "paths", nargs="*", help="default: every tracked file that changed"
+    )
     commit.add_argument("-m", "--message", required=True)
     repo_option(commit).set_defaults(run=verb_commit)
 

@@ -38,6 +38,7 @@ diverged is refused by name rather than overwritten.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -85,6 +86,34 @@ def _short_branch(branch: str) -> str:
         if short.startswith(prefix):
             return short[len(prefix):]
     return short
+
+
+@contextlib.contextmanager
+def _nothing_left_behind(repo: str, branch: str):
+    """Drop the working copy if what follows refuses. Only then.
+
+    `prepare` has to bring the copy down before some of its refusals can be
+    made -- whether a spent branch's last revision is in the way is a question
+    about the copy, and nothing else can answer it. What that left was a tree
+    and a session record under a branch name the refusal had just told the
+    caller not to use, on a volume every card on this pod shares. The next
+    `prepare` of that name then found a copy already there and refused a second
+    time for an unrelated reason, and the first refusal's advice -- pick a name
+    the repository has not used -- never got followed because the obstacle had
+    changed.
+
+    Any exception, not only the refusals: a copy kept after a failure nobody
+    planned for is the same litter. `discard` is best-effort on the way out,
+    because the refusal is the news and a failure to tidy must not replace it.
+    """
+    try:
+        yield
+    except BaseException:
+        try:
+            vcs_client.discard(repo, key=branch)
+        except Exception:  # noqa: BLE001 -- see the docstring: tidying never speaks
+            pass
+        raise
 
 
 def refuse_branch_on_its_own_base(branch: str, base: str, verb: str) -> None:
@@ -275,8 +304,9 @@ def handle_prepare(args) -> int:
     if proposal:
         log(f"'{branch}' already has an open proposal; taking a copy of it.")
         cloned = vcs_client.clone(repo, branch=branch, force=args.force, key=branch)
-        base = proposal["target"]
-        refuse_branch_on_its_own_base(branch, base, "prepare")
+        with _nothing_left_behind(repo, branch):
+            base = proposal["target"]
+            refuse_branch_on_its_own_base(branch, base, "prepare")
         started_from = branch
     else:
         # Before the copy comes down, because it is one call and it is the only
@@ -287,59 +317,60 @@ def handle_prepare(args) -> int:
         # this card's change, and a sibling card preparing another branch of the
         # same repository gets a tree of its own rather than colliding here.
         cloned = vcs_client.clone(repo, force=args.force, key=branch)
-        base = cloned["branch"]
-        if spent:
-            # After the clone, not before it: the question is whether the base
-            # this copy is standing on already contains the old tip, and that is
-            # answered in the copy.
-            in_the_way = stale_tip(repo, spent, vcs_client.resolve_session(repo, key=branch))
-            spent_named = (
-                f"'{branch}' was the source of "
-                f"{spent.get('url') or 'an earlier proposal'}, which is "
-                f"{spent.get('state') or 'no longer open'}. That proposal's last "
-                f"revision, {in_the_way[:12]}, is not in '{base}', so it was "
-                "squash-merged or closed rather than merged whole"
-            ) if in_the_way else ""
-            if in_the_way and getattr(args, "allow_reused_branch", False):
-                # Said, not silent. If the caller is wrong about the branch
-                # being gone, `publish` refuses BRANCH_DIVERGED at the end of
-                # the turn, and this line is what makes that refusal legible
-                # rather than a surprise.
-                log(
-                    f"{spent_named}. --allow-reused-branch says the repository "
-                    "no longer holds the branch, so the name is free; if it "
-                    "does still hold it, publishing will be refused as "
-                    "BRANCH_DIVERGED."
+        with _nothing_left_behind(repo, branch):
+            base = cloned["branch"]
+            if spent:
+                # After the clone, not before it: the question is whether the base
+                # this copy is standing on already contains the old tip, and that is
+                # answered in the copy.
+                in_the_way = stale_tip(repo, spent, vcs_client.resolve_session(repo, key=branch))
+                spent_named = (
+                    f"'{branch}' was the source of "
+                    f"{spent.get('url') or 'an earlier proposal'}, which is "
+                    f"{spent.get('state') or 'no longer open'}. That proposal's last "
+                    f"revision, {in_the_way[:12]}, is not in '{base}', so it was "
+                    "squash-merged or closed rather than merged whole"
+                ) if in_the_way else ""
+                if in_the_way and getattr(args, "allow_reused_branch", False):
+                    # Said, not silent. If the caller is wrong about the branch
+                    # being gone, `publish` refuses BRANCH_DIVERGED at the end of
+                    # the turn, and this line is what makes that refusal legible
+                    # rather than a surprise.
+                    log(
+                        f"{spent_named}. --allow-reused-branch says the repository "
+                        "no longer holds the branch, so the name is free; if it "
+                        "does still hold it, publishing will be refused as "
+                        "BRANCH_DIVERGED."
+                    )
+                elif in_the_way:
+                    raise ValueError(
+                        f"{spent_named}. If the remote still holds the branch "
+                        "there, a change cut fresh from "
+                        f"'{base}' does not build on it, and publishing it would be "
+                        "refused as BRANCH_DIVERGED after the whole change had been "
+                        "written. Submit this one under a branch name the repository "
+                        "has not used: the derived name is a default, not a "
+                        "requirement. If the repository deletes a branch when it "
+                        "merges it, the name is already free — nothing here can see "
+                        "that, because no read verb reports whether a branch exists "
+                        "— so say so with --allow-reused-branch."
+                    )
+            # Before the switch below, not after it. The branch the copy came down
+            # on is the remote's default, and `check_branch` cannot know its name:
+            # a fleet whose trunk is `release-trunk` gets past the list of three.
+            refuse_branch_on_its_own_base(branch, base, "prepare")
+            # `branch` reports a failed switch rather than raising on one, and the
+            # JSON below would otherwise name a branch this run is not standing on.
+            # `handle_submit` does catch it -- it refuses when HEAD is somewhere
+            # other than `--branch` -- but that is a turn later, after the agent has
+            # written the whole change into a copy sitting on the base branch. Fail
+            # where the fault is.
+            switched = vcs_client.branch(repo, branch, key=branch)
+            if switched["exitCode"] != 0:
+                raise vcs_client.VcsError(
+                    f"could not take the branch '{branch}': "
+                    f"{switched['stderr'] or 'git exited ' + str(switched['exitCode'])}"
                 )
-            elif in_the_way:
-                raise ValueError(
-                    f"{spent_named}. If the remote still holds the branch "
-                    "there, a change cut fresh from "
-                    f"'{base}' does not build on it, and publishing it would be "
-                    "refused as BRANCH_DIVERGED after the whole change had been "
-                    "written. Submit this one under a branch name the repository "
-                    "has not used: the derived name is a default, not a "
-                    "requirement. If the repository deletes a branch when it "
-                    "merges it, the name is already free — nothing here can see "
-                    "that, because no read verb reports whether a branch exists "
-                    "— so say so with --allow-reused-branch."
-                )
-        # Before the switch below, not after it. The branch the copy came down
-        # on is the remote's default, and `check_branch` cannot know its name:
-        # a fleet whose trunk is `release-trunk` gets past the list of three.
-        refuse_branch_on_its_own_base(branch, base, "prepare")
-        # `branch` reports a failed switch rather than raising on one, and the
-        # JSON below would otherwise name a branch this run is not standing on.
-        # `handle_submit` does catch it -- it refuses when HEAD is somewhere
-        # other than `--branch` -- but that is a turn later, after the agent has
-        # written the whole change into a copy sitting on the base branch. Fail
-        # where the fault is.
-        switched = vcs_client.branch(repo, branch, key=branch)
-        if switched["exitCode"] != 0:
-            raise vcs_client.VcsError(
-                f"could not take the branch '{branch}': "
-                f"{switched['stderr'] or 'git exited ' + str(switched['exitCode'])}"
-            )
         started_from = base
 
     print(json.dumps({
@@ -467,6 +498,20 @@ def handle_submit(args) -> int:
     # because that is where it already says it is going and moving it is not
     # this script's call; from the branch the copy came down on otherwise.
     base = args.base or (proposal or {}).get("target") or session["branch"]
+    if args.base and proposal and args.base != proposal.get("target"):
+        # Said for the same reason `--title` above is: the publish honours it
+        # and the proposal does not. `proposal-update` carries a title, a body
+        # and labels -- no forge in this protocol lets a caller move an open
+        # proposal's target -- so the round lands on `--base` while the
+        # proposal still says it is going to the branch it was opened onto, and
+        # nothing in the answer would have said so.
+        log(
+            f"--base {args.base} is where this round is published to, but "
+            f"{proposal.get('url') or 'the open proposal'} still targets "
+            f"{proposal.get('target')}: an open proposal's target cannot be "
+            "moved from here. Close it and open another one onto the branch "
+            "you meant if that is what you need."
+        )
     # `session["branch"]` is deliberately not checked here as well: on the
     # second round of an open proposal the copy was taken of the branch itself,
     # so it equals `branch` by design -- that equality is what `advance` below

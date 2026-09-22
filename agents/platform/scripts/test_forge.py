@@ -819,6 +819,26 @@ class PermissionTest(BrokerCase):
         with self.assertLogs(forge.LOGGER, logging.INFO):
             self.assertIsNone(provider._has_write(REPO, "maintainer"))
 
+    def test_a_refusal_is_remembered_for_the_tick(self):
+        """"Nothing answered" is cached the way an answer is, and for the tick only.
+
+        A broker that is refusing is refusing for every comment author on every
+        swept pull request, so re-asking would pay the timeout once per
+        commenter and hold the sweep open for the sum of them. The instance is
+        built fresh each tick, which is what keeps this from being a refusal
+        remembered past the outage that caused it.
+        """
+        self.broker.refuse["identity"] = vcs_client.VcsError("boom", code="FORGE_UNAVAILABLE")
+        provider = forge.provider_for()
+        with self.assertLogs(forge.LOGGER, logging.INFO):
+            self.assertIsNone(provider._has_write(REPO, "maintainer"))
+        # What the first lookup cost, retries included -- `_identity` asks with
+        # `retry_transient`, so an unavailable forge is more than one call.
+        once = len(self.broker.payloads("identity"))
+        for _ in range(3):
+            self.assertIsNone(provider._has_write(REPO, "maintainer"))
+        self.assertEqual(len(self.broker.payloads("identity")), once)
+
     def test_an_empty_login_costs_no_call(self):
         provider = self._provider(True)
         self.assertIs(provider._has_write(REPO, ""), False)

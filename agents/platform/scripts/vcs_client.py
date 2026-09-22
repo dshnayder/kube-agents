@@ -72,6 +72,12 @@ AUTHOR_EMAIL = os.environ.get(
 # caller is told before anything is sent.
 MAX_BUNDLE_BYTES = 64 << 20
 
+# How many untracked files the refusal below names before it counts the rest.
+# Enough that the caller can see what it is being asked about -- a stray report
+# beside two manifests -- and few enough that a copy someone ran a build in
+# does not answer with a screenful and bury the instruction under it.
+UNTRACKED_FILES_NAMED = 10
+
 
 class VcsError(RuntimeError):
     """A refusal the caller is meant to read, as JSON on stdout.
@@ -745,8 +751,12 @@ def commit(
     else:
         untracked = _untracked(tree)
         if untracked:
-            shown = ", ".join(untracked[:10])
-            more = f" (and {len(untracked) - 10} more)" if len(untracked) > 10 else ""
+            shown = ", ".join(untracked[:UNTRACKED_FILES_NAMED])
+            more = (
+                f" (and {len(untracked) - UNTRACKED_FILES_NAMED} more)"
+                if len(untracked) > UNTRACKED_FILES_NAMED
+                else ""
+            )
             raise VcsError(
                 f"{len(untracked)} file(s) here are not tracked yet and will not "
                 f"be recorded on their own: {shown}{more}. Name the ones that "

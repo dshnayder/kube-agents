@@ -1216,6 +1216,42 @@ class RepositoryVerbTest(unittest.TestCase):
             )
         self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
 
+    def test_advance_does_not_reach_a_default_branch_of_another_name(self):
+        """The refusal above would hold with no remote lookup at all.
+
+        `main` is in the static set, so that test passes whether or not the
+        broker ever asks the remote what its default is -- and the whole point
+        of asking is the repository whose trunk is called something else. Here
+        it is `trunk`, which is in no set: only `_default_branch_of_remote` can
+        refuse it, and if that lookup were dropped the publish would land on
+        the branch every change is supposed to be proposed against.
+        """
+        git(self.seed, "checkout", "--quiet", "-b", "trunk")
+        git(self.seed, "push", "--quiet", "origin", "trunk")
+        git(self.origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+        # A real target, so that a broker which stopped asking the remote fails
+        # this on the branch it moved rather than on a fetch of a branch that
+        # was never there.
+        git(self.seed, "push", "--quiet", "origin", "trunk:release")
+
+        work, answer = self.clone_locally()
+        self.assertEqual(answer["branch"], "trunk")
+        self.commit_in(work, "c.txt", "c\n", "onto trunk")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "trunk",
+                    "target": "release",
+                    "clonedFrom": "trunk",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "trunk", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+        self.assertEqual(self.remote_tip("trunk"), answer["revision"])
+
     def test_scratch_names_come_from_a_counter_not_from_the_caller(self):
         first = self.broker._scratch("clone")
         second = self.broker._scratch("clone")
