@@ -47,10 +47,15 @@ design. §4 keeps the design as proposed, for the day it is revisited.
 
 ## How to read this document
 
-§1 states the problem as it was posed. §2 is what the experiment measured, and the estimate for a
-semantic ranker. §3 is the decision to park, what to do instead, and when to revisit. §4 is the
-design as proposed, kept for reference. §5 is what the custom harness would provide if the design
-is revived. §6 lists what is unresolved.
+- [§1](#1-the-problem-as-posed) states the problem as it was posed.
+- [§2](#2-what-the-experiment-showed) is what the experiment measured, and the estimate for a
+  semantic ranker.
+- [§3](#3-decision-park-the-design) is the decision to park, what to do instead, and when to
+  revisit.
+- [§4](#4-the-design-as-proposed) is the design as proposed, kept for reference.
+- [§5](#5-what-the-custom-harness-would-provide) is what the custom harness would provide if the
+  design is revived.
+- [§6](#6-open-questions) lists what is unresolved.
 
 ## 1. The problem as posed
 
