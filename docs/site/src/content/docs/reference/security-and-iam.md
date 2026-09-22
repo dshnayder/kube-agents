@@ -240,7 +240,7 @@ Because the agent's Kubernetes RBAC is read-only, remediations are proposed rath
 3. A Pull Request is opened against your GitOps repository. `fleet-audit` publishes its report as one GitHub issue per audit stream — the ledger, rewritten in place each run — and opens a narrow Pull Request only for a finding whose fix is a manifest, linked back to that ledger. One more machine-owned issue exists: `chat-delivery-watch`, a scheduled script with no model in the loop, opens, edits and closes a single issue labelled `agent:delivery-watch` in that repository (or the one `CHAT_DELIVERY_LEDGER_REPO` names) when scheduled reports stop reaching chat, and creates that label if it is missing; [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) has the reasoning.
 4. A human reviews and merges; a GitOps controller (Argo CD, Flux) reconciles the change into the cluster.
 
-Both paths share the same guardrails: blanket staging (`git add .` / `git add -A`) is refused, and pushes to `main`, `master`, and `production` are hard-blocked.
+Both paths share the same guardrails: the helper stages only what it is told to — an untracked file is refused by name rather than swept into the change — and pushes to `main`, `master`, and `production` are hard-blocked.
 
 The agent never has direct write access to running infrastructure — see [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
 

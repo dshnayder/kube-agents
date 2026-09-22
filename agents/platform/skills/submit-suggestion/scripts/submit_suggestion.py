@@ -417,6 +417,28 @@ def handle_submit(args) -> int:
     # and the retry the message asks for finds the work already published and
     # nothing left to commit.
     proposal = open_proposal(repo, branch)
+    # A proposal that closed between `prepare` and this call. On a second round
+    # the copy was taken *of* the branch, so `session["branch"]` is the branch
+    # itself and `base` below falls through to it -- which reaches
+    # `refuse_branch_on_its_own_base` and answers an ordinary review-round event
+    # with a security refusal about a branch on its own base. It is not a
+    # security matter and the advice it gives is wrong, so the state gets its
+    # own answer here, ahead of the `--keep-description` refusal that would
+    # otherwise send a caller round the loop into it.
+    if (
+        proposal is None
+        and not args.base
+        and _short_branch(session["branch"]) == _short_branch(branch)
+    ):
+        raise ValueError(
+            f"no proposal is open for '{branch}' on {repo} any more. This copy "
+            "was taken of the branch because one was, so it has been merged or "
+            "closed since. If it merged, the change has landed and there is "
+            "nothing here to submit. If it was closed, the next change wants a "
+            "branch name the repository has not used -- this one is spent. To "
+            "open a fresh proposal from this branch even so, say what it "
+            "targets with --base."
+        )
     if args.keep_description:
         if not proposal:
             raise RuntimeError(

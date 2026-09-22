@@ -531,6 +531,27 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
         self.assertIn("same as the base branch", str(caught.exception))
 
+    def test_prepare_refuses_a_name_git_will_not_take_as_a_branch(self):
+        """The guard on the switch's exit status, reached without a mock.
+
+        `check_branch` validates the protected-name list, not git's ref syntax,
+        so a space -- or `..`, or a trailing `.lock` -- gets past it, the clone
+        happens, and `git switch --create` exits 128. `branch` reports that
+        rather than raising, so without the guard `prepare` prints a JSON line
+        naming a branch the copy is not standing on and the whole turn is spent
+        editing the base.
+        """
+        for branch in (
+            "platform-agent/bad name",
+            "platform-agent/a..b",
+            "platform-agent/x.lock",
+        ):
+            with self.subTest(branch=branch):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    self.run_subject("prepare", "--branch", branch)
+                self.assertIn("could not take the branch", str(caught.exception))
+                self.assertEqual(self.broker.payloads("publish"), [])
+
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(
             gitops_workspace, "get_managed_github_repos", lambda: ["acme/infra"]
@@ -921,6 +942,57 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.proposals[0]["body"], "and the body")
         self.assertEqual(len(self.broker.payloads("publish")), 1)
         self.assertTrue(any("nothing" in line and "refreshing" in line for line in self.logged))
+
+    def test_a_proposal_closed_mid_round_says_so_instead_of_crying_security(self):
+        """A reviewer merging while the agent works is ordinary, not an attack.
+
+        The second round's copy is taken *of* the branch, so with the proposal
+        gone `base` falls through to the branch itself and the branch-on-its-own
+        -base refusal fires -- a CRITICAL SECURITY REFUSAL naming a state that is
+        nothing of the kind, advising a separate feature branch when the real
+        answer is that there is no proposal left to add to.
+        """
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "merged"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", branch, "--title", "second", "--body", "two")
+        said = str(caught.exception)
+        self.assertIn("no proposal is open", said)
+        self.assertNotIn("SECURITY REFUSAL", said)
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
+
+    def test_keep_description_on_a_closed_proposal_does_not_send_the_caller_in_a_circle(self):
+        """Its refusal names `--title`/`--body-file`, which land on the same state."""
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "closed"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", branch, "--keep-description")
+        self.assertIn("no proposal is open", str(caught.exception))
+
+    def test_a_closed_proposal_is_still_a_fresh_one_under_an_explicit_base(self):
+        """The escape the refusal names, and the reason it is not a dead end."""
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "closed"
+        _, out = self.run_subject(
+            "submit", "--branch", branch, "--base", "main", "--title", "second", "--body", "two"
+        )
+        self.assertTrue(out.startswith("https://forge.test/acme/infra/pull/"))
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 2)
 
     def test_a_first_submission_with_nothing_to_publish_is_still_refused(self):
         """The same state with no proposal open is a mistake, and stays one."""
