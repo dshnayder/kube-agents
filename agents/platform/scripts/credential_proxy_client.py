@@ -830,7 +830,19 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         try:
             answer = json.load(exc)
         except (ValueError, TypeError):
+            # The status arrived but the body is not a refusal document. The
+            # status is the whole answer.
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        except (http.client.HTTPException, OSError) as broke:
+            # The body ran out mid-read instead: an `IncompleteRead`, or a
+            # `RemoteDisconnected`, or a reset socket. None of those is a
+            # `ValueError`, so the clause above does not see them, and the
+            # identical clause at the foot of this `try` cannot either --
+            # Python does not offer an exception raised inside an `except`
+            # block to that block's siblings. Without this arm it leaves
+            # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
+            # has no arm for and every consumer is built on it having one.
+            raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by

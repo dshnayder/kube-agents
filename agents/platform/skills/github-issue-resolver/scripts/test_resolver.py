@@ -127,9 +127,20 @@ class FakeForge:
         row = self._find(repo, payload["number"])
         answer = {"issue": dict(row)}
         if payload.get("comments"):
-            answer["comments"] = [
-                dict(c) for c in self.comments.get((repo, row["number"]), [])
+            # The page and the "did it fill" flag are the provider's own
+            # semantics (`providers/github/forge.py::_comments`): the forge is
+            # asked for `limit` comments and calls the conversation truncated
+            # when it hands back that many. A fake that always returned the
+            # whole thread would make the caller's truncation warning -- and
+            # the `comments_truncated` field the model reads -- unreachable
+            # from this suite, which is the only place either is exercised.
+            limit = payload.get("limit", 30)
+            page = [dict(c) for c in self.comments.get((repo, row["number"]), [])][
+                :limit
             ]
+            answer["comments"] = page
+            answer["commentCount"] = len(page)
+            answer["commentsTruncated"] = len(page) >= limit
         return answer
 
     def _issue_comment(self, repo, payload):
@@ -595,6 +606,56 @@ class HandlePollTest(ResolverTest):
         self.assertEqual(payload["issue_number"], 7)
         self.assertEqual(payload["comments"], [])
         self.assertIn("could not fetch comments for issue #7", self.stderr)
+        # A thread nobody could read is not a thread that ran past its page.
+        self.assertIs(payload["comments_truncated"], False)
+
+    def test_a_conversation_past_the_window_is_declared_rather_than_guessed_at(self):
+        """A full page and a complete conversation look identical otherwise.
+
+        The investigation this payload feeds decides which requests it has
+        already answered. Reading a truncated thread as a whole one is how it
+        answers the same request on every tick, so the ceiling is reported
+        twice: on stderr for the operator and on the payload for the model.
+        """
+        forge = FakeForge(
+            issues={"acme/toolkit": [issue(7)]},
+            comments={
+                ("acme/toolkit", 7): [
+                    {
+                        "author": "alice",
+                        "body": f"note {n}",
+                        "created": "2026-07-30T00:00:00Z",
+                    }
+                    for n in range(resolver.POLL_WINDOW + 5)
+                ]
+            },
+        )
+        payload, _ = self.poll(forge=forge)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(forge.one("issue-view")["limit"], resolver.POLL_WINDOW)
+        self.assertEqual(len(payload["comments"]), resolver.POLL_WINDOW)
+        self.assertIs(payload["comments_truncated"], True)
+        self.assertIn(
+            f"issue #7 has more than {resolver.POLL_WINDOW} comments", self.stderr
+        )
+
+    def test_a_conversation_inside_the_window_is_not_called_truncated(self):
+        forge = FakeForge(
+            issues={"acme/toolkit": [issue(7)]},
+            comments={
+                ("acme/toolkit", 7): [
+                    {
+                        "author": "alice",
+                        "body": "hi",
+                        "created": "2026-07-30T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        payload, _ = self.poll(forge=forge)
+        self.assertEqual(len(payload["comments"]), 1)
+        self.assertIs(payload["comments_truncated"], False)
+        self.assertNotIn("has more than", self.stderr)
 
     def test_a_refused_repository_is_named_and_the_others_still_polled(self):
         forge = FakeForge(

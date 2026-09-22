@@ -148,11 +148,12 @@ def call(verb: str, payload: dict) -> dict:
         # `URLError`, so this never reached the arm above; the transport module
         # names it, because nothing in this file may import a network client.
         #
-        # Its own arm and not folded into the "not JSON" one below, which
-        # `http.client.IncompleteRead` used to reach by also being a
-        # `ValueError`: that sentence says the broker answered when in fact it
-        # stopped, and a truncated answer may have been acted on at the far
-        # end.
+        # Its own arm and not folded into the "not JSON" one below: that
+        # sentence says the broker answered when in fact it stopped, and a
+        # truncated answer may have been acted on at the far end. They are
+        # separate types as well as separate stories -- an `IncompleteRead` is
+        # an `HTTPException` and a `RemoteDisconnected` is an `OSError`, so
+        # neither would land on `ValueError` even if that reading were wanted.
         #
         # Everything downstream is built on the one exception type this
         # function promises: `sweep_stale_issues` says "nothing here raises",

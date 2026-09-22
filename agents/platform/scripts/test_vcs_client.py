@@ -10,6 +10,7 @@ never builds an argparse namespace. These tests are that caller.
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import shutil
@@ -79,10 +80,10 @@ class ForgeCallTest(unittest.TestCase):
         the body read after it are not wrapped, and the broker opener clears
         the socket timeout once connected. So a pod evicted or rolled while an
         answer was being read raised `http.client` and `socket` types straight
-        out of `vcs_call`. `IncompleteRead` is in the list because it is also a
-        `ValueError` and so reached the caller's "the broker answered with
-        something that is not JSON" arm, which says the broker answered when in
-        fact it stopped.
+        out of `vcs_call`. `IncompleteRead` is in the list because it is the
+        one that carries a partial body: without an arm of its own it is a
+        bare `HTTPException` reaching a caller whose whole contract is that
+        this function raises one type.
         """
         for error in (
             http.client.RemoteDisconnected("Remote end closed connection"),
@@ -92,6 +93,46 @@ class ForgeCallTest(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(
                     client, "open_broker_request", side_effect=error
+                ), mock.patch.object(client, "authorization_headers", return_value={}):
+                    with self.assertRaises(client.BrokerDisconnected) as caught:
+                        client.vcs_call("http://127.0.0.1:1", "forge", {})
+                self.assertIn(type(error).__name__, str(caught.exception))
+
+    def test_a_body_that_runs_out_while_an_error_is_read_is_still_a_disconnect(self):
+        """The same drop, one layer in: the status landed, the body did not.
+
+        A broker rolled between its response line and its body gives a real
+        `HTTPError` whose payload read then tears. That read happens inside the
+        `except HTTPError` clause, and Python does not offer an exception
+        raised there to that clause's siblings -- so the disconnect arm at the
+        foot of the same `try` cannot catch it, however it is ordered. Left
+        alone it leaves `vcs_call` as a raw `http.client` type, and
+        `vcs_client.call` has no arm for one.
+        """
+
+        class TornBody(io.BytesIO):
+            def __init__(self, error):
+                super().__init__(b"")
+                self.error = error
+
+            def read(self, *args, **kwargs):
+                raise self.error
+
+        for error in (
+            http.client.IncompleteRead(b'{"error": "no', 40),
+            http.client.RemoteDisconnected("Remote end closed connection"),
+            ConnectionResetError(104, "Connection reset by peer"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                torn = urllib.error.HTTPError(
+                    "http://127.0.0.1:1/v1/vcs/forge",
+                    503,
+                    "Service Unavailable",
+                    {},
+                    TornBody(error),
+                )
+                with mock.patch.object(
+                    client, "open_broker_request", side_effect=torn
                 ), mock.patch.object(client, "authorization_headers", return_value={}):
                     with self.assertRaises(client.BrokerDisconnected) as caught:
                         client.vcs_call("http://127.0.0.1:1", "forge", {})
