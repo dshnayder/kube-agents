@@ -222,14 +222,16 @@ returns its URL — resubmitting is not an error. `--keep-description` (Step 5) 
 the one exception: it leaves the open pull request's title and body as their
 author wrote them.
 
-Older invocations carried `--workspace`, `--lease`, `--handle` and `--base-sha`.
-They are still accepted, and read and ignored with a line saying so. That is
-all they buy: a command written against the old shape fails on what is actually
-wrong with it — there is no working copy here, take the branch with `prepare`
-— rather than on "unrecognized arguments", which says nothing and hides the
-real cause. A card that prepared before an upgrade cannot submit after one; its
-clone was on a volume this script no longer has. Prepare again. Do not write
-new commands with these flags.
+Older invocations carried `--workspace`, `--lease`, `--handle`, `--from`,
+`--delete` and `--base-sha`, and had `list` and `fetch` as commands of their
+own. The flags are still accepted, and read and ignored with a line saying so;
+the two commands refuse with a line saying where the files are now. That is all
+any of it buys: a command written against the old shape fails on what is
+actually wrong with it — there is no working copy here, take the branch with
+`prepare` — rather than on "unrecognized arguments" or "invalid choice", which
+say nothing and hide the real cause. A card that prepared before an upgrade
+cannot submit after one; its clone was on a volume this script no longer has.
+Prepare again. Do not write new commands with these flags.
 
 ### Step 4: Confirm Suggestion
 

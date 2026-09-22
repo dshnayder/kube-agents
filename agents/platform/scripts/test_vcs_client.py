@@ -9,6 +9,7 @@ never builds an argparse namespace. These tests are that caller.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -16,11 +17,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import credential_proxy_client as client  # noqa: E402
 import vcs_client  # noqa: E402
 
 REAL_GIT = shutil.which("git") or "/usr/bin/git"
@@ -67,6 +70,68 @@ class ForgeCallTest(unittest.TestCase):
                 vcs_client.call("publish", {})
         self.assertEqual(caught.exception.code, "PROTECTED_BRANCH")
         self.assertEqual(caught.exception.as_json(), {"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"})
+
+
+    def test_a_socket_that_drops_mid_answer_becomes_a_broker_disconnect(self):
+        """The transport's half: what `urllib` leaves unwrapped, named here.
+
+        `urllib` wraps only `h.request(...)` in `URLError`; `getresponse()` and
+        the body read after it are not wrapped, and the broker opener clears
+        the socket timeout once connected. So a pod evicted or rolled while an
+        answer was being read raised `http.client` and `socket` types straight
+        out of `vcs_call`. `IncompleteRead` is in the list because it is also a
+        `ValueError` and so reached the caller's "the broker answered with
+        something that is not JSON" arm, which says the broker answered when in
+        fact it stopped.
+        """
+        for error in (
+            http.client.RemoteDisconnected("Remote end closed connection"),
+            http.client.IncompleteRead(b'{"ok": tr', 12),
+            ConnectionResetError(104, "Connection reset by peer"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(
+                    client, "open_broker_request", side_effect=error
+                ), mock.patch.object(client, "authorization_headers", return_value={}):
+                    with self.assertRaises(client.BrokerDisconnected) as caught:
+                        client.vcs_call("http://127.0.0.1:1", "forge", {})
+                self.assertIn(type(error).__name__, str(caught.exception))
+
+    def test_a_send_that_never_landed_stays_a_URLError(self):
+        """The distinction the new type exists to keep.
+
+        A refused connection changed nothing at the far end; one that broke
+        mid-answer may have been acted on. `URLError` is itself an `OSError`,
+        so without its own arm ahead of the catch it would be reported as the
+        second when it is the first.
+        """
+        with mock.patch.object(
+            client, "open_broker_request",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ), mock.patch.object(client, "authorization_headers", return_value={}):
+            with self.assertRaises(urllib.error.URLError):
+                client.vcs_call("http://127.0.0.1:1", "forge", {})
+
+    def test_a_broker_that_drops_mid_answer_is_still_a_VcsError(self):
+        """The caller's half: every consumer is built on "one exception type".
+
+        `resolver.sweep_stale_issues` says "nothing here raises" and would have
+        raised, taking the poll with it; `_fetch_comments` says it returns `[]`
+        rather than raising; and `github_scan_gate.run_resolver_poll` would
+        turn the traceback into a `RuntimeError` where the SKILL promises a
+        reason code, losing every managed repository's poll to one broken read.
+        """
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}
+        ), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call",
+            side_effect=client.BrokerDisconnected("RemoteDisconnected: closed"),
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("forge", {})
+        said = str(caught.exception)
+        self.assertIn("broke before the answer was complete", said)
+        self.assertIn("RemoteDisconnected", said)
 
 
 class WorkingCopyTest(unittest.TestCase):

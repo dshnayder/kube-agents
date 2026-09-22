@@ -622,7 +622,28 @@ RETIRED = {
     "--workspace": "the copy's path is in the session, not an argument",
     "--lease": "there is no shared volume to lease a clone on",
     "--handle": "there is no broker-side checkout to hold a handle to",
+    # Content mode's two, and the pair that matters most here: the operator
+    # renders CREDENTIAL_PROXY_CONTENT_WORKSPACE=1 unconditionally and offers
+    # no field to turn it off, so content mode -- not the leased-clone shape
+    # `--workspace` and `--lease` belong to -- is what every card in flight
+    # during the rollout is calling.
+    "--from": "the change set is the working copy `prepare` printed, not a "
+              "directory of files",
+    "--delete": "delete the file in the working copy; the deletion is staged "
+                "with every other change",
     "--base-sha": "`publish` checks ancestry against what it cloned",
+}
+
+# The read half of content mode, which had its own subcommands. Same bargain as
+# RETIRED and the same one turn of the shell: the call cannot be rescued -- the
+# broker holds no tree to read -- but "there is no working copy" names the
+# problem and argparse's "invalid choice" does not. A `list`/`fetch` pair also
+# has somewhere to go, which the flags above do not: the files are on disk.
+RETIRED_COMMANDS = {
+    "list": "the working copy `prepare` printed is a directory; list it with "
+            "the shell",
+    "fetch": "the working copy `prepare` printed holds the files; read them "
+             "in place",
 }
 
 
@@ -707,6 +728,15 @@ def normalise_argv(argv: list) -> list:
     argv = list(argv)
     if not argv or argv[0] in COMMANDS or argv[0] in ("-h", "--help"):
         return argv
+    if argv[0] in RETIRED_COMMANDS:
+        # Before the `submit` prefix below, which would otherwise turn
+        # `list --handle X` into `submit list --handle X` and lose the whole
+        # thing behind "unrecognized arguments: list".
+        raise ValueError(
+            f"`{argv[0]}` is no longer a command: {RETIRED_COMMANDS[argv[0]]}. "
+            "If there is no working copy here, take the branch first: "
+            "`submit_suggestion.py prepare --branch <name>`."
+        )
     return ["submit", *argv]
 
 

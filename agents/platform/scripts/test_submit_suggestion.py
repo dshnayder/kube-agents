@@ -1027,6 +1027,49 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("platform-agent/scale-web", said)
         self.assertNotIn("vcs.py clone", said.split("(")[0])
 
+    def test_the_content_mode_submit_reaches_the_refusal_that_names_prepare(self):
+        """The shape that was actually live, not the one the flags were named for.
+
+        `--workspace`/`--lease` belong to the leased-clone mode. The operator
+        renders `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally and
+        gives no field to turn it off, so the card in flight during a rollout
+        is calling content mode: `--handle … --from … --base … --base-sha …`.
+        Leave `--from` and `--delete` out of `RETIRED` and argparse exits on
+        "unrecognized arguments" before `handle_submit` is ever reached, which
+        is the one thing the shim exists to prevent.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "t", "--body", "b",
+                "--handle", "ws_7c21",
+                "--from", "/tmp/scratch",
+                "--base", "main",
+                "--base-sha", "a" * 40,
+                "--delete", "old/thing.yaml",
+            )
+        said = str(caught.exception)
+        self.assertIn("prepare", said)
+        self.assertIn("platform-agent/scale-web", said)
+
+    def test_the_read_half_of_content_mode_says_where_the_files_are(self):
+        """`list` and `fetch` were commands, so they fail before any flag is read.
+
+        `normalise_argv` prefixes an unrecognised argv with `submit`, which
+        turns `list --handle X` into `submit list --handle X` and loses the
+        whole call behind "unrecognized arguments: list". These two have
+        somewhere to send the caller that the retired flags do not -- the files
+        are on disk in the working copy -- so they say it.
+        """
+        for command in ("list", "fetch"):
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError) as caught:
+                    self.run_subject(command, "--handle", "ws_7c21")
+                said = str(caught.exception)
+                self.assertIn(f"`{command}` is no longer a command", said)
+                self.assertIn("working copy", said)
+                self.assertIn("prepare", said)
+
     def test_an_argv_with_no_subcommand_is_read_as_submit(self):
         self.assertEqual(
             submit_suggestion.normalise_argv(["--branch", "b", "--title", "t"]),

@@ -142,6 +142,29 @@ def call(verb: str, payload: dict) -> dict:
             f"the broker at {endpoint} could not be reached: {exc.reason}. "
             "Retry shortly."
         ) from exc
+    except credential_proxy_client.BrokerDisconnected as exc:
+        # The connection broke after the request was on the wire -- a broker
+        # evicted or rolled mid-answer. `urllib` wraps only the send in
+        # `URLError`, so this never reached the arm above; the transport module
+        # names it, because nothing in this file may import a network client.
+        #
+        # Its own arm and not folded into the "not JSON" one below, which
+        # `http.client.IncompleteRead` used to reach by also being a
+        # `ValueError`: that sentence says the broker answered when in fact it
+        # stopped, and a truncated answer may have been acted on at the far
+        # end.
+        #
+        # Everything downstream is built on the one exception type this
+        # function promises: `sweep_stale_issues` says "nothing here raises",
+        # `_fetch_comments` says it returns `[]` rather than raising, and
+        # `github_scan_gate.run_resolver_poll` would turn the traceback into a
+        # `RuntimeError` where the SKILL promises a reason code -- losing every
+        # managed repository's poll to one broken read.
+        raise VcsError(
+            f"the connection to the broker at {endpoint} broke before the "
+            f"answer was complete ({exc}). Retry shortly; if it persists the "
+            "broker is restarting under load."
+        ) from exc
     except ValueError as exc:
         raise VcsError(
             "the broker answered with something that is not JSON; retry, and "

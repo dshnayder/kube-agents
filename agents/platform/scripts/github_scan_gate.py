@@ -581,10 +581,18 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
                     prs.append((r, pr))
         except forge.ForgeError as error:
             refused.append((r, error))
-    if refused and not prs and not nameless:
+    if refused and len(refused) == len(repos):
         # Nothing was swept, so there is no partial result to report and the
         # first refusal is the whole story -- the same single warning the
         # sweep returned before it read repositories one at a time.
+        #
+        # Counted, not inferred from an empty `prs`. Having no open agent pull
+        # request is the ordinary state of a healthy repository, so "no cards
+        # and something refused" is true on most ticks of a partial outage --
+        # which took this return, announced the watcher was not running at all
+        # and named no repository, while the branch below had the operator's
+        # actual message. It also skipped `provider.truncations()` for the
+        # repositories that were read.
         return SweepResult(warnings=[_forge_warning(refused[0][1])])
     if nameless:
         warnings.append(

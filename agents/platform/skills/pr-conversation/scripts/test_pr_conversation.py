@@ -292,6 +292,28 @@ class PollTest(_Harness):
         self.assertIn(OTHER_REPO, err.getvalue())
         self.assertIn("FORGE_AUTH", err.getvalue())
 
+    def test_a_quiet_healthy_repository_is_not_read_as_a_total_outage(self):
+        """A repository with nothing open is the ordinary case, not an outage.
+
+        Deciding "nothing was read" from an empty request list asks the same
+        question on a total outage and on a partial one whose working
+        repository simply had no open pull request -- so the poll answered
+        ERROR, and the worker stood down everywhere, on most ticks of a partial
+        outage. Counted repositories tell the two apart.
+        """
+        provider = FakeProvider(
+            prs=[],
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_AUTH", "HTTP 401"),
+            },
+        )
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(json.loads(out)["status"], "NO_REQUESTS")
+        self.assertIn(OTHER_REPO, err.getvalue())
+
     def test_every_repository_refusing_is_still_one_error(self):
         """Nothing was read, so there is no partial poll to qualify."""
         refusal = forge.ForgeError("FORGE_AUTH", "HTTP 401")

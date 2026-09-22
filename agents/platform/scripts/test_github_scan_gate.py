@@ -155,11 +155,16 @@ class IssuesSweepTest(unittest.TestCase):
         self.assertEqual(result.warnings, [])
 
     def test_error_reaches_the_room(self):
-        with self._poll({"status": "ERROR", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}):
+        # A reason the resolver can still produce. It used to be
+        # `GITHUB_AUTH_NOT_CONFIGURED`, one of the three the `gh auth status`
+        # pre-flight hand-rolled; this series deletes that pre-flight, and a
+        # fixture naming a code nothing emits reads as documentation that it
+        # is still live.
+        with self._poll({"status": "ERROR", "reason": "FORGE_UNAUTHENTICATED"}):
             result = gate.sweep_issues()
         self.assertEqual(result.cards, [])
         self.assertEqual(len(result.warnings), 1)
-        self.assertIn("GITHUB_AUTH_NOT_CONFIGURED", result.warnings[0])
+        self.assertIn("FORGE_UNAUTHENTICATED", result.warnings[0])
 
     def test_error_value_is_carried_through(self):
         """``GIT_REPO_UNPARSEABLE`` is only actionable with the offending value."""
@@ -1435,6 +1440,30 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(result.cards, [])
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("FORGE_UNAUTHENTICATED", result.warnings[0])
+
+    def test_a_quiet_healthy_repository_is_not_read_as_a_total_outage(self):
+        """Having nothing open is the ordinary state, not evidence of an outage.
+
+        The first version of the test above asked whether any card had been
+        filed, which is the same question on a total outage and on a partial
+        one whose working repository simply had no open pull request this
+        tick -- the common case. So a partial outage announced the watcher was
+        not running at all, named no repository, and withheld the named
+        warning the operator needed, every ten minutes. Counted repositories
+        tell the two apart.
+        """
+        provider = FakeProvider(
+            prs=[],
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn(OTHER_REPO, result.warnings[0])
+        self.assertIn("The other managed repositories were swept", result.warnings[0])
 
 
 class ResolverPathTest(unittest.TestCase):

@@ -364,11 +364,16 @@ def handle_poll(args) -> int:
                 f"pr_conversation: {name} not swept — {error.reason}"
                 f"{f' ({error.value})' if error.value else ''}\n"
             )
-        if refused and not prs and not nameless:
-            # Nothing was read and nothing else to report, so there is no
-            # partial poll to qualify and the first refusal is the whole
-            # story — the same single ERROR this printed before it read
-            # repositories one at a time.
+        if refused and len(refused) == len(repos):
+            # Nothing was read at all, so there is no partial poll to
+            # qualify and the first refusal is the whole story — the same
+            # single ERROR this printed before it read repositories one at a
+            # time.
+            #
+            # Counted, not inferred from an empty `prs`: a repository with no
+            # open pull request is the ordinary case, so on a partial outage
+            # this would have reported the poll dead everywhere on most ticks
+            # while the repositories that answered were being swept fine.
             first = refused[0][1]
             print(json.dumps(
                 {"status": "ERROR", "reason": first.reason, "value": first.value}
