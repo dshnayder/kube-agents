@@ -1,7 +1,8 @@
 # Context-scoped capabilities: exposing the tools and skills a turn needs
 
-> **STATUS — proposal for review; nothing here is implemented.** The measurement phase (§7,
-> phase 0) is the first deliverable and the gate on the rest.
+> **STATUS — proposal for review.** Nothing here is enabled on any install. A prototype of stage
+> 3 exists on this branch as a Hermes plugin that is inert unless an environment variable names an
+> arm; §8 reports what it measured when the plan in §7 was run once.
 
 **Status:** Draft for review. **Scope:** every agent profile this repository ships (chat,
 platform, cluster, a2a specialists) and the harness that runs them, whichever harness that is.
@@ -9,10 +10,11 @@ platform, cluster, a2a specialists) and the harness that runs them, whichever ha
 ## Summary
 
 An agent sees its whole capability catalogue on every turn: every tool schema in the request and
-every skill in a system-prompt index. The Platform Agent's catalogue is 44 skills and roughly 90
-tools, and it grows without a gate, because 29 of those skills are synced from an upstream
-repository and every new MCP server adds its tools to the same list. Published measurements put
-the point where tool selection accuracy starts to fall at 30 to 50 tools. This repository has
+every skill in a system-prompt index. The Platform Agent's catalogue is 44 skills and about 60
+tools in the request with another 43 behind a search bridge, and it grows without a gate, because
+29 of those skills are synced from an upstream repository and every new MCP server adds its tools
+to the same list. Published measurements put the point where tool selection accuracy starts to
+fall at 30 to 50 tools. This repository has
 recorded two incidents from the other direction, where the harness hid capabilities to keep the
 list short: the model failing to find a hidden capability
 ([#1703](https://github.com/gke-labs/kube-agents/issues/1703)), and the model acting on the wrong
@@ -55,15 +57,16 @@ contract. §11 lists what is unresolved.
 | cluster  | 7                   | ~40 harness core tools, 3 bridge tools; GKE and developer-knowledge MCP tools deferred                                  | `agents/cluster/`, scaffolded per cluster                                     |
 | chat     | 0 (skills disabled) | router, kanban, memory                                                                                                  | `agents/chat/config.yaml`, a deliberate lockdown                              |
 
-The tool counts are derived from the toolset definitions at the pinned harness version; the
-measured figure per profile is phase 0's first output (§7.1). The skill bodies total 465 KB;
-the index the model reads is one line per skill, and the harness truncates each description to 60
-characters. The platform profile's descriptions average 77 characters, so most of the 44 lines the
-model chooses from end in an ellipsis.
+The tool counts are derived from the toolset definitions at the pinned harness version; under
+the API server, where §8 measured, the platform profile's request carried 21 tools. The skill
+bodies total 465 KB; the index the model reads is one line per skill, and the harness truncates
+each description to 60 characters. Every one of the platform profile's 44 descriptions is longer
+than that (the shortest is 111 characters, the median about 350), so every line the model chooses
+from ends in an ellipsis.
 
 Three static levers exist and are used: a per-profile toolset allowlist, a per-platform toolset
-denylist applied last, and per-task skill lists on cron jobs (16 of them) and kanban cards (the
-`--skill` flag). All three decide before the question exists. Nothing decides per turn.
+denylist applied last, and per-task skill lists on cron jobs (9 of the 16 carry one) and kanban
+cards (the `--skill` flag). All three decide before the question exists. Nothing decides per turn.
 
 ### 1.2 Why the size matters
 
@@ -243,9 +246,11 @@ rule it bounds.
 2. **The shelf is never empty.** Every in-scope capability the working set omits appears by
    name, grouped by domain, with the instruction to search. A capability that is nowhere is one
    the model substitutes for; the incidents in §1.3 are both this.
-3. **Entry is by rank within budget; exit is by disuse.** A capability enters when it ranks
-   inside the budget for the current signal. It leaves after N turns without use, N configurable,
-   default 5, or when the budget is exceeded and it is the least recently used. It does not leave
+3. **This turn's ranking always enters; earlier turns' entries are carried, then leave by
+   disuse.** The top of the ranking for the current signal is always in the working set. Entries
+   from earlier turns stay while they are younger than N turns, N configurable, default 5, most
+   recent first, up to as many again as the fresh budget, so a stale set can never crowd out what
+   this turn ranked and the working set is at most twice the budget. An entry does not leave
    because the next turn's signal ranked it lower. This is hysteresis: a troubleshooting session
    that oscillates between storage and networking keeps both.
 4. **Changes land at turn boundaries only.** The working set for turn T is fixed before the
@@ -410,7 +415,7 @@ those skills. This is the loop that keeps running after the design is done.
 
 The plan in §7 was run once, on 2026-09-21, against a dedicated install with the Platform Agent
 as the front door. The method, code and probes are in
-[`experiments/capability-scope-ab/`](../../bench/experiments/capability-scope-ab/README.md), and the
+[`bench/experiments/capability-scope-ab/`](../../bench/experiments/capability-scope-ab/README.md), and the
 scored tables, one row per run, are committed under its `results/` directory; the raw transcripts
 and per-turn records stayed on the machine that ran them. Every number below is in those files.
 
@@ -419,9 +424,9 @@ and per-turn records stayed on the machine that ran them. Every number below is 
 Three arms and two catalogue sizes, 22 probes, three repetitions each, one prompt per session,
 the same image and model throughout. `stock` is the shipped index: every skill, description cut
 at 60 characters. `fulldesc` is the same index with full descriptions, the cheapest fix in §5.
-`scoped` is the design's stage 3: names only in the system prompt, the top six skills by a BM25
-ranker injected with full descriptions per turn, and the tool array filtered to a pinned set plus
-six. The `shipped` rung is the 44 skills in the repository; the `grown` rung adds 60 real skills
+`scoped` (the experiment files call it `scoped-all`) is the design's stage 3: names only in the
+system prompt, the top six skills by a BM25 ranker injected with full descriptions per turn, and
+the tool array filtered to a pinned set plus six. The `shipped` rung is the 44 skills in the repository; the `grown` rung adds 60 real skills
 from the upstream repository the sync reads, five of which the next sync will pull in unasked.
 Twenty probes name a gold skill; two are controls where loading any skill is wrong. Each run was
 capped at ten model iterations and prefixed with one sentence keeping it on the local cluster.
@@ -429,8 +434,11 @@ The model was Gemini 3.1 Pro through the install's LiteLLM; §8.6 covers the rep
 cell on Gemini 3.5 Flash.
 
 The offline ranker alone, before any model saw it, put the gold skill in its top six for 16 of
-20 probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10. Those
-misses are carried into the run, not tuned away.
+20 bare probes on the shipped catalogue and 15 of 20 on the grown one, and first for 13 and 10.
+The driver prefixed every probe with a framing sentence, and the ranker scored the prefixed text:
+on that signal it still placed the gold skill in the top six for 15 of 20 but first for only 5,
+because the framing words outweigh a short ask in a lexical score. Those misses are carried into
+the run, not tuned away, and the prefix effect is a finding in its own right (§8.5).
 
 ### 8.2 Selection
 
@@ -461,13 +469,14 @@ Three details from the per-probe table qualify the averages:
 - The regression §6 predicted appears once: the repository-inspection probe went from three gold
   picks under `stock` to none under `scoped` on the shipped rung, because the ranker leaves that
   skill out of its top six and the names-only shelf did not bring the model to it.
-- Under `scoped`, a third of all skill loads were of skills outside the injected six (25 of 78
-  on the shipped rung, 20 of 82 on the grown), so the shelf carried them; without it those would
-  have been misses. The shelf is load-bearing.
+- Under `scoped`, a quarter to a third of all skill loads were of skills outside the injected six
+  (25 of 78 on the shipped rung, 20 of 82 on the grown), so the shelf carried them; without it
+  those would have been misses. The shelf is load-bearing.
 - Under `stock` on the grown catalogue one run loaded a skill that does not exist, a plausible
   name assembled from its neighbours in the list; no scoped run did. Four of the six wrong picks
-  across all cells were the write-path skill chosen for a configuration change, which the
-  persona's own routing rule half-endorses; the scoring kept them wrong.
+  across all cells were the write-path skill, three of them for a configuration change the
+  persona's own routing rule half-endorses and one for a read-only repository question; the
+  scoring kept all four wrong.
 
 ### 8.3 Cost
 
@@ -482,10 +491,11 @@ Three details from the per-probe table qualify the averages:
 
 The prompt is about 28k tokens on every arm because it is the persona and the harness's standing
 instructions; the skill index at 60 characters a line is under a thousand tokens of that, the
-tool array under the API server is 21 to 35 tools of which the filter hid one to a dozen, and the
-MCP tools were already behind the harness's own search bridge. What the table does show is the
-cost of the obvious alternative: full descriptions for every skill add 3k tokens to every call on
-the shipped catalogue and 10k on the grown one, and double the time to the first tool call.
+tool array under the API server is 21 tools of which the filter hid exactly one on every recorded
+turn, and the MCP tools were already behind the harness's own search bridge. What the table does
+show is the cost of the obvious alternative: full descriptions for every skill add 3k tokens to
+every call on the shipped catalogue and 8k on the grown one, and double the time to the first
+tool call.
 `scoped` delivers the descriptions that matter at the token cost of `stock`, and at 104 skills it
 is already 800 tokens a call cheaper than the truncated index. The token claim in §1 therefore
 holds as a function of catalogue size and of where the tool schemas sit, and on this profile as
@@ -514,6 +524,10 @@ skill. It is also why the shelf is not optional.
   sidecar in §4.2 is the fix and is now the first item of the next phase, ahead of tools.
 - The bench-side verifier gap in §11 has a concrete shape: every number above came from a driver
   that reads the tool-call trace, and the harness records the same trace today.
+- The scoping signal should be the user's ask, not the message as the harness composed it. The
+  driver's framing prefix cut the lexical ranker's gold-first from 13 to 5 probes offline; any
+  text a harness or a channel adapter prepends to the user turn does the same. The signal in
+  §4.2 is therefore the user's text before injection, and the design says so.
 
 ### 8.6 The repeat on Gemini 3.5 Flash
 
@@ -551,17 +565,21 @@ against either alternative and full descriptions alone do nothing for it. The co
 the same on Flash as on Pro: `fulldesc` adds 3k to 5k tokens to every call and doubles the time
 to the first tool call, `scoped` costs what `stock` costs, and at 104 skills it is 3.7k tokens a
 call cheaper than the truncated index. The one spurious load on a control probe is the only
-false positive in 792 runs.
+false positive in 72 control runs.
 
 ### 8.7 What the run does not show
 
 - Whether the picked skill produced a better outcome. The probes were scored on the pick, not on
   the answer; a bench verifier that asserts the capability behind an outcome is still the gap in
   §11.
-- Multi-turn behaviour: stickiness, hysteresis and the turn-boundary rule ran but were never
-  exercised by a second turn.
-- Tool scoping: the tool array on this profile is small and the filter hid one to a dozen tools,
-  so the run says nothing about the 30-to-50 knee the literature reports for tools.
+- Multi-turn behaviour. Every probe was one turn, and the prototype as run could not have carried
+  a working set to a second turn anyway: it cleared its state on the harness's session-end hook,
+  which fires after every message. The review that followed the run found this; the plugin now
+  ages state out instead, and rule 3 of §4.3 is untested until a multi-turn run.
+- Tool scoping. The tool array on this profile is 21 tools and the filter hid one, so the run
+  says nothing about the 30-to-50 knee the literature reports for tools. The measured `scoped`
+  arm also carried no shelf for the hidden tool, against rule 2; the plugin now puts hidden tool
+  names on the search tool's description, untested in a run.
 - Anything about a ranker with metadata. The v1 ranker had names and descriptions only; the
   regressions it caused are the argument for the sidecar, not a measurement of it.
 
@@ -601,14 +619,16 @@ more invasive one, since only one context engine may be registered and this repo
 that slot for other work.
 
 **Stage 3, tools, one upstream change.** No hook mutates the tool array per turn. The per-turn
-prologue already rebuilds it when MCP registration changes, so the change is a `select_tools`
-hook at that point, receiving the full list and the turn's signal and returning the subset, with
-the harness guaranteeing the same cache-safety it already claims for the prologue. This is an
-upstream contribution rather than a patch, and it is one the upstream tracker is already asking
-for in several forms: per-session tool filtering, deferral of built-in toolsets, an on-demand
-tool loader for gateway profiles. Until it lands, tools are scoped statically at the toolset
-level, which is what the profiles do today, and the record still measures what the per-turn
-policy would have done.
+prologue already rebuilds it when MCP registration changes, so the durable change is a
+`select_tools` hook at that point, receiving the full list and the turn's signal and returning
+the subset, with the harness guaranteeing the same cache-safety it already claims for the
+prologue. That is an upstream contribution, and one the upstream tracker is already asking for
+in several forms: per-session tool filtering, deferral of built-in toolsets, an on-demand tool
+loader for gateway profiles. The prototype on this branch stands in for it with a build-time
+patch that hands the tool array to the plugin before each request; the patch is inert unless
+the plugin is enabled, and it is the experiment's stand-in, not the proposed mechanism. Until
+the hook lands, an install scopes tools statically at the toolset level, which is what the
+profiles do today.
 
 **The record.** The pre-tool-call observer hook and the skill lifecycle hook give the "used"
 side; the layer emits the "shown" side. Phase 0 needs nothing else.

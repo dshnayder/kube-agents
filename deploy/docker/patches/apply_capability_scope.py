@@ -158,33 +158,70 @@ replace_once(
 )
 
 # 3. Extra skill directories. -------------------------------------------------------------------
+# The resolver returns early when there is no config.yaml, when it does not parse, and when it has
+# no `skills:` block; the env directories have to survive all three, so a helper supplies them on
+# every early return and the normal path merges them into the configured list.
+replace_once(
+    SKILL_UTILS,
+    """def get_external_skills_dirs() -> List[Path]:
+""",
+    """def _ka_extra_skill_dirs() -> List[Path]:
+    \"\"\"capability_scope experiment: directories named by %s that exist.\"\"\"
+    import os as _ka_os
+    out: List[Path] = []
+    for d in (_ka_os.environ.get("%s") or "").split(_ka_os.pathsep):
+        p = Path(_ka_os.path.expanduser(d.strip())) if d.strip() else None
+        if p is not None and p.is_dir() and p.resolve() not in [q.resolve() for q in out]:
+            out.append(p.resolve())
+    return out
+
+
+def get_external_skills_dirs() -> List[Path]:
+"""
+    % (EXTRA_DIRS_ENV, EXTRA_DIRS_ENV),
+)
+replace_once(
+    SKILL_UTILS,
+    """    config_path = get_config_path()
+    if not config_path.exists():
+        return []
+""",
+    """    config_path = get_config_path()
+    if not config_path.exists():
+        return _ka_extra_skill_dirs()
+""",
+)
+replace_once(
+    SKILL_UTILS,
+    """    parsed = _load_raw_config()
+    if not parsed:
+        return []
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+""",
+    """    parsed = _load_raw_config()
+    if not parsed:
+        return _ka_extra_skill_dirs()
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        skills_cfg = {}
+""",
+)
 replace_once(
     SKILL_UTILS,
     """    raw_dirs = skills_cfg.get("external_dirs")
     if not raw_dirs:
 """,
     """    raw_dirs = skills_cfg.get("external_dirs")
-    import os as _ka_os
-    _ka_extra = [d for d in (_ka_os.environ.get("%s") or "").split(_ka_os.pathsep) if d.strip()]
+    _ka_extra = [str(p) for p in _ka_extra_skill_dirs()]
     if _ka_extra:
         if isinstance(raw_dirs, str):
             raw_dirs = [raw_dirs]
         raw_dirs = list(raw_dirs or []) + _ka_extra
     if not raw_dirs:
-"""
-    % EXTRA_DIRS_ENV,
-)
-# skills_cfg may be missing entirely when the profile config has no `skills:` block; the early
-# return above it would then skip the env dirs, so widen that guard too.
-replace_once(
-    SKILL_UTILS,
-    """    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
-""",
-    """    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        skills_cfg = {}
 """,
 )
 
