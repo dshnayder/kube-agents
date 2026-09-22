@@ -9,9 +9,10 @@
 
 ## TL;DR
 
-We tested showing the agent only the tools and skills relevant to each request. At the catalogue
-size we ship today and expect in the near future, scoping does not improve the agent enough to
-justify its complexity, so the design is parked.
+Today the agent's context carries every tool and skill it has, on every request. We ran an
+experiment comparing that with a context that carries only the tools and skills relevant to the
+request. At the catalogue size we ship today and expect in the near future, this scoping does not
+improve the agent enough to justify its complexity, so the design is parked.
 
 ## Summary
 
