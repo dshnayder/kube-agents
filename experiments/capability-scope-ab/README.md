@@ -3,8 +3,9 @@
 The experiment behind [`docs/designs/context-scoped-capabilities.md`](../../docs/designs/context-scoped-capabilities.md)
 §7. It asks one question: when the Platform Agent sees only the skills a turn needs, with the
 rest by name, does it pick the right one more often and cost less than when it sees everything?
-Results are in the design document; this directory holds the method and the code so the run can
-be repeated.
+The design document reads the results; this directory holds the method, the code, and under
+`results/` the scored tables (`<model>.md`), the raw metrics (`<model>.json`) and one row per run
+(`<model>.csv`) that `make_results.sh` writes from a run directory.
 
 ## Arms and rungs
 
@@ -78,8 +79,8 @@ turn into a sweep of every cluster in the project.
 
 ## Limits of the setup
 
-- One model (the install's `model-default`), one persona, one operator scoring. Enough to decide
-  direction; not a benchmark.
+- Two models (Gemini 3.1 Pro, then a repeat on Gemini 3.5 Flash), one persona, one operator
+  scoring. Enough to decide direction; not a benchmark.
 - The ranker is v1: BM25 over skill name and description with a crude stemmer. It has no trigger
   phrases or domain tags yet, so its misses are part of what is measured, not tuned away.
 - Probes are single-turn, so the sticky working set and the turn-boundary rule are exercised but
