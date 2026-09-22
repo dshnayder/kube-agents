@@ -182,6 +182,27 @@ class SelfAware:
         raise AssertionError("the author check makes no API call of its own")
 
 
+class LookupFailed:
+    """A transport whose `whoami` call did not happen. Not the same as "".
+
+    `<cli> auth status` exits non-zero on a timeout and when the
+    token-validation call it makes of its own accord is throttled, and it
+    prints no login line in either case -- so the difference between this and
+    a credential that answered and named nobody is the exit code, and nothing
+    else.
+    """
+
+    def whoami(self) -> str:
+        raise WorkspaceError(
+            "`gh auth status` exited 124 without saying who the credential is",
+            status=502,
+            code="FORGE_CALL_FAILED",
+        )
+
+    def api(self, *_args, **_kwargs):
+        raise AssertionError("the author check makes no API call of its own")
+
+
 class Recorder:
     """A stand-in for the forge CLI, holding what it saw and what it answers."""
 
@@ -1155,6 +1176,26 @@ class RepositoryVerbTest(unittest.TestCase):
         made = self._advance_onto(forge)
         self.assertEqual(self.remote_tip("release-1.2"), made)
 
+    def test_advance_is_refused_when_who_the_credential_is_cannot_be_learned(self):
+        """A lookup that failed is not a credential that cannot say.
+
+        The weaker bar belongs to a forge with no way to answer the question.
+        Taken for a forge that has one and whose answer did not arrive, it
+        drops the ownership half of the check on exactly the case it was added
+        for -- a stranger's open proposal on a long-lived branch -- and a
+        timeout on one `auth status` is the whole of what it takes to get
+        there.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: LookupFailed()
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+        self.assertIn("who this credential is", str(caught.exception))
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
     def test_advance_does_not_reach_the_default_branch(self):
         # Everything else still applies to it. The default-branch refusal is
         # the one that does not come from the request, so it is the one worth
@@ -1540,6 +1581,27 @@ class CollaborationTest(unittest.TestCase):
         broken = subprocess.CompletedProcess(["gh"], 1, "", "connect: timeout")
         broker, _ = self.broker(status, broken)
         self.assertIsNone(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+
+    def test_a_login_lookup_that_failed_is_not_an_empty_login(self):
+        """The two are one string apart in the output and worlds apart in meaning.
+
+        Empty is an answer -- an installation token cannot always introspect
+        itself -- and every caller reads it as "do not compare". A call that
+        timed out or was throttled prints no login either, so reading the
+        output without the exit code turns an outage into that answer, and the
+        comparisons it governs quietly stop happening.
+        """
+        timed_out = subprocess.CompletedProcess(["gh"], 124, "", "")
+        broker, recorder = self.broker(timed_out)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.identity({"repository": "acme/infra"})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+        self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        silent = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  - Active account: true\n"
+        )
+        broker, _ = self.broker(silent)
+        self.assertEqual(broker.identity({"repository": "acme/infra"})["identity"]["login"], "")
 
     def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
         """`bot` puts the suffix back that the translation took off.

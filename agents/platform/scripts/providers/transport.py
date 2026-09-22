@@ -66,6 +66,13 @@ class Transport(Protocol):
         route. An installation-style token cannot always introspect itself
         over HTTP -- the current-user route answers 401 for one -- which is
         why this is not a verb the forge composes.
+
+        **A lookup that did not happen is not an empty login, and raises.**
+        Empty says the credential answered and named nobody, and its callers
+        read it as "do not compare", which drops a comparison rather than
+        failing one. A timeout or a throttled call reaching them as "" would
+        turn an outage into that silence, so it has to arrive as an error
+        instead. The rule is `forge.viewer_login`'s, one layer down.
         """
         ...
 
@@ -139,6 +146,20 @@ class CliTransport:
 
     def whoami(self) -> str:
         done = self._runner([self._executable, "auth", "status"], stdin=None)
+        if done.returncode != 0:
+            # The exit code is the whole of the difference. `auth status` exits
+            # non-zero on a timeout -- 124, from the runner -- and when the
+            # token-validation call it makes of its own accord is throttled or
+            # cannot reach the host, and it prints no login line in any of
+            # those, exactly as a credential that cannot introspect itself
+            # prints none. Reading the output alone cannot tell them apart, so
+            # the read happens only once the call is known to have happened.
+            raise WorkspaceError(
+                f"`{self._executable} auth status` exited {done.returncode} "
+                "without saying who the credential is",
+                status=502,
+                code="FORGE_CALL_FAILED",
+            )
         found = _CLI_LOGIN_RE.search(f"{done.stdout or ''}\n{done.stderr or ''}")
         return found.group(1).strip() if found else ""
 

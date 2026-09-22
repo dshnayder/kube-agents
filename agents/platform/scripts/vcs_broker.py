@@ -790,7 +790,26 @@ class VcsBroker:
         # -- the `release-1.2` back-merge every GitOps repository has one of --
         # otherwise satisfies the bar with nothing under this install's name at
         # all, which is the incident with an extra step rather than a cost.
-        viewer = self._viewer(bound)
+        try:
+            viewer = self._viewer(bound)
+        except WorkspaceError as failed:
+            # A lookup that did not happen is not a credential that cannot
+            # say, and settling for the weaker bar on it would drop the
+            # ownership half of this check on exactly the branch it was added
+            # for. Refused with the transport's own code rather than
+            # `CLONED_BRANCH`: what is known is that the question could not be
+            # asked, and reporting that as "the proposal is somebody else's"
+            # would be a guess that sends the caller to rename a branch over
+            # what a retry fixes.
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, and an open proposal on it exists, "
+                "but asking the forge who this credential is failed, so whether "
+                "that proposal is this install's could not be established: "
+                f"{failed}. Retry; the branch has not been moved.",
+                status=502,
+                code="FORGE_CALL_FAILED",
+            ) from failed
         authors = {str(item.get("author") or "") for item in proposals}
         authors.discard("")
         keys = {_login_key(author) for author in authors}
@@ -818,10 +837,17 @@ class VcsBroker:
         one the tests run against -- has nowhere to ask. The caller treats "" as
         "do not compare", which leaves the weaker bar in place rather than
         refusing every `advance` on such an install.
+
+        Which is why only the second of those is caught here. A forge with no
+        transport cannot answer the question at all, and never will; a
+        transport whose call failed would have answered, and its silence is an
+        outage wearing the same clothes. Turning that into "" is how the weaker
+        bar arrives on an install that was meant to have the stronger one, so
+        it is left to the caller to refuse.
         """
         try:
             return bound.transport().whoami()
-        except (ForgeUnsupported, WorkspaceError):
+        except ForgeUnsupported:
             return ""
 
     def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
