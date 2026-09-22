@@ -428,6 +428,30 @@ class SandboxForwardingTest(unittest.TestCase):
         )
         self.assertGreater(resolver.FORWARD_TIMEOUT_MARGIN_S, 0)
 
+    def test_the_margin_covers_the_read_that_happens_inside_it(self):
+        """`> 0` is not the property the margin is for.
+
+        The gate starts its clock at `subprocess.run`; this process then pays
+        its own `get_managed_github_repos()` before `sandbox_exec.run` is
+        entered, and that read is bounded by `GITOPS_STATE_READ_TIMEOUT_SECONDS`
+        rather than by anything here. A margin under that number inverts the
+        order the margin exists to fix on exactly the tick it matters -- a slow
+        API server is when the read is slow -- and the outer kill orphans the
+        ssh child. Nothing else pins the two: raising the ConfigMap timeout and
+        leaving this behind reopens it silently.
+        """
+        import gitops_workspace  # local: the read the margin has to cover
+
+        self.assertGreater(
+            resolver.FORWARD_TIMEOUT_MARGIN_S,
+            gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
+        )
+        # And the hop still gets most of the window: a margin sized off the read
+        # must not eat the budget it is carving out of.
+        self.assertLess(
+            resolver.FORWARD_TIMEOUT_MARGIN_S, resolver.FORWARD_TIMEOUT_PER_REPO_S / 2
+        )
+
     def test_the_hop_is_bounded_and_the_ceiling_is_sized_by_the_sweep(self):
         """The reason it may cross once: one budget, not one per forge call.
 

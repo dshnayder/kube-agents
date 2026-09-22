@@ -42,6 +42,16 @@ _HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
 # The `<cli> auth status` convention: a line `Logged in to <host> account <login>`,
 # which some CLI versions print on stdout and others on stderr; both are read.
 _CLI_LOGIN_RE = re.compile(r"Logged in to \S+ account (\S+)")
+# The other half of that convention: what `auth status` prints when it reached
+# the forge and the forge rejected the credential. It carries no `(HTTP 401)` --
+# the CLI phrases that answer in its own words rather than passing the status
+# through -- so it needs its own marker, and it is the one non-zero exit of that
+# command that is not transient.
+_CLI_CREDENTIAL_REJECTED_RE = re.compile(
+    r"token .{0,40}\bis invalid|authentication failed|bad credentials"
+    r"|requires authentication|invalid or revoked",
+    re.IGNORECASE,
+)
 
 
 class Transport(Protocol):
@@ -147,13 +157,29 @@ class CliTransport:
     def whoami(self) -> str:
         done = self._runner([self._executable, "auth", "status"], stdin=None)
         if done.returncode != 0:
-            # The exit code is the whole of the difference. `auth status` exits
-            # non-zero on a timeout -- 124, from the runner -- and when the
-            # token-validation call it makes of its own accord is throttled or
-            # cannot reach the host, and it prints no login line in any of
-            # those, exactly as a credential that cannot introspect itself
-            # prints none. Reading the output alone cannot tell them apart, so
-            # the read happens only once the call is known to have happened.
+            output = f"{done.stdout or ''}\n{done.stderr or ''}"
+            if _HTTP_STATUS_RE.search(output) or _CLI_CREDENTIAL_REJECTED_RE.search(
+                output
+            ):
+                # The forge answered and said no. That has to be told apart
+                # from the rest, because `FORGE_CALL_FAILED` reads "one retry
+                # is reasonable" and a revoked token will never come back --
+                # and this is the call an install makes first: the sweep asks
+                # `viewer_login` of every managed repository before it asks
+                # anything else, so a dead credential reported as a call
+                # failure names a forge outage on every repository, every tick,
+                # and the 401 a later verb would have produced is never
+                # reached. 401 is the default rather than the answer: an
+                # `(HTTP 4xx)` in the output wins, since a throttle of the
+                # token-validation call prints its own status and is not a dead
+                # credential.
+                raise self._failure(done.stderr or "", done.stdout or "", default=401)
+            # Everything else stays what it was. `auth status` exits non-zero on
+            # a timeout -- 124, from the runner -- and when the validation call
+            # it makes of its own accord cannot reach the host, and it prints no
+            # login line in any of those, exactly as a credential that cannot
+            # introspect itself prints none. Those the exit code cannot tell
+            # apart from each other, and none of them is the forge's answer.
             raise WorkspaceError(
                 f"`{self._executable} auth status` exited {done.returncode} "
                 "without saying who the credential is",
@@ -163,7 +189,7 @@ class CliTransport:
         found = _CLI_LOGIN_RE.search(f"{done.stdout or ''}\n{done.stderr or ''}")
         return found.group(1).strip() if found else ""
 
-    def _failure(self, stderr: str, stdout: str = "") -> WorkspaceError:
+    def _failure(self, stderr: str, stdout: str = "", default: int = 0) -> WorkspaceError:
         """The forge's refusal, with the reason it actually gave as the detail.
 
         A CLI puts its summary on the first line of stderr -- `gh: Validation
@@ -207,9 +233,12 @@ class CliTransport:
         found = _HTTP_STATUS_RE.search(output)
         # A CLI that failed without ever reaching the forge -- it could not
         # resolve the host, or it has no credential loaded -- prints no status
-        # at all. Status 0 matches nothing in the guidance table and lands on
-        # the "did not say why" reading, which is the truth.
-        status = int(found.group(1)) if found else 0
+        # at all. The default 0 matches nothing in the guidance table and lands
+        # on the "did not say why" reading, which is the truth. A caller that
+        # already knows what the absence means -- `whoami`, where the CLI
+        # phrases the forge's 401 in prose instead of passing it through --
+        # names the status it stands for instead.
+        status = int(found.group(1)) if found else default
         # The first line is what the caller is shown; the whole output is what
         # an override reads, because the marker a forge uses for a throttle is
         # often on the line after the summary.

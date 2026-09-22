@@ -190,23 +190,39 @@ def _login_key(login: str) -> str:
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
 
 
-def this_install(repo: str) -> str:
+def this_install(repo: str, *, settled_later: bool = True) -> str:
     """The login this install authenticates as on `repo`'s forge, or "".
 
     Empty for a credential that cannot introspect itself and for a forge with
     no way to ask. Both are real answers and both mean "do not compare", which
     is the bar `vcs_broker._require_open_proposal` keeps on the same question.
 
-    A lookup that *failed* is empty here too, and that is the one place this is
-    deliberately weaker than the broker. The broker refuses an `advance` whose
-    ownership it could not establish, because by then the change is written and
-    the push is the next thing to happen. This call is the early warning in
-    front of that refusal, not a second gate: a transient failure costs the
-    warning and leaves the protection where it already was.
+    A lookup that *failed* is empty here too by default, and that is the one
+    place this is deliberately weaker than the broker. The broker refuses an
+    `advance` whose ownership it could not establish, because by then the
+    change is written and the push is the next thing to happen. Called in front
+    of that refusal this is the early warning, not a second gate: a transient
+    failure costs the warning and leaves the protection where it already was.
+
+    `settled_later=False` is the route where that reasoning does not hold,
+    because nothing downstream settles it -- the second round that changes only
+    the description, which skips the publish and writes this run's title and
+    body straight into the open proposal. There a failed lookup is the whole of
+    what stands between this run and a stranger's description, so it refuses
+    instead of warning. A forge that answered and named nobody still falls
+    through: that is a capability the forge does not have, not a failure, and
+    refusing on it would take the route away on every such forge.
     """
     try:
         answer = vcs_client.forge("identity", {}, repository=repo)
     except vcs_client.VcsError as failed:
+        if not settled_later:
+            raise ValueError(
+                f"could not ask {repo}'s forge who this install is ({failed}), "
+                "and this round changes only the open proposal's description -- "
+                "there is no publish after it to establish that the proposal is "
+                "ours. Retry once the forge is answering again."
+            ) from failed
         log(
             f"could not ask {repo}'s forge who this install is ({failed}); "
             "whether the open proposal on this branch is ours is unknown here, "
@@ -659,6 +675,18 @@ def handle_submit(args) -> int:
         # a first submission and the wrong one here, where the proposal to
         # refresh is already open and the branch is already where it should
         # be. So the publish is skipped and the update below is reached.
+        #
+        # And the only route to `proposal-update` with no publish in front of
+        # it, so the ownership check `prepare` makes as an early warning is a
+        # gate here. Everywhere else the broker settles it: a publish carrying
+        # `advance` is refused unless the open proposal is this install's, and
+        # `already_published` above means a publish of this copy already was.
+        # `proposal-update` is a plain forge verb with no such guard, so
+        # without this a stranger's title and body are overwritten by a run
+        # that never pushed a commit.
+        refuse_a_proposal_that_is_not_ours(
+            branch, proposal, this_install(repo, settled_later=False)
+        )
         log(f"'{branch}' holds nothing {repo} does not have; refreshing the proposal it belongs to.")
     else:
         log(f"Publishing '{branch}' to {repo}...")

@@ -417,8 +417,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          managed-repository config (`get_managed_github_repos`,
 #                          `is_valid_repo_slug`, `validate_repo_org`), which every
 #                          skill checks a `--repo` against before it acts. Its
-#                          leased clone is not used from here — the working copies
-#                          are `vcs_client`'s now
+#                          leased clone is still used from here by the two skills
+#                          that read a whole tree — inspect-repository and
+#                          fleet-upgrade-verification's api_deprecation_scan, both
+#                          `ensure_workspace(..., lease=...)`. Nothing that
+#                          *proposes* a change uses it any more: those working
+#                          copies are `vcs_client`'s
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by

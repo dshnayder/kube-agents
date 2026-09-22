@@ -38,6 +38,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 import sandbox_exec  # noqa: E402 — needs the sys.path lines above
 import vcs_client  # noqa: E402 — needs the sys.path lines above
 from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
+    GITOPS_STATE_READ_TIMEOUT_SECONDS,
     get_managed_github_repos,
     is_valid_repo_slug,
 )
@@ -73,7 +74,8 @@ SANDBOX_RESOLVER = "/opt/vcs/libexec/platform/resolver.py"
 # that and never fire, or below it and kill a legitimate poll of a fleet with
 # several repositories in it. The margin is what makes this one fire first, so a
 # hung hop is reported as `SANDBOX_UNREACHABLE` rather than killed from outside
-# -- an outer kill reaches this process and orphans the ssh child.
+# -- an outer kill reaches this process and orphans the ssh child. What that
+# margin has to be large enough for is below.
 #
 # It is a copy of the number rather than an import: this module is forwarded
 # into the sandbox, where every import it makes has to be a root-owned file in
@@ -81,7 +83,26 @@ SANDBOX_RESOLVER = "/opt/vcs/libexec/platform/resolver.py"
 # the whole scanner there. `test_resolver` pins the two equal instead, so the
 # copy cannot drift.
 FORWARD_TIMEOUT_PER_REPO_S = 300
-FORWARD_TIMEOUT_MARGIN_S = 15
+
+# What the margin has to cover, and it is not a round number: the gate starts
+# its clock at `subprocess.run`, and everything this process does before
+# `sandbox_exec.run` is entered is spent inside that window. Nearly all of it is
+# one thing -- this process's own `get_managed_github_repos()`, the same
+# ConfigMap read the gate already paid, bounded by the timeout below. A fixed 15
+# did not cover it: on a slow API server -- which is exactly when that read is
+# slow -- the gate's kill landed first, and an outer kill reaches this process
+# and orphans the ssh child, leaving the far-side `poll` and its stale-issue
+# writes running unattended while the tick reports no output rather than
+# `SANDBOX_UNREACHABLE`. That is the inversion this margin exists to prevent, so
+# it is sized off the read rather than guessed above it. The remaining 15 is
+# interpreter startup and the argv handling either side of the read.
+#
+# The read's own failure is deliberately left undersizing the hop: `repos` falls
+# back to 1, so on a fleet of three the hop gets 255s against the gate's 900.
+# That errs in the safe direction -- this process fires first, reports
+# `SANDBOX_UNREACHABLE` and reaps its child -- and the count it would need to do
+# better is one the gate does not pass down.
+FORWARD_TIMEOUT_MARGIN_S = GITOPS_STATE_READ_TIMEOUT_SECONDS + 15
 
 IN_PROGRESS = "status:in-progress"
 ESCALATION_NEEDED = "status:escalation-needed"

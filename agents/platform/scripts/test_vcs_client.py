@@ -239,6 +239,25 @@ class WorkingCopyTest(unittest.TestCase):
         removed = vcs_client.discard("acme/infra")
         self.assertFalse(Path(removed["removed"]).exists())
 
+    def test_a_branch_that_was_not_switched_to_is_not_reported_as_created(self):
+        """`created` says what happened, not what the argv asked for.
+
+        `switch --create` on a name git will not take creates nothing and exits
+        non-zero, and the answer already carries that exit code -- but a caller
+        reading the flag rather than the code was told it had a branch of its
+        own to publish while standing on the one it started from. The name here
+        is one `check_ref_format` refuses for its arrangement rather than its
+        characters, so it clears every validator in front of this and is
+        refused by git itself.
+        """
+        vcs_client.clone("acme/infra")
+        before = vcs_client.branch("acme/infra", "fix/one")["branch"]
+        answer = vcs_client.branch("acme/infra", "fix/one/")
+        self.assertNotEqual(answer["exitCode"], 0)
+        self.assertFalse(answer["created"])
+        # And it is still standing where it was.
+        self.assertEqual(answer["branch"], before)
+
     def test_a_record_written_before_the_branch_was_in_its_name_can_be_discarded(self):
         """The copies an install already had when this landed are not zombies.
 

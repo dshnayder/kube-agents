@@ -95,6 +95,19 @@ COMMENT_KINDS = frozenset({"issue", "review_comment", "review"})
 
 PROPOSAL_STATES = frozenset({"open", "closed", "merged"})
 
+# Payload fields that hold text a caller wrote, as opposed to an identifier or
+# an enumerated value the protocol fixed. These are what must never reach a
+# path, a query string or an argv.
+PROSE_FIELDS = ("title", "body", "comment", "description")
+
+# The write verbs that carry none of it. Named, because "the fixture has no
+# prose in it" is otherwise indistinguishable from "the fixture forgot to put
+# any in", and the second is how the check above goes quiet. `issue-close`'s
+# `reason` is on this side of the line: the forge takes two fixed words for it,
+# so it is an enumeration spelled in letters rather than something a caller
+# wrote.
+PROSELESS_WRITES = frozenset({"proposal-close", "issue-close"})
+
 
 TESTDATA = Path(__file__).resolve().parent / "testdata" / "providers"
 
@@ -396,31 +409,59 @@ class ContractTest(unittest.TestCase):
     def test_a_write_verb_sends_its_prose_in_a_body(self):
         # Not in a path and not in a query. What a caller wrote must not end up
         # in an argv, in `ps`, or in a `CalledProcessError` some layer logs.
+        #
+        # Every free-text field, not just `body`. Reading only `body` made this
+        # vacuous for most of the write verbs -- `issue-update` carries a title,
+        # `label-ensure` a description, and neither was checked -- and a
+        # fixture that happens to omit the one field the test reads is exactly
+        # how a contract stops holding without anyone noticing. The verbs that
+        # carry no prose at all are named below rather than left to be inferred
+        # from a fixture.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
                 if not verb.endswith(("-create", "-comment", "-update", "-close", "-ensure")):
                     continue
                 fixture = self.load(directory, verb)
-                prose = fixture["payload"].get("body") or ""
+                prose = [
+                    value
+                    for field in PROSE_FIELDS
+                    for value in [fixture["payload"].get(field)]
+                    if isinstance(value, str) and value.strip()
+                ]
                 with self.subTest(forge=name, verb=verb):
+                    if verb in PROSELESS_WRITES:
+                        self.assertEqual(
+                            prose, [], f"{verb} is listed as carrying no prose"
+                        )
+                    else:
+                        self.assertTrue(
+                            prose,
+                            f"{verb}'s fixture carries no free text, so this "
+                            "verb is not covered by the contract at all",
+                        )
                     _, api = self.invoke(forge, verb, fixture)
-                    # The call that carried the prose is not always the first
-                    # write: an update applies its labels before it patches the
-                    # text, and a create-or-update may precede both with a read.
-                    # So take the write the prose is actually in, and fall back
-                    # to the first only for a verb that carries no prose.
                     writes = [c for c in api.calls if c[0] in {"POST", "PATCH", "PUT"}]
                     self.assertTrue(writes, "no write was made")
-                    carrying = [c for c in writes if prose and prose in [str(v) for v in (c[3] or {}).values()]]
-                    method, path, params, body, _raw = (carrying or writes)[0]
-                    self.assertIn(method, {"POST", "PATCH", "PUT"})
-                    self.assertIsInstance(body, dict)
-                    if prose:
-                        self.assertIn(prose, [str(value) for value in body.values()])
-                        self.assertNotIn(prose, path)
-                        self.assertNotIn(
-                            prose, [str(value) for value in (params or {}).values()]
-                        )
+                    for text in prose or [None]:
+                        # The call that carried it is not always the first
+                        # write: an update applies its labels before it patches
+                        # the text, and a create-or-update may precede both with
+                        # a read. So take the write the text is actually in, and
+                        # fall back to the first only for a verb with no prose.
+                        carrying = [
+                            c
+                            for c in writes
+                            if text and text in [str(v) for v in (c[3] or {}).values()]
+                        ]
+                        method, path, params, body, _raw = (carrying or writes)[0]
+                        self.assertIn(method, {"POST", "PATCH", "PUT"})
+                        self.assertIsInstance(body, dict)
+                        if text:
+                            self.assertIn(text, [str(value) for value in body.values()])
+                            self.assertNotIn(text, path)
+                            self.assertNotIn(
+                                text, [str(value) for value in (params or {}).values()]
+                            )
 
     def test_the_shared_validators_reject_the_same_inputs_for_every_forge(self):
         # Validation is a property of the caller's request, not of a forge's

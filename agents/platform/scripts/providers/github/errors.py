@@ -13,10 +13,11 @@ It spends 422 on two as well. `search/issues` answers 422, not 404, for a
 repository that does not exist or that the credential cannot see -- so the same
 fault reads as `FORGE_NOT_FOUND` through `/repos/{repo}/issues` and as
 `FORGE_REJECTED`, "fix the field named in the detail", through the search
-route. `issue_list` takes the search route whenever the caller filters, which
-the issue resolver's poll always does, so the code an operator is shown for a
-deleted or unreachable repository depended on which half of the same sweep hit
-it first.
+route. `issue_list` takes the search route when the caller passes `query` or
+`excludeLabels` -- a plain `labels` filter still goes to `/repos/{repo}/issues`
+-- and the issue resolver's poll passes `excludeLabels` on every tick, so the
+code an operator is shown for a deleted or unreachable repository depended on
+which half of the same sweep hit it first.
 """
 
 from __future__ import annotations

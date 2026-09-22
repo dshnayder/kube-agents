@@ -716,7 +716,11 @@ def branch(
         "forge": session["forge"],
         "verb": "branch",
         "branch": current_branch(session),
-        "created": exists.returncode != 0,
+        # What happened, not what was asked for: `--create` on a switch that
+        # failed creates nothing, and a caller that reads `created` to decide
+        # whether it has a branch of its own to publish would have been told
+        # yes by a call that left it standing where it was.
+        "created": exists.returncode != 0 and done.returncode == 0,
         "exitCode": done.returncode,
         "stderr": done.stderr.strip()[:2000],
     }

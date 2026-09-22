@@ -1693,6 +1693,43 @@ class CollaborationTest(unittest.TestCase):
         broker, _ = self.broker(silent)
         self.assertEqual(broker.identity({"repository": "acme/infra"})["identity"]["login"], "")
 
+    def test_a_credential_the_forge_rejected_is_not_a_call_that_failed(self):
+        """The other non-zero exit of `auth status`, and it is not transient.
+
+        A revoked or expired token exits 1 with the CLI saying so in prose --
+        there is no `(HTTP 401)` to parse, because the CLI phrases that answer
+        itself. Read as `FORGE_CALL_FAILED` it comes back as "the forge did not
+        answer ... one retry is reasonable", and `identity` is the first call an
+        install makes: `github_scan_gate.sweep_pull_requests` asks
+        `viewer_login` of every managed repository before it asks anything
+        else, so a dead credential reported that way names a forge outage on
+        every repository, every tick, and the 401 a later verb would have
+        produced is never reached.
+        """
+        for output in (
+            "github.com\n  X github.com: authentication failed\n"
+            "  - The github.com token in GH_TOKEN is invalid.\n",
+            "gh: Bad credentials\n",
+        ):
+            with self.subTest(output=output.splitlines()[-1]):
+                revoked = subprocess.CompletedProcess(["gh"], 1, "", output)
+                broker, _ = self.broker(revoked)
+                with self.assertRaises(WorkspaceError) as caught:
+                    broker.identity({"repository": "acme/infra"})
+                self.assertEqual(
+                    caught.exception.fields.get("code"), "FORGE_UNAUTHENTICATED"
+                )
+        # And a throttle of the validation call `auth status` makes of its own
+        # accord still says what it is: the status the CLI printed wins over the
+        # default the absence of one stands for.
+        throttled = subprocess.CompletedProcess(
+            ["gh"], 1, "", "gh: API rate limit exceeded (HTTP 429)\n"
+        )
+        broker, _ = self.broker(throttled)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.identity({"repository": "acme/infra"})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_RATE_LIMITED")
+
     def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
         """`bot` puts the suffix back that the translation took off.
 

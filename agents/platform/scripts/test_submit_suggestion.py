@@ -99,6 +99,7 @@ class FakeBroker:
         self.serial = count()
         self.create_fails_with: Exception | None = None
         self.update_fails_with: Exception | None = None
+        self.identity_fails_with: Exception | None = None
         # Who the credential authenticates as, which is what `proposal_create`
         # records as the author. Set it to somebody else and the proposals this
         # fake already holds become a stranger's.
@@ -165,6 +166,8 @@ class FakeBroker:
     # -- collaboration verbs ---------------------------------------------
 
     def identity(self, payload):
+        if self.identity_fails_with:
+            raise self.identity_fails_with
         return {"identity": {"login": self.viewer, "canWrite": True}}
 
     def proposal_list(self, payload):
@@ -1089,6 +1092,62 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.proposals[0]["body"], "and the body")
         self.assertEqual(len(self.broker.payloads("publish")), 1)
         self.assertTrue(any("nothing" in line and "refreshing" in line for line in self.logged))
+
+    def test_submit_refuses_a_description_only_round_on_somebody_else_s_proposal(self):
+        """The one route to `proposal-update` that no publish stands in front of.
+
+        `prepare` warns rather than refuses when the `identity` lookup failed,
+        on the reasoning that the publish settles ownership afterwards. This
+        round has no publish: nothing was committed, so `submit` skips straight
+        to `proposal-update`, which is a plain forge verb with no
+        `_require_open_proposal` behind it. Without a check here the stranger's
+        title and body are overwritten by a run that pushed nothing.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        # The collision, arriving the only way it can reach `submit`: the
+        # credential is somebody else now, and the lookup that would have said
+        # so at `prepare` was down for that call.
+        self.broker.viewer = "a-colleague"
+        self.broker.identity_fails_with = vcs_client.VcsError(
+            "the forge did not answer", code="FORGE_CALL_FAILED"
+        )
+        self.prepare(branch, force=True)
+        self.broker.identity_fails_with = None
+
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--title", "not theirs", "--body", "nor this"
+            )
+        self.assertIn("kube-agents", str(caught.exception))
+        self.assertIn("a-colleague", str(caught.exception))
+        # And the description is as its author left it.
+        self.assertEqual(self.broker.payloads("proposal-update"), [])
+        self.assertEqual(self.broker.proposals[0]["title"], "first round")
+
+    def test_submit_refuses_the_refresh_it_cannot_establish_ownership_for(self):
+        """A failed lookup is not a pass on the route that nothing else guards.
+
+        Empty from `this_install` means "do not compare", which is right where
+        the broker compares next and wrong here, where it does not. A lookup
+        the forge could not answer is therefore a refusal on this route and a
+        warning on every other one.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        self.prepare(branch, force=True)
+        self.broker.identity_fails_with = vcs_client.VcsError(
+            "the forge did not answer", code="FORGE_CALL_FAILED"
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--title", "round two", "--body", "b"
+            )
+        self.assertIn("who this install is", str(caught.exception))
+        self.assertEqual(self.broker.payloads("proposal-update"), [])
 
     def test_a_proposal_closed_mid_round_says_so_instead_of_crying_security(self):
         """A reviewer merging while the agent works is ordinary, not an attack.

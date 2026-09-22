@@ -561,14 +561,16 @@ class ParseTaskIdTest(unittest.TestCase):
 
 
 class PostBodyTest(unittest.TestCase):
-    """The body reaches `gh` as bytes, never as a path.
+    """The body is handed over as text, never as a path.
 
     Regression for two live failures that both came of staging it in a file.
     With the body in `/tmp` — a per-container emptyDir — every refusal died on
     "no such file or directory" (#1030). Moving it to a shared volume traded
     that for the #955 uid split, where the 0600 file `NamedTemporaryFile`
-    creates was unreadable to the process that ran `gh`. Separate pods leave no
-    shared volume to move it back to, so it goes on fd 0 and neither can recur.
+    creates was unreadable to the process that ran `gh`. Neither can recur: the
+    gate no longer runs `gh` at all — it hands the text to the provider, which
+    sends it in a verb's JSON payload — and separate pods leave no shared
+    volume to stage a file on anyway.
     """
 
     class _Recorder:
