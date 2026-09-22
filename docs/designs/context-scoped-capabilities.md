@@ -1,7 +1,8 @@
 # Context-scoped capabilities: exposing the tools and skills a turn needs
 
-> **STATUS — parked.** An experiment found that scoping tools and skills per turn does not pay
-> for its complexity on the catalogue that ships today. Nothing here is enabled on any install.
+> **STATUS — parked.** An experiment found that scoping skills per turn does not pay for its
+> complexity on the catalogue that ships today, and the tools a request carries leave nothing to
+> scope. Nothing here is enabled on any install.
 > §3 says what to do instead and which measurements reopen the design.
 
 **Status:** Parked after one experiment. **Scope:** every agent profile this repository ships
@@ -9,10 +10,11 @@
 
 ## TL;DR
 
-Today the agent's context carries every tool and skill it has, on every request. We ran an
-experiment comparing that with a context that carries only the tools and skills relevant to the
-request. At the catalogue size we ship today and expect in the near future, this scoping does not
-improve the agent enough to justify its complexity, so the design is parked.
+Today the agent's context carries every skill it has, on every request. We ran an experiment
+comparing that with a context that carries only the skills relevant to the request. At the
+catalogue size we ship today and expect in the near future, this scoping does not improve the
+agent enough to justify its complexity, so the design is parked. Tools were not scoped: the ones
+in every request are core tools any turn may need, and the rest are already behind tool search.
 
 ## Summary
 
@@ -37,6 +39,10 @@ The design is parked because the experiment in §2 does not justify it for today
   outcome, and the lexical ranker missed a quarter of the probes.
 - **Scoping saves no tokens on this profile,** because the skill index is under a thousand
   tokens of a 28k-token prompt. It adds a ranker, per-session state, and a new failure mode.
+- **Tool definitions are the large part of the prompt, and relevance scoping cannot reach
+  them.** The 21 tools in the request take about 12,000 tokens, roughly 40% of it, but they are
+  core tools (shell, files, cron, session search) that any turn may need. The MCP tools, the only
+  ones a search could stand in for, are already deferred behind tool search.
 - **Picks were scored, not answers.** The run does not show that a better pick produced a better
   outcome.
 
@@ -262,7 +268,13 @@ against either alternative, and full descriptions alone do nothing for it.
 - **Multi-turn behaviour.** Every probe was one turn. The prototype as run cleared its state at
   the end of every message, so the sticky working set of §4.5 is untested.
 - **Tool scoping.** The filter hid one tool of 21, so the run says nothing about the 30-to-50
-  tool threshold the literature reports.
+  tool threshold the literature reports. There was little to hide. The 21 tools are the core set,
+  which the runtime never defers, plus the three tool-search bridge tools. Their definitions
+  serialise to about 48,000 characters, roughly 12,000 tokens, and three of them carry nearly half
+  of that: `cronjob` about 9,800 characters, `session_search` about 7,000, `skill_manage` about
+  4,400. The MCP tools are deferred: the request carries a short listing of them, capped at
+  4,000 tokens, and a tool's full schema enters the context only when the agent searches for
+  it. The sizes were measured on a newer build of the runtime than the one the run used.
 - **A ranker with better metadata or a semantic model.** §2.7 estimates the second.
 - **Cheaper fixes for under-use.** No arm tried better descriptions or a persona instruction to
   check the skill list first.
@@ -325,8 +337,9 @@ A future experiment should run a hybrid-ranker arm against those fixes, not agai
   cheaper changes can target directly.
 - **It adds a failure mode.** A ranker miss makes the agent worse than no scoping, and the
   lexical ranker missed a quarter of the probes.
-- **It saves no tokens here.** The index is a small part of the prompt, and the tool array is
-  already short under the API endpoint.
+- **It saves no tokens here.** The index is a small part of the prompt. The tool definitions
+  are large but are core tools any turn may need, so the tokens there are won by shortening and
+  gating them, not by guessing relevance.
 - **It adds moving parts.** A catalogue build, a ranker with its own golden tests, per-session
   working-set state, and a record to maintain, for an effect that is significant only on a
   catalogue twice today's size.
@@ -339,7 +352,14 @@ A future experiment should run a hybrid-ranker arm against those fixes, not agai
    change upstream.
 2. **Tell the agent to check its skills.** One persona line asking the agent to scan the skill
    list before investigating targets the skipped-skill failure directly. It is untested.
-3. **Measure capability use in the custom harness.** Record which skill and tool each turn used,
+3. **Shrink the core tool definitions.** They are about 40% of the prompt. Cut each description
+   to what the model needs to choose and call the tool, starting with `cronjob`,
+   `session_search` and `skill_manage`.
+4. **Gate tools deterministically in the custom harness.** Leave a tool out when the deployment
+   or the entry path means it cannot be used: no browser tools where there is no browser, no
+   workspace tools without the credential, no `cronjob` inside a cron run. The decision is a
+   fact the harness knows, not a guess about relevance, so it cannot hide a tool the turn needs.
+5. **Measure capability use in the custom harness.** Record which skill and tool each turn used,
    so under-use and wrong use are visible in production traffic, not only in an experiment. This
    is the scoping record of §4.8 without the scoping, and it is what reopens this design.
 
@@ -348,8 +368,10 @@ A future experiment should run a hybrid-ranker arm against those fixes, not agai
 Reopen the design when any of these holds:
 
 - the platform catalogue passes about 80 skills, the size between the two measured points;
-- the tools in a request pass 30, the threshold the literature reports, or tool schemas pass
-  about 20% of the prompt;
+- the tools in a request pass 30, the threshold the literature reports, after the
+  deterministic gating of §3.2;
+- the deferred MCP catalogue outgrows its listing budget, so the listing falls back to names
+  only and the agent starts missing tools it should have searched for;
 - the capability-use record shows under-use or wrong use that the fixes in §3.2 did not close.
 
 A revived design starts from a hybrid ranker (§2.7), scores only the user's own text and not
