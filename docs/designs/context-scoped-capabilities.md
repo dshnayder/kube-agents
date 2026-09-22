@@ -7,6 +7,12 @@
 **Status:** Parked after one experiment. **Scope:** every agent profile this repository ships
 (chat, platform, cluster, a2a specialists) and the custom harness that will run them.
 
+## TL;DR
+
+We tested showing the agent only the tools and skills relevant to each request. At the catalogue
+size we ship today and expect in the near future, scoping does not improve the agent enough to
+justify its complexity, so the design is parked.
+
 ## Summary
 
 An agent sees its whole capability catalogue on every turn: every tool schema in the request and
