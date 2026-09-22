@@ -239,9 +239,13 @@ def _slug(forge: str, repo: str, key: str) -> str:
     already a copy here -- or, with `--force`, deleted the first card's
     unpublished work.
 
-    `/` becomes `__` the way it already does in the repository name. A branch
-    name cannot contain `_` at all (`providers/validate.BRANCH_RE`), so no two
-    branches of one repository can land on the same directory.
+    `/` becomes `__` the way it already does in the repository name, which does
+    not make the name injective: `providers/validate.BRANCH_RE` admits `_`, so
+    `feat/x` and `feat__x` ask for the same directory. Left encoded this way on
+    purpose -- escaping the `_` would rename every copy whose branch holds one,
+    which is most of them, and `save_session`'s "write it back where it came
+    from" rule reads this prefix off the existing name. `clone` refuses the
+    collision outright instead, which is a message rather than a rename.
     """
     return f"{forge}__{repo.replace('/', '__')}__{key.replace('/', '__')}"
 
@@ -536,6 +540,39 @@ def _refuse_to_discard(destination: Path, *, force: bool) -> None:
     )
 
 
+def _refuse_a_collision(destination: Path, forge: str, repo: str, key: str) -> None:
+    """Stop one card's copy from being taken over by another card's clone.
+
+    `_slug` is not injective -- see there -- so `feat/x` and `feat__x` name the
+    same directory. The pair is an unlikely coincidence; the failure it produces
+    is the reason this is checked anyway, because none of it reads as a name
+    clash. `_refuse_to_discard` would report the *other* branch's unpublished
+    work, `--force` would delete that branch's tree, and `save_session` would
+    write over its record -- after which the card that prepared it is told there
+    is no local copy of a branch it is standing in.
+
+    Refused past `--force` on purpose: that flag means "replace the copy I
+    made", and it is the caller's own work it is offering to lose. It cannot
+    stand in for consent to discard someone else's, so there is no flag past
+    this one. `discard` on the occupant is, and it names what it is removing.
+    """
+    occupant = next(
+        (s for s in all_sessions() if Path(s.get("path", "")) == destination), None
+    )
+    if occupant is None:
+        return
+    if (occupant.get("forge"), occupant.get("repo"), key_of(occupant)) == (forge, repo, key):
+        return
+    raise VcsError(
+        f"{destination} is already the copy of {occupant.get('repo')} on "
+        f"{key_of(occupant)}, which is a different branch with the same"
+        f" directory name as {key} -- `/` and `__` are written the same way"
+        " there. Prepare this work under a name that does not collide, or"
+        f" `vcs.py discard --branch {key_of(occupant)}` first if that copy is"
+        " finished with."
+    )
+
+
 def clone(
     repository: str,
     branch: str | None = None,
@@ -559,6 +596,7 @@ def clone(
     # belongs to that branch, not to the base every other card also clones.
     key = key or branch or answer["branch"]
     destination = ROOT / _slug(answer["forge"], answer["repo"], key)
+    _refuse_a_collision(destination, answer["forge"], answer["repo"], key)
     if destination.exists():
         _refuse_to_discard(destination, force=force)
         shutil.rmtree(destination)

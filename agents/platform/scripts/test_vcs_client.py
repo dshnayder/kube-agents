@@ -332,6 +332,38 @@ class WorkingCopyTest(unittest.TestCase):
             vcs_client.resolve_session("acme/infra")["path"], first["path"]
         )
 
+    def test_two_branches_with_the_same_directory_name_do_not_share_a_copy(self):
+        """`_slug` is not injective, so the collision is refused rather than taken.
+
+        `BRANCH_RE` admits `_` and `/` is written as `__`, so `fix/one` and
+        `fix__one` derive the same directory. Before this the second clone took
+        it: `--force` deleted the first card's tree and `save_session` wrote
+        over its record, and the first card was then told there was no local
+        copy of the branch it had prepared.
+        """
+        first = vcs_client.clone("acme/infra", key="fix/one")
+        tree = Path(first["path"])
+        self.assertTrue(first["path"].endswith("local__acme__infra__fix__one"))
+        (tree / "a.txt").write_text("a2\n")
+        vcs_client.commit("work that never left", spec="acme/infra", key="fix/one")
+
+        for force in (False, True):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.clone("acme/infra", key="fix__one", force=force)
+            self.assertIn("fix/one", str(caught.exception))
+            self.assertIn("different branch", str(caught.exception))
+        # Neither the tree nor the record moved, so the first card still resolves.
+        self.assertEqual(
+            vcs_client.resolve_session("acme/infra", key="fix/one")["path"],
+            first["path"],
+        )
+        self.assertEqual(vcs_client.unpublished_revisions(
+            vcs_client.resolve_session("acme/infra", key="fix/one")), 1)
+        # And discarding the occupant is what frees the name.
+        vcs_client.discard("acme/infra", key="fix/one")
+        taken = vcs_client.clone("acme/infra", key="fix__one")
+        self.assertEqual(taken["path"], first["path"])
+
     def test_a_second_clone_refuses_to_discard_work_on_a_branch_it_is_not_standing_on(self):
         """Every branch the copy holds, not the one that is checked out.
 
