@@ -179,7 +179,9 @@ class ContractTest(unittest.TestCase):
 
     def test_a_forge_ships_a_fixture_for_every_verb_it_claims(self):
         # The check that keeps the rest of this file from passing vacuously: a
-        # forge could claim all eight and be tested on none.
+        # forge could claim every verb it serves and be tested on none. No
+        # count here on purpose -- the number has changed with each slice of
+        # the migration, and a comment carrying it goes stale the next time.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
                 with self.subTest(forge=name, verb=verb):

@@ -131,8 +131,9 @@ BROKER_UNSUPPORTED = "FORGE_UNSUPPORTED"
 #: What a failed verb is called when the broker named no code. Every one of
 #: those is a fault on this side of the seam and the call never reached a forge
 #: at all -- `CREDENTIAL_PROXY_URL` unset, the socket refused, the projected
-#: token missing, a broker image that does not serve the routes, an answer that
-#: is not JSON. `REPO_UNREACHABLE` was the older reading and it sent an
+#: token missing, an answer that is not JSON. A broker image that does not
+#: serve the routes is *not* in that list: it answered, so `vcs_client` codes
+#: it `BROKER_ROUTE_UNSUPPORTED` and it never reaches this fallback. `REPO_UNREACHABLE` was the older reading and it sent an
 #: operator to the repository and the credential for a broker that was down.
 #: `resolver.py` reports this class under this name already, and the two sweeps
 #: have to agree: an operator's glossary keys on the code, so a restarting
@@ -151,8 +152,13 @@ REASON_UNREACHABLE = "BROKER_UNREACHABLE"
 #: fails the build if the import can be satisfied any other way.
 SANDBOX_FORGE = "/opt/vcs/libexec/platform/forge.py"
 
-#: Bounds the ssh hop around a forwarded verb. The broker has its own ceiling on
-#: the work inside it; this is that plus room for the connection.
+#: Bounds the ssh hop around a forwarded verb. Not the broker's ceiling plus
+#: room -- the broker allows 300s per forge call and a verb may make several, so
+#: no single number here can sit above it. It is a bound on the verbs this
+#: module forwards, which are reads that answer in seconds, chosen so that a
+#: hung hop fails the tick instead of holding the cron's slot. A verb that
+#: legitimately runs longer than this belongs on a route of its own, not on a
+#: larger constant.
 FORWARD_TIMEOUT_S = 90
 
 #: A conversation that does not fit one page. Its own code because it is not a

@@ -106,9 +106,11 @@ class VcsError(RuntimeError):
 # ---- the broker -----------------------------------------------------------
 
 #: The broker answered and does not route this verb -- an install whose
-#: credential-proxy image predates the `/v1/vcs/*` routes. Its own code because
-#: the codeless fallback every consumer applies is `BROKER_UNREACHABLE`, which
-#: names a broker that is down; this one is up.
+#: credential-proxy image predates the verb, or the whole `/v1/vcs/*` namespace.
+#: Its own code because the codeless fallback every consumer applies is
+#: `BROKER_UNREACHABLE`, which names a broker that is down; this one is up.
+#: Recognised from a 404 that carries no code of the broker's, which is the
+#: shape a missing route has and the shape nothing else on these routes wears.
 BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 
 
@@ -122,27 +124,55 @@ def call(verb: str, payload: dict) -> dict:
     try:
         return credential_proxy_client.vcs_call(endpoint, verb, payload)
     except credential_proxy_client.WorkspaceUnavailable as exc:
-        # There is no switch for this, so reaching it means the broker in this
-        # install predates the routes. Said plainly, because the alternative
-        # reading -- that something here can be turned on -- sends whoever hits
-        # it looking for a configuration field that does not exist.
+        # The broker served `/v1/vcs/` and answered that version control is not
+        # built on it -- `_handle_vcs_post` with `self.vcs is None`. That is the
+        # only place the `VCS_UNAVAILABLE` code comes from, and on a broker that
+        # is serving requests at all it should be unreachable: `build_vcs_broker`
+        # is "Always built; there is no switch". So this arm is a contradiction
+        # made legible rather than a version skew -- kept because an answer
+        # nothing is supposed to send is worth naming when it arrives, not
+        # collapsed into the codeless fallback where it would read as a broker
+        # that is down.
         #
-        # Coded, unlike the two refusals below it: every consumer reports a
-        # codeless refusal as `BROKER_UNREACHABLE`, and this broker answered --
-        # it is running, it is reachable, and it 404s one route. An operator
-        # sent to look for a broker that is down would find one that is up.
-        # The other two really are "no broker was reached", so they keep the
-        # fallback.
+        # The version-skew case does *not* arrive here. It arrives as a codeless
+        # 404, immediately below.
         raise VcsError(
-            f"this broker does not serve the version-control routes: {exc}. "
-            "Its image is older than this skill.",
+            f"this broker says version control is not available on it: {exc}. "
+            "That should not be reachable on a running broker; report it.",
             code=BROKER_ROUTE_UNSUPPORTED,
         ) from exc
     except credential_proxy_client.WorkspaceRequestError as exc:
         payload = exc.payload or {}
+        code = payload.get("code")
+        if code is None and exc.status == 404:
+            # This is the version skew, and it is the shape an older broker
+            # actually answers with. A credential-proxy that has the `/v1/vcs/`
+            # namespace but no route for a verb this skill calls answers
+            # `{"status": "not_found"}` with no code; one older than the
+            # namespace falls through to the same codeless 404 from the generic
+            # handler. Both used to land on `payload.get("code")` being None and
+            # be reported by every consumer as `BROKER_UNREACHABLE` -- an
+            # operator sent to look for a broker that is down, finding one that
+            # is up and old.
+            #
+            # Safe to read a bare 404 this way because no other refusal on these
+            # routes wears it: a forge 404 is coded `FORGE_NOT_FOUND` by
+            # `providers.errors`, the managed-repository check answers 403 with
+            # `REPOSITORY_NOT_MANAGED`, the registry's refusals are 400s, and
+            # `vcs_broker` raises no 404 of its own. A 404 whose body is not
+            # even JSON -- an ingress or a Service in front of the wrong pod --
+            # lands here too, and that is the right answer for it as well: it
+            # says this endpoint does not serve this route, which is true, and
+            # it is never "the broker did not answer".
+            raise VcsError(
+                f"this broker does not serve `{verb}`: {exc}. Its image is "
+                "older than this skill; roll the credential-proxy image "
+                "forward with the agent and sandbox images.",
+                code=BROKER_ROUTE_UNSUPPORTED,
+            ) from exc
         raise VcsError(
             payload.get("error", str(exc)),
-            code=payload.get("code"),
+            code=code,
             detail=payload.get("detail"),
         ) from exc
     except credential_proxy_client.TokenUnavailable as exc:

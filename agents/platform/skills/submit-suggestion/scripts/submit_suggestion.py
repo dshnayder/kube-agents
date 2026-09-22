@@ -183,7 +183,15 @@ PROPOSAL_HISTORY_LIMIT = 5
 #: the two raw makes an install a stranger to its own proposals, so this folds
 #: them together -- `vcs_broker._login_key`'s rule, restated here because the
 #: broker runs on the other side of the proxy and this side cannot import it.
-_AUTOMATION_MARKING = re.compile(r"\[bot\]$", re.IGNORECASE)
+#:
+#: Any bracketed suffix, not `[bot]` alone, because that is what the broker's
+#: rule is and the two have to agree: narrower here means this side refuses a
+#: proposal the broker would have accepted as ours, and since that refusal is
+#: now hard on the description-only route it would take the round away outright.
+#: It is the broader rule that carries the broker's recorded trade -- it folds
+#: `name[bot]` onto a human spelled `name` -- and duplicating the rule without
+#: duplicating its failure mode is not restating it.
+_AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
 
 
 def _login_key(login: str) -> str:

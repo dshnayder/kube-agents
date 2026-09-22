@@ -420,9 +420,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          leased clone is still used from here by the two skills
 #                          that read a whole tree — inspect-repository and
 #                          fleet-upgrade-verification's api_deprecation_scan, both
-#                          `ensure_workspace(..., lease=...)`. Nothing that
-#                          *proposes* a change uses it any more: those working
-#                          copies are `vcs_client`'s
+#                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
+#                          audit_report, which also proposes from it. That last one
+#                          is the consumer this migration does not move; every
+#                          other working copy that *proposes* a change is
+#                          `vcs_client`'s now
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by

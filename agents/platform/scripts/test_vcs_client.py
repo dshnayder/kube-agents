@@ -73,6 +73,72 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.as_json(), {"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"})
 
 
+    def test_a_broker_too_old_for_a_verb_is_not_a_broker_that_is_down(self):
+        """The shape an old credential-proxy actually answers with.
+
+        `BROKER_ROUTE_UNSUPPORTED` used to be raised only for the broker's
+        `VCS_UNAVAILABLE` body, which `build_vcs_broker` says a running broker
+        never sends. A broker whose image predates one of these verbs answers a
+        codeless 404 instead -- `{"status": "not_found"}` from the route lookup,
+        or the generic handler's on an image older than the namespace -- and
+        that fell to the plain arm and was reported as `BROKER_UNREACHABLE`,
+        sending an operator after a broker that is up.
+        """
+        for payload in ({"status": "not_found"}, {"error": "HTTP 404"}):
+            with self.subTest(payload=payload):
+                error = vcs_client.credential_proxy_client.WorkspaceRequestError(
+                    404, payload
+                )
+                with mock.patch.dict(
+                    os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}
+                ), mock.patch.object(
+                    vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+                ):
+                    with self.assertRaises(vcs_client.VcsError) as caught:
+                        vcs_client.call("issue-update", {})
+                self.assertEqual(
+                    caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED
+                )
+                self.assertIn("issue-update", str(caught.exception))
+
+    def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
+        """The other half: a bare 404 is the only one read as a missing route.
+
+        `providers.errors` codes a forge 404 `FORGE_NOT_FOUND`, and reading
+        that as a broker too old would send an operator to roll an image over a
+        repository name that is misspelt.
+        """
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
+            404, {"error": "no such repository", "code": "FORGE_NOT_FOUND"}
+        )
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}
+        ), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("issue-update", {})
+        self.assertEqual(caught.exception.code, "FORGE_NOT_FOUND")
+
+    def test_version_control_unbuilt_keeps_its_own_arm(self):
+        """`VCS_UNAVAILABLE` still answers `BROKER_ROUTE_UNSUPPORTED`.
+
+        Unreachable on a served broker, which is why the message says to report
+        it rather than to roll an image -- but it is still not a broker that is
+        down, so it keeps the code rather than the codeless fallback.
+        """
+        error = vcs_client.credential_proxy_client.WorkspaceUnavailable(
+            "version control is not available on this broker"
+        )
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}
+        ), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("publish", {})
+        self.assertEqual(caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED)
+
     def test_a_socket_that_drops_mid_answer_becomes_a_broker_disconnect(self):
         """The transport's half: what `urllib` leaves unwrapped, named here.
 

@@ -114,9 +114,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    publish as `BRANCH_DIVERGED`, and the branch has to be deleted on the forge
    before this workload can be remediated again. Report that and stop.
 
-   **Do not put a suffix on the name to get past the refusal.** Step 2b asks
-   the forge about `platform-agent/remediate-stockout-<workload>` and nothing
-   else, so a pull request opened on any other name is invisible to the next
+   **Do not put a suffix on the name to get past the refusal.** The duplicate
+   check in Step 2 §A asks the forge about
+   `platform-agent/remediate-stockout-<workload>` and nothing else, so a pull request opened on any other name is invisible to the next
    alert for this workload: that alert finds nothing open, reaches this same
    refusal, suffixes again, and opens a second pull request for one stockout.
    One name per workload is what makes the duplicate check a check.

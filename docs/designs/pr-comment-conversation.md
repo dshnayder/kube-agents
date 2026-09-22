@@ -275,8 +275,9 @@ calls rather than reimplements.
   installation token cannot introspect itself and returns `401 Bad credentials` — so the broker's
   GitHub module reads the account out of the credential store instead, and the `identity` verb hands
   it back. It took no argument at first and takes a repository now, because an install serving two
-  forges has two credentials and two accounts. An empty answer disables the whole sweep with a `⚠️`
-  rather than falling back to the branch prefix.
+  forges has two credentials and two accounts. An empty answer takes that one repository out of the
+  sweep with a `⚠️` naming it, rather than falling back to the branch prefix; the rest are
+  swept. It disabled the whole sweep at first, which cost every repository the outage of one.
 - **`preflight()` moved onto the protocol, and then off it.** It began as a module-level function
   the sweep called before constructing a provider, which meant a test holding a fake provider still
   reached past it to the real `gh`. Making it a method fixed that — a caller that has a provider

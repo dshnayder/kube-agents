@@ -856,9 +856,42 @@ class BrokerCallTest(unittest.TestCase):
         self.assertIn("shell sandbox", str(caught.exception))
 
     def test_a_broker_without_the_routes_is_named_as_an_old_image(self):
+        # The shape an old credential-proxy actually answers with: a 404 with
+        # no code of its own, either from the route lookup or from the generic
+        # handler on an image older than the `/v1/vcs/` namespace. This test
+        # asserted the `VCS_UNAVAILABLE` arm instead, which `build_vcs_broker`
+        # says a running broker never takes -- so the message it pinned
+        # ("older than this skill") described a path the code did not reach,
+        # and the skew it was written for was reported as `BROKER_UNREACHABLE`.
+        #
         # There is no switch, so the refusal must not read like one. "Turned
         # off" would send whoever hit it looking for a configuration field that
         # does not exist.
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs_client.credential_proxy_client,
+            "vcs_call",
+            side_effect=vcs_client.credential_proxy_client.WorkspaceRequestError(
+                404, {"status": "not_found"}
+            ),
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs_client.call("clone", {})
+        self.assertIn("older than this skill", str(caught.exception))
+        self.assertNotIn("turned off", str(caught.exception))
+        # Coded, because every consumer reports a codeless refusal as
+        # `BROKER_UNREACHABLE` -- and this broker answered.
+        self.assertEqual(caught.exception.code, "BROKER_ROUTE_UNSUPPORTED")
+
+    def test_version_control_unbuilt_says_to_report_it_rather_than_roll(self):
+        """`VCS_UNAVAILABLE` keeps an arm, and stops claiming to be the skew.
+
+        `build_vcs_broker` is "Always built; there is no switch", so a broker
+        serving requests cannot send this. It is still not a broker that is
+        down, so it keeps the code -- but telling an operator to roll an image
+        forward would send them after a version skew that is not what happened.
+        """
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
@@ -870,11 +903,9 @@ class BrokerCallTest(unittest.TestCase):
         ):
             with self.assertRaises(vcs.VcsError) as caught:
                 vcs_client.call("clone", {})
-        self.assertIn("older than this skill", str(caught.exception))
-        self.assertNotIn("turned off", str(caught.exception))
-        # Coded, because every consumer reports a codeless refusal as
-        # `BROKER_UNREACHABLE` -- and this broker answered.
         self.assertEqual(caught.exception.code, "BROKER_ROUTE_UNSUPPORTED")
+        self.assertIn("report it", str(caught.exception))
+        self.assertNotIn("older than this skill", str(caught.exception))
 
     def test_a_request_error_surfaces_the_broker_s_own_wording(self):
         error = vcs_client.credential_proxy_client.WorkspaceRequestError(

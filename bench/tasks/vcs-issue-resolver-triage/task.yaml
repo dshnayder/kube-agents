@@ -93,12 +93,13 @@ validated: false
 owner: dshnayder
 
 verification_spec:
-  # THE RED, kept as its own named check rather than folded into the one below
-  # so that `verification_report[]` says "the resolver could not reach the
-  # forge" rather than "the report did not mention a label" -- both are true on
-  # main, but only the first names the cause. The phrases are the skill's own
-  # words for the failure: its SKILL.md ERROR branch mandates that chat line
-  # verbatim.
+  # Its own named check rather than folded into the one below so that
+  # `verification_report[]` says "the resolver could not reach the forge"
+  # rather than "the report did not mention a label" -- if this case ever goes
+  # red, only the first names the cause. It is not red today and this case is
+  # not this PR's red: the header above says why, and both checks pass on
+  # `main`. The phrases are the skill's own words for the failure: its SKILL.md
+  # ERROR branch mandates that chat line verbatim.
   - name: the-resolver-reached-the-forge
     role: objective
     # assert, not the converge default: the transcript is immutable once the

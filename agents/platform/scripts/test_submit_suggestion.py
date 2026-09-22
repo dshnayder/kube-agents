@@ -406,6 +406,31 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         again = self.prepare(branch, force=True)
         self.assertEqual(again["started_from"], branch)
 
+    def test_the_marking_rule_is_the_broker_s_and_not_a_narrower_copy(self):
+        """Any bracketed suffix, because that is what `vcs_broker._login_key` folds.
+
+        This side cannot import the broker, so the rule is restated -- and a
+        restatement that is narrower is worse than none: the broker would
+        accept the `advance` while this side refuses the round outright, and
+        which of the two answers the agent gets would depend on how the forge
+        happens to spell its automations.
+        """
+        self.assertEqual(
+            submit_suggestion._login_key("kube-agents[bot]"),
+            submit_suggestion._login_key("Kube-Agents"),
+        )
+        for marking in ("[bot]", "[app]", "[BOT]", "[service account]"):
+            with self.subTest(marking=marking):
+                self.assertEqual(
+                    submit_suggestion._login_key(f"kube-agents{marking}"),
+                    "kube-agents",
+                )
+        # Not a suffix, so not a marking: two accounts stay two.
+        self.assertNotEqual(
+            submit_suggestion._login_key("kube-agents[bot]-staging"),
+            submit_suggestion._login_key("kube-agents"),
+        )
+
     def test_prepare_refuses_a_branch_name_whose_squash_merged_branch_is_still_there(self):
         """The reuse the docstring promises, on the forge default that breaks it.
 

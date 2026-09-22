@@ -606,10 +606,19 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             "requests."
         )
     for name, error in sorted(refused, key=lambda item: item[0]):
+        # "The others" means the ones that were actually swept, which is not
+        # every other managed repository when the block above has already taken
+        # some out: a repository whose credential could not name itself is
+        # skipped too, and telling an operator it was swept sends them looking
+        # for a result that was never produced.
+        others = (
+            "The other managed repositories were swept."
+            if not nameless
+            else "The managed repositories not named in this report were swept."
+        )
         warnings.append(
             f"⚠️ **The PR watcher is not running on** `{name}` — "
-            f"{_forge_detail(error)}. The other managed repositories were "
-            "swept."
+            f"{_forge_detail(error)}. {others}"
         )
 
     cap = _max_per_tick()
