@@ -328,6 +328,51 @@ class PollTest(_Harness):
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "FORGE_AUTH")
 
+    def test_one_unreadable_conversation_does_not_end_the_whole_poll(self):
+        """The watcher skips such a pull request; this must skip the same one.
+
+        `list_comments` refuses a conversation past one page with
+        `CONVERSATION_TRUNCATED`, which is a permanent property of one busy
+        thread rather than a fault that clears. `sweep_pr_comments` files it
+        under unreadable and goes on; before this, `poll` let it out of the
+        loop and answered ERROR for every other pull request too -- and this
+        command is the one an operator runs to see what the watcher saw.
+        """
+        busy = make_pr(1, head_ref="platform-agent/busy")
+        quiet = make_pr(2, head_ref="platform-agent/quiet")
+
+        class TruncatingProvider(FakeProvider):
+            def list_comments(self, repo, pr):
+                if pr.number == 1:
+                    raise forge.ForgeError("CONVERSATION_TRUNCATED", f"{repo}#1")
+                return [make_comment("IC_2", "/agent bump to 4")]
+
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(
+                ["poll"], TruncatingProvider(prs=[busy, quiet])
+            )
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_2"])
+        # Named rather than dropped in silence, for the reason the sweep names
+        # its own: a thread nobody can read never clears itself.
+        self.assertIn("CONVERSATION_TRUNCATED", err.getvalue())
+        self.assertIn(f"{REPO}#1", err.getvalue())
+
+    def test_every_conversation_unreadable_is_still_one_error(self):
+        """Nothing was read at all, so an empty poll would read as nothing to do."""
+
+        class TruncatingProvider(FakeProvider):
+            def list_comments(self, repo, pr):
+                raise forge.ForgeError("CONVERSATION_TRUNCATED", f"{repo}#{pr.number}")
+
+        with redirect_stderr(StringIO()):
+            _rc, out = self.run_helper(["poll"], TruncatingProvider(prs=[make_pr()]))
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "CONVERSATION_TRUNCATED")
+
     def test_no_credential_anywhere_names_itself_is_an_error_not_a_quiet_poll(self):
         """The model must not read "the credential is broken" as "nothing to do"."""
         provider = FakeProvider(

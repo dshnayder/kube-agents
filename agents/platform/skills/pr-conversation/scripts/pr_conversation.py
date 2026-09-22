@@ -402,12 +402,26 @@ def handle_poll(args) -> int:
         threads = []
         over_budget = 0
         deferred_requests = 0
+        # Pull requests whose conversation could not be read, with the reason.
+        # Per pull request rather than per poll, the way `sweep_pr_comments`
+        # files them: `list_comments` refuses a conversation past one page, and
+        # that is a permanent property of one busy thread rather than a fault
+        # -- letting it out of this loop would end the poll for every other
+        # pull request, which is the failure `refused` above already exists to
+        # prevent one repository causing. The watcher skips such a thread and
+        # goes on, and this command is the one an operator runs to see what the
+        # watcher saw.
+        unreadable: list[tuple[str, int, forge.ForgeError]] = []
         for repo, pr in prs:
             # Cached by the pass above, which dropped every repository whose
             # credential could not name itself, so this costs nothing and is
             # never empty.
             viewer = provider.viewer_login(repo)
-            comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+            try:
+                comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+            except forge.ForgeError as refusal:
+                unreadable.append((repo, pr.number, refusal))
+                continue
             # Untrusted requests past this pull request's refusal budget are not
             # offered at all. The sweep already stopped refusing them, on
             # purpose, and handing them to the worker is how that bound got
@@ -466,6 +480,28 @@ def handle_poll(args) -> int:
             if deferred_count:
                 thread["omitted_requests"] = deferred_count
             threads.append(thread)
+
+        if unreadable and len(unreadable) == len(prs):
+            # Every one of them, which is no longer one thread's property but
+            # the read itself: an empty poll here would be read as nothing to
+            # do, so it stays the error it was before this loop learned to
+            # continue.
+            first = unreadable[0][2]
+            print(json.dumps(
+                {"status": "ERROR", "reason": first.reason, "value": first.value}
+            ))
+            return 0
+        if unreadable:
+            sys.stderr.write(
+                "pr_conversation: "
+                + ", ".join(
+                    f"{repo}#{number} ({refusal.reason})"
+                    for repo, number, refusal in sorted(
+                        unreadable, key=lambda row: (row[0], row[1])
+                    )
+                )
+                + " could not be read and were skipped\n"
+            )
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
         return 0

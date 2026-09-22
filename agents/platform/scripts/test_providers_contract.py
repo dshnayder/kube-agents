@@ -313,6 +313,56 @@ class ContractTest(unittest.TestCase):
                     self.assertTrue(short["commentsTruncated"])
                     self.assertGreaterEqual(len(short["comments"]), 1)
 
+    def test_any_one_page_of_a_conversation_filling_truncates_it(self):
+        """Each page in turn, because one forge's conversation is several.
+
+        The test above cannot see which page the flag came from: at `limit=1`
+        every recorded page fills, so a forge that judged only the first of
+        them passes. GitHub splits a proposal's conversation across three
+        endpoints and a reviewer picks one of them blind, so a flag taken from
+        one page is a conversation that reads as complete while an arbitrary
+        number of requests sit past the ceiling -- the caller then answers the
+        same request on every tick forever.
+
+        So: for each recorded page, replay the verb with `limit` set to that
+        page's length and every *other* page trimmed below it. Only the chosen
+        page fills, and the flag has to come from it. A forge that dropped any
+        page from the judgement fails on that page's turn, and one that judged
+        a page after filtering its rows -- a bodiless review is not an
+        utterance, but it is still a row the forge sent -- fails on the page
+        that holds one.
+        """
+        for name, forge, directory in self.instances():
+            for verb in ("proposal-view", "issue-view"):
+                if verb not in forge.verbs:
+                    continue
+                fixture = self.load(directory, verb)
+                if not fixture["payload"].get("comments"):
+                    continue
+                pages = [
+                    index
+                    for index, answer in enumerate(fixture["responses"])
+                    if isinstance(answer, list) and answer
+                ]
+                for filled in pages:
+                    limit = len(fixture["responses"][filled])
+                    responses = [
+                        answer[: limit - 1]
+                        if isinstance(answer, list) and index != filled
+                        else answer
+                        for index, answer in enumerate(fixture["responses"])
+                    ]
+                    with self.subTest(forge=name, verb=verb, page=filled):
+                        answer, _ = self.invoke(
+                            forge,
+                            verb,
+                            {
+                                "payload": dict(fixture["payload"], limit=limit),
+                                "responses": responses,
+                            },
+                        )
+                        self.assertTrue(answer["commentsTruncated"])
+
     # -- what the forge asked for -------------------------------------------
 
     def test_a_forge_composes_a_request_and_not_a_url(self):

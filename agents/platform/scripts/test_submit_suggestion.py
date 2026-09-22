@@ -131,6 +131,24 @@ class FakeBroker:
 
     def publish(self, payload):
         branch = payload["branch"]
+        if payload.get("advance") and not [
+            proposal
+            for proposal in self.proposals
+            if proposal["state"] == "open" and proposal["source"] == branch
+        ]:
+            # `vcs_broker._require_open_proposal`, which runs on every
+            # `advance` publish: the flag says this copy was taken of a
+            # proposal branch in order to add to it, so a branch carrying no
+            # open proposal is refused before anything is pushed. Kept here
+            # because a fake that pushes anyway can prove a route the shipped
+            # broker refuses -- which it did, for a refusal whose advice was a
+            # dead end on the real thing.
+            raise vcs_client.VcsError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, but no open proposal on this "
+                "repository has it as its source.",
+                code="CLONED_BRANCH",
+            )
         work = self._serving_copy()
         bundle = work.parent / f"{work.name}.in.bundle"
         bundle.write_bytes(base64.b64decode(payload["bundleBase64"]))
@@ -979,8 +997,14 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             self.run_subject("submit", "--branch", branch, "--keep-description")
         self.assertIn("no proposal is open", str(caught.exception))
 
-    def test_a_closed_proposal_is_still_a_fresh_one_under_an_explicit_base(self):
-        """The escape the refusal names, and the reason it is not a dead end."""
+    def test_a_closed_proposal_is_not_escapable_with_a_base_either(self):
+        """Because the broker shuts that door, the refusal must not open it.
+
+        A copy taken *of* the branch publishes with `advance`, and the broker
+        refuses an `advance` publish onto a branch carrying no open proposal --
+        `--base` changes the target, not that. A refusal that offered it would
+        be sending the agent to a 409 it reaches *after* writing the change.
+        """
         branch = "platform-agent/scale-web"
         prepared = self.prepare()
         self.edit(prepared)
@@ -988,11 +1012,19 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         again = self.prepare(branch, force=True)
         self.edit(again, "replicas: 5\n")
         self.broker.proposals[0]["state"] = "closed"
-        _, out = self.run_subject(
-            "submit", "--branch", branch, "--base", "main", "--title", "second", "--body", "two"
-        )
-        self.assertTrue(out.startswith("https://forge.test/acme/infra/pull/"))
-        self.assertEqual(len(self.broker.payloads("proposal-create")), 2)
+        published = len(self.broker.payloads("publish"))
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--base", "main",
+                "--title", "second", "--body", "two",
+            )
+        said = str(caught.exception)
+        self.assertIn("no proposal is open", said)
+        self.assertIn("--base does not get past that", said)
+        # Nothing further was sent: the refusal is ahead of the publish, which
+        # is the half that matters -- the 409 would arrive after the push.
+        self.assertEqual(len(self.broker.payloads("publish")), published)
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
 
     def test_a_first_submission_with_nothing_to_publish_is_still_refused(self):
         """The same state with no proposal open is a mistake, and stays one."""

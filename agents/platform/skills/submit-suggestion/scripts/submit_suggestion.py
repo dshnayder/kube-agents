@@ -425,19 +425,24 @@ def handle_submit(args) -> int:
     # security matter and the advice it gives is wrong, so the state gets its
     # own answer here, ahead of the `--keep-description` refusal that would
     # otherwise send a caller round the loop into it.
-    if (
-        proposal is None
-        and not args.base
-        and _short_branch(session["branch"]) == _short_branch(branch)
-    ):
+    #
+    # `--base` is deliberately not an escape from it. That equality is also what
+    # sets `advance` on the publish below, and the broker refuses an `advance`
+    # publish whose branch carries no open proposal
+    # (`vcs_broker._require_open_proposal`, 409 `CLONED_BRANCH`) -- while
+    # `advance` unset is refused on this side as a write to the branch the copy
+    # was cloned from. Both doors are shut whatever `--base` says, so offering
+    # it here would be advice that fails after the change has been written.
+    if proposal is None and _short_branch(session["branch"]) == _short_branch(branch):
         raise ValueError(
             f"no proposal is open for '{branch}' on {repo} any more. This copy "
             "was taken of the branch because one was, so it has been merged or "
             "closed since. If it merged, the change has landed and there is "
-            "nothing here to submit. If it was closed, the next change wants a "
-            "branch name the repository has not used -- this one is spent. To "
-            "open a fresh proposal from this branch even so, say what it "
-            "targets with --base."
+            "nothing here to submit. If it was closed, this branch is spent: "
+            "publishing from a copy taken of it needs the proposal that is "
+            "gone, and --base does not get past that. Run `prepare` again for "
+            "a branch name the repository has not used, remake the change "
+            "there and submit that."
         )
     if args.keep_description:
         if not proposal:
