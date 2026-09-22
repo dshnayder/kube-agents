@@ -4,6 +4,13 @@
 already has; everything after it is a direction for kube-agents, not a build plan with dates. The
 one experiment it asks for is a backtest, and the document says what result would change it.
 
+## TL;DR
+
+kube-agents has already evolved from a **reactive** agent, which fixes what a person reports,
+to a **proactive** one, whose scheduled audits and event triggers find and fix problems nobody has
+reported yet. This document proposes the next step: a **predictive** mode, in which kube-agents
+forecasts a failure and resolves it before it happens.
+
 ## In short
 
 kube-agents has two operating modes today. In the **reactive** mode a person sees a problem and asks
