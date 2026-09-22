@@ -1,7 +1,7 @@
 # Capability-scoping A/B
 
-The experiment behind [`docs/designs/context-scoped-capabilities.md`](../../../docs/designs/context-scoped-capabilities.md)
-§7. It asks one question: when the Platform Agent sees only the skills a turn needs, with the
+The experiment behind [`docs/designs/context-scoped-capabilities.md`](../../../docs/designs/context-scoped-capabilities.md).
+It asks one question: when the Platform Agent sees only the skills a turn needs, with the
 rest by name, does it pick the right one more often and cost less than when it sees everything?
 The design document reads the results; this directory holds the method, the code, and under
 `results/` the scored tables (`<model>.md`), the raw metrics (`<model>.json`) and one row per run
@@ -57,7 +57,7 @@ From each run's response and session row, and from the plugin's per-turn record:
 The matrix ran on 2026-09-21 on Gemini 3.1 Pro and again on Gemini 3.5 Flash: 792 runs. Each
 probe asks for something one skill is written for, its gold skill. A run is scored by the first
 skill the agent read with `skill_view`. The full tables, per-probe picks, and the reading of them
-are in `results/` and in the design document's §8.
+are in `results/` and in the design document's §2.
 
 Both models pooled, 120 runs per cell. The p-values are a two-proportion test of `scoped-all`
 against the arm named.
@@ -84,7 +84,7 @@ Cost per first model call, Gemini 3.1 Pro medians:
 - Scoping cost what `stock` costs. Full descriptions added 3k to 8k tokens a call and doubled the
   time to the first tool call.
 - Picks were scored, not outcomes, every probe was one turn, and the filter hid only one tool.
-  The design document's §8.7 lists what the run does not show.
+  The design document's §2.6 lists what the run does not show.
 
 ## How it runs
 
