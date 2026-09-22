@@ -8,7 +8,7 @@ readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
 HERE=$(cd "$(dirname "$0")" && pwd); readonly HERE
-CTX=${CTX:-csc-adc}; export CTX
+CTX=${CTX:?kube context of the install}; export CTX
 readonly NS=kubeagents-system
 readonly LOCAL_PORT=${LOCAL_PORT:-18642}
 # Straight to the Hermes API server on the gateway pod's loopback, not through the Service: the

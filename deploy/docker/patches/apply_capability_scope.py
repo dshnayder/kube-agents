@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Build-time patch for the capability-scoping experiment (bench/experiments/capability-scope-ab/).
 
-Four small, environment-gated changes to the Hermes runtime. With none of the variables set the
-runtime behaves exactly as shipped, which is what makes one image serve every arm of the A/B.
+Three small, environment-gated changes to the Hermes runtime and one call site the plugin owns.
+With none of the variables set and the plugin disabled the runtime behaves exactly as shipped,
+which is what makes one image serve every arm of the A/B.
 
   KA_SKILLS_INDEX_MODE=names   render every skill category in the system-prompt index as a
                                names-only line (the design's "shelf").
   KA_SKILL_DESC_LIMIT=<int>    override the 60-character description truncation in the index.
   KA_EXTRA_SKILLS_DIRS=<a:b>   extra skill directories, appended to skills.external_dirs, so a
                                larger catalogue can be mounted without touching the synced set.
-  (always)                     the conversation loop hands the tool array to the capability_scope
-                               plugin's filter_tools() before each request; the plugin returns it
-                               unchanged unless KA_SCOPE_MODE=skills+tools.
+  (plugin)                     the conversation loop hands the tool array to the capability_scope
+                               plugin's filter_tools() before each request when the plugin is
+                               loaded; the plugin returns it unchanged unless
+                               KA_SCOPE_MODE=skills+tools.
 
 Usage: apply_capability_scope.py /opt/hermes
 """

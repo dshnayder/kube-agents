@@ -17,7 +17,7 @@ export PATH=$HOME/bin:$PATH
 
 readonly ARM=${1:?arm}
 readonly RUNG=${2:?rung}
-readonly CTX=${CTX:-csc-adc}
+readonly CTX=${CTX:?kube context of the install}
 readonly NS=kubeagents-system
 readonly CR=${CR:-platform-agent}
 readonly DISTRACTOR_DIR=/opt/data/distractor-skills

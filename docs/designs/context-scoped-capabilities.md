@@ -1,7 +1,7 @@
 # Context-scoped capabilities: exposing the tools and skills a turn needs
 
 > **STATUS — proposal for review.** Nothing here is enabled on any install. A prototype of stage
-> 3 exists on this branch as a Hermes plugin that is inert unless an environment variable names an
+> 3 exists in the tree as a Hermes plugin that is inert unless an environment variable names an
 > arm; §8 reports what it measured when the plan in §7 was run once.
 
 **Status:** Draft for review. **Scope:** every agent profile this repository ships (chat,
@@ -639,8 +639,8 @@ the image already does for other constants.
 
 **What the prototype learned about this install.** The run in §8 used exactly the shape above:
 a plugin on the pre-LLM-call, pre-tool-call and post-API-request hooks, plus a build-time patch
-with four environment-gated seams (names-only index, description limit, extra skill directories,
-a tool filter in the conversation loop). Four facts about the deployment, not the harness, cost
+with three environment-gated seams (names-only index, description limit, extra skill
+directories) and a tool-filter call in the conversation loop that the plugin owns. Four facts about the deployment, not the harness, cost
 most of the integration time and belong here so the next attempt does not rediscover them:
 
 - The operator passes `spec.deployment.env` to the sandbox allowlist and the credential proxy,

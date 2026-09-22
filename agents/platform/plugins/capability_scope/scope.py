@@ -453,11 +453,11 @@ def filter_tools(agent: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]
         return tools
     shown = [t for t, name in zip(tools, names) if name in keep]
     shown_names = [_tool_name(t) for t in shown]
-    for carrier in SHELF_CARRIER_TOOLS:  # preference order, not array order
-        if carrier in shown_names:
-            i = shown_names.index(carrier)
-            shown[i] = _with_shelf(shown[i], hidden)
-            break
+    # Preference order, not array order; the first shown tool carries it when no carrier survives
+    # a custom pinned set, so the shelf is never silently dropped.
+    carrier = next((c for c in SHELF_CARRIER_TOOLS if c in shown_names), shown_names[0])
+    i = shown_names.index(carrier)
+    shown[i] = _with_shelf(shown[i], hidden)
     return shown
 
 

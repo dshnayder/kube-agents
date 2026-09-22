@@ -13,8 +13,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[3]
 SKILLS_DIR = REPO / "agents" / "platform" / "skills"
 SCENARIOS = REPO / "bench" / "experiments" / "capability-scope-ab" / "scenarios.json"
+FROZEN_CATALOGUE = HERE / "test_catalogue.json"
 TOP_K = 6
-# The probes whose gold skill the v1 ranker puts in its top six on the shipped catalogue. A
+# The probes whose gold skill the v1 ranker puts in its top six on the frozen catalogue. A
 # regression removes one of these; an improvement adds to the list and the test is updated.
 GOLDEN_TOP_K = {
     "crashloop", "hpa", "nodepool-no-scaleup", "namespace-cost", "pdb-probes", "https-gateway",
@@ -123,7 +124,11 @@ class ToolsMode(unittest.TestCase):
 
 class Ranker(unittest.TestCase):
     def test_golden_probes(self):
+        """Ranks against the frozen catalogue in test_catalogue.json, not the live skills tree, so
+        a skill edit or an upstream sync cannot move this set; only a ranker change can."""
         scope = _fresh_scope(KA_SCOPE_MODE="off")
+        frozen = json.loads(FROZEN_CATALOGUE.read_text())["skills"]
+        scope.load_skill_catalogue = lambda: [dict(s, path="") for s in frozen]
         scenarios = json.loads(SCENARIOS.read_text())["scenarios"]
         hits = set()
         for s in scenarios:
@@ -156,7 +161,6 @@ class Ranker(unittest.TestCase):
 
 class ControlFile(unittest.TestCase):
     def test_only_ka_keys_and_environment_wins(self):
-        pkg = importlib.import_module("__init__") if False else None  # keep linters quiet about the import below
         sys.path.insert(0, str(HERE.parent))
         module = importlib.import_module("capability_scope")
         with tempfile.TemporaryDirectory() as d:

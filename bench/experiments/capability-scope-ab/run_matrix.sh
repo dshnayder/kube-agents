@@ -12,7 +12,7 @@ readonly OUT_ROOT=${1:?out root}
 readonly REPS=${2:-3}
 readonly PARALLEL=${3:-3}
 HERE=$(cd "$(dirname "$0")" && pwd); readonly HERE
-CTX=${CTX:-csc-adc}; export CTX
+CTX=${CTX:?kube context of the install}; export CTX
 readonly NS=kubeagents-system
 BASE=${BASE:-http://127.0.0.1:18642}
 readonly SCENARIOS=${SCENARIOS:-$HERE/scenarios.json}
@@ -33,7 +33,7 @@ for cell in $MATRIX; do
   "$HERE/switch_arm.sh" "$arm" "$rung" 2>&1 | tee -a "$OUT_ROOT/switch.log"
   python3 "$HERE/run_ab.py" --base "$BASE" --token "$PLATFORM_AGENT_TOKEN" --scenarios "$SCENARIOS" \
     --out "$OUT_ROOT/$label" --label "$label" --reps "$REPS" --parallel "$PARALLEL" --prefix "$PREFIX" 2>&1 | tee -a "$OUT_ROOT/$label.log"
-  pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | head -1 | sed 's#pod/##')
+  pod=$(kubectl --context "$CTX" -n "$NS" get pod -o name | grep "$GATEWAY_DEPLOY" | grep -v Terminating | head -1 | sed 's#pod/##')
   kubectl --context "$CTX" -n "$NS" exec "$pod" -c platform-agent -- cat "/opt/data/capability_scope-$label.jsonl" > "$OUT_ROOT/$label/capability_scope.jsonl" 2>/dev/null || echo "no record for $label"
   echo "== $(date -u +%FT%TZ) done $label ($(find "$OUT_ROOT/$label" -name "*-r[0-9]*.json" 2>/dev/null | wc -l) run files)"
 done

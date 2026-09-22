@@ -193,9 +193,11 @@ COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gat
 # broke through once already (f9f1747c, 2026-08-07). A new build gate does not
 # buy a layer.
 # The capability_scope experiment's applier and verifier ride in this COPY and RUN so they add
-# no layers: environment-gated seams for a names-only skill index, the description limit, extra
-# skill dirs, and a per-turn tool filter (bench/experiments/capability-scope-ab/). Inert unless
-# the KA_* variables are set; the verifier exercises each seam both ways before the layer lands.
+# no layers: three environment-gated seams (a names-only skill index, the description limit,
+# extra skill dirs) and a tool-filter call the capability_scope plugin owns
+# (bench/experiments/capability-scope-ab/). Inert unless the KA_* variables are set and the
+# plugin is enabled; the verifier drives the three seams both ways in a throwaway home and
+# checks the call site by source position before the layer lands.
 COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
      deploy/docker/patches/apply_capability_scope.py \

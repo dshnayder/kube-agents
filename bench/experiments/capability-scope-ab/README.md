@@ -55,13 +55,14 @@ From each run's response and session row, and from the plugin's per-turn record:
 ## How it runs
 
 The prototype is the `capability_scope` plugin (`agents/platform/plugins/capability_scope/`) plus
-`deploy/docker/patches/apply_capability_scope.py`, both on this branch and both inert unless the
-`KA_*` variables are set. One image serves every arm.
+`deploy/docker/patches/apply_capability_scope.py`, both in the tree and both inert unless the
+`KA_*` variables are set and the plugin is enabled. One image serves every arm.
 
 1. Build the image from this branch and install kube-agents with it (the run used a dedicated
    cluster with `platformFrontDoor: true`, so the API server serves the Platform Agent directly,
-   and `--memory=off`). Building needs the hermes-otel plugin pinned to a manifest-v1 commit,
-   which pull request #1820 carries; until it merges, apply that pin locally first.
+   and `--memory=off`). Building needs the hermes-otel plugin install in the Dockerfile pinned to
+   a manifest-v1 commit (`b7ece46a5c883a619686b6c698b0316d9fd50962`); this branch does not carry
+   that pin, so apply it in the build tree first.
 2. Copy the distractor skills onto the agent's data volume at `/opt/data/distractor-skills`.
 3. Enable the plugin in the profile's `plugins.enabled` list on the data volume; it is not enabled
    in the image. In front-door mode the profile's `config.yaml` on the data volume is not re-synced

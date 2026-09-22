@@ -26,7 +26,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources.
 - `scripts/`: Repository tooling — `installer/` (what the front doors share), `dev/`, `release/`.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
-- `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
+- `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library; `experiments/` under it holds A/B records.
 - `images.json`: Inventory of every container image an install pulls, with its upstream reference
   and pin. Read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
 - `INSTALL.md`: Installation guide.
