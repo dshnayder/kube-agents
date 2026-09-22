@@ -199,6 +199,18 @@ class LookupFailed:
             code="FORGE_CALL_FAILED",
         )
 
+
+class Nameless:
+    """A transport that answered and named nobody. The documented "" case.
+
+    Exit zero and no login line: a credential a forge accepts and cannot
+    introspect. It is the arm `_viewer`'s docstring leads with, and it reaches
+    the comparison from the other side of the `except` from `LookupFailed`.
+    """
+
+    def whoami(self) -> str:
+        return ""
+
     def api(self, *_args, **_kwargs):
         raise AssertionError("the author check makes no API call of its own")
 
@@ -1176,6 +1188,22 @@ class RepositoryVerbTest(unittest.TestCase):
         made = self._advance_onto(forge)
         self.assertEqual(self.remote_tip("release-1.2"), made)
 
+    def test_advance_keeps_the_weaker_bar_when_the_credential_answers_with_no_login(self):
+        """The other half of the same sentence, and the one that has a transport.
+
+        The test above reaches "" through `ForgeUnsupported` -- a forge with
+        nowhere to ask. This one has somewhere: the call succeeds and names
+        nobody, which is what `whoami` is documented to do for a credential
+        that cannot introspect itself. Both must leave the comparison
+        unmade; only one of them was covered.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: Nameless()
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
+
     def test_advance_is_refused_when_who_the_credential_is_cannot_be_learned(self):
         """A lookup that failed is not a credential that cannot say.
 
@@ -1554,6 +1582,32 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(recorder.calls[1][4], "repos/acme/infra/issues/9/labels/b")
         self.assertEqual(recorder.calls[2][4], "repos/acme/infra/pulls/9")
         self.assertEqual(json.loads(recorder.stdin[2])["title"], "new")
+
+    def test_a_removal_of_a_label_already_off_does_not_lose_the_rest_of_the_update(self):
+        """The 404 is the state the caller asked for, so the PATCH still runs.
+
+        The resolver finishes an issue with one call --
+        `{labelsAdd: [status:<terminal>], labelsRemove: [status:in-progress]}`
+        -- and the stale sweep may have taken the claim label off first. Letting
+        GitHub's 404 out would abort the update before the PATCH, leaving that
+        issue with no terminal label. Any other refusal is not the asked-for
+        state and is still an error.
+        """
+        gone = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker([{"name": "a"}], gone, {"number": 9, "state": "open"})
+        answer = broker.proposal_update(
+            {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+        )
+        self.assertEqual([call[3] for call in recorder.calls], ["POST", "DELETE", "PATCH"])
+        self.assertEqual(answer["proposal"]["number"], 9)
+
+        denied = subprocess.CompletedProcess(["gh"], 1, "", "gh: Forbidden (HTTP 403)")
+        broker, recorder = self.broker([{"name": "a"}], denied, {"number": 9, "state": "open"})
+        with self.assertRaises(WorkspaceError):
+            broker.proposal_update(
+                {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+            )
+        self.assertEqual([call[3] for call in recorder.calls], ["POST", "DELETE"])
 
     def test_issue_close_carries_a_neutral_reason(self):
         broker, recorder = self.broker({"number": 5, "state": "closed"})

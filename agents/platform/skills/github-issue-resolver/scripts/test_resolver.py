@@ -374,6 +374,68 @@ class SandboxForwardingTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "SANDBOX_UNREACHABLE")
         self.assertIn("did not answer", payload["error"])
 
+    def test_a_far_side_that_never_ran_is_not_a_verdict_about_the_repositories(self):
+        """An image missing the script is an unreachable sandbox, not a refusal.
+
+        The hop succeeds and the exit code is the shell's, not the resolver's.
+        Passed up it reads as "the poll ran and failed", which is what the
+        caller does with a non-zero resolver -- and the image has shipped
+        without a script this expects before.
+        """
+        for code, stderr in (
+            (127, "bash: python3: command not found"),
+            (126, "bash: /opt/vcs/libexec/platform/resolver.py: cannot execute"),
+            (2, "python3: can't open file '/opt/vcs/libexec/platform/resolver.py'"),
+        ):
+            with self.subTest(exit=code):
+                _, exit_code = self._main(
+                    ["poll"],
+                    enabled=True,
+                    forwarded={"return_value": subprocess.CompletedProcess([], code, "", stderr)},
+                )
+                self.assertEqual(exit_code, 1)
+                payload = json.loads(self.stdout)
+                self.assertEqual(payload["reason"], "SANDBOX_UNREACHABLE")
+        # An exit code the far side really did choose still travels. `2` is
+        # argparse's as well as python's, and only one of them means the
+        # script never opened.
+        _, exit_code = self._main(
+            ["poll"],
+            enabled=True,
+            forwarded={
+                "return_value": subprocess.CompletedProcess(
+                    [], 2, "", "resolver.py: error: unrecognized arguments: --nope"
+                )
+            },
+        )
+        self.assertEqual(exit_code, 2)
+
+    def test_the_hop_is_bounded_and_the_ceiling_is_sized_by_the_sweep(self):
+        """The reason it may cross once: one budget, not one per forge call.
+
+        A hop with no ceiling is the arrangement this replaced -- the caller's
+        own budget kills this process without reaching the ssh child, and a
+        subcommand the model ran from its shell has no outer budget at all.
+        """
+        one = resolver.FORWARD_TIMEOUT_PER_REPO_S - resolver.FORWARD_TIMEOUT_MARGIN_S
+        ran, _ = self._main(["poll"], enabled=True)
+        self.assertEqual(ran.call_args.kwargs["timeout"], one)
+        # Three repositories behind one hop is three repositories' worth of work.
+        with mock.patch.object(
+            resolver, "get_managed_github_repos", return_value=["a/b", "c/d", "e/f"]
+        ):
+            self.assertEqual(
+                resolver._forward_timeout(["poll"]),
+                3 * resolver.FORWARD_TIMEOUT_PER_REPO_S - resolver.FORWARD_TIMEOUT_MARGIN_S,
+            )
+        # `claim` names one issue, so it gets the one-repository ceiling and
+        # does not pay a ConfigMap read on the model's path to find that out.
+        with mock.patch.object(
+            resolver, "get_managed_github_repos", side_effect=AssertionError("read anyway")
+        ) as unread:
+            self.assertEqual(resolver._forward_timeout(["claim", "--issue", "1"]), one)
+        unread.assert_not_called()
+
     def test_only_poll_pays_a_configmap_read_to_size_its_budget(self):
         """`claim` and `transition` name one issue, and are on the model's path.
 

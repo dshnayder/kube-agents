@@ -213,14 +213,22 @@ class ProviderSelectionTest(BrokerCase):
         self.assertEqual(ctx.exception.reason, "FORGE_HOST_UNSUPPORTED")
         self.assertEqual(ctx.exception.value, "gitlab.com")
 
-    def test_an_unsupported_host_that_cannot_be_parsed_names_the_value(self):
-        """A shorthand has no host to name, so the operator gets what was configured."""
+    def test_an_unsupported_host_with_no_host_to_name_names_the_value(self):
+        """Both arms of `_host_of`, which fall together on the same answer.
+
+        `acme/toolkit` parses -- it is the hostless shorthand -- and its `host`
+        is empty; `not a ref` does not parse at all. Neither has a host to put
+        in the refusal, so both name the value the operator configured rather
+        than an empty string.
+        """
         self.broker.refuse["identity"] = vcs_client.VcsError(
             "unsupported", code="FORGE_UNSUPPORTED"
         )
-        with self.assertRaises(forge.UnknownForgeHost) as ctx:
-            forge.call("identity", {}, "acme/toolkit")
-        self.assertEqual(ctx.exception.value, "acme/toolkit")
+        for configured in ("acme/toolkit", "not a ref"):
+            with self.subTest(configured=configured):
+                with self.assertRaises(forge.UnknownForgeHost) as ctx:
+                    forge.call("identity", {}, configured)
+                self.assertEqual(ctx.exception.value, configured)
 
 
 # ---- policy that never reaches a forge -------------------------------------
@@ -615,6 +623,22 @@ class ForwardTest(unittest.TestCase):
             forge.call("proposal-list", {}, REPO)
         self.assertIn("not JSON", ctx.exception.value)
         self.assertEqual(ctx.exception.reason, "SANDBOX_UNREACHABLE")
+
+    def test_json_that_is_not_an_envelope_is_the_same_fault(self):
+        """Parsing is not the check -- `null` and a list parse and answer nothing.
+
+        The reads below the parse are `.get`, so any of these used to leave
+        `AttributeError` out of a module whose every caller catches
+        `ForgeError`: the sweep died on the far side's shape instead of
+        reporting it.
+        """
+        for printed in ("null", "[]", '"a string"', "3"):
+            with self.subTest(printed=printed):
+                self._run(stdout=printed + "\n")
+                with self.assertRaises(forge.ForgeError) as ctx:
+                    forge.call("proposal-list", {}, REPO)
+                self.assertEqual(ctx.exception.reason, "SANDBOX_UNREACHABLE")
+                self.assertIn("not an envelope", ctx.exception.value)
 
 
 class MainTest(unittest.TestCase):
@@ -1399,8 +1423,16 @@ class ProtocolConformanceTest(unittest.TestCase):
         import inspect
 
         source = inspect.getsource(forge.BrokerProvider)
+        # Every spelling a dispatch could take, not just the double-quoted
+        # equality: a guard that reads for one of them passes a rewrite into
+        # any of the others, which is the regression it exists to catch.
         for name in ("github", "gitlab", "bitbucket"):
-            self.assertNotIn(f'== "{name}', source.lower(), name)
+            for spelling in (
+                f'== "{name}', f"== '{name}", f'!= "{name}', f"!= '{name}",
+                f'in ("{name}', f"in ('{name}", f'startswith("{name}',
+                f"startswith('{name}", f'"{name}" in ', f"'{name}' in ",
+            ):
+                self.assertNotIn(spelling, source.lower(), f"{name}: {spelling}")
         self.assertNotIn("_host_of", source)
 
 

@@ -242,7 +242,7 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `proposal comment`     | Reply on a proposal                                                                                                                          |
 | `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |
 | `proposal close`       | Close it without merging                                                                                                                     |
-| `proposal commits`     | The revisions on its source branch, **oldest first** — the last entry is the newest; `--page` for the next page                              |
+| `proposal commits`     | The revisions on its source branch, **oldest first**; the last entry is the tip only when `"truncated": false`; `--page` for the next page   |
 | `proposal acknowledge` | React to one comment so its author sees it was read; needs `--comment-id` and `--kind` from `view --comments`                                |
 | `issue list`           | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                                                             |
 | `issue view`           | One issue; `--comments` for the discussion                                                                                                   |

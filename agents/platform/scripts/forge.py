@@ -539,6 +539,16 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
             f"{verb} on {repo} answered with something that is not JSON: {exc}",
             code=REASON_SANDBOX_UNREACHABLE,
         ) from exc
+    # `null`, a list, a number and a bare string are all valid JSON and none of
+    # them is the envelope. Without this the next two lines raise
+    # `AttributeError` out of a module whose callers catch `VcsError`, so a far
+    # side printing the wrong shape crashes the sweep instead of naming it.
+    if not isinstance(answer, dict):
+        raise vcs_client.VcsError(
+            f"{verb} on {repo} answered with {type(answer).__name__}, not an "
+            "envelope",
+            code=REASON_SANDBOX_UNREACHABLE,
+        )
     refusal = answer.get("refusal")
     if refusal:
         raise vcs_client.VcsError(

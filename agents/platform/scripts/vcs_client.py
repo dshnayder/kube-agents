@@ -3,10 +3,10 @@
 
 `vcs.py` is the command line the model drives; this is the same thing for the
 scripts that used to shell `gh` and the credential shim -- the issue resolver,
-the suggestion submitter, the audit ledger -- so that a consumer reaches a forge
-the way the skill does: one broker call per verb, a working copy with no remote
-and no credential for everything local. Extracted rather than reimplemented,
-so the two callers cannot drift.
+the suggestion submitter, the pull-request scan gate -- so that a consumer
+reaches a forge the way the skill does: one broker call per verb, a working copy
+with no remote and no credential for everything local. Extracted rather than
+reimplemented, so the callers cannot drift.
 
 Everything that spends a credential goes through `call()`, which is
 `POST /v1/vcs/<verb>` on the credential broker. Everything else runs the
@@ -105,6 +105,12 @@ class VcsError(RuntimeError):
 
 # ---- the broker -----------------------------------------------------------
 
+#: The broker answered and does not route this verb -- an install whose
+#: credential-proxy image predates the `/v1/vcs/*` routes. Its own code because
+#: the codeless fallback every consumer applies is `BROKER_UNREACHABLE`, which
+#: names a broker that is down; this one is up.
+BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
+
 
 def call(verb: str, payload: dict) -> dict:
     endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
@@ -120,9 +126,17 @@ def call(verb: str, payload: dict) -> dict:
         # install predates the routes. Said plainly, because the alternative
         # reading -- that something here can be turned on -- sends whoever hits
         # it looking for a configuration field that does not exist.
+        #
+        # Coded, unlike the two refusals below it: every consumer reports a
+        # codeless refusal as `BROKER_UNREACHABLE`, and this broker answered --
+        # it is running, it is reachable, and it 404s one route. An operator
+        # sent to look for a broker that is down would find one that is up.
+        # The other two really are "no broker was reached", so they keep the
+        # fallback.
         raise VcsError(
             f"this broker does not serve the version-control routes: {exc}. "
-            "Its image is older than this skill."
+            "Its image is older than this skill.",
+            code=BROKER_ROUTE_UNSUPPORTED,
         ) from exc
     except credential_proxy_client.WorkspaceRequestError as exc:
         payload = exc.payload or {}

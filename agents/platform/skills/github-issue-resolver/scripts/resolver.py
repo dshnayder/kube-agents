@@ -184,6 +184,16 @@ def _forward_timeout(argv) -> int:
             repos = 1
     return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
 
+#: Exit codes a process that never ran comes back with: the shell's 127
+#: (not found) and 126 (found, not executable), and python's 2 for a script
+#: path it could not open. Paired with `_NEVER_RAN` below, because 2 is also
+#: argparse's.
+_NEVER_RAN_CODES = frozenset({2, 126, 127})
+_NEVER_RAN = re.compile(
+    r"can't open file|No such file or directory|not found|cannot execute|Permission denied"
+)
+
+
 def _forward_to_sandbox(argv: list) -> int:
     """Re-run this whole subcommand inside the shell sandbox.
 
@@ -215,7 +225,9 @@ def _forward_to_sandbox(argv: list) -> int:
     separately. See `_forward_timeout` for why the ceiling is the caller's
     arithmetic and not a constant. A hop that hits it is `SANDBOX_UNREACHABLE`,
     the same answer a refused connection gives, because the two mean the same
-    thing to the poll: it has not learned that the repositories are quiet.
+    thing to the poll: it has not learned that the repositories are quiet. So
+    is a hop that lands on an image with no script at the far end -- see the
+    exit codes below.
     """
     timeout = _forward_timeout(list(argv))
     try:
@@ -230,6 +242,19 @@ def _forward_to_sandbox(argv: list) -> int:
         sys.stdout.write(completed.stdout)
     if completed.stderr:
         sys.stderr.write(completed.stderr)
+    # A far side that never started is not a verdict about the repositories,
+    # and passing its exit code up says it was: the caller reads a non-zero
+    # resolver as "the poll ran and refused". The image has shipped without a
+    # script this expects before, and the whole tick then looked like an
+    # ordinary failure instead of an unreachable sandbox. The shell's own
+    # not-found/not-executable codes and python's "can't open file" are the
+    # only shapes that mean it -- the resolver's own refusals exit 1, and
+    # argparse's 2 carries a different sentence.
+    if completed.returncode in _NEVER_RAN_CODES and _NEVER_RAN.search(completed.stderr or ""):
+        raise sandbox_exec.SandboxUnavailable(
+            f"{SANDBOX_RESOLVER} did not run in the sandbox (exit "
+            f"{completed.returncode}): {(completed.stderr or '').strip().splitlines()[-1]}"
+        )
     return completed.returncode
 
 

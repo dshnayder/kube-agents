@@ -1101,8 +1101,11 @@ class PrCommentsSweepTest(unittest.TestCase):
 
     def test_a_bot_whose_login_does_not_say_so_is_still_passed_over(self):
         """The suffix is a spelling, not the fact. A GitHub App's REST author
-        arrives as `app/renovate`, and the login is normalised before any
-        caller sees it, so reading `[bot]` off the string caught neither."""
+        arrives as `renovate[bot]`, but the broker's translation strips the
+        affix and `normalise_login` strips whichever of them is left, so by the
+        time a login reaches this sweep it is plain `renovate` -- reading
+        `[bot]` off the string would pass an automation through. `is_bot`, the
+        forge's own answer, is the fact."""
         provider = FakeProvider(
             prs=[make_pr()],
             comments={12: [make_comment("IC_1", "/agent x", author="renovate", is_bot=True)]},

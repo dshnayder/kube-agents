@@ -402,10 +402,15 @@ def handle_submit(args) -> int:
     # card. When nothing is keyed on it, resolve without the key -- the refusal
     # below names the branch the copy is actually standing on, which says more
     # about the mistake than "no local copy" would, and it is the mistake an
-    # agent submitting the wrong branch name makes.
+    # agent submitting the wrong branch name makes. Which lookup answered is
+    # kept, because it decides whether that copy is the caller's to be advised
+    # about: see the pair of refusals below.
+    named = f" --repo {args.repo}" if args.repo else ""
+    keyed = True
     try:
         session = vcs_client.resolve_session(args.repo, key=branch)
     except vcs_client.VcsError:
+        keyed = False
         try:
             session = vcs_client.resolve_session(args.repo)
         except vcs_client.VcsError as missing:
@@ -418,7 +423,6 @@ def handle_submit(args) -> int:
             # the verb that brings the repository down *and* cuts the branch,
             # and it is what the retired flags above promise this refusal will
             # say.
-            named = f" --repo {args.repo}" if args.repo else ""
             raise ValueError(
                 f"there is no working copy for '{branch}' here. Take the "
                 f"branch first: `submit_suggestion.py prepare{named} --branch "
@@ -436,10 +440,27 @@ def handle_submit(args) -> int:
 
     current = vcs_client.current_branch(session)
     if current != branch:
+        if keyed:
+            # The caller's own copy -- it asked for this key and got it -- so
+            # the branch it is standing on is the caller's to submit.
+            raise ValueError(
+                f"the copy at {session['path']} is on branch '{current}', not "
+                f"'{branch}'. Make your changes on '{branch}' before "
+                "submitting, or pass the branch you are actually on."
+            )
+        # The keyless fallback found it, so nothing here is keyed on `branch`
+        # and the copy is another card's: one repository is cloned once per
+        # card and the scratch root is shared by all of them. "Pass the branch
+        # you are actually on" is sound advice inside the caller's own copy and
+        # is a way to lose work outside it -- that branch is the other card's,
+        # its edits are half-finished, and a caller that takes the advice
+        # commits and publishes them under *this* call's title and description.
+        # So the branch is named as somebody else's and not offered.
         raise ValueError(
-            f"the copy at {session['path']} is on branch '{current}', not "
-            f"'{branch}'. Make your changes on '{branch}' before submitting, "
-            "or pass the branch you are actually on."
+            f"the copy at {session['path']} was taken for '{copy_key}' and is "
+            f"on branch '{current}'; nothing here was taken for '{branch}'. It "
+            f"is not this card's copy to submit into. Take your own: "
+            f"`submit_suggestion.py prepare{named} --branch {branch}`."
         )
 
     # Before anything is sent. Two of the three refusals below are ones the

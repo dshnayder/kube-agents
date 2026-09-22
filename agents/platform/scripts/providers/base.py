@@ -125,8 +125,8 @@ class Forge:
     # What this forge calls a change proposal, for messages the caller reads.
     proposal_noun = "change proposal"
     # Which of the collaboration verbs this forge serves. A forge that serves
-    # all of them says so; one with no issue tracker omits four and gets a
-    # named refusal for free.
+    # all of them says so; one with no issue tracker omits the six `issue-*`
+    # verbs and gets a named refusal for free.
     verbs: tuple[str, ...] = ()
     # "cli" or "http". A declaration; the broker builds the thing. `cli` is the
     # second half of the same declaration and is meaningful only for the first:

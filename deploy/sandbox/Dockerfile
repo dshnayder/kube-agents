@@ -428,8 +428,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
-#                          go through it, and nothing else in this image talks to
-#                          the broker
+#                          go through it, and it is the only thing in this image
+#                          that composes a `/v1/vcs/<verb>` request. Other scripts
+#                          here -- github_token_refresh, gke_endpoint,
+#                          inspect-repository, fleet-audit,
+#                          fleet-upgrade-verification -- do reach the proxy
+#                          directly, for its other routes, not for a forge verb
 #   workspace_paths.py     the workspace protocol's path validator, imported by
 #                          inspect-repository to re-check every name at the point
 #                          it becomes a write. The broker's content_workspace

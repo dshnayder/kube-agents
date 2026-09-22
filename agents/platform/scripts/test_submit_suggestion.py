@@ -756,11 +756,45 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertNotIn("platform-agent/scale-web", self.remote_branches())
 
     def test_submit_refuses_a_copy_standing_on_another_branch(self):
+        """And does not offer that branch: the copy is not this caller's.
+
+        Nothing is keyed on the branch asked for, so the copy came from the
+        keyless fallback and the scratch root is shared -- it is whichever
+        single copy of the repository is here, which on a pod running two
+        cards is the sibling card's, mid-edit. "Pass the branch you are
+        actually on" would have this caller commit those edits under its own
+        title and open a pull request for them, so the refusal names the
+        branch as somebody else's and sends the caller to `prepare`.
+        """
         prepared = self.prepare()
         self.edit(prepared)
         with self.assertRaises(ValueError) as caught:
             self.run_subject("submit", "--branch", "platform-agent/something-else", "--title", "t", "--body", "b")
-        self.assertIn("is on branch 'platform-agent/scale-web'", str(caught.exception))
+        said = str(caught.exception)
+        self.assertIn("is on branch 'platform-agent/scale-web'", said)
+        self.assertIn("was taken for 'platform-agent/scale-web'", said)
+        self.assertIn("prepare --branch platform-agent/something-else", said)
+        self.assertNotIn("pass the branch you are actually on", said)
+        self.assertEqual(self.broker.payloads("publish"), [])
+        # And the sibling's edits are still uncommitted, where it left them.
+        self.assertEqual(git(Path(prepared["workspace"]), "status", "--porcelain").stdout.split(), ["M", "app.yaml"])
+
+    def test_submit_inside_the_callers_own_copy_still_offers_the_branch_it_is_on(self):
+        """The keyed lookup answered, so the other branch is the caller's too.
+
+        `prepare --branch A` then a hand-cut B inside that tree: A still names
+        the copy, so `submit --branch A` finds it by key and the branch it is
+        standing on is one this caller cut. Here the shorter advice is right,
+        and it is the advice the refusal above has to withhold.
+        """
+        prepared = self.prepare()
+        git(Path(prepared["workspace"]), "checkout", "--quiet", "-b", "platform-agent/second-thought")
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b")
+        said = str(caught.exception)
+        self.assertIn("is on branch 'platform-agent/second-thought'", said)
+        self.assertIn("pass the branch you are actually on", said)
         self.assertEqual(self.broker.payloads("publish"), [])
 
     def test_submit_finds_a_copy_whose_key_is_not_the_branch_it_is_standing_on(self):
@@ -1042,7 +1076,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.payloads("proposal-create"), [])
 
     def test_resubmitting_an_open_proposal_with_nothing_new_is_not_an_error(self):
-        """SKILL.md L198-L200 says so, and a card retry is the ordinary way there.
+        """SKILL.md's Step 3 says so -- "resubmitting is not an error" -- and a
+        card retry is the ordinary way there.
 
         Under the `git push --force-with-lease` + `gh pr edit` pair this
         replaced it was true; the publish refusal made it false for one round.

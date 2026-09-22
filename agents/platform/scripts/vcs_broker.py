@@ -154,6 +154,15 @@ def _login_key(login: str) -> str:
     login before it emits an author; a transport's `whoami` reports whatever the
     credential store holds, marking and all. Compared raw, an install is a
     stranger to its own proposals.
+
+    The marking is therefore not available to tell the two apart, and this
+    folds `kube-agents[bot]` onto a human account spelled `kube-agents`: the
+    `advance` ownership check above would read that person's open proposal as
+    this install's. Getting it back needs the author's bot flag carried through
+    `proposal-list`, which no forge in the protocol emits today. The failure is
+    permissive and it takes a human registering the install's own App name on
+    the same forge, so it is recorded rather than guarded -- guessing from the
+    spelling is how the comparison broke in the first place.
     """
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
 

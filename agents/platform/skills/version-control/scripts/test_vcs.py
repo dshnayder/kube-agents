@@ -506,6 +506,27 @@ class WriteTest(VcsTestCase):
         self.assertIn("cloned from", answer["error"])
         self.assertNotIn("publish", [name for name, _ in self.broker.calls])
 
+    def test_publish_advance_is_the_one_way_onto_the_cloned_branch(self):
+        """The flag has to reach `client.publish`, or the refusal above is a wall.
+
+        A copy taken *of* a proposal branch in order to add to it is the one
+        reason to publish the branch it came down on, and `--advance` is the
+        whole of how a caller says so. Accepted by the parser and dropped on
+        the way through, the second round of every review is refused with
+        advice that does not work.
+        """
+        self.change("inventory/clusters.yaml", "replicas: 5\n")
+        self.run_vcs("commit", "-m", "another round on the proposal branch")
+        code, answer = self.run_vcs("publish", "--target", "release", "--advance")
+        self.assertEqual(code, 0, answer)
+        payload = self.broker.payload("publish")
+        self.assertTrue(payload["advance"])
+        self.assertEqual((payload["branch"], payload["target"]), ("main", "release"))
+        # Absent, it is false rather than missing: the broker reads it either way.
+        self.assertFalse(
+            vcs.build_parser().parse_args(["publish", "--target", "release"]).advance
+        )
+
     def test_publish_tells_the_broker_which_branch_the_copy_was_cloned_from(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("inventory/clusters.yaml", "replicas: 5\n")
@@ -578,6 +599,31 @@ class WriteTest(VcsTestCase):
         self.assertEqual(vcs_client.all_sessions(), [])
         # Nothing is released on the credential side because nothing was held.
         self.assertEqual(self.broker.calls, [])
+
+    def test_discard_names_which_copy_when_the_repository_is_cloned_twice(self):
+        """`--branch` is the only way to say it, and a discarded copy cannot be stood in.
+
+        The read verbs can be run from inside the copy they are about. This one
+        removes the directory, so the caller is standing somewhere else by
+        definition -- and with two copies of one repository and no name, there
+        is nothing to resolve on.
+        """
+        git(self.origin, "branch", "release", "main")
+        first = self.clone("--branch", "main")
+        second = self.clone("--branch", "release")
+        self.assertNotEqual(first["path"], second["path"])
+
+        code, answer = self.run_vcs("discard")
+        self.assertEqual(code, 1)
+        self.assertIn("several working copies are here", answer["error"])
+
+        code, answer = self.run_vcs("discard", "--branch", "release")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(answer["removed"], second["path"])
+        self.assertFalse(Path(second["path"]).exists())
+        # And only that one.
+        self.assertTrue(Path(first["path"]).exists())
+        self.assertEqual([s["branch"] for s in vcs_client.all_sessions()], ["main"])
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +739,27 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("page", self.broker.payload("proposal-commits"))
 
+    def test_proposal_list_can_ask_about_one_branch(self):
+        """`--source`/`--target` reached the parser and not the payload once.
+
+        The broker filters at the forge, so a flag the command line accepts
+        and drops is a listing of every open proposal presented as the answer
+        about one branch -- which `submit-suggestion` reads to decide whether
+        a second round has somewhere to go.
+        """
+        code, _ = self.run_vcs(
+            "proposal", "list", "--source", "fix/replicas", "--target", "release"
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-list")
+        self.assertEqual((payload["source"], payload["target"]), ("fix/replicas", "release"))
+        # Absent, neither is sent: an unfiltered listing is the default.
+        code, _ = self.run_vcs("proposal", "list")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-list")
+        self.assertNotIn("source", payload)
+        self.assertNotIn("target", payload)
+
     def test_identity_says_when_the_login_is_an_automations(self):
         code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
         self.assertEqual(code, 0)
@@ -805,6 +872,9 @@ class BrokerCallTest(unittest.TestCase):
                 vcs_client.call("clone", {})
         self.assertIn("older than this skill", str(caught.exception))
         self.assertNotIn("turned off", str(caught.exception))
+        # Coded, because every consumer reports a codeless refusal as
+        # `BROKER_UNREACHABLE` -- and this broker answered.
+        self.assertEqual(caught.exception.code, "BROKER_ROUTE_UNSUPPORTED")
 
     def test_a_request_error_surfaces_the_broker_s_own_wording(self):
         error = vcs_client.credential_proxy_client.WorkspaceRequestError(

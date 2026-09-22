@@ -562,10 +562,11 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     for r in repos:
         # Per repository and not once for the sweep, because identity is a
         # property of a forge and an install serving two of them
-        # authenticates as two accounts. Repositories on one forge still
-        # cost one lookup between them: the provider caches per repository
-        # and every `identity` answer carries the viewer, so the first
-        # permission check on each forge has already paid for this.
+        # authenticates as two accounts. It is not free on the second
+        # repository of one forge -- the provider's cache is keyed by
+        # repository, so each one costs a lookup of its own -- but every
+        # `identity` answer carries the viewer, so a repository whose
+        # permission check has already run pays nothing here.
         #
         # The refusal is caught per repository and not around the loop. Around
         # it, a dead credential on the second repository -- or one on a host
