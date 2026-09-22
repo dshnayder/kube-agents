@@ -107,6 +107,19 @@ SCOPED_RUN_NOTE = (
 # matches the same three forms for the same reason.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
 
+# gcloud's words for a `clusters list` that some zones answered and others did
+# not. It reports that on stderr and still exits 0, and `--format json` carries
+# only the clusters that came back -- the API's own `missingZones` field is
+# dropped by the formatter, so stderr is the only place the shortfall is
+# stated. Read as a complete listing it is the worst shape this collector can
+# take: the project looks enumerated, so no `gate-failed` row is written, and
+# the clusters in the silent zones are indistinguishable from clusters that do
+# not exist. Their cohorts then vote without them -- a majority computed
+# against a fleet nobody knows is short -- and `finish` resolves every ledger
+# finding on them and closes the remediation pull request, on the strength of
+# a run that never saw them.
+ZONE_TIMEOUT_MARKER = "did not respond"
+
 # SOP §1: only a cluster with a settled configuration votes, and a cluster
 # younger than this has not settled.
 VOTING_STATUSES = ("RUNNING", "RECONCILING")
@@ -139,7 +152,19 @@ GOOGLE_LABEL_PREFIX = "goog"
 # Taint keys GKE applies to a node pool on the owner's behalf, so a pool
 # carrying only these is an ordinary pool rather than one pinned by hand.
 # `_is_pinned_pool` says why that distinction decides whether a ledger closes.
-GKE_MANAGED_TAINT_KEYS = ("nvidia.com/gpu", "google.com/tpu")
+# Accelerators are not the only case: GKE taints an Arm pool
+# `kubernetes.io/arch=arm64`, a GKE Sandbox pool `sandbox.gke.io/runtime=gvisor`
+# and a Windows pool `node.kubernetes.io/os=windows`, none of them a choice its
+# owner made or can revisit. Reading any of them as a pin drops every pool of a
+# single-architecture cluster from the vote, which is the permanent gap the
+# GPU case used to cause.
+GKE_MANAGED_TAINT_KEYS = (
+    "nvidia.com/gpu",
+    "google.com/tpu",
+    "kubernetes.io/arch",
+    "sandbox.gke.io/runtime",
+    "node.kubernetes.io/os",
+)
 # The one facet whose absent value is another audit's to act on; see
 # `_shape_rules_out`.
 RELEASE_CHANNEL_SLUG = "release-channel"
@@ -278,9 +303,28 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
         log(f"WARNING: {partial}")
         return Discovery(projects, None, partial)
 
-    for candidate in (p.strip() for p in (list_result.stdout or "").splitlines()):
-        if candidate and candidate not in projects:
+    listed = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip()]
+    for candidate in listed:
+        if candidate not in projects:
             projects.append(candidate)
+    if base and base not in listed:
+        # rc 0 and the active project absent from its own output. The
+        # credential just resolved that project and is about to list clusters
+        # in it, so the listing is filtered rather than complete -- a role
+        # carrying `container.clusters.list` but not `resourcemanager.projects.get`,
+        # or a proxy that drops rows instead of denying the call. Treated like
+        # the rc != 0 branch above: the scope is provably short by at least one
+        # project, and a scope that silently narrowed lets `finish` resolve
+        # every finding outside it.
+        partial = (
+            f"`gcloud projects list` rc=0 did not name the active project {base!r}, "
+            f"so it is filtered rather than complete: it returned {len(listed)} "
+            "project(s) and this run reads clusters in one it did not return. How "
+            "many other projects the fleet holds is unknown, so every cohort here "
+            "was compared against part of it."
+        )
+        log(f"WARNING: {partial}")
+        return Discovery(projects, None, partial)
     if not projects:
         # Both calls answered rc 0 and neither named a project: the `project`
         # property is unset and the credential can list none. An empty
@@ -315,7 +359,12 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
     they hold a cluster", and that sentence only reads as intended if a project
     that cannot hold one reads as empty rather than as unread -- otherwise a
     credential with organisation-wide visibility turns every non-GKE project
-    into a permanent coverage gap. See `API_DISABLED_MARKERS`."""
+    into a permanent coverage gap. See `API_DISABLED_MARKERS`.
+
+    The third shape returns all three: clusters, their command record, and an
+    error, for a listing gcloud answered partially and still exited 0 on. The
+    clusters it did return are compared; the error is what makes the ones it
+    did not say so. See `ZONE_TIMEOUT_MARKER`."""
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
@@ -329,7 +378,18 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
         return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
     for c in parsed:
         c["_project"] = project
-    return parsed, _record(shlex.join(argv), result), None
+    record = _record(shlex.join(argv), result)
+    # rc 0, parseable JSON, and a warning saying the JSON is short. The
+    # clusters that did come back are real and are returned to be compared;
+    # the error travels with them so the project also gets its `gate-failed`
+    # row, which is the only thing that stops the missing ones reading as
+    # absent. See `ZONE_TIMEOUT_MARKER`.
+    incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
+    if incomplete:
+        detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]
+        log(f"{project}: clusters list returned {len(parsed)} cluster(s) but is incomplete: {detail}")
+        return parsed, record, f"clusters list rc=0 but incomplete: {detail}"
+    return parsed, record, None
 
 
 def cluster_eligibility(c: dict, *, now: datetime) -> str | None:
@@ -481,10 +541,12 @@ def _is_pinned_pool(p: dict) -> bool:
     mark it dedicated or pinned capacity, which its owner deliberately keeps a
     fixed size.
 
-    Not "carries any taint". GKE taints an accelerator pool itself -- a GPU
-    pool comes up with `nvidia.com/gpu=present:NoSchedule` whether or not its
-    owner asked for one -- and reading that as a pin drops every pool of a
-    GPU-only cluster from the vote. `_pool_fraction` then returns `None`,
+    Not "carries any taint". GKE taints some pools itself -- a GPU pool comes
+    up with `nvidia.com/gpu=present:NoSchedule`, an Arm pool with
+    `kubernetes.io/arch=arm64:NoSchedule`, a sandboxed pool with
+    `sandbox.gke.io/runtime=gvisor:NoSchedule` -- whether or not its owner
+    asked for one, and reading that as a pin drops every pool of a GPU-only,
+    Arm-only or sandboxed cluster from the vote. `_pool_fraction` then returns `None`,
     `_shape_rules_out` declines (pools exist and are not Windows), and
     `unvoted_facets` writes a `limitations` sentence that `coverage_gaps` turns
     into a gap on every run: the stream never leaves `partial`, `resolved`
@@ -1102,7 +1164,7 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
             out[ckey(c)] = (
                 f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
-                f"{_unlabelled_cause(key, labelled, len(env_of), layout.cluster_cohorts)}"
+                f"{_unlabelled_cause(key, labelled, len(env_of), layout, c)}"
             )
     node_level = sum(1 for f in FACETS if f.standard_only)
     for key, members in layout.node_cohorts.items():
@@ -1160,7 +1222,35 @@ def joinable_environments(
     )
 
 
-def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple, list[dict]]) -> str:
+def joinable_for_cluster(layout: Layout, c: dict, *, cluster_short: bool, node_short: bool) -> list[tuple[str, int]]:
+    """The environment values that close *every* cohort gap this cluster has,
+    commonest first -- `joinable_environments` resolved against §2.3's two
+    cohortings at once.
+
+    A value has to satisfy each axis the cluster is short on, so where both are
+    short that is an intersection, and the intersection can be empty while
+    either axis alone offers a value. Prescribing a label off one axis is a
+    remedy that closes half the gap: the eight configurable facets start
+    comparing and the eleven node-level ones still do not, and the operator who
+    applied it sees the same coverage gap on the next run.
+
+    Shared by §4.14's finding and by `_unlabelled_cause`'s remedy clause for the
+    same reason `joinable_environments` is shared by anything -- the two say the
+    same thing about the same cluster in the same report, and computing it twice
+    is how one comes to prescribe a value the other withholds.
+    """
+    joinable = joinable_environments(layout.cluster_cohorts) if cluster_short else []
+    if node_short:
+        by_mode = joinable_environments(layout.node_cohorts, mode=cluster_mode(c))
+        joinable = (
+            [(v, n) for v, n in joinable if v in {w for w, _ in by_mode}]
+            if cluster_short
+            else by_mode
+        )
+    return joinable
+
+
+def _unlabelled_cause(key: tuple, labelled: int, total: int, layout: Layout, c: dict) -> str:
     """Why the `unknown` cohort floored out, when the rest of the fleet did not.
 
     The floor sentence is true and gives the reader nothing to do with it. On
@@ -1196,10 +1286,26 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     likeliest application is a no-op belongs with the sizing findings the cost
     SOP's §3.7 withholds for the same reason, so the sentence names the values that work
     and says plainly that the others do not.
+
+    "Work" means both of §2.3's cohorts, which is why this takes the whole
+    `Layout` and the cluster rather than one cohort dict. A Standard cluster
+    whose cluster-level cohort floored out has a `(standard, unknown)` cohort
+    that floored out underneath it -- the node-level cohort is a subset -- so a
+    value read off the cluster-level cohorts alone can be one that starts the
+    eight configurable facets comparing and leaves the eleven node-level ones
+    exactly as they were. §4.14's finding already intersects the two through
+    `joinable_for_cluster`; this clause calls the same function, so the
+    `limitations` sentence cannot name a value the finding beside it withheld.
     """
     if key[-1:] != ("unknown",) or not labelled:
         return ""
-    joinable = joinable_environments(cohorts)
+    # Reached from the cluster-level loop, so that cohort is short by
+    # construction. The node-level one is asked on its own terms: on Autopilot
+    # its eleven facets are inapplicable, so its floor withholds nothing and no
+    # label is being asked to close it.
+    mode = cluster_mode(c)
+    node_short = mode != "autopilot" and len(layout.cohort_of(c, True)) < COHORT_FLOOR
+    joinable = joinable_for_cluster(layout, c, cluster_short=True, node_short=node_short)
     if joinable:
         named = " or ".join(f"`environment={v}`" for v, _ in joinable)
         peers = ", ".join(f"{n} other cluster{'' if n == 1 else 's'} carry `{v}`"
@@ -1209,6 +1315,22 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
             " value opens a new cohort of one and compares nothing, so a label"
             " chosen to describe this cluster rather than to match its peers"
             " leaves the coverage gap exactly as it is."
+        )
+    elif node_short and joinable_environments(layout.cluster_cohorts):
+        # A value reaches the cluster-level floor and none reaches both. Saying
+        # only "no value reaches the floor" would be read against the cohort the
+        # sentence just named and look false, so the clause names the half that
+        # works and the half that does not -- an operator who applies it anyway
+        # gets the eight and should know the eleven stay where they are.
+        named = " or ".join(
+            f"`environment={v}`" for v, _ in joinable_environments(layout.cluster_cohorts)
+        )
+        remedy = (
+            f" {named} would reach this cohort's floor, but no value reaches"
+            f" the floor of the `{mode}` cohort the {sum(1 for f in FACETS if f.standard_only)}"
+            " node-level facets are compared within, so no single label closes"
+            " both gaps and this cluster stays partly uncompared until the"
+            " fleet grows."
         )
     else:
         remedy = (
@@ -1312,20 +1434,10 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         # node-level cohort being short is not a gap and no label would be
         # closing one; `node_short` is false for it above rather than here, so
         # the value search below never has to satisfy a constraint that does
-        # not apply.
-        #
-        # A value has to close every gap this cluster actually has. Where both
-        # are short that is an intersection, and it can be empty while either
-        # axis alone offers a value -- advising a label that fixes one half and
-        # leaves the other is the no-op §3.7 of the cost SOP withholds.
-        joinable = joinable_environments(cohorts) if cluster_short else []
-        if node_short:
-            by_mode = joinable_environments(layout.node_cohorts, mode=mode)
-            joinable = (
-                [(v, n) for v, n in joinable if v in {w for w, _ in by_mode}]
-                if cluster_short
-                else by_mode
-            )
+        # not apply. Where it does, `joinable_for_cluster` is what makes a
+        # value satisfy both axes rather than one; publishing off one half is
+        # the no-op §3.7 of the cost SOP withholds.
+        joinable = joinable_for_cluster(layout, c, cluster_short=cluster_short, node_short=node_short)
         if not joinable:
             continue
         value, peers = joinable[0]
@@ -1772,7 +1884,13 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             all_clusters.extend(clusters)
             if record is not None:
                 command_by_project[futures[future]] = record
-            elif error:
+            # Not `elif`. A partial listing carries both -- a record, because
+            # the clusters it returned are evidence and their findings need the
+            # command that produced them, and an error, because the project is
+            # still short. Under `elif` the record silently swallowed the
+            # error and the project read as fully enumerated, which is the one
+            # outcome `ZONE_TIMEOUT_MARKER` exists to prevent.
+            if error:
                 failed_projects[futures[future]] = error
 
     # Before anything reads a cluster's name: `compute_drift` writes names into

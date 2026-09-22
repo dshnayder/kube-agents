@@ -143,6 +143,31 @@ class DiscoverProjectsTest(unittest.TestCase):
         result = fd.discover_projects(None, run=self._discovery_run(""))
         self.assertEqual(result, ["acme"])
 
+    def test_a_projects_list_that_omits_the_active_project_is_a_narrowing(self):
+        """rc 0 and the active project absent from its own output. The
+        credential just resolved that project and is about to list clusters in
+        it, so the listing is filtered rather than complete -- a role carrying
+        `container.clusters.list` but not `resourcemanager.projects.get`, or a
+        proxy dropping rows instead of denying the call. Unrecorded it is the
+        same loss as the rc != 0 fallback beside it: `finish` reads a fleet of
+        one project as the whole fleet and stale-closes every remediation pull
+        request outside it."""
+        discovery = fd.discover_fleet(None, run=self._discovery_run("other-proj\n"))
+        self.assertEqual(discovery.projects, ["acme", "other-proj"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("did not name the active project", discovery.partial)
+
+    def test_a_projects_list_naming_the_active_project_is_complete(self):
+        """The guard above must not fire on the ordinary install. A stock
+        `kube-agents-iam` grants `roles/compute.viewer` and
+        `roles/monitoring.viewer`, both of which carry
+        `resourcemanager.projects.get`, so `projects list` does return the
+        project the run is standing in -- and a `partial` on every run is the
+        permanent coverage gap that pins `resolved` at 0."""
+        discovery = fd.discover_fleet(None, run=self._discovery_run("acme\nacme-staging\n"))
+        self.assertEqual(discovery.projects, ["acme", "acme-staging"])
+        self.assertIsNone(discovery.partial)
+
     def test_every_project_projects_list_returns_is_in_scope(self):
         result = fd.discover_projects(
             None,
@@ -232,6 +257,45 @@ class EnumerateProjectClustersTest(unittest.TestCase):
         # A log line alone leaves the failure nowhere a validator can read it.
         self.assertIn("denied", error)
         self.assertIn("rc=1", error)
+
+    def test_a_listing_some_zones_did_not_answer_returns_its_clusters_and_the_loss(self):
+        """gcloud warns on stderr and exits 0, and `--format json` carries only
+        the clusters that answered -- the API's `missingZones` is dropped by the
+        formatter. Read as complete, the clusters in the silent zones are
+        indistinguishable from clusters that do not exist: their cohorts vote
+        without them, and `finish` resolves every ledger finding on them."""
+        warning = ("WARNING: The following zones did not respond: "
+                   "[us-central1-a, us-central1-b]. List results may be incomplete.\n")
+        clusters, record, error = fd.enumerate_project_clusters(
+            "acme", run=lambda a: run_of(0, json.dumps([{"name": "c1"}]), warning))
+        # The clusters that did come back are real and still get compared.
+        self.assertEqual([c["name"] for c in clusters], ["c1"])
+        self.assertIsNotNone(record)
+        # And the shortfall travels with them, naming the zones.
+        self.assertIn("incomplete", error)
+        self.assertIn("us-central1-a", error)
+
+    def test_a_partial_listing_is_a_gate_failed_row_beside_its_own_clusters(self):
+        """The error and the record travel together, so the caller has to keep
+        both. Under an `elif` the record swallowed the error and the project
+        read as fully enumerated -- the one outcome the warning exists to
+        prevent."""
+        warning = "WARNING: The following zones did not respond: [us-central1-a]."
+
+        def run(argv, **_):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([cluster("c1")]), warning)
+            raise AssertionError(f"unexpected argv {argv}")
+
+        manifest = collected(run)
+        rows = {e["name"]: e for e in manifest["clusters"]}
+        # The cluster is in the manifest, collected, as it should be.
+        self.assertEqual(rows[T("c1")]["outcome"], fd.OUTCOME_COLLECTED)
+        # And so is the project, gate-failed, which is what §6 turns into a
+        # coverage gap the document must account for.
+        gate_failed = rows[f"{fd.PROJECT_TARGET_PREFIX}acme"]
+        self.assertEqual(gate_failed["outcome"], fd.OUTCOME_GATE_FAILED)
+        self.assertIn("us-central1-a", gate_failed["error"])
 
 
 class ClusterEligibilityTest(unittest.TestCase):
@@ -624,6 +688,26 @@ class FacetNormalizeTest(unittest.TestCase):
         gpu_and_dedicated = dict(gpu, config={"taints": [
             {"key": "nvidia.com/gpu"}, {"key": "dedicated", "value": "batch"}]})
         self.assertIsNone(fd.norm_pool_autoscaling(cluster("c", nodePools=[gpu_and_dedicated])))
+
+    def test_arm_sandbox_and_windows_pools_are_not_owners_pinning_a_pool(self):
+        """Accelerators were never the only case. GKE taints an Arm pool
+        `kubernetes.io/arch=arm64`, a GKE Sandbox pool
+        `sandbox.gke.io/runtime=gvisor` and a Windows pool
+        `node.kubernetes.io/os=windows`, none of them a choice its owner made
+        or can revisit -- and reading any of them as a pin drops every pool of
+        a single-architecture cluster from the vote, which is the same
+        permanent `partial` the GPU taint used to cause."""
+        for key, value in (("kubernetes.io/arch", "arm64"),
+                           ("sandbox.gke.io/runtime", "gvisor"),
+                           ("node.kubernetes.io/os", "windows")):
+            with self.subTest(taint=key):
+                managed = {"name": "p", "autoscaling": {"enabled": False},
+                           "config": {"taints": [{"key": key, "value": value, "effect": "NO_SCHEDULE"}]}}
+                self.assertEqual(fd.norm_pool_autoscaling(cluster("c", nodePools=[managed])), "NONE")
+                # An owner-applied taint beside it still pins the pool.
+                both = dict(managed, config={"taints": [
+                    {"key": key, "value": value}, {"key": "dedicated", "value": "batch"}]})
+                self.assertIsNone(fd.norm_pool_autoscaling(cluster("c", nodePools=[both])))
 
     def test_intra_node_visibility(self):
         base, out, flagged = self.hit("intra-node-visibility", cluster("c"), {"networkConfig.enableIntraNodeVisibility": False})
@@ -2122,6 +2206,31 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         gap = fd.cohort_limitations(fleet, now=NOW)[K("host")]
         self.assertIn("Only `environment=test` would reach the floor here", gap)
         self.assertIn("to `test`", candidates[K("host")][0]["excerpt"])
+
+    def test_the_gap_sentence_withholds_a_value_that_closes_only_half_the_gap(self):
+        """The test above is a fleet where the two cohortings happen to agree,
+        so it cannot see the case where they do not. Here `test` is carried by
+        two clusters that straddle the mode split: the cluster-level cohort
+        `(test)` reaches the floor with `host` in it and the node-level
+        `(standard, test)` does not, so labelling `host` starts the eight
+        configurable facets comparing and leaves the eleven node-level ones
+        exactly as they were. §4.14 intersects the two and publishes nothing;
+        the gap sentence read only the cluster-level cohorts, so it prescribed
+        `environment=test` beside a finding that had just withheld it."""
+        fleet = [
+            cluster("host", labels={}),
+            cluster("one", labels={"environment": "test"}),
+            cluster("two", labels={"environment": "test"}, autopilot=True),
+        ]
+        _run, candidates, _na = self.check(fleet)
+        self.assertEqual(candidates, {})
+        gap = fd.cohort_limitations(fleet, now=NOW)[K("host")]
+        self.assertNotIn("Only `environment=test` would reach the floor", gap)
+        # It still names the value rather than claiming none exists -- an
+        # operator told "no value reaches the floor" about a cohort with two
+        # `test` peers in it reads a sentence that looks false.
+        self.assertIn("`environment=test` would reach this cohort's floor", gap)
+        self.assertIn("no single label closes both gaps", gap)
 
     def test_a_labelled_cluster_runs_the_check_and_passes_it(self):
         run, candidates, na = self.check(self._live_shape({"environment": "test"}))
