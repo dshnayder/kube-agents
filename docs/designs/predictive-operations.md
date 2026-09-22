@@ -60,6 +60,7 @@ have what they came for.
 | [Order of work](#order-of-work)                               | phases with the decision gate that could stop them                    |
 | [Out of scope](#out-of-scope)                                 | what this is not                                                      |
 | [Open questions](#open-questions)                             | what only a build or a backtest can answer                            |
+| [Prior art](#prior-art)                                       | what other agents and platforms ship today, and what it changes here  |
 
 ## Scope
 
@@ -485,3 +486,56 @@ Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 5 each s
   — the managed alternative for the acute tier.
 - [BigQuery `AI.FORECAST`](https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-ai-forecast)
   — the same model as a managed function, for a very large fleet.
+
+## Prior art
+
+A survey of what shipped as of September 2026, so a reviewer can see where this proposal sits.
+Three findings, and what each changes in the document.
+
+**No Kubernetes or AI SRE agent forecasts.** K8sGPT, HolmesGPT, Komodor's Klaudia, kagent,
+Cleric, Resolve AI, Traversal, Metoro and Datadog's Bits Investigation all run the same loop:
+detect, investigate, remediate. HolmesGPT and Azure SRE Agent add scheduled health checks, which
+is this repository's proactive tier under another name; Azure's published capacity-planning
+example is a custom skill that flags quota above a fixed fraction, a current-value threshold.
+Google's Gemini Cloud Assist "Proactive Mode" is background investigation triggered by an alert
+or a cost anomaly, and its documentation does not use the word forecast. Two small vendors,
+Hawkeye and Phoebe AI, claim prediction on a one-to-three-day horizon; neither documents the
+mechanism. The mode this document names is not occupied.
+
+**The observability platforms have the forecasting, without the agent.** This is where the
+real prior art is, and one of them has the whole loop:
+
+- [Dynatrace Davis AI](https://docs.dynatrace.com/docs/observe/infrastructure-observability/kubernetes-app/use-cases/predictive-operations)
+  documents a "predictive Kubernetes operations" workflow that forecasts disk fill, resolves the
+  owner, and opens a pull request changing the disk size in the service's configuration
+  repository. Dynatrace runs it weekly over
+  [some eight thousand of its own disks](https://www.dynatrace.com/news/blog/automate-predictive-capacity-management-with-davis-ai-for-workflows/).
+  That is forecast, ownership, declarative remediation: the shape proposed here, inside one
+  vendor's platform and data lake.
+- [Grafana Cloud](https://grafana.com/docs/grafana-cloud/machine-learning/dynamic-alerting/forecasting/)
+  ships metric forecasts with daily and weekly seasonality, one forecast per entity in a label
+  set, and a documented disk-full pattern that alerts days before the fill.
+- New Relic ships
+  [predictive alerts](https://docs.newrelic.com/docs/alerts/create-alert/set-thresholds/predictive-alerts/);
+  Datadog's Watchdog runs on Toto, its own time-series foundation model; Cloud Monitoring has the
+  forecast alert condition weighed [above](#alternatives-weighed), with its 2.5-day cap.
+
+**Time-series foundation models have been measured on Kubernetes metrics.**
+[Parseable's benchmark](https://www.parseable.com/blog/zero-shot-forecasting) (April 2026) ran
+Chronos, TimesFM, IBM's Tiny Time-Mixers and Toto against classical baselines on real pod
+metrics: Toto led on high-frequency multivariate series, Chronos was the most versatile, and no
+model handled a first-of-its-kind event zero-shot. The
+[k0rdent FinOps Agent](https://cloudnativenow.com/contributed-content/building-finops-with-k0rdent-open-source/)
+already runs Toto zero-shot over Prometheus and OpenCost series for cost and utilization
+forecasts with p10, p50 and p90 intervals; it is the nearest operations agent built on such a
+model, and it forecasts spend rather than failure.
+
+What this changes here. The positioning stands: nothing combines a forecast, an attributed
+finding and a declarative remediation in an agent that runs inside the install, and Dynatrace's
+workflow is evidence that the loop works in production. Two adjustments follow. The backtest in
+[Order of work](#order-of-work) phase 2 should run Toto and Chronos beside TimesFM, since both
+publish open weights and Toto was trained on observability data; the finding shape carries the
+model as provenance, so the winner per series class is a configuration, not a redesign, and
+each model's licence terms are checked in that phase before it is pinned. And the benchmark's
+observation about first-of-its-kind events is the same regime-change rule stated in
+[Honesty about the future](#honesty-about-the-future), now with a measurement behind it.
