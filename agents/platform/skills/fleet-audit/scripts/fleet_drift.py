@@ -1403,8 +1403,12 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
             "an environment and every cluster is compared regardless of its labels -- an "
             "environment label would not change which clusters this one is measured against."
         )
+        # A cluster §1 excluded is not compared at all, so the sentence above
+        # would contradict its `limitations`; it gets nothing here, as it does
+        # under `environment` below.
         for c in clusters:
-            not_applicable[ckey(c)] = [{"check": UNLABELLED_SLUG, "reason": reason}]
+            if ckey(c) in env_of:
+                not_applicable[ckey(c)] = [{"check": UNLABELLED_SLUG, "reason": reason}]
         return checks_run, candidates, not_applicable
 
     labelled = sum(1 for _, source in env_of.values() if source == "label")

@@ -358,6 +358,25 @@ class CohortStrategyTest(unittest.TestCase):
         clusters = [cluster("deploy-test", labels={})] + [cluster(f"c{i}", labels={}) for i in range(15)]
         self.assertEqual(fd.decide_cohort_strategy(clusters), "mode-only")
 
+    def test_two_guesses_in_sixteen_do_not_select_environment(self):
+        """The docstring's fleet: two `test` tokens in sixteen names. A rule
+        that trusted any two inferred environments would still pass the
+        one-in-sixteen test above; this one pins the half-the-fleet bar."""
+        clusters = [cluster("deploy-test", labels={}), cluster("perf-test", labels={})]
+        clusters += [cluster(f"c{i}", labels={}) for i in range(14)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "mode-only")
+
+    def test_exactly_half_the_fleet_named_selects_environment(self):
+        """The bar is inclusive: inference resolving half the fleet earns the axis."""
+        clusters = [cluster(f"prod-{i}", labels={}) for i in range(4)]
+        clusters += [cluster(f"c{i}", labels={}) for i in range(4)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "environment")
+
+    def test_one_short_of_half_does_not_select_environment(self):
+        clusters = [cluster(f"prod-{i}", labels={}) for i in range(3)]
+        clusters += [cluster(f"c{i}", labels={}) for i in range(4)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "mode-only")
+
     def test_a_fleetwide_naming_convention_does_select_environment(self):
         """Inference earns the strategy once it is the fleet's actual naming
         convention rather than a guess about a couple of stragglers."""
@@ -2403,6 +2422,16 @@ class NoEnvironmentLabelTest(unittest.TestCase):
         self.assertNotIn(K("host"), run)
         self.assertEqual(candidates, {})
         self.assertEqual(na, {})
+
+    def test_an_ineligible_cluster_is_not_declared_when_cohorts_ignore_environment(self):
+        """Under `project` the N/A reason says every cluster is compared, which a
+        cluster §1 excluded is not; its `limitations` already covers it."""
+        fleet = [cluster(f"c{i}", project=p, labels={})
+                 for p in ("acme", "other") for i in range(2)]
+        fleet.append(cluster("host", project="other", labels={}, status="PROVISIONING"))
+        run, candidates, na = self.check(fleet)
+        self.assertEqual(len(na), 4)
+        self.assertNotIn(K("host", project="other"), na)
 
     def test_the_finding_reaches_the_manifest(self):
         clusters_json = json.dumps(self._live_shape({}))
