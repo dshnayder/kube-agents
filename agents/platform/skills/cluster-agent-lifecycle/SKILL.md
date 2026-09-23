@@ -28,12 +28,9 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`):
-
-   ```bash
-   python3 /opt/data/scripts/cluster_agent_profile.py name \
-     --project "<project>" --cluster "<cluster>" --location "<location>"
-   ```
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(cluster_name, location, project_id)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — `cluster_agent_profile.py` is a stub in your shell, so do not run it and do not block on it.
+   - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
+   - If it does not exist, you cannot create it from your shell. Investigate the cluster yourself this once and say in your `result` that it had no Cluster Agent.
 
 2. **Create the card** with the request in the body:
 
@@ -131,8 +128,4 @@ net, not the primary path.
 
 ## Listing profiles
 
-```bash
-python3 /opt/data/scripts/cluster_agent_profile.py list
-```
-
-Lists the currently provisioned Cluster Agent profiles (one per managed cluster).
+Call `list_cluster_agents()`. It lists the currently provisioned Cluster Agent profiles (one per managed cluster) with the cluster each is pinned to.

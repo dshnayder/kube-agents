@@ -19,9 +19,17 @@ from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
+from cluster_agent_profile import RESERVED_PROFILES, profile_name, read_cluster_identity
 from gke_endpoint import dns_endpoint_args
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
+# The data root the Cluster Agent profiles live under, as `<root>/profiles/<name>`.
+# Read from PLATFORM_AGENT_HOME, which the operator sets from
+# spec.harness.hermes.agentHome; not HERMES_HOME, which in a platform worker is the
+# platform profile's own home and would show a roster with no Cluster Agents in it.
+DEFAULT_AGENT_HOME = "/opt/data"
+PROFILES_DIRNAME = "profiles"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
 # synchronously — it creates the session, runs a whole Chat Agent turn (its own
@@ -377,6 +385,66 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
         return f"ERROR: Failed to describe GKE cluster.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
     except Exception as e:
         return f"ERROR: An unexpected error occurred: {e}"
+
+
+# =============================================================================
+# Cluster Agent roster
+# =============================================================================
+#
+# cluster_agent_profile.py is stubbed in the shell sandbox (it needs the profiles
+# tree on the agent pod's PVC), so the agent cannot resolve a kanban assignee from
+# its terminal. This server runs in the agent pod, where the tree is.
+
+def _profiles_dir() -> Path:
+    return Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME) / PROFILES_DIRNAME
+
+
+def _cluster_agent_roster() -> list[dict]:
+    base = _profiles_dir()
+    if not base.is_dir():
+        return []
+    roster = []
+    for home in sorted(base.iterdir()):
+        if not home.is_dir() or home.name in RESERVED_PROFILES:
+            continue
+        roster.append({"name": home.name, **(read_cluster_identity(home) or {})})
+    return roster
+
+
+@mcp.tool()
+def list_cluster_agents() -> str:
+    """
+    List every Cluster Agent profile, with the cluster each one is pinned to.
+
+    Returns JSON: a list of {name, project, cluster, location}. `name` is the
+    kanban assignee for delegating work on that cluster. A profile scaffolded
+    without its identity stamp has only `name`.
+    """
+    try:
+        return json.dumps(_cluster_agent_roster(), indent=2)
+    except Exception as e:
+        return f"ERROR: Could not read the Cluster Agent roster: {e}"
+
+
+@mcp.tool()
+def resolve_cluster_agent(cluster_name: str, location: str, project_id: str = "") -> str:
+    """
+    Resolve the Cluster Agent profile for one GKE cluster: the kanban assignee.
+
+    Returns JSON with 'name' and 'exists'. Assign a card to 'name' only when
+    'exists' is true; a card assigned to a profile that does not exist is never
+    dispatched and sits in 'ready' forever.
+
+    Args:
+        cluster_name: The name of the GKE cluster.
+        location: The cluster's region or zone, as GKE reports it.
+        project_id: Optional GCP Project ID. If omitted, resolves automatically.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+    name = profile_name(pid, cluster_name, location)
+    return json.dumps({"name": name, "exists": (_profiles_dir() / name).is_dir()}, indent=2)
 
 
 def _kubeconfig_slug(value: str) -> str:

@@ -1307,5 +1307,59 @@ class TestFindingsTransport(unittest.TestCase):
         self.assertNotIn("content-type", sent["headers"])
 
 
+class TestClusterAgentRoster(unittest.TestCase):
+    """The assignee lookup the sandbox cannot do: it reads the agent pod's profiles tree."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profiles = Path(self.tmp.name) / "profiles"
+        env = patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _profile(self, name, identity=None):
+        home = self.profiles / name
+        home.mkdir(parents=True)
+        if identity:
+            (home / "config.yaml").write_text(json.dumps({"cluster_identity": identity}))
+        return home
+
+    def test_resolve_reports_an_existing_profile(self):
+        self._profile("cluster-proj-seeded-a-us-central1")
+        got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-a", "us-central1", "proj"))
+        self.assertEqual({"name": "cluster-proj-seeded-a-us-central1", "exists": True}, got)
+
+    def test_resolve_reports_a_missing_profile(self):
+        got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-z", "us-central1", "proj"))
+        self.assertEqual({"name": "cluster-proj-seeded-z-us-central1", "exists": False}, got)
+
+    def test_resolve_reads_the_data_root_not_the_profile_home(self):
+        # A platform worker's HERMES_HOME is <root>/profiles/platform; the roster is
+        # a level up from it, under PLATFORM_AGENT_HOME.
+        self._profile("cluster-proj-seeded-a-us-central1")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.profiles / "platform")}):
+            got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-a", "us-central1", "proj"))
+        self.assertTrue(got["exists"])
+
+    def test_list_carries_identity_and_skips_reserved_profiles(self):
+        identity = {"project": "proj", "cluster": "seeded-a", "location": "us-central1"}
+        self._profile("cluster-proj-seeded-a-us-central1", identity)
+        self._profile("cluster-unstamped")
+        self._profile("platform")
+        self._profile("default")
+        got = json.loads(platform_mcp_server.list_cluster_agents())
+        self.assertEqual(
+            [
+                {"name": "cluster-proj-seeded-a-us-central1", **identity},
+                {"name": "cluster-unstamped"},
+            ],
+            got,
+        )
+
+    def test_list_is_empty_without_a_profiles_tree(self):
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_agents()))
+
+
 if __name__ == '__main__':
     unittest.main()
