@@ -216,6 +216,9 @@ def collect_target(project, cluster, start, end, n):
         except urllib.error.HTTPError as e:
             print(f"{project}/{cluster} {cls}: HTTP {e.code}", file=sys.stderr, flush=True)
             continue
+        except RuntimeError as e:
+            print(f"{project}/{cluster} {cls}: skipped, {e}", file=sys.stderr, flush=True)
+            continue
         for ts in series:
             labels = key_of(ts, q["group"])
             values = to_grid(ts, start, n)

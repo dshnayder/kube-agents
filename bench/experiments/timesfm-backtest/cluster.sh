@@ -31,7 +31,7 @@ up)
   kubectl -n timesfm rollout status deploy/forecaster --timeout=30m
   ;;
 run)
-  RUN="${2:?run name}" envsubst '${RUN}' < "${HERE}/k8s/backtest-job.yaml" | kubectl apply -f -
+  sed "s/\${RUN}/${2:?run name}/g" "${HERE}/k8s/backtest-job.yaml" | kubectl apply -f -
   kubectl -n timesfm wait --for=condition=complete "job/backtest-${2}" --timeout="${JOB_TIMEOUT}"
   ;;
 fetch)

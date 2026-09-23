@@ -20,6 +20,16 @@ spec:
       containers:
         - name: backtest
           image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/timesfm-backtest:v3
+          # Waits for the corpus, so the Job can be applied before the collector finishes.
+          command:
+            - sh
+            - -c
+            - >-
+              python3 -c "import time; from google.cloud import storage;
+              b = storage.Client().bucket('agentic-harness-demo-timesfm-exp').blob('series.jsonl.gz');
+              [time.sleep(60) for _ in iter(lambda: b.exists(), True)]"
+              && exec python3 backtest.py "$@"
+            - backtest
           args:
             - --data=gs://agentic-harness-demo-timesfm-exp/series.jsonl.gz
             - --forecaster=http://forecaster:8080
