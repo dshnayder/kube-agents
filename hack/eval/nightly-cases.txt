@@ -373,3 +373,10 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# Not yet observed in CI (`validated: false`). Delegation's route rather
+# than its answer: the crashloop-debug prompt and fixture, graded on a
+# Cluster Agent profile doing the delegated work (worker_agents) and on no
+# delegated worker running cluster_agent_profile.py or
+# kanban_notify_propagate.py, which the shell sandbox stubs.
+./tasks/cluster-agent-delegation-profile-lookup/task.yaml

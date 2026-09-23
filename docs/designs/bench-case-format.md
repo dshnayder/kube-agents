@@ -166,7 +166,7 @@ matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/mat
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
 deployment's ready replicas land in a range).
 
-Five read what the run produced, from this repository
+Six read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer), `tool_called` (calls in the
@@ -175,7 +175,9 @@ published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it).
+purges it), and `worker_agents` (regular expressions every one of which must match the
+profile at least one delegated worker ran as, read from the tags the harness puts on the
+workers' trajectory entries).
 
 Two limits are worth knowing before choosing one. `tool_called` counts the delegating
 turn's calls only — the harness appends the delegated workers' calls to the trajectory
@@ -191,9 +193,10 @@ the one check that sees the route a worker took, but only its terminal commands,
 its MCP tool calls, and only for cards the run delegated — a router that answered without
 delegating leaves it nothing to read, which is `status: "error"`, not a pass. The record
 itself does carry the workers' MCP tool calls, as the tagged trajectory entries above; no
-deterministic check reads them, and the judged metrics receive them as the execution trace.
+deterministic check reads their contents — `worker_agents` reads only which profile made
+them — and the judged metrics receive them as the execution trace.
 
-All seven fail closed. A check that cannot observe its subject returns `status: "error"`,
+All eight fail closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
 1.0, which the gate fails. Silence is not a pass.
 
