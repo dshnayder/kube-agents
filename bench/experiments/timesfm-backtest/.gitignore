@@ -1,1 +1,6 @@
 data/
+# bench/.gitignore ignores results/; the summary is the committed record, the per-row metrics
+# name workloads and stay local.
+!results/
+results/*
+!results/summary.md

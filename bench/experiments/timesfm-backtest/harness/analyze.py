@@ -113,7 +113,9 @@ def main():
     long = complete(df[df.origin >= LONG_FROM])
     short = complete(df[~df.arm.isin(["tfm-28d", "tfm-ens"])])
     ids = df.id.nunique()
-    print(f"# TimesFM backtest summary\n\n{ids} series, {df.cluster.nunique()} clusters, "
+    # Every pool project names its cluster platform-agent-host, so a cluster is project/cluster.
+    clusters = df.id.str.split("/").str[:2].str.join("/").nunique()
+    print(f"# TimesFM backtest summary\n\n{ids} series, {clusters} clusters, "
           f"origins {df.origin.min()}..{df.origin.max()} (long set from {LONG_FROM}).\n")
     print("Series per class:\n")
     print(table(df.groupby("class").id.nunique().to_frame("series")))

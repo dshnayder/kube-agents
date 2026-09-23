@@ -54,8 +54,7 @@ at least 21 days from its first point, 90% of the points in that span are presen
 constant; GKE's own namespaces are dropped. An arm forecasts a series at an origin only when the
 arm's whole context window is real data, so a series from a three-week-old cluster enters the
 1- and 7-day arms but never the 28-day one, and the analysis compares arms only on the
-(series, origin) pairs they all scored. Eval runs create a namespace
-each, so most listed series live less than a day and fail the coverage test. The corpus is not
+(series, origin) pairs they all scored. Eval runs create a namespace each, so most listed series live less than a day and fail the coverage test. The corpus is not
 committed: it names workloads and namespaces, and it is regenerated from the command below.
 
 ## Arms
@@ -119,4 +118,87 @@ into the image, behind `POST /forecast`, with one compiled copy per context buck
 
 ## Results
 
-Pending: the Job `backtest-r1` is running.
+Run `r1`, 2026-09-23. The full tables are in [`results/summary.md`](results/summary.md). The
+per-row metrics are not committed, for the same reason as the corpus.
+
+153 series were kept: 60 from `kage-management` and 3 to 9 from each evaluation host, whose
+namespaces rarely outlive a run. The long set covers origins 28 to 40, 13 days, and the 113
+series with 28 days of real history, 1,030 (series, origin) pairs per arm. The short set covers
+all 33 origins with the 1- and 7-day arms, 3,357 pairs per arm.
+
+**TimesFM beats every baseline on the whole day.** On the long set:
+
+| Arm         | Median MASE | First-hour MASE |   WQL | 80% coverage | Beats `snaive-1d` |
+| ----------- | ----------: | --------------: | ----: | -----------: | ----------------: |
+| `snaive-1d` |        0.90 |            0.65 | 0.046 |         0.78 |                 — |
+| `snaive-7d` |        1.14 |            0.91 | 0.064 |         0.73 |               30% |
+| `linear-7d` |        0.84 |            0.62 | 0.043 |         0.59 |               56% |
+| `tfm-1d`    |        0.58 |            0.19 | 0.031 |         0.74 |               84% |
+| `tfm-7d`    |        0.55 |            0.18 | 0.028 |         0.81 |               84% |
+| `tfm-28d`   |        0.54 |            0.20 | 0.027 |         0.83 |               85% |
+| `tfm-ens`   |        0.55 |            0.18 | 0.028 |         0.81 |               86% |
+
+Compared with repeating yesterday, the model's median error is about 40% lower, its quantile
+loss is about 40% lower, and its first-hour error is less than a third. The 7- and 28-day bands
+are calibrated (0.81 and 0.83 against a nominal 0.80). The 1-day band is slightly overconfident.
+The short set gives the same ordering: 0.59 and 0.57 for the 1- and 7-day arms, against 0.91
+for `snaive-1d`. By class, memory gains most (0.44 against 0.84). CPU requested gains least,
+because requests change in steps at deploys: `snaive-7d` scores 0.78 there and `tfm-7d` 0.75.
+Node counts were flat on most days, so every arm's median there is near zero and the class says
+little.
+
+**Context length hardly matters for the day's shape.** The 7-day window from the proposal is
+within 0.01 MASE of the 28-day one. One day of context is measurably worse. The ensemble of the
+three windows is no better than the 28-day arm alone.
+
+**The raw forecast misses daily peaks.** The day's highest q90 was at or above the day's real
+maximum only 19–26% of the time for the TimesFM arms. For `snaive-1d` it was 80%. The model's
+quantiles are per point. A smooth q90 path sits under a spike that could land at any of the
+day's 288 steps, and the maximum of per-point q90s is not a q90 of the maximum. As a result, the
+raw q90 flags almost none of the 77 days that set a new high (recall 3–18%).
+
+**A conformal correction fixes coverage, but TimesFM gains little on peaks.** The correction
+raises each series' peak bound by the 90% quantile of its own earlier misses. On origins 33 to
+40, where every arm has at least five earlier origins, it gives:
+
+| Arm         | Peak coverage | Headroom (scale units) | Alerts | Precision | Recall |
+| ----------- | ------------: | ---------------------: | -----: | --------: | -----: |
+| `snaive-1d` |          0.96 |                    5.3 |    421 |      0.11 |   0.98 |
+| `linear-7d` |          0.96 |                    4.4 |    360 |      0.13 |   0.98 |
+| `tfm-7d`    |          0.95 |                    4.7 |    382 |      0.12 |   0.96 |
+| `tfm-28d`   |          0.90 |                    2.5 |    205 |      0.19 |   0.81 |
+| `tfm-ens`   |          0.90 |                    2.7 |    223 |      0.17 |   0.81 |
+
+After correction, every arm reaches roughly the target coverage. The 28-day forecast gives the
+tightest bound, half the headroom and half the alerts, at the cost of recall. None of them is
+precise: at best about one alert in five was a real new high, and only 47 events fall in this
+window.
+
+**No series reached 90% of its limit.** The breach question the design gates on cannot be
+scored on this corpus.
+
+**Latency.** A batch of up to 64 series with a 288-step horizon took 3.6 s median at 1-day
+context, 7.6 s at 7 days and 29 s at 28 days. That is one TimesFM replica with 14 CPU cores,
+padded to buckets of 512, 2,048 and 8,192 points. A thousand series at 28 days is 16 batches,
+about eight minutes on one replica.
+
+### Caveats
+
+- One install dominates. `kage-management` supplies 60 of the 153 series. The evaluation hosts
+  are young and small, and their workloads are the harness itself.
+- Six weeks of data. The long set has 13 origins, and the conformal table only 8. Weekly
+  effects are seen at most five times.
+- No year-old series was available, so the three-window proposal's yearly window is untested.
+- The model runs zero-shot, with no covariates, on CPU. XReg and fine-tuning were not tried.
+
+### What it answers
+
+- Feeding the model 7 days to forecast day T works. It beats every baseline, and 28 days adds
+  almost nothing to the day's shape. Longer context is worth its fourfold cost only for peak
+  bounds.
+- Averaging forecasts from several windows is no better than the longest window alone. The
+  December case needs a year of archived series, fed either as one long hourly context or
+  through a holiday covariate. Neither exists yet.
+- An alert on "tomorrow's peak exceeds X" cannot use the model's raw q90. It needs a peak-level
+  calibration, and after calibration its advantage over the baselines is modest. A breach
+  forecast has to be judged on breach events, which this corpus does not contain.

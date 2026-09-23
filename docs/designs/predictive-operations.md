@@ -703,7 +703,43 @@ test: no cluster in reach is a year old, and Cloud Monitoring keeps five-minute 
 weeks and ten-minute downsamples for 24 months, so the collector design above has to archive its
 own series before year-over-year input exists at all.
 
-Results are pending and will be recorded here.
+### Results
+
+The first run covered 153 series from 12 clusters over 41 days, 2026-08-13 to 2026-09-23. The
+experiment's README has the tables and caveats. It found four things.
+
+**The forecaster clears the baseline bar on the day's shape.** Zero-shot TimesFM had a median
+MASE of 0.54–0.58, against 0.90 for seasonal-naive and 0.84 for linear. It beat seasonal-naive
+on 84–86% of (series, origin) pairs, and its quantile loss was about 40% lower. It was strongest
+in the first hour, at 0.18 against 0.65. The 7- and 28-day intervals held their nominal 80%
+coverage. Memory gained most. CPU requests, which move in steps at deploys, gained least.
+
+**Context length is not the lever.** The proposal's 7-day window came within 0.01 MASE of the
+28-day one. The ensemble of windows added nothing over the longest window alone. Seasonality
+longer than the context therefore has to come from the other two routes in
+[Covariates and long cycles](#covariates-and-long-cycles): long hourly context from archived
+series, or a covariate. That makes the collector's archive a prerequisite for year-over-year
+forecasting.
+
+**Per-point quantiles do not bound a peak.** The day's highest q90 covered the real daily
+maximum only 19–26% of the time, against 80% for seasonal-naive. It flagged 3–18% of the days
+that set a new high. A breach test that compares the q90 path to a threshold is therefore
+overconfident by construction.
+
+[Calibration](#calibration) must include a peak-level correction as well as per-point interval
+scaling. The experiment tried one, a split-conformal raise from each series' own earlier misses.
+It restored 90–96% peak coverage for every arm. Once corrected, TimesFM's peak alerts were only
+modestly better than the baselines': 19% precision at 81% recall for the 28-day arm, against 11%
+at 98% for seasonal-naive.
+
+**The breach gate is still open.** No series reached 90% of its limit in the window, so the
+[order of work](#order-of-work)'s phase-2 gate, breach precision at equal recall, has no events
+to score. It needs a longer window, a fleet with real pressure on its limits, or replayed past
+incidents.
+
+The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
+288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
+a thousand series fits in minutes.
 
 ## Order of work
 
