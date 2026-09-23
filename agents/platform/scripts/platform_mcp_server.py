@@ -20,6 +20,7 @@ from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
 from cluster_agent_profile import RESERVED_PROFILES, profile_name, read_cluster_identity
+from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import is_scaffolded, profiles_base
 
@@ -399,15 +400,25 @@ def _profiles_dir() -> Path:
     return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
 
 
+def _is_ready(home: Path) -> bool:
+    """A profile the dispatcher can hand a card to and its worker can serve.
+
+    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+    profiles/ that Hermes never registered, and a card assigned to it never runs.
+    The scaffold artifacts too: create_profile registers the profile and stamps its
+    identity before it fetches the credential and writes USER.md, so a scaffold that
+    stopped in between is registered, and its worker blocks at preflight.
+    """
+    return is_scaffolded(home) and all((home / f).is_file() for f in SCAFFOLD_ARTIFACTS)
+
+
 def _cluster_agent_roster() -> list[dict]:
     base = _profiles_dir()
     if not base.is_dir():
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        # is_scaffolded, not is_dir: a plugin mount point can leave a directory under
-        # profiles/ that Hermes never registered, and a card assigned to it never runs.
-        if home.name in RESERVED_PROFILES or not is_scaffolded(home):
+        if home.name in RESERVED_PROFILES or not _is_ready(home):
             continue
         entry = {"name": home.name}
         try:
@@ -443,8 +454,10 @@ def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
     Returns JSON with 'name' and 'exists'. Assign a card to 'name' only when
     'exists' is true; a card assigned to a profile that does not exist is never
     dispatched and sits in 'ready' forever. 'exists' is also false when the
-    profile under that name is pinned to a different cluster: sanitizing can map
-    two clusters to one name, and the profile's own identity is what it works on.
+    profile's scaffold never finished (no USER.md, so its worker would block at
+    preflight), and when the profile under that name is pinned to a different
+    cluster: sanitizing can map two clusters to one name, and the profile's own
+    identity is what it works on.
 
     Args:
         project: The GCP project the cluster is in. Required: the name is
@@ -457,7 +470,7 @@ def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
         return "ERROR: project, cluster and location are all required."
     name = profile_name(project, cluster, location)
     home = _profiles_dir() / name
-    exists = is_scaffolded(home)
+    exists = _is_ready(home)
     if exists:
         try:
             identity = read_cluster_identity(home)
@@ -465,8 +478,10 @@ def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
             log(f"Warning: could not read the cluster identity of {name}: {e}")
             identity = None
         # A profile scaffolded without its identity stamp is taken at its name.
+        # Case-insensitive, as profile_name is: GKE identifiers are lowercase, and a
+        # capitalised spelling of the same cluster is not a different cluster.
         wanted = {"project": project, "cluster": cluster, "location": location}
-        exists = identity is None or identity == wanted
+        exists = identity is None or all(identity[k].lower() == v.lower() for k, v in wanted.items())
     return json.dumps({"name": name, "exists": exists}, indent=2)
 
 

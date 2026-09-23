@@ -1322,6 +1322,7 @@ class TestClusterAgentRoster(unittest.TestCase):
         home = self.profiles / name
         home.mkdir(parents=True)
         (home / "profile.yaml").write_text("")
+        (home / "USER.md").write_text("")
         if identity:
             (home / "config.yaml").write_text(json.dumps({"cluster_identity": identity}))
         return home
@@ -1370,6 +1371,23 @@ class TestClusterAgentRoster(unittest.TestCase):
         self.assertTrue(mine["exists"])
         self.assertEqual(mine["name"], other["name"])
         self.assertFalse(other["exists"])
+
+    def test_resolve_matches_identity_case_insensitively(self):
+        self._profile(
+            "cluster-acme-prod-east-a-us-central1",
+            {"project": "acme-prod", "cluster": "east-a", "location": "us-central1"},
+        )
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("Acme-Prod", "east-a", "US-CENTRAL1"))
+        self.assertEqual({"name": "cluster-acme-prod-east-a-us-central1", "exists": True}, got)
+
+    def test_an_unfinished_scaffold_is_not_ready(self):
+        # create_profile registers and stamps the profile before it fetches the
+        # credential and writes USER.md; a scaffold that stopped there blocks its worker.
+        identity = {"project": "proj", "cluster": "seeded-a", "location": "us-central1"}
+        (self._profile("cluster-proj-seeded-a-us-central1", identity) / "USER.md").unlink()
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-a", "us-central1"))
+        self.assertFalse(got["exists"])
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
 
     def test_a_config_that_is_not_a_mapping_does_not_lose_the_roster(self):
         self._profile("cluster-good", {"project": "p", "cluster": "c", "location": "l"})
