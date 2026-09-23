@@ -1358,6 +1358,25 @@ class TestClusterAgentRoster(unittest.TestCase):
             got,
         )
 
+    def test_resolve_rejects_a_profile_pinned_to_another_cluster(self):
+        # acme-prod/east-a and acme-prod-east/a sanitize to the same name; the profile
+        # under it works the cluster its identity names, not the one asked about.
+        self._profile(
+            "cluster-acme-prod-east-a-us-central1",
+            {"project": "acme-prod", "cluster": "east-a", "location": "us-central1"},
+        )
+        mine = json.loads(platform_mcp_server.resolve_cluster_agent("acme-prod", "east-a", "us-central1"))
+        other = json.loads(platform_mcp_server.resolve_cluster_agent("acme-prod-east", "a", "us-central1"))
+        self.assertTrue(mine["exists"])
+        self.assertEqual(mine["name"], other["name"])
+        self.assertFalse(other["exists"])
+
+    def test_a_config_that_is_not_a_mapping_does_not_lose_the_roster(self):
+        self._profile("cluster-good", {"project": "p", "cluster": "c", "location": "l"})
+        (self._profile("cluster-list") / "config.yaml").write_text("- x\n")
+        got = json.loads(platform_mcp_server.list_cluster_agents())
+        self.assertEqual(["cluster-good", "cluster-list"], [e["name"] for e in got])
+
     def test_an_unregistered_directory_is_not_a_profile(self):
         # The kubelet can leave a plugin mount point under profiles/ that Hermes
         # never registered; a card assigned to it would never be dispatched.

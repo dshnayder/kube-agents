@@ -1677,13 +1677,14 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Three scripts an agent is told to run fail it: `cluster_agent_profile.py`,
-`cluster_agent_reconcile.py` and `kanban_notify_propagate.py`. Each gets a stub at its
+Three scripts fail an agent that runs them from the shell: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py` and `kanban_notify_propagate.py`, the last kept as a manual
+back-fill tool that no instruction names. Each gets a stub at its
 path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod. `platform_mcp_server.py` now carries the two reads, `list_cluster_agents` and
+pod. `platform_mcp_server.py` carries the two reads, `list_cluster_agents` and
 `resolve_cluster_agent`, which is how the agent finds a kanban assignee; creating and
 deleting a profile still has no tool.
 
@@ -2055,17 +2056,17 @@ it read-only (`mode=ro`) for its invariant and blocked-card queries and shells o
 read-write open of `/opt/data/kanban.db` from an agent shell is what the persona forbids.
 [`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
 does open it, `sqlite3.connect` at line 63 — and the Platform Agent's `SOUL.md` (§0, the
-sub-card paragraph under _Show your progress_; §6's fan-out bullet repeats it) tells the
-agent to run it from the shell. That is coherent today, where §0's ban on touching the
-board is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not
-survive the move.
+sub-card paragraph under _Show your progress_; §6's fan-out bullet repeated it) told the
+agent to run it from the shell. That was coherent before the split, where §0's ban on
+touching the board is a ban on ad-hoc edits and the script was a sanctioned writer, but
+it did not survive the move.
 
 Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
 write path that the rule exists to close, after a worker used that path on 2026-08-07
 to mark three cards `done` with an invented result. Under the split,
 `kanban_board_health.py` stays agent-side and stops being a problem;
 `kanban_notify_propagate.py` needs to become something the agent calls rather than
-something it runs. In the event it needed neither: `kanban_create` copies the creating
+something it runs. It turned out to need neither: `kanban_create` copies the creating
 worker's subscription onto the child (upstream `create_task`, and the
 `kanban_auto_subscribe` image patch), so the instructions to run it were removed and
 the script is left as a manual back-fill tool.

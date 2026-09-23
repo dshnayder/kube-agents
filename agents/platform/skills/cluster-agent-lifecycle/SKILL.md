@@ -28,7 +28,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(project_id, cluster_name, location)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — `cluster_agent_profile.py` is a stub in your shell, so do not run it and do not block on it.
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(project_id, cluster_name, location)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
    - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
    - If it does not exist, the cluster has no Cluster Agent yet (the hourly reconcile job below creates one for every cluster in scope). Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
@@ -44,7 +44,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
    The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(result=<the RCA>, summary=<one-line status>, metadata={...})`.
 
-3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
+3. **Read the result** — the card carries the requester's chat subscription, so the completion (or a `needs_input` block) is posted into their thread. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
 
 **Multi-cluster (fan-out):** create one card per cluster **with no `parents`**, in one burst, so they run in parallel. `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Then **keep your own card open**: poll each per-cluster card with `kanban_show(<id>)` (`sleep 60` between rounds), and once all of them are settled, synthesize their `result`/`metadata` into your own `kanban_complete(result=...)`. Completing your card is the delivery, so never complete it on a dispatch receipt — the image refuses a `kanban_complete` while your fanned-out cards are unfinished (#1010). See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 

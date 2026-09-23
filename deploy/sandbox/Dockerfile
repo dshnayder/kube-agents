@@ -434,8 +434,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 # instructions: a skill that starts calling a shared script the sandbox does not
 # have fails that test rather than failing in a pod.
 #
-# Deliberately absent, and stubbed below instead: three scripts an agent is told to
-# run that cannot run here. cluster_agent_profile.py and cluster_agent_reconcile.py
+# Deliberately absent, and stubbed below instead: three scripts that cannot run here
+# (kanban_notify_propagate.py is a manual back-fill tool no instruction names). cluster_agent_profile.py and cluster_agent_reconcile.py
 # shell out to `hermes profile create` and write /opt/data/profiles on the agent
 # pod's PVC — cluster_agent_profile.py:325 says so of itself — and
 # kanban_notify_propagate.py opens the kanban SQLite database in the agent pod's

@@ -412,8 +412,9 @@ def _cluster_agent_roster() -> list[dict]:
         entry = {"name": home.name}
         try:
             entry.update(read_cluster_identity(home) or {})
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError, AttributeError) as e:
             # One unreadable config costs that profile its identity, not the whole roster.
+            # AttributeError is a config.yaml that parses to a list or a scalar.
             log(f"Warning: could not read the cluster identity of {home.name}: {e}")
         roster.append(entry)
     return roster
@@ -441,7 +442,9 @@ def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> 
 
     Returns JSON with 'name' and 'exists'. Assign a card to 'name' only when
     'exists' is true; a card assigned to a profile that does not exist is never
-    dispatched and sits in 'ready' forever.
+    dispatched and sits in 'ready' forever. 'exists' is also false when the
+    profile under that name is pinned to a different cluster: sanitizing can map
+    two clusters to one name, and the profile's own identity is what it works on.
 
     Args:
         project_id: The GCP project the cluster is in. Required: the name is
@@ -453,7 +456,18 @@ def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> 
     if not (project_id and cluster_name and location):
         return "ERROR: project_id, cluster_name and location are all required."
     name = profile_name(project_id, cluster_name, location)
-    return json.dumps({"name": name, "exists": is_scaffolded(_profiles_dir() / name)}, indent=2)
+    home = _profiles_dir() / name
+    exists = is_scaffolded(home)
+    if exists:
+        try:
+            identity = read_cluster_identity(home)
+        except (OSError, UnicodeDecodeError, AttributeError) as e:
+            log(f"Warning: could not read the cluster identity of {name}: {e}")
+            identity = None
+        # A profile scaffolded without its identity stamp is taken at its name.
+        wanted = {"project": project_id, "cluster": cluster_name, "location": location}
+        exists = identity is None or identity == wanted
+    return json.dumps({"name": name, "exists": exists}, indent=2)
 
 
 def _kubeconfig_slug(value: str) -> str:

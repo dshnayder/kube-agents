@@ -22,7 +22,10 @@
 # child, so each staged sub-step's completion posts its own line into the same
 # chat thread the original request came from.
 #
-# Usage (run by the specialist right after creating a child card):
+# kanban_create now copies the subscription itself (upstream create_task and the
+# kanban_auto_subscribe image patch); this is kept to back-fill a card created without it.
+#
+# Usage:
 #   python3 /opt/data/scripts/kanban_notify_propagate.py --to <child_id> [--from <parent_id>]
 #
 # `--from` defaults to $HERMES_KANBAN_TASK (the worker's current card). The board
