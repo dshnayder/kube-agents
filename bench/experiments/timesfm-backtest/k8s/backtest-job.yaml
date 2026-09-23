@@ -1,0 +1,29 @@
+# The backtest itself. RUN is substituted by cluster.sh; the KSA reads the corpus and writes
+# results through a direct Workload Identity grant on the bucket.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backtest
+  namespace: timesfm
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backtest-${RUN}
+  namespace: timesfm
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: backtest
+      restartPolicy: Never
+      containers:
+        - name: backtest
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/timesfm-backtest:v3
+          args:
+            - --data=gs://agentic-harness-demo-timesfm-exp/series.jsonl.gz
+            - --forecaster=http://forecaster:8080
+            - --out=gs://agentic-harness-demo-timesfm-exp/results/${RUN}
+            - --workers=4
+          resources:
+            requests: { cpu: "1", memory: 6Gi }

@@ -682,7 +682,27 @@ rule sets out, and the case is never added to the blocking roster in the change 
 The experiment is in [`bench/experiments/timesfm-backtest/`](../../bench/experiments/timesfm-backtest/README.md):
 a rolling-origin, day-ahead backtest of TimesFM 2.5 on real series from the eval-pool clusters and
 the production install, against seasonal-naive and linear baselines. Each origin feeds the model
-the seven days before a day and forecasts that day, then scores the forecast against what happened.
+the days before a UTC midnight and forecasts the 288 five-minute points of the day after it, then
+scores the forecast against what happened.
+
+The starting proposal was a single comparison: the model reads T-8d to T-1d and predicts day T.
+The experiment keeps that as its `tfm-7d` arm and changes three things around it. It runs every
+midnight with enough history as an origin, because one day is one draw. It runs the same origins
+through `snaive-1d`, `snaive-7d` and `linear-7d`, because the decision rule above makes
+seasonal-naive the bar a forecast has to clear. And it adds a 28-day arm, because a model sees a
+weekly cycle only after it has seen two.
+
+The second proposal was to feed three windows: the last day, the last month, and the same month a
+year earlier, so a December spike is visible in December. The motivation holds; the mechanism does
+not fit the model. TimesFM 2.5 forecasts one univariate series at a time, so three windows cannot
+be inputs side by side. The same effect comes from one long context (a year at hourly resolution is
+8,760 points, inside the 16,384 the model accepts), from combining forecasts made over different
+windows, or from a holiday calendar passed as a covariate through XReg. The experiment tests the
+combination as `tfm-ens`, the mean of the 1-, 7- and 28-day forecasts. The yearly window it cannot
+test: no cluster in reach is a year old, and Cloud Monitoring keeps five-minute points for six
+weeks and ten-minute downsamples for 24 months, so the collector design above has to archive its
+own series before year-over-year input exists at all.
+
 Results are pending and will be recorded here.
 
 ## Order of work

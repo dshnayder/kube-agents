@@ -1,0 +1,38 @@
+# TimesFM 2.5 on CPU. One pod per n2-standard-16 node: the model uses every core it is given,
+# and the backtest sends one request per replica at a time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forecaster
+  namespace: timesfm
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { app: forecaster }
+  template:
+    metadata:
+      labels: { app: forecaster }
+    spec:
+      containers:
+        - name: forecaster
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/timesfm-forecaster:v1
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: "14", memory: 12Gi }
+            limits: { memory: 16Gi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forecaster
+  namespace: timesfm
+spec:
+  selector: { app: forecaster }
+  ports: [{ port: 8080, targetPort: 8080 }]
