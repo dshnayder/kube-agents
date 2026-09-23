@@ -449,7 +449,14 @@ DELTA_RE = re.compile(
 # stream pays one run of withheld `resolved` for a rename in this one; a
 # per-stream stamp would be the alternative, and it is a bigger change than
 # the single run it would save.
-ID_SCHEME = 3
+#
+# 4: the security-patch-orchestrator collector (`patch_readiness.py`) makes the
+# same rename for its stream, for the same reason, so every patch finding is
+# re-spelled on its first run under the collector and scheme 3's ledgers and
+# remediation pull requests cannot be joined against it.
+ID_SCHEME = 4
+# Joins a qualified cluster name's `<project>/<location>/<name>` segments.
+QUALIFIED_TARGET_SEPARATOR = "/"
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -489,6 +496,12 @@ HELD_IDS_RE = re.compile(rf"<!--[ \t]*{HELD_IDS_COMMENT}:[ \t]*(\[.*?\])[ \t]*--
 HELD_CHECK_LINE_RE = re.compile(
     r"^- \*\*Check:\*\* `([^`\n]*)` — the collector ran `([^`\n]*)` there", re.M
 )
+# One audited row of a previous body's Scope table: cluster, location, project.
+# Read back only to qualify a bare cluster name when a scheme bump re-spells
+# the rows (`_scope_qualified_names`).
+# The location cell is the one written without a code span, which is what
+# tells this row from the evidence appendix's `cluster | check | command` rows.
+SCOPE_ROW_RE = re.compile(r"^\| `([^`\n]+)` \| ([^|`\n]+?) \| `([^`\n]+)` \|", re.M)
 WHERE_LINE_RE = re.compile(
     r"^- \*\*Where:\*\* `([^`\n]*)`"
     r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
@@ -1402,10 +1415,10 @@ def checks_na(cluster: object) -> list[str]:
     """The check slugs a `scope.clusters` entry declares inapplicable.
 
     A check that *cannot* apply to a cluster is not a check that failed to run,
-    and the difference decides whether the stream can ever close. Node-pool
-    checks against an Autopilot cluster are the standing example: Google owns
-    the node pools, so there is nothing there to inspect and never will be.
-    Counted as gaps they made every Autopilot cluster permanently `⚠`, which
+    and the difference decides whether the stream can ever close. Workload
+    checks for shapes Autopilot admission rejects (privileged containers,
+    hostPath volumes) are the standing example: nothing there can match, and
+    never will. Counted as gaps they made every Autopilot cluster permanently `⚠`, which
     pinned `resolved` at 0, stopped every stale remediation pull request from
     closing, and left a ledger that could not retire no matter how healthy the
     fleet got.
@@ -1847,6 +1860,27 @@ def parse_id_scheme(body: str | None) -> int:
         return 0
 
 
+def _qualified_scope_entries(
+    cluster: str, audited_names: set[str], qualified_by_leaf: dict[str, list[str]]
+) -> list[str]:
+    """The qualified scope entries a bare cluster name could stand for.
+
+    A collector qualifies names as `<project>/<location>/<name>` while its
+    candidates' `object` still reads `Cluster/<name>`, so the bare name is the
+    easy misspelling. `qualified_by_leaf` keys each such entry by its name's
+    id segment, so `Prod` finds `acme/us-east1/prod` as the id would."""
+    if cluster in audited_names:
+        return []
+    return sorted(qualified_by_leaf.get(_id_segment(cluster), []))
+
+
+def _scope_spelling_hint(
+    cluster: str, audited_names: set[str], qualified_by_leaf: dict[str, list[str]]
+) -> str:
+    entries = _qualified_scope_entries(cluster, audited_names, qualified_by_leaf)
+    return f" Did you mean {' or '.join(map(repr, entries))}?" if entries else ""
+
+
 def validate_findings(data: object, audit_id: str) -> dict:
     """Validate a findings document. Raises ValidationError naming index + field."""
     validate_audit_id(audit_id)
@@ -1882,6 +1916,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
     # claim to have performed, or excused itself from, a check that is not one.
     finding_check_set = audit_finding_checks(audit_id)
     audited_names: set[str] = set()
+    qualified_by_leaf: dict[str, list[str]] = {}
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
             raise ValidationError(f"scope.clusters[{i}]: expected an object")
@@ -1889,7 +1924,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
-        # A finding names its cluster by bare name, and so does every lookup
+        # A finding names its cluster by this name, and so does every lookup
         # that resolves one back to this table. Two same-named clusters in two
         # projects make that name ambiguous, and the ambiguity is already
         # load-bearing today: `coverage_gaps` and the scope table resolve by
@@ -1903,12 +1938,18 @@ def validate_findings(data: object, audit_id: str) -> dict:
         if name in audited_names:
             raise ValidationError(
                 f"scope.clusters[{i}].name: duplicate cluster {name!r}. Findings "
-                "reference a cluster by bare name, so two clusters sharing one "
+                "reference a cluster by this name, so two clusters sharing one "
                 "name cannot be told apart — their findings would merge into a "
                 "single identity and the ledger would under-report. Audit the "
                 "projects in separate runs."
             )
         audited_names.add(name)
+        leaf = name.rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
+        qualified = QUALIFIED_TARGET_SEPARATOR.join(
+            (str(cluster["project"]), str(cluster["location"]), leaf)
+        )
+        if name == qualified:
+            qualified_by_leaf.setdefault(_id_segment(leaf), []).append(name)
         # Optional, but non-empty when present: "I read this cluster fine, but
         # some checks did not run or do not apply" is a different claim from
         # "I could not read this cluster", and conflating the two produces
@@ -2108,6 +2149,21 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "against it is a contradiction. Move the cluster to scope.clusters "
                 "(with a limitations note) or drop the finding"
             )
+        # Only the bare form of a qualified entry. A finding may name a target
+        # scope does not list -- the cost stream files unattributable disks
+        # under `project/<id>` -- but not a second spelling of one it does,
+        # which derives a second id for the same finding.
+        qualified = _qualified_scope_entries(
+            str(finding["cluster"]), audited_names, qualified_by_leaf
+        )
+        if qualified:
+            raise ValidationError(
+                f"findings[{i}].cluster: {finding['cluster']!r} is the bare "
+                f"name of {' and '.join(map(repr, qualified))} in scope.clusters. "
+                "Write the qualified name of the cluster the finding is on: the "
+                "cluster is part of the finding's id, so the bare name files "
+                "this finding as a new one beside the collector's candidate"
+            )
         # namespace may legitimately be empty for cluster-scoped objects.
         _require_str(finding.get("namespace", ""), f"findings[{i}].namespace")
         _require_str(finding.get("object"), f"findings[{i}].object", allow_empty=False)
@@ -2285,7 +2341,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
             if cluster not in audited_names:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
-                    "finding can only be confirmed gone on a cluster this run read"
+                    "finding can only be confirmed gone on a cluster this run read."
+                    + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
@@ -2380,7 +2437,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
                     "declaration justifies a posture this run observed, so the "
-                    "cluster it was observed on must be one this run read"
+                    "cluster it was observed on must be one this run read."
+                    + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
@@ -3196,9 +3254,9 @@ def collector_held_entries(
         held_ids = sorted(flagged)
         titles: dict[str, str] = {}
     else:
-        marker_ids, _ = previous_marker_ids(previous_body)
+        marker_ids, _ = previous_marker_ids(previous_body, flagged)
         held_ids = [fid for fid in marker_ids if fid in flagged]
-        respelled = _respelled_rows(previous_body)
+        respelled = _respelled_rows(previous_body, flagged)
         # Titles from the rows that recorded a location, not from every
         # heading. `held_row_from_id` renders a heading too -- "<id> (carried
         # by id; location not recorded on the previous ledger)" -- and it is a
@@ -4360,7 +4418,24 @@ def parse_held_ids(body: str | None) -> list[str]:
     return kept
 
 
-def _respelled_rows(body: str | None) -> dict[str, str]:
+def _scope_qualified_names(body: str) -> dict[str, str]:
+    """{bare cluster name: `<project>/<location>/<name>`}, from a previous body's Scope table.
+
+    Schemes 3 and 4 moved a stream's cluster names from bare to qualified, so a
+    `Where:` line written before the move names a cluster no collector
+    candidate spells that way any more. The Scope row beside it has the
+    project and location that qualify it. A name audited at two locations is
+    left out: which row a finding belonged to is not recorded, and guessing
+    would hold the wrong cluster's finding.
+    """
+    seen: dict[str, set[str]] = {}
+    for name, location, project in SCOPE_ROW_RE.findall(body):
+        if "/" not in name:
+            seen.setdefault(name, set()).add(f"{project}/{location.strip()}/{name}")
+    return {name: next(iter(q)) for name, q in seen.items() if len(q) == 1}
+
+
+def _respelled_rows(body: str | None, flagged: set[str] | frozenset[str] = frozenset()) -> dict[str, str]:
     """{id as the previous body spelled it: id under the current scheme}, per rendered row.
 
     A row's `Where:` line and the check in its id are the fields identity is
@@ -4368,21 +4443,37 @@ def _respelled_rows(body: str | None) -> dict[str, str]:
     harness runs — which is what a marker cannot be. The check slug is read
     off the id: `_shorten_id` never touches it, and `unaccounted_previous_findings`
     already relies on the same.
+
+    Under another scheme a row naming a bare cluster is also spelled with the
+    name qualified from the body's Scope table (`_scope_qualified_names`), and
+    that spelling wins when the collector's `flagged` ids carry it and not the
+    bare one. Schemes 3 and 4 moved a stream's clusters from bare to qualified
+    names; matched on the bare spelling alone, its first run under the
+    collector held nothing, and a clean document closed the ledger over
+    findings the collector still flagged.
     """
-    return {
-        raw: published_id(
-            {
-                "check": raw.split(".", 1)[0],
-                "cluster": where["cluster"],
-                "namespace": where["namespace"],
-                "object": where["object"],
-            }
-        )
-        for raw, where in parse_finding_locations(body).items()
-    }
+    stale = parse_id_scheme(body) != ID_SCHEME
+    qualified = _scope_qualified_names(normalise_newlines(body)) if stale and flagged else {}
+    out: dict[str, str] = {}
+    for raw, where in parse_finding_locations(body).items():
+        identity = {
+            "check": raw.split(".", 1)[0],
+            "cluster": where["cluster"],
+            "namespace": where["namespace"],
+            "object": where["object"],
+        }
+        fid = published_id(identity)
+        if fid not in flagged and where["cluster"] in qualified:
+            renamed = published_id({**identity, "cluster": qualified[where["cluster"]]})
+            if renamed in flagged:
+                fid = renamed
+        out[raw] = fid
+    return out
 
 
-def previous_marker_ids(body: str | None) -> tuple[list[str], int]:
+def previous_marker_ids(
+    body: str | None, flagged: set[str] | frozenset[str] = frozenset()
+) -> tuple[list[str], int]:
     """The previous marker's ids under the current scheme, and the residual.
 
     Under the current scheme the marker is read as it stands. Under another,
@@ -4391,11 +4482,13 @@ def previous_marker_ids(body: str | None) -> tuple[list[str], int]:
     marker id, dropping out of the bump run's marker and leaving the ledger
     unannounced; held ids with no row — the note and empty tiers write none —
     are the residual, which the caller reports and which the bump loses.
+    `flagged` picks between a row's bare and qualified spellings
+    (`_respelled_rows`).
     """
     marker = parse_delta_block(body)
     if not marker or parse_id_scheme(body) == ID_SCHEME:
         return marker, 0
-    respelled = _respelled_rows(body)
+    respelled = _respelled_rows(body, flagged)
     # The residual is counted over the held list, not the whole marker: a
     # rendered finding with no row is main's cost of a bump, not a hold lost.
     return [respelled[fid] for fid in marker if fid in respelled], sum(
@@ -4512,8 +4605,20 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     for cluster in (data.get("scope") or {}).get("clusters") or []:
         if isinstance(cluster, dict):
             clusters_by_key.setdefault(_id_segment(str(cluster.get("name", ""))), cluster)
+    # A body from before a stream qualified its cluster names names them bare;
+    # the Scope table qualifies them, as `_respelled_rows` does.
+    stale = parse_id_scheme(previous_body) != ID_SCHEME
+    qualified = _scope_qualified_names(normalise_newlines(previous_body)) if stale else {}
     held: list[dict] = []
     for fid, where in previous.items():
+        renamed = qualified.get(where["cluster"])
+        if (
+            renamed
+            and _id_segment(where["cluster"]) not in clusters_by_key
+            and _id_segment(renamed) in clusters_by_key
+        ):
+            where = {**where, "cluster": renamed}
+            fid = published_id({"check": fid.split(".", 1)[0], **where})
         # `_shorten_id` never touches the leading segment, so the check slug
         # survives shortening; the other three are read verbatim off the body
         # rather than off the id, which may have been clipped.
