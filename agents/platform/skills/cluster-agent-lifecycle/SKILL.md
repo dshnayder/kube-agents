@@ -7,7 +7,7 @@ description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes
 
 As the Platform Agent you own the lifecycle of **Cluster Agents**. A Cluster Agent is a Hermes _profile_ — an isolated agent instance with its own persona (`SOUL.md`), scoped toolset, and home directory — that you create dynamically **inside your own pod**, one per managed GKE cluster. It handles read-only runtime operations and deep workload diagnostics on that single cluster, and returns its findings to you.
 
-You never debug tenant workloads directly. You delegate that to the cluster's Cluster Agent and act on what it returns.
+You never debug tenant workloads directly while the cluster has a Cluster Agent. You delegate that to it and act on what it returns.
 
 The engine for all of this is the helper script `scripts/cluster_agent_profile.py` (resolved at `/opt/data/scripts/cluster_agent_profile.py` at runtime).
 
@@ -28,9 +28,9 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(cluster_name, location, project_id)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — `cluster_agent_profile.py` is a stub in your shell, so do not run it and do not block on it.
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(project_id, cluster_name, location)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — `cluster_agent_profile.py` is a stub in your shell, so do not run it and do not block on it.
    - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
-   - If it does not exist, you cannot create it from your shell. Investigate the cluster yourself this once and say in your `result` that it had no Cluster Agent.
+   - If it does not exist, the cluster has no Cluster Agent yet (the hourly reconcile job below creates one for every cluster in scope). Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
 2. **Create the card** with the request in the body:
 

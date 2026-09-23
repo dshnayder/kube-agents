@@ -1683,7 +1683,9 @@ path in the sandbox that prints why it cannot run there and exits non-zero. Leav
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod; `platform_mcp_server.py` exposes no profile tool today.
+pod. `platform_mcp_server.py` now carries the two reads, `list_cluster_agents` and
+`resolve_cluster_agent`, which is how the agent finds a kanban assignee; creating and
+deleting a profile still has no tool.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
@@ -2063,7 +2065,10 @@ write path that the rule exists to close, after a worker used that path on 2026-
 to mark three cards `done` with an invented result. Under the split,
 `kanban_board_health.py` stays agent-side and stops being a problem;
 `kanban_notify_propagate.py` needs to become something the agent calls rather than
-something it runs.
+something it runs. In the event it needed neither: `kanban_create` copies the creating
+worker's subscription onto the child (upstream `create_task`, and the
+`kanban_auto_subscribe` image patch), so the instructions to run it were removed and
+the script is left as a manual back-fill tool.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
 `hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and

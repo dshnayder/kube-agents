@@ -1321,17 +1321,18 @@ class TestClusterAgentRoster(unittest.TestCase):
     def _profile(self, name, identity=None):
         home = self.profiles / name
         home.mkdir(parents=True)
+        (home / "profile.yaml").write_text("")
         if identity:
             (home / "config.yaml").write_text(json.dumps({"cluster_identity": identity}))
         return home
 
     def test_resolve_reports_an_existing_profile(self):
         self._profile("cluster-proj-seeded-a-us-central1")
-        got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-a", "us-central1", "proj"))
+        got = json.loads(platform_mcp_server.resolve_cluster_agent("proj", "seeded-a", "us-central1"))
         self.assertEqual({"name": "cluster-proj-seeded-a-us-central1", "exists": True}, got)
 
     def test_resolve_reports_a_missing_profile(self):
-        got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-z", "us-central1", "proj"))
+        got = json.loads(platform_mcp_server.resolve_cluster_agent("proj", "seeded-z", "us-central1"))
         self.assertEqual({"name": "cluster-proj-seeded-z-us-central1", "exists": False}, got)
 
     def test_resolve_reads_the_data_root_not_the_profile_home(self):
@@ -1339,7 +1340,7 @@ class TestClusterAgentRoster(unittest.TestCase):
         # a level up from it, under PLATFORM_AGENT_HOME.
         self._profile("cluster-proj-seeded-a-us-central1")
         with patch.dict(os.environ, {"HERMES_HOME": str(self.profiles / "platform")}):
-            got = json.loads(platform_mcp_server.resolve_cluster_agent("seeded-a", "us-central1", "proj"))
+            got = json.loads(platform_mcp_server.resolve_cluster_agent("proj", "seeded-a", "us-central1"))
         self.assertTrue(got["exists"])
 
     def test_list_carries_identity_and_skips_reserved_profiles(self):
@@ -1355,6 +1356,36 @@ class TestClusterAgentRoster(unittest.TestCase):
                 {"name": "cluster-unstamped"},
             ],
             got,
+        )
+
+    def test_an_unregistered_directory_is_not_a_profile(self):
+        # The kubelet can leave a plugin mount point under profiles/ that Hermes
+        # never registered; a card assigned to it would never be dispatched.
+        (self.profiles / "cluster-proj-seeded-a-us-central1" / "plugins").mkdir(parents=True)
+        got = json.loads(platform_mcp_server.resolve_cluster_agent("proj", "seeded-a", "us-central1"))
+        self.assertFalse(got["exists"])
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_agents()))
+
+    def test_resolve_requires_the_project(self):
+        self.assertTrue(
+            platform_mcp_server.resolve_cluster_agent("", "seeded-a", "us-central1").startswith("ERROR")
+        )
+
+    def test_one_unreadable_profile_does_not_lose_the_roster(self):
+        self._profile("cluster-proj-seeded-a-us-central1")
+        self._profile("cluster-proj-seeded-b-us-central1")
+        real = platform_mcp_server.read_cluster_identity
+
+        def flaky(home):
+            if home.name.endswith("seeded-a-us-central1"):
+                raise PermissionError("denied")
+            return real(home)
+
+        with patch.object(platform_mcp_server, "read_cluster_identity", flaky):
+            got = json.loads(platform_mcp_server.list_cluster_agents())
+        self.assertEqual(
+            ["cluster-proj-seeded-a-us-central1", "cluster-proj-seeded-b-us-central1"],
+            [p["name"] for p in got],
         )
 
     def test_list_is_empty_without_a_profiles_tree(self):

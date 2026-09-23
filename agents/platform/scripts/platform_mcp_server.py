@@ -21,6 +21,7 @@ import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
 from cluster_agent_profile import RESERVED_PROFILES, profile_name, read_cluster_identity
 from gke_endpoint import dns_endpoint_args
+from profile_scaffold import is_scaffolded, profiles_base
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -29,7 +30,6 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # spec.harness.hermes.agentHome; not HERMES_HOME, which in a platform worker is the
 # platform profile's own home and would show a roster with no Cluster Agents in it.
 DEFAULT_AGENT_HOME = "/opt/data"
-PROFILES_DIRNAME = "profiles"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
 # synchronously — it creates the session, runs a whole Chat Agent turn (its own
@@ -396,7 +396,7 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
 # its terminal. This server runs in the agent pod, where the tree is.
 
 def _profiles_dir() -> Path:
-    return Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME) / PROFILES_DIRNAME
+    return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
 
 
 def _cluster_agent_roster() -> list[dict]:
@@ -405,9 +405,17 @@ def _cluster_agent_roster() -> list[dict]:
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if not home.is_dir() or home.name in RESERVED_PROFILES:
+        # is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+        # profiles/ that Hermes never registered, and a card assigned to it never runs.
+        if home.name in RESERVED_PROFILES or not is_scaffolded(home):
             continue
-        roster.append({"name": home.name, **(read_cluster_identity(home) or {})})
+        entry = {"name": home.name}
+        try:
+            entry.update(read_cluster_identity(home) or {})
+        except (OSError, UnicodeDecodeError) as e:
+            # One unreadable config costs that profile its identity, not the whole roster.
+            log(f"Warning: could not read the cluster identity of {home.name}: {e}")
+        roster.append(entry)
     return roster
 
 
@@ -427,7 +435,7 @@ def list_cluster_agents() -> str:
 
 
 @mcp.tool()
-def resolve_cluster_agent(cluster_name: str, location: str, project_id: str = "") -> str:
+def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> str:
     """
     Resolve the Cluster Agent profile for one GKE cluster: the kanban assignee.
 
@@ -436,15 +444,16 @@ def resolve_cluster_agent(cluster_name: str, location: str, project_id: str = ""
     dispatched and sits in 'ready' forever.
 
     Args:
+        project_id: The GCP project the cluster is in. Required: the name is
+            derived from it, and the agent's own project is the wrong answer for
+            a cluster anywhere else in the fleet.
         cluster_name: The name of the GKE cluster.
         location: The cluster's region or zone, as GKE reports it.
-        project_id: Optional GCP Project ID. If omitted, resolves automatically.
     """
-    pid = project_id if project_id else get_project_id()
-    if not pid:
-        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
-    name = profile_name(pid, cluster_name, location)
-    return json.dumps({"name": name, "exists": (_profiles_dir() / name).is_dir()}, indent=2)
+    if not (project_id and cluster_name and location):
+        return "ERROR: project_id, cluster_name and location are all required."
+    name = profile_name(project_id, cluster_name, location)
+    return json.dumps({"name": name, "exists": is_scaffolded(_profiles_dir() / name)}, indent=2)
 
 
 def _kubeconfig_slug(value: str) -> str:
