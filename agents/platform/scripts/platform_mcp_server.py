@@ -421,7 +421,7 @@ def _cluster_agent_roster() -> list[dict]:
 
 
 @mcp.tool()
-def list_cluster_agents() -> str:
+def list_cluster_profiles() -> str:
     """
     List every Cluster Agent profile, with the cluster each one is pinned to.
 
@@ -436,7 +436,7 @@ def list_cluster_agents() -> str:
 
 
 @mcp.tool()
-def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> str:
+def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
     """
     Resolve the Cluster Agent profile for one GKE cluster: the kanban assignee.
 
@@ -447,15 +447,15 @@ def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> 
     two clusters to one name, and the profile's own identity is what it works on.
 
     Args:
-        project_id: The GCP project the cluster is in. Required: the name is
+        project: The GCP project the cluster is in. Required: the name is
             derived from it, and the agent's own project is the wrong answer for
             a cluster anywhere else in the fleet.
-        cluster_name: The name of the GKE cluster.
+        cluster: The name of the GKE cluster.
         location: The cluster's region or zone, as GKE reports it.
     """
-    if not (project_id and cluster_name and location):
-        return "ERROR: project_id, cluster_name and location are all required."
-    name = profile_name(project_id, cluster_name, location)
+    if not (project and cluster and location):
+        return "ERROR: project, cluster and location are all required."
+    name = profile_name(project, cluster, location)
     home = _profiles_dir() / name
     exists = is_scaffolded(home)
     if exists:
@@ -465,7 +465,7 @@ def resolve_cluster_agent(project_id: str, cluster_name: str, location: str) -> 
             log(f"Warning: could not read the cluster identity of {name}: {e}")
             identity = None
         # A profile scaffolded without its identity stamp is taken at its name.
-        wanted = {"project": project_id, "cluster": cluster_name, "location": location}
+        wanted = {"project": project, "cluster": cluster, "location": location}
         exists = identity is None or identity == wanted
     return json.dumps({"name": name, "exists": exists}, indent=2)
 

@@ -28,7 +28,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `resolve_cluster_agent(project_id, cluster_name, location)` tool. It returns `name` and `exists`; `list_cluster_agents()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `get_cluster_profile_name(project, cluster, location)` tool. It returns `name` and `exists`; `list_cluster_profiles()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
    - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
    - If it does not exist, the cluster has no Cluster Agent yet (the hourly reconcile job below creates one for every cluster in scope). Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
@@ -128,4 +128,4 @@ net, not the primary path.
 
 ## Listing profiles
 
-Call `list_cluster_agents()`. It lists the currently provisioned Cluster Agent profiles (one per managed cluster) with the cluster each is pinned to.
+Call `list_cluster_profiles()`. It lists the currently provisioned Cluster Agent profiles (one per managed cluster) with the cluster each is pinned to.

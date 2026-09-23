@@ -1684,8 +1684,8 @@ path in the sandbox that prints why it cannot run there and exits non-zero. Leav
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod. `platform_mcp_server.py` carries the two reads, `list_cluster_agents` and
-`resolve_cluster_agent`, which is how the agent finds a kanban assignee; creating and
+pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
 deleting a profile still has no tool.
 
 None of this is held together by review.
