@@ -4,12 +4,23 @@
 already has; everything after it is a direction for kube-agents, not a build plan with dates. The
 one experiment it asks for is a backtest, and the document says what result would change it.
 
+**Authors:** Dmitry Shnayder; Gari Singh — the prediction-plane design merged here.
+
 ## TL;DR
 
 kube-agents has already evolved from a **reactive** agent, which fixes what a person reports,
 to a **proactive** one, whose scheduled audits and event triggers find and fix problems nobody has
 reported yet. This document proposes the next step: a **predictive** mode, in which kube-agents
 forecasts a failure and resolves it before it happens.
+
+It merges two designs. The kube-agents half — the finding shape, the compute-then-judge split, the
+ledger and pull-request path, the capability lifecycle and the eval loop — is Dmitry Shnayder's.
+The platform-agnostic half comes from Gari Singh's
+[Zero-Shot Forecasting for Predictive Operations](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7):
+the forecast, prediction and action layers, the reference-type taxonomy and use-case catalogue,
+the context-builder rules, the calibration layer, the cost-derived decision rule, the triage
+cascade, the intervention problem, and the prerequisite spikes. Where the two disagreed, this
+document says so and says how it resolves.
 
 ## In short
 
@@ -25,16 +36,24 @@ current rate, a node pool a week from its autoscaler maximum, a container whose 
 climbing toward its memory limit, a namespace approaching its ResourceQuota: each is a boring number
 today and an incident later, and the only difference between the two is when someone looks.
 
+The defect this fixes is the same everywhere: the cluster has a rich history of a signal and every
+control that watches it uses only the most recent value. A disk alert at 85% is minutes of warning
+on a fast-filling volume and three weeks of ignored ticket on a slow one. The information needed to
+act earlier is already in the series; nothing reads it.
+
 The mechanism is a **forecast threshold breach**. The agent already knows the limits, because they
 are declared objects it reads today. Cloud Monitoring already holds the history, and the credential
 proxy already relays read-only Monitoring calls. What is missing is the forecaster in between, and
 the finding shape and remediation path that turn a forecast into work. The forecaster proposed is
 [TimesFM 2.5](https://github.com/google-research/timesfm), Google's open-weight time-series
-foundation model, run as a credential-free service inside the install. The action a predictive
-finding produces is the same declarative path every finding takes: a ledger entry and a pull
-request, with a human merging. What changes is only _when_ it fires — which is exactly the property
-the [workflow model](../architecture/04-workflow-model.md) gives a trigger: it changes when an agent
-wakes, never what it may do.
+foundation model, run as a credential-free service inside the install. What makes a foundation
+model the right tool, rather than Holt-Winters or Prophet, is that it forecasts **zero-shot**: no
+per-series fitting, no per-series hyperparameters, and no warm-up history, so a claim created
+yesterday is treated the same as one a year old, and the model is small enough to run on CPU beside
+the agent. The action a predictive finding produces is the same declarative path every finding
+takes: a ledger entry and a pull request, with a human merging. What changes is only _when_ it
+fires — which is exactly the property the [workflow model](../architecture/04-workflow-model.md)
+gives a trigger: it changes when an agent wakes, never what it may do.
 
 The vocabulary is deliberate. _Proactive_ is already taken by the audits and the site's
 [Proactive autonomy](../site/src/content/docs/overview/proactive-autonomy.md) page, and it means
@@ -47,20 +66,23 @@ before the breach is _preemptive remediation_.
 Each section goes a level deeper than the one before it, so a human reader can stop as soon as they
 have what they came for.
 
-| Section                                                       | What it gives you                                                     |
-| ------------------------------------------------------------- | --------------------------------------------------------------------- |
-| [Scope](#scope)                                               | what an install already has, and what this document adds              |
-| [The three modes](#the-three-modes)                           | the definition of predictive, and the shape of problem it owns        |
-| [What a predictive finding is](#what-a-predictive-finding-is) | the forecast threshold breach, its fields, and the first series       |
-| [The forecaster](#the-forecaster)                             | why TimesFM 2.5, what it is not, and the alternatives weighed         |
-| [Where the series come from](#where-the-series-come-from)     | the metrics source contract, and why no new credential path is needed |
-| [How it fits the pipeline](#how-it-fits-the-pipeline)         | code forecasts, the agent judges; ledger, pull request, event path    |
-| [Honesty about the future](#honesty-about-the-future)         | calibration, the hit-and-miss record, and the ways a series lies      |
-| [Evaluation](#evaluation)                                     | the red case the loop requires, and why a replay fixture comes first  |
-| [Order of work](#order-of-work)                               | phases with the decision gate that could stop them                    |
-| [Out of scope](#out-of-scope)                                 | what this is not                                                      |
-| [Open questions](#open-questions)                             | what only a build or a backtest can answer                            |
-| [Prior art](#prior-art)                                       | what other agents and platforms ship today, and what it changes here  |
+| Section                                                       | What it gives you                                                                   |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| [Scope](#scope)                                               | what an install already has, and what this document adds                            |
+| [The three modes](#the-three-modes)                           | the definition of predictive, and the shape of problem it owns                      |
+| [Three layers](#three-layers-forecast-prediction-action)      | forecast, prediction and action, and where kube-agents draws its boundary           |
+| [What a predictive finding is](#what-a-predictive-finding-is) | the breach, its reference types, its fields, the first series, and the use-case map |
+| [The forecaster](#the-forecaster)                             | why TimesFM 2.5, what it is not, covariates, and the alternatives weighed           |
+| [Where the series come from](#where-the-series-come-from)     | the metrics source contract, and why no new credential path is needed               |
+| [How it fits the pipeline](#how-it-fits-the-pipeline)         | triage, forecast, decision rule, agent judgement; ledger, pull request, event path  |
+| [Honesty about the future](#honesty-about-the-future)         | baselines, calibration, the intervention problem, and the ways a series lies        |
+| [Evaluation](#evaluation)                                     | the metrics, the red case the loop requires, and why a replay fixture comes first   |
+| [Backtest experiment](#backtest-experiment)                   | the day-ahead backtest on real clusters, and its results                            |
+| [Order of work](#order-of-work)                               | phases and prerequisite spikes, with the decision gate that could stop them         |
+| [Success measures and risks](#success-measures-and-risks)     | the targets a phase is judged against, and what could sink it                       |
+| [Out of scope](#out-of-scope)                                 | what this is not                                                                    |
+| [Open questions](#open-questions)                             | what only a build or a backtest can answer                                          |
+| [Prior art](#prior-art)                                       | what other agents and platforms ship today, and what it changes here                |
 
 ## Scope
 
@@ -101,7 +123,7 @@ watcher and the alert routes own it, and no forecast helps, because there is no 
 **slow** shape is a resource consumed against a declared limit: disk, memory, node count, quota,
 object count. Every one of those has a history that says where it is going, and every one of them
 ends in the same way when nobody reads it — a `FailedScheduling` storm, a `Pending` pod, a write
-error on a full volume. The predictive mode owns the slow shape, and only it.
+error on a full volume. The predictive mode owns the slow shape first.
 
 Two consequences follow. First, the predictive mode is not anomaly detection. An anomaly is a value
 that is unusual now; the [fleet anomaly checks](fleet-anomaly-detection-checks.md) own that, and a
@@ -110,10 +132,42 @@ finding never scales anything; it proposes a change to a declared limit through 
 tells an owner their consumption is on course for one. Keeping a controller's job out of the
 agent's hands is what makes the finding safe to raise.
 
+## Three layers: forecast, prediction, action
+
+Gari Singh's design describes a _prediction plane_ in three layers, and the product boundary can be
+drawn after any of them:
+
+| Layer               | Output                                                                      | In kube-agents                                                                  |
+| ------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **L1 — Forecast**   | Quantile trajectories for a registered series                               | The forecaster service: arrays in, quantiles out, no credentials, no opinion    |
+| **L2 — Prediction** | A typed claim: "series X crosses reference R in about T, with confidence C" | The predictive finding, written by the sweep and judged by the agent            |
+| **L3 — Action**     | Actuation with guardrails                                                   | A pull request against the declaration, merged by a human; never a direct write |
+
+Most of the value is at L2. L1 alone is a chart, and it has a second consumer: the fleet anomaly
+checks can read the same quantile bands as a dynamic normal without owning a model. L3 is where the
+risk is, and this is where the two source designs diverged. Gari's design allows an `enforce` mode
+per policy, in which the plane raises a memory limit or pre-warms a node itself behind rate limits,
+concurrency caps and a circuit breaker. The kube-agents workflow model does not let an agent write
+to a cluster outside the declarative path, so this document keeps L3 at `recommend`: every action is
+a pull request, and the halt-and-flag gates stand. `enforce` is out of scope, not deferred.
+
+Four principles from the prediction-plane design carry over unchanged, because each is about the
+finding rather than the actuator:
+
+- A forecast is a proposal, never a command. The agent can veto, delay or downgrade it.
+- Shadow first. A new series class runs with its findings recorded but not reported until its
+  record justifies promotion, and promotion is a recorded criteria change (R4, R7).
+- Asymmetric by default. A cheap, reversible remediation (a larger PVC request on an expandable
+  StorageClass) gets an aggressive threshold; an expensive or irreversible one (a project quota, a
+  data-volume migration) gets a conservative one. The [decision rule](#the-decision-rule) derives
+  both from costs rather than hand-picked quantiles.
+- No silent staleness. A forecast built on a gappy or stale window is labelled as such and cannot
+  produce a pull request.
+
 ## What a predictive finding is
 
 A predictive finding is a **forecast threshold breach**: a claim that a named series will cross a
-named limit within a stated horizon, with the confidence and lead time attached.
+named reference within a stated horizon, with the confidence and lead time attached.
 
 ### The two halves of a series
 
@@ -124,7 +178,28 @@ Forecasting a ratio a controller holds flat is the most common way to produce a 
 answer: a node pool's CPU utilization stays near its target precisely because the autoscaler keeps
 adding nodes, so the series that carries the risk is the node count against the autoscaler maximum,
 not the utilization. And a limit is a fact, not a forecast; reading it from the object keeps the
-finding's threshold reproducible in the way every audit's red lines require.
+finding's threshold reproducible in the way every audit's red lines require. Where the limit itself
+moves — a VPA rewriting requests — the limit becomes a second series, and the breach is a
+trajectory intersection rather than a line crossing; that doubles the cost for those series and is
+left to a later phase.
+
+### Reference types
+
+The organising insight of the prediction-plane design is that a forecast becomes useful the moment
+there is something to compare it against, and that the use cases differ only in what that is:
+
+| Reference      | Meaning                                                         | Use cases        |
+| -------------- | --------------------------------------------------------------- | ---------------- |
+| Static line    | A declared limit, quota or capacity                             | UC-1, UC-5, UC-8 |
+| Self (band)    | The forecast of the signal itself, as a dynamic normal          | UC-3, UC-10      |
+| Counterfactual | A forecast from pre-change history, against post-change reality | UC-7             |
+| Deadline       | A required value at a required time                             | UC-6             |
+| Budget         | An integral of the signal over a window                         | UC-9             |
+| Derived trend  | A decomposition of the signal, such as its trough envelope      | UC-4             |
+
+The first build supports only the static line, for the reason the prediction-plane design gives
+for its own first phase: the reference already exists in the system, so the first shipped thing is
+verifiable. The other types are the later phases in the [use-case map](#the-use-case-map).
 
 ### The finding's fields
 
@@ -137,15 +212,17 @@ A finding carries enough that a reader can check it without re-running the model
   pool's `autoscaling.maxNodeCount`, the container's memory limit, the ResourceQuota's `hard`.
 - **Last observation.** The most recent value and its timestamp, so a reader can see how far from
   the limit the series is now.
-- **Breach.** The median crossing time, the earliest plausible crossing time (the outer quantile
-  in the direction of the limit), and the probability of a crossing within the horizon, expressed as
-  the share of the forecast's quantile paths that cross. A finding is raised only when that share
-  clears the criteria's minimum.
+- **Breach.** The crossing time per quantile — q90 at 8 days, q50 at 17, q10 never — which _is_ the
+  distribution of the breach time, reported as such rather than collapsed to a point. The earliest
+  plausible crossing is the outer quantile toward the limit.
 - **Lead time.** Now to the earliest plausible crossing. It sets the severity and the path.
 - **Trend.** The slope over the recent window and whether the lead time got shorter or longer since
   the last run, the "better or worse since last week" the anomaly checks require of every finding.
+- **Calibration and quality.** The series group's calibration state and any quality flags the
+  collector raised (see [Know the ways a series lies](#know-the-ways-a-series-lies)).
 - **Provenance.** Model name, version and image digest; the context length used and the span it
-  covers; the criteria revision, as the vehicle's R4 requires of any report.
+  covers; a digest of the context window, so the forecast can be reproduced exactly weeks later;
+  the criteria revision, as the vehicle's R4 requires of any report.
 - **Owner.** From the team label, as every fleet finding names one.
 
 ### Severity and path, by lead time
@@ -157,27 +234,60 @@ A finding carries enough that a reader can check it without re-running the model
 | Inside the horizon (30 d default)        | minor    | A ledger finding, advisory. No pull request until it climbs a tier.                                                                       |
 
 All three defaults are criteria (R4), tunable per cluster family, never by the agent on its own for
-the narrowing direction (R5).
+the narrowing direction (R5). The horizon for a series class is set by its **remediation lead
+time**, not by the model: a volume expansion may need a maintenance window, and a quota increase
+takes days, so storage and quota need long horizons while memory needs short ones.
 
 ### The first series
 
 Five series, chosen because each has a declared limit the agent already reads, a metric a stock GKE
 cluster already exports, and a remediation the existing declarative path already knows how to make.
 
-| Series                     | Consumed quantity                                                                                 | Declared limit                    | Remediation                                                                                                                                            |
-| -------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| PersistentVolumeClaim fill | `kubernetes.io/pod/volume/used_bytes` per mounted claim                                           | The claim's requested storage     | `kind: manifest`: a larger request where the StorageClass allows expansion; `manual` where it does not, since that migration is an owner's decision    |
-| Node pool headroom         | Node count per pool, derived from the per-node series' resource labels                            | The pool's autoscaler maximum     | A pull request against the pool's declaration raising the maximum, or the fallback shapes the stockout SOP already proposes                            |
-| Container memory to limit  | `kubernetes.io/container/memory/used_bytes` (working set) per container                           | The container's memory limit      | `kind: manifest` for a limit raise when the owner confirms growth is legitimate; otherwise a finding for the owner, because a leak is not a sizing bug |
-| Namespace quota            | `kube_resourcequota` used, through Managed Prometheus, where the kube-state-metrics package is on | The quota's `hard`                | `kind: manifest`: a quota change in the tenant's declaration, or an owner finding                                                                      |
-| Project quota              | `serviceruntime.googleapis.com/quota/allocation/usage` per region and metric                      | The matching `quota/limit` series | `kind: manual`: a quota increase request; the stockout SOP's instant 90% check stays as it is                                                          |
+| Series                            | Consumed quantity                                                                                 | Declared limit                    | Remediation                                                                                                                                            |
+| --------------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| PersistentVolumeClaim fill (UC-5) | `kubernetes.io/pod/volume/used_bytes` per mounted claim                                           | The claim's requested storage     | `kind: manifest`: a larger request where the StorageClass allows expansion; `manual` where it does not, since that migration is an owner's decision    |
+| Node pool headroom (UC-8)         | Node count per pool, derived from the per-node series' resource labels                            | The pool's autoscaler maximum     | A pull request against the pool's declaration raising the maximum, or the fallback shapes the stockout SOP already proposes                            |
+| Container memory to limit (UC-1)  | `kubernetes.io/container/memory/used_bytes` (working set) per container                           | The container's memory limit      | `kind: manifest` for a limit raise when the owner confirms growth is legitimate; otherwise a finding for the owner, because a leak is not a sizing bug |
+| Namespace quota (UC-8)            | `kube_resourcequota` used, through Managed Prometheus, where the kube-state-metrics package is on | The quota's `hard`                | `kind: manifest`: a quota change in the tenant's declaration, or an owner finding                                                                      |
+| Project quota (UC-8)              | `serviceruntime.googleapis.com/quota/allocation/usage` per region and metric                      | The matching `quota/limit` series | `kind: manual`: a quota increase request; the stockout SOP's instant 90% check stays as it is                                                          |
 
-Two classes are deliberately absent. **Deadlines** — certificate expiry, key age, CA rotation,
-a maintenance exclusion's end — are countdowns, not forecasts; they need no model and belong to the
-anomaly checks' expiry section, though a deadline finding should carry the same lead-time field so
-the two read alike. **Control-plane load** — etcd object count, API server latency — is a good
-candidate for a second wave and is left out of the first because its limits are not declared
-objects but published GKE bounds, which changes how the limit half is read.
+The memory series needs care the others do not. A fast-allocating service goes from 60% to dead in
+ninety seconds, which no daily sweep catches; a JVM or Go service idles at 92% of its limit by
+design. The forecast distinguishes "high" from "rising toward the wall", but on a short horizon and
+at native resolution; the daily sweep's version of this series is the slow climb, and the fast one
+is the acute tier's.
+
+### The use-case map
+
+The prediction-plane design catalogues ten use cases. Each is the same three primitives — signal,
+quantile trajectory, reference — in a different arrangement. This table places each in kube-agents.
+
+| Use case                               | Signal, reference                                                                                        | In kube-agents                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| UC-1 OOM                               | Working set against `limits.memory`                                                                      | First series.                                                                                                                                                                                                                                                                                                                  |
+| UC-5 Storage exhaustion                | Volume used bytes against capacity; time-to-full as a distribution ("q10 says 4 days, q90 says 31")      | First series. A slope break in the fill rate is itself worth flagging: a retention regression shows there long before capacity does.                                                                                                                                                                                           |
+| UC-8 Capacity and quota                | Node count, requested against allocatable, quota usage against quota                                     | First series (node pool, namespace and project quota). The long-horizon regime (reservations, committed use) is a later report, not a finding.                                                                                                                                                                                 |
+| UC-10 Suppression and window selection | An existing alert annotated with the band forecast before it fired; the quietest window in the next 72 h | Later. Suppression becomes a "was this expected?" field on the acute tier's incidents, and severity is downgraded, never the signal. Window selection answers "when should this node pool upgrade run?" for the upgrade-readiness work.                                                                                        |
+| UC-4 Slow leak                         | The per-period minima (trough envelope) of memory or file descriptors                                    | Later. It answers "leak or load?", the question Job B asks of every memory finding; forecasting the trough rather than the raw series separates the two.                                                                                                                                                                       |
+| UC-9 Error-budget burn                 | Burn rate integrated over the rest of the SLO window, against the budget                                 | Later, where Cloud Monitoring SLOs are defined.                                                                                                                                                                                                                                                                                |
+| UC-6 Backlog and deadline              | Arrival and service rate against a drain deadline                                                        | Later, and only where a queue exports both series; stock GKE exports neither.                                                                                                                                                                                                                                                  |
+| UC-7 Counterfactual canary             | Post-deploy metrics against a forecast from pre-deploy history                                           | Later. A synthetic control needing no second fleet; a candidate input for the rollout checks the upgrade work runs.                                                                                                                                                                                                            |
+| UC-3 Anomaly bands                     | An observation against the forecast's own q10–q90 band, alerted on violation density                     | Not here. The fleet anomaly checks own anomalies; they may consume L1 bands. The prediction-plane design puts it last for the same reason: no proximity screen, so everything must be forecast, and it is the use case most likely to be muted.                                                                                |
+| UC-2 Predictive autoscaling            | Request rate or CPU against provisioned capacity, with known-future covariates                           | Not here. This is the second divergence between the source designs: the prediction plane treats it as a policy on the substrate, and kube-agents treats scaling as a controller's job (HPA, KEDA, the cluster autoscaler). A finding may propose a scheduled `minReplicas` change as a pull request; the agent does not scale. |
+
+### Where not to forecast
+
+A generic forecasting substrate invites being pointed at everything. These classes are
+deliberately absent, and the collector refuses them rather than forecasting them badly:
+
+| Anti-pattern                                                                       | Why it fails                                                                                | Use instead                                                                                                |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Deadlines: certificate expiry, key age, CA rotation, a maintenance exclusion's end | A countdown; there is nothing to forecast                                                   | Arithmetic, in the anomaly checks' expiry section, carrying the same lead-time field so the two read alike |
+| Step-function, config-driven signals                                               | Changes are exogenous and instantaneous; history has no predictive content                  | Event-driven checks, the drift detector                                                                    |
+| Rare discrete events (crash loops, node failures)                                  | Not a time series; the base rate is too low for quantiles                                   | The event watcher, reliability statistics                                                                  |
+| Security and intrusion detection                                                   | Adversaries adapt, and statistically unusual is not malicious                               | Purpose-built detection                                                                                    |
+| Series with under about two seasonal periods of history                            | Nothing to condition on; the model extrapolates the last slope                              | The instant checks until history accrues                                                                   |
+| Control-plane load (etcd object count, API server latency)                         | A good second-wave candidate, but its limits are published GKE bounds, not declared objects | A later series class once the limit half can be read from a bounds table                                   |
 
 ## The forecaster
 
@@ -191,9 +301,11 @@ use spikes nightly, a node pool that breathes with traffic: a linear fit through
 cries wolf every Friday or misses the crossing by a week. A model that reads the shape of the
 series is what turns a forecast into something a person will still trust after the third finding.
 
-Training a model per series is out of the question at fleet scale, and it is what time-series
-foundation models exist to avoid. They are pretrained once on a large corpus of series and forecast
-a new series **zero-shot**, from its own history alone.
+The classical alternatives — Holt-Winters, ARIMA, Prophet — read shape, but they need per-series
+fitting, per-series seasonality declarations and a warm history before they produce anything.
+Operating a fleet of them is the hard part, and it is what time-series foundation models remove:
+they are pretrained once on a large corpus of series and forecast a new series **zero-shot**, from
+its own history alone.
 
 ### Why TimesFM 2.5
 
@@ -213,14 +325,40 @@ sufficient on its own:
   and no feature engineering. That is exactly the shape a Monitoring `timeSeries` call returns after
   alignment, and the collector's whole job is to produce it.
 - **Output contract.** Ten quantiles per horizon step, from q10 to q90, with a continuous quantile
-  head up to 1,000 steps. The breach probability in the finding is read straight off those paths,
-  and the earliest plausible crossing is the outer quantile. A point forecast alone could not
-  produce either.
+  head up to 1,000 steps. The breach distribution in the finding is read straight off those paths.
+  A point forecast alone could not produce it.
 - **Ecosystem.** Checkpoints on Hugging Face (`google/timesfm-2.5-200m-pytorch`, and a transformers
   port), PyTorch, Flax and MLX backends, a covariate extension, a fine-tuning path, and an official
   agent `SKILL.md` in the repository — the same artifact shape this harness ships its own skills in.
   Google also serves the same model as BigQuery's `AI.FORECAST` and on Vertex AI Model Garden,
   which keeps a managed path open (below) without changing the model.
+
+The forecaster sits behind one interface — context windows and a spec in, quantile matrices out —
+with more than one backend: TimesFM, a seasonal-naive and linear baseline, and a constant forecast
+for degenerate series and for inference failure. The baseline is a first-class backend, not a test
+fixture, because a series class on which the model cannot beat it should ship on the baseline, and
+that is only knowable if the baseline can run in shadow beside the model. Requests are batched by
+spec, so the specs are drawn from a small fixed set rather than set freely per series: spec
+proliferation is batch fragmentation.
+
+### Covariates and long cycles
+
+Some series have structure their own recent history cannot show: a nightly batch window, a planned
+migration, a quarter-end, the Christmas peak. The prediction-plane design treats known-future
+inputs as first-class (its UC-2 is built on them) and specifies a fallback for models without
+native support: forecast without the covariate, then apply a simple adjustment keyed on it, fit on
+past occurrences of the same event. TimesFM 2.5's repository ships in-context covariate regression
+(`forecast_with_covariates`, the XReg extension), which fits a linear model on the covariates
+jointly with the forecast; 3.0's native multivariate path is licence-blocked. The first five series
+stay univariate.
+
+A yearly effect is not a reason to feed the model three separate series — last day, last month,
+same month last year. A decoder-only model takes one context; three windows spliced together hand
+it two cliff edges. The two honest ways to show it a year are a single long context at coarse
+resolution (a year at hourly alignment is 8,760 points, inside the 16,384 limit, and Cloud
+Monitoring keeps system metrics for 24 months at ten-minute resolution) run beside a short
+fine-resolution context, or a holiday calendar as a covariate. Which is better is a backtest
+question; the [experiment](#backtest-experiment) runs the first.
 
 ### What it is not
 
@@ -234,14 +372,14 @@ backtest on the fleet's own series before any finding reaches a ledger.
 
 ### Alternatives weighed
 
-| Alternative                                | What it offers                                                                                                                                            | Why not the primary                                                                                                                                                                                                                                                                                                                                               |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `predict_linear` in Managed Prometheus     | Already there, free, right for monotone series.                                                                                                           | Blind to seasonality, and only reaches series that are in Prometheus. It is the **baseline the backtest compares against**, and if it wins on a series class, that class ships on it (see [Order of work](#order-of-work)).                                                                                                                                       |
-| Cloud Monitoring forecast conditions       | A metric-threshold alerting policy with `forecastOptions` predicts a crossing within a window of 1 hour to 2.5 days, trained per series, no model to run. | The horizon caps at 2.5 days, which covers the acute tier and none of the others; each series needs a policy provisioned in advance, and the output is an alert, not an attributed finding with a remediation. It is a fine **input** for the acute tier through the Pub/Sub adapter's existing alert route, and a candidate remediation the agent could propose. |
-| BigQuery `AI.FORECAST`                     | The same TimesFM model, managed, forecasting millions of series in one SQL statement, with `AI.DETECT_ANOMALIES` alongside.                               | Needs the metrics exported into BigQuery first, a second data path with its own cost and retention, and BigQuery is a source several SOPs forbid. The right answer for a very large fleet once the mode has earned its place; not the first build.                                                                                                                |
-| Vertex AI Model Garden endpoint            | Managed serving of the same weights.                                                                                                                      | Per-call cost and egress for a model small enough to run beside the agent. Kept as the option for an install that forbids new in-cluster workloads.                                                                                                                                                                                                               |
-| TimesFM 3.0                                | Native multivariate forecasting and past-and-future covariates.                                                                                           | Non-commercial weights. Revisit if relicensed.                                                                                                                                                                                                                                                                                                                    |
-| Tabular foundation models (TabPFN and kin) | Classification over features, which is the shape of "will this pod fail" rather than "when does this series cross".                                       | A different question, with licence terms that restrict the current weights; a later document, if a failure-classification mode is ever wanted.                                                                                                                                                                                                                    |
+| Alternative                                            | What it offers                                                                                                                                            | Why not the primary                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `predict_linear` in Managed Prometheus, seasonal-naive | Already there or two lines of code, free, right for monotone or strictly periodic series.                                                                 | Linear is blind to seasonality; seasonal-naive is blind to trend. Both are **baselines the backtest compares against**, and if one wins on a series class, that class ships on it (see [Order of work](#order-of-work)).                                                                                                                                          |
+| Cloud Monitoring forecast conditions                   | A metric-threshold alerting policy with `forecastOptions` predicts a crossing within a window of 1 hour to 2.5 days, trained per series, no model to run. | The horizon caps at 2.5 days, which covers the acute tier and none of the others; each series needs a policy provisioned in advance, and the output is an alert, not an attributed finding with a remediation. It is a fine **input** for the acute tier through the Pub/Sub adapter's existing alert route, and a candidate remediation the agent could propose. |
+| BigQuery `AI.FORECAST`                                 | The same TimesFM model, managed, forecasting millions of series in one SQL statement, with `AI.DETECT_ANOMALIES` alongside.                               | Needs the metrics exported into BigQuery first, a second data path with its own cost and retention, and BigQuery is a source several SOPs forbid. The right answer for a very large fleet once the mode has earned its place; not the first build.                                                                                                                |
+| Vertex AI Model Garden endpoint                        | Managed serving of the same weights.                                                                                                                      | Per-call cost and egress for a model small enough to run beside the agent. Kept as the option for an install that forbids new in-cluster workloads; configuring it is a recorded data-egress decision.                                                                                                                                                            |
+| TimesFM 3.0                                            | Native multivariate forecasting and past-and-future covariates.                                                                                           | Non-commercial weights. Revisit if relicensed.                                                                                                                                                                                                                                                                                                                    |
+| Tabular foundation models (TabPFN and kin)             | Classification over features, which is the shape of "will this pod fail" rather than "when does this series cross".                                       | A different question, with licence terms that restrict the current weights; a later document, if a failure-classification mode is ever wanted.                                                                                                                                                                                                                    |
 
 ### Where it runs
 
@@ -251,12 +389,16 @@ toggle in the chart alongside the existing optional components in
 [`values.yaml`](../../charts/kube-agents/values.yaml), a manifest under the operator's integrations
 tree, weights baked into the image so nothing reaches out to a model hub at start, and a
 NetworkPolicy that admits only the agent's sandbox. It takes arrays and returns quantiles. It
-cannot read Monitoring, cannot reach a cluster, and holds nothing worth stealing.
+cannot read Monitoring, cannot reach a cluster, and holds nothing worth stealing. If it is down, the
+sweep falls back to the baseline backend, marks its findings so, and the instant checks keep
+running: the predictive mode never makes the reactive and proactive ones worse.
 
 The alternative, loading the model inside the sandbox image, was rejected: 800 MB of weights
 against the image layer budget, and a model process sharing a pod with the agent's shell, for no
 gain in trust. The split keeps the credentialed read where the relay's policy already governs it
-and the model where a policy has nothing to govern.
+and the model where a policy has nothing to govern. The prediction-plane design's split-inference
+shape — the model on a GPU node pool, control on CPU — is available to a large fleet as a
+deployment choice, since the interface is a batched call either way.
 
 ## Where the series come from
 
@@ -285,7 +427,9 @@ What the sources give:
 
 The relay is project-scoped, which is the Platform Agent's scope. A series is always tagged with
 its cluster from the resource labels, so one collection pass covers the fleet the agent manages
-and the ledger groups findings per cluster family and region, as the anomaly checks require.
+and the ledger groups findings per cluster family and region, as the anomaly checks require. Series
+labels can carry sensitive identifiers; whatever the capability keeps inherits the retention and
+access of the Monitoring data it came from.
 
 ## How it fits the pipeline
 
@@ -294,11 +438,12 @@ judging it, which is where an agent earns its place. Forecasting splits the same
 same reason.
 
 **Job A: compute the forecast.** Code, not a prompt. A sweep enumerates the enabled series per
-cluster, reads each through the relay, aligns and gap-fills it, sends it to the forecaster, and
-compares the returned quantile paths against the declared limit. What comes out is a candidate list
-with every field in the finding shape filled from data. A model call should never be inside the
-agent's reasoning loop for this; a `kubectl top` sampled three times is what the cost SOP does
-today and the relay's own rationale for replacing it applies with more force to a forecast.
+cluster, triages them, reads the admitted ones through the relay, builds each context window,
+sends the batch to the forecaster, and applies the decision rule against the declared limit. What
+comes out is a candidate list with every field in the finding shape filled from data. A model call
+should never be inside the agent's reasoning loop for this; a `kubectl top` sampled three times is
+what the cost SOP does today, and the relay's own rationale for replacing it applies with more
+force to a forecast.
 
 **Job B: judge the forecast.** The agent, in the audit's session. For each candidate it asks what
 code cannot: is the growth legitimate (a StatefulSet that is meant to accumulate) or a defect (a
@@ -307,7 +452,8 @@ declaration in the GitOps repository to change, and what should it say? Is the f
 same trend as last week with a shorter lead time? The answers set the remediation kind and write
 the recommendation. This is also where the agent applies the declared-intent rule the
 obtainability audit already has: a repository that declares a claim's growth expected reclassifies
-the finding rather than raising it.
+the finding rather than raising it. The prediction plane predicts _that_ a signal moves, not _why_;
+the why is Job B.
 
 **The result takes the existing paths.** Findings go to the audit's ledger issue through the same
 helper every audit uses, with the delta computed against the previous run, and a `kind: manifest`
@@ -321,22 +467,69 @@ emits an inject with `kind: forecast-breach` into the session path the event wat
 The watcher's own source comment reserves that mechanism for signal sources beyond Kubernetes
 events; this is one. The incident thread then carries the finding, and a person replying in it is
 answered by a session that saw the forecast. The same sweep can run between scheduled runs on that
-tier alone — a short-horizon check every few hours, the full sweep daily — because its cost is
-dominated by the number of series, not by the horizon.
+tier alone — a short-horizon check every few hours, the full sweep daily — because a 30-day
+forecast does not need refreshing every hour.
+
+### Triage
+
+A mid-size cluster emits hundreds of thousands of series, and a fleet multiplies that. Most are
+nowhere near informing a decision: a container at 12% of its memory limit on a flat slope does not
+need a quantile forecast to establish that it will not run out. Deciding what to forecast is a
+larger engineering problem than forecasting, and the prediction-plane design answers it with a
+cascade of screens, each more expensive than the last:
+
+| Tier | Screen                                                                                         | Admits                   |
+| ---- | ---------------------------------------------------------------------------------------------- | ------------------------ |
+| T0   | Is the series in an enabled class, and fresh?                                                  | Everything registered    |
+| T1   | Proximity: `(limit − now) / σ_recent`                                                          | Drops the large majority |
+| T2   | Motion: a robust slope, extrapolated to the limit                                              | Drops most of the rest   |
+| T3   | Cheap forecast: seasonal-naive with an empirical residual band; disagreement with T2 escalates | A few percent            |
+| T4   | TimesFM                                                                                        | The admitted set         |
+
+Three rules make it safe as well as cheap. A series once admitted stays admitted for a cooldown, or
+it flickers across the T1 boundary. A small random fraction of screened-out series is forecast
+anyway; that is the only measurement of the triage's own false-negative rate, and without it the
+triage cannot be falsified. And the inference budget per sweep is a fixed number that triage fills
+by priority, so under pressure the sweep forecasts fewer low-priority series rather than running
+long. The static-limit series are cheap precisely because T1 has a limit to measure proximity
+against; a band reference has none, which is the cost reason UC-3 sits outside this design.
+
+### The decision rule
+
+Given the quantile trajectory and the limit, the sweep computes the first step at which each
+quantile crosses, interpolated within the step, and requires the crossing to hold for several
+consecutive steps, since a single step poking over the line at the horizon's end is usually noise.
+
+Which quantile counts is not hardcoded. Acting is right when the expected cost of acting is below
+the expected cost of not acting, which for a crossing reduces to acting when
+`P(breach) > C_fp / (C_fp + C_fn)`. A criteria entry therefore states a false-positive and a
+false-negative cost per remediation class, even as rough relative numbers, and the threshold
+probability follows. A larger PVC request costs almost nothing if unneeded and a full database
+volume is an outage, so that class acts on a low probability; a project quota increase or a
+data-volume migration needs near-certainty. An operator who insists can still pin a quantile.
+
+A finding moves `clear → pending → raised`, with `pending` requiring the crossing in several
+consecutive sweeps and the return to `clear` requiring a wider margin than raising did. Without
+that asymmetry a series sitting near the boundary flaps, and the ledger fills with a finding that
+opens and closes weekly. Dwell trades lead time for precision and is the main criteria knob.
+
+Correlated findings collapse. A node pool nearing its maximum and every workload on it growing are
+one finding with the rest attached as evidence; without that, the first real trend produces a page
+of findings nobody reads.
 
 ### On the vehicle
 
 The capability is audit-shaped and maps onto the vehicle's requirements without special cases:
 
-| Requirement      | For this capability                                                                                                                                                                                                                                                                                                 |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1 Pre-defined   | The five series, the three horizons, a 90% limit fraction and a 0.7 breach probability ship as defaults. Quiet rather than thorough: a fresh install should see a handful of findings, not a page.                                                                                                                  |
-| R2 Scheduled     | One roster job for the daily sweep; the ledger is its record; a clean sweep is silent.                                                                                                                                                                                                                              |
-| R3 Triggerable   | "When will `orders-db-0`'s volume fill?" is a scoped run answered in the thread. "Run the capacity runway now" is the shipped stream marked due. The acute tier is the event path above, and a Cloud Monitoring forecast alert arriving through the Pub/Sub adapter is another event that wakes it.                 |
-| R4 Customizable  | Criteria: the series enabled, the limit fraction, the three horizons, the minimum probability, per-family exclusions, the alignment window. The procedure, the red lines and the model are image-owned.                                                                                                             |
-| R5 Self-learning | The evidence class this capability has that no other audit does: every finding is a prediction that is later true or false. A finding whose breach did not arrive, or arrived when the forecast said it would not, is a precision signal the agent can propose criteria changes from. Narrowing stays propose-only. |
-| R6 Durability    | As the vehicle specifies; nothing here needs more.                                                                                                                                                                                                                                                                  |
-| R7 Write path    | As the vehicle specifies. The model's outputs are never written to criteria; only a person's confirmation moves a threshold.                                                                                                                                                                                        |
+| Requirement      | For this capability                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1 Pre-defined   | The five series, the three horizons, a 90% limit fraction and cost weights per remediation class ship as defaults. Quiet rather than thorough: a fresh install should see a handful of findings, not a page.                                                                                                                                                                                   |
+| R2 Scheduled     | One roster job for the daily sweep; the ledger is its record; a clean sweep is silent.                                                                                                                                                                                                                                                                                                         |
+| R3 Triggerable   | "When will `orders-db-0`'s volume fill?" is a scoped run answered in the thread. "Run the capacity runway now" is the shipped stream marked due. The acute tier is the event path above, and a Cloud Monitoring forecast alert arriving through the Pub/Sub adapter is another event that wakes it.                                                                                            |
+| R4 Customizable  | Criteria: the series enabled, the limit fraction, the three horizons, the cost weights, dwell, per-family exclusions, the alignment window, and each class's shadow or reporting state. The procedure, the red lines and the model are image-owned.                                                                                                                                            |
+| R5 Self-learning | The evidence class this capability has that no other audit does: every finding is a prediction that is later true or false. A finding whose breach did not arrive, or arrived when the forecast said it would not, is a precision signal the agent can propose criteria changes from — scored as the [intervention problem](#the-intervention-problem) requires. Narrowing stays propose-only. |
+| R6 Durability    | As the vehicle specifies; nothing here needs more.                                                                                                                                                                                                                                                                                                                                             |
+| R7 Write path    | As the vehicle specifies. The model's outputs are never written to criteria; only a person's confirmation moves a threshold or promotes a class out of shadow.                                                                                                                                                                                                                                 |
 
 The standing state the A2A bus provides is a natural home for the current forecast per series: a
 state topic on the pattern the [payload spec](spec-a2a-payloads.md) already sketches for
@@ -346,46 +539,115 @@ cold collection. That is an enhancement, not a dependency.
 ## Honesty about the future
 
 A finding about the present can be checked by re-reading the object. A finding about the future
-cannot, and a mode built on forecasts is only as useful as its record of being right. Four rules
-keep it honest.
+cannot, and a mode built on forecasts is only as useful as its record of being right.
 
-**Backtest before the first finding.** On the fleet's own series, a rolling-origin backtest: cut
-each series at points in the past, forecast forward, and compare against what happened. Report
-precision and recall of the breach decision per series class, against the linear baseline. This is
-the experiment the [order of work](#order-of-work) gates on, and its result is recorded in this
-document's successor before the capability reaches a roster.
+### Backtest against baselines before the first finding
 
-**Keep the hit-and-miss record.** Every finding carries its predicted crossing; every later sweep
-records whether the series crossed, when, and whether a remediation changed the limit in between.
-The ledger already computes a run-over-run delta; this adds an outcome to each closed finding. Per
-series class, the capability then reports its own precision in each ledger rewrite, so a reader
-sees "12 of 14 PVC forecasts in the last quarter crossed within the predicted window" next to the
-findings that rest on the same model.
+On the fleet's own series, a rolling-origin backtest: cut each series at points in the past,
+forecast forward from what was known at that point only, and compare against what happened. Point
+in time is strict; a context that leaks one future point invalidates the result. Report the
+forecast-level and decision-level [metrics](#metrics) per series class against two baselines,
+seasonal-naive and linear. This is the experiment the [order of work](#order-of-work) gates on.
 
-**Quiet defaults, conservative quantiles.** The breach decision uses the outer quantile toward the
-limit for lead time and the share of paths for probability, and the shipped minimum probability
-is high. The first weeks on a fleet are for tuning down, not up; the vehicle's R1 says why.
+### Calibration
 
-**Know the ways a series lies.** The collector handles each of these before the model sees the
-series, and the finding says when one applied:
+Zero-shot quantiles are calibrated on average over the model's training data, which promises
+nothing about one install's volume fill. If the q90 is really a q60 for some series, every
+threshold derived from it is silently wrong, and the cost rule above is denominated in
+probabilities that do not mean what they say. The capability therefore keeps, per series group
+(per series once history allows), a rolling record of forecast quantile against realised value at
+several horizon steps, since coverage degrades with horizon and one aggregate hides it. From that
+record it widens or narrows the model's interval by the factor that restores nominal coverage, a
+conformal adjustment that is cheap, distribution-free and does not touch the model. A group whose
+factor is large is telling the operator the model does not understand it.
 
-- **Gaps and dead time.** Prometheus-fed series drop to zero or vanish while a pod is rescheduled.
-  Gaps are masked, not zero-filled, and a series with too little unmasked context is skipped with a
-  limitation, not forecast.
-- **Regime changes.** A deploy changes a slope; a PVC expansion resets a fill; a limit raise moves
-  the threshold. The collector cuts the context at the most recent change in the declared limit or
-  in the object's generation, and forecasts from the segment that reflects the current regime.
+Each group is in one of three states. `unmeasured`: too little history, findings are advisory and
+marked low confidence. `calibrated`: coverage within tolerance, findings may carry a pull request.
+`miscalibrated`: persistent error the correction cannot fix, excluded from pull requests and a
+candidate for the baseline backend. A deploy or a limit change resets the group to `unmeasured`
+rather than carrying a confidently wrong correction forward.
+
+### The intervention problem
+
+If the mode works, its predictions stop coming true. It forecasts a full volume, someone merges the
+expansion, and the volume never fills. Scored naively, that is a false positive; scored that way
+for long enough, a working capability looks broken, someone tunes it to be less sensitive, and it
+becomes broken. There is no complete answer, and the prediction-plane design gives three partial
+ones that this capability adopts:
+
+- **Record the counterfactual.** Every finding stores the state at the time it was raised, and
+  every later sweep records whether the series crossed, when, and whether a remediation changed the
+  limit in between. The question scored is whether the finding was justified, not whether the
+  disaster occurred. The ledger already computes a run-over-run delta; this adds an outcome to each
+  closed finding, and each ledger rewrite reports the class's record — "12 of 14 PVC forecasts in
+  the last quarter crossed within the predicted window, 3 were remediated first".
+- **Shadow classes.** A class in shadow produces unconfounded ground truth, because nobody acts on
+  it. Every class starts there.
+- **Historical replay.** A corpus of recorded series with known crossings, replayed offline, is
+  unconfounded by construction and is the [replay fixture](#evaluation) below. It measures recall
+  well and precision poorly, since it holds the incidents that happened and not the ones prevented.
+
+The consequence, stated so nobody tunes against it: precision is measured on replay and shadow,
+never on the outcomes of findings someone acted on.
+
+### Quiet defaults, conservative costs
+
+The shipped cost weights err toward silence. The first weeks on a fleet are for tuning down, not
+up; the vehicle's R1 says why.
+
+### Know the ways a series lies
+
+The model accepts anything and returns confident nonsense when fed nonsense. The collector handles
+each of these before the model sees the series, and the finding carries a quality flag when one
+applied (`gappy`, `short_context`, `post_restart`, `low_variance`, `stale`, `clipped`):
+
+- **Resolution and downsampling.** The context should span at least two periods of the dominant
+  cycle, which is more points at native resolution than the model takes, so resolution follows the
+  horizon: short horizons at native resolution, long ones aligned to five minutes, ten or an hour.
+  The aligner preserves what the series class cares about — `max` for an exhaustion series, since a
+  five-minute mean hides the spike that kills the pod; `min` for a trough envelope; `mean` for load.
+- **Three kinds of gap.** A scrape miss is short and interpolated. An absent series — the pod did
+  not exist — truncates the context and is never zero-filled. A zero is a real measurement.
+  Zero-filling a restart gap hands the model a cliff edge, and it extrapolates one. A series with
+  too little unmasked context is skipped with a limitation, not forecast.
+- **Restarts and regime changes.** A restart resets memory; a deploy changes a slope; a PVC
+  expansion resets a fill; a limit raise moves the threshold. The collector cuts the context at the
+  most recent change in the declared limit, the object's generation or the container's restart
+  count, and forecasts from the segment that reflects the current regime. The leak series is the
+  exception: it wants to see across restarts, since a restart that resets a leak is the confirming
+  evidence.
 - **Controllers that hide the trend.** Covered above: forecast the quantity a controller consumes
   (node count), not the ratio it defends (utilization).
-- **Hard caps.** A series that has already reached its cap is flat and forecasts flat. The instant
-  checks catch the cap; the forecaster is for the approach.
+- **Hard caps and flat series.** A series already at its cap is flat and forecasts flat; the
+  instant checks catch the cap, the forecaster is for the approach. A near-constant context is
+  short-circuited to a constant forecast rather than sent to the model.
+- **Bounds.** A ratio cannot exceed one and memory cannot be negative; forecasts are clipped to
+  the series' bounds.
 - **Series too short or too young.** Fewer than 32 points is below the model's floor and, more to
   the point, a day-old claim has no trend worth reading. The minimum context is a criterion, with a
   floor the image owns.
-- **Counters.** A cumulative counter is differenced before forecasting; the limit is compared to the
-  level, not the rate.
+- **Counters.** A cumulative counter is rate-converted, with resets handled, before forecasting;
+  forecasting the raw counter produces a straight line with no information in it. The limit is
+  compared to the level, not the rate.
 
 ## Evaluation
+
+### Metrics
+
+Average accuracy is not the goal; accuracy near the limit is. A model with a good overall error
+that is optimistic in the upper tail is worse than useless for a memory series. Two families of
+metric, per series class and horizon step:
+
+- **Forecast level.** Weighted quantile (pinball) loss, the primary quality measure since the
+  capability consumes quantiles; empirical coverage at each nominal level; and MASE against
+  seasonal-naive, the relevance measure — above one, the model is losing to a two-line baseline on
+  that class.
+- **Decision level.** Precision and recall of the breach decision; the lead-time distribution of
+  true positives, with a per-class minimum useful lead time below which a correct finding counts as
+  a miss; and coverage restricted to windows where the series was near its limit, which is the
+  number that predicts real performance and is usually worse than unconditional coverage.
+
+### The eval case
 
 The [eval-driven development rule](../../.agents/rules/eval_driven_development.md) makes a
 failing case the start of any change to agent behaviour, and the seeded fleet is where planted
@@ -399,7 +661,10 @@ for the Compute Advice API. A case then plants a recorded PVC fill with a known 
 deterministic checks assert that the agent's report names that claim, that the breach time falls
 within a tolerance of the truth, that the remediation is `kind: manifest` against the claim's
 declaration in the case's GitOps fixture, and that no mutating call was made. This runs today, needs
-no waiting, and is the red case the first implementation must turn green three times.
+no waiting, and is the red case the first implementation must turn green three times. The recorded
+series double as the start of the replay corpus: real recordings with known crossings, long
+stretches of normal operation (precision is measured against those), and synthetic edge cases for
+restarts, gaps, step changes and flat series.
 
 **A live fixture second.** One workload on a seeded cluster that writes into a claim at a fixed
 rate, sized so the claim never actually fills inside the eval cadence and reset on a schedule, gives
@@ -412,41 +677,91 @@ The case lands in the existing `capacity` domain; a new domain needs a presubmit
 can exist, which a first case cannot earn. Registration follows the nightly-first rule the eval
 rule sets out, and the case is never added to the blocking roster in the change that makes it pass.
 
+## Backtest experiment
+
+The experiment is in [`bench/experiments/timesfm-backtest/`](../../bench/experiments/timesfm-backtest/README.md):
+a rolling-origin, day-ahead backtest of TimesFM 2.5 on real series from the eval-pool clusters and
+the production install, against seasonal-naive and linear baselines. Each origin feeds the model
+the seven days before a day and forecasts that day, then scores the forecast against what happened.
+Results are pending and will be recorded here.
+
 ## Order of work
 
-Each phase is a separate change with its own live validation. The first has a decision gate that can
-stop the rest.
+Each phase is a separate change with its own live validation. The prediction-plane design names
+five prerequisite spikes; they are folded into the phases they gate.
 
 1. **The collector, as a library and a sandbox command.** Written to the relay's contract, producing
    aligned series with limits attached for the five series classes, with a `limitations` record per
-   cluster. No model yet: its output is the linear baseline's input as well as the forecaster's.
-   This phase is also the metrics source the anomaly checks say they need, built once.
-2. **The forecaster service and the backtest.** The TimesFM 2.5 image, the chart toggle, and the
-   rolling-origin backtest on a real fleet's series against `predict_linear`. **Decision gate:** a
-   series class ships on TimesFM only where the backtest shows it beats the baseline on breach
-   precision at equal recall. Where it does not, that class ships on the baseline, and the finding
-   shape is unchanged — the model is a provenance field, not the design. If no class clears the
-   gate, the mode still ships on the baseline and this document records why.
-3. **The capability.** The SOP, the roster job, the ledger stream, the remediation kinds per series,
-   the replay-fixture case run red then green, and the criteria on the vehicle once its store
-   exists (image-owned defaults until then).
+   cluster. No model yet: its output is the baselines' input as well as the forecaster's. This
+   phase is also the metrics source the anomaly checks say they need, built once. It carries two
+   spikes: whether point-in-time series for past breaches can be reconstructed at the resolution
+   needed (if not, recording must start now, which makes it the most urgent spike despite looking
+   the least interesting), and how much gap handling, counter conversion and the choice of
+   downsampling function change forecast quality — which decides how much engineering the context
+   rules above deserve.
+2. **The forecaster service and the backtest.** The TimesFM 2.5 image, the chart toggle, the
+   baseline backends, and the rolling-origin backtest on a real fleet's series. It carries the
+   inference-cost spike (latency and throughput at realistic batch sizes on the install's own CPU
+   shape, which sizes the triage budget) and the quality spike (on which series archetypes — sawtooth
+   memory, diurnal load, bursty queues, monotone disk — the model beats seasonal-naive). **Decision
+   gate:** a series class ships on TimesFM only where the backtest shows it beats the baselines on
+   breach precision at equal recall. Where it does not, that class ships on the baseline, and the
+   finding shape is unchanged — the model is a provenance field, not the design. If no class clears
+   the gate, the mode still ships on the baseline and this document records why.
+3. **The capability.** The SOP, the roster job, the ledger stream, the triage and decision rule,
+   calibration state, the remediation kinds per series, every class in shadow, the replay-fixture
+   case run red then green, and the criteria on the vehicle once its store exists (image-owned
+   defaults until then).
 4. **The acute tier.** The `forecast-breach` inject kind, the short-horizon sweep, and the session
    path's handling of a finding that is a forecast rather than an event.
 5. **Chat.** "When will X run out" as a scoped run, and the state topic so the answer starts from
    the last sweep.
+6. **Further references.** The leak series (derived trend), expected-spike annotation and window
+   selection (band), error-budget burn (budget), and counterfactual rollout checks, each on its own
+   case. The covariate spike — what XReg gives against the residual fallback on a real scheduled
+   event — gates any series that needs a covariate.
 
-Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 5 each start from one.
+Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 6 each start from one. Each
+phase's gate is a backtest or eval record, not a demonstration.
+
+## Success measures and risks
+
+The prediction-plane design sets targets for its first version. Adapted to a capability whose
+action is a pull request:
+
+| Measure        | Definition                                                                                           | Target                                                                                |
+| -------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Lead time      | Median time from finding to predicted breach, for true positives                                     | At least ten times the remediation latency — for a pull request path, days, not hours |
+| Precision      | Share of raised findings that would have crossed absent intervention, on replay and shadow           | 0.8 for a class allowed to open pull requests                                         |
+| Recall         | Share of real breaches of a covered class found with usable lead time                                | 0.5 in the first version                                                              |
+| Coverage error | Absolute gap between empirical and nominal coverage for q10, q50, q90, per group, rolling seven days | 0.05 after calibration                                                                |
+| Cost           | The forecaster's compute as a share of the install's own                                             | 1%                                                                                    |
+| Reversal rate  | Share of merged predictive remediations reverted within a week                                       | 0.02                                                                                  |
+
+| Risk                                                         | Impact                                                  | Mitigation                                                                                        |
+| ------------------------------------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| The model does not beat seasonal-naive on the fleet's series | The model half of the thesis fails                      | The phase 2 gate; the baseline backend keeps the capability alive either way                      |
+| Triage false negatives hide a real breach                    | A missed breach in a mode claiming to predict them      | The random sampling floor makes the rate measurable; the ledger reports it                        |
+| Intervention confounding lowers measured precision           | The capability is tuned into uselessness                | Precision on replay and shadow only, stated in the ledger's own record                            |
+| Findings become noise                                        | The stream is muted and takes the good findings with it | Shadow first, quiet costs, dwell, collapse of correlated findings, UC-3 left out                  |
+| Inference cost exceeds budget at fleet cardinality           | The capability cannot run widely                        | The inference-cost spike; a fixed budget that triage fills                                        |
+| Model version drift                                          | A silent quality regression                             | A pinned image digest, the model as provenance, calibration as the regression detector            |
+| A covariate is wrong about the future                        | A confidently wrong forecast                            | Record covariates with the forecast so a postmortem can tell a covariate error from a model error |
 
 ## Out of scope
 
-- **Anomaly detection on the present value.** The fleet anomaly checks own it.
-- **Predictive autoscaling.** A controller's job (HPA, KEDA, the cluster autoscaler); the agent
-  proposes limits, it does not scale.
+- **Anomaly detection on the present value.** The fleet anomaly checks own it; they may read the
+  forecaster's bands.
+- **Predictive autoscaling and any direct actuation.** A controller's job (HPA, KEDA, the cluster
+  autoscaler); the agent proposes limits through pull requests, it does not scale or resize. The
+  prediction plane's `enforce` mode has no counterpart here.
+- **Root-cause analysis.** The forecast says that a series moves; Job B's judgement about why is a
+  recommendation, not a diagnosis.
 - **Failure classification.** "Will this pod fail" from features is a different model family and
   a different licence conversation.
 - **Deadlines.** Expiry and rotation are countdowns; they share the lead-time field and nothing else.
-- **Multivariate forecasting and covariates.** The features that need TimesFM 3.0 or its extension
-  packages; the first series are univariate by construction.
+- **Multivariate forecasting.** Forecasting pairs independently and combining them understates the
+  joint tail; the features that fix that need TimesFM 3.0.
 - **Fine-tuning.** Zero-shot is the premise. A fleet whose series defeat it is a reason to revisit
   the model choice, not to run a training pipeline inside an install.
 
@@ -457,6 +772,11 @@ Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 5 each s
 - **Sweep cost.** A fleet of a hundred clusters with a few thousand mounted claims is a few thousand
   series of two thousand points each; on CPU that is minutes, not hours, by the published
   throughput figures, but the figure that matters is the one measured on the install's own node.
+- **Calibration grouping.** Short-lived series never accumulate the residual history per-series
+  calibration needs. Grouping by class and workload is the proposed answer; the right granularity
+  is empirical.
+- **Multi-resolution against long context.** Whether two specs per series (a week fine, a year
+  coarse) beat one long context depends on the inference-cost curve and the backtest.
 - **Metric packages that are off.** The kube-state-metrics and kubelet packages are per-cluster
   choices. Whether the capability should recommend enabling them as its own finding, or stay silent
   on a cluster that lacks them, is a criteria decision the first fleet will settle.
@@ -464,13 +784,19 @@ Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 5 each s
   pool series does not apply, and the finding shape needs a way to say so per cluster mode.
 - **Where the hit-and-miss record lives.** The ledger issue's hidden marker carries findings across
   runs; whether it can carry outcomes too, or whether the record wants the criteria store or a state
-  topic, is a question for the change that builds phase 3.
+  topic, is a question for the change that builds phase 3. The replay corpus wants a longer
+  retention than either, and its own storage.
+- **Who owns a predictive remediation.** A platform-owned capability proposing changes to
+  application-owned limits needs an ownership answer before its first pull request surprises
+  someone; the team label names the reviewer, not the decision.
 - **The relay's POST shapes.** MQL `timeSeries:query` is refused today, by design. The GET shapes
   suffice for the five series; a later series that needs MQL reopens the relay design's second
   question, not this one.
 
 ## Related
 
+- [Zero-Shot Forecasting for Predictive Operations](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7)
+  — Gari Singh's platform-agnostic prediction-plane design, merged here.
 - [`capability-delivery-vehicle.md`](capability-delivery-vehicle.md) — the lifecycle this
   capability rides on.
 - [`fleet-anomaly-detection-checks.md`](fleet-anomaly-detection-checks.md) — the neighbouring
@@ -481,7 +807,7 @@ Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 5 each s
 - [`../architecture/04-workflow-model.md`](../architecture/04-workflow-model.md) — why a new
   trigger changes when the agent wakes and nothing else.
 - [TimesFM repository](https://github.com/google-research/timesfm) — licence terms per version,
-  the 2.5 API, and the official agent skill.
+  the 2.5 API, the covariate extension, and the official agent skill.
 - [Cloud Monitoring forecast conditions](https://docs.cloud.google.com/monitoring/alerts/metric-forecast)
   — the managed alternative for the acute tier.
 - [BigQuery `AI.FORECAST`](https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-ai-forecast)
@@ -534,8 +860,8 @@ What this changes here. The positioning stands: nothing combines a forecast, an 
 finding and a declarative remediation in an agent that runs inside the install, and Dynatrace's
 workflow is evidence that the loop works in production. Two adjustments follow. The backtest in
 [Order of work](#order-of-work) phase 2 should run Toto and Chronos beside TimesFM, since both
-publish open weights and Toto was trained on observability data; the finding shape carries the
-model as provenance, so the winner per series class is a configuration, not a redesign, and
-each model's licence terms are checked in that phase before it is pinned. And the benchmark's
-observation about first-of-its-kind events is the same regime-change rule stated in
-[Honesty about the future](#honesty-about-the-future), now with a measurement behind it.
+publish open weights and Toto was trained on observability data; the forecaster's backend
+interface makes the winner per series class a configuration, not a redesign, and each model's
+licence terms are checked in that phase before it is pinned. And the benchmark's observation about
+first-of-its-kind events is the same regime-change rule stated in
+[Know the ways a series lies](#know-the-ways-a-series-lies), now with a measurement behind it.
