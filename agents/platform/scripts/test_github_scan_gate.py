@@ -1351,6 +1351,8 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(len(result.cards), 1)
         self.assertIn("acme/toolkit#12", result.warnings[0])
+        # A transient fault clears itself; it is not told to label anything.
+        self.assertNotIn("agent:ignore", result.warnings[0])
 
     def test_the_warning_says_which_kind_of_unreadable(self):
         """Two faults land here and they send an operator to different places.
@@ -1370,6 +1372,8 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(result.cards, [])
         self.assertIn("acme/toolkit#12", result.warnings[0])
         self.assertIn(forge.REASON_CONVERSATION_TRUNCATED, result.warnings[0])
+        # It never clears on its own, so the way to stop it is named.
+        self.assertIn("`agent:ignore`", result.warnings[0])
 
     def test_a_credential_that_cannot_name_itself_is_loud(self):
         """No viewer identity means no way to tell our own PR from anyone else's.

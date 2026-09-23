@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 from pathlib import Path
 
@@ -58,6 +59,14 @@ LOCAL_GIT = os.environ.get("KUBE_AGENTS_LOCAL_GIT", "/opt/vcs/libexec/git")
 
 ROOT = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", "/opt/data/scratch/vcs"))
 SESSIONS = ROOT / ".sessions"
+
+# How long a working copy nobody has touched is kept. The scratch root sits on
+# the sandbox's `/opt/data` claim beside sshd, the shell's scratch and the
+# profile mirror, and a copy stays until the same branch is cloned again or
+# `discard` is called -- which a landed `submit`, an abandoned card and a plain
+# read all never do. Without a bound, a year of remediation branches fills that
+# claim, and a full disk is a broken sandbox. 24 hours is what the lease reaper this replaces used; 0 turns it off.
+COPY_TTL_HOURS = float(os.environ.get("KUBE_AGENTS_VCS_TTL_HOURS", "24"))
 
 # Who the local revisions are authored by. Overridable, but it needs a value:
 # git refuses to commit without one and the resulting error talks about
@@ -624,6 +633,56 @@ def _refuse_a_collision(destination: Path, forge: str, repo: str, key: str) -> N
     )
 
 
+def _last_touched(session: dict, tree: Path) -> float:
+    """When anything last happened to this copy that a verb would leave a mark of.
+
+    The record is rewritten by `clone` and `publish`; the index by every
+    `add`, `commit` and `switch`; the HEAD log by every commit and checkout.
+    Editing a file in the tree touches none of them, and a card that edits for a
+    day without staging anything is not one this has to keep alive.
+    """
+    stamps = []
+    for path in (Path(session.get("_file") or ""), tree / ".git" / "index", tree / ".git" / "logs" / "HEAD", tree):
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(stamps, default=0.0)
+
+
+def reap_stale_copies(keep: Path | None = None, *, ttl_hours: float | None = None) -> list[str]:
+    """Delete working copies, and their records, that nobody has touched inside the TTL.
+
+    Only copies with a record are considered, and only a record whose tree is
+    under `ROOT`: the path is read from a file the sandbox user can write, and
+    this must not become a way to delete anything else. `keep` is the copy the
+    caller is about to take, so a clone never reaps its own destination.
+    """
+    ttl = COPY_TTL_HOURS if ttl_hours is None else ttl_hours
+    if ttl <= 0:
+        return []
+    cutoff = time.time() - ttl * 3600.0
+    root = ROOT.resolve()
+    spared = keep.resolve() if keep else None
+    removed: list[str] = []
+    for session in all_sessions():
+        try:
+            tree = Path(session["path"])
+            resolved = tree.resolve()
+        except (KeyError, TypeError, OSError):
+            continue
+        if tree.is_symlink() or resolved == spared or resolved.parent != root:
+            continue
+        if _last_touched(session, tree) >= cutoff:
+            continue
+        shutil.rmtree(resolved, ignore_errors=True)
+        if resolved.exists():
+            continue
+        Path(session["_file"]).unlink(missing_ok=True)
+        removed.append(resolved.name)
+    return removed
+
+
 def clone(
     repository: str,
     branch: str | None = None,
@@ -648,6 +707,12 @@ def clone(
     key = key or branch or answer["branch"]
     destination = ROOT / _slug(answer["forge"], answer["repo"], key)
     _refuse_a_collision(destination, answer["forge"], answer["repo"], key)
+    # Here, because this is the one verb that adds to the scratch root. Best
+    # effort: a copy that could not be tidied is not a reason to refuse a read.
+    try:
+        reap_stale_copies(keep=destination)
+    except OSError:
+        pass
     if destination.exists():
         _refuse_to_discard(destination, force=force)
         shutil.rmtree(destination)

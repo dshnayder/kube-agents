@@ -692,6 +692,15 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
+        # A conversation too long for one page never clears on its own, and the
+        # watcher runs every ten minutes with `deliver: "chat"`: without a way
+        # out named here, that is 144 identical warnings a day in the room.
+        if any(reason == forge.REASON_CONVERSATION_TRUNCATED for _, _, reason in unreadable):
+            warnings[-1] += (
+                f" For {forge.REASON_CONVERSATION_TRUNCATED}, this repeats every"
+                f" tick until the pull request closes: label it `{forge.IGNORE_LABEL}`"
+                " to stop this warning, or split the thread."
+            )
     # Drained here rather than warned about where it happens, because the same
     # listing fills its page on every tick and on more than one repository. A
     # listing read short is not an error the sweep can recover from — it simply

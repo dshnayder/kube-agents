@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -527,6 +528,60 @@ class WorkingCopyTest(unittest.TestCase):
         vcs_client.publish("acme/infra", key="work")
         again = vcs_client.clone("acme/infra", key="work")
         self.assertEqual(again["path"], cloned["path"])
+
+    def _age(self, session: dict, hours: float) -> None:
+        """Backdate every mark `_last_touched` reads, as if nobody had touched the copy for `hours`."""
+        then = time.time() - hours * 3600
+        tree = Path(session["path"])
+        for path in (Path(session["_file"]), tree / ".git" / "index", tree / ".git" / "logs" / "HEAD", tree):
+            if path.exists():
+                os.utime(path, (then, then))
+
+    def _session(self, key: str) -> dict:
+        return next(s for s in vcs_client.all_sessions() if vcs_client.key_of(s) == key)
+
+    def test_a_clone_reaps_copies_nobody_has_touched_inside_the_ttl(self):
+        """The lease's reaper went with the lease; this is what bounds the scratch root now.
+
+        A landed `submit` does not discard its copy, so every branch ever
+        prepared would otherwise stay on the sandbox's claim for good.
+        """
+        vcs_client.clone("acme/infra", key="fix/old")
+        vcs_client.clone("acme/infra", key="fix/recent")
+        old, recent = self._session("fix/old"), self._session("fix/recent")
+        self._age(old, 25)
+        self._age(recent, 23)
+        vcs_client.clone("acme/infra", key="fix/new")
+        self.assertFalse(Path(old["path"]).exists())
+        self.assertFalse(Path(old["_file"]).exists())
+        self.assertTrue(Path(recent["path"]).exists())
+        self.assertEqual(sorted(vcs_client.key_of(s) for s in vcs_client.all_sessions()), ["fix/new", "fix/recent"])
+
+    def test_a_clone_does_not_reap_its_own_destination(self):
+        vcs_client.clone("acme/infra", key="fix/one")
+        self._age(self._session("fix/one"), 48)
+        cloned = vcs_client.clone("acme/infra", key="fix/one")
+        self.assertTrue(Path(cloned["path"]).exists())
+
+    def test_a_record_naming_a_path_outside_the_root_is_never_reaped(self):
+        """The record is a file the sandbox user can write; its path must not become a delete primitive."""
+        vcs_client.clone("acme/infra", key="fix/one")
+        session = self._session("fix/one")
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        record = Path(session["_file"])
+        written = json.loads(record.read_text())
+        written["path"] = str(outside)
+        record.write_text(json.dumps(written))
+        session["path"] = str(outside)
+        self._age(session, 48)
+        self.assertEqual(vcs_client.reap_stale_copies(), [])
+        self.assertTrue(outside.exists())
+
+    def test_a_ttl_of_zero_turns_the_reaper_off(self):
+        vcs_client.clone("acme/infra", key="fix/one")
+        self._age(self._session("fix/one"), 48)
+        self.assertEqual(vcs_client.reap_stale_copies(ttl_hours=0), [])
 
     def test_two_copies_are_ambiguous_until_one_is_named_or_stood_in(self):
         first = vcs_client.clone("acme/infra", key="fix/one")

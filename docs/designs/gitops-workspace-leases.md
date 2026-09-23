@@ -139,7 +139,10 @@ GitOps repository are ordinary, and a copy named for the repository alone would 
 card's `prepare` either refuse or, with `--force`, delete the first card's unpublished work. Two
 cards, two copies, and no lease between them — so there is nothing to lease and no
 `assert_lease_owner` for `submit` to call: `--workspace` and `--lease` are both retired flags that
-warn and are ignored. Where a repository is cloned twice, `--repo` no longer identifies a copy on
+warn and are ignored. The lease's reaper went with the lease, and `clone` took its job: before
+bringing a copy down it deletes every other copy whose record, index and HEAD log are all older than
+`KUBE_AGENTS_VCS_TTL_HOURS` (default 24, 0 turns it off). Nothing else would — a landed `submit`
+leaves its copy behind, and a second round re-clones the branch anyway. Where a repository is cloned twice, `--repo` no longer identifies a copy on
 its own; the directory the caller is standing in does, and a caller that is standing nowhere is
 refused with the paths. `prepare --branch <name>` brings the repository down and
 prints `{"workspace", "repo", "branch", "base", "started_from", "proposal"}`; the agent works inside

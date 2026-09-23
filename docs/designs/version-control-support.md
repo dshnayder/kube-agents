@@ -10,10 +10,14 @@
 > through those verbs rather than by naming GitHub. Two things are deliberately
 > left behind by that migration and are not scheduling slips: `audit_report.py`
 > and the `fleet-audit` prose around it still shell `gh`, and
-> `inspect_repository.py` stays on the `git` shim because it reads repositories
-> this install does not manage and does it with a shallow clone — neither of
-> which the verbs offer, the second on purpose ([The seam](#3-the-seam)). The
-> CRD still knows only `spec.integration.github`, and no second forge exists.
+> `inspect_repository.py` stays on the broker's content-workspace route rather
+> than moving to the verbs, because it reads repositories this install does not
+> manage and does it with a shallow clone — neither of which the verbs offer,
+> the second on purpose ([The seam](#3-the-seam)). Its fallback, `git clone`
+> through the sandbox's credential shim, is taken only against a broker that
+> does not serve that route, which no shipped install is; it goes when the shim
+> does. The CRD still knows only `spec.integration.github`, and no second forge
+> exists.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -126,8 +130,9 @@ The coupling runs through five layers, each with a different owner and a differe
    provider abstraction — `pr_conversation.py`, `pr_triggers.py` and `github_scan_gate.py`, all on
    `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
-   `inspect_repository.py`, reaches a repository rather than an API, and does it by running
-   `git clone` through the sandbox's credential shim. (`github_token_refresh.py` and
+   `inspect_repository.py`, reaches a repository rather than an API, and does it through the
+   broker's content-workspace route, which clones on the credential side and honours `--depth`.
+   (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
    layer 3.) Five of the six are now on the verbs, and `forge.py` with them — it holds typed
    values and three policy rules and no forge implementation. `audit_report.py` is the sixth and
