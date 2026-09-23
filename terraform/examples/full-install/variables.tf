@@ -357,7 +357,7 @@ variable "enable_slack" {
 }
 
 variable "slack_bot_token" {
-  description = "SLACK_BOT_TOKEN (xoxb-...) stored in the credentials Secret. Only used when enable_slack is true."
+  description = "SLACK_BOT_TOKEN stored in the credentials Secret: one xoxb-... token, or several comma-separated, one per Slack workspace the agent serves. Only used when enable_slack is true."
   type        = string
   sensitive   = true
   default     = ""
@@ -507,7 +507,7 @@ variable "enable_cert_manager" {
 variable "cert_manager_version" {
   description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
-  default     = "v1.21.1"
+  default     = "v1.21.2"
 }
 
 variable "enable_webhooks" {
