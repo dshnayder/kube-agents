@@ -164,7 +164,9 @@ fields, and it may be a compound node: `sequence` (ordered, fail-fast), `paralle
 Three read the cluster, from devops-bench: `resource_property` (a JSONPath property of
 matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/matches),
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
-deployment's ready replicas land in a range).
+deployment's ready replicas land in a range). A fourth, `fleet_resource_property`, is
+this repository's `resource_property` against the seeded-fleet cluster that carries a
+fixture role, named by `fixture_role:` rather than by cluster.
 
 Six read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
@@ -196,7 +198,7 @@ itself does carry the workers' MCP tool calls, as the tagged trajectory entries 
 deterministic check reads their contents — `worker_agents` reads only which profile made
 them — and the judged metrics receive them as the execution trace.
 
-All eight fail closed. A check that cannot observe its subject returns `status: "error"`,
+Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
 1.0, which the gate fails. Silence is not a pass.
 

@@ -7,8 +7,9 @@
 #
 # What it catches. On a sandboxed install the agent's terminal runs in the
 # shell sandbox, which stubs cluster_agent_profile.py and
-# kanban_notify_propagate.py (deploy/sandbox/Dockerfile): both need the agent
-# pod's profile tree and the hermes binary. An instruction that tells the
+# kanban_notify_propagate.py (deploy/sandbox/Dockerfile): the first needs the
+# agent pod's profile tree and the hermes binary, the second the kanban
+# database. An instruction that tells the
 # Platform Agent to resolve a Cluster Agent's profile with
 # `cluster_agent_profile.py name`/`list`, or to copy a chat subscription with
 # kanban_notify_propagate.py, sends every delegation through a command that
@@ -21,13 +22,15 @@
 # So the objectives here are the route. worker_agents reads which profiles
 # the delegated workers ran as and requires a Cluster Agent among them;
 # worker_commands reads the terminal commands every delegated worker ran,
-# including the `platform` worker that plans the fan-out, and forbids the
-# two stubbed scripts. The profile lookup
-# is the platform_control MCP server's get_cluster_profile_name /
-# list_cluster_profiles, which run in the agent pod and so never appear here.
-# Only `name` and `list` are forbidden: `create` and `delete` are the
-# lifecycle skill's documented path for a cluster with no profile, and every
-# seeded cluster already has one.
+# including the `platform` worker that plans the fan-out, and forbids both
+# stubbed scripts. Every cluster_agent_profile.py subcommand is forbidden, not
+# only the lookups: all of them are stubbed, and a cluster with no profile is
+# now investigated inline rather than scaffolded mid-delegation. The profile
+# lookup is the platform_control MCP server's get_cluster_profile_name /
+# list_cluster_profiles, which run in the agent pod. Their calls are in the
+# workers' trajectory, but no check requires them: the route this case
+# grades is where the work ran, and a card assigned to a composed name that
+# is not a profile is never dispatched, which worker_agents already fails.
 #
 # Planted defect required: the crashloop-workload fixture shared with
 # cluster-agent-crashloop-debug (payments-api in seeded-debug, OOMKilled on a
@@ -82,7 +85,7 @@ verification_spec:
       type: worker_commands
       forbidden_patterns:
         [
-          'cluster_agent_profile\.py\s+(name|list)\b',
+          'cluster_agent_profile\.py\s+(name|list|create|delete)\b',
           'kanban_notify_propagate\.py',
         ]
   - name: rca-names-the-oom

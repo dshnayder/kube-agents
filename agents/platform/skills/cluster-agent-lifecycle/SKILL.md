@@ -30,7 +30,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `get_cluster_profile_name(project, cluster, location)` tool. It returns `name` and `exists`; `list_cluster_profiles()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
    - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
-   - If it does not exist, the cluster has no Cluster Agent yet (the hourly reconcile job below creates one for every cluster in scope). Investigate it yourself and say in your `result` that it had no Cluster Agent.
+   - If it does not exist, the cluster has no usable Cluster Agent: none yet (the hourly reconcile job below creates one for every cluster in scope), a scaffold that never finished, or a profile under that name pinned to a different cluster. Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
 2. **Create the card** with the request in the body:
 
