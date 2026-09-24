@@ -528,6 +528,19 @@ class BlockingExclusionEscalationTest(unittest.TestCase):
             with self.subTest(end=end):
                 self.assertEqual(self.blocking(self.frozen(end), None), (False, []))
 
+    def test_a_freeze_whose_window_does_not_parse_leaves_commands(self):
+        """The check skips an exclusion it cannot read, so `commands` said a
+        freeze it never judged was clean."""
+        for end in ("", "not-a-time", None):
+            with self.subTest(end=end):
+                c = self.frozen(end, node_pools=[pool(), pool("behind", version="1.27.3-gke.100")])
+                self.assertEqual(self.blocking(c, BASELINE), (False, []))
+
+    def test_an_unreadable_exclusion_outside_the_blocking_scopes_costs_nothing(self):
+        c = self.frozen("not-a-time")
+        c["maintenancePolicy"]["window"]["maintenanceExclusions"]["freeze"]["maintenanceExclusionOptions"]["scope"] = "NO_MINOR_UPGRADES"
+        self.assertEqual(self.blocking(c, BASELINE), (True, []))
+
     def test_an_unfrozen_cluster_is_judged_without_the_version_checks(self):
         self.assertEqual(self.blocking(cluster(), None), (True, []))
 

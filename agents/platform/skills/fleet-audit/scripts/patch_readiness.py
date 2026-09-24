@@ -693,6 +693,24 @@ def _utc(timestamp: str | None) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def blocking_exclusions_readable(cluster: dict) -> bool:
+    """Whether every blocking-scope exclusion carries timestamps `_utc` reads.
+
+    `check_blocking_exclusion` skips one it cannot read, and that skip is a
+    freeze the check did not judge: in `commands` it would read as clean."""
+    window = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
+    for exclusion in (window.get("maintenanceExclusions") or {}).values():
+        scope = ((exclusion.get("maintenanceExclusionOptions") or {}).get("scope")) or DEFAULT_EXCLUSION_SCOPE
+        if scope not in BLOCKING_EXCLUSION_SCOPES:
+            continue
+        try:
+            _utc(exclusion.get("startTime"))
+            _utc(exclusion.get("endTime"))
+        except ValueError:
+            return False
+    return True
+
+
 def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_finding: bool) -> dict | None:
     # `maintenanceExclusions` is a map keyed by exclusion name
     # (`{name: {startTime, endTime, maintenanceExclusionOptions}}`), not a
@@ -868,7 +886,10 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     # leaves `commands` with its candidate as `pool-skew` does. With no such
     # exclusion there is nothing to grade and the check judged the cluster.
     escalation_judged = has_version_finding or (pool_skew_judged and master_behind_judged(cluster, baseline))
-    if not escalation_judged and check_blocking_exclusion(cluster, now=now, has_version_finding=True) is not None:
+    # A blocking exclusion whose window does not parse is skipped by the
+    # check, so it keeps the slug out for the same reason.
+    frozen = check_blocking_exclusion(cluster, now=now, has_version_finding=True) is not None
+    if not blocking_exclusions_readable(cluster) or (not escalation_judged and frozen):
         slugs.remove("blocking-exclusion")
 
     single_hits = (
