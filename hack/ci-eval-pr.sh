@@ -1172,10 +1172,10 @@ ledger_reset_token() { # <owner/repo>
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the eight audit cases
-# carries one; two consistency cases share fleet-consistency-drift, and the
-# reset is per stream, so both retire that one ledger). Empty for a case that
-# writes no ledger.
+# ledger_issue_contains checks in task.yaml (each of the nine audit cases
+# carries one; two consistency cases share fleet-consistency-drift and two
+# patch cases share security-patch-orchestrator, and the reset is per stream,
+# so each pair retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
@@ -2101,7 +2101,7 @@ lock_acquire() { # <dir> [deadline-seconds]
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
 # How many cases in this run write the given stream's ledger: 1 for an
-# empty id or a case alone on its stream, 2 for the two consistency cases.
+# empty id or a case alone on its stream, 2 for a stream two cases share.
 # A loop over TASKS rather than a map, since bash 3.2 (what `bash -n` runs
 # under on a contributor's Mac) has no associative arrays and TASKS is short.
 stream_case_count() { # <audit-id>
@@ -2250,8 +2250,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
-  # one stream (the two consistency cases) must not reset and rewrite each
-  # other's ledger mid-run. The same scaled
+  # one stream (the consistency pair, the patch pair) must not reset and
+  # rewrite each other's ledger mid-run. The same scaled
   # deadline: a waiter here outlasts the other cases' units on the stream.
   if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"

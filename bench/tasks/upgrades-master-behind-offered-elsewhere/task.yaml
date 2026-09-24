@@ -62,8 +62,9 @@ verification_spec:
       type: ledger_issue_contains
       audit: security-patch-orchestrator
       # finding_ids, because the body's scope table names every cluster on
-      # every run. Two phrases rather than "master-behind.seeded-b":
-      # `_shorten_id` may trim the cluster segment, never the check slug.
+      # every run. Two phrases rather than "master-behind.seeded-b": the id
+      # carries the qualified `<project>/<location>/seeded-b`, so the bare
+      # name never directly follows the slug.
       scope: finding_ids
       required_phrases: ["master-behind", "seeded-b"]
   - name: the-lagging-cluster-is-graded-major-not-critical

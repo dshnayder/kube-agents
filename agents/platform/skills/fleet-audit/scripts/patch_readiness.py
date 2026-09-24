@@ -71,6 +71,8 @@ GLOBAL_LOCATION = "global"
 # GKE supports node pools at most this many minors behind the control plane;
 # at it the next control-plane upgrade is blocked, past it the pool is unsupported.
 SKEW_CEILING_MINORS = 2
+# §3.3: a fleet flags once its control planes span this many minors.
+FLEET_SPREAD_MIN_MINORS = 2
 
 # A digest of this file, published as `checks_revision`. The manifest contract
 # (docs/designs/fleet-audit-collector-manifest.md §2) carries it unread today,
@@ -452,9 +454,10 @@ def master_behind_judged(cluster: dict, baseline: dict | None) -> bool:
     cluster off its channel's roster that no other channel lists, when the
     baseline has no `validMasterVersions`: whether anything still offers its
     version is the question every branch rests on, and nothing in the
-    baseline answers it.
+    baseline answers it. A `currentMasterVersion` that does not parse judges
+    nothing against any roster, so it is unjudged whatever the baseline holds.
     """
-    if baseline is None:
+    if baseline is None or parse_version(cluster.get("currentMasterVersion") or "") is None:
         return False
     channel = _release_channel(cluster)
     if not channel:
@@ -603,13 +606,20 @@ def check_fleet_spread(clusters: list[dict]) -> list[dict]:
     if len(minors) < 2:
         return []
     oldest, newest = min(minors), max(minors)
-    if newest[0] != oldest[0] or newest[1] - oldest[1] < 2:
+    # §2: any difference in the first element is unbounded skew, so a fleet on
+    # two majors is the widest spread there is, and a minor count across the
+    # boundary would be meaningless.
+    if newest[0] != oldest[0]:
+        width = "across major versions"
+    elif newest[1] - oldest[1] >= FLEET_SPREAD_MIN_MINORS:
+        width = f"{newest[1] - oldest[1]} minors wide"
+    else:
         return []
     laggard = sorted(minors[oldest])[0]
     return [
         {
             "object": f"Cluster/{laggard}",
-            "excerpt": f"fleet spans {oldest[0]}.{oldest[1]}–{newest[0]}.{newest[1]}, {newest[1] - oldest[1]} minors wide",
+            "excerpt": f"fleet spans {oldest[0]}.{oldest[1]}–{newest[0]}.{newest[1]}, {width}",
         }
     ]
 
@@ -686,7 +696,7 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
     # list -- iterating it as a list would walk the names, not the windows.
     window = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
     exclusions = window.get("maintenanceExclusions") or {}
-    best = None
+    best, best_key = None, None
     for name, exclusion in exclusions.items():
         scope = ((exclusion.get("maintenanceExclusionOptions") or {}).get("scope")) or DEFAULT_EXCLUSION_SCOPE
         if scope not in BLOCKING_EXCLUSION_SCOPES:
@@ -705,6 +715,12 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
         long_freeze = (end - now) > LONG_FREEZE
         if not (long_freeze or has_version_finding):
             continue
+        # Several can qualify at once. The one that ends last is the freeze
+        # actually holding the cluster, and choosing it keeps the excerpt
+        # stable whatever order the API lists the map in.
+        if best is not None and (end, name) <= best_key:
+            continue
+        best_key = (end, name)
         severity = MAJOR if has_version_finding else MINOR
         best = {"object": f"Cluster/{cluster['name']}", "excerpt": f"exclusion {name} (scope {scope}) until {exclusion.get('endTime')}", "severity": severity}
     return best
@@ -811,8 +827,13 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     the agent to name in `limitations`, not a gate failure. No cluster shape
     rules any of the ten out -- the comment above explains why Autopilot does
     not -- so the collector never writes `checks_not_applicable`."""
-    slugs = ["pool-skew", "no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"]
+    slugs = ["no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"]
     candidates = []
+    # `pool-skew` compares every pool against the control plane, so a master
+    # version that does not parse leaves it nothing to judge; `check_pool_skew`
+    # returns no hits then, which in `commands` would read as clean.
+    if parse_version(cluster.get("currentMasterVersion") or "") is not None:
+        slugs.insert(0, "pool-skew")
 
     master_behind_hit = check_master_behind(cluster, baseline)
     pool_skew_hits = check_pool_skew(cluster)
@@ -1058,7 +1079,11 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         # the roster of checks that ran, so recording it only on a hit makes a
         # tight fleet indistinguishable from one nobody measured, and every
         # clean run reports a coverage gap it does not have.
-        commands["fleet-spread"] = clusters_record
+        # A master version that does not parse never reaches the computation
+        # (`check_fleet_spread` skips it), so it is the one cluster the check
+        # did not run against.
+        if parse_version(c.get("currentMasterVersion") or "") is not None:
+            commands["fleet-spread"] = clusters_record
         entry = {
             "name": target_name(project, location, c["name"]),
             "project": project,

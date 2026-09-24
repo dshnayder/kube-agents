@@ -16344,10 +16344,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     a renderer that reorders a section -- each fails here, naming the byte.
 
     One deviation is deliberate and is recorded in the transcripts rather than
-    excused: `ID_SCHEME` went from 2 to 3 because the drift collector now
-    qualifies cluster names, and the stamp is global, so every stream's bodies
-    carry the new number. That is the whole of the change here -- five lines,
-    one per body -- and this class is what proves it.
+    excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
+    qualifying cluster names, and from 3 to 4 when the patch-readiness
+    collector did the same, and the stamp is global, so every stream's bodies
+    carry the current number. That is the whole of the change here -- five
+    lines, one per body -- and this class is what proves it.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

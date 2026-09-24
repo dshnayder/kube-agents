@@ -404,6 +404,16 @@ class FleetSpreadTest(unittest.TestCase):
         self.assertEqual(pr.check_fleet_spread(clusters), [])
 
 
+    def test_a_fleet_on_two_majors_is_flagged_on_the_laggard(self):
+        """§2 reads any difference in the first element as unbounded skew,
+        so two majors is the widest spread there is. The guard returned [] for
+        it, and the excerpt's minor count means nothing across the boundary."""
+        clusters = [cluster(name="old", master="1.33.0-gke.1"), cluster(name="new", master="2.0.0-gke.1")]
+        hits = pr.check_fleet_spread(clusters)
+        self.assertEqual([h["object"] for h in hits], ["Cluster/old"])
+        self.assertIn("across major versions", hits[0]["excerpt"])
+        self.assertNotIn("minors wide", hits[0]["excerpt"])
+
 class NoChannelTest(unittest.TestCase):
     def test_flags_empty_channel(self):
         self.assertIsNotNone(pr.check_no_channel(cluster(channel="")))
@@ -547,6 +557,19 @@ class BlockingExclusionTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("freeze", hit["excerpt"])
 
+
+    def test_the_freeze_that_ends_last_is_reported_whatever_the_map_order(self):
+        """Every qualifying exclusion overwrote the last, so the excerpt named
+        whichever the API listed last: the wrong freeze to shorten, and one
+        that could flip between runs."""
+        long = {"startTime": "2026-01-01T00:00:00Z", "endTime": "2026-09-01T00:00:00Z", "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}
+        short = {"startTime": "2026-01-01T00:00:00Z", "endTime": "2026-03-01T00:00:00Z", "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}
+        for order in ((("long-freeze", long), ("short-freeze", short)), (("short-freeze", short), ("long-freeze", long))):
+            with self.subTest(first=order[0][0]):
+                c = cluster(maintenancePolicy={"window": {"recurringWindow": {}, "maintenanceExclusions": dict(order)}})
+                hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False)
+                self.assertIn("long-freeze", hit["excerpt"])
+                self.assertIn("2026-09-01", hit["excerpt"])
 
 class StaleImageTypeTest(unittest.TestCase):
     def test_autopilot_pools_carry_an_image_type_and_are_checked(self):
@@ -809,6 +832,25 @@ class CollectProjectTest(unittest.TestCase):
         checks = {c["check"] for c in entries[0]["commands"]}
         self.assertNotIn("master-behind", checks)
         self.assertNotIn("stale-image-type", checks)
+
+    def test_an_unparseable_master_version_leaves_the_version_checks_out_of_commands(self):
+        """`check_master_behind`, `check_pool_skew` and the spread all skip a
+        master version they cannot parse, and the manifest still listed their
+        slugs as run: in `commands`, no candidate reads as clean."""
+        for label, master in (("absent", None), ("new-shape", "1.31")):
+            with self.subTest(master=label):
+                c = cluster(master=master)
+                if master is None:
+                    del c["currentMasterVersion"]
+                responses = {
+                    "clusters list": run_of(0, json.dumps([c])),
+                    "get-server-config": run_of(0, json.dumps(server_config())),
+                }
+                entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+                checks = {cmd["check"] for cmd in entries[0]["commands"]}
+                self.assertEqual(checks & {"master-behind", "pool-skew", "fleet-spread"}, set())
+                self.assertIn("stale-image-type", checks)
+                self.assertIn("no-channel", checks)
 
     def test_clusters_list_failure_is_recorded_as_a_gate_failed_project(self):
         """Returning [] dropped the project out of the manifest, where it read
@@ -1364,8 +1406,6 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
     def test_checks_run_copied_from_a_collected_cluster_survives_cross_check(self):
-        import audit_report
-
         c = cluster()
         responses = {
             # A full discovery rather than `--project`, whose unenumerated row
@@ -1392,8 +1432,6 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         audit_report.cross_check_manifest(data, manifest)  # must not raise
 
     def test_a_check_absent_from_the_manifest_is_rejected(self):
-        import audit_report
-
         c = cluster()
         responses = {
             # A full discovery rather than `--project`, whose unenumerated row
