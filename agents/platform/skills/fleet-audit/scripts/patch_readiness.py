@@ -749,9 +749,16 @@ def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
 
 
 def notification_topic(cluster: dict) -> str:
-    """The topic this cluster already publishes upgrade notifications to."""
+    """The topic this cluster already publishes upgrade notifications to.
+
+    Enabled is not enough: a filter that leaves out upgrade events publishes
+    to the topic without publishing upgrade notifications, and
+    `check_no_notifications` flags that cluster for it."""
     pubsub = ((cluster.get("notificationConfig") or {}).get("pubsub") or {})
-    return str(pubsub.get("topic") or "") if pubsub.get("enabled") else ""
+    event_types = (pubsub.get("filter") or {}).get("eventType") or []
+    if not pubsub.get("enabled") or (event_types and UPGRADE_AVAILABLE_EVENT not in event_types):
+        return ""
+    return str(pubsub.get("topic") or "")
 
 
 def _upgrade_scheduled(cluster: dict) -> bool:
@@ -831,12 +838,21 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     candidates = []
     # `pool-skew` compares every pool against the control plane, so a master
     # version that does not parse leaves it nothing to judge; `check_pool_skew`
-    # returns no hits then, which in `commands` would read as clean.
-    if parse_version(cluster.get("currentMasterVersion") or "") is not None:
+    # returns no hits then, which in `commands` would read as clean. A pool
+    # whose own version does not parse is skipped the same way, so it also
+    # keeps the slug out: `commands` says the check judged the whole cluster.
+    # Its candidates go with it, since a candidate's evidence is the
+    # `commands` entry for its check; the SOP's manual fallback covers both.
+    pool_skew_judged = parse_version(cluster.get("currentMasterVersion") or "") is not None and all(
+        parse_version(pool.get("version") or "") is not None
+        for pool in cluster.get("nodePools") or []
+        if not _pool_status_excludes(pool, cluster)
+    )
+    if pool_skew_judged:
         slugs.insert(0, "pool-skew")
 
     master_behind_hit = check_master_behind(cluster, baseline)
-    pool_skew_hits = check_pool_skew(cluster)
+    pool_skew_hits = check_pool_skew(cluster) if pool_skew_judged else []
     # §3.8's escalation is specifically "a critical/major version finding" --
     # a minor one (3.1c's same-minor patch lag, 3.2's patch-only drift)
     # does not, on its own, justify calling out a long freeze as major.
@@ -859,7 +875,12 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
         slugs.append("master-behind")
         if master_behind_hit is not None:
             candidates.append(_emit("master-behind", master_behind_hit))
-    if baseline is not None and baseline["validImageTypes"]:
+    # A pool with no `config.imageType` is skipped by the check, so it keeps
+    # the slug out for the reason `pool-skew`'s comment gives.
+    image_types_readable = all(
+        ((pool.get("config") or {}).get("imageType") or "") for pool in cluster.get("nodePools") or []
+    )
+    if baseline is not None and baseline["validImageTypes"] and image_types_readable:
         slugs.append("stale-image-type")
         candidates += [_emit("stale-image-type", hit) for hit in check_stale_image_type(cluster, baseline)]
 
@@ -1157,12 +1178,21 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # this key, not the exit code, is what tells the worker not to publish.
     collected = [e for e in entries if e.get("outcome") == OUTCOME_COLLECTED]
     failed = [e for e in entries if e.get("outcome") == OUTCOME_GATE_FAILED and e["name"] != UNENUMERATED_PROJECTS_TARGET]
+    out_of_scope = [e for e in entries if e.get("outcome") == OUTCOME_OUT_OF_SCOPE]
     if discovery.error:
         manifest["error"] = discovery.error
     elif failed and not collected:
+        # The answering projects may still have listed clusters §1.5 rules
+        # out; those entries stay in `clusters`, so the error says so rather
+        # than calling the projects empty.
+        rest = (
+            f"the rest held no auditable cluster ({len(out_of_scope)} out of scope)"
+            if out_of_scope
+            else "the rest held none"
+        )
         manifest["error"] = (
             f"no cluster could be read: {len(failed)} of {len(projects)} project(s) in scope "
-            f"failed `clusters list` and the rest held none; {failed[0]['name']}: {failed[0]['error']}"
+            f"failed `clusters list` and {rest}; {failed[0]['name']}: {failed[0]['error']}"
         )[:ERROR_EXCERPT_CHARS]
     return manifest
 

@@ -763,6 +763,15 @@ class IncumbentTopicTest(unittest.TestCase):
         c = cluster(**{"notificationConfig": {"pubsub": {"enabled": False, "topic": self.TOPIC}}})
         self.assertEqual(pr.notification_topic(c), "")
 
+    def test_a_cluster_filtering_out_upgrade_events_is_not_an_incumbent(self):
+        """It publishes to the topic, but not upgrade notifications, and this
+        same stream flags it for that; naming its topic as where the fleet
+        publishes them would put a false sentence in the ledger."""
+        pubsub = {"enabled": True, "topic": self.TOPIC, "filter": {"eventType": ["SECURITY_BULLETIN_EVENT"]}}
+        self.assertEqual(pr.notification_topic(cluster(notificationConfig={"pubsub": pubsub})), "")
+        pubsub["filter"]["eventType"].append(pr.UPGRADE_AVAILABLE_EVENT)
+        self.assertEqual(pr.notification_topic(cluster(notificationConfig={"pubsub": pubsub})), self.TOPIC)
+
     def test_an_enrolled_cluster_reports_its_topic(self):
         c = cluster(**{"notificationConfig": {"pubsub": {"enabled": True, "topic": self.TOPIC}}})
         self.assertEqual(pr.notification_topic(c), self.TOPIC)
@@ -851,6 +860,37 @@ class CollectProjectTest(unittest.TestCase):
                 self.assertEqual(checks & {"master-behind", "pool-skew", "fleet-spread"}, set())
                 self.assertIn("stale-image-type", checks)
                 self.assertIn("no-channel", checks)
+
+    def test_a_pool_the_version_checks_cannot_read_leaves_its_check_out_of_commands(self):
+        """The master parses, so the cluster-level rule keeps `pool-skew`; a
+        pool the check skipped would still have read as judged and clean."""
+        cases = (
+            ("pool-skew", pool("odd", version="1.29")),
+            ("stale-image-type", pool("bare", config={})),
+        )
+        for slug, unreadable in cases:
+            with self.subTest(slug=slug):
+                behind = pool("behind", version="1.27.3-gke.100", image_type="UBUNTU")
+                c = cluster(node_pools=[pool(), behind, unreadable])
+                responses = {
+                    "clusters list": run_of(0, json.dumps([c])),
+                    "get-server-config": run_of(0, json.dumps(server_config())),
+                }
+                entry = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)[0]
+                self.assertNotIn(slug, {cmd["check"] for cmd in entry["commands"]})
+                self.assertNotIn(slug, {cand["check"] for cand in entry["candidates"]})
+                self.assertIn("no-channel", {cmd["check"] for cmd in entry["commands"]})
+
+    def test_a_pool_mid_upgrade_does_not_cost_pool_skew_its_slug(self):
+        """`check_pool_skew` leaves a reconciling pool out on purpose, so its
+        version is not one the check needed to read."""
+        c = cluster(node_pools=[pool(), pool("moving", version="", status="RECONCILING")])
+        responses = {
+            "clusters list": run_of(0, json.dumps([c])),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+        entry = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)[0]
+        self.assertIn("pool-skew", {cmd["check"] for cmd in entry["commands"]})
 
     def test_clusters_list_failure_is_recorded_as_a_gate_failed_project(self):
         """Returning [] dropped the project out of the manifest, where it read
@@ -1249,6 +1289,18 @@ class CollectFleetTest(unittest.TestCase):
         run = self.discovering(listing=(0, "base\nother\n"), clusters={"base": denied, "other": denied})
         manifest = pr.collect_fleet(run=run, now=NOW)
         self.assertIn("no cluster could be read", manifest["error"])
+
+    def test_a_failed_project_beside_one_holding_only_out_of_scope_clusters(self):
+        """The answering project listed a cluster, so "held none" was false
+        about a manifest that carries its out-of-scope entry."""
+        denied = run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+        provisioning = run_of(0, json.dumps([cluster(name="new", status="PROVISIONING")]))
+        run = self.discovering(listing=(0, "base\nother\n"), clusters={"base": denied, "other": provisioning})
+        manifest = pr.collect_fleet(run=run, now=NOW)
+        self.assertIn("no cluster could be read", manifest["error"])
+        self.assertIn("no auditable cluster (1 out of scope)", manifest["error"])
+        self.assertNotIn("held none", manifest["error"])
+        self.assertIn("out-of-scope", {c["outcome"] for c in manifest["clusters"]})
 
     def test_main_exits_non_zero_on_a_manifest_error_and_still_prints_it(self):
         run = self.discovering(base="", listing=(1, ""))
