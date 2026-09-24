@@ -97,9 +97,11 @@ class MasterBehindTest(unittest.TestCase):
         unsupported = pr._emit("master-behind", pr.check_master_behind(cluster(master="1.28.0-gke.1"), BASELINE))
         self.assertTrue(unsupported["impact_authoritative"])
         self.assertEqual(unsupported["impact"], pr.UNSUPPORTED_MASTER_IMPACT)
-        behind = pr._emit("master-behind", {"object": "Cluster/c", "excerpt": "x", "severity": "major"})
+        lagging, default = "1.30.3-gke.100", "1.30.5-gke.100"
+        baseline = pr.normalize_server_config(server_config(default=default, valid_versions=[lagging, default]))
+        behind = pr._emit("master-behind", pr.check_master_behind(cluster(master=lagging), baseline))
         self.assertTrue(behind["impact_authoritative"])
-        self.assertEqual(behind["impact"], pr.IMPACT["master-behind"])
+        self.assertEqual(behind["impact"], pr.BEHIND_MASTER_IMPACT.format(default=default))
         self.assertFalse(pr._emit("no-channel", {"object": "Cluster/c", "excerpt": "x"})["impact_authoritative"])
 
     def test_absent_from_valid_versions_is_critical(self):
@@ -562,24 +564,24 @@ class BlockingExclusionTest(unittest.TestCase):
             }
         )
 
-    def test_a_long_freeze_is_flagged_even_without_a_version_finding(self):
+    def test_a_freeze_ending_past_thirty_days_is_flagged_even_without_a_version_finding(self):
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z")
         hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["severity"], "minor")
 
-    def test_a_short_freeze_with_no_version_finding_is_not_flagged(self):
+    def test_a_freeze_ending_within_thirty_days_with_no_version_finding_is_not_flagged(self):
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-01-20T00:00:00Z")
         self.assertIsNone(pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False))
 
-    def test_a_short_freeze_holding_back_a_version_finding_is_major(self):
+    def test_a_freeze_ending_within_thirty_days_holding_back_a_version_finding_is_major(self):
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-01-20T00:00:00Z")
         hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=True)
         self.assertEqual(hit["severity"], "major")
 
-    def test_a_freeze_thirty_days_and_change_long_counts_as_long(self):
+    def test_a_freeze_ending_thirty_days_and_change_out_counts_as_long(self):
         """`(end - now).days` truncates, so 30 days 23 hours read as 30 and
-        fell under a `> 30` threshold. The SOP's rule is on the duration, not
+        fell under a `> 30` threshold. The SOP's rule is on the time left, not
         on its whole-day floor."""
         # NOW is 2026-01-15, so this ends 30 days and 23 hours out.
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-02-14T23:00:00Z")
@@ -587,7 +589,7 @@ class BlockingExclusionTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit["severity"], "minor")
 
-    def test_a_freeze_exactly_thirty_days_long_is_not_long(self):
+    def test_a_freeze_ending_exactly_thirty_days_out_is_not_long(self):
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-02-14T00:00:00Z")
         self.assertIsNone(pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False))
 
@@ -1060,7 +1062,7 @@ class CollectProjectTest(unittest.TestCase):
     def test_a_clean_fleet_reports_no_coverage_gap_for_fleet_spread(self):
         """End-to-end: §6's arithmetic over a tight fleet, which is the shape
         every healthy run of this audit takes."""
-        clusters = [cluster(name="a", master="1.30.0-gke.1"), cluster(name="b", master="1.30.1-gke.2")]
+        clusters = [cluster(name="a"), cluster(name="b")]
         responses = {
             "clusters list": run_of(0, json.dumps(clusters)),
             "get-server-config": run_of(0, json.dumps(server_config())),
@@ -1068,6 +1070,7 @@ class CollectProjectTest(unittest.TestCase):
         entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
         roster = set(audit_report.audit_target_checks("security-patch-orchestrator", "a"))
         for entry in entries:
+            self.assertEqual(entry["candidates"], [])
             self.assertEqual(roster - {c["check"] for c in entry["commands"]}, set())
 
     def test_the_sop_spells_an_unreadable_project_the_way_the_manifest_does(self):
@@ -1236,12 +1239,11 @@ class CollectFleetTest(unittest.TestCase):
         self.assertGreaterEqual(audit_report.ID_SCHEME, 4)
 
     def test_a_cluster_section_one_skips_is_not_marked_collected(self):
-        """§1.5 orders a PROVISIONING/STOPPING/ERROR or alpha cluster into
-        `scope.skipped`, and the two scope lists may not overlap — but the
-        collector marked it `collected`, and `cross_check_manifest` rejects a
-        document that omits a `collected` cluster from `scope.clusters`. On a
-        fleet holding one such cluster the run could not publish whichever list
-        the model chose."""
+        """§1.5 skips a PROVISIONING/STOPPING/ERROR or alpha cluster, and the
+        collector marks it `out-of-scope`, which goes in neither scope list. It
+        used to mark it `collected`, which `cross_check_manifest` holds to
+        `scope.clusters`, so on a fleet holding one such cluster the run could
+        not publish whichever list the model chose."""
         clusters = [
             cluster(name="fine"),
             cluster(name="mid-flight", status="PROVISIONING"),
@@ -1444,22 +1446,22 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
 
         entries = pr.collect_project("acme", run=run, now=NOW)
         entry = entries[0]
-        return entry, {c["check"] for c in entry["commands"]}, {e["check"] for e in entry.get("checks_not_applicable") or []}
+        # No cluster shape rules a check out, so the collector declares none
+        # inapplicable, and no slug can be both run and declared.
+        self.assertNotIn("checks_not_applicable", entry)
+        return entry, {c["check"] for c in entry["commands"]}
 
     def test_autopilot_runs_all_four_and_declares_nothing_inapplicable(self):
-        entry, ran, declared = self.collect(autopilot=True)
+        _, ran = self.collect(autopilot=True)
         self.assertTrue(set(self.POOL_CHECKS) <= ran)
-        self.assertEqual(declared, set())
-        self.assertNotIn("checks_not_applicable", entry)
 
     def test_a_standard_cluster_is_treated_identically(self):
         """The whole distinction is gone, so the two shapes now produce the
         same dispositions -- which is the claim worth pinning, because a
         divergence that reappears would reappear silently."""
-        _, ap_ran, ap_declared = self.collect(autopilot=True)
-        _, std_ran, std_declared = self.collect(autopilot=False)
+        _, ap_ran = self.collect(autopilot=True)
+        _, std_ran = self.collect(autopilot=False)
         self.assertEqual(ap_ran, std_ran)
-        self.assertEqual(ap_declared, std_declared)
 
     def test_the_checks_actually_read_the_autopilot_fields(self):
         """The point of running them. If GKE ever returns a pool with
@@ -1474,7 +1476,7 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
             auto_repair=False,
             image_type="UBUNTU",  # deprecated, and absent from validImageTypes
         )]
-        entry, _, _ = self.collect(autopilot=True, node_pools=pools)
+        entry, _ = self.collect(autopilot=True, node_pools=pools)
         found = {c["check"] for c in entry["candidates"]}
         self.assertTrue({"pool-skew", "no-autoupgrade", "no-autorepair", "stale-image-type"} <= found)
 
@@ -1482,7 +1484,7 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
         """Running the checks must not manufacture findings out of the normal
         Autopilot shape -- otherwise this trades four honest n/a entries for
         four per-cluster false positives across the fleet."""
-        entry, _, _ = self.collect(autopilot=True)
+        entry, _ = self.collect(autopilot=True)
         found = {c["check"] for c in entry["candidates"]}
         self.assertEqual(found & set(self.POOL_CHECKS), set())
 
@@ -1492,40 +1494,30 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
         after. `check_pool_skew` already excluded that case for Standard; it is
         what makes running the check on Autopilot safe rather than noisy."""
         pools = [pool("ap-pool-1", version="1.30.4-gke.100")]
-        entry, _, _ = self.collect(autopilot=True, node_pools=pools)
+        entry, _ = self.collect(autopilot=True, node_pools=pools)
         self.assertNotIn("pool-skew", {c["check"] for c in entry["candidates"]})
-
-    def test_no_slug_is_both_run_and_inapplicable(self):
-        """`stale-image-type` was written into `commands` from the baseline
-        branch, after the not-applicable filter had already removed it from
-        `slugs` — so the manifest asserted both at once."""
-        _, ran, declared = self.collect(autopilot=True)
-        self.assertEqual(ran & declared, set())
 
     def test_a_missing_baseline_is_a_gap_for_both_baseline_checks(self):
         """`stale-image-type` needs the location roster to judge an image
         against, so a failed `get-server-config` leaves it unread -- a real
         coverage gap, and no longer excused as inapplicable."""
-        _, ran, declared = self.collect(autopilot=True, server_config_rc=1)
+        _, ran = self.collect(autopilot=True, server_config_rc=1)
         self.assertNotIn("stale-image-type", ran)
-        self.assertNotIn("stale-image-type", declared)
 
     def test_master_behind_stays_a_real_check_on_autopilot(self):
         """An Autopilot control plane has a version like any other, and when
         the baseline fails it is a genuine gap, not something to excuse."""
-        _, ran, declared = self.collect(autopilot=True)
-        self.assertNotIn("master-behind", declared)
+        _, ran = self.collect(autopilot=True)
         self.assertIn("master-behind", ran)
-        _, ran_no_baseline, declared_no_baseline = self.collect(autopilot=True, server_config_rc=1)
+        _, ran_no_baseline = self.collect(autopilot=True, server_config_rc=1)
         self.assertNotIn("master-behind", ran_no_baseline)
-        self.assertNotIn("master-behind", declared_no_baseline)
 
     def test_the_run_list_accounts_for_the_whole_roster(self):
         """An Autopilot cluster owes a disposition for all ten checks, and now
         every one of them is a check that ran rather than one excused."""
-        _, ran, declared = self.collect(autopilot=True)
+        _, ran = self.collect(autopilot=True)
         roster = set(audit_report.AUDITS["security-patch-orchestrator"].checks)
-        self.assertEqual(roster - ran - declared, set())
+        self.assertEqual(roster - ran, set())
         self.assertEqual(roster, ran)
 
 

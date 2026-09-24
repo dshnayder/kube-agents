@@ -324,9 +324,11 @@ previous body stamped with another scheme, every id the marker names that has a 
 a finding's or a held row's — is re-derived from that row's `Where:` line and the check in its id,
 and that re-derived set stands in for the raw marker on the manifest path and for the held list
 on the manifest-less one. A bump that qualified a stream's cluster names leaves `Where:` lines
-naming the bare cluster, so on the manifest path a row is also spelled with the name qualified from
-the previous body's Scope table, and that spelling is used when the collector flags it and not the
-bare one. A bare name the table lists at two locations is not qualified. Only held ids with no row — the note and fourth tiers write none — are
+naming the bare cluster, so on the manifest path a row is also spelled with each name that could
+qualify it — from the previous body's Scope table, or, for a cluster past its `MAX_SCOPE_ROWS`
+rows, from this run's manifest clusters — and the spelling the collector flags is used when it does
+not flag the bare one. A name two clusters share takes the one the collector flags, and the first by
+id when it flags both: either keeps the ledger open over a finding the collector reports. Only held ids with no row — the note and fourth tiers write none — are
 the residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
 naming their count. That residual is the cost of a
 bump, which is rare and operator-initiated.

@@ -135,7 +135,7 @@ BLOCKING_EXCLUSION_SCOPES = {"NO_UPGRADES", "NO_MINOR_OR_NODE_UPGRADES"}
 # A scope-less exclusion is a full freeze: `NO_UPGRADES` is the scope enum's zero
 # value, and GKE's JSON omits a field at its zero value.
 DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
-# §3.8's "longer than 30 days".
+# §3.8's "ends more than 30 days from now": time left, not the freeze's length.
 LONG_FREEZE = timedelta(days=30)
 # §3.8's escalation: a freeze beside a critical or major version finding.
 # The severities the SOP grades in, as `finish` spells them.
@@ -732,7 +732,7 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
         # `.days` truncates, so a 30-day-23-hour freeze read as 30 and fell
         # through: the SOP's threshold is "longer than 30 days", and comparing
         # the timedelta itself is the only reading of that which does not lose
-        # the last day.
+        # the last day. The SOP measures the time left, from now to the end.
         long_freeze = (end - now) > LONG_FREEZE
         if not (long_freeze or has_version_finding):
             continue
@@ -849,10 +849,11 @@ def _emit(slug: str, hit: dict) -> dict:
 
 def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) -> tuple[list[str], list[dict]]:
     """The check slugs this cluster has data for, and its candidates. A slug
-    missing from the first (`master-behind` and `stale-image-type`, when the
-    location's baseline could not be fetched or did not carry the roster the
-    check judges against) is a coverage gap the SOP tells
-    the agent to name in `limitations`, not a gate failure. No cluster shape
+    missing from the first is a check that judged nothing here -- `master-behind`
+    and `stale-image-type` without the baseline they read, `pool-skew` or
+    `stale-image-type` over a version or image type that does not parse, and
+    `blocking-exclusion` over a freeze it could not grade -- and a coverage gap
+    the SOP tells the agent to name in `limitations`, not a gate failure. No cluster shape
     rules any of the ten out -- the comment above explains why Autopilot does
     not -- so the collector never writes `checks_not_applicable`."""
     slugs = ["no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"]
@@ -1133,8 +1134,10 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         # tight fleet indistinguishable from one nobody measured, and every
         # clean run reports a coverage gap it does not have.
         # A master version that does not parse never reaches the computation
-        # (`check_fleet_spread` skips it), so it is the one cluster the check
-        # did not run against.
+        # (`check_fleet_spread` skips it), so the check did not run against
+        # that cluster. A cluster mid-upgrade is skipped too, by §3's
+        # suppression gate: that is the check's judgement on it, so it keeps
+        # the slug, as a reconciling pool keeps `pool-skew`'s.
         if parse_version(c.get("currentMasterVersion") or "") is not None:
             commands["fleet-spread"] = clusters_record
         entry = {
