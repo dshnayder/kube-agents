@@ -120,6 +120,9 @@ python3 harness/pointwise.py dump/ > results/pointwise.md
 python3 harness/horizon.py forecast --data data/series.jsonl.gz \
   --forecaster http://localhost:8080 --dump dump-8h/
 python3 harness/horizon.py report dump-8h/ dump/ > results/horizon.md
+for days in 1 7; do python3 harness/window.py forecast --data data/series.jsonl.gz \
+  --forecaster http://localhost:8080 --context-days $days --every-hours 6 --dump dump-window$days/; done
+python3 harness/window.py report dump-window1/ dump-window7/ > results/window.md
 ```
 
 The forecaster ([`forecaster/`](forecaster/)) is TimesFM 2.5 200M (Apache-2.0 weights) baked

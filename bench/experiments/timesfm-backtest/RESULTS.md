@@ -34,9 +34,13 @@ What this means for the predictive agent:
   and 83% of node-count values are in the band, close to the target. At 12–24 hours ahead the
   figures are 73% and 70%. An agent that acts a few hours ahead gets near the target for memory
   and node count. One that acts a day ahead does not.
-- **Forecasting 8 hours ahead instead of 24 helps, but not enough.** Re-forecasting three
-  times a day raises the in-band share from 70% to 76% and cuts the too-high share from 15% to
-  12%. Disk reaches 96% and memory 85%. Nothing else reaches 90%.
+- **Forecasting 8 hours ahead instead of 24 roughly halves the worst miss.** On a typical day,
+  a memory forecast made 8 hours ahead is never more than 1% too high or 2% too low in any hour
+  of the 8. A 24-hour forecast misses by up to 3% and 5%. On a bad day (1 in 10), the figures
+  are 14% either way against about 25%. On a typical day, 8 hours ahead is well inside the
+  −10%/+5% target for disk and memory and just inside it for container CPU. Cluster-level CPU is
+  not, and on a bad day only disk stays inside
+  ([8 hours ahead or 24?](#8-hours-ahead-or-24)).
 - **CPU is not predictable at this precision.** To catch 90% of hourly container-CPU values, the
   band would have to widen to −27%/+15%. For cluster CPU used, it would take −67%/+26%.
 
@@ -119,28 +123,66 @@ Share of hourly values in band, by how far ahead of the forecast they are:
 The first hour is forecast well for everything except cluster CPU used. After that, accuracy
 falls steadily across the day.
 
-### An 8-hour horizon gains about 6 points
+### 8 hours ahead or 24?
 
-We also forecast 8 hours ahead from 00, 08 and 16 UTC each day and compared each window with
-the midnight 24-hour forecast for the same clock hours. Scoring only the first 8 hours of the
-midnight forecast would overstate the gain slightly: at the same 8-hour horizon, the 00:00–08:00
-UTC window scores 78% against 74–76% for the other two.
+**The test.** Take 10am as an example:
 
-| Series                | 8-hour forecast  | 24-hour forecast, same hours | Repeat yesterday |
-| --------------------- | ---------------- | ---------------------------- | ---------------- |
-| disk used             | 96 / 1 / 2       | 90 / 4 / 6                   | 85 / 5 / 10      |
-| container memory      | 85 / 10 / 5      | 78 / 14 / 8                  | 68 / 21 / 11     |
-| node count            | 80 / 6 / 14      | 75 / 7 / 18                  | 70 / 15 / 15     |
-| container CPU         | 71 / 13 / 15     | 65 / 16 / 19                 | 50 / 31 / 19     |
-| cluster CPU requested | 67 / 12 / 21     | 60 / 14 / 26                 | 55 / 23 / 21     |
-| cluster CPU used      | 45 / 21 / 35     | 40 / 22 / 37                 | 29 / 38 / 32     |
-| **all**               | **76 / 12 / 12** | **70 / 15 / 16**             | **58 / 25 / 16** |
+- **8 hours ahead.** At 2am, TimesFM gets the previous 7 days of data and forecasts every hour
+  from 2am to 10am. At 10am we compare each hour's forecast with what was actually measured. We
+  note the largest overshoot (forecast above actual) and the largest undershoot (forecast below
+  actual), each as a percentage of the actual value.
+- **24 hours ahead.** At 10am yesterday, TimesFM gets the previous 7 days and forecasts every
+  hour until 10am today. We compare all 24 hours the same way.
 
-Each cell is the percentage in band / more than 5% too high / more than 10% too low, hourly
-values. The gain is largest in the evening window, 16:00–24:00 UTC, where the 24-hour forecast
-is 16 or more hours old: 74% in band against 63%. Repeating yesterday does not improve with a
-shorter horizon, so TimesFM's lead over it widens to 18 points.
-[`results/horizon.md`](results/horizon.md) has each window separately.
+We repeated this from four start times a day (00:00, 06:00, 12:00 and 18:00 UTC) on each of the
+33 days, for all 153 series: about 15,000 forecasts per horizon. The tables give the largest
+overshoot and undershoot on a typical day (the median forecast) and on a bad day (the worst 1
+in 10). "0%" means under half a percent.
+
+**On a typical day:**
+
+| Series                | 8 h ahead: too high by at most | 8 h ahead: too low by at most | 24 h ahead: too high by at most | 24 h ahead: too low by at most |
+| --------------------- | -----------------------------: | ----------------------------: | ------------------------------: | -----------------------------: |
+| disk used             |                             0% |                            0% |                              0% |                             1% |
+| container memory      |                             1% |                            2% |                              3% |                             5% |
+| node count            |                             0% |                            0% |                              0% |                             8% |
+| container CPU         |                             3% |                            8% |                              7% |                            15% |
+| cluster CPU requested |                             1% |                           12% |                              4% |                            32% |
+| cluster CPU used      |                             6% |                           36% |                             17% |                            66% |
+
+**On a bad day (worst 1 in 10):**
+
+| Series                | 8 h ahead: too high by at most | 8 h ahead: too low by at most | 24 h ahead: too high by at most | 24 h ahead: too low by at most |
+| --------------------- | -----------------------------: | ----------------------------: | ------------------------------: | -----------------------------: |
+| disk used             |                             1% |                            3% |                              6% |                            13% |
+| container memory      |                            14% |                           14% |                             25% |                            24% |
+| node count            |                            28% |                           35% |                             43% |                            45% |
+| container CPU         |                            18% |                           31% |                             32% |                            45% |
+| cluster CPU requested |                            38% |                           43% |                             44% |                            48% |
+| cluster CPU used      |                            50% |                           72% |                             79% |                            76% |
+
+How to read it:
+
+- **Disk and memory.** On a typical day, an 8-hour forecast stays within 2% of the actual value
+  in every hour, inside the −10%/+5% target. On a bad day, disk still does. Memory reaches 14%
+  either way.
+- **Node count** changes in whole nodes. On most days nothing changes and the forecast is exact.
+  On a day the cluster scales, the forecast is off by one or more nodes, and one node is a third
+  of a 3-node cluster.
+- **CPU** misses mostly by forecasting too low: the model does not foresee bursts. Container
+  CPU 8 hours ahead is just inside the target on a typical day (3% high, 8% low) and far outside
+  it on a bad one (31% low). Cluster-level CPU is outside it even on a typical day.
+
+Part of the difference is that a 24-hour window has three times as many hours in which to miss.
+To remove that, we also compared the same 8 clock hours forecast 8 hours ahead and 16–24 hours
+ahead. On a typical day the two are close: memory 1%/2% both ways; container CPU 3%/8% against
+4%/9%. On a bad day, the fresher forecast is better by a few points: memory 14%/14% against
+20%/18%; container CPU 18%/31% against 25%/34%. Re-forecasting more often helps, but less than
+the tables above suggest.
+
+With 24 hours of history instead of 7 days, the typical-day figures change by at most 4
+points. On bad days, 7 days helps mainly cluster CPU used, where the 8-hour overshoot falls
+from 82% to 50%. [`results/window.md`](results/window.md) has both histories.
 
 ### Shifting the forecast lower does not help
 
@@ -203,10 +245,13 @@ seconds from 7 days of history. A daily run over a thousand series takes minutes
 
 - [`results/pointwise.md`](results/pointwise.md): the point-by-point tables at both steps, for
   every method, by lead time and by forecast quantile.
-- [`results/horizon.md`](results/horizon.md): 8-hour against 24-hour forecasts, per window.
+- [`results/window.md`](results/window.md): largest overshoot and undershoot, 8 against 24
+  hours ahead, with 24 hours and 7 days of history.
+- [`results/horizon.md`](results/horizon.md): 8-hour against 24-hour forecasts as the share of
+  hourly values in band, per time of day.
 - [`results/decision.md`](results/decision.md): the threshold-warning tables.
 - [`results/summary.md`](results/summary.md): the standard forecast-accuracy scores.
 
 The [README](README.md) has the method and the commands. `harness/pointwise.py`,
 `harness/decide.py` and `harness/peaks.py` produce these tables from a `backtest.py --dump`
-run; `harness/horizon.py` makes and scores the 8-hour forecasts.
+run; `harness/window.py` and `harness/horizon.py` make and score the 8-hour forecasts.

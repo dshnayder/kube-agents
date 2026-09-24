@@ -740,15 +740,17 @@ to score. It needs a longer window, a fleet with real pressure on its limits, or
 incidents.
 
 **A day ahead, the forecast is within −10%/+5% of the actual value 70% of the time, not 90%.**
-Comparing each forecast hourly value with the value measured in that hour, 70% landed in the
-band, 15% were more than 5% too high and 16% more than 10% too low. Only disk usage reached 90%;
-memory reached 78%, node count 75%, CPU 40–65%. TimesFM beat repeating yesterday on every series
-type (58% in band, 25% too high), and accuracy was far higher in the first hours: 88% for memory
-and 83% for node count one to six hours ahead. Re-forecasting 8 hours ahead three times a day
-raised the overall share to 76%; only disk (96%) cleared 90%. Warnings on a forecast threshold crossing were
-rarely wrong but caught 3 of 299 crossings that were new that day; the rest the proactive agent
-already sees. Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the
-agent. Trend-driven resources such as disks, and horizons of a few hours, remain open.
+Comparing each forecast hourly value with the value measured in that hour, 70% landed in the band,
+15% were more than 5% too high and 16% more than 10% too low. Only disk usage reached 90%; memory
+reached 78%, node count 75%, CPU 40–65%. TimesFM beat repeating yesterday on every series type (58%
+in band, 25% too high), and accuracy was far higher in the first hours: 88% for memory and 83% for
+node count one to six hours ahead. Re-forecasting 8 hours ahead three times a day raised the overall
+share to 76%; only disk (96%) cleared 90%. Forecasting 8 hours ahead roughly halved the worst hourly
+miss: on a typical day memory stayed within 1% high and 2% low, against 3% and 5% a day ahead.
+Warnings on a forecast threshold crossing were rarely wrong but caught 3 of 299 crossings that were
+new that day; the rest the proactive agent already sees. Day-ahead forecasts of bursty CPU and
+memory are therefore not a reason to build the agent. Trend-driven resources such as disks, and
+horizons of a few hours, remain open.
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
 288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
