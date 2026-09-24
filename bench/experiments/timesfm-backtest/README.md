@@ -109,6 +109,13 @@ SSL_CERT_FILE=/etc/ssl/cert.pem python3 collect.py --end 2026-09-23 --days 41 \
 ./cluster.sh fetch r1            # metrics.csv.gz and latency.csv.gz into results/
 python3 harness/analyze.py results/metrics.csv.gz results/latency.csv.gz > results/summary.md
 ./cluster.sh down
+# RESULTS.md's tables: the forecaster image run locally on :8080 (a few hours on CPU); --dump
+# keeps every forecast path, peaks.py forecasts the daily-peak series
+python3 harness/backtest.py --data data/series.jsonl.gz --forecaster http://localhost:8080 \
+  --out results/r2 --dump dump/
+python3 harness/peaks.py --data data/series.jsonl.gz --forecaster http://localhost:8080 \
+  --out results/r2/peaks.csv.gz
+python3 harness/decide.py dump/ results/r2/peaks.csv.gz > results/decision.md
 ```
 
 The forecaster ([`forecaster/`](forecaster/)) is TimesFM 2.5 200M (Apache-2.0 weights) baked
@@ -117,6 +124,10 @@ into the image, behind `POST /forecast`, with one compiled copy per context buck
 ([`harness/`](harness/)) is the backtest; the analysis runs wherever the results land.
 
 ## Results
+
+[RESULTS.md](RESULTS.md) is the write-up for deciding whether to build the predictive agent:
+threshold warnings, the accuracy band, and the recommendation. This section records the
+standard forecast-accuracy scores behind it.
 
 Run `r1`, 2026-09-23. The full tables are in [`results/summary.md`](results/summary.md). The
 per-row metrics are not committed, for the same reason as the corpus.
@@ -200,5 +211,5 @@ about eight minutes on one replica.
   December case needs a year of archived series, fed either as one long hourly context or
   through a holiday covariate. Neither exists yet.
 - An alert on "tomorrow's peak exceeds X" cannot use the model's raw q90. It needs a peak-level
-  calibration, and after calibration its advantage over the baselines is modest. A breach
-  forecast has to be judged on breach events, which this corpus does not contain.
+  calibration, and after calibration its advantage over the baselines is modest.
+  [RESULTS.md](RESULTS.md) scores such alerts directly against per-series thresholds.

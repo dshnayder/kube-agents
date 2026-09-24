@@ -80,8 +80,8 @@ def fill(x):
     return x
 
 
-def post(url, inputs):
-    body = json.dumps({"inputs": [x.tolist() for x in inputs], "horizon": HORIZON}).encode()
+def post(url, inputs, horizon=HORIZON):
+    body = json.dumps({"inputs": [x.tolist() for x in inputs], "horizon": horizon}).encode()
     for attempt in range(MAX_RETRIES):
         try:
             req = urllib.request.Request(url + "/forecast", data=body,
@@ -148,6 +148,26 @@ def score(s, d, arm, quant, truth, ctx, limit):
     return row
 
 
+def write_dump(directory, d, live, forecasts):
+    """origin-DD.npz: ids, classes, truth (L, 288), the week before (L, 7*288), the latest
+    limit per series (NaN when none), and per arm (L, 288, 10) with NaN for unscored series."""
+    os.makedirs(directory, exist_ok=True)
+    n = len(live)
+    arrays = dict(
+        ids=np.array([s["id"] for s, _, _ in live]),
+        classes=np.array([s["class"] for s, _, _ in live]),
+        truth=np.stack([t for _, t, _ in live]).astype(np.float32),
+        week=np.stack([c[-RESIDUAL_DAYS * DAY:] for _, _, c in live]).astype(np.float32),
+        limit=np.array([np.nan if s["lim"] is None or np.isnan(s["lim"][:(d + 1) * DAY]).all()
+                        else np.nanmax(s["lim"][:(d + 1) * DAY]) for s, _, _ in live]))
+    for arm, f in forecasts.items():
+        out = np.full((n, HORIZON, len(QUANTILES) + 1), np.nan, dtype=np.float32)
+        for i, q in f.items():
+            out[i] = q
+        arrays[arm] = out
+    np.savez_compressed(os.path.join(directory, f"origin-{d:02d}.npz"), **arrays)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
@@ -156,6 +176,9 @@ def main():
     ap.add_argument("--workers", type=int, default=1,
                     help="concurrent requests; one per forecaster replica")
     ap.add_argument("--limit-series", type=int, default=0, help="smoke runs only")
+    ap.add_argument("--dump", default="",
+                    help="local directory for one npz per origin: truth and every arm's "
+                         "quantiles, for analyses the per-row metrics cannot answer")
     a = ap.parse_args()
 
     series = [json.loads(line) for line in gzip.decompress(read_bytes(a.data)).decode().splitlines()]
@@ -207,12 +230,17 @@ def main():
             forecasts[ENSEMBLE] = {i: np.mean([forecasts[arm][i] for arm in TFM_ARMS], axis=0)
                                    for i in forecasts["tfm-28d"]
                                    if all(i in forecasts[arm] for arm in TFM_ARMS)}
+        dump = {}
         for i, (s, truth, ctx) in enumerate(live):
             for arm in ("snaive-1d", "snaive-7d", "linear-7d"):
-                rows.append(score(s, d, arm, baseline(ctx, arm), truth, ctx, s["lim"]))
+                q = baseline(ctx, arm)
+                dump.setdefault(arm, {})[i] = q
+                rows.append(score(s, d, arm, q, truth, ctx, s["lim"]))
             for arm, f in forecasts.items():
                 if i in f:
                     rows.append(score(s, d, arm, f[i], truth, ctx, s["lim"]))
+        if a.dump:
+            write_dump(a.dump, d, live, {**dump, **forecasts})
         print(f"origin {d}: {len(live)} series, arms {sorted(forecasts)}, "
               f"{time.time() - t0:.0f}s", flush=True)
 

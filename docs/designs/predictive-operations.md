@@ -706,7 +706,9 @@ own series before year-over-year input exists at all.
 ### Results
 
 The first run covered 153 series from 12 clusters over 41 days, 2026-08-13 to 2026-09-23. The
-experiment's README has the tables and caveats. It found four things.
+experiment's README has the tables and caveats. It found five things; the last is the go/no-go
+reading, written up for a decision in the experiment's
+[RESULTS.md](../../bench/experiments/timesfm-backtest/RESULTS.md).
 
 **The forecaster clears the baseline bar on the day's shape.** Zero-shot TimesFM had a median
 MASE of 0.54–0.58, against 0.90 for seasonal-naive and 0.84 for linear. It beat seasonal-naive
@@ -736,6 +738,17 @@ at 98% for seasonal-naive.
 [order of work](#order-of-work)'s phase-2 gate, breach precision at equal recall, has no events
 to score. It needs a longer window, a fleet with real pressure on its limits, or replayed past
 incidents.
+
+**Day-ahead threshold warnings add little over the proactive agent.** Against a per-series
+threshold each series crossed on one day in ten, a warning on the median forecast busiest hour
+was right 84% of the time, caught 9% of crossings, and raised a false alarm on 0.2% of
+series-days. Of the 36 it caught, 33 had crossed the day before, which the proactive agent
+already sees. On the 299 crossings that were new that day, it warned on 3. Lowering the warning
+quantile bought recall at repeat-yesterday's precision or worse, and forecasting the daily-peak
+series directly did not help. Forecasts landed within −10% to +5% of the actual 90% of the time
+for disk only; memory reached 76% and CPU 39–61%. Day-ahead warnings on bursty CPU and memory are
+therefore not a reason to build the agent. Trend-driven resources over multi-day horizons, such
+as disks filling or memory leaking, are untested: the corpus had three disks.
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
 288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
