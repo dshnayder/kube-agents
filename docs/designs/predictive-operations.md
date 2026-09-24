@@ -55,6 +55,12 @@ takes: a ledger entry and a pull request, with a human merging. What changes is 
 fires — which is exactly the property the [workflow model](../architecture/04-workflow-model.md)
 gives a trigger: it changes when an agent wakes, never what it may do.
 
+Prediction is not switched on fleet-wide. It is opt-in, and even then a cluster predicts only
+while a probe, a backtest on its own history, shows its load can be forecast. Its stored
+predictions are scored against what really happened, and it stops predicting when they are
+wrong too often. Clusters that are not predicting are re-probed from time to time
+([A per-cluster probe decides where to predict](#a-per-cluster-probe-decides-where-to-predict)).
+
 The vocabulary is deliberate. _Proactive_ is already taken by the audits and the site's
 [Proactive autonomy](../site/src/content/docs/overview/proactive-autonomy.md) page, and it means
 "finds an existing problem unprompted". _Predictive_ names the mechanism, a forecast, and reads as
@@ -549,6 +555,56 @@ in time is strict; a context that leaks one future point invalidates the result.
 forecast-level and decision-level [metrics](#metrics) per series class against two baselines,
 seasonal-naive and linear. This is the experiment the [order of work](#order-of-work) gates on.
 
+### A per-cluster probe decides where to predict
+
+The [backtest experiment](#backtest-experiment) found that predictability belongs to the cluster,
+not the model. The same forecaster that overshot memory by 20% on a bad day on the bursty
+evaluation hosts overshot by 4% on a customer staging cluster with steady load. A fleet-wide
+yes or no would be wrong for one of them. The mode is therefore gated per cluster, and a cluster
+earns predictions by showing, on its own history, that they would have been right.
+
+Predictive mode is opt-in and off by default. When an operator enables it, each cluster under
+management moves through three states:
+
+- **`probing`.** The probe runs the experiment on the cluster's own recent history: a
+  rolling-origin backtest, cut at points in the past, forecasting forward only from what was known
+  then, and scoring against what happened, as in the experiment. It checks the costly side first: how
+  far forecasts overshoot on a bad day at the horizons the mode uses, and whether TimesFM beats
+  seasonal-naive there. A cluster that clears the bar moves to `predicting`, and one that does not
+  moves to `unpredictable`. Nothing is acted on while probing.
+- **`predicting`.** The sweep computes the cluster's future values and acts on them through the
+  normal finding path. Every prediction is stored with its horizon. When the period it covers
+  has passed and the real values are available, it is scored against them. That rolling score
+  is the same record [calibration](#calibration) keeps. If it drops below the bar, the cluster
+  stops predicting and moves to `unpredictable`. It does not wait for an operator.
+- **`unpredictable`.** No predictions are computed or acted on. The proactive mode still watches
+  current values, which is why a forecast that is not trusted costs a head start and not an
+  incident. The probe reruns on a schedule. When the cluster's series have become predictable,
+  for example after a workload settles or a noisy tenant leaves, it moves back to `predicting`.
+
+The bars are asymmetric on purpose. Entering `predicting` takes a stricter score than staying
+there, and a cluster stays in a state for a minimum time before it may leave it, so a cluster near
+the line does not flap between the two. Both bars, the reprobe interval and the horizons are
+criteria on the [vehicle](#on-the-vehicle), with quiet defaults. They are not constants. Over-forecasts
+are the costly miss, since each one is a pull request and an interrupted person, and enough of
+them teach people to ignore the agent. So the bars are set on overshoot, and undershoot
+counts for less.
+
+The decision is per cluster, and the probe records it per series class within the cluster. A
+cluster whose memory forecasts well and whose CPU does not predicts memory only. Within a
+`predicting` cluster, the per-group states in [Calibration](#calibration) still apply.
+
+Live scoring meets [the intervention problem](#the-intervention-problem): a prediction someone
+acted on may never come true. The live score therefore uses only predictions no finding acted on.
+That is most of them, since most forecasts raise no finding. A series with a remediated finding
+leaves the score until its next unacted window.
+
+The probe is cheap enough to run routinely. Forecast time is set by the padded context, not the
+horizon or batch size. One 11-core CPU container forecasts 64 series from 7 days of history in
+about 20 seconds per request. A probe over four weeks with two cut points a day and 50 series is
+56 requests, about 20 minutes. On the staging cluster, the experiment's 7-day run, 129 cut points over
+50 series, took 50 minutes.
+
 ### Calibration
 
 Zero-shot quantiles are calibrated on average over the model's training data, which promises
@@ -754,7 +810,8 @@ caught 3 of 148 crossings that were new that day; the rest the proactive agent a
 Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the agent.
 Trend-driven resources such as disks, and horizons of a few hours, remain open. One busy customer staging
 cluster forecast far better than the evaluation hosts (a bad-day memory overshoot of 4% against
-20%, 8 hours ahead), so steady production load is where the question goes next.
+20%, 8 hours ahead), so the answer depends on the cluster. That is why prediction is gated
+per cluster by a probe ([A per-cluster probe decides where to predict](#a-per-cluster-probe-decides-where-to-predict)).
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
 288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
@@ -785,7 +842,7 @@ five prerequisite spikes; they are folded into the phases they gate.
    finding shape is unchanged — the model is a provenance field, not the design. If no class clears
    the gate, the mode still ships on the baseline and this document records why.
 3. **The capability.** The SOP, the roster job, the ledger stream, the triage and decision rule,
-   calibration state, the remediation kinds per series, every class in shadow, the replay-fixture
+   the opt-in toggle and the per-cluster probe with its reprobe schedule, calibration state, the remediation kinds per series, every class in shadow, the replay-fixture
    case run red then green, and the criteria on the vehicle once its store exists (image-owned
    defaults until then).
 4. **The acute tier.** The `forecast-breach` inject kind, the short-horizon sweep, and the session

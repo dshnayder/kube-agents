@@ -56,8 +56,10 @@ forecasting memory and node count a few hours ahead, where TimesFM beats repeati
 and over-forecasts less. That use has not been tested against what the proactive agent already
 sees from current values. One busy customer staging cluster forecast far better than the
 evaluation hosts: a bad-day memory overshoot of 4% against 20%, 8 hours ahead
-([staging cluster](#a-busy-staging-cluster-forecasts-far-better)). Steady production load is
-where the question should be asked next. Forecasting itself takes seconds per request, so it
+([staging cluster](#a-busy-staging-cluster-forecasts-far-better)). Predictability is therefore a
+property of the cluster. The design gates prediction per cluster on a probe that runs this
+experiment on the cluster's own history
+([design](../../../docs/designs/predictive-operations.md#a-per-cluster-probe-decides-where-to-predict)). Forecasting itself takes seconds per request, so it
 never lags the horizon ([forecast time](#forecasting-takes-seconds-not-hours)).
 
 ## What was tested
