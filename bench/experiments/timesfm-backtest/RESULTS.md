@@ -5,6 +5,17 @@
 **Hypothesis:** TimesFM can predict a time series' values 24 hours ahead to within −10% to +5% of
 the actual value, 90% of the time.
 
+The band is a rough figure. Its shape carries the point: it is narrower on the high side
+because the two ways of being wrong cost different amounts.
+
+- **Too high is costly.** A forecast above what really happens makes the agent act on a problem
+  that never arrives: a pull request someone has to review, a person interrupted. Enough of
+  them and the agent's warnings become noise. The experience gets worse, and people learn to
+  ignore every alarm the agent raises, including the real ones.
+- **Too low is tolerable.** A forecast below what really happens misses the problem in advance,
+  and the proactive agent, which watches current values, catches it when it arrives. The
+  predictive agent loses its head start, not the fix.
+
 **Result:** at midnight UTC each day, TimesFM forecast the next 24 hours of CPU usage, requested CPU, memory
 usage, node count and disk usage. We compared each forecast hourly value with the value actually
 measured in that hour. **70%** of forecasts landed within −10%/+5%. **15%** were more than 5%
@@ -25,21 +36,20 @@ other series types.
 What this means for the predictive agent:
 
 - **As stated, the hypothesis is not confirmed.** A full day ahead, only smoothly growing series
-  such as disk usage are forecast within the band 90% of the time. Of the 153 series, 24 meet the
-  target on their own.
+  such as disk usage are forecast within the band 90% of the time. Of the 153 series, 24 reach
+  90% on their own.
 - **The model is clearly better than the simple rule.** On every series type, TimesFM puts more
   values in the band than repeating yesterday: 70% against 58%. It also over-forecasts
   less often: 15% against 25%. Prediction does add accuracy.
 - **Accuracy depends on how far ahead you look.** For the next 1–6 hours, 88% of memory values
-  and 83% of node-count values are in the band, close to the target. At 12–24 hours ahead the
-  figures are 73% and 70%. An agent that acts a few hours ahead gets near the target for memory
-  and node count. One that acts a day ahead does not.
+  and 83% of node-count values are in the band. At 12–24 hours ahead the figures are 73% and
+  70%. An agent that acts a few hours ahead comes close to 90% for memory and node count. One that acts a day ahead does not.
 - **Forecasting 8 hours ahead instead of 24 roughly halves the worst miss.** On a typical day,
   a memory forecast made 8 hours ahead is never more than 1% too high or 2% too low in any hour
   of the 8. A 24-hour forecast misses by up to 3% and 5%. On a bad day (1 in 10), the figures
-  are 14% either way against about 25%. On a typical day, 8 hours ahead is well inside the
-  −10%/+5% target for disk and memory and just inside it for container CPU. Cluster-level CPU is
-  not, and on a bad day only disk stays inside
+  are 14% either way against about 25%. On a typical day, an 8-hour forecast of disk, memory
+  or container CPU is never more than 3% too high. On a bad day, only disk stays within a few
+  percent; everything else overshoots by 14% or more
   ([8 hours ahead or 24?](#8-hours-ahead-or-24)).
 - **CPU is not predictable at this precision.** To catch 90% of hourly container-CPU values, the
   band would have to widen to −27%/+15%. For cluster CPU used, it would take −67%/+26%.
@@ -86,7 +96,7 @@ Repeating yesterday was the strongest, so it is the one in the table above.
 
 ## Findings
 
-### Only disk usage meets the target a day ahead
+### Only disk usage reaches 90% in band a day ahead
 
 The table above is the result. The misses fall on both sides, and which side depends on the
 series type:
@@ -95,7 +105,7 @@ series type:
 - Node count and CPU are more often too low. The model does not foresee a scale-up or a burst
   that nothing in the past week announced.
 
-Per series, the target is met by 2 of 3 disks, 15 of 57 memory series, 4 of 12 node counts, 1 of
+Per series, 90% in band is reached by 2 of 3 disks, 15 of 57 memory series, 4 of 12 node counts, 1 of
 12 requested-CPU series, 2 of 57 container-CPU series and none of the cluster-CPU series.
 
 ### TimesFM beats every rule that needs no model
@@ -164,14 +174,13 @@ in 10). "0%" means under half a percent.
 How to read it:
 
 - **Disk and memory.** On a typical day, an 8-hour forecast stays within 2% of the actual value
-  in every hour, inside the −10%/+5% target. On a bad day, disk still does. Memory reaches 14%
-  either way.
+  in every hour. On a bad day, disk still does. Memory reaches 14% either way.
 - **Node count** changes in whole nodes. On most days nothing changes and the forecast is exact.
   On a day the cluster scales, the forecast is off by one or more nodes, and one node is a third
   of a 3-node cluster.
 - **CPU** misses mostly by forecasting too low: the model does not foresee bursts. Container
-  CPU 8 hours ahead is just inside the target on a typical day (3% high, 8% low) and far outside
-  it on a bad one (31% low). Cluster-level CPU is outside it even on a typical day.
+  CPU 8 hours ahead is at most 3% high and 8% low on a typical day, and 18% high and 31% low on a
+  bad one. Cluster-level CPU misses by double digits even on a typical day.
 
 Part of the difference is that a 24-hour window has three times as many hours in which to miss.
 To remove that, we also compared the same 8 clock hours forecast 8 hours ahead and 16–24 hours
@@ -224,7 +233,7 @@ seconds from 7 days of history. A daily run over a thousand series takes minutes
 - **Trend-driven series.** Disks, persistent volumes, quotas and memory that leaks grow rather
   than burst, which is where disk's 90% comes from. This corpus had 3 disks. A production fleet
   would have hundreds.
-- **Shorter horizons.** Memory and node count come close to the target within 6 hours. An agent
+- **Shorter horizons.** Memory and node count come close to 90% in band within 6 hours. An agent
   that forecasts a few hours ahead, several times a day, should be tested as its own design.
 - **Scheduled load as input.** Known events, such as release days or nightly runs, can be passed
   to TimesFM as covariates. That is the one way to forecast a burst's timing, and it was not
