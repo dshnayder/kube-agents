@@ -387,6 +387,16 @@ class FleetSpreadTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "Cluster/old")
 
+    def test_the_laggard_is_the_oldest_version_on_the_oldest_minor(self):
+        """Clusters on one channel share a minor, so the name broke the tie and
+        the finding moved to whichever project sorted first."""
+        clusters = [
+            cluster(name="acme/us-central1/aaa", master="1.28.15-gke.1"),
+            cluster(name="zzz/us-east4/zzz", master="1.28.0-gke.1"),
+            cluster(name="new", master="1.30.0-gke.1"),
+        ]
+        self.assertEqual(pr.check_fleet_spread(clusters)[0]["object"], "Cluster/zzz/us-east4/zzz")
+
     def test_a_one_minor_spread_is_not_flagged(self):
         clusters = [cluster(name="a", master="1.29.0-gke.1"), cluster(name="b", master="1.30.0-gke.1")]
         self.assertEqual(pr.check_fleet_spread(clusters), [])
@@ -476,6 +486,56 @@ class NoMaintenanceWindowTest(unittest.TestCase):
     def test_does_not_flag_daily_window(self):
         c = cluster(**{"maintenancePolicy": {"window": {"dailyMaintenanceWindow": {}}}})
         self.assertIsNone(pr.check_no_maintenance_window(c))
+
+
+class BlockingExclusionEscalationTest(unittest.TestCase):
+    """§3.8's escalation input is derived in `collect_one_cluster` from the
+    two version checks, so it is tested through it."""
+
+    SHORT_END = "2026-01-25T00:00:00Z"
+    LONG_END = "2026-06-01T00:00:00Z"
+
+    def frozen(self, end, **kwargs):
+        exclusion = {"startTime": "2026-01-01T00:00:00Z", "endTime": end, "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}
+        return cluster(maintenancePolicy={"window": {"recurringWindow": {}, "maintenanceExclusions": {"freeze": exclusion}}}, **kwargs)
+
+    def blocking(self, c, baseline):
+        slugs, candidates = pr.collect_one_cluster(c, baseline, now=NOW)
+        hits = [cand for cand in candidates if cand["check"] == "blocking-exclusion"]
+        return "blocking-exclusion" in slugs, hits
+
+    def test_a_short_freeze_beside_a_pool_three_minors_behind_is_major(self):
+        c = self.frozen(self.SHORT_END, node_pools=[pool(), pool("behind", version="1.27.3-gke.100")])
+        judged, hits = self.blocking(c, BASELINE)
+        self.assertTrue(judged)
+        self.assertEqual([hit["severity"] for hit in hits], ["major"])
+
+    def test_a_same_minor_master_lag_does_not_escalate(self):
+        lagging = "1.30.3-gke.100"
+        baseline = pr.normalize_server_config(server_config(valid_versions=[lagging, "1.30.5-gke.100"]))
+        for end, expected in ((self.SHORT_END, []), (self.LONG_END, ["minor"])):
+            with self.subTest(end=end):
+                c = self.frozen(end, master=lagging, node_pools=[pool(version=lagging)])
+                judged, hits = self.blocking(c, baseline)
+                self.assertTrue(judged)
+                self.assertEqual([hit["severity"] for hit in hits], expected)
+
+    def test_a_freeze_the_version_checks_could_not_grade_leaves_commands(self):
+        """With no baseline `master-behind` judged nothing, so a short freeze
+        read as clean and a long one as `minor` over a cluster that may be
+        critically behind."""
+        for end in (self.SHORT_END, self.LONG_END):
+            with self.subTest(end=end):
+                self.assertEqual(self.blocking(self.frozen(end), None), (False, []))
+
+    def test_an_unfrozen_cluster_is_judged_without_the_version_checks(self):
+        self.assertEqual(self.blocking(cluster(), None), (True, []))
+
+    def test_a_version_finding_grades_the_freeze_without_the_other_check(self):
+        c = self.frozen(self.SHORT_END, node_pools=[pool(), pool("behind", version="1.27.3-gke.100")])
+        judged, hits = self.blocking(c, None)
+        self.assertTrue(judged)
+        self.assertEqual([hit["severity"] for hit in hits], ["major"])
 
 
 class BlockingExclusionTest(unittest.TestCase):

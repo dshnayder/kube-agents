@@ -1947,11 +1947,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "projects in separate runs."
             )
         audited_names.add(name)
-        leaf = name.rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
-        qualified = QUALIFIED_TARGET_SEPARATOR.join(
-            (str(cluster["project"]), str(cluster["location"]), leaf)
-        )
-        if name == qualified:
+        # By the name's shape, as `_scope_qualified_names` reads it: the
+        # manifest cross-check matches on `name` alone, so an entry whose
+        # `project` or `location` field is spelled differently still stands for
+        # this cluster. `project/<id>` has one separator and stays out.
+        if name.count(QUALIFIED_TARGET_SEPARATOR) == QUALIFIED_CLUSTER_SEGMENTS - 1:
+            leaf = name.rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
             qualified_by_leaf.setdefault(_id_segment(leaf), []).append(name)
         # Optional, but non-empty when present: "I read this cluster fine, but
         # some checks did not run or do not apply" is a different claim from
@@ -4424,20 +4425,18 @@ def parse_held_ids(body: str | None) -> list[str]:
     return kept
 
 
-def _scope_qualified_names(body: str, clusters: Iterable[str] = ()) -> dict[str, str]:
-    """{bare cluster name: `<project>/<location>/<name>`}, from a previous body's Scope table.
+def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
+    """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
 
     Schemes 3 and 4 moved a stream's cluster names from bare to qualified, so a
     `Where:` line written before the move names a cluster no collector
     candidate spells that way any more. The Scope row beside it has the
-    project and location that qualify it. A name audited at two locations is
-    left out: which row a finding belonged to is not recorded, and guessing
-    would hold the wrong cluster's finding.
+    project and location that qualify it; a name audited at two locations has
+    two, and which row a finding belonged to is not recorded.
 
     The table stops at `MAX_SCOPE_ROWS`, so on a larger fleet a `Where:` line
     can name a cluster with no row. `clusters` -- the qualified names this run
-    knows, from its manifest or its document -- qualifies those names, under
-    the same rule: one spelling, or none.
+    knows, from its manifest or its document -- spells those names instead.
     """
     sep = QUALIFIED_TARGET_SEPARATOR
     seen: dict[str, set[str]] = {}
@@ -4449,7 +4448,14 @@ def _scope_qualified_names(body: str, clusters: Iterable[str] = ()) -> dict[str,
         name = qualified.rsplit(sep, 1)[-1]
         if qualified.count(sep) == QUALIFIED_CLUSTER_SEGMENTS - 1 and name not in seen:
             current.setdefault(name, set()).add(qualified)
-    return {name: next(iter(q)) for name, q in (seen | current).items() if len(q) == 1}
+    return seen | current
+
+
+def _scope_qualified_names(body: str, clusters: Iterable[str] = ()) -> dict[str, str]:
+    """{bare cluster name: `<project>/<location>/<name>`}, for the names `_scope_spellings`
+    spells one way. With nothing else to choose by, guessing between two
+    spellings would hold the wrong cluster's finding, so a shared name is left out."""
+    return {name: next(iter(q)) for name, q in _scope_spellings(body, clusters).items() if len(q) == 1}
 
 
 def _respelled_rows(
@@ -4466,15 +4472,18 @@ def _respelled_rows(
     already relies on the same.
 
     Under another scheme a row naming a bare cluster is also spelled with the
-    name qualified from the body's Scope table (`_scope_qualified_names`), and
-    that spelling wins when the collector's `flagged` ids carry it and not the
-    bare one. Schemes 3 and 4 moved a stream's clusters from bare to qualified
+    name qualified from the body's Scope table (`_scope_spellings`), and that
+    spelling wins when the collector's `flagged` ids carry it and not the bare
+    one. Schemes 3 and 4 moved a stream's clusters from bare to qualified
     names; matched on the bare spelling alone, its first run under the
     collector held nothing, and a clean document closed the ledger over
-    findings the collector still flagged.
+    findings the collector still flagged. A name two clusters share is
+    spelled as the one the collector flags. When it flags both, the first
+    by id is held: either keeps the ledger open over a finding the collector
+    does report, where holding neither closed it.
     """
     stale = parse_id_scheme(body) != ID_SCHEME
-    qualified = _scope_qualified_names(normalise_newlines(body), clusters) if stale and flagged else {}
+    spellings = _scope_spellings(normalise_newlines(body), clusters) if stale and flagged else {}
     out: dict[str, str] = {}
     for raw, where in parse_finding_locations(body).items():
         identity = {
@@ -4484,10 +4493,17 @@ def _respelled_rows(
             "object": where["object"],
         }
         fid = published_id(identity)
-        if fid not in flagged and where["cluster"] in qualified:
-            renamed = published_id({**identity, "cluster": qualified[where["cluster"]]})
-            if renamed in flagged:
-                fid = renamed
+        if fid not in flagged:
+            renamed = sorted(
+                respelled
+                for respelled in (
+                    published_id({**identity, "cluster": name})
+                    for name in spellings.get(where["cluster"], ())
+                )
+                if respelled in flagged
+            )
+            if renamed:
+                fid = renamed[0]
         out[raw] = fid
     return out
 

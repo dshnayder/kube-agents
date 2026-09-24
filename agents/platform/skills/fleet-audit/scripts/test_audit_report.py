@@ -1223,6 +1223,20 @@ class TestValidation(unittest.TestCase):
             audit_report.validate_findings(doc, AUDIT)
         self.assertIn("'acme-dr/us-west1/prod' and 'acme-prod/us-east1/prod'", str(exc.exception))
 
+    def test_a_qualified_entry_whose_fields_are_respelled_still_arms_the_guard(self):
+        # The manifest cross-check reads `name` alone, so the entry stands for
+        # the cluster whatever its `project` and `location` fields say.
+        for location, project in (("US-EAST1", "acme-prod"), ("us-east1", "acme")):
+            with self.subTest(location=location, project=project):
+                qualified = "acme-prod/us-east1-b/prod"
+                doc = make_doc(
+                    clusters=[{"name": qualified, "location": location, "project": project}],
+                    findings=[make_finding(cluster="prod")],
+                )
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(repr(qualified), str(exc.exception))
+
     def test_a_bare_project_id_beside_a_project_target_is_accepted(self):
         # `project/<id>` is not a qualified cluster, so its tail is no cluster name.
         doc = make_doc(
@@ -16112,7 +16126,9 @@ class TestFinishManifestFlag(HarnessTestCase):
     def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
         """`collector_held_entries` carries the held entry itself; the finish
         payload above would read `HELD` from the unaccounted rule alone. A name
-        two manifest clusters could own is qualified to neither."""
+        two manifest clusters could own is spelled as the one the collector
+        flags, and held on the first by id when it flags both: holding neither
+        closed the ledger over a finding the collector still reported."""
         previous_body = published_body(make_doc(), generated_at=NOW).replace(
             f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
             f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
@@ -16127,13 +16143,21 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         self.assertEqual([entry["id"] for entry in held], [derived_id(cluster=qualified[0])])
         ambiguous = (qualified[0], "acme-stage/us-east1/prod-us-east")
-        held = audit_report.collector_held_entries(
-            _full_manifest(names=ambiguous, candidates=[self.netpol_candidate(cluster=qualified[0])]),
-            make_doc(findings=[]),
-            exclude=set(),
-            previous_body=previous_body,
-        )
-        self.assertEqual(held, [])
+        for flagged in ((qualified[0],), (ambiguous[1],), ambiguous):
+            with self.subTest(flagged=flagged):
+                held = audit_report.collector_held_entries(
+                    _full_manifest(
+                        names=ambiguous,
+                        candidates=[self.netpol_candidate(cluster=name) for name in flagged],
+                    ),
+                    make_doc(findings=[]),
+                    exclude=set(),
+                    previous_body=previous_body,
+                )
+                self.assertEqual(
+                    [entry["id"] for entry in held],
+                    [min(derived_id(cluster=name) for name in flagged)],
+                )
 
     def test_this_runs_clusters_qualify_only_names_the_table_does_not_list(self):
         body = (

@@ -600,9 +600,9 @@ def check_fleet_spread(clusters: list[dict]) -> list[dict]:
     for c in clusters:
         if _upgrade_in_progress(c):
             continue
-        m = minor_of(c.get("currentMasterVersion") or "")
-        if m is not None:
-            minors.setdefault(m, []).append(c["name"])
+        version = parse_version(c.get("currentMasterVersion") or "")
+        if version is not None:
+            minors.setdefault(version[:2], []).append((version, c["name"]))
     if len(minors) < 2:
         return []
     oldest, newest = min(minors), max(minors)
@@ -615,7 +615,10 @@ def check_fleet_spread(clusters: list[dict]) -> list[dict]:
         width = f"{newest[1] - oldest[1]} minors wide"
     else:
         return []
-    laggard = sorted(minors[oldest])[0]
+    # The oldest version on the oldest minor, so patch and build decide the
+    # laggard; the qualified name only breaks a tie between equal versions,
+    # which keeps the finding's id on one cluster from run to run.
+    laggard = min(minors[oldest])[1]
     return [
         {
             "object": f"Cluster/{laggard}",
@@ -859,6 +862,14 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     has_version_finding = (master_behind_hit or {}).get("severity") in VERSION_FINDING_SEVERITIES or any(
         h.get("severity") in VERSION_FINDING_SEVERITIES for h in pool_skew_hits
     )
+    # Whether a freeze is reported, and at what severity, rests on those two
+    # checks. When either judged nothing and neither found a critical/major,
+    # an in-effect blocking exclusion cannot be graded, so `blocking-exclusion`
+    # leaves `commands` with its candidate as `pool-skew` does. With no such
+    # exclusion there is nothing to grade and the check judged the cluster.
+    escalation_judged = has_version_finding or (pool_skew_judged and master_behind_judged(cluster, baseline))
+    if not escalation_judged and check_blocking_exclusion(cluster, now=now, has_version_finding=True) is not None:
+        slugs.remove("blocking-exclusion")
 
     single_hits = (
         ("no-channel", check_no_channel(cluster)),
@@ -866,7 +877,7 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
         ("blocking-exclusion", check_blocking_exclusion(cluster, now=now, has_version_finding=has_version_finding)),
         ("no-notifications", check_no_notifications(cluster)),
     )
-    candidates += [_emit(slug, hit) for slug, hit in single_hits if hit]
+    candidates += [_emit(slug, hit) for slug, hit in single_hits if hit and slug in slugs]
     candidates += [_emit("pool-skew", hit) for hit in pool_skew_hits]
     candidates += [_emit("no-autoupgrade", hit) for hit in check_no_autoupgrade(cluster)]
     candidates += [_emit("no-autorepair", hit) for hit in check_no_autorepair(cluster)]
