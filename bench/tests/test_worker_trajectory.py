@@ -421,12 +421,19 @@ def test_the_call_cap_stops_the_read_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_calls=2))
     assert [c["name"] for c in payload["calls"]] == ["terminal", "kanban_create"]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["calls"]
+
+
+def test_a_call_cap_clip_is_not_reported_as_the_card_cap(data_root: Path) -> None:
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT], max_calls=2), [FRONT], 5.0)
+    assert worker_trajectory.gaps(captured.summary) == [worker_trajectory.CALL_CAP_GAP]
 
 
 def test_the_card_cap_stops_the_walk_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_cards=1))
     assert [c["task"] for c in payload["cards"]] == [FRONT]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["cards"]
     assert CHILD not in {c["task"] for c in payload["calls"]}
 
 
@@ -804,7 +811,7 @@ def test_gaps_is_none_when_the_read_did_not_run() -> None:
 
 def test_gaps_lists_unread_reads_and_the_card_cap() -> None:
     gap = "no session store for profile cluster-x"
-    summary = {"cards": [], "errors": [gap], "unread": [gap], "truncated": True, "calls": 0}
+    summary = {"cards": [], "errors": [gap], "unread": [gap], "truncated": True, "clipped": ["cards"], "calls": 0}
     assert worker_trajectory.gaps(summary) == [gap, worker_trajectory.TRUNCATED_GAP]
 
 

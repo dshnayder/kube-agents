@@ -118,10 +118,14 @@ MAX_CARDS = 32
 MAX_CALLS = 2000
 MAX_RESULT_CHARS = 2000
 MAX_ARGS_CHARS = 2000
-# What ``gaps`` reports for a fan-out the pod clipped at ``MAX_CARDS``: the
-# cards past the cap were never read, so a profile that worked only those is
-# absent from the capture without having been absent from the run.
+# What ``gaps`` reports for a read the pod clipped, by the cap that fired: past
+# ``MAX_CARDS`` later cards were never read, and past ``MAX_CALLS`` the walk
+# goes on but later workers' calls are dropped. Either way a profile that
+# worked only the unread part is absent from the capture without having been
+# absent from the run.
 TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
+CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
+CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 
 # Runs inside the agent container under hermes' own interpreter. Plain
 # ``python3`` and ``sqlite3``, plus the redactor loaded from the image: nothing
@@ -144,7 +148,14 @@ roots = [a for a in sys.argv[8:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False}
+out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False, "clipped": []}
+
+
+# Which cap stopped the read; ``truncated`` alone cannot say.
+def stopped_at(cap):
+    out["truncated"] = True
+    if cap not in out["clipped"]:
+        out["clipped"].append(cap)
 
 
 # A note that also means something the run did was not read. Every other
@@ -391,7 +402,7 @@ def read_session(conn, card, profile, sid):
                     continue
                 fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
                 if len(out["calls"]) >= MAX_CALLS:
-                    out["truncated"] = True
+                    stopped_at("calls")
                     return count
                 arguments = fn.get("arguments")
                 entry = {
@@ -492,7 +503,7 @@ while kb is not None and queue:
     if tid in cards:
         continue
     if len(cards) >= MAX_CARDS:
-        out["truncated"] = True
+        stopped_at("cards")
         break
     try:
         row = kb.execute(
@@ -585,8 +596,8 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
 
     ``None`` when the read did not run at all; otherwise every read the pod
     could not make (``unread``: a store, card or session it could not open,
-    a dispatched card with no session), plus ``TRUNCATED_GAP`` when it
-    clipped the fan-out. The rest of ``errors`` is not a gap: a withheld
+    a dispatched card with no session), plus the ``CLIP_GAPS`` entry for
+    each cap that clipped the read. The rest of ``errors`` is not a gap: a withheld
     redactor or an orphan result leaves the worker tags whole, and a name
     no run was dispatched to has no store because nothing ran as it. An
     empty list means the capture is complete, so a profile missing from it
@@ -595,8 +606,7 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     if summary is None:
         return None
     problems = [str(e) for e in summary.get("unread") or []]
-    if summary.get("truncated"):
-        problems.append(TRUNCATED_GAP)
+    problems += [CLIP_GAPS[c] for c in summary.get("clipped") or [] if c in CLIP_GAPS]
     return problems
 
 
@@ -690,6 +700,7 @@ def capture(
         "errors": [str(e) for e in payload.get("errors") or []],
         "unread": [str(e) for e in payload.get("unread") or []],
         "truncated": bool(payload.get("truncated")),
+        "clipped": [str(c) for c in payload.get("clipped") or []],
         "calls": len(entries),
     }
     for problem in summary["errors"]:
