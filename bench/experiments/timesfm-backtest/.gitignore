@@ -1,6 +1,7 @@
 data/
 # per-origin forecast paths from backtest.py --dump; they name workloads.
 dump/
+dump-8h/
 # bench/.gitignore ignores results/; the summaries are the committed record, the per-row metrics
 # name workloads and stay local.
 !results/
@@ -8,3 +9,4 @@ results/*
 !results/summary.md
 !results/decision.md
 !results/pointwise.md
+!results/horizon.md

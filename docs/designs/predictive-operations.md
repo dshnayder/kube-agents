@@ -744,7 +744,8 @@ Comparing each forecast hourly value with the value measured in that hour, 70% l
 band, 15% were more than 5% too high and 16% more than 10% too low. Only disk usage reached 90%;
 memory reached 78%, node count 75%, CPU 40–65%. TimesFM beat repeating yesterday on every series
 type (58% in band, 25% too high), and accuracy was far higher in the first hours: 88% for memory
-and 83% for node count one to six hours ahead. Warnings on a forecast threshold crossing were
+and 83% for node count one to six hours ahead. Re-forecasting 8 hours ahead three times a day
+raised the overall share to 76%; only disk (96%) cleared 90%. Warnings on a forecast threshold crossing were
 rarely wrong but caught 3 of 299 crossings that were new that day; the rest the proactive agent
 already sees. Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the
 agent. Trend-driven resources such as disks, and horizons of a few hours, remain open.

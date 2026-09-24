@@ -117,6 +117,9 @@ python3 harness/peaks.py --data data/series.jsonl.gz --forecaster http://localho
   --out results/r2/peaks.csv.gz
 python3 harness/decide.py dump/ results/r2/peaks.csv.gz > results/decision.md
 python3 harness/pointwise.py dump/ > results/pointwise.md
+python3 harness/horizon.py forecast --data data/series.jsonl.gz \
+  --forecaster http://localhost:8080 --dump dump-8h/
+python3 harness/horizon.py report dump-8h/ dump/ > results/horizon.md
 ```
 
 The forecaster ([`forecaster/`](forecaster/)) is TimesFM 2.5 200M (Apache-2.0 weights) baked

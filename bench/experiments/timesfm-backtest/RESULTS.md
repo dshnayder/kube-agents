@@ -34,6 +34,9 @@ What this means for the predictive agent:
   and 83% of node-count values are in the band, close to the target. At 12–24 hours ahead the
   figures are 73% and 70%. An agent that acts a few hours ahead gets near the target for memory
   and node count. One that acts a day ahead does not.
+- **Forecasting 8 hours ahead instead of 24 helps, but not enough.** Re-forecasting three
+  times a day raises the in-band share from 70% to 76% and cuts the too-high share from 15% to
+  12%. Disk reaches 96% and memory 85%. Nothing else reaches 90%.
 - **CPU is not predictable at this precision.** To catch 90% of hourly container-CPU values, the
   band would have to widen to −27%/+15%. For cluster CPU used, it would take −67%/+26%.
 
@@ -116,6 +119,29 @@ Share of hourly values in band, by how far ahead of the forecast they are:
 The first hour is forecast well for everything except cluster CPU used. After that, accuracy
 falls steadily across the day.
 
+### An 8-hour horizon gains about 6 points
+
+We also forecast 8 hours ahead from 00, 08 and 16 UTC each day and compared each window with
+the midnight 24-hour forecast for the same clock hours. Scoring only the first 8 hours of the
+midnight forecast would overstate the gain slightly: at the same 8-hour horizon, the 00:00–08:00
+UTC window scores 78% against 74–76% for the other two.
+
+| Series                | 8-hour forecast  | 24-hour forecast, same hours | Repeat yesterday |
+| --------------------- | ---------------- | ---------------------------- | ---------------- |
+| disk used             | 96 / 1 / 2       | 90 / 4 / 6                   | 85 / 5 / 10      |
+| container memory      | 85 / 10 / 5      | 78 / 14 / 8                  | 68 / 21 / 11     |
+| node count            | 80 / 6 / 14      | 75 / 7 / 18                  | 70 / 15 / 15     |
+| container CPU         | 71 / 13 / 15     | 65 / 16 / 19                 | 50 / 31 / 19     |
+| cluster CPU requested | 67 / 12 / 21     | 60 / 14 / 26                 | 55 / 23 / 21     |
+| cluster CPU used      | 45 / 21 / 35     | 40 / 22 / 37                 | 29 / 38 / 32     |
+| **all**               | **76 / 12 / 12** | **70 / 15 / 16**             | **58 / 25 / 16** |
+
+Each cell is the percentage in band / more than 5% too high / more than 10% too low, hourly
+values. The gain is largest in the evening window, 16:00–24:00 UTC, where the 24-hour forecast
+is 16 or more hours old: 74% in band against 63%. Repeating yesterday does not improve with a
+shorter horizon, so TimesFM's lead over it widens to 18 points.
+[`results/horizon.md`](results/horizon.md) has each window separately.
+
 ### Shifting the forecast lower does not help
 
 The median forecast is used throughout. A lower quantile cuts the too-high share but adds as
@@ -177,9 +203,10 @@ seconds from 7 days of history. A daily run over a thousand series takes minutes
 
 - [`results/pointwise.md`](results/pointwise.md): the point-by-point tables at both steps, for
   every method, by lead time and by forecast quantile.
+- [`results/horizon.md`](results/horizon.md): 8-hour against 24-hour forecasts, per window.
 - [`results/decision.md`](results/decision.md): the threshold-warning tables.
 - [`results/summary.md`](results/summary.md): the standard forecast-accuracy scores.
 
 The [README](README.md) has the method and the commands. `harness/pointwise.py`,
 `harness/decide.py` and `harness/peaks.py` produce these tables from a `backtest.py --dump`
-run.
+run; `harness/horizon.py` makes and scores the 8-hour forecasts.
