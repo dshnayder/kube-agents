@@ -59,6 +59,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -457,6 +458,8 @@ DELTA_RE = re.compile(
 ID_SCHEME = 4
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
+# `<project>/<location>/<name>`: the segments of a qualified cluster name.
+QUALIFIED_CLUSTER_SEGMENTS = 3
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -2028,12 +2031,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
 
         # Checks that cannot apply here, each with the reason it cannot. These
         # come *out* of the denominator rather than counting against coverage:
-        # an Autopilot cluster has no node pools to inspect, so a node-pool
-        # check that "did not run" there did not fail to run — there was
-        # nothing to run it against. Treating the two as one thing is what left
-        # every Autopilot cluster at `6/10 ⚠` forever, and a permanently
-        # partial stream can never close its ledger, never report a finding as
-        # resolved, and never close a stale remediation pull request.
+        # a check with nothing to run against did not fail to run. Treating
+        # the two as one thing is what left every Autopilot cluster at `6/10 ⚠`
+        # forever, back when its node-pool checks were counted as not run, and
+        # a permanently partial stream can never close its ledger, never report
+        # a finding as resolved, and never close a stale remediation pull
+        # request.
         na_entries = cluster.get("checks_not_applicable")
         if na_entries is not None:
             if not isinstance(na_entries, list):
@@ -3254,9 +3257,12 @@ def collector_held_entries(
         held_ids = sorted(flagged)
         titles: dict[str, str] = {}
     else:
-        marker_ids, _ = previous_marker_ids(previous_body, flagged)
+        # Every audited cluster, not only those with candidates: a bare name
+        # is qualified only when one cluster this run knows could own it.
+        clusters = {str(entry.get("name") or "") for entry in _manifest_clusters(manifest)}
+        marker_ids, _ = previous_marker_ids(previous_body, flagged, clusters)
         held_ids = [fid for fid in marker_ids if fid in flagged]
-        respelled = _respelled_rows(previous_body, flagged)
+        respelled = _respelled_rows(previous_body, flagged, clusters)
         # Titles from the rows that recorded a location, not from every
         # heading. `held_row_from_id` renders a heading too -- "<id> (carried
         # by id; location not recorded on the previous ledger)" -- and it is a
@@ -4418,7 +4424,7 @@ def parse_held_ids(body: str | None) -> list[str]:
     return kept
 
 
-def _scope_qualified_names(body: str) -> dict[str, str]:
+def _scope_qualified_names(body: str, clusters: Iterable[str] = ()) -> dict[str, str]:
     """{bare cluster name: `<project>/<location>/<name>`}, from a previous body's Scope table.
 
     Schemes 3 and 4 moved a stream's cluster names from bare to qualified, so a
@@ -4427,15 +4433,30 @@ def _scope_qualified_names(body: str) -> dict[str, str]:
     project and location that qualify it. A name audited at two locations is
     left out: which row a finding belonged to is not recorded, and guessing
     would hold the wrong cluster's finding.
+
+    The table stops at `MAX_SCOPE_ROWS`, so on a larger fleet a `Where:` line
+    can name a cluster with no row. `clusters` -- the qualified names this run
+    knows, from its manifest or its document -- qualifies those names, under
+    the same rule: one spelling, or none.
     """
+    sep = QUALIFIED_TARGET_SEPARATOR
     seen: dict[str, set[str]] = {}
     for name, location, project in SCOPE_ROW_RE.findall(body):
-        if "/" not in name:
-            seen.setdefault(name, set()).add(f"{project}/{location.strip()}/{name}")
-    return {name: next(iter(q)) for name, q in seen.items() if len(q) == 1}
+        if sep not in name:
+            seen.setdefault(name, set()).add(sep.join((project, location.strip(), name)))
+    current: dict[str, set[str]] = {}
+    for qualified in clusters:
+        name = qualified.rsplit(sep, 1)[-1]
+        if qualified.count(sep) == QUALIFIED_CLUSTER_SEGMENTS - 1 and name not in seen:
+            current.setdefault(name, set()).add(qualified)
+    return {name: next(iter(q)) for name, q in (seen | current).items() if len(q) == 1}
 
 
-def _respelled_rows(body: str | None, flagged: set[str] | frozenset[str] = frozenset()) -> dict[str, str]:
+def _respelled_rows(
+    body: str | None,
+    flagged: set[str] | frozenset[str] = frozenset(),
+    clusters: Iterable[str] = (),
+) -> dict[str, str]:
     """{id as the previous body spelled it: id under the current scheme}, per rendered row.
 
     A row's `Where:` line and the check in its id are the fields identity is
@@ -4453,7 +4474,7 @@ def _respelled_rows(body: str | None, flagged: set[str] | frozenset[str] = froze
     findings the collector still flagged.
     """
     stale = parse_id_scheme(body) != ID_SCHEME
-    qualified = _scope_qualified_names(normalise_newlines(body)) if stale and flagged else {}
+    qualified = _scope_qualified_names(normalise_newlines(body), clusters) if stale and flagged else {}
     out: dict[str, str] = {}
     for raw, where in parse_finding_locations(body).items():
         identity = {
@@ -4472,7 +4493,9 @@ def _respelled_rows(body: str | None, flagged: set[str] | frozenset[str] = froze
 
 
 def previous_marker_ids(
-    body: str | None, flagged: set[str] | frozenset[str] = frozenset()
+    body: str | None,
+    flagged: set[str] | frozenset[str] = frozenset(),
+    clusters: Iterable[str] = (),
 ) -> tuple[list[str], int]:
     """The previous marker's ids under the current scheme, and the residual.
 
@@ -4483,12 +4506,12 @@ def previous_marker_ids(
     unannounced; held ids with no row — the note and empty tiers write none —
     are the residual, which the caller reports and which the bump loses.
     `flagged` picks between a row's bare and qualified spellings
-    (`_respelled_rows`).
+    (`_respelled_rows`), qualifying names past the Scope table from `clusters`.
     """
     marker = parse_delta_block(body)
     if not marker or parse_id_scheme(body) == ID_SCHEME:
         return marker, 0
-    respelled = _respelled_rows(body, flagged)
+    respelled = _respelled_rows(body, flagged, clusters)
     # The residual is counted over the held list, not the whole marker: a
     # rendered finding with no row is main's cost of a bump, not a hold lost.
     return [respelled[fid] for fid in marker if fid in respelled], sum(
@@ -4608,7 +4631,8 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     # A body from before a stream qualified its cluster names names them bare;
     # the Scope table qualifies them, as `_respelled_rows` does.
     stale = parse_id_scheme(previous_body) != ID_SCHEME
-    qualified = _scope_qualified_names(normalise_newlines(previous_body)) if stale else {}
+    scope_names = [str(cluster.get("name", "")) for cluster in clusters_by_key.values()]
+    qualified = _scope_qualified_names(normalise_newlines(previous_body), scope_names) if stale else {}
     held: list[dict] = []
     for fid, where in previous.items():
         renamed = qualified.get(where["cluster"])

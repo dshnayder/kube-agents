@@ -448,7 +448,11 @@ def master_behind_judged(cluster: dict, baseline: dict | None) -> bool:
     empty, is a check that judged nothing, and the manifest must not record it
     as run: a check in `commands` with no candidate reads as clean. So is a
     channel without a parseable `defaultVersion`: branch (a) still runs, but
-    (b) and (c) cannot, and a hit on (a) is recorded on its own.
+    (b) and (c) cannot, and a hit on (a) is recorded on its own. And so is a
+    cluster off its channel's roster that no other channel lists, when the
+    baseline has no `validMasterVersions`: whether anything still offers its
+    version is the question every branch rests on, and nothing in the
+    baseline answers it.
     """
     if baseline is None:
         return False
@@ -456,7 +460,11 @@ def master_behind_judged(cluster: dict, baseline: dict | None) -> bool:
     if not channel:
         return bool(baseline["validMasterVersions"])
     info = baseline["channels"].get(channel) or {}
-    return bool(info.get("validVersions")) and parse_version(info.get("defaultVersion") or "") is not None
+    valid = info.get("validVersions") or []
+    current = cluster.get("currentMasterVersion") or ""
+    if current not in valid and not baseline["validMasterVersions"] and not _still_offered(baseline, current, channel):
+        return False
+    return bool(valid) and parse_version(info.get("defaultVersion") or "") is not None
 
 
 def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
@@ -496,6 +504,14 @@ def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
     # over clusters the same API response shows GKE still patching.
     off_roster = current not in valid
     if off_roster and not _still_offered(baseline, current, channel):
+        # "Offered nowhere" is only decidable against `validMasterVersions`.
+        # Without it -- the same missing field as the empty roster above --
+        # this would grade the staggered rollout `critical` again, and the
+        # branches below would claim patches nothing established. Another
+        # channel listing the version is positive evidence and still counts.
+        # `master_behind_judged` leaves the slug out of `commands` here too.
+        if not baseline["validMasterVersions"]:
+            return None
         return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} offered by no channel at this location", "severity": CRITICAL, "impact": UNSUPPORTED_MASTER_IMPACT}
     if not default:
         return None

@@ -16073,6 +16073,84 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
 
+    def test_a_cluster_past_the_scope_table_is_qualified_from_this_run(self):
+        """`_render_scope` stops at `MAX_SCOPE_ROWS`, so on a larger fleet the
+        previous body has `Where:` lines naming clusters with no Scope row.
+        This run's own clusters qualify those, and the clean run is held."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        self.assertNotIn("prod-us-east", audit_report._scope_qualified_names(previous_body))
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
+        """`collector_held_entries` carries the held entry itself; the finish
+        payload above would read `HELD` from the unaccounted rule alone. A name
+        two manifest clusters could own is qualified to neither."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        held = audit_report.collector_held_entries(
+            _full_manifest(names=qualified, candidates=[self.netpol_candidate(cluster=qualified[0])]),
+            make_doc(findings=[]),
+            exclude=set(),
+            previous_body=previous_body,
+        )
+        self.assertEqual([entry["id"] for entry in held], [derived_id(cluster=qualified[0])])
+        ambiguous = (qualified[0], "acme-stage/us-east1/prod-us-east")
+        held = audit_report.collector_held_entries(
+            _full_manifest(names=ambiguous, candidates=[self.netpol_candidate(cluster=qualified[0])]),
+            make_doc(findings=[]),
+            exclude=set(),
+            previous_body=previous_body,
+        )
+        self.assertEqual(held, [])
+
+    def test_this_runs_clusters_qualify_only_names_the_table_does_not_list(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+        )
+        clusters = [
+            "acme-prod/us-east1/web",
+            "acme-prod/us-east1/api",
+            "acme-prod/us-east1/db",
+            "acme-stage/us-east1/db",
+            "unqualified",
+        ]
+        self.assertEqual(
+            audit_report._scope_qualified_names(body, clusters), {"api": "acme-prod/us-east1/api"}
+        )
+
     def test_a_name_audited_at_two_locations_is_not_qualified(self):
         body = (
             "| `web` | us-east1 | `acme-prod` | 10/10 |\n"

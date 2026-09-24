@@ -79,6 +79,12 @@ verification_spec:
       # severity cell. Node-pool findings end in the pool name and never
       # match. Of the checks the fixture trips, only master-behind can be
       # major there; the collector files no-notifications at minor.
+      # The table is the only place the body puts a severity beside an id,
+      # and it stops at MAX_DELTA_ROWS (50) rows, criticals first, then majors
+      # by qualified cluster name. The measured runs published 26 findings on
+      # 13 clusters; a project carrying enough extra clusters to push this row
+      # past 50 fails the required phrase with "_…and N more below_" in the
+      # table, which is the row cut off, not the grade wrong.
       required_phrases: ["seeded-b) | major"]
       forbidden_phrases: ["seeded-b) | critical"]
   - name: no-invented-cves

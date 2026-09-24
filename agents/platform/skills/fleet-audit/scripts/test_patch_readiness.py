@@ -150,6 +150,30 @@ class MasterBehindTest(unittest.TestCase):
                 self.assertIn(default, hit["excerpt"])
                 self.assertIn("no longer on that channel's roster", hit["excerpt"])
 
+    def test_a_baseline_without_valid_master_versions_does_not_judge_off_roster(self):
+        """No `validMasterVersions` is a field the response did not carry, not
+        a location that offers nothing. A cluster off its channel's roster is
+        neither published as out of support nor recorded as checked; one on
+        the roster is judged as before."""
+        current, default = "1.35.7-gke.1027000", "1.35.7-gke.1150000"
+        for label, raw in {
+            "empty": {
+                "channels": [{"channel": "REGULAR", "defaultVersion": default, "validVersions": [default]}],
+                "validMasterVersions": [],
+            },
+            "absent": {
+                "channels": [{"channel": "REGULAR", "defaultVersion": default, "validVersions": [default]}],
+            },
+        }.items():
+            with self.subTest(validMasterVersions=label):
+                baseline = pr.normalize_server_config(raw)
+                for master in (current, "1.36.1-gke.1", "1.28.1-gke.1"):
+                    off = cluster(channel="REGULAR", master=master)
+                    self.assertIsNone(pr.check_master_behind(off, baseline))
+                    self.assertFalse(pr.master_behind_judged(off, baseline))
+                on = cluster(channel="REGULAR", master=default)
+                self.assertTrue(pr.master_behind_judged(on, baseline))
+
     def test_a_version_no_route_offers_is_still_critical(self):
         """The fix must not cost the check its real case. Same shape as the
         test above, with the version absent from every roster the location
@@ -519,6 +543,9 @@ class BlockingExclusionTest(unittest.TestCase):
         exclusions = c["maintenancePolicy"]["window"]["maintenanceExclusions"]
         self.assertIsInstance(exclusions, dict)
         self.assertIn("freeze", exclusions)
+        hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False)
+        self.assertIsNotNone(hit)
+        self.assertIn("freeze", hit["excerpt"])
 
 
 class StaleImageTypeTest(unittest.TestCase):
@@ -684,7 +711,7 @@ class IncumbentTopicTest(unittest.TestCase):
         self.assertNotIn(self.TOPIC, self.excerpt(entries[1], 1))
 
     def test_a_cluster_filtering_its_own_topic_is_not_pointed_at_the_fleets(self):
-        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("filtered", self.OTHER)]
+        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("filtered", self.TOPIC)]
         entries[1]["candidates"][0]["excerpt"] = f"{pr.FILTER_EXCLUDES_PREFIX} UPGRADE_AVAILABLE_EVENT: ['SECURITY_BULLETIN_EVENT']"
         pr.attach_incumbent_topic(entries)
         self.assertNotIn(self.TOPIC, self.excerpt(entries[1]))
