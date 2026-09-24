@@ -841,6 +841,19 @@ class TestSessionKvHeaders(unittest.TestCase):
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
 
+    def test_config_yaml_passes_the_agent_home_into_this_subprocess(self):
+        """The roster tools read the Cluster Agent profiles under
+        PLATFORM_AGENT_HOME. Undeclared, Hermes strips it and the server falls
+        back to the default home, finding no profile on an install whose
+        agentHome is elsewhere. test_mcp_env_contract.py reads the
+        `get(...) or default` form as a probe and does not catch it."""
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        env = config["mcp_servers"]["platform_control"]["env"]
+        self.assertEqual(env.get("PLATFORM_AGENT_HOME"), "${PLATFORM_AGENT_HOME}")
+
 
 class TestReportToChat(unittest.TestCase):
     """The specialist's hand-off to the Chat Agent relay."""
