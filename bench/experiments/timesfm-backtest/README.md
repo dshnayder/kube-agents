@@ -1,7 +1,7 @@
 # TimesFM backtest
 
-The experiment behind the "Backtest experiment" section of
-[`docs/designs/predictive-operations.md`](../../../docs/designs/predictive-operations.md). It
+The experiment behind the "Experiment" section of
+[`docs/designs/predictive-operations.md`](https://github.com/dshnayder/kube-agents/blob/design/predictive-operations/docs/designs/predictive-operations.md). It
 asks how accurately TimesFM 2.5, zero-shot, forecasts tomorrow's GKE telemetry from the days
 before it, and whether that accuracy is enough to act on. The design document reads the
 results; this directory holds the method, the code, and under `results/` the summary tables.

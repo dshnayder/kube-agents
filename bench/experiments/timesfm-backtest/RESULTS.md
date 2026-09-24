@@ -59,7 +59,7 @@ evaluation hosts: a bad-day memory overshoot of 4% against 20%, 8 hours ahead
 ([staging cluster](#a-busy-staging-cluster-forecasts-far-better)). Predictability is therefore a
 property of the cluster. The design gates prediction per cluster on a probe that runs this
 experiment on the cluster's own history
-([design](../../../docs/designs/predictive-operations.md#a-per-cluster-probe-decides-where-to-predict)). Forecasting itself takes seconds per request, so it
+([design](https://github.com/dshnayder/kube-agents/blob/design/predictive-operations/docs/designs/predictive-operations.md#enabling-predictive-mode-opt-in-per-cluster)). Forecasting itself takes seconds per request, so it
 never lags the horizon ([forecast time](#forecasting-takes-seconds-not-hours)).
 
 ## What was tested
