@@ -1,28 +1,61 @@
-# Predictive operations: acting on a forecast threshold breach
+# Predictive operations: warning before a resource runs out
 
-**Status:** proposal for review; nothing built. The [Scope](#scope) section names what an install
-already has; everything after it is a direction for kube-agents, not a build plan with dates. The
-one experiment it asks for is a backtest, and the document says what result would change it.
+**Status:** proposal for review; nothing is built. A first backtest has run on real clusters, and
+the [Experiment](#experiment) section reports it. The [Scope](#scope) section names what an install
+already has; everything after it is a direction for kube-agents, not a build plan with dates.
 
 **Authors:** Dmitry Shnayder; Gari Singh — the prediction-plane design merged here.
 
+## How to read this document
+
+The document starts short and gets more detailed as it goes. Stop reading once you have what you
+need.
+
+| Section                                      | Read it if you want                                                                     | Length       |
+| -------------------------------------------- | --------------------------------------------------------------------------------------- | ------------ |
+| [TL;DR](#tldr)                               | what this is about, in one paragraph                                                    | a minute     |
+| [Summary](#summary)                          | how it works and what the evidence says, without the detail                             | five minutes |
+| [Detailed design](#detailed-design)          | how it is enabled, what it forecasts, how a warning reaches people, how it is evaluated | the rest     |
+| [Experiment](#experiment)                    | what was measured on real clusters, with links to the full results                      | ten minutes  |
+| [Related](#related), [Prior art](#prior-art) | the neighbouring designs, and what other products ship today                            | as needed    |
+
+The detailed design is in this order:
+
+| Subsection                                                               | What it gives you                                                                   |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| [Scope](#scope)                                                          | what an install already has, and what this document adds                            |
+| [The three modes](#the-three-modes)                                      | the definition of predictive, and the shape of problem it owns                      |
+| [Three layers](#three-layers-forecast-prediction-action)                 | forecast, prediction and action, and where kube-agents draws its boundary           |
+| [Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster) | opt-in, the per-cluster probe, and when a cluster stops or starts predicting        |
+| [What a predictive finding is](#what-a-predictive-finding-is)            | the breach, its reference types, its fields, the first series, and the use-case map |
+| [The forecaster](#the-forecaster)                                        | why TimesFM 2.5, what it is not, covariates, and the alternatives weighed           |
+| [Where the series come from](#where-the-series-come-from)                | the metrics source contract, and why no new credential path is needed               |
+| [How a prediction reaches people](#how-a-prediction-reaches-people)      | triage, forecast, decision rule, agent judgement; ledger, pull request, incident    |
+| [Honesty about the future](#honesty-about-the-future)                    | baselines, calibration, the intervention problem, and the ways a series lies        |
+| [Evaluation](#evaluation)                                                | the metrics, the red case the loop requires, and why a replay fixture comes first   |
+| [Order of work](#order-of-work)                                          | phases and prerequisite spikes, with the decision gate that could stop them         |
+| [Success measures and risks](#success-measures-and-risks)                | the targets a phase is judged against, and what could sink it                       |
+| [Out of scope](#out-of-scope)                                            | what this is not                                                                    |
+| [Open questions](#open-questions)                                        | what only a build or a backtest can answer                                          |
+
 ## TL;DR
 
-kube-agents has already evolved from a **reactive** agent, which fixes what a person reports,
-to a **proactive** one, whose scheduled audits and event triggers find and fix problems nobody has
-reported yet. This document proposes the next step: a **predictive** mode, in which kube-agents
-forecasts a failure and resolves it before it happens.
+This document proposes and evaluates a **predictive mode** for kube-agents. Today the agent is
+**reactive**, fixing what a person reports, and **proactive**, finding problems that already exist
+before anyone reports them. In predictive mode it warns before the problem exists. It uses
+[TimesFM](https://github.com/google-research/timesfm), Google's open time-series forecasting model,
+to forecast series such as CPU, memory, disk and node count. When a forecast shows a resource
+running out, the agent raises an early warning with a proposed fix, before the outage.
 
-It merges two designs. The kube-agents half — the finding shape, the compute-then-judge split, the
-ledger and pull-request path, the capability lifecycle and the eval loop — is Dmitry Shnayder's.
-The platform-agnostic half comes from Gari Singh's
-[Zero-Shot Forecasting for Predictive Operations](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7):
-the forecast, prediction and action layers, the reference-type taxonomy and use-case catalogue,
-the context-builder rules, the calibration layer, the cost-derived decision rule, the triage
-cascade, the intervention problem, and the prerequisite spikes. Where the two disagreed, this
-document says so and says how it resolves.
+The feature is **opt-in and disabled by default**. Once enabled, a cluster uses predictions only
+after a probe, a backtest on the cluster's own history, shows its load can be forecast. It stops
+if its predictions start going wrong.
 
-## In short
+The evidence so far: on bursty test clusters, forecasts a day ahead are too imprecise to act on.
+On a real customer staging cluster, 8-hour forecasts of memory, requested CPU and node count were
+accurate enough. Forecasting costs seconds per request on CPU. Nothing is built yet.
+
+## Summary
 
 kube-agents has two operating modes today. In the **reactive** mode a person sees a problem and asks
 the agent in chat. In the **proactive** mode the agent finds a problem nobody has reported yet: the
@@ -55,11 +88,37 @@ takes: a ledger entry and a pull request, with a human merging. What changes is 
 fires — which is exactly the property the [workflow model](../architecture/04-workflow-model.md)
 gives a trigger: it changes when an agent wakes, never what it may do.
 
-Prediction is not switched on fleet-wide. It is opt-in, and even then a cluster predicts only
-while a probe, a backtest on its own history, shows its load can be forecast. Its stored
-predictions are scored against what really happened, and it stops predicting when they are
-wrong too often. Clusters that are not predicting are re-probed from time to time
-([A per-cluster probe decides where to predict](#a-per-cluster-probe-decides-where-to-predict)).
+**Opt-in, and earned per cluster.** Predictive mode ships disabled. When an operator enables it,
+each managed cluster runs a probe: the forecaster replays the cluster's recent history and checks
+how often it would have been right, above all how often it would have warned about something that
+never came. Only a cluster that passes gets predictions, and only for the series types that passed.
+Every prediction is later scored against what really happened. A cluster whose score drops stops
+predicting, and the probe re-runs on the rest from time to time.
+[Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster) has the states and bars.
+
+**Why a false alarm costs more than a miss.** A forecast that is too high makes the agent act on a
+problem that never arrives: a pull request someone reviews, a person interrupted. Enough of them
+and people learn to ignore every warning the agent raises, real ones included. A forecast that is
+too low only loses the head start, because the proactive mode still catches the problem when it
+arrives. Every threshold in the design leans toward silence for this reason.
+
+**How a warning reaches people.** Code computes the forecasts and the agent judges them: is the
+growth legitimate, and is the limit or the consumer the thing to change? A breach days away becomes
+a finding in the audit ledger and, where the limit is declared in Git, a pull request a human
+merges. A breach inside the next 24 hours is injected into the incident path the event watcher
+already uses, so a person sees it the same day.
+[How a prediction reaches people](#how-a-prediction-reaches-people) has the detail.
+
+**What the experiment found.** On 11 bursty test clusters, day-ahead forecasts landed within
+−10%/+5% of the real value 57% of the time: better than repeating yesterday (45%), far from good
+enough to act on. Forecasting 8 hours ahead halved the typical miss. On a real customer staging
+cluster with steady load, the bad-day overshoot of an 8-hour memory forecast fell from 20% to 4%.
+One CPU container forecasts 64 series in about 20 seconds from 7 days of history, so forecasting
+never lags the horizon. The [Experiment](#experiment) section has the numbers.
+
+**What gets built first.** A metrics collector, then the forecaster service with a backtest on a
+real fleet, then the capability itself with every series class in shadow until its record earns
+promotion. [Order of work](#order-of-work) lists the phases and the gates between them.
 
 The vocabulary is deliberate. _Proactive_ is already taken by the audits and the site's
 [Proactive autonomy](../site/src/content/docs/overview/proactive-autonomy.md) page, and it means
@@ -67,30 +126,22 @@ The vocabulary is deliberate. _Proactive_ is already taken by the audits and the
 the next rung on the ladder reactive, proactive, predictive. The action a predictive finding takes
 before the breach is _preemptive remediation_.
 
-## How to read this document
+**Where the design comes from.** It merges two designs. The kube-agents half — the finding shape,
+the compute-then-judge split, the ledger and pull-request path, the capability lifecycle and the
+eval loop — is Dmitry Shnayder's. The platform-agnostic half comes from Gari Singh's [Zero-Shot
+Forecasting for Predictive
+Operations](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7): the forecast,
+prediction and action layers, the reference-type taxonomy and use-case catalogue, the
+context-builder rules, the calibration layer, the cost-derived decision rule, the triage cascade,
+the intervention problem, and the prerequisite spikes. Where the two disagreed, this document says
+so and says how it resolves.
 
-Each section goes a level deeper than the one before it, so a human reader can stop as soon as they
-have what they came for.
+## Detailed design
 
-| Section                                                       | What it gives you                                                                   |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| [Scope](#scope)                                               | what an install already has, and what this document adds                            |
-| [The three modes](#the-three-modes)                           | the definition of predictive, and the shape of problem it owns                      |
-| [Three layers](#three-layers-forecast-prediction-action)      | forecast, prediction and action, and where kube-agents draws its boundary           |
-| [What a predictive finding is](#what-a-predictive-finding-is) | the breach, its reference types, its fields, the first series, and the use-case map |
-| [The forecaster](#the-forecaster)                             | why TimesFM 2.5, what it is not, covariates, and the alternatives weighed           |
-| [Where the series come from](#where-the-series-come-from)     | the metrics source contract, and why no new credential path is needed               |
-| [How it fits the pipeline](#how-it-fits-the-pipeline)         | triage, forecast, decision rule, agent judgement; ledger, pull request, event path  |
-| [Honesty about the future](#honesty-about-the-future)         | baselines, calibration, the intervention problem, and the ways a series lies        |
-| [Evaluation](#evaluation)                                     | the metrics, the red case the loop requires, and why a replay fixture comes first   |
-| [Backtest experiment](#backtest-experiment)                   | the day-ahead backtest on real clusters, and its results                            |
-| [Order of work](#order-of-work)                               | phases and prerequisite spikes, with the decision gate that could stop them         |
-| [Success measures and risks](#success-measures-and-risks)     | the targets a phase is judged against, and what could sink it                       |
-| [Out of scope](#out-of-scope)                                 | what this is not                                                                    |
-| [Open questions](#open-questions)                             | what only a build or a backtest can answer                                          |
-| [Prior art](#prior-art)                                       | what other agents and platforms ship today, and what it changes here                |
+Each subsection below can be read on its own; the [table above](#how-to-read-this-document) says
+what each one covers.
 
-## Scope
+### Scope
 
 Most of the machinery a predictive mode needs is on `main` under some other name. This table is
 the boundary between what an install already has and what this document asks for.
@@ -109,7 +160,7 @@ the boundary between what an install already has and what this document asks for
 Out of scope here, as for the vehicle: file names, tool names, and which change lands first beyond
 the order of work below. Those belong to the change that implements it.
 
-## The three modes
+### The three modes
 
 | Mode           | The condition when the agent acts | What wakes it                                        | Ships today                                                             |
 | -------------- | --------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------- |
@@ -138,7 +189,7 @@ finding never scales anything; it proposes a change to a declared limit through 
 tells an owner their consumption is on course for one. Keeping a controller's job out of the
 agent's hands is what makes the finding safe to raise.
 
-## Three layers: forecast, prediction, action
+### Three layers: forecast, prediction, action
 
 Gari Singh's design describes a _prediction plane_ in three layers, and the product boundary can be
 drawn after any of them:
@@ -170,12 +221,61 @@ finding rather than the actuator:
 - No silent staleness. A forecast built on a gappy or stale window is labelled as such and cannot
   produce a pull request.
 
-## What a predictive finding is
+### Enabling predictive mode: opt-in, per cluster
+
+The [experiment](#experiment) found that predictability belongs to the cluster, not the model. The
+same forecaster that overshot memory by 20% on a bad day on the bursty evaluation hosts overshot by
+4% on a customer staging cluster with steady load. A fleet-wide yes or no would be wrong for one of
+them. The mode is therefore gated per cluster, and a cluster earns predictions by showing, on its
+own history, that they would have been right.
+
+Predictive mode is opt-in and off by default. When an operator enables it, each cluster under
+management moves through three states:
+
+- **`probing`.** The probe runs the experiment on the cluster's own recent history: a rolling-origin
+  backtest, cut at points in the past, forecasting forward only from what was known then, and
+  scoring against what happened, as in the experiment. It checks the costly side first: how far
+  forecasts overshoot on a bad day at the horizons the mode uses, and whether TimesFM beats
+  seasonal-naive there. A cluster that clears the bar moves to `predicting`, and one that does not
+  moves to `unpredictable`. Nothing is acted on while probing.
+- **`predicting`.** The sweep computes the cluster's future values and acts on them through the
+  normal finding path. Every prediction is stored with its horizon. When the period it covers has
+  passed and the real values are available, it is scored against them. That rolling score is the
+  same record [calibration](#calibration) keeps. If it drops below the bar, the cluster stops
+  predicting and moves to `unpredictable`. It does not wait for an operator.
+- **`unpredictable`.** No predictions are computed or acted on. The proactive mode still watches
+  current values, which is why a forecast that is not trusted costs a head start and not an
+  incident. The probe reruns on a schedule. When the cluster's series have become predictable, for
+  example after a workload settles or a noisy tenant leaves, it moves back to `predicting`.
+
+The bars are asymmetric on purpose. Entering `predicting` takes a stricter score than staying there,
+and a cluster stays in a state for a minimum time before it may leave it, so a cluster near the line
+does not flap between the two. Both bars, the reprobe interval and the horizons are criteria on the
+[vehicle](#on-the-vehicle), with quiet defaults. They are not constants. Over-forecasts are the
+costly miss, since each one is a pull request and an interrupted person, and enough of them teach
+people to ignore the agent. So the bars are set on overshoot, and undershoot counts for less.
+
+The decision is per cluster, and the probe records it per series class within the cluster. A cluster
+whose memory forecasts well and whose CPU does not predicts memory only. Within a `predicting`
+cluster, the per-group states in [Calibration](#calibration) still apply.
+
+Live scoring meets [the intervention problem](#the-intervention-problem): a prediction someone acted
+on may never come true. The live score therefore uses only predictions no finding acted on. That is
+most of them, since most forecasts raise no finding. A series with a remediated finding leaves the
+score until its next unacted window.
+
+The probe is cheap enough to run routinely. Forecast time is set by the padded context, not the
+horizon or batch size. One 11-core CPU container forecasts 64 series from 7 days of history in about
+20 seconds per request. A probe over four weeks with two cut points a day and 50 series is 56
+requests, about 20 minutes. On the staging cluster, the experiment's 7-day run, 129 cut points over
+50 series, took 50 minutes.
+
+### What a predictive finding is
 
 A predictive finding is a **forecast threshold breach**: a claim that a named series will cross a
 named reference within a stated horizon, with the confidence and lead time attached.
 
-### The two halves of a series
+#### The two halves of a series
 
 Every series the mode watches has the same structure: a **consumed quantity** the agent reads from
 a metrics source, and a **declared limit** the agent reads from an object it already audits. The
@@ -189,7 +289,7 @@ moves — a VPA rewriting requests — the limit becomes a second series, and th
 trajectory intersection rather than a line crossing; that doubles the cost for those series and is
 left to a later phase.
 
-### Reference types
+#### Reference types
 
 The organising insight of the prediction-plane design is that a forecast becomes useful the moment
 there is something to compare it against, and that the use cases differ only in what that is:
@@ -207,7 +307,7 @@ The first build supports only the static line, for the reason the prediction-pla
 for its own first phase: the reference already exists in the system, so the first shipped thing is
 verifiable. The other types are the later phases in the [use-case map](#the-use-case-map).
 
-### The finding's fields
+#### The finding's fields
 
 A finding carries enough that a reader can check it without re-running the model:
 
@@ -231,7 +331,7 @@ A finding carries enough that a reader can check it without re-running the model
   the criteria revision, as the vehicle's R4 requires of any report.
 - **Owner.** From the team label, as every fleet finding names one.
 
-### Severity and path, by lead time
+#### Severity and path, by lead time
 
 | Lead time                                | Severity | Path                                                                                                                                      |
 | ---------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -244,7 +344,7 @@ the narrowing direction (R5). The horizon for a series class is set by its **rem
 time**, not by the model: a volume expansion may need a maintenance window, and a quota increase
 takes days, so storage and quota need long horizons while memory needs short ones.
 
-### The first series
+#### The first series
 
 Five series, chosen because each has a declared limit the agent already reads, a metric a stock GKE
 cluster already exports, and a remediation the existing declarative path already knows how to make.
@@ -263,7 +363,7 @@ design. The forecast distinguishes "high" from "rising toward the wall", but on 
 at native resolution; the daily sweep's version of this series is the slow climb, and the fast one
 is the acute tier's.
 
-### The use-case map
+#### The use-case map
 
 The prediction-plane design catalogues ten use cases. Each is the same three primitives — signal,
 quantile trajectory, reference — in a different arrangement. This table places each in kube-agents.
@@ -281,7 +381,7 @@ quantile trajectory, reference — in a different arrangement. This table places
 | UC-3 Anomaly bands                     | An observation against the forecast's own q10–q90 band, alerted on violation density                     | Not here. The fleet anomaly checks own anomalies; they may consume L1 bands. The prediction-plane design puts it last for the same reason: no proximity screen, so everything must be forecast, and it is the use case most likely to be muted.                                                                                |
 | UC-2 Predictive autoscaling            | Request rate or CPU against provisioned capacity, with known-future covariates                           | Not here. This is the second divergence between the source designs: the prediction plane treats it as a policy on the substrate, and kube-agents treats scaling as a controller's job (HPA, KEDA, the cluster autoscaler). A finding may propose a scheduled `minReplicas` change as a pull request; the agent does not scale. |
 
-### Where not to forecast
+#### Where not to forecast
 
 A generic forecasting substrate invites being pointed at everything. These classes are
 deliberately absent, and the collector refuses them rather than forecasting them badly:
@@ -295,9 +395,9 @@ deliberately absent, and the collector refuses them rather than forecasting them
 | Series with under about two seasonal periods of history                            | Nothing to condition on; the model extrapolates the last slope                              | The instant checks until history accrues                                                                   |
 | Control-plane load (etcd object count, API server latency)                         | A good second-wave candidate, but its limits are published GKE bounds, not declared objects | A later series class once the limit half can be read from a bounds table                                   |
 
-## The forecaster
+### The forecaster
 
-### Why a foundation model at all
+#### Why a foundation model at all
 
 The forecast most operators run today is `predict_linear` in PromQL: a straight line through the
 last few hours, extrapolated. For a volume filling at a steady rate it is right, cheap, and already
@@ -313,7 +413,7 @@ Operating a fleet of them is the hard part, and it is what time-series foundatio
 they are pretrained once on a large corpus of series and forecast a new series **zero-shot**, from
 its own history alone.
 
-### Why TimesFM 2.5
+#### Why TimesFM 2.5
 
 [TimesFM](https://github.com/google-research/timesfm) is Google Research's decoder-only time-series
 foundation model. Version 2.5 is the one this document proposes, for reasons that are each
@@ -347,7 +447,7 @@ that is only knowable if the baseline can run in shadow beside the model. Reques
 spec, so the specs are drawn from a small fixed set rather than set freely per series: spec
 proliferation is batch fragmentation.
 
-### Covariates and long cycles
+#### Covariates and long cycles
 
 Some series have structure their own recent history cannot show: a nightly batch window, a planned
 migration, a quarter-end, the Christmas peak. The prediction-plane design treats known-future
@@ -364,19 +464,19 @@ it two cliff edges. The two honest ways to show it a year are a single long cont
 resolution (a year at hourly alignment is 8,760 points, inside the 16,384 limit, and Cloud
 Monitoring keeps system metrics for 24 months at ten-minute resolution) run beside a short
 fine-resolution context, or a holiday calendar as a covariate. Which is better is a backtest
-question; the [experiment](#backtest-experiment) runs the first.
+question; the [experiment](#experiment) runs the first.
 
-### What it is not
+#### What it is not
 
 TimesFM does not know what a PersistentVolumeClaim is. It sees numbers and returns numbers. It does
 not detect anomalies, though its prediction intervals can be used that way; it does not explain a
 trend; it does not decide whether growth is legitimate. Every one of those is the agent's job, and
-the [pipeline section](#how-it-fits-the-pipeline) keeps them there. A published evaluation of
+the [pipeline section](#how-a-prediction-reaches-people) keeps them there. A published evaluation of
 foundation models on real operational series also finds cases where zero-shot forecasts do poorly
 even with tuned context and horizon, which is why the [order of work](#order-of-work) puts a
 backtest on the fleet's own series before any finding reaches a ledger.
 
-### Alternatives weighed
+#### Alternatives weighed
 
 | Alternative                                            | What it offers                                                                                                                                            | Why not the primary                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -387,7 +487,7 @@ backtest on the fleet's own series before any finding reaches a ledger.
 | TimesFM 3.0                                            | Native multivariate forecasting and past-and-future covariates.                                                                                           | Non-commercial weights. Revisit if relicensed.                                                                                                                                                                                                                                                                                                                    |
 | Tabular foundation models (TabPFN and kin)             | Classification over features, which is the shape of "will this pod fail" rather than "when does this series cross".                                       | A different question, with licence terms that restrict the current weights; a later document, if a failure-classification mode is ever wanted.                                                                                                                                                                                                                    |
 
-### Where it runs
+#### Where it runs
 
 The forecaster is a **separate Deployment with no credentials**, on the pattern the memory store's
 pods already follow: its own image pinned in [`images.json`](../../images.json), an `enabled:`
@@ -406,7 +506,7 @@ and the model where a policy has nothing to govern. The prediction-plane design'
 shape — the model on a GPU node pool, control on CPU — is available to a large fleet as a
 deployment choice, since the interface is a batched call either way.
 
-## Where the series come from
+### Where the series come from
 
 The relay design anticipated this consumer. Its route list permits, GET only, the three Monitoring
 shapes a collector needs: `timeSeries` list for GKE system metrics, `metricDescriptors` list so the
@@ -437,11 +537,12 @@ and the ledger groups findings per cluster family and region, as the anomaly che
 labels can carry sensitive identifiers; whatever the capability keeps inherits the retention and
 access of the Monitoring data it came from.
 
-## How it fits the pipeline
+### How a prediction reaches people
 
-Drift detection split its problem into two jobs: computing the diff, which is mechanical, and
-judging it, which is where an agent earns its place. Forecasting splits the same way, and for the
-same reason.
+A prediction becomes work through paths that already exist: a ledger finding and a pull request for
+most lead times, and an incident inject when the breach is close. Drift detection split its problem
+into two jobs: computing the diff, which is mechanical, and judging it, which is where an agent
+earns its place. Forecasting splits the same way, and for the same reason.
 
 **Job A: compute the forecast.** Code, not a prompt. A sweep enumerates the enabled series per
 cluster, triages them, reads the admitted ones through the relay, builds each context window,
@@ -476,7 +577,7 @@ answered by a session that saw the forecast. The same sweep can run between sche
 tier alone — a short-horizon check every few hours, the full sweep daily — because a 30-day
 forecast does not need refreshing every hour.
 
-### Triage
+#### Triage
 
 A mid-size cluster emits hundreds of thousands of series, and a fleet multiplies that. Most are
 nowhere near informing a decision: a container at 12% of its memory limit on a flat slope does not
@@ -500,7 +601,7 @@ by priority, so under pressure the sweep forecasts fewer low-priority series rat
 long. The static-limit series are cheap precisely because T1 has a limit to measure proximity
 against; a band reference has none, which is the cost reason UC-3 sits outside this design.
 
-### The decision rule
+#### The decision rule
 
 Given the quantile trajectory and the limit, the sweep computes the first step at which each
 quantile crosses, interpolated within the step, and requires the crossing to hold for several
@@ -523,7 +624,7 @@ Correlated findings collapse. A node pool nearing its maximum and every workload
 one finding with the rest attached as evidence; without that, the first real trend produces a page
 of findings nobody reads.
 
-### On the vehicle
+#### On the vehicle
 
 The capability is audit-shaped and maps onto the vehicle's requirements without special cases:
 
@@ -542,12 +643,12 @@ state topic on the pattern the [payload spec](spec-a2a-payloads.md) already sket
 upgrade-readiness verdicts, so a later question in chat starts from the last sweep rather than a
 cold collection. That is an enhancement, not a dependency.
 
-## Honesty about the future
+### Honesty about the future
 
 A finding about the present can be checked by re-reading the object. A finding about the future
 cannot, and a mode built on forecasts is only as useful as its record of being right.
 
-### Backtest against baselines before the first finding
+#### Backtest against baselines before the first finding
 
 On the fleet's own series, a rolling-origin backtest: cut each series at points in the past,
 forecast forward from what was known at that point only, and compare against what happened. Point
@@ -555,57 +656,7 @@ in time is strict; a context that leaks one future point invalidates the result.
 forecast-level and decision-level [metrics](#metrics) per series class against two baselines,
 seasonal-naive and linear. This is the experiment the [order of work](#order-of-work) gates on.
 
-### A per-cluster probe decides where to predict
-
-The [backtest experiment](#backtest-experiment) found that predictability belongs to the cluster,
-not the model. The same forecaster that overshot memory by 20% on a bad day on the bursty
-evaluation hosts overshot by 4% on a customer staging cluster with steady load. A fleet-wide
-yes or no would be wrong for one of them. The mode is therefore gated per cluster, and a cluster
-earns predictions by showing, on its own history, that they would have been right.
-
-Predictive mode is opt-in and off by default. When an operator enables it, each cluster under
-management moves through three states:
-
-- **`probing`.** The probe runs the experiment on the cluster's own recent history: a
-  rolling-origin backtest, cut at points in the past, forecasting forward only from what was known
-  then, and scoring against what happened, as in the experiment. It checks the costly side first: how
-  far forecasts overshoot on a bad day at the horizons the mode uses, and whether TimesFM beats
-  seasonal-naive there. A cluster that clears the bar moves to `predicting`, and one that does not
-  moves to `unpredictable`. Nothing is acted on while probing.
-- **`predicting`.** The sweep computes the cluster's future values and acts on them through the
-  normal finding path. Every prediction is stored with its horizon. When the period it covers
-  has passed and the real values are available, it is scored against them. That rolling score
-  is the same record [calibration](#calibration) keeps. If it drops below the bar, the cluster
-  stops predicting and moves to `unpredictable`. It does not wait for an operator.
-- **`unpredictable`.** No predictions are computed or acted on. The proactive mode still watches
-  current values, which is why a forecast that is not trusted costs a head start and not an
-  incident. The probe reruns on a schedule. When the cluster's series have become predictable,
-  for example after a workload settles or a noisy tenant leaves, it moves back to `predicting`.
-
-The bars are asymmetric on purpose. Entering `predicting` takes a stricter score than staying
-there, and a cluster stays in a state for a minimum time before it may leave it, so a cluster near
-the line does not flap between the two. Both bars, the reprobe interval and the horizons are
-criteria on the [vehicle](#on-the-vehicle), with quiet defaults. They are not constants. Over-forecasts
-are the costly miss, since each one is a pull request and an interrupted person, and enough of
-them teach people to ignore the agent. So the bars are set on overshoot, and undershoot
-counts for less.
-
-The decision is per cluster, and the probe records it per series class within the cluster. A
-cluster whose memory forecasts well and whose CPU does not predicts memory only. Within a
-`predicting` cluster, the per-group states in [Calibration](#calibration) still apply.
-
-Live scoring meets [the intervention problem](#the-intervention-problem): a prediction someone
-acted on may never come true. The live score therefore uses only predictions no finding acted on.
-That is most of them, since most forecasts raise no finding. A series with a remediated finding
-leaves the score until its next unacted window.
-
-The probe is cheap enough to run routinely. Forecast time is set by the padded context, not the
-horizon or batch size. One 11-core CPU container forecasts 64 series from 7 days of history in
-about 20 seconds per request. A probe over four weeks with two cut points a day and 50 series is
-56 requests, about 20 minutes. On the staging cluster, the experiment's 7-day run, 129 cut points over
-50 series, took 50 minutes.
-
-### Calibration
+#### Calibration
 
 Zero-shot quantiles are calibrated on average over the model's training data, which promises
 nothing about one install's volume fill. If the q90 is really a q60 for some series, every
@@ -623,7 +674,7 @@ marked low confidence. `calibrated`: coverage within tolerance, findings may car
 candidate for the baseline backend. A deploy or a limit change resets the group to `unmeasured`
 rather than carrying a confidently wrong correction forward.
 
-### The intervention problem
+#### The intervention problem
 
 If the mode works, its predictions stop coming true. It forecasts a full volume, someone merges the
 expansion, and the volume never fills. Scored naively, that is a false positive; scored that way
@@ -646,12 +697,12 @@ ones that this capability adopts:
 The consequence, stated so nobody tunes against it: precision is measured on replay and shadow,
 never on the outcomes of findings someone acted on.
 
-### Quiet defaults, conservative costs
+#### Quiet defaults, conservative costs
 
 The shipped cost weights err toward silence. The first weeks on a fleet are for tuning down, not
 up; the vehicle's R1 says why.
 
-### Know the ways a series lies
+#### Know the ways a series lies
 
 The model accepts anything and returns confident nonsense when fed nonsense. The collector handles
 each of these before the model sees the series, and the finding carries a quality flag when one
@@ -686,9 +737,9 @@ applied (`gappy`, `short_context`, `post_restart`, `low_variance`, `stale`, `cli
   forecasting the raw counter produces a straight line with no information in it. The limit is
   compared to the level, not the rate.
 
-## Evaluation
+### Evaluation
 
-### Metrics
+#### Metrics
 
 Average accuracy is not the goal; accuracy near the limit is. A model with a good overall error
 that is optimistic in the upper tail is worse than useless for a memory series. Two families of
@@ -703,7 +754,7 @@ metric, per series class and horizon step:
   a miss; and coverage restricted to windows where the series was near its limit, which is the
   number that predicts real performance and is usually worse than unconditional coverage.
 
-### The eval case
+#### The eval case
 
 The [eval-driven development rule](../../.agents/rules/eval_driven_development.md) makes a
 failing case the start of any change to agent behaviour, and the seeded fleet is where planted
@@ -733,13 +784,128 @@ The case lands in the existing `capacity` domain; a new domain needs a presubmit
 can exist, which a first case cannot earn. Registration follows the nightly-first rule the eval
 rule sets out, and the case is never added to the blocking roster in the change that makes it pass.
 
-## Backtest experiment
+### Order of work
 
-The experiment is in [`bench/experiments/timesfm-backtest/`](../../bench/experiments/timesfm-backtest/README.md):
-a rolling-origin, day-ahead backtest of TimesFM 2.5 on real series from the eval-pool clusters and
-the production install, against seasonal-naive and linear baselines. Each origin feeds the model
-the days before a UTC midnight and forecasts the 288 five-minute points of the day after it, then
-scores the forecast against what happened.
+Each phase is a separate change with its own live validation. The prediction-plane design names
+five prerequisite spikes; they are folded into the phases they gate.
+
+1. **The collector, as a library and a sandbox command.** Written to the relay's contract, producing
+   aligned series with limits attached for the five series classes, with a `limitations` record per
+   cluster. No model yet: its output is the baselines' input as well as the forecaster's. This
+   phase is also the metrics source the anomaly checks say they need, built once. It carries two
+   spikes: whether point-in-time series for past breaches can be reconstructed at the resolution
+   needed (if not, recording must start now, which makes it the most urgent spike despite looking
+   the least interesting), and how much gap handling, counter conversion and the choice of
+   downsampling function change forecast quality — which decides how much engineering the context
+   rules above deserve.
+2. **The forecaster service and the backtest.** The TimesFM 2.5 image, the chart toggle, the
+   baseline backends, and the rolling-origin backtest on a real fleet's series. It carries the
+   inference-cost spike (latency and throughput at realistic batch sizes on the install's own CPU
+   shape, which sizes the triage budget) and the quality spike (on which series archetypes — sawtooth
+   memory, diurnal load, bursty queues, monotone disk — the model beats seasonal-naive). **Decision
+   gate:** a series class ships on TimesFM only where the backtest shows it beats the baselines on
+   breach precision at equal recall. Where it does not, that class ships on the baseline, and the
+   finding shape is unchanged — the model is a provenance field, not the design. If no class clears
+   the gate, the mode still ships on the baseline and this document records why.
+3. **The capability.** The SOP, the roster job, the ledger stream, the triage and decision rule,
+   the opt-in toggle and the per-cluster probe with its reprobe schedule, calibration state, the
+   remediation kinds per series, every class in shadow, the replay-fixture case run red then green,
+   and the criteria on the vehicle once its store exists (image-owned defaults until then).
+4. **The acute tier.** The `forecast-breach` inject kind, the short-horizon sweep, and the session
+   path's handling of a finding that is a forecast rather than an event.
+5. **Chat.** "When will X run out" as a scoped run, and the state topic so the answer starts from
+   the last sweep.
+6. **Further references.** The leak series (derived trend), expected-spike annotation and window
+   selection (band), error-budget burn (budget), and counterfactual rollout checks, each on its own
+   case. The covariate spike — what XReg gives against the residual fallback on a real scheduled
+   event — gates any series that needs a covariate.
+
+Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 6 each start from one. Each
+phase's gate is a backtest or eval record, not a demonstration.
+
+### Success measures and risks
+
+The prediction-plane design sets targets for its first version. Adapted to a capability whose
+action is a pull request:
+
+| Measure        | Definition                                                                                           | Target                                                                                |
+| -------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Lead time      | Median time from finding to predicted breach, for true positives                                     | At least ten times the remediation latency — for a pull request path, days, not hours |
+| Precision      | Share of raised findings that would have crossed absent intervention, on replay and shadow           | 0.8 for a class allowed to open pull requests                                         |
+| Recall         | Share of real breaches of a covered class found with usable lead time                                | 0.5 in the first version                                                              |
+| Coverage error | Absolute gap between empirical and nominal coverage for q10, q50, q90, per group, rolling seven days | 0.05 after calibration                                                                |
+| Cost           | The forecaster's compute as a share of the install's own                                             | 1%                                                                                    |
+| Reversal rate  | Share of merged predictive remediations reverted within a week                                       | 0.02                                                                                  |
+
+| Risk                                                         | Impact                                                  | Mitigation                                                                                        |
+| ------------------------------------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| The model does not beat seasonal-naive on the fleet's series | The model half of the thesis fails                      | The phase 2 gate; the baseline backend keeps the capability alive either way                      |
+| Triage false negatives hide a real breach                    | A missed breach in a mode claiming to predict them      | The random sampling floor makes the rate measurable; the ledger reports it                        |
+| Intervention confounding lowers measured precision           | The capability is tuned into uselessness                | Precision on replay and shadow only, stated in the ledger's own record                            |
+| Findings become noise                                        | The stream is muted and takes the good findings with it | Shadow first, quiet costs, dwell, collapse of correlated findings, UC-3 left out                  |
+| Inference cost exceeds budget at fleet cardinality           | The capability cannot run widely                        | The inference-cost spike; a fixed budget that triage fills                                        |
+| Model version drift                                          | A silent quality regression                             | A pinned image digest, the model as provenance, calibration as the regression detector            |
+| A covariate is wrong about the future                        | A confidently wrong forecast                            | Record covariates with the forecast so a postmortem can tell a covariate error from a model error |
+
+### Out of scope
+
+- **Anomaly detection on the present value.** The fleet anomaly checks own it; they may read the
+  forecaster's bands.
+- **Predictive autoscaling and any direct actuation.** A controller's job (HPA, KEDA, the cluster
+  autoscaler); the agent proposes limits through pull requests, it does not scale or resize. The
+  prediction plane's `enforce` mode has no counterpart here.
+- **Root-cause analysis.** The forecast says that a series moves; Job B's judgement about why is a
+  recommendation, not a diagnosis.
+- **Failure classification.** "Will this pod fail" from features is a different model family and
+  a different licence conversation.
+- **Deadlines.** Expiry and rotation are countdowns; they share the lead-time field and nothing else.
+- **Multivariate forecasting.** Forecasting pairs independently and combining them understates the
+  joint tail; the features that fix that need TimesFM 3.0.
+- **Fine-tuning.** Zero-shot is the premise. A fleet whose series defeat it is a reason to revisit
+  the model choice, not to run a training pipeline inside an install.
+
+### Open questions
+
+- **Precision on a real fleet.** The day-ahead backtest has run ([Experiment](#experiment)), but no
+  series crossed a limit in its window, so breach precision, the number the proposal rests on,
+  is still unmeasured.
+- **Sweep cost.** A fleet of a hundred clusters with a few thousand mounted claims is a few thousand
+  series of two thousand points each; on CPU that is minutes, not hours, by the published
+  throughput figures, but the figure that matters is the one measured on the install's own node.
+- **Calibration grouping.** Short-lived series never accumulate the residual history per-series
+  calibration needs. Grouping by class and workload is the proposed answer; the right granularity
+  is empirical.
+- **Multi-resolution against long context.** Whether two specs per series (a week fine, a year
+  coarse) beat one long context depends on the inference-cost curve and the backtest.
+- **Metric packages that are off.** The kube-state-metrics and kubelet packages are per-cluster
+  choices. Whether the capability should recommend enabling them as its own finding, or stay silent
+  on a cluster that lacks them, is a criteria decision the first fleet will settle.
+- **Autopilot.** System metrics are present; node pools are not the operator's to size. The node
+  pool series does not apply, and the finding shape needs a way to say so per cluster mode.
+- **Where the hit-and-miss record lives.** The ledger issue's hidden marker carries findings across
+  runs; whether it can carry outcomes too, or whether the record wants the criteria store or a state
+  topic, is a question for the change that builds phase 3. The replay corpus wants a longer
+  retention than either, and its own storage.
+- **Who owns a predictive remediation.** A platform-owned capability proposing changes to
+  application-owned limits needs an ownership answer before its first pull request surprises
+  someone; the team label names the reviewer, not the decision.
+- **The relay's POST shapes.** MQL `timeSeries:query` is refused today, by design. The GET shapes
+  suffice for the five series; a later series that needs MQL reopens the relay design's second
+  question, not this one.
+
+## Experiment
+
+The experiment's code, method and full results are kept out of this repository, on the
+`experiment/timesfm-backtest` branch of the author's fork:
+[README](https://github.com/dshnayder/kube-agents/blob/experiment/timesfm-backtest/bench/experiments/timesfm-backtest/README.md) for the method and the commands to rerun it, and
+[RESULTS.md](https://github.com/dshnayder/kube-agents/blob/experiment/timesfm-backtest/bench/experiments/timesfm-backtest/RESULTS.md) for the go/no-go write-up.
+
+It is a rolling-origin backtest of TimesFM 2.5 against seasonal-naive and linear baselines, on real
+series from the 11 evaluation clusters and from one customer staging cluster. At each origin the
+model reads the days before it, forecasts the next 24 hours of five-minute points, and the forecast
+is scored against what happened.
+
+### What it tested
 
 The starting proposal was a single comparison: the model reads T-8d to T-1d and predicts day T.
 The experiment keeps that as its `tfm-7d` arm and changes three things around it. It runs every
@@ -759,14 +925,13 @@ test: no cluster in reach is a year old, and Cloud Monitoring keeps five-minute 
 weeks and ten-minute downsamples for 24 months, so the collector design above has to archive its
 own series before year-over-year input exists at all.
 
-### Results
+### What it found
 
 The first run covered the 11 evaluation hosts over 41 days, 2026-08-13 to 2026-09-23: 93 series
 that live long enough to forecast. The production install was collected too and left out; it
 does little beyond occasional pull-request tests, and its near-idle series flattered every score.
 The experiment's README has the tables and caveats. It found five things; the last is the go/no-go
-reading, written up for a decision in the experiment's
-[RESULTS.md](../../bench/experiments/timesfm-backtest/RESULTS.md).
+reading.
 
 **The forecaster clears the baseline bar on the day's shape.** Zero-shot TimesFM had a median
 MASE of 0.61–0.63, against 0.92 for seasonal-naive and 0.97 for linear. It beat seasonal-naive
@@ -807,124 +972,19 @@ miss: memory stayed within 2% high and 3% low, against 9% either way a day ahead
 in 10) it was still up to 20% too high. A lower quantile (q30) halved the costly too-high share
 for at most 5 points of in-band. Warnings on a forecast threshold crossing were rarely wrong but
 caught 3 of 148 crossings that were new that day; the rest the proactive agent already sees.
-Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the agent.
-Trend-driven resources such as disks, and horizons of a few hours, remain open. One busy customer staging
-cluster forecast far better than the evaluation hosts (a bad-day memory overshoot of 4% against
-20%, 8 hours ahead), so the answer depends on the cluster. That is why prediction is gated
-per cluster by a probe ([A per-cluster probe decides where to predict](#a-per-cluster-probe-decides-where-to-predict)).
+On bursty clusters like these, day-ahead forecasts of CPU and memory are not accurate enough to
+act on. One busy customer staging cluster forecast far better than the evaluation hosts (a bad-day
+memory overshoot of 4% against 20%, 8 hours ahead), so the answer depends on the cluster. That is
+why prediction is gated per cluster by a probe
+([Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster)). Trend-driven resources
+such as disks remain untested: no disk on these clusters lived long enough to forecast.
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
-288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
-a thousand series fits in minutes. Horizon length and batch size up to 64 do not change the
-time; only the padded context does.
-
-## Order of work
-
-Each phase is a separate change with its own live validation. The prediction-plane design names
-five prerequisite spikes; they are folded into the phases they gate.
-
-1. **The collector, as a library and a sandbox command.** Written to the relay's contract, producing
-   aligned series with limits attached for the five series classes, with a `limitations` record per
-   cluster. No model yet: its output is the baselines' input as well as the forecaster's. This
-   phase is also the metrics source the anomaly checks say they need, built once. It carries two
-   spikes: whether point-in-time series for past breaches can be reconstructed at the resolution
-   needed (if not, recording must start now, which makes it the most urgent spike despite looking
-   the least interesting), and how much gap handling, counter conversion and the choice of
-   downsampling function change forecast quality — which decides how much engineering the context
-   rules above deserve.
-2. **The forecaster service and the backtest.** The TimesFM 2.5 image, the chart toggle, the
-   baseline backends, and the rolling-origin backtest on a real fleet's series. It carries the
-   inference-cost spike (latency and throughput at realistic batch sizes on the install's own CPU
-   shape, which sizes the triage budget) and the quality spike (on which series archetypes — sawtooth
-   memory, diurnal load, bursty queues, monotone disk — the model beats seasonal-naive). **Decision
-   gate:** a series class ships on TimesFM only where the backtest shows it beats the baselines on
-   breach precision at equal recall. Where it does not, that class ships on the baseline, and the
-   finding shape is unchanged — the model is a provenance field, not the design. If no class clears
-   the gate, the mode still ships on the baseline and this document records why.
-3. **The capability.** The SOP, the roster job, the ledger stream, the triage and decision rule,
-   the opt-in toggle and the per-cluster probe with its reprobe schedule, calibration state, the remediation kinds per series, every class in shadow, the replay-fixture
-   case run red then green, and the criteria on the vehicle once its store exists (image-owned
-   defaults until then).
-4. **The acute tier.** The `forecast-breach` inject kind, the short-horizon sweep, and the session
-   path's handling of a finding that is a forecast rather than an event.
-5. **Chat.** "When will X run out" as a scoped run, and the state topic so the answer starts from
-   the last sweep.
-6. **Further references.** The leak series (derived trend), expected-spike annotation and window
-   selection (band), error-budget burn (budget), and counterfactual rollout checks, each on its own
-   case. The covariate spike — what XReg gives against the residual fallback on a real scheduled
-   event — gates any series that needs a covariate.
-
-Phases 1 and 2 produce no agent behaviour and need no case; phases 3 to 6 each start from one. Each
-phase's gate is a backtest or eval record, not a demonstration.
-
-## Success measures and risks
-
-The prediction-plane design sets targets for its first version. Adapted to a capability whose
-action is a pull request:
-
-| Measure        | Definition                                                                                           | Target                                                                                |
-| -------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Lead time      | Median time from finding to predicted breach, for true positives                                     | At least ten times the remediation latency — for a pull request path, days, not hours |
-| Precision      | Share of raised findings that would have crossed absent intervention, on replay and shadow           | 0.8 for a class allowed to open pull requests                                         |
-| Recall         | Share of real breaches of a covered class found with usable lead time                                | 0.5 in the first version                                                              |
-| Coverage error | Absolute gap between empirical and nominal coverage for q10, q50, q90, per group, rolling seven days | 0.05 after calibration                                                                |
-| Cost           | The forecaster's compute as a share of the install's own                                             | 1%                                                                                    |
-| Reversal rate  | Share of merged predictive remediations reverted within a week                                       | 0.02                                                                                  |
-
-| Risk                                                         | Impact                                                  | Mitigation                                                                                        |
-| ------------------------------------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| The model does not beat seasonal-naive on the fleet's series | The model half of the thesis fails                      | The phase 2 gate; the baseline backend keeps the capability alive either way                      |
-| Triage false negatives hide a real breach                    | A missed breach in a mode claiming to predict them      | The random sampling floor makes the rate measurable; the ledger reports it                        |
-| Intervention confounding lowers measured precision           | The capability is tuned into uselessness                | Precision on replay and shadow only, stated in the ledger's own record                            |
-| Findings become noise                                        | The stream is muted and takes the good findings with it | Shadow first, quiet costs, dwell, collapse of correlated findings, UC-3 left out                  |
-| Inference cost exceeds budget at fleet cardinality           | The capability cannot run widely                        | The inference-cost spike; a fixed budget that triage fills                                        |
-| Model version drift                                          | A silent quality regression                             | A pinned image digest, the model as provenance, calibration as the regression detector            |
-| A covariate is wrong about the future                        | A confidently wrong forecast                            | Record covariates with the forecast so a postmortem can tell a covariate error from a model error |
-
-## Out of scope
-
-- **Anomaly detection on the present value.** The fleet anomaly checks own it; they may read the
-  forecaster's bands.
-- **Predictive autoscaling and any direct actuation.** A controller's job (HPA, KEDA, the cluster
-  autoscaler); the agent proposes limits through pull requests, it does not scale or resize. The
-  prediction plane's `enforce` mode has no counterpart here.
-- **Root-cause analysis.** The forecast says that a series moves; Job B's judgement about why is a
-  recommendation, not a diagnosis.
-- **Failure classification.** "Will this pod fail" from features is a different model family and
-  a different licence conversation.
-- **Deadlines.** Expiry and rotation are countdowns; they share the lead-time field and nothing else.
-- **Multivariate forecasting.** Forecasting pairs independently and combining them understates the
-  joint tail; the features that fix that need TimesFM 3.0.
-- **Fine-tuning.** Zero-shot is the premise. A fleet whose series defeat it is a reason to revisit
-  the model choice, not to run a training pipeline inside an install.
-
-## Open questions
-
-- **Precision on a real fleet.** The whole proposal rests on the backtest in phase 2. Nothing here
-  should be quoted as a result until it has run.
-- **Sweep cost.** A fleet of a hundred clusters with a few thousand mounted claims is a few thousand
-  series of two thousand points each; on CPU that is minutes, not hours, by the published
-  throughput figures, but the figure that matters is the one measured on the install's own node.
-- **Calibration grouping.** Short-lived series never accumulate the residual history per-series
-  calibration needs. Grouping by class and workload is the proposed answer; the right granularity
-  is empirical.
-- **Multi-resolution against long context.** Whether two specs per series (a week fine, a year
-  coarse) beat one long context depends on the inference-cost curve and the backtest.
-- **Metric packages that are off.** The kube-state-metrics and kubelet packages are per-cluster
-  choices. Whether the capability should recommend enabling them as its own finding, or stay silent
-  on a cluster that lacks them, is a criteria decision the first fleet will settle.
-- **Autopilot.** System metrics are present; node pools are not the operator's to size. The node
-  pool series does not apply, and the finding shape needs a way to say so per cluster mode.
-- **Where the hit-and-miss record lives.** The ledger issue's hidden marker carries findings across
-  runs; whether it can carry outcomes too, or whether the record wants the criteria store or a state
-  topic, is a question for the change that builds phase 3. The replay corpus wants a longer
-  retention than either, and its own storage.
-- **Who owns a predictive remediation.** A platform-owned capability proposing changes to
-  application-owned limits needs an ownership answer before its first pull request surprises
-  someone; the team label names the reviewer, not the decision.
-- **The relay's POST shapes.** MQL `timeSeries:query` is refused today, by design. The GET shapes
-  suffice for the five series; a later series that needs MQL reopens the relay design's second
-  question, not this one.
+288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context. On an 11-core
+container the same batches took 7.6, 20.7 and 70 seconds. Horizon length and batch size up to 64
+do not change the time; only the padded context does. A thousand series forecast from 7 days of
+history is 16 requests, two to six minutes on one replica, so forecasting never lags the horizon
+it covers.
 
 ## Related
 
