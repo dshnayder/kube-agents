@@ -100,6 +100,8 @@ class FakeBroker:
         self.create_fails_with: Exception | None = None
         self.update_fails_with: Exception | None = None
         self.identity_fails_with: Exception | None = None
+        self.delete_fails_with: Exception | None = None
+        self.view_fails_with: Exception | None = None
         # Who the credential authenticates as, which is what `proposal_create`
         # records as the author. Set it to somebody else and the proposals this
         # fake already holds become a stranger's.
@@ -214,6 +216,36 @@ class FakeBroker:
                         proposal[field] = payload[field]
                 return {"proposal": proposal}
         raise AssertionError(f"no proposal {payload['number']}")
+
+    def branch_view(self, payload):
+        if self.view_fails_with:
+            raise self.view_fails_with
+        tip = self._tip(payload["branch"])
+        return {"branch": {"name": payload["branch"], "exists": bool(tip), "revision": tip or None}}
+
+    def branch_delete(self, payload):
+        """`vcs_broker.branch_delete`'s refusals, in its order.
+
+        Kept whole because the caller's advice depends on which one it gets,
+        and a fake that deletes anything would prove a route the broker refuses.
+        """
+        if self.delete_fails_with:
+            raise self.delete_fails_with
+        branch, expected = payload["branch"], payload["revision"]
+        if not branch.startswith("platform-agent/"):
+            raise vcs_client.VcsError(f"{branch} is not ours.", code="BRANCH_NOT_OURS")
+        history = [proposal for proposal in self.proposals if proposal["source"] == branch]
+        if [proposal for proposal in history if proposal["state"] == "open"]:
+            raise vcs_client.VcsError(f"{branch} has an open proposal.", code="OPEN_PROPOSAL")
+        tip = self._tip(branch)
+        if not tip:
+            return {"branch": {"name": branch, "deleted": False, "revision": None}}
+        if tip != expected:
+            raise vcs_client.VcsError(f"{branch} is at {tip}.", code="BRANCH_MOVED")
+        if tip not in {proposal.get("sourceRevision") for proposal in history}:
+            raise vcs_client.VcsError(f"{branch} moved on after its proposal.", code="NOT_SPENT")
+        git(self.origin, "update-ref", "-d", f"refs/heads/{branch}", tip)
+        return {"branch": {"name": branch, "deleted": True, "revision": tip}}
 
     def _tip(self, branch: str) -> str:
         shown = git(self.origin, "rev-parse", f"refs/heads/{branch}", check=False)
@@ -333,18 +365,25 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         (self.origin / "app.yaml").write_text("replicas: 7\n")
         git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
         self.existing_proposal(branch)["state"] = "merged"
-        for proposal in self.broker.proposals:
-            proposal["state"] = "merged"
+        # Somebody pushed to the branch after its proposal was merged, so its
+        # tip is no longer the one a spent proposal carried and the broker will
+        # not delete it: that commit is nobody's record but the branch's.
+        git(self.origin, "checkout", "--quiet", branch)
+        (self.origin / "app.yaml").write_text("replicas: 8\n")
+        git(self.origin, "commit", "--quiet", "-am", "after the merge")
+        git(self.origin, "checkout", "--quiet", "main")
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as caught:
             self.prepare(branch)
+        self.assertIn("NOT_SPENT", str(caught.exception))
+        self.assertIn("has not used", str(caught.exception))
         self.assertEqual(list(vcs_client.ROOT.glob("*/.git")), [])
         with self.assertRaises(vcs_client.VcsError):
             vcs_client.resolve_session("acme/infra", key=branch)
-        # And the name works on the next attempt, which is what the refusal
-        # told the caller to do -- with the flag, since the branch is genuinely
-        # still there.
-        self.assertEqual(self.prepare(branch, allow_reused_branch=True)["branch"], branch)
+        # And the name works on the next attempt once the branch is gone, with
+        # no copy or session left over to refuse it for.
+        git(self.origin, "branch", "--quiet", "-D", branch)
+        self.assertEqual(self.prepare(branch)["branch"], branch)
 
     def test_prepare_takes_a_copy_of_a_branch_that_already_has_a_proposal(self):
         # Step 5 of the SKILL: another round on a proposal under review. The
@@ -431,14 +470,14 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             submit_suggestion._login_key("kube-agents"),
         )
 
-    def test_prepare_refuses_a_branch_name_whose_squash_merged_branch_is_still_there(self):
+    def test_prepare_deletes_a_squash_merged_branch_that_is_still_there(self):
         """The reuse the docstring promises, on the forge default that breaks it.
 
         Squash-merge leaves the source branch on the remote at a revision the
         base does not contain, so a branch cut fresh from the base does not
-        build on it and `publish` is refused as `BRANCH_DIVERGED` -- after the
-        agent has written the whole change. Refused here instead, where the
-        fault is and before the work.
+        build on it and `publish` would be refused as `BRANCH_DIVERGED` --
+        after the agent has written the whole change. The branch is spent, so
+        `prepare` deletes it before the work, at the revision it read.
         """
         branch = "platform-agent/scale-web"
         # The first round: a branch with a commit on it, and a proposal that is
@@ -453,24 +492,61 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         merged = self.existing_proposal(branch)
         merged["state"] = "merged"
 
+        prepared = self.prepare(branch)
+
+        self.assertEqual(prepared["branch"], branch)
+        self.assertEqual(self.broker._tip(branch), "")
+        # Deleted at the revision the spent proposal carried, so a push that
+        # landed between the read and the delete would have been refused.
+        self.assertEqual(
+            self.broker.payloads("branch-delete"),
+            [{"branch": branch, "revision": merged["sourceRevision"], "repository": "acme/infra"}],
+        )
+        said = "\n".join(self.logged)
+        self.assertIn(merged["url"], said)
+        self.assertIn(f"Deleted the spent branch at {merged['sourceRevision'][:12]}", said)
+
+    def test_a_delete_the_forge_did_not_answer_says_retry_not_rename(self):
+        # An outage is not a verdict on the name; renaming over it would give
+        # up a name the next attempt clears.
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        self.existing_proposal(branch)["state"] = "closed"
+        self.broker.delete_fails_with = vcs_client.VcsError(
+            "the forge did not answer", code="FORGE_CALL_FAILED"
+        )
         with self.assertRaises(ValueError) as caught:
             self.prepare(branch)
-        message = str(caught.exception)
-        self.assertIn("BRANCH_DIVERGED", message)
-        self.assertIn(merged["url"], message)
-        self.assertIn("has not used", message)
-        # The revision named is the one the remote's branch is actually at.
-        self.assertIn(merged["sourceRevision"][:12], message)
+        self.assertIn("run prepare again", str(caught.exception))
+        self.assertNotIn("has not used", str(caught.exception))
+        self.assertNotEqual(self.broker._tip(branch), "")
+
+    def test_a_broker_without_the_branch_verbs_refuses_the_name_by_code(self):
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        self.existing_proposal(branch)["state"] = "closed"
+        self.broker.view_fails_with = vcs_client.VcsError(
+            "no such route", code=vcs_client.BROKER_ROUTE_UNSUPPORTED
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        self.assertIn("BROKER_ROUTE_UNSUPPORTED", str(caught.exception))
+        self.assertIn("has not used", str(caught.exception))
+        self.assertEqual(self.broker.payloads("branch-delete"), [])
 
     def test_a_repository_that_deletes_merged_branches_can_reuse_the_name(self):
-        """The refusal above is right only while the remote still holds the branch.
+        """The delete above is needed only while the remote still holds the branch.
 
         GitHub's "automatically delete head branches" is on in plenty of
         repositories, and there it deletes the branch as it squash-merges. The
-        name is then free, `publish` would create it and succeed, and the check
-        cannot tell the two cases apart: no read verb in the vocabulary reports
-        whether a branch exists. So the caller says which it is, and is told
-        what it is being trusted about.
+        name is then free, `publish` creates it and succeeds, and `prepare`
+        finds that out by asking rather than by trying to delete it.
         """
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)
@@ -486,16 +562,26 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # the base, so `stale_tip` answers exactly as it does above.
         git(self.origin, "branch", "--quiet", "-D", branch)
 
-        prepared = self.prepare(branch, allow_reused_branch=True)
+        prepared = self.prepare(branch)
 
         self.assertEqual(prepared["branch"], branch)
         standing = git(Path(prepared["workspace"]), "rev-parse", "--abbrev-ref", "HEAD")
         self.assertEqual(standing.stdout.strip(), branch)
-        # Trusted, not silently. If the caller was wrong, this line is what
-        # makes the BRANCH_DIVERGED at the end of the turn legible.
+        self.assertEqual(self.broker.payloads("branch-delete"), [])
         said = "\n".join(self.logged)
-        self.assertIn("BRANCH_DIVERGED", said)
         self.assertIn(merged["url"], said)
+        self.assertIn("no longer holds the branch", said)
+
+    def test_the_retired_reuse_switch_is_accepted_and_says_so(self):
+        """A card that learned `--allow-reused-branch` before the rollout still prepares.
+
+        A switch, so it must not swallow the argument after it the way a
+        retired flag that takes a value would.
+        """
+        _, out = self.run_subject("prepare", "--allow-reused-branch", "--branch", "platform-agent/scale-web")
+        prepared = json.loads(out)
+        self.assertEqual(prepared["branch"], "platform-agent/scale-web")
+        self.assertIn("--allow-reused-branch is no longer read", "\n".join(self.logged))
 
     def test_prepare_names_the_real_tip_of_a_long_spent_branch(self):
         """The tip is the proposal's `sourceRevision`, not the last commit of a page.
@@ -503,7 +589,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         `proposal-commits` is oldest first and bounded, so for a proposal past
         the page its last entry was an old revision -- one the base may well
         contain while the real tip is not. Six commits, then a squash-merge:
-        the refusal has to name the sixth, and it has to refuse at all.
+        the branch has to be found in the way at all, and deleted at the sixth.
         """
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)
@@ -517,16 +603,17 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         merged = self.existing_proposal(branch)
         merged["state"] = "merged"
 
-        with self.assertRaises(ValueError) as caught:
-            self.prepare(branch)
-        self.assertIn(tip[:12], str(caught.exception))
+        self.prepare(branch)
+        self.assertEqual(
+            self.broker.payloads("branch-delete"), [{"branch": branch, "revision": tip, "repository": "acme/infra"}]
+        )
         # Answered off the proposal itself. Asserting the whole sequence and
         # not the absence of one verb: `submit_suggestion` issues no
         # `proposal-commits` on any path, so a check for that alone passes
         # however many calls `prepare` makes.
         self.assertEqual(
             [verb for verb, _ in self.broker.calls],
-            ["proposal-list", "proposal-list", "clone"],
+            ["proposal-list", "proposal-list", "clone", "branch-view", "branch-delete"],
         )
 
     def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):

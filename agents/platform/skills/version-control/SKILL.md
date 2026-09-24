@@ -15,7 +15,8 @@ The remote verbs are exactly these:
 
 `capabilities`, `identity`, `clone`, `publish`,
 `proposal create|list|view|comment|update|close|commits|acknowledge`,
-`issue create|list|view|comment|update|close`, `label ensure`.
+`issue create|list|view|comment|update|close`, `label ensure`,
+`remote-branch view|delete`.
 
 `update` edits a title or body and adds or removes labels; `close` closes;
 `commits` lists the revisions on a proposal's source branch; `acknowledge`
@@ -25,7 +26,12 @@ author sees it was read — `capabilities` says whether this forge supports it.
 carrying any of them — that is how a queue is read for unclaimed work.
 `label ensure` creates a label or updates it if it exists. `identity` says
 who this install is on the forge and, with `--login`, whether that login may
-write to the repository.
+write to the repository. `remote-branch view` says whether the shared
+repository still holds a branch and at which revision; `remote-branch delete`
+removes one only when it is spent — under `platform-agent/`, no open proposal
+on it, and its tip exactly what a merged or closed proposal this install opened
+from this repository carried — and only
+at the `--revision` you just read.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which
@@ -200,7 +206,18 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   on — clone again and reapply the change. An ordinary push to the target by
   somebody else is _not_ refused: your proposal simply opens with a base behind
   the tip, which is a rebase on the forge and not a problem here. Do not try to
-  force any of them.
+  force any of them. `BRANCH_DIVERGED` on a `platform-agent/` name whose last
+  proposal was closed or squash-merged is a spent branch in the way:
+  `remote-branch view` reads its revision and `remote-branch delete` clears it.
+  That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
+  the closed proposal is not this install's), `OPEN_PROPOSAL`, `NOT_SPENT` (it
+  holds revisions no proposal carried); each of those is somebody's work — pick
+  another name or report it. `BRANCH_MOVED` means it moved since you read it:
+  view it again, and delete only if it is still spent.
+  `PROTECTED_BRANCH` is never yours to clear; `FORGE_CALL_FAILED` deleted
+  nothing, so read the branch again and retry. A forge without `proposal-list`
+  does not list `remote-branch delete` in `capabilities` and refuses it
+  `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
   `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
@@ -252,6 +269,8 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `issue close`          | Close it; `--reason completed\|not-planned`                                                                                                  |
 | `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                                                             |
 | `identity`             | Who this install is on this forge; `--login` asks whether that account may write here, `--bot` if `view --comments` said it is an automation |
+| `remote-branch view`   | Whether the shared repository holds this branch, and its `revision` if it does                                                               |
+| `remote-branch delete` | Delete a spent `platform-agent/` branch at `--revision`; refused while a proposal on it is open or when it holds revisions none carried      |
 
 Every listing verb takes `-n/--limit` and answers with `count` and `truncated`.
 `truncated` is the forge's word for "there was more", judged on what it sent
