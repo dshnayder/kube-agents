@@ -525,7 +525,11 @@ class WorkerAgentsVerifier(BaseVerifier):
     ``re.fullmatch`` the ``agent`` tag of at least one worker entry.
 
     Fails closed like its siblings: a run with no tagged entries is
-    ``status="error"``, not a fail -- the harness saw no worker at all.
+    ``status="error"``, not a fail -- the harness saw no worker at all. So is
+    a required profile missing from a capture that recorded gaps
+    (``worker_capture_gaps``): a store it could not open or a fan-out it
+    clipped may hold exactly the calls that would have matched, and grading
+    that as the agent taking the wrong route would be a guess.
     """
 
     type: Literal["worker_agents"]
@@ -557,6 +561,17 @@ class WorkerAgentsVerifier(BaseVerifier):
                 reason=_NO_WORKER_AGENTS_REASON,
             )
         missing = [p for p in self.required_agents if not any(re.fullmatch(p, a) for a in agents)]
+        if missing and snap.worker_capture_gaps:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no captured worker ran as a profile matching {missing} (workers seen: {agents}), "
+                    f"but the capture was incomplete, so this check could not be evaluated: "
+                    f"{'; '.join(snap.worker_capture_gaps)}"
+                ),
+            )
         if missing:
             return VerificationResult(
                 success=False,

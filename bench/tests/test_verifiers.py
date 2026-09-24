@@ -249,6 +249,33 @@ def test_worker_agents_matches_the_whole_tag():
     assert not res.success
 
 
+def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
+    # The platform worker's store read, the Cluster Agent's did not: the
+    # absent profile is a read gap, not the agent taking the wrong route.
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    gap = "no session store for profile cluster-demo-seeded-a-us-central1-a"
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[gap])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+    assert gap in res.reason
+
+
+def test_worker_agents_gaps_do_not_mask_a_match():
+    worker = [{"name": "terminal", "args": {}, "agent": "cluster-demo-seeded-a-us-central1-a", "task": "t_2"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=["card t_9: locked"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_agents_complete_capture_still_fails():
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+
+
 def test_worker_agents_router_only_is_error_not_fail():
     transcript.set("ok", _TRAJECTORY)
     res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)

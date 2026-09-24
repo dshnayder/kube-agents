@@ -21,11 +21,15 @@
 #
 # So the objectives here are the route. worker_agents reads which profiles
 # the delegated workers ran as and requires a Cluster Agent among them;
-# worker_commands reads the terminal commands every delegated worker ran,
-# including the `platform` worker that plans the fan-out, and forbids both
-# stubbed scripts. Every cluster_agent_profile.py subcommand is forbidden, not
-# only the lookups: all of them are stubbed, and a cluster with no profile is
-# now investigated inline rather than scaffolded mid-delegation. The profile
+# worker_commands forbids both stubbed scripts in the terminal of the
+# `platform` worker that plans the fan-out -- the card the front door
+# delegated, and where main ran them. It does not reach the Cluster Agent
+# cards that worker files: the harness reads worker logs only for cards the
+# run delegated (docs/designs/bench-case-format.md), so a Cluster Agent
+# running either script passes it. Any invocation of cluster_agent_profile.py
+# is forbidden, not only the lookups: the stub refuses them all, and a cluster
+# with no profile is now investigated inline rather than scaffolded
+# mid-delegation. The profile
 # lookup is the platform_control MCP server's get_cluster_profile_name /
 # list_cluster_profiles, which run in the agent pod. Their calls are in the
 # workers' trajectory, but no check requires them: the route this case
@@ -79,15 +83,13 @@ verification_spec:
     role: objective
     check:
       # A match anywhere in a command, not only at its start: the scripts are
-      # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`)
-      # and inside loops the worker writes, and neither name has a use in a
-      # worker's terminal on an install where the stubs apply.
+      # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`),
+      # quoted, with `--help`, or inside loops the worker writes, and neither
+      # name has a use in a worker's terminal on an install where the stubs
+      # apply.
       type: worker_commands
       forbidden_patterns:
-        [
-          'cluster_agent_profile\.py\s+(name|list|create|delete)\b',
-          'kanban_notify_propagate\.py',
-        ]
+        ['cluster_agent_profile\.py', 'kanban_notify_propagate\.py']
   - name: rca-names-the-oom
     role: objective
     mode: assert

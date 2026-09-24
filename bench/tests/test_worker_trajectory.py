@@ -775,6 +775,22 @@ def test_settle_records_none_when_the_read_did_not_run(no_cluster_exec: list[str
     assert any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
 
 
+def test_gaps_is_none_when_the_read_did_not_run() -> None:
+    assert worker_trajectory.gaps(None) is None
+
+
+def test_gaps_lists_errors_and_the_card_cap() -> None:
+    summary = {"cards": [], "errors": ["no session store for profile cluster-x"], "truncated": True, "calls": 0}
+    assert worker_trajectory.gaps(summary) == [
+        "no session store for profile cluster-x",
+        worker_trajectory.TRUNCATED_GAP,
+    ]
+
+
+def test_gaps_is_empty_for_a_complete_read() -> None:
+    assert worker_trajectory.gaps({"cards": [], "errors": [], "truncated": False, "calls": 3}) == []
+
+
 # ---------------------------------------------------------- tool_called stays
 
 

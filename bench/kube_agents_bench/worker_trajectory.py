@@ -118,6 +118,10 @@ MAX_CARDS = 32
 MAX_CALLS = 2000
 MAX_RESULT_CHARS = 2000
 MAX_ARGS_CHARS = 2000
+# What ``gaps`` reports for a fan-out the pod clipped at ``MAX_CARDS``: the
+# cards past the cap were never read, so a profile that worked only those is
+# absent from the capture without having been absent from the run.
+TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
 
 # Runs inside the agent container under hermes' own interpreter. Plain
 # ``python3`` and ``sqlite3``, plus the redactor loaded from the image: nothing
@@ -560,6 +564,22 @@ class WorkerCapture:
 
     entries: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+
+
+def gaps(summary: dict[str, Any] | None) -> list[str] | None:
+    """What a capture could not read, from its ``summary``.
+
+    ``None`` when the read did not run at all; otherwise every per-card or
+    per-profile problem the pod recorded, plus ``TRUNCATED_GAP`` when it
+    clipped the fan-out. An empty list means the capture is complete, so a
+    profile missing from it did not work the run.
+    """
+    if summary is None:
+        return None
+    problems = [str(e) for e in summary.get("errors") or []]
+    if summary.get("truncated"):
+        problems.append(TRUNCATED_GAP)
+    return problems
 
 
 def _entry(call: dict[str, Any]) -> dict[str, Any]:

@@ -249,6 +249,13 @@
 # record built without anyone watching, on an install nobody prepared for it.
 ./tasks/gitops-drift-out-of-band-triage/task.yaml
 
+# Not yet observed in CI (`validated: false`). Delegation's route rather
+# than its answer: the crashloop-debug prompt and fixture, graded on a
+# Cluster Agent profile doing the delegated work (worker_agents) and on the
+# platform worker not running cluster_agent_profile.py or
+# kanban_notify_propagate.py, which the shell sandbox stubs.
+./tasks/cluster-agent-delegation-profile-lookup/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
@@ -378,10 +385,3 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
-
-# Not yet observed in CI (`validated: false`). Delegation's route rather
-# than its answer: the crashloop-debug prompt and fixture, graded on a
-# Cluster Agent profile doing the delegated work (worker_agents) and on no
-# delegated worker running cluster_agent_profile.py or
-# kanban_notify_propagate.py, which the shell sandbox stubs.
-./tasks/cluster-agent-delegation-profile-lookup/task.yaml
