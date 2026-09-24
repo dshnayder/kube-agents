@@ -9,6 +9,7 @@ Authentication is the caller's Application Default Credentials; the quota projec
 explicitly because the eval-pool projects do not grant serviceusage to a reader.
 
     python3 collect.py --end 2026-09-23 --days 41 --out data/series.jsonl.gz
+    python3 collect.py --end 2026-09-24 --days 41 --target my-project/my-cluster --out other.jsonl.gz
 """
 
 import argparse
@@ -32,6 +33,9 @@ MAX_RETRIES = 5
 RETRY_SLEEP_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 300
 PARALLEL_TARGETS = 12
+# A busy cluster's container queries stall when they span the whole window, so each query is
+# issued in chunks of this many days and the points merged per series.
+CHUNK_DAYS = 7
 # Full-resolution retention for GKE system metrics is six weeks; points older than that are
 # ten-minute downsamples and would leave every other 5-minute slot empty.
 MAX_DAYS_AT_FULL_RESOLUTION = 42
@@ -156,6 +160,21 @@ def list_series(project, cluster, q, start, end):
             return out
 
 
+def list_series_chunked(project, cluster, q, start, end):
+    merged = {}
+    lo = start
+    while lo < end:
+        hi = min(lo + dt.timedelta(days=CHUNK_DAYS), end)
+        for ts in list_series(project, cluster, q, lo, hi):
+            k = json.dumps(key_of(ts, q["group"]), sort_keys=True)
+            if k in merged:
+                merged[k]["points"] += ts["points"]
+            else:
+                merged[k] = ts
+        lo = hi
+    return list(merged.values())
+
+
 def key_of(ts, group):
     labels = {}
     for g in group:
@@ -207,10 +226,10 @@ def collect_target(project, cluster, start, end, n):
     lines, dropped = [], {}
     for cls, q in CLASSES.items():
         try:
-            series = list_series(project, cluster, q, start, end)
+            series = list_series_chunked(project, cluster, q, start, end)
             limits = {}
             if q.get("limit"):
-                for ts in list_series(project, cluster, q["limit"], start, end):
+                for ts in list_series_chunked(project, cluster, q["limit"], start, end):
                     limits[json.dumps(key_of(ts, q["group"]), sort_keys=True)] = \
                         to_grid(ts, start, n)
         except urllib.error.HTTPError as e:
@@ -242,7 +261,10 @@ def main():
     ap.add_argument("--end", required=True, help="UTC date the window ends at (midnight)")
     ap.add_argument("--days", type=int, default=41)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--target", action="append", metavar="PROJECT/CLUSTER",
+                    help="collect this cluster instead of the default targets; repeatable")
     a = ap.parse_args()
+    targets = [tuple(t.split("/", 1)) for t in a.target] if a.target else TARGETS
     if a.days > MAX_DAYS_AT_FULL_RESOLUTION:
         sys.exit(f"--days above {MAX_DAYS_AT_FULL_RESOLUTION} reaches downsampled data")
     end = dt.datetime.strptime(a.end, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
@@ -251,7 +273,7 @@ def main():
     kept, dropped = 0, {}
     with concurrent.futures.ThreadPoolExecutor(PARALLEL_TARGETS) as pool, \
             gzip.open(a.out, "wt") as f:
-        jobs = [pool.submit(collect_target, p, c, start, end, n) for p, c in TARGETS]
+        jobs = [pool.submit(collect_target, p, c, start, end, n) for p, c in targets]
         for job in jobs:
             lines, why = job.result()
             for line in lines:

@@ -15,6 +15,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+from scope import included
+
 LONG_FROM = 28
 NEW_HIGH_MARGIN = 0.1
 # Conformal peak correction: each series' own past peak misses, at this coverage, need at least
@@ -107,6 +109,7 @@ def calibrated_summary(df):
 def main():
     df = pd.read_csv(sys.argv[1], keep_default_na=True, dtype={"limit_hit": object,
                                                                "pred_limit_hit": object})
+    df = df[df.id.map(included)]
     df["limit_hit"] = df.limit_hit.fillna("")
     df["pred_limit_hit"] = df.pred_limit_hit.fillna("")
     lat = pd.read_csv(sys.argv[2])

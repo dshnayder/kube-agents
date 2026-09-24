@@ -25,7 +25,8 @@ import numpy as np
 import pandas as pd
 
 from backtest import BATCH, DAY, FIRST_ORIGIN, HOUR, MAX_MISSING, fill, post
-from pointwise import CLASSES, MIN_SHARE_OF_WEEK_MAX, coarsen
+from pointwise import CLASSES, MIN_SHARE_OF_WEEK_MAX, coarsen, present
+from scope import included
 
 # Window name -> (hours, offset in hours from the start of the forecast). The last one is the
 # 24-hour forecast's final 8 hours: the clock hours an 8-hour forecast made 16 hours later covers.
@@ -91,6 +92,8 @@ def report(a):
             days = int(z["context_days"]) if "context_days" in z.files else 1
             history = "24 hours of history" if days == 1 else f"{days} days of history"
             for k in range(len(z["ids"])):
+                if not included(z["ids"][k]):
+                    continue
                 for case, (hours, offset) in CASES.items():
                     e = extremes(z["truth"][k], z["pred"][k], z["floor"][k], hours, offset)
                     if e is not None:
@@ -104,7 +107,7 @@ def report(a):
 
     def table(pctl, history, cases):
         out = {}
-        for c in CLASSES:
+        for c in present(df):
             g = df[(df.cls == c) & (df.history == history)]
             row = {}
             for case in cases:

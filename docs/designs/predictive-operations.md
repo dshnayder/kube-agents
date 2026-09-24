@@ -705,16 +705,18 @@ own series before year-over-year input exists at all.
 
 ### Results
 
-The first run covered 153 series from 12 clusters over 41 days, 2026-08-13 to 2026-09-23. The
-experiment's README has the tables and caveats. It found five things; the last is the go/no-go
+The first run covered the 11 evaluation hosts over 41 days, 2026-08-13 to 2026-09-23: 93 series
+that live long enough to forecast. The production install was collected too and left out; it
+does little beyond occasional pull-request tests, and its near-idle series flattered every score.
+The experiment's README has the tables and caveats. It found five things; the last is the go/no-go
 reading, written up for a decision in the experiment's
 [RESULTS.md](../../bench/experiments/timesfm-backtest/RESULTS.md).
 
 **The forecaster clears the baseline bar on the day's shape.** Zero-shot TimesFM had a median
-MASE of 0.54–0.58, against 0.90 for seasonal-naive and 0.84 for linear. It beat seasonal-naive
-on 84–86% of (series, origin) pairs, and its quantile loss was about 40% lower. It was strongest
-in the first hour, at 0.18 against 0.65. The 7- and 28-day intervals held their nominal 80%
-coverage. Memory gained most. CPU requests, which move in steps at deploys, gained least.
+MASE of 0.61–0.63, against 0.92 for seasonal-naive and 0.97 for linear. It beat seasonal-naive
+on 78–82% of (series, origin) pairs, and its quantile loss was about 40% lower. It was strongest
+in the first hour, at 0.08 against 0.71. The 7- and 28-day intervals held close to their nominal
+80% coverage. Memory gained most. CPU requests, which move in steps at deploys, gained least.
 
 **Context length is not the lever.** The proposal's 7-day window came within 0.01 MASE of the
 28-day one. The ensemble of windows added nothing over the longest window alone. Seasonality
@@ -724,37 +726,40 @@ series, or a covariate. That makes the collector's archive a prerequisite for ye
 forecasting.
 
 **Per-point quantiles do not bound a peak.** The day's highest q90 covered the real daily
-maximum only 19–26% of the time, against 80% for seasonal-naive. It flagged 3–18% of the days
+maximum only 26–29% of the time, against 81% for seasonal-naive. It flagged 4–21% of the days
 that set a new high. A breach test that compares the q90 path to a threshold is therefore
 overconfident by construction.
 
 [Calibration](#calibration) must include a peak-level correction as well as per-point interval
 scaling. The experiment tried one, a split-conformal raise from each series' own earlier misses.
-It restored 90–96% peak coverage for every arm. Once corrected, TimesFM's peak alerts were only
-modestly better than the baselines': 19% precision at 81% recall for the 28-day arm, against 11%
-at 98% for seasonal-naive.
+It restored 86–95% peak coverage. Once corrected, TimesFM's peak alerts were only modestly
+better than the baselines': 18% precision at 92% recall for the 7-day arm, against 13% at 100%
+for seasonal-naive, on 12 events.
 
 **The breach gate is still open.** No series reached 90% of its limit in the window, so the
 [order of work](#order-of-work)'s phase-2 gate, breach precision at equal recall, has no events
 to score. It needs a longer window, a fleet with real pressure on its limits, or replayed past
 incidents.
 
-**A day ahead, the forecast is within −10%/+5% of the actual value 70% of the time, not 90%.**
-Comparing each forecast hourly value with the value measured in that hour, 70% landed in the band,
-15% were more than 5% too high and 16% more than 10% too low. Only disk usage reached 90%; memory
-reached 78%, node count 75%, CPU 40–65%. TimesFM beat repeating yesterday on every series type (58%
-in band, 25% too high), and accuracy was far higher in the first hours: 88% for memory and 83% for
-node count one to six hours ahead. Re-forecasting 8 hours ahead three times a day raised the overall
-share to 76%; only disk (96%) cleared 90%. Forecasting 8 hours ahead roughly halved the worst hourly
-miss: on a typical day memory stayed within 1% high and 2% low, against 3% and 5% a day ahead.
-Warnings on a forecast threshold crossing were rarely wrong but caught 3 of 299 crossings that were
-new that day; the rest the proactive agent already sees. Day-ahead forecasts of bursty CPU and
-memory are therefore not a reason to build the agent. Trend-driven resources such as disks, and
-horizons of a few hours, remain open.
+**A day ahead, the forecast is within −10%/+5% of the actual value 57% of the time, not 90%.**
+Comparing each forecast hourly value with the value measured in that hour, 57% landed in the band,
+19% were more than 5% too high and 23% more than 10% too low. No series type came near 90%: node
+count reached 71%, memory 68%, CPU 36–52%. TimesFM beat repeating yesterday on every series type
+(45% in band, 32% too high), and accuracy was far higher in the first hours: 80% for memory and
+for node count one to six hours ahead. Forecasting 8 hours ahead roughly halved the typical hourly
+miss: memory stayed within 2% high and 3% low, against 9% either way a day ahead; on a bad day (1
+in 10) it was still up to 20% too high. A lower quantile (q30) halved the costly too-high share
+for at most 5 points of in-band. Warnings on a forecast threshold crossing were rarely wrong but
+caught 3 of 148 crossings that were new that day; the rest the proactive agent already sees.
+Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the agent.
+Trend-driven resources such as disks, and horizons of a few hours, remain open. One busy customer staging
+cluster forecast far better than the evaluation hosts (a bad-day memory overshoot of 4% against
+20%, 8 hours ahead), so steady production load is where the question goes next.
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
 288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of
-a thousand series fits in minutes.
+a thousand series fits in minutes. Horizon length and batch size up to 64 do not change the
+time; only the padded context does.
 
 ## Order of work
 

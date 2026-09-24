@@ -18,6 +18,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+from scope import included
+
 DAY = 288
 # Tolerance band: the forecast may sit up to BAND_OVER above the actual value (the direction
 # that raises false alarms) and up to BAND_UNDER below it (the direction that misses, which the
@@ -64,7 +66,7 @@ def load(directory):
                 continue
             f = z[arm]
             for i in range(len(z["ids"])):
-                if np.isnan(f[i]).all():
+                if np.isnan(f[i]).all() or not included(z["ids"][i]):
                     continue
                 rows.append(dict(id=str(z["ids"][i]), cls=str(z["classes"][i]), origin=origin,
                                  arm=arm, truth=z["truth"][i], week=z["week"][i], fc=f[i]))
@@ -204,6 +206,7 @@ def headline(p, percentile):
 
 def peak_section(path):
     p = pd.read_csv(path)
+    p = p[p.id.map(included)]
     print("## Forecasting tomorrow's peak directly\n")
     print(f"TimesFM reads the series of daily peaks up to the origin and forecasts one step. "
           f"{p.id.nunique()} series, origins {p.origin.min()}..{p.origin.max()}.\n")

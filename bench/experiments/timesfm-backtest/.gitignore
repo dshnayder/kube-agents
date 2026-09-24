@@ -3,6 +3,7 @@ data/
 dump/
 dump-8h/
 dump-window*/
+dump-staging*/
 # bench/.gitignore ignores results/; the summaries are the committed record, the per-row metrics
 # name workloads and stay local.
 !results/
@@ -12,3 +13,5 @@ results/*
 !results/pointwise.md
 !results/horizon.md
 !results/window.md
+!results/window-staging.md
+!results/timing.md

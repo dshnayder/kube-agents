@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 
 from backtest import BATCH, DAY, FIRST_ORIGIN, HOUR, MAX_MISSING, RESIDUAL_DAYS, fill, post
-from pointwise import CLASSES, MIN_SHARE_OF_WEEK_MAX, coarsen, pct, split
+from pointwise import CLASSES, MIN_SHARE_OF_WEEK_MAX, coarsen, pct, present, split
+from scope import included
 
 HORIZON_HOURS = 8
 STEPS = HORIZON_HOURS * HOUR
@@ -95,7 +96,7 @@ def report(a):
         index = {str(i): k for k, i in enumerate(lz["ids"])}
         for k, sid in enumerate(z["ids"].astype(str)):
             j = index.get(sid)
-            if j is None or np.isnan(lz[LONG_ARM][j, :, Q50]).all():
+            if not included(sid) or j is None or np.isnan(lz[LONG_ARM][j, :, Q50]).all():
                 continue
             long24 = lz[LONG_ARM][j, hour * HOUR:hour * HOUR + STEPS, Q50]
             for method, pred in (("8-hour forecast", z["tfm"][k]),
@@ -112,7 +113,7 @@ def report(a):
         for m in methods:
             g = d[d.method == m]
             col = {CLASSES[c]: "{} / {} / {}".format(*map(pct, split(g[g.cls == c].err)))
-                   for c in CLASSES}
+                   for c in present(g)}
             col["all"] = "{} / {} / {}".format(*map(pct, split(g.err)))
             out[m] = col
         return pd.DataFrame(out)

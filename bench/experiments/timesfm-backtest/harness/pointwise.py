@@ -19,6 +19,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+from scope import included
+
 DAY = 288
 HOUR = 12
 BAND_OVER = 0.05
@@ -44,6 +46,11 @@ CLASSES = {
     "container_cpu": "container CPU", "cluster_cpu": "cluster CPU used",
 }
 PERCENT = 100
+
+
+def present(d):
+    """The classes, in CLASSES order, that have at least one row in d."""
+    return [c for c in CLASSES if (d.cls == c).any()]
 
 
 def coarsen(x, step):
@@ -73,6 +80,8 @@ def load(directory):
                 for q, k in QUANTILE_COLUMNS.items():
                     pred = coarsen(fc[:, :, k], step)
                     for i in np.flatnonzero(scored):
+                        if not included(ids[i]):
+                            continue
                         v, p = truth[i], pred[i]
                         real = ~np.isnan(v) & ~np.isnan(p)
                         keep = real & (v > floor[i])
@@ -99,7 +108,8 @@ def pct(x):
 
 def class_table(d):
     rows = []
-    for cls, name in CLASSES.items():
+    for cls in present(d):
+        name = CLASSES[cls]
         g = d[d.cls == cls]
         inside, over, under = split(g.err)
         per_series = g.groupby("id").err.apply(lambda e: split(e)[0])
@@ -126,7 +136,7 @@ def compare_table(parts, step, column, arms):
     for arm, d in frames.items():
         d = d[[k in common for k in zip(d.id, d.origin)]]
         rows[ARMS[arm]] = {f"{CLASSES[c]} ({d[d.cls == c].id.nunique()})":
-                           pct(split(d[d.cls == c].err)[column]) for c in CLASSES}
+                           pct(split(d[d.cls == c].err)[column]) for c in present(d)}
         rows[ARMS[arm]]["all"] = pct(split(d.err)[column])
     return pd.DataFrame(rows), len(common)
 
@@ -136,7 +146,7 @@ def lead_table(d):
     for lo, hi in LEAD_BINS:
         g = d[(d.lead >= lo) & (d.lead < hi)]
         rows[f"{lo}-{hi} h ahead"] = {CLASSES[c]: pct(split(g[g.cls == c].err)[0])
-                                      for c in CLASSES}
+                                      for c in present(g)}
     return pd.DataFrame(rows)
 
 
@@ -145,7 +155,7 @@ def sweep_table(parts, step):
     for q in SWEEP:
         d = frame(parts, HEADLINE_ARM, step, q)
         rows[q] = {CLASSES[c]: "{} / {} / {}".format(*map(pct, split(d[d.cls == c].err)))
-                   for c in CLASSES}
+                   for c in present(d)}
     return pd.DataFrame(rows)
 
 
