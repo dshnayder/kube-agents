@@ -739,16 +739,15 @@ at 98% for seasonal-naive.
 to score. It needs a longer window, a fleet with real pressure on its limits, or replayed past
 incidents.
 
-**Day-ahead threshold warnings add little over the proactive agent.** Against a per-series
-threshold each series crossed on one day in ten, a warning on the median forecast busiest hour
-was right 84% of the time, caught 9% of crossings, and raised a false alarm on 0.2% of
-series-days. Of the 36 it caught, 33 had crossed the day before, which the proactive agent
-already sees. On the 299 crossings that were new that day, it warned on 3. Lowering the warning
-quantile bought recall at repeat-yesterday's precision or worse, and forecasting the daily-peak
-series directly did not help. Forecasts landed within −10% to +5% of the actual 90% of the time
-for disk only; memory reached 76% and CPU 39–61%. Day-ahead warnings on bursty CPU and memory are
-therefore not a reason to build the agent. Trend-driven resources over multi-day horizons, such
-as disks filling or memory leaking, are untested: the corpus had three disks.
+**A day ahead, the forecast is within −10%/+5% of the actual value 70% of the time, not 90%.**
+Comparing each forecast hourly value with the value measured in that hour, 70% landed in the
+band, 15% were more than 5% too high and 16% more than 10% too low. Only disk usage reached 90%;
+memory reached 78%, node count 75%, CPU 40–65%. TimesFM beat repeating yesterday on every series
+type (58% in band, 25% too high), and accuracy was far higher in the first hours: 88% for memory
+and 83% for node count one to six hours ahead. Warnings on a forecast threshold crossing were
+rarely wrong but caught 3 of 299 crossings that were new that day; the rest the proactive agent
+already sees. Day-ahead forecasts of bursty CPU and memory are therefore not a reason to build the
+agent. Trend-driven resources such as disks, and horizons of a few hours, remain open.
 
 The cost spike has its first data point. On one 14-core CPU replica, a batch of 64 series with a
 288-step horizon took 3.6, 7.6 and 29 seconds at 1-, 7- and 28-day context, so a daily sweep of

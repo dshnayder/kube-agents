@@ -7,3 +7,4 @@ dump/
 results/*
 !results/summary.md
 !results/decision.md
+!results/pointwise.md

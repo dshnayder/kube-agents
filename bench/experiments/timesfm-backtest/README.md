@@ -116,6 +116,7 @@ python3 harness/backtest.py --data data/series.jsonl.gz --forecaster http://loca
 python3 harness/peaks.py --data data/series.jsonl.gz --forecaster http://localhost:8080 \
   --out results/r2/peaks.csv.gz
 python3 harness/decide.py dump/ results/r2/peaks.csv.gz > results/decision.md
+python3 harness/pointwise.py dump/ > results/pointwise.md
 ```
 
 The forecaster ([`forecaster/`](forecaster/)) is TimesFM 2.5 200M (Apache-2.0 weights) baked
@@ -126,7 +127,7 @@ into the image, behind `POST /forecast`, with one compiled copy per context buck
 ## Results
 
 [RESULTS.md](RESULTS.md) is the write-up for deciding whether to build the predictive agent:
-threshold warnings, the accuracy band, and the recommendation. This section records the
+point-by-point accuracy against a −10%/+5% band, threshold warnings, and the recommendation. This section records the
 standard forecast-accuracy scores behind it.
 
 Run `r1`, 2026-09-23. The full tables are in [`results/summary.md`](results/summary.md). The
