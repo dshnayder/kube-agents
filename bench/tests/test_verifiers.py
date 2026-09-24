@@ -2194,6 +2194,93 @@ def test_a_pull_url_over_an_issue_number_is_a_fail(token, github):
     assert "is an issue, not a pull request" in res.reason
 
 
+def _closed_from(ref: str = "platform-agent/fix") -> str:
+    return (
+        f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls"
+        f"?state=closed&head=gke-agentic:{ref.replace('/', '%2F')}&per_page=30"
+    )
+
+
+def _closed_six() -> dict:
+    return {"number": 6, "created_at": "2026-08-21T09:00:10Z", "state": "closed",
+            "head": {"sha": "c" * 40}}
+
+
+def _commits_of(number: int = 7) -> str:
+    return f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls/{number}/commits?per_page=100"
+
+
+def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
+    """#1918's case: close a pull request, then propose again under its branch."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "closed pull request had used" in res.reason
+
+
+def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
+    """The same name reached by cloning the spent branch and adding to it: the
+    closed proposal's revision rides along into the new one."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail"
+    assert "added to rather than cleared" in res.reason
+
+
+def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (403, {"message": "Resource not accessible by integration"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
+def test_the_same_change_on_a_fresh_branch_is_a_fail(token, github):
+    """What a worker refused the spent name does: a real pull request, written
+    this run, on a branch nothing closed. Every other clause passes it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not a second proposal on a spent name" in res.reason
+    # Off by default: the remediation cases grade the pull request alone.
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_name_spent_by_an_earlier_run_does_not_count(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (
+        200,
+        [{"number": 3, "created_at": "2026-08-20T09:00:00Z", "state": "closed"}],
+    )
+    assert _pr_check(reuses_spent_branch=True).verify(5.0).status == "fail"
+
+
+def test_an_unlistable_branch_history_is_an_error_not_a_fail(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (403, {"message": "Resource not accessible"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
 def test_a_pull_request_outside_the_eval_org_is_rejected_unasked(token, github):
     _stash_pr_report("Fix proposed: https://github.com/someone-else/infra/pull/7")
     res = _pr_check().verify(5.0)

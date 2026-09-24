@@ -46,6 +46,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -1279,7 +1280,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     branch moves the head commit, rep 2 quoting rep 1's URL does not. One
     surviving candidate is enough — a reply may link the ticket it came from
     beside the fix — and a candidate GitHub cannot answer for ends the check
-    only when no other candidate passes.
+    only when no other candidate passes. With ``reuses_spent_branch`` it also
+    asks that the branch carried a closed pull request created during this
+    run, and that the candidate does not contain that one's head revision.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1291,8 +1294,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     unreadable API is the absence of an observation. 404 on both is either the
     number or a repository this credential cannot see; nothing in the API
     separates them, so both are graded as absence. ``_head_push`` then reads
-    ``/pulls/{n}`` outright, which needs ``pull_requests: read`` --
-    ``hack/ci-eval-pr.sh`` mints it.
+    ``/pulls/{n}`` outright, and the ``reuses_spent_branch`` clause reads
+    ``/pulls`` endpoints whatever the first answer was, so both need
+    ``pull_requests: read`` -- ``hack/ci-eval-pr.sh`` mints it.
     """
 
     type: Literal["pull_request_opened"]
@@ -1305,6 +1309,107 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # clock, which are two different machines. Small on purpose: every second
     # of it is a second of a previous rep's pull request reading as this one's.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    # Also require that the pull request's branch is one a pull request closed
+    # during this run already used -- the second proposal on a spent name. A
+    # worker refused the name can open the same change on a fresh branch and
+    # pass every other clause here, which is exactly the outcome a reuse case
+    # must fail. And it must not contain the closed one's head revision: a
+    # worker that clones the spent branch and adds to it lands on the same
+    # name with the rejected change carried along. Listed from
+    # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
+    # needs `pull_requests: read`.
+    reuses_spent_branch: bool = False
+
+    def _spent_before(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        payload: dict,
+        token: str,
+        budget: float,
+        started: datetime,
+    ) -> tuple[str | None, str | None]:
+        """``(rejection, unevaluable)`` for :attr:`reuses_spent_branch`; both None passes.
+
+        The head ref is not on the issues endpoint's answer, so a candidate
+        resolved there is read again from ``/pulls/{n}``.
+        """
+        slug = f"{owner}/{repo}#{number}"
+        head = payload.get("head") if isinstance(payload.get("head"), dict) else None
+        if head is None:
+            status_code, pulled = _http_get_json(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}", token, budget
+            )
+            if status_code != 200 or not isinstance(pulled, dict):
+                return None, (
+                    f"GitHub answered {status_code} for the pull request {slug}, so "
+                    "its branch could not be read; add `pull_requests: read` if that "
+                    "is 403 — this check could not be evaluated"
+                )
+            head = pulled.get("head") if isinstance(pulled.get("head"), dict) else {}
+        ref = str(head.get("ref") or "")
+        if not ref:
+            return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
+        status_code, listed = _http_get_json(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page=30",
+            token,
+            budget,
+        )
+        if status_code != 200 or not isinstance(listed, list):
+            return None, (
+                f"GitHub answered {status_code} listing the closed pull requests from "
+                f"{ref}; add `pull_requests: read` if that is 403 — this check could "
+                "not be evaluated"
+            )
+        spent = None
+        for earlier in listed:
+            if not isinstance(earlier, dict) or earlier.get("number") == number:
+                continue
+            created = _parse_github_time(earlier.get("created_at"))
+            if created and (started - created).total_seconds() <= self.max_clock_skew_sec:
+                spent = earlier
+                break
+        if spent is not None:
+            # The name alone is not the reuse. A worker that clones the spent
+            # branch and publishes on top of it also lands on the same name,
+            # and its proposal carries the closed one's revisions -- the
+            # rejected change, back under review. A branch cut fresh from the
+            # base carries none of them.
+            carried = str((spent.get("head") or {}).get("sha") or "")
+            if not carried:
+                return None, (
+                    f"GitHub returned no head revision for #{spent.get('number')}, so "
+                    f"whether {slug} builds on it could not be read; this check "
+                    "could not be evaluated"
+                )
+            status_code, commits = _http_get_json(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                "?per_page=100",
+                token,
+                budget,
+            )
+            if status_code != 200 or not isinstance(commits, list):
+                return None, (
+                    f"GitHub answered {status_code} listing the commits of {slug}; add "
+                    "`pull_requests: read` if that is 403 — this check could not be "
+                    "evaluated"
+                )
+            if any(isinstance(c, dict) and c.get("sha") == carried for c in commits):
+                return (
+                    f"{slug}: it builds on {carried[:12]}, the last revision of the "
+                    f"closed pull request #{spent.get('number')}, so the spent branch "
+                    "was added to rather than cleared and the closed change is back "
+                    "under review",
+                    None,
+                )
+            return None, None
+        return (
+            f"{slug}: its branch {ref} carries no pull request that this run opened "
+            "and closed, so this is not a second proposal on a spent name",
+            None,
+        )
 
     def _resolve(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -1593,12 +1698,28 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "wrote to a pull request an earlier one pushed the fix to"
                 )
                 continue
+            if self.reuses_spent_branch:
+                try:
+                    rejection, unevaluable = self._spent_before(
+                        owner, repo, number, payload, token, budget, started
+                    )
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                if rejection:
+                    rejected.append(rejection)
+                    continue
             return done(
                 True,
                 f"{slug} was {'opened' if touched == created else 'updated'} at "
                 f"{touched.isoformat()}, during this run, and carries "
                 f"{changed if changed is not None else 'an unreported number of'} "
-                "changed file(s)",
+                "changed file(s)"
+                + (", on a branch this run's closed pull request had used"
+                   if self.reuses_spent_branch else ""),
                 raw={
                     "pull_request": slug,
                     "created_at": created.isoformat(),

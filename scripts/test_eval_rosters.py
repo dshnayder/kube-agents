@@ -129,6 +129,8 @@ MOVED_TO_NIGHTLY = [
 ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-issue-resolver-triage",
     "vcs-review-feedback-read-back",
+    # #1918: a second proposal under a branch name its first proposal spent.
+    "vcs-spent-branch-reuse",
 ]
 # Registered after the moved block, in file order, by the pull request that
 # authored each case.
