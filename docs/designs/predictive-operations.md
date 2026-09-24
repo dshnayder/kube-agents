@@ -4,7 +4,7 @@
 the [Experiment](#experiment) section reports it. The [Scope](#scope) section names what an install
 already has; everything after it is a direction for kube-agents, not a build plan with dates.
 
-**Authors:** Dmitry Shnayder; Gari Singh — the prediction-plane design merged here.
+**Authors:** Dmitry Shnayder; Gari Singh — his [prediction-plane design](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7) is merged here.
 
 ## How to read this document
 
