@@ -904,8 +904,22 @@ class TestBlockingPdb(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_a_workload_scaled_to_zero_is_never_blocked(self):
-        hits = collect.check_blocking_pdb(self.ctx(pdb("p", max_unavailable=0), replicas=0))
-        self.assertEqual(hits, [])
+        # S5 drops it in `normalize_workloads`, so the budget matches nothing
+        # and is left alone as an orphan would be.
+        ctx = self.ctx(pdb("p", max_unavailable=0), replicas=0)
+        self.assertEqual(ctx["workloads"], [])
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+
+    def test_a_budget_over_a_daemonset_is_never_blocking(self):
+        # Drains delete DaemonSet pods rather than evict them, so the budget
+        # wedges nothing -- and with no `replicas`, `minAvailable: 1` read the
+        # one pod as the whole floor.
+        d = deployment("agent")
+        d["kind"] = "DaemonSet"
+        d["spec"].pop("replicas", None)
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        ctx = context_of(pdbs={"default": [pdb("p", min_available=1)]}, workloads=collect.normalize_workloads(dump_of(d)))
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
 
     def test_an_orphan_pdb_matching_no_workload_is_not_reported(self):
         ctx = context_of(pdbs={"default": [pdb("p", max_unavailable=0, selector={"matchLabels": {"app": "nope"}})]},
@@ -989,10 +1003,12 @@ class TestBlockingPdb(unittest.TestCase):
         self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="7.5%"), replicas=3)), [])
 
     def test_a_percentage_over_a_workload_scaled_to_zero_is_not_reported(self):
-        # floor 0 makes the arithmetic meaningless, and there is nothing to
-        # evict either way. The guard is that it does not report, not that it
-        # divides by zero -- ceil(x * 0 / 100) is 0, which is >= 0.
-        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="100%"), replicas=0)), [])
+        # Nothing to evict. S5 drops the workload before the check runs, so
+        # the percentage never meets a floor of 0 -- where ceil(x * 0 / 100)
+        # would be 0, which is >= 0, and read as blocking.
+        ctx = self.ctx(pdb("p", min_available="100%"), replicas=0)
+        self.assertEqual(ctx["workloads"], [])
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
 
 
     def _two_deployments(self, pdb_entry, replicas=2):
@@ -1679,7 +1695,14 @@ class TestEndpointNodeCollection(unittest.TestCase):
         self.assertEqual(self.nodes_for(addresses=2, nodes=["n1", "n2"], unready=(1,)), ["n1"])
 
     def test_a_terminating_endpoint_is_excluded(self):
-        self.assertEqual(self.nodes_for(addresses=1, terminating=2, nodes=["n1"]), ["n1"])
+        # The terminating endpoints name a node of their own, so only the
+        # terminating guard -- not the missing-nodeName one -- keeps them out.
+        dump = self.dump(addresses=1, terminating=2, nodes=["n1"])
+        for item in dump["items"]:
+            for endpoint in item.get("endpoints") or []:
+                if (endpoint.get("conditions") or {}).get("terminating"):
+                    endpoint["nodeName"] = "n9"
+        self.assertEqual(collect.services_with_endpoints(dump)[0]["endpoint_nodes"], ["n1"])
 
     def test_an_endpoint_with_no_node_name_is_skipped_not_counted_as_a_node(self):
         """Counting it as an unknown node would read as spread."""
@@ -2546,6 +2569,7 @@ class TestScheduleNeverSucceeds(unittest.TestCase):
         self.assertEqual(self.hits(cronjob(ns="a"), job("j1", ns="b", failed=1)), [])
 
     def test_a_job_owned_by_something_else_is_not_joined_to_it(self):
+        self.assertEqual(self.hits(cronjob(), job("j1", owner="another-cj", failed=1)), [])
         self.assertEqual(self.hits(cronjob(), job("j1", owner=None, failed=1)), [])
 
     def test_an_unparseable_timestamp_stays_quiet_rather_than_failing_the_cluster(self):
@@ -2672,6 +2696,30 @@ class TestRolloutDropsTraffic(unittest.TestCase):
 
     def test_a_service_declaring_no_ports_is_never_flagged(self):
         self.assertIsNone(self.check(context=self.svc_ctx()))
+
+    def test_an_exporter_behind_a_sibling_metrics_service_is_not_named(self):
+        # A serving and a metrics Service on one selector: only the serving
+        # Service's targetPort is in the request path, so the exporter's missing
+        # hook drops nothing even though a Service does route to it.
+        wl = self.wl(
+            containers=[
+                {"name": "app", "ports": [{"containerPort": 8080}]},
+                {"name": "exporter", "ports": [{"name": "metrics", "containerPort": 9102}]},
+            ]
+        )
+        context = context_of(
+            services={
+                "default": [
+                    service("s", selector={"app": "api"}, ports=[{"name": "http", "port": 80, "targetPort": 8080}]),
+                    service("m", selector={"app": "api"}, ports=[{"name": "metrics", "port": 9102, "targetPort": 9102}]),
+                ]
+            }
+        )
+        hit = self.check(wl, context)
+        self.assertIn("preStop hook: app\n", hit["excerpt"])
+        self.assertNotIn("exporter", hit["excerpt"].splitlines()[0])
+        readiness = collect.check_probes_readiness(wl, context)
+        self.assertIn("readiness probe: app\n", readiness["excerpt"])
 
     def test_a_hook_on_every_serving_container_silences_it(self):
         self.assertIsNone(
@@ -3363,7 +3411,7 @@ class TestCronjobRunsOverlap(unittest.TestCase):
             self.hits(
                 *self.runs(
                     ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:01:00Z"),
-                    ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:02:00Z"),
+                    ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:12:00Z"),
                     ("2026-09-06T20:20:00Z", "2026-09-06T20:20:00Z", "2026-09-06T20:21:00Z"),
                 )
             ),
@@ -3729,6 +3777,19 @@ class TestServicePortUnresolved(unittest.TestCase):
         dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
         dep["spec"]["template"]["spec"]["containers"][0]["ports"] = [{"containerPort": 8080}]
         self.assertIn("8080", self.hits(self.svc(), endpointslice("api", ports=[]), dep)[0]["excerpt"])
+
+    def test_a_native_sidecars_ports_are_offered_too(self):
+        # An `initContainers` entry with `restartPolicy: Always` serves ports
+        # like a regular container, so its names are valid answers.
+        dep = deployment("api")
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        dep["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "proxy", "restartPolicy": "Always", "ports": [{"name": "proxy", "containerPort": 8643}]},
+            {"name": "migrate", "ports": [{"name": "never", "containerPort": 9}]},
+        ]
+        excerpt = self.hits(self.svc(), endpointslice("api", ports=[]), dep)[0]["excerpt"]
+        self.assertIn("proxy", excerpt)
+        self.assertNotIn("never", excerpt)
 
     def test_no_backend_found_still_produces_a_finding(self):
         excerpt = self.hits(self.svc(), endpointslice("api", ports=[]))[0]["excerpt"]
@@ -4923,6 +4984,29 @@ class TestClusterAdminBinding(unittest.TestCase):
         )
         self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
 
+    def test_two_flagged_subjects_on_one_binding_are_one_candidate_naming_both(self):
+        # One finding id per (check, object): a hit per subject would give
+        # `finish` two candidates with one identity.
+        ctx = context_of(
+            clusterrolebindings=[
+                crb("b", [subject("ServiceAccount", "a", "app"), subject("ServiceAccount", "b", "app")])
+            ]
+        )
+        hits = collect.check_cluster_admin_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("ServiceAccount/app/a", hits[0]["excerpt"])
+        self.assertIn("ServiceAccount/app/b", hits[0]["excerpt"])
+
+    def test_the_worst_subject_on_a_binding_sets_its_severity(self):
+        ctx = context_of(
+            clusterrolebindings=[
+                crb("b", [subject("Group", "platform-admins@acme.com"), subject("ServiceAccount", "a", "app")])
+            ]
+        )
+        hits = collect.check_cluster_admin_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+
 
 class TestWildcardRbac(unittest.TestCase):
     WILDCARD_RULE = [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["*"]}]
@@ -5243,15 +5327,38 @@ class TestAnonymousRbacBinding(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("grants *", hits[0]["excerpt"])
 
-    def test_the_four_baseline_roles_are_never_flagged(self):
+    def test_the_four_baseline_roles_are_never_flagged_for_authenticated_callers(self):
         for role in sorted(collect._BASELINE_AUTHENTICATED_ROLES):
+            with self.subTest(role=role):
+                ctx = context_of(
+                    roles=[cluster_role(role, self.WRITE_RULE)],
+                    clusterrolebindings=[
+                        role_binding("ClusterRole", role, [subject("Group", "system:authenticated")])
+                    ],
+                )
+                self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_public_info_viewer_is_the_one_baseline_role_bound_to_anonymous_callers(self):
+        ctx = context_of(
+            clusterrolebindings=[
+                role_binding("ClusterRole", "system:public-info-viewer", [subject("Group", "system:unauthenticated")])
+            ]
+        )
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_re_enabling_anonymous_discovery_is_flagged(self):
+        # Kubernetes 1.14 removed `system:unauthenticated` from these bindings;
+        # putting it back is a choice someone made.
+        for role in ("system:discovery", "system:basic-user", "system:service-account-issuer-discovery"):
             with self.subTest(role=role):
                 ctx = context_of(
                     clusterrolebindings=[
                         role_binding("ClusterRole", role, [subject("Group", "system:unauthenticated")])
                     ]
                 )
-                self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+                hits = collect.check_anonymous_rbac_binding(ctx)
+                self.assertEqual(len(hits), 1)
+                self.assertIn("presented no credential", hits[0]["impact"])
 
     def test_service_account_groups_belong_to_the_other_check(self):
         for name in ("system:serviceaccounts", "system:serviceaccounts:default"):
@@ -5290,13 +5397,34 @@ class TestAnonymousRbacBinding(unittest.TestCase):
         ctx = context_of(clusterrolebindings=[crb("b", [subject("ServiceAccount", "system:anonymous", "default")])])
         self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
 
-    def test_one_binding_naming_both_universal_subjects_reports_both(self):
+    def test_one_binding_naming_both_universal_subjects_is_one_candidate_naming_both(self):
+        # One finding id per (check, object): two candidates for one binding
+        # would be refused by `finish`, or lose a subject from the excerpt.
         ctx = context_of(
             clusterrolebindings=[
                 crb("b", [subject("User", "system:anonymous"), subject("Group", "system:unauthenticated")])
             ]
         )
-        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 2)
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("User/system:anonymous", hits[0]["excerpt"])
+        self.assertIn("Group/system:unauthenticated", hits[0]["excerpt"])
+
+    def test_an_anonymous_subject_beside_a_writing_authenticated_one_takes_the_anonymous_impact(self):
+        ctx = context_of(
+            roles=[cluster_role("edit", self.WRITE_RULE)],
+            clusterrolebindings=[
+                role_binding(
+                    "ClusterRole", "edit",
+                    [subject("Group", "system:authenticated"), subject("User", "system:anonymous")],
+                )
+            ],
+        )
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("presented no credential", hits[0]["impact"])
+        self.assertIn("Group/system:authenticated", hits[0]["excerpt"])
+        self.assertIn("grants", hits[0]["excerpt"])
 
     def test_the_two_arms_carry_different_impact_sentences(self):
         anon = collect.check_anonymous_rbac_binding(
@@ -5461,6 +5589,28 @@ class TestNetpolMissing(unittest.TestCase):
         ctx = context_of(
             namespaces=[namespace("payments")],
             networkpolicies=[netpol("deny", ns="payments", policy_types=["Ingress"])],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_default_deny_with_no_policy_types_is_never_flagged(self):
+        # `podSelector: {}` alone derives to `policyTypes: [Ingress]` with no
+        # rule admitting anything: the deny-all §2.6's remediation writes.
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("deny", ns="payments")],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_an_empty_ingress_rule_on_an_egress_only_policy_is_not_allow_all(self):
+        # Kubernetes ignores `ingress` on a policy whose declared types omit it.
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[
+                netpol("egress", ns="payments", ingress=[{}], policy_types=["Egress"]),
+                netpol("deny", ns="payments", policy_types=["Ingress"]),
+            ],
             workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
         )
         self.assertEqual(collect.check_netpol_missing(ctx), [])
@@ -5834,6 +5984,13 @@ class TestUnboundSaAutomount(unittest.TestCase):
         self.assertEqual(
             collect.check_unbound_sa_automount(self.ctx(rolebindings=[self.binding("api-sa")])), []
         )
+
+    def test_a_rolebinding_subject_with_no_namespace_takes_the_bindings_own(self):
+        # The API server reads an omitted subject namespace as the RoleBinding's.
+        binding = self.binding("api-sa")
+        binding["metadata"]["namespace"] = "shop"
+        del binding["subjects"][0]["namespace"]
+        self.assertEqual(collect.check_unbound_sa_automount(self.ctx(rolebindings=[binding])), [])
 
     def test_a_vault_injected_workload_is_not_flagged(self):
         # The injector's sidecar logs in to Vault with the mounted token, and
@@ -6263,6 +6420,10 @@ class TestPublicControlPlane(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("dnsEndpointConfig.allowExternalTraffic=true", found[0]["excerpt"])
         self.assertNotIn("enablePublicEndpoint", found[0]["excerpt"])
+        # No IP endpoint means no allowlist to cite: the lead says why the IP
+        # path is absent rather than claiming a control nobody configured.
+        self.assertTrue(found[0]["impact"].startswith("The cluster serves no public IP endpoint"))
+        self.assertNotIn("allowlisted", found[0]["impact"])
 
     def test_both_paths_open_names_both(self):
         found = collect.check_public_control_plane(
@@ -6311,6 +6472,7 @@ class TestPublicControlPlane(unittest.TestCase):
         # The IP-endpoint sentence would send the reader to widen or narrow a
         # list that changes nothing about this path.
         self.assertNotIn("directly exploitable", impact)
+        self.assertTrue(impact.startswith("The IP endpoint is allowlisted, but the cluster also serves a DNS"))
 
     def test_an_open_ip_endpoint_keeps_the_unauthenticated_arm_even_beside_dns(self):
         """DNS being open too does not soften the IP endpoint's own exposure."""
@@ -6805,6 +6967,23 @@ class TestImageFloatingTag(unittest.TestCase):
         self.assertIn(DIGEST_B, hit["excerpt"])
         self.assertIn("running different builds of app", hit["impact"])
 
+    def test_two_revisions_mid_rollout_are_not_drift(self):
+        # Old and new ReplicaSets each running their own digest is a rollout in
+        # progress; only a split inside one revision proves the tag moved.
+        pods = self.running(DIGEST_A, DIGEST_B)
+        pods[0]["labels"] = {"pod-template-hash": "old"}
+        pods[1]["labels"] = {"pod-template-hash": "new"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("2 pod-template revisions live", hit["excerpt"])
+        self.assertNotIn("running different builds", hit["impact"])
+
+    def test_a_split_inside_one_revision_is_still_drift(self):
+        pods = self.running(DIGEST_A, DIGEST_B, DIGEST_A)
+        pods[0]["labels"] = pods[1]["labels"] = {"pod-template-hash": "new"}
+        pods[2]["labels"] = {"pod-template-hash": "old"}
+        self.assertEqual(self.hit("gcr.io/acme/app:latest", pods=pods)["severity"], "major")
+
     def test_a_finished_pod_does_not_contribute_a_digest(self):
         # A Succeeded Job pod's image is not what is running.
         hit = self.hit(
@@ -7099,6 +7278,7 @@ class TestLbWorldOpen(unittest.TestCase):
     def test_one_public_address_beside_a_private_one_is_still_flagged(self):
         hits = self.run_on(lb_service(ingress=("10.150.0.78", "34.10.11.12")))
         self.assertEqual(len(hits), 1)
+        self.assertIn("2 assigned addresses, 1 of them not private", hits[0]["excerpt"])
 
     def test_a_balancer_with_no_address_yet_is_flagged_on_its_spec(self):
         hits = self.run_on(lb_service(ingress=None))
@@ -7269,6 +7449,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             netpol_items=[namespace("payments")],
             ccnp_run=Run(["x"], 0, json.dumps(dump_of(ccnp("fleet-wide"))), "", 0.1),
         )
+        self.assertNotIn("netpol-missing", {c["check"] for c in result["candidates"]})
+
+    def test_a_namespace_holding_only_finished_pods_is_not_flagged_by_netpol_missing(self):
+        # A Succeeded Job pod accepts no traffic, so it is no exposure.
+        pod = compliance_pod("migrate", ns="payments")
+        pod["status"] = {"phase": "Succeeded"}
+        result = self.run_with(workload_items=[pod], netpol_items=[namespace("payments")])
         self.assertNotIn("netpol-missing", {c["check"] for c in result["candidates"]})
 
     def test_ccnp_read_failure_does_not_gate_the_cluster_closed(self):
@@ -7918,6 +8105,32 @@ class TestResolveArgv(unittest.TestCase):
         self.assertEqual(
             self.flags({"command": ["python3", "serve.py"], "args": ["--model", "x"]}),
             ["python3", "serve.py", "--model", "x"],
+        )
+
+    def test_a_c_flag_after_the_script_path_belongs_to_the_script(self):
+        # `python3 serve.py -c cfg.yaml --model x`: the interpreter's options end
+        # at `serve.py`, so `-c` is the script's config flag, not inline code.
+        self.assertEqual(
+            self.flags({"command": ["python3", "serve.py", "-c", "cfg.yaml"], "args": ["--model", "x"]}),
+            ["python3", "serve.py", "-c", "cfg.yaml", "--model", "x"],
+        )
+
+    def test_a_c_flag_after_a_module_belongs_to_the_module(self):
+        self.assertEqual(
+            self.flags({"command": ["python3", "-m", "serve", "-c", "cfg"], "args": ["--model", "x"]}),
+            ["python3", "-m", "serve", "-c", "cfg", "--model", "x"],
+        )
+
+    def test_a_c_flag_after_a_shell_script_path_belongs_to_the_script(self):
+        self.assertEqual(
+            self.flags({"command": ["bash", "entry.sh", "-c", "cfg"], "args": ["--model", "x"]}),
+            ["bash", "entry.sh", "-c", "cfg", "--model", "x"],
+        )
+
+    def test_a_shell_option_value_is_not_read_as_the_script_path(self):
+        self.assertEqual(
+            self.flags({"command": ["bash", "-o", "pipefail", "-c", "vllm --model foo"]}),
+            ["vllm", "--model", "foo"],
         )
 
     def test_a_shell_one_liner_is_read_as_the_command_line_it_is(self):
@@ -8611,7 +8824,7 @@ class TestInferenceEndpointPublic(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertNotIn("136.70.153.197", hits[0]["excerpt"])
         self.assertNotIn("10.0.0.5", hits[0]["excerpt"])
-        self.assertIn("1 assigned address, none of them private", hits[0]["excerpt"])
+        self.assertIn("2 assigned addresses, 1 of them not private", hits[0]["excerpt"])
 
     def test_an_ingress_entry_carrying_both_ip_and_hostname_keeps_the_hostname(self):
         # `ip or hostname` short-circuits and would throw the hostname away.
@@ -8779,11 +8992,12 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         `collect_cluster` declares a target's workload-scoped checks
         inapplicable when nothing survives the filters, because a check with
         nothing to examine has cleared nothing. `_EMPTY_SCOPE_REASON` leaves
-        this stream out on purpose: all six of its checks take an AI workload,
-        so an empty scope would empty `commands`, the validator refuses an
-        empty `checks_run` without a `limitations` note, and that note would
-        pin a fleet of model-free clusters at `partial` forever. §1 of the SOP
-        argues the trade-off and lands here.
+        this stream out on purpose: its filter is the subject definition
+        itself, so with no AI workload on the cluster there is no object any
+        of the six checks could be true of, and "ran and matched nothing" is
+        a verdict about the cluster rather than a gap. The comment above
+        `_EMPTY_SCOPE_REASON` argues it, and says why the older mechanical
+        argument (an empty `commands` forcing a `limitations` note) was wrong.
         """
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
         self.assertEqual(result["outcome"], "collected")
@@ -10147,18 +10361,24 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
         def run(argv, **kwargs):
             if argv[:4] == ["gcloud", "container", "clusters", "list"]:
                 return Run(argv, 0, json.dumps([self.CLUSTER]), "", 0.01)
+            # Compliance gates on the control-plane describe and reads node
+            # pools; obtainability issues neither.
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"privateClusterConfig": {}}), "", 0.01)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.01)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.01)
             return Run(argv, 0, "", "", 0.01)
 
         return run
 
-    def candidates(self, *items):
+    def candidates(self, *items, audit_id="obtainability-audit"):
         with TemporaryDirectory() as tmp:
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
                     patch.object(collect, "SCRATCH_DIR", tmp):
                 manifest = collect.collect_fleet(
-                    "obtainability-audit", "acme",
+                    audit_id, "acme",
                     run=self.fleet_run(*items), workspace=self.clone(tmp),
                 )
         return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
@@ -10191,6 +10411,19 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
                 },
                 candidate["check"],
             )
+
+    def test_a_chart_rendered_workload_carries_its_release_declaration_on_compliance_too(self):
+        # Compliance builds its own workload records and cluster hits; both
+        # used to drop the release, so §3's release branch never fired there.
+        rendered = self.tracked(
+            "rendered",
+            **{"spec.template.spec.containers": [{"name": "app", "securityContext": {"privileged": True}}]},
+        )
+        candidates = self.candidates(rendered, audit_id="compliance-audit")
+        on_the_workload = [c for c in candidates if c["object"] == "Deployment/rendered"]
+        self.assertTrue(on_the_workload)
+        for candidate in on_the_workload:
+            self.assertEqual(candidate["release_declaration"]["path"], "apps/charted.yaml", candidate["check"])
 
     def test_an_unmanaged_workload_carries_neither_annotation(self):
         candidates = self.candidates(deployment("plain"))
@@ -10884,6 +11117,16 @@ class TestSecondReviewFixes(unittest.TestCase):
             collect._role_ref_key(cluster_ref, "team-b"),
             collect._role_ref_key({"kind": "ClusterRole"}, "", name="admin"),
         )
+
+
+class TestDefaultRun(unittest.TestCase):
+    def test_a_timed_out_child_leaves_its_output_as_text(self):
+        # `TimeoutExpired` carries the partial output as bytes whatever `text=`
+        # said, and every reader of `Run` treats it as str.
+        result = collect.default_run([sys.executable, "-c", "import sys, time; print(1, flush=True); print(2, file=sys.stderr, flush=True); time.sleep(5)"], timeout=1)
+        self.assertEqual(result.rc, collect.TIMEOUT_RC)
+        self.assertIsInstance(result.stdout, str)
+        self.assertIsInstance(result.stderr, str)
 
 
 if __name__ == "__main__":

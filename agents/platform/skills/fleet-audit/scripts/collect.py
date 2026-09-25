@@ -315,7 +315,15 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         )
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
+        # notwithstanding, and every consumer of `Run` slices and joins it as str.
+        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
+
+
+def _text(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode(errors="replace")
+    return output or ""
 
 
 # GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -570,7 +578,7 @@ def run_and_gate(
 ) -> tuple[dict | None, Run]:
     """One collection command, behind a fail-closed gate.
 
-    The gate is the ai-security SOP's pattern (`ai_security_audit_sop.md:89`):
+    The gate is the ai-security SOP's pattern (its §2 manual fallback):
     a `kubectl`/`gcloud` that failed leaves empty or truncated output, and
     reading that as "nothing here" is indistinguishable from a genuinely
     empty result unless something checks the output is well-formed *before*
@@ -1204,7 +1212,12 @@ def _container_ports_behind(dump: dict, ns: str, selector: dict) -> tuple[str | 
         if not selector_matches({"matchLabels": selector}, pod_labels):
             continue
         declared = []
-        for container in (template.get("spec") or {}).get("containers") or []:
+        pod_spec = template.get("spec") or {}
+        # Native sidecars serve ports like any other container, so a named
+        # `targetPort` one of them declares is declared -- the same reading
+        # `_effective_containers` gives the audited workloads.
+        sidecars = [ic for ic in pod_spec.get("initContainers") or [] if ic.get("restartPolicy") == "Always"]
+        for container in (pod_spec.get("containers") or []) + sidecars:
             for port in container.get("ports") or []:
                 declared.append(port.get("name") or str(port.get("containerPort", "")))
         return f"{item['kind']}/{meta.get('name', '')}", declared
@@ -1251,7 +1264,7 @@ def _selecting_services(workload: dict, context: dict) -> list[dict]:
     for svc in context["services"].get(workload["ns"], []):
         spec = svc.get("spec") or {}
         selector = spec.get("selector")
-        if spec.get("type") == "ExternalName" or not selector:
+        if spec.get("type") == EXTERNALNAME_SERVICE_TYPE or not selector:
             continue
         if selector_matches({"matchLabels": selector}, workload["pod_labels"]):
             matched.append(svc)
@@ -1669,10 +1682,16 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             # disruption controller counts every pod the PDB selects, so two
             # Deployments of two under one `minAvailable: 2` leave two
             # evictions, not none.
+            # DaemonSets left out, as `check_no_pdb` leaves them: `kubectl
+            # drain --ignore-daemonsets` and the node-pool upgrade path delete
+            # their pods rather than evict them, so no budget over one wedges a
+            # drain -- and with no `replicas`, one pod read as the whole floor.
             matches = [
                 wl
                 for wl in context["workloads"]
-                if wl["ns"] == ns and selector_matches(selector, wl["pod_labels"])
+                if wl["ns"] == ns
+                and wl["kind"] != "DaemonSet"
+                and selector_matches(selector, wl["pod_labels"])
             ]
             matched = matches[0] if matches else None
             replicas = sum(wl["spec"].get("replicas", 1) or 1 for wl in matches) if matches else None
@@ -1739,6 +1758,7 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                     # so a note naming what holds the Deployment would send the
                     # reader to the wrong chart.
                     "reconciler": reconciler_of(meta),
+                    "release": release_of(meta),
                 }
             )
     return hits
@@ -1823,6 +1843,7 @@ def check_pdb_overlapping(context: dict) -> list[dict]:
                 "excerpt": f"pods labelled {workload['pod_labels']} are selected by "
                 f"{len(covering)} PodDisruptionBudgets: {', '.join(names)}{note}",
                 "reconciler": workload.get("reconciler"),
+                "release": workload.get("release"),
             }
         )
     return hits
@@ -1905,6 +1926,7 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                         "excerpt": f"minReplicas == maxReplicas == {min_r}; autoscaling is cosmetic",
                         "severity": "major",
                         "reconciler": reconciler,
+                        "release": release_of(meta),
                     }
                 )
                 continue
@@ -1922,6 +1944,7 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                         "excerpt": f"scaleTargetRef {target.get('kind')}/{target.get('name')} not found",
                         "severity": "minor",
                         "reconciler": reconciler,
+                        "release": release_of(meta),
                     }
                 )
     return hits
@@ -2011,6 +2034,7 @@ def check_hpa_floors_at_one(context: dict) -> list[dict]:
                         f"{_exposure_line(services)}"
                     ),
                     "reconciler": reconciler_of(meta),
+                    "release": release_of(meta),
                 }
             )
     return hits
@@ -2298,6 +2322,20 @@ def _metrics_only_ports(services: list[dict]) -> bool:
     return bool(ports) and all(port.get("name") in _METRICS_PORT_NAMES for port in ports)
 
 
+def _routing_services(services: list[dict]) -> list[dict]:
+    """The selecting Services that carry requests, for picking the containers behind them.
+
+    A serving Service and a metrics Service commonly share one selector, and the
+    union of their target ports names the exporter sidecar as though it were in
+    the request path -- so a probe-less or hook-less exporter was published as
+    dropping production traffic. Each metrics-only Service is set aside here;
+    when every Service is one, they are all kept, because then the scrape port
+    is the only routing there is and the exposure line already says so.
+    """
+    serving = [svc for svc in services if not _metrics_only_ports([svc])]
+    return serving or services
+
+
 def _exposure_scope(services: list[dict]) -> str:
     """Which of the three things "Service-backed" means for this workload.
 
@@ -2345,7 +2383,7 @@ def check_probes_readiness(workload: dict, context: dict) -> dict | None:
         return None
     behind = [
         c
-        for c in _containers_behind_a_service(workload, services)
+        for c in _containers_behind_a_service(workload, _routing_services(services))
         if c.get("name") not in _SELF_HEALTH_SIDECARS and not c.get("readinessProbe")
     ]
     if not behind:
@@ -2635,7 +2673,7 @@ def check_rollout_drops_traffic(workload: dict, context: dict) -> dict | None:
         return None
     missing = [
         c.get("name", "")
-        for c in _containers_behind_a_service(workload, services)
+        for c in _containers_behind_a_service(workload, _routing_services(services))
         if c.get("name") not in _SELF_HEALTH_SIDECARS and not (c.get("lifecycle") or {}).get("preStop")
     ]
     if not missing:
@@ -3070,7 +3108,7 @@ def _rfc3339(stamp: str) -> float | None:
     if not stamp:
         return None
     try:
-        return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        return datetime.datetime.strptime(stamp, TIMESTAMP_FORMAT).replace(
             tzinfo=datetime.timezone.utc
         ).timestamp()
     except (ValueError, TypeError):
@@ -3182,6 +3220,7 @@ def check_schedule_never_succeeds(context: dict) -> list[dict]:
                     f"{_failure_summary(finished)}"
                 ),
                 "reconciler": reconciler_of(cronjob.get("metadata") or {}),
+                "release": release_of(cronjob.get("metadata") or {}),
             }
         )
     return hits
@@ -3305,6 +3344,7 @@ def check_cronjob_runs_overlap(context: dict) -> list[dict]:
                     "so a run is still going when the next one starts"
                 ),
                 "reconciler": reconciler_of(cronjob.get("metadata") or {}),
+                "release": release_of(cronjob.get("metadata") or {}),
             }
         )
     return hits
@@ -3359,6 +3399,7 @@ def check_service_selects_nothing(context: dict) -> list[dict]:
                     "address, so every request to it is refused"
                 ),
                 "reconciler": reconciler_of(service.get("metadata") or {}),
+                "release": release_of(service.get("metadata") or {}),
             }
         )
     return hits
@@ -3425,6 +3466,7 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
                     f"port, because {backend} declares {declared}"
                 ),
                 "reconciler": reconciler_of(service.get("metadata") or {}),
+                "release": release_of(service.get("metadata") or {}),
             }
         )
     return hits
@@ -3568,6 +3610,7 @@ def normalize_compliance_workloads(dump: dict) -> list[dict]:
             "suspended": _is_suspended_cronjob(item),
             "scaled_to_zero": _is_scaled_to_zero(item),
             "reconciler": reconciler_of(meta),
+            "release": release_of(meta),
         })
     return out
 
@@ -3716,21 +3759,31 @@ def check_cluster_admin_binding(context: dict) -> list[dict]:
             continue
         crb_meta = crb.get("metadata") or {}
         name = crb_meta.get("name", "")
-        reconciler = reconciler_of(crb_meta)
+        # One candidate per binding, naming every flagged subject: the finding
+        # id is (check, cluster, namespace, object), so a hit per subject
+        # would hand `finish` two candidates with one identity -- a document
+        # carrying both is refused, and one carrying either loses the other
+        # subject from the excerpt. The worst subject sets the severity: an
+        # org group beside a ServiceAccount does not make the SA's grant minor.
+        targets, all_org_groups = [], True
         for subject in crb.get("subjects") or []:
             flagged, is_org_group = _is_non_system_subject(subject)
             if not flagged:
                 continue
-            target = f"{subject.get('kind')}/{subject.get('namespace', '-')}/{subject.get('name')}"
-            hits.append(
-                {
-                    "namespace": "",
-                    "object": f"ClusterRoleBinding/{name}",
-                    "excerpt": f"{name} -> {target}",
-                    "severity": "minor" if is_org_group else "critical",
-                    "reconciler": reconciler,
-                }
-            )
+            targets.append(f"{subject.get('kind')}/{subject.get('namespace', '-')}/{subject.get('name')}")
+            all_org_groups = all_org_groups and is_org_group
+        if not targets:
+            continue
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"ClusterRoleBinding/{name}",
+                "excerpt": f"{name} -> {', '.join(targets)}",
+                "severity": "minor" if all_org_groups else "critical",
+                "reconciler": reconciler_of(crb_meta),
+                "release": release_of(crb_meta),
+            }
+        )
     return hits
 
 
@@ -3970,6 +4023,7 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
                 # but the remediation narrows the rule, so the reader needs
                 # whatever holds the role.
                 "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
             }
         )
     return hits
@@ -4066,9 +4120,19 @@ def check_anonymous_rbac_binding(context: dict) -> list[dict]:
     treats it as a legitimate posture rather than a defect, and a check that
     called it critical here would be arguing with the same file.
 
-    `_BASELINE_AUTHENTICATED_ROLES` is the four roles Kubernetes itself binds
-    this way on every cluster. They are excluded rather than reported and
-    downgraded, because they are not a choice anyone made.
+    The baseline exclusions differ by arm, because Kubernetes binds different
+    roles to each. `_BASELINE_AUTHENTICATED_ROLES` is the four it binds to
+    `system:authenticated` (or to the ServiceAccount groups) on every cluster;
+    `_BASELINE_ANONYMOUS_ROLES` is the one it binds to
+    `system:unauthenticated`. `system:discovery` and `system:basic-user` lost
+    that subject in Kubernetes 1.14, so binding either to an anonymous subject
+    is how anonymous discovery is re-enabled -- a choice someone made, and one
+    this check reports.
+
+    One candidate per binding, naming every universal subject it matched: the
+    finding id is (check, cluster, namespace, object), and a hit per subject
+    would hand `finish` two candidates with one identity. An anonymous subject
+    sets the impact whenever one is present, since it is the wider grant.
 
     `system:serviceaccounts` is deliberately absent. It is universal in the
     same way, but it names workloads rather than people, the remediation is a
@@ -4077,47 +4141,44 @@ def check_anonymous_rbac_binding(context: dict) -> list[dict]:
     hits = []
     for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or []):
         role_ref = binding.get("roleRef") or {}
-        if role_ref.get("name") in _BASELINE_AUTHENTICATED_ROLES:
-            continue
+        role_name = role_ref.get("name")
         meta = binding.get("metadata") or {}
         namespace = meta.get("namespace", "")
         kind = binding.get("kind") or ""
+        ref = f"{role_ref.get('kind', '')}/{role_ref.get('name', '')}"
+        anonymous, authenticated = [], []
         for subject in binding.get("subjects") or []:
             if subject.get("kind") not in ("User", "Group"):
                 continue
             name = subject.get("name") or ""
-            anonymous = name in _ANONYMOUS_SUBJECTS
-            if not anonymous and name != _AUTHENTICATED_SUBJECT:
-                continue
-            ref = f"{role_ref.get('kind', '')}/{role_ref.get('name', '')}"
-            if anonymous:
-                impact = _IMPACT_ANONYMOUS_RBAC_ANONYMOUS
-                excerpt = f"{kind}/{meta.get('name', '')} -> {ref} for {subject.get('kind')}/{name}"
-            else:
-                rules = _rules_of_role_ref(context, role_ref, namespace)
-                if rules is None:
-                    # The role does not exist, so the binding grants nothing
-                    # and there is no verb list to build the sentence from.
-                    # Reporting it would be a critical on an object that
-                    # currently does what the remediation would make it do.
-                    continue
-                writes = _rules_write(rules)
-                if not writes:
-                    continue
-                impact = _IMPACT_ANONYMOUS_RBAC_AUTHENTICATED
-                excerpt = (
-                    f"{kind}/{meta.get('name', '')} -> {ref} for Group/{name}"
-                    f"; {ref} grants {', '.join(writes)}"
-                )
-            hits.append(
-                {
-                    "namespace": namespace,
-                    "object": f"{kind}/{meta.get('name', '')}",
-                    "excerpt": excerpt,
-                    "impact": impact,
-                    "reconciler": reconciler_of(meta),
-                }
-            )
+            if name in _ANONYMOUS_SUBJECTS and role_name not in _BASELINE_ANONYMOUS_ROLES:
+                anonymous.append(f"{subject.get('kind')}/{name}")
+            elif name == _AUTHENTICATED_SUBJECT and role_name not in _BASELINE_AUTHENTICATED_ROLES:
+                authenticated.append(f"Group/{name}")
+        writes: list[str] = []
+        if authenticated:
+            rules = _rules_of_role_ref(context, role_ref, namespace)
+            # A role absent from the dump grants nothing and has no verb list
+            # to build the sentence from, and a read-only one is a legitimate
+            # posture (§2.16); either way the authenticated subject drops out.
+            writes = _rules_write(rules) if rules is not None else []
+            if not writes:
+                authenticated = []
+        if not anonymous and not authenticated:
+            continue
+        excerpt = f"{kind}/{meta.get('name', '')} -> {ref} for {', '.join(anonymous + authenticated)}"
+        if authenticated:
+            excerpt += f"; {ref} grants {', '.join(writes)}"
+        hits.append(
+            {
+                "namespace": namespace,
+                "object": f"{kind}/{meta.get('name', '')}",
+                "excerpt": excerpt,
+                "impact": _IMPACT_ANONYMOUS_RBAC_ANONYMOUS if anonymous else _IMPACT_ANONYMOUS_RBAC_AUTHENTICATED,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
     return hits
 
 
@@ -4235,14 +4296,16 @@ def check_netpol_missing(context: dict) -> list[dict]:
                 excerpt += f"; {elsewhere} in other namespaces of this cluster"
             hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": excerpt, "severity": "major"})
             continue
+        # An empty ingress rule on a policy that enforces Ingress, and nothing
+        # else. `podSelector: {}` with no `policyTypes` and no rules derives to
+        # `[Ingress]` with nothing admitted -- the deny-all §2.6 remediates
+        # *to* -- so reading an absent `policyTypes` as allow-all flagged the fix.
         allow_all = [
             p
             for p in policies
             if (p.get("spec") or {}).get("podSelector") == {}
-            and (
-                any(rule == {} for rule in (p.get("spec") or {}).get("ingress") or [])
-                or not (p.get("spec") or {}).get("policyTypes")
-            )
+            and _enforces_ingress(p)
+            and any(rule == {} for rule in (p.get("spec") or {}).get("ingress") or [])
         ]
         # Any allow-all, not only an all-allow-all namespace: policies are
         # additive, so one `ingress: [{}]` over every pod admits all traffic
@@ -4409,6 +4472,7 @@ def check_default_sa_automount(context: dict) -> list[dict]:
                 # a namespace fact. The record carries the same field the
                 # workload checks read.
                 "reconciler": wl.get("reconciler"),
+                "release": wl.get("release"),
             }
         )
     return hits
@@ -4438,6 +4502,10 @@ _BASELINE_AUTHENTICATED_ROLES = frozenset({
     "system:public-info-viewer",
     "system:service-account-issuer-discovery",
 })
+# The one role Kubernetes binds to `system:unauthenticated` out of the box.
+# The other three above are bound to authenticated callers or ServiceAccounts
+# only, so an anonymous binding of any of them was written by someone.
+_BASELINE_ANONYMOUS_ROLES = frozenset({"system:public-info-viewer"})
 
 _IMPACT_UNBOUND_SA_AUTOMOUNT = (
     "This workload mounts a live API-server credential into every container, "
@@ -4521,12 +4589,16 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
     universal, granted_namespaces = _sa_groups_granted(context)
     if universal:
         return []
-    bound = {
-        (subject.get("namespace") or "", subject.get("name") or "")
-        for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or [])
-        for subject in binding.get("subjects") or []
-        if subject.get("kind") == "ServiceAccount"
-    }
+    # A RoleBinding may leave a ServiceAccount subject's `namespace` out, and
+    # the API server then reads it as the binding's own. Keyed on "" instead,
+    # that grant matched no workload and the ServiceAccount it binds was
+    # reported as bound to nothing.
+    bound = set()
+    for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or []):
+        binding_ns = (binding.get("metadata") or {}).get("namespace") or ""
+        for subject in binding.get("subjects") or []:
+            if subject.get("kind") == "ServiceAccount":
+                bound.add((subject.get("namespace") or binding_ns, subject.get("name") or ""))
     # Only the SAs that exist. A `serviceAccountName` naming an absent object
     # mounts no token at all -- the pod does not start -- so it is not this
     # check's finding, and reporting it as one would send a pull request to
@@ -4571,6 +4643,7 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
                 # reconciler, or the finding cannot say a hand-applied fix
                 # would be reverted.
                 "reconciler": wl.get("reconciler"),
+                "release": wl.get("release"),
             }
         )
     return hits
@@ -4831,8 +4904,14 @@ _IMPACT_GOOGLE_CLOUD_ACCESS = (
 # the API server, where the IP endpoint puts the server itself on the internet.
 # Still a finding: authorized networks is the control an operator reaches for
 # here and it does not apply, so the sentence has to say what does.
+# The DNS-only arm opens with why the IP endpoint contributed nothing: an
+# allowlist suppressed it, or the cluster serves no public IP endpoint at all.
+# Claiming an allowlist on a cluster that has none tells the operator to look
+# for a control they never configured.
+_DNS_ENDPOINT_IP_ALLOWLISTED = "The IP endpoint is allowlisted, but the cluster also serves"
+_DNS_ENDPOINT_IP_NOT_PUBLIC = "The cluster serves no public IP endpoint, but it does serve"
 _IMPACT_PUBLIC_DNS_ENDPOINT = (
-    "The IP endpoint is allowlisted, but the cluster also serves a DNS "
+    " a DNS "
     "endpoint that resolves and answers from any address on the internet. "
     "Authorized networks do not gate it — IAM does, so reaching the API "
     "server needs a Google identity holding container.clusters.connect, and "
@@ -4873,6 +4952,7 @@ def check_public_control_plane(context: dict) -> list[dict]:
     """
     describe = context.get("cluster_describe") or {}
     paths = _external_control_plane_paths(describe)
+    ip_open = any("dnsEndpointConfig" not in p for p in paths)
     if _has_restrictive_authorized_networks(describe):
         paths = [p for p in paths if "dnsEndpointConfig" in p]
     if not paths:
@@ -4880,7 +4960,8 @@ def check_public_control_plane(context: dict) -> list[dict]:
     dns_only = all("dnsEndpointConfig" in path for path in paths)
     impact = _IMPACT_PUBLIC_IP_ENDPOINT
     if dns_only:
-        impact = _IMPACT_PUBLIC_DNS_ENDPOINT
+        lead = _DNS_ENDPOINT_IP_ALLOWLISTED if ip_open else _DNS_ENDPOINT_IP_NOT_PUBLIC
+        impact = lead + _IMPACT_PUBLIC_DNS_ENDPOINT
     elif _allowlisted_but_for_google_cloud(describe):
         impact = _IMPACT_GOOGLE_CLOUD_ACCESS
     decided = "; ".join(paths)
@@ -4928,8 +5009,8 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
             non_root = None
         run_as_user = c_sc.get("runAsUser", pod_sc.get("runAsUser"))
         seccomp_type = ((c_sc.get("seccompProfile") or {}).get("type") or (pod_sc.get("seccompProfile") or {}).get("type") or "")
-        # Which of the three fired, not just that one did. This check reads
-        # three independent settings and a bare container name throws away the
+        # Which of the five fired, not just that one did. This check reads
+        # five independent settings and a bare container name throws away the
         # only part a reader needs: the fix for `runAsUser=0` is not the fix
         # for a missing seccomp profile. `audit_report.py`'s
         # `adopt_collector_evidence` cites "a full securityContext breakdown
@@ -5083,6 +5164,7 @@ def normalize_ai_workloads(dump: dict) -> list[dict]:
             "lbl": _pod_template_labels_of(item), "suspended": _is_suspended_cronjob(item),
             "scaled_to_zero": _is_scaled_to_zero(item),
             "reconciler": reconciler_of(meta),
+            "release": release_of(meta),
         })
     return out
 
@@ -5100,6 +5182,13 @@ _INLINE_CODE_INTERPRETERS = ("python", "python2", "python3", "node", "nodejs", "
 # `-c`, and the bundles a shell is routinely invoked with: `-ec`, `-lc`, `-exc`.
 _SHELL_INLINE_FLAG_RE = re.compile(r"^-[a-z]*c$")
 _INTERPRETER_INLINE_FLAG_RE = re.compile(r"^-(c|e)$")
+# The interpreter's own options stop at the first operand -- a script path, or
+# the module `-m` names -- and every token after it belongs to that program. A
+# `-c` there is the script's flag, so the scan stops rather than reading the
+# token after it as inline code. The few options that take a separate value
+# are skipped with their value so it is not mistaken for that operand.
+_INLINE_OPTIONS_END = ("--", "-m")
+_INLINE_OPTIONS_WITH_VALUE = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-r", "-I"})
 
 
 def _container_argv(container: dict) -> list[str]:
@@ -5174,7 +5263,16 @@ def _resolve_argv(container: dict) -> _Argv:
     if not shell and program not in _INLINE_CODE_INTERPRETERS:
         return _Argv(argv, argv)
     flag_re = _SHELL_INLINE_FLAG_RE if shell else _INTERPRETER_INLINE_FLAG_RE
+    skip_value = False
     for i, token in enumerate(argv[1:], start=1):
+        if skip_value:
+            skip_value = False
+            continue
+        if token in _INLINE_OPTIONS_END or not token.startswith(("-", "+")):
+            break
+        if token in _INLINE_OPTIONS_WITH_VALUE:
+            skip_value = True
+            continue
         if not flag_re.fullmatch(token) or i + 1 >= len(argv):
             continue
         if not shell:
@@ -5674,9 +5772,7 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         if spec.get("type") != "LoadBalancer":
             continue
         annotations = meta.get("annotations") or {}
-        if annotations.get("networking.gke.io/load-balancer-type") == "Internal":
-            continue
-        if annotations.get("cloud.google.com/load-balancer-type") == "Internal":
+        if any(annotations.get(key) == _INTERNAL_LB_ANNOTATION_VALUE for key in _INTERNAL_LB_ANNOTATIONS):
             continue
         selector = spec.get("selector") or {}
         if not selector:
@@ -5724,6 +5820,7 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
             # something was a Service the Argo CD Application
             # `workloads-adamparco-gitops` reasserts on every sync.
             "reconciler": reconciler_of(meta),
+            "release": release_of(meta),
             # The count, never the address. `ai_security_audit_sop.md`
             # (Red Lines, and again under check 3.5) forbids publishing
             # the address of a reachable model endpoint, and these
@@ -5733,11 +5830,7 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
             # model's excerpt with this string, so an SOP-compliant
             # excerpt would be replaced by whatever is written here.
             "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace"
-            + (
-                f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, none of them private"
-                if public
-                else ""
-            ),
+            + (_address_count_clause(assigned, public) if public else ""),
         }
         # Downgraded rather than dropped, the opposite of the private-address
         # branch above. A private address settles reachability outright; an
@@ -5878,6 +5971,20 @@ def _assigned_public_addresses(svc: dict) -> tuple[list[str], list[str]]:
     return assigned, [addr for addr in assigned if not _is_private_address(addr)]
 
 
+def _address_count_clause(assigned: list[str], public: list[str]) -> str:
+    """How many load-balancer addresses were assigned and how many route, never which.
+
+    Counted over `assigned`, with the routable share stated when it is not all
+    of them: an ingress of one private and one public address is two assigned
+    addresses, and an excerpt that said "1 assigned address" would be
+    contradicted by the first `kubectl get svc` a reader runs.
+    """
+    plural = "es" if len(assigned) > 1 else ""
+    if len(public) == len(assigned):
+        return f"; {len(assigned)} assigned address{plural}, none of them private"
+    return f"; {len(assigned)} assigned address{plural}, {len(public)} of them not private"
+
+
 def check_lb_world_open(context: dict) -> list[dict]:
     """Cluster-scoped: a LoadBalancer Service publishing a management port to the internet.
 
@@ -5974,15 +6081,11 @@ def check_lb_world_open(context: dict) -> list[dict]:
                 "namespace": meta.get("namespace", ""),
                 "object": f"Service/{meta.get('name', '')}",
                 "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
                 "excerpt": (
                     f"type=LoadBalancer, no internal-LB annotation and "
                     f"{ranges_clause}, publishing {named} to 0.0.0.0/0"
-                    + (
-                        f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, "
-                        "none of them private"
-                        if public
-                        else "; no address assigned yet"
-                    )
+                    + (_address_count_clause(assigned, public) if public else "; no address assigned yet")
                 ),
             }
         )
@@ -6163,8 +6266,30 @@ def _running_digests(pod: dict) -> dict[str, str]:
     return out
 
 
-def _workload_running_digests(workload: dict, context: dict) -> dict[str, set[str]]:
-    """`{container name: every digest a live pod of this workload is running}`.
+#: The pod labels a controller stamps with the pod template revision a pod was
+#: created from: a Deployment's ReplicaSet, and a StatefulSet's or DaemonSet's
+#: ControllerRevision.
+_POD_REVISION_LABELS = ("pod-template-hash", "controller-revision-hash")
+
+
+def _pod_revision(pod: dict) -> str:
+    """Which pod-template revision this pod came from, for grouping its digests.
+
+    Pods of two revisions running two digests is a rollout in progress -- the
+    template changed, and possibly the image with it -- not a tag re-resolving
+    under one template. Falls back to the controlling owner's name, which is a
+    ReplicaSet's for a Deployment and so names the revision as well.
+    """
+    labels = pod.get("labels") or {}
+    for label in _POD_REVISION_LABELS:
+        if labels.get(label):
+            return labels[label]
+    owners = pod.get("owners") or []
+    return owners[0].get("name", "") if owners else ""
+
+
+def _workload_running_digests(workload: dict, context: dict) -> dict[str, dict[str, set[str]]]:
+    """`{container name: {revision: every digest its live pods are running}}`.
 
     Joined through the same owner-reference walk `netpol-missing` uses, so a
     Deployment's pods reach it through their ReplicaSet.
@@ -6174,16 +6299,19 @@ def _workload_running_digests(workload: dict, context: dict) -> dict[str, set[st
     is a no-op diff; more than one means the same container is running
     different bytes on different nodes *right now*, which is what an unpinned
     tag does when a rollout or a node replacement re-resolves it partway.
+    Keyed by revision too, because only a split inside one revision proves it;
+    see `_pod_revision`.
     """
     ref = f"{workload['kind']}/{workload['name']}"
-    seen: dict[str, set[str]] = {}
+    seen: dict[str, dict[str, set[str]]] = {}
     for pod in context.get("pods") or []:
         if pod.get("ns") != workload["ns"] or not _is_live_pod(pod):
             continue
         if _pod_workload_ref(pod, context.get("workloads") or []) != ref:
             continue
+        revision = _pod_revision(pod)
         for name, digest in (pod.get("images") or {}).items():
-            seen.setdefault(name, set()).add(digest)
+            seen.setdefault(name, {}).setdefault(revision, set()).add(digest)
     return seen
 
 
@@ -6209,12 +6337,20 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
         if not (FLOATING_TAG_RE.search(image) or not UNTAGGED_IMAGE_RE.search(image)):
             continue
         name = container.get("name", "")
-        digests = sorted(running.get(name) or ())
+        by_revision = running.get(name) or {}
+        digests = sorted(set().union(*by_revision.values())) if by_revision else []
         if len(digests) == 1:
             bad.append(f"{name}: {image} -> currently running {digests[0]}")
-        elif digests:
+        elif any(len(revision_digests) > 1 for revision_digests in by_revision.values()):
             split.append(name)
             bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
+        elif digests:
+            # One digest per revision: a rollout mid-flight, which proves no
+            # drift, so it stays at the unpinned-reference severity.
+            bad.append(
+                f"{name}: {image} -> {len(by_revision)} pod-template revisions live, "
+                f"one digest each: {', '.join(digests)}"
+            )
         else:
             bad.append(f"{name}: {image} (no running pod to read a digest from)")
     if not bad:
@@ -6746,17 +6882,18 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
         kubeconfig, cluster["name"], project=cluster["project"], location=cluster["location"], run=run
     )
     if not gate_ok:
-        raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:300]}")
+        raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     dump = json.loads(dump_path.read_text(encoding="utf-8"))
     workloads = normalize_workloads(dump)
     record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
     return CollectedContext(build_context(dump, workloads), workloads, {spec.slug: record for spec in checks})
 
 
-# check slug -> which named collection(s) it needs, so a gate failure on one
-# collection (e.g. the gcloud describe) does not also invalidate checks that
-# only need another (e.g. the workload dump). Every slug not listed here
-# needs no cross-reference beyond the workload dump.
+# check slug -> which named collection(s) it reads. Only the keys are used:
+# a slug listed here gets its `commands` record from the collection that feeds
+# it, and every slug not listed is attributed to the workload dump. The values
+# document the dependency; they do not isolate failures -- every gate failure
+# raises GateFailure for the whole cluster, whichever collection it hit.
 _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "cluster-admin-binding": ("rbac",),
     "wildcard-rbac": ("rbac",),
@@ -6776,10 +6913,10 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
 # ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
 KCC_CATEGORY = "gcp"
 
-# The four Autopilot CRDs that can lift the admission rules
-# `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` rests on.
 DEFAULT_SERVICE_ACCOUNT = "default"
 
+# The four Autopilot CRDs that can lift the admission rules
+# `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` rests on.
 AUTOPILOT_ALLOWLIST_KINDS = (
     "workloadallowlists.auto.gke.io",
     "allowlistsynchronizers.auto.gke.io",
@@ -6863,15 +7000,17 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
     parsed, result = gated(workload_argv)
     if parsed is None:
-        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
     # Raw, from the same dump: `netpol-missing`'s exposure test asks whether a
     # namespace runs pods, which is not the same question as whether it holds
     # anything this audit is allowed to name.
+    # Live pods only, as the name promises: a namespace holding nothing but a
+    # finished Job pod exposes nothing, which `_is_live_pod` already says.
     context["pod_namespaces"] = {
         (i.get("metadata") or {}).get("namespace", "")
         for i in parsed.get("items", []) or []
-        if i.get("kind") == "Pod"
+        if i.get("kind") == "Pod" and _is_live_pod({"phase": (i.get("status") or {}).get("phase")})
     }
     # The same pods again, with the labels kept. "Does this namespace hold a
     # NetworkPolicy" and "is this pod selected by one" are different questions,
@@ -6901,7 +7040,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     rbac_argv = ["kubectl", "get", "clusterroles,roles,clusterrolebindings,rolebindings", "-A", "-o", "json"]
     parsed, result = gated(rbac_argv)
     if parsed is None:
-        raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
@@ -6913,7 +7052,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]
     parsed, result = gated(netpol_argv)
     if parsed is None:
-        raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
@@ -6926,7 +7065,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     service_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
     parsed, result = gated(service_argv)
     if parsed is None:
-        raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
     commands["lb-world-open"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(service_argv)}", result)
 
@@ -7037,7 +7176,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     sa_argv = ["kubectl", "get", "sa", "-A", "-o", "json"]
     parsed, result = gated(sa_argv)
     if parsed is None:
-        raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
     sa_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
     commands["default-sa-automount"] = sa_record
@@ -7050,7 +7189,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     ]
     parsed, result = gated(describe_argv)
     if parsed is None:
-        raise GateFailure(f"cluster describe gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"cluster describe gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["cluster_describe"] = parsed
     describe_command = shlex.join(describe_argv)
     describe_record = _record(describe_command, result)
@@ -7090,7 +7229,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
         parsed, result = gated(node_pools_argv)
         if parsed is None:
-            raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+            raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
         commands["legacy-metadata"] = _record(shlex.join(node_pools_argv), result)
 
@@ -7138,14 +7277,14 @@ def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpe
     workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
     parsed, result = run_and_gate(workload_argv, kubeconfig, run=run)
     if parsed is None:
-        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     ai_workloads = normalize_ai_workloads(parsed)
     workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
 
     svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
     svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
     if svc_parsed is None:
-        raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:300]}")
+        raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     svc_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(svc_argv)}", svc_result)
 
     context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
@@ -7182,8 +7321,8 @@ _WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({
 
 _EMPTY_SCOPE_REASON: dict[str, str] = {
     "obtainability-audit": (
-        "No workload on this cluster is in scope: every Deployment, StatefulSet, "
-        "DaemonSet and Job the dump returned is in a system namespace, "
+        "No workload on this cluster is in scope: every Deployment, StatefulSet "
+        "and DaemonSet the dump returned is in a system namespace, "
         "addon-managed, owned by another object, opted out, or scaled to zero. "
         "This check examined nothing here, which is not the same as finding nothing."
     ),
@@ -7909,7 +8048,7 @@ def collect_cluster(
             "name": target, "project": project, "location": location,
             "autopilot": autopilot,
             "outcome": OUTCOME_UNREACHABLE,
-            "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}",
+            "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}",
         }
 
     try:
