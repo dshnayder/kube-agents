@@ -256,6 +256,32 @@ This is one cluster, and pointwise scoring was not run on it, so it shows the di
 than a fleet-wide rate: on steady production-like load, over-forecasts are rare enough that
 memory, requested CPU and node-count forecasts could carry a warning.
 
+### Eight hours ahead, TimesFM forecasts the last hour
+
+The staging result above measures error, and a quiet series has low error under any forecast. So
+we compared TimesFM's 8-hour peak with three forecasts that cost nothing: the last hour's value
+repeated, the same hours yesterday, and the same hours last week. A warning is about the peak, so
+each is scored by the highest value it forecast in the window against the highest that came.
+Median, then the worst miss and worst overshoot in 1 window in 10, on the staging cluster:
+
+| Series           | Daily swing | TimesFM          | Last hour repeated | Same hours yesterday |
+| ---------------- | ----------: | ---------------- | ------------------ | -------------------- |
+| container memory |          5% | −1% (−8%, 0%)    | −1% (−7%, 0%)      | 0% (−6%, +6%)        |
+| node count       |         22% | −10% (−17%, +1%) | −9% (−17%, +2%)    | +2% (−17%, +17%)     |
+| CPU requested    |          7% | −3% (−7%, +1%)   | −3% (−7%, +1%)     | 0% (−6%, +7%)        |
+| container CPU    |         30% | −7% (−32%, +1%)  | −6% (−27%, +1%)    | 0% (−18%, +20%)      |
+| cluster CPU used |         27% | −9% (−23%, +2%)  | −9% (−23%, +2%)    | 0% (−21%, +25%)      |
+
+TimesFM's peak is the last hour's value to within a point here, and within four on the evaluation
+hosts. The staging cluster forecasts well because its load moves little in a day (memory 5%,
+requested CPU 7%, against 22% and 54% on the evaluation hosts), not because the model reads it.
+When load rose more than 15% in the window, about 40% of CPU windows, TimesFM forecast a peak
+18–20% below the real one. Yesterday's hours centre on the real peak and miss less, but overshoot by
+17–25% in 1 window in 10 here and by up to 155% on the evaluation hosts, and each overshoot is a
+false alarm. A last-hour forecast is the current value, which the proactive agent already sees;
+where TimesFM matches it, forecasting adds nothing. [`results/baselines.md`](results/baselines.md)
+has both clusters, the last-week baseline and the rising windows.
+
 ### Forecasting takes seconds, not hours
 
 A forecast has to finish well inside the horizon it covers, or the agent falls behind. It does,

@@ -139,6 +139,9 @@ python3 collect.py --target PROJECT/CLUSTER --end 2026-09-24 --days 41 --out dat
 for days in 1 7; do python3 harness/window.py forecast --data data/staging.jsonl.gz \
   --forecaster http://localhost:8080 --context-days $days --every-hours 6 --dump dump-staging$days/; done
 python3 harness/window.py report dump-staging1/ dump-staging7/ > results/window-staging.md
+# TimesFM's 8-hour peak against the last hour, yesterday and last week, from the 7-day dumps
+python3 harness/baselines.py staging=data/staging.jsonl.gz:dump-staging7 \
+  CI=data/series.jsonl.gz:dump-window7 > results/baselines.md
 # forecast time, against an otherwise idle forecaster
 python3 harness/timing.py --data data/series.jsonl.gz --forecaster http://localhost:8080 \
   > results/timing.md
