@@ -1231,10 +1231,11 @@ ledger_reset_token() { # <owner/repo>
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the nine audit cases
-# carries one; two consistency cases share fleet-consistency-drift and two
-# patch cases share security-patch-orchestrator, and the reset is per stream,
-# so each pair retires one ledger). Empty for a case that writes no ledger.
+# ledger_issue_contains checks in task.yaml (each of the ten audit cases
+# carries one; two consistency cases share fleet-consistency-drift, two
+# patch cases share security-patch-orchestrator and two obtainability cases
+# share obtainability-audit, and the reset is per stream, so each pair
+# retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
@@ -2192,6 +2193,7 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
+    obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
     # presubmit before that. The canary measured 1002s median, 2074s p90,
@@ -2273,6 +2275,7 @@ unit_delegation_timeout() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere) echo 3000 ;;
+    obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }

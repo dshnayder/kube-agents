@@ -45,7 +45,7 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The nine ledger-writing cases and the audit id each grades under; a case
+# The ten ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
@@ -54,6 +54,7 @@ AUDIT_IDS = {
     "consistency-no-environment-label": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",
+    "obtainability-planted-orphan-service": "obtainability-audit",
     "stockout-pinned-pool": "stockout-prevention",
     "upgrades-master-behind-offered-elsewhere": "security-patch-orchestrator",
     "upgrade-readiness-lagging-cluster": "security-patch-orchestrator",
