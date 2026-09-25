@@ -1684,8 +1684,10 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             # evictions, not none.
             # DaemonSets left out, as `check_no_pdb` leaves them: `kubectl
             # drain --ignore-daemonsets` and the node-pool upgrade path delete
-            # their pods rather than evict them, so no budget over one wedges a
+            # their pods rather than evict them, so no budget over only those wedges a
             # drain -- and with no `replicas`, one pod read as the whole floor.
+            # That leaves them out of the report, not out of the decision; see
+            # `unscalable` below for a budget that selects both.
             selected = [
                 wl for wl in context["workloads"] if wl["ns"] == ns and selector_matches(selector, wl["pod_labels"])
             ]
