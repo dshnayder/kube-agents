@@ -939,6 +939,26 @@ class TestBlockingPdb(unittest.TestCase):
         hits = collect.check_blocking_pdb(ctx)
         self.assertEqual([h["object"] for h in hits], ["PodDisruptionBudget/p"])
 
+    def test_a_daemonset_beside_a_deployment_leaves_maxunavailable_and_percentages_uncountable(self):
+        # The disruption controller needs a scale subresource on every
+        # selected pod's controller to resolve these spellings; a DaemonSet has
+        # none, so the budget permits no evictions however loose it reads.
+        ds = deployment("agent")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        ds["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        api = deployment("api", **{"spec.replicas": 5})
+        api["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        workloads = collect.normalize_workloads(dump_of(api, ds))
+        for entry in (pdb("p", max_unavailable=1), pdb("p", max_unavailable="50%"), pdb("p", min_available="20%")):
+            with self.subTest(spec=entry["spec"]):
+                hits = collect.check_blocking_pdb(context_of(pdbs={"default": [entry]}, workloads=workloads))
+                self.assertEqual([h["object"] for h in hits], ["PodDisruptionBudget/p"])
+                self.assertIn("DaemonSet agent, which has no scale subresource", hits[0]["excerpt"])
+
+    def test_maxunavailable_one_without_a_daemonset_is_not_blocking(self):
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", max_unavailable=1))), [])
+
     def test_an_orphan_pdb_matching_no_workload_is_not_reported(self):
         ctx = context_of(pdbs={"default": [pdb("p", max_unavailable=0, selector={"matchLabels": {"app": "nope"}})]},
                           workloads=collect.normalize_workloads(dump_of(deployment("api"))))
@@ -7009,6 +7029,19 @@ class TestImageFloatingTag(unittest.TestCase):
         self.assertEqual(hit["severity"], "major")
         self.assertIn("all writing this reference, resolved to 2 digests", hit["excerpt"])
         self.assertIn("running different builds of app", hit["impact"])
+        self.assertIn("a template change made a new revision", hit["impact"])
+        self.assertNotIn("no deploy was made", hit["impact"])
+
+    def test_a_template_reference_no_live_pod_runs_is_not_offered_as_a_pin(self):
+        # `set image` on a paused Deployment or an OnDelete DaemonSet: the
+        # running digest belongs to the old reference, so pinning the new one
+        # to it would revert the change.
+        pods = self.running(DIGEST_A)
+        pods[0]["image_refs"] = {"app": "gcr.io/acme/app:v1"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("no live pod runs this reference yet; they still write gcr.io/acme/app:v1", hit["excerpt"])
+        self.assertNotIn("currently running", hit["excerpt"])
 
     def test_a_split_inside_one_revision_is_still_drift(self):
         pods = self.running(DIGEST_A, DIGEST_B, DIGEST_A)
@@ -8188,6 +8221,20 @@ class TestResolveArgv(unittest.TestCase):
             self.flags({"command": ["bash", "--rcfile", "rc", "-c", "vllm serve --model foo"]}),
             ["vllm", "serve", "--model", "foo"],
         )
+
+    def test_bundled_and_long_interpreter_inline_flags_parse_nothing(self):
+        for command in (
+            ["python3", "-uc", "print(1)"],
+            ["perl", "-le", "print 1"],
+            ["ruby", "-we", "puts 1"],
+            ["node", "--eval", "console.log(1)"],
+            ["node", "-p", "1"],
+            ["nodejs", "--print", "1"],
+            ["python3", "--check-hash-based-pycs", "always", "-c", "print(1)"],
+            ["node", "-r", "dotenv/config", "-e", "console.log(1)"],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.flags({"command": command, "args": ["--model", "meta/x"]}), [])
 
     def test_a_shell_one_liner_is_read_as_the_command_line_it_is(self):
         self.assertEqual(
