@@ -41,9 +41,8 @@ the 2026-08-07 live run (12:58):
 
 Result: the synthesizer's answer sat undelivered for 91.3s until the user
 asked after it — ``gateway.log`` shows zero Slack sends between 12:59:02 and
-13:02:15. The manual remedy,
-``agents/platform/scripts/kanban_notify_propagate.py``, relies on the worker
-remembering to run it; it didn't.
+13:02:15. The manual remedy, a propagate script the worker had to remember
+to run, did not get run; it has since been deleted.
 
 The fix
 -------
@@ -105,8 +104,7 @@ logger = logging.getLogger(__name__)
 
 #: The subscription columns copied parent -> child. ``task_id`` is rewritten,
 #: ``created_at`` re-stamped, ``last_event_id`` seeded at the child's own
-#: head. Matches both the manual propagate script and upstream
-#: ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
+#: head. Matches upstream ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
 #: instead of a silently wrong copy.
 COPY_COLUMNS = ("platform", "chat_id", "thread_id", "user_id", "notifier_profile")
 

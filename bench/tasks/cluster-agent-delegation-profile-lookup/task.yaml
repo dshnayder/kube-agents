@@ -6,14 +6,13 @@
 # sandbox cannot run.
 #
 # What it catches. On a sandboxed install the agent's terminal runs in the
-# shell sandbox, which stubs cluster_agent_profile.py and
-# kanban_notify_propagate.py (deploy/sandbox/Dockerfile): the first needs the
-# agent pod's profile tree and the hermes binary, the second the kanban
-# database. An instruction that tells the
-# Platform Agent to resolve a Cluster Agent's profile with
-# `cluster_agent_profile.py name`/`list`, or to copy a chat subscription with
-# kanban_notify_propagate.py, sends every delegation through a command that
-# prints "does not run in the shell sandbox". The workers then block their
+# shell sandbox, which stubs cluster_agent_profile.py
+# (deploy/sandbox/Dockerfile): it needs the agent pod's profile tree and the
+# hermes binary. An instruction that tells the Platform Agent to resolve a
+# Cluster Agent's profile with `cluster_agent_profile.py name`/`list` sends
+# every delegation through a command that prints "does not run in the shell
+# sandbox". kanban_notify_propagate.py, which copied a chat subscription, is
+# deleted; its pattern stays forbidden to catch a worker that still tries it. The workers then block their
 # cards or fall back to searching the fleet themselves. The answer can still
 # be right, which is why cluster-agent-crashloop-debug (same prompt, same
 # fixture) passes through the regression: its checks read the answer and the

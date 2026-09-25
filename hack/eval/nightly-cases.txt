@@ -259,8 +259,8 @@
 # Not yet observed in CI (`validated: false`). Delegation's route rather
 # than its answer: the crashloop-debug prompt and fixture, graded on a
 # Cluster Agent profile doing the delegated work (worker_agents) and on the
-# platform worker not running cluster_agent_profile.py or
-# kanban_notify_propagate.py, which the shell sandbox stubs.
+# platform worker not running cluster_agent_profile.py, which the shell
+# sandbox stubs, or the deleted kanban_notify_propagate.py.
 ./tasks/cluster-agent-delegation-profile-lookup/task.yaml
 
 # The patch stream's second full audit, nightly from the start (2026-09-23):
