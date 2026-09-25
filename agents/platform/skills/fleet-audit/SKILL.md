@@ -329,15 +329,16 @@ coverage gap. An SOP that mentions neither runs `finish` without them, exactly a
 A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
 and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
-`--manifest-file`. A manifest cluster may also carry `checks_unevaluated`, `{check, reason}` for a
-check whose own read failed: it did not run and is not inapplicable, so it goes in neither
-`checks_run` nor `checks_not_applicable` but in that cluster's `limitations`, which keeps the run
-partial and leaves open every finding that check filed there. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
 says how to read its manifest and what is still yours to write — the upgrade and patch readiness
 stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
 streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
 §3).
+The compliance collector may also give a cluster `checks_unevaluated`, `{check, reason}` for a check
+whose own read failed: it did not run and is not inapplicable, so it goes in neither `checks_run`
+nor `checks_not_applicable` but in that cluster's `limitations`, which keeps the run partial and
+leaves open every finding that check filed there. `finish` rejects the slug anywhere else.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
@@ -466,7 +467,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
           },
           {
             "check": "host-namespace",
-            "reason": "GKE Autopilot: admission rejects hostNetwork, hostPID and hostIPC for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
+            "reason": "GKE Autopilot: admission rejects hostPID/hostIPC/hostNetwork for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
           },
           {
             "check": "hostpath-mount",

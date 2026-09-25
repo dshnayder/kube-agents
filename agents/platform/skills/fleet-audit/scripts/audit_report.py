@@ -2981,6 +2981,36 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             for entry in manifest_cluster.get("checks_not_applicable") or []
             if isinstance(entry, dict)
         }
+        # A check whose own read failed did not run and is not inapplicable,
+        # so it may sit in neither list; it belongs in `limitations`, which
+        # makes the run partial and keeps every finding it filed here open.
+        # Declared not applicable instead, it would leave the denominator and
+        # a clean document would resolve those findings over a read that never
+        # happened.
+        collector_unevaluated = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_unevaluated") or []
+            if isinstance(entry, dict)
+        }
+        misfiled = sorted(collector_unevaluated & (set(claimed) | set(checks_na(cluster))))
+        if misfiled:
+            raise ValidationError(
+                f"scope.clusters: {name!r} reports {', '.join(repr(s) for s in misfiled)} "
+                f"as run or not applicable, but the collector manifest for {audit_id} "
+                f"lists them in checks_unevaluated on {name!r}: the read each check "
+                "depends on failed, so it neither ran nor was found inapplicable. "
+                "Leave them out of checks_run and checks_not_applicable and name "
+                "them in this target's `limitations`."
+            )
+        if collector_unevaluated and not str(cluster.get("limitations", "")).strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} lists "
+                f"{', '.join(repr(s) for s in sorted(collector_unevaluated))} in "
+                f"checks_unevaluated on {name!r}. Name each one and the read that "
+                "failed in `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
         for slug in claimed:
             if slug not in ok_checks:
                 raise ValidationError(

@@ -183,8 +183,8 @@ NAMESPACE_KEY_WIDTH = 3
 # The two ways that question resolves, carried on the record so the SOP can
 # tell them apart: a directory already holding objects applied to the
 # namespace, or the Kustomize root an Application renders into it. A sibling
-# needs no wiring; an overlay's `resources:` list has to name the new file,
-# which `audit_report.wire_kustomize_additions` does at publish time.
+# needs no wiring; an overlay's `resources:` list has to name the new file, and
+# a remediation carries one file, so the SOPs make that fix `kind: manual`.
 NAMESPACE_DIRECTORY_SIBLING = "sibling"
 NAMESPACE_DIRECTORY_OVERLAY = "overlay"
 NAMESPACE_DIRECTORY_CLUSTER = "cluster"
@@ -1615,9 +1615,8 @@ def check_blocking_pdb(context: dict) -> list[dict]:
     rates the first `minor` at most and the second not at all, and this
     conversion covers the `critical` drain-blocking case, not every PDB
     config-rot shape. Multi-match (more than one workload sharing a PDB's
-    selector) reports against the first match; the SOP does not specify a
-    tie-break and this is conservative — under-reporting a real block is
-    unlikely when the norm is one PDB per workload.
+    selector) is measured against every matched workload's pods together,
+    as the disruption controller counts them, and reported against the first.
 
     Where an HPA owns the matched workload's replica count, the comparison is
     against the autoscaler's floor rather than `spec.replicas`. That field is a
@@ -1666,24 +1665,31 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             selector = spec.get("selector")
             if selector is None:
                 continue  # selects no pods in policy/v1, so it blocks nothing
-            matched = next(
-                (
-                    wl
-                    for wl in context["workloads"]
-                    if wl["ns"] == ns and selector_matches(selector, wl["pod_labels"])
-                ),
-                None,
-            )
-            replicas = matched["spec"].get("replicas", 1) or 1 if matched else None
-            hpa = _hpa_targeting(matched, context) if matched is not None else None
-            # The lowest replica count nothing has to happen for the workload to
-            # reach. Without an autoscaler that is the declared count; with one
-            # it is the floor, and the declared count is a reading rather than a
-            # decision.
-            floor = replicas
-            if hpa is not None:
-                declared_floor = (hpa.get("spec") or {}).get("minReplicas")
-                floor = DEFAULT_HPA_MIN_REPLICAS if declared_floor is None else declared_floor
+            # Every workload the selector reaches, not the first: the
+            # disruption controller counts every pod the PDB selects, so two
+            # Deployments of two under one `minAvailable: 2` leave two
+            # evictions, not none.
+            matches = [
+                wl
+                for wl in context["workloads"]
+                if wl["ns"] == ns and selector_matches(selector, wl["pod_labels"])
+            ]
+            matched = matches[0] if matches else None
+            replicas = sum(wl["spec"].get("replicas", 1) or 1 for wl in matches) if matches else None
+            hpa = _hpa_targeting(matched, context) if len(matches) == 1 else None
+            # The lowest replica count nothing has to happen for the workloads
+            # to reach. Without an autoscaler that is the declared count; with
+            # one it is the floor, and the declared count is a reading rather
+            # than a decision.
+            floor = 0
+            for wl in matches:
+                wl_hpa = _hpa_targeting(wl, context)
+                if wl_hpa is None:
+                    floor += wl["spec"].get("replicas", 1) or 1
+                else:
+                    declared_floor = (wl_hpa.get("spec") or {}).get("minReplicas")
+                    floor += DEFAULT_HPA_MIN_REPLICAS if declared_floor is None else declared_floor
+            floor = floor if matches else None
             percent = _percent_value(min_available)
             # What the disruption controller will require to be up, for the
             # percentage spelling only -- the integer spelling is already the
@@ -1703,7 +1709,12 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             if not blocking or matched is None or replicas == 0:
                 continue
             scale = f"replicas={replicas}"
-            if hpa is not None:
+            if len(matches) > 1:
+                scale = (
+                    "with " + ", ".join(wl["kind"] + "/" + wl["name"] for wl in matches[1:]) + "; "
+                    f"{floor} pods selected at the floor"
+                )
+            elif hpa is not None:
                 scale = (
                     f"replicas={replicas} now, but scaled by "
                     f"HorizontalPodAutoscaler/{(hpa.get('metadata') or {}).get('name', '')} "
@@ -1831,6 +1842,20 @@ def check_no_hpa(workload: dict, context: dict) -> dict | None:
     }
 
 
+def _hpa_able_to_scale(hpa: dict) -> bool:
+    """Whether the HPA controller reports it resolved its target.
+
+    `AbleToScale=True` means the controller read the target's scale
+    subresource, so a target missing from the dump is the dump's gap, not the
+    cluster's. An absent condition -- an HPA too new to have one -- does not
+    count as True.
+    """
+    return any(
+        cond.get("type") == "AbleToScale" and cond.get("status") == "True"
+        for cond in (hpa.get("status") or {}).get("conditions") or []
+    )
+
+
 def check_hpa_cannot_scale(context: dict) -> list[dict]:
     """Cluster-scoped: two independent flag conditions on the HPA itself,
     (a) `major` — pinned (`minReplicas == maxReplicas`) and (b) `minor` —
@@ -1884,7 +1909,12 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                 )
                 continue
             target_key = (ns, target.get("kind"), target.get("name"))
-            if target.get("kind") in ("Deployment", "StatefulSet") and target_key not in known:
+            if (
+                target.get("kind") in ("Deployment", "StatefulSet")
+                and target.get("apiVersion") == _WORKLOAD_API_VERSION
+                and target_key not in known
+                and not _hpa_able_to_scale(hpa)
+            ):
                 hits.append(
                     {
                         "namespace": ns,
@@ -3047,6 +3077,23 @@ def _rfc3339(stamp: str) -> float | None:
         return None
 
 
+def _job_finished(job: dict) -> bool:
+    """Succeeded and no longer active, or carrying a terminal `Failed` condition.
+
+    `failed` alone is not finished: between retries a Job reads `failed=1`,
+    `active=0` and no terminal condition, and the controller is about to
+    start another pod. §3.12 says such a Job has not finished.
+    """
+    status = job.get("status") or {}
+    if status.get("active"):
+        return False
+    if status.get("succeeded"):
+        return True
+    return any(
+        c.get("type") == "Failed" and c.get("status") == "True" for c in status.get("conditions") or []
+    )
+
+
 def _failure_summary(finished: list[dict]) -> str:
     """The `Failed` condition's reason on the most recent Job, as a clause.
 
@@ -3103,12 +3150,7 @@ def check_schedule_never_succeeds(context: dict) -> list[dict]:
             # have failed at, and one whose schedule has passed without firing
             # is a scheduler problem this check would misattribute.
             continue
-        finished = [
-            job
-            for job in entry["jobs"]
-            if ((job.get("status") or {}).get("succeeded") or (job.get("status") or {}).get("failed"))
-            and not (job.get("status") or {}).get("active")
-        ]
+        finished = [job for job in entry["jobs"] if _job_finished(job)]
         if not finished or any((job.get("status") or {}).get("succeeded") for job in finished):
             # An active Job counts as neither, deliberately: an hourly schedule
             # almost always has one in flight, and letting it veto the check
@@ -3790,8 +3832,19 @@ def _binding_principal(subject: dict) -> str:
     return name
 
 
+def _role_ref_key(ref: dict, namespace: str, name: str | None = None) -> tuple:
+    """(kind, name, namespace) for a Role, (kind, name, "") for a ClusterRole.
+
+    A RoleBinding's `roleRef` to a Role names one in the binding's own
+    namespace; keyed on name alone, team-b's binding of its own `manager`
+    Role would mark team-a's unbound `manager` as bound.
+    """
+    kind = ref.get("kind")
+    return (kind, ref.get("name") if name is None else name, namespace if kind == "Role" else "")
+
+
 def check_wildcard_rbac(context: dict) -> list[dict]:
-    """The universal suppressions on line 126 of the SOP say "every check in
+    """The universal suppressions in §2 of the SOP say "every check in
     this section", and this is the check that never applied them: it has two
     suppressions of its own -- the `rbac-defaults` label and the `system:` name
     prefix -- and neither covers a GKE add-on.
@@ -3823,7 +3876,7 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
             for subject in binding.get("subjects") or []:
                 flagged, _ = _is_non_system_subject(subject)
                 if flagged:
-                    key = (role_ref.get("kind"), role_ref.get("name"))
+                    key = _role_ref_key(role_ref, (binding.get("metadata") or {}).get("namespace", ""))
                     principal = _binding_principal(subject)
                     if principal not in bound_non_system.setdefault(key, []):
                         bound_non_system[key].append(principal)
@@ -3880,7 +3933,7 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
         ]
         if not wildcard_rules:
             continue
-        key = (role.get("kind"), meta.get("name"))
+        key = _role_ref_key(role, meta.get("namespace", ""), name=meta.get("name"))
         if key not in bound_non_system:
             continue
         ns = meta.get("namespace", "")
@@ -3996,7 +4049,7 @@ def check_anonymous_rbac_binding(context: dict) -> list[dict]:
     the cluster to whoever can reach the endpoint. For
     `system:authenticated` the role decides, and a read-only one is not
     reported at all -- `view` bound to that group is how a great many
-    organisations make a cluster browsable, `_sa_grant_is_universal` already
+    organisations make a cluster browsable, `_sa_groups_granted` already
     treats it as a legitimate posture rather than a defect, and a check that
     called it critical here would be arguing with the same file.
 
@@ -4178,7 +4231,10 @@ def check_netpol_missing(context: dict) -> list[dict]:
                 or not (p.get("spec") or {}).get("policyTypes")
             )
         ]
-        if allow_all and len(allow_all) == len(policies):
+        # Any allow-all, not only an all-allow-all namespace: policies are
+        # additive, so one `ingress: [{}]` over every pod admits all traffic
+        # to every pod whatever the narrower policies beside it say.
+        if allow_all:
             for p in allow_all:
                 hits.append(
                     {
@@ -4207,6 +4263,9 @@ def check_netpol_missing(context: dict) -> list[dict]:
             # would resolve and re-raise this finding on every rollout. The
             # workload names go in the excerpt, where churn costs nothing.
             live = sum(1 for p in context.get("pods") or [] if p.get("ns") == ns and _is_live_pod(p))
+            # Only the policies that police ingress cover anything here; an
+            # Egress-only policy selects pods without restricting who reaches them.
+            enforcing = sum(1 for p in policies if _enforces_ingress(p))
             names = sorted({_pod_workload_ref(p, context.get("workloads") or []) for p in uncovered})
             hits.append(
                 {
@@ -4214,8 +4273,8 @@ def check_netpol_missing(context: dict) -> list[dict]:
                     "object": f"Namespace/{ns}",
                     "excerpt": (
                         f"{len(uncovered)} of {live} pods here are selected by no NetworkPolicy that "
-                        f"enforces Ingress: {', '.join(names)}; {len(policies)} "
-                        f"{'policy' if len(policies) == 1 else 'policies'} in this namespace cover the rest"
+                        f"enforces Ingress: {', '.join(names)}; {enforcing} Ingress "
+                        f"{'policy' if enforcing == 1 else 'policies'} in this namespace cover the rest"
                     ),
                     "severity": "major",
                     "impact": _IMPACT_NETPOL_PARTIAL,
@@ -4350,6 +4409,7 @@ def check_default_sa_automount(context: dict) -> list[dict]:
 # ServiceAccount is really unbound -- and if these four counted, no
 # ServiceAccount on any cluster would ever qualify.
 _UNIVERSAL_SA_GROUPS = frozenset({"system:authenticated", "system:serviceaccounts"})
+_SA_NAMESPACE_GROUP_PREFIX = "system:serviceaccounts:"
 _BASELINE_AUTHENTICATED_ROLES = frozenset({
     "system:basic-user",
     "system:discovery",
@@ -4369,8 +4429,8 @@ _IMPACT_UNBOUND_SA_AUTOMOUNT = (
 )
 
 
-def _sa_grant_is_universal(context: dict) -> bool:
-    """Whether this cluster grants every ServiceAccount something by group.
+def _sa_groups_granted(context: dict) -> tuple[bool, set[str]]:
+    """Which ServiceAccounts this cluster grants something by group.
 
     §2.14's whole claim is "no binding grants this ServiceAccount anything",
     and a binding whose subject is a *group* covering service accounts breaks
@@ -4379,11 +4439,17 @@ def _sa_grant_is_universal(context: dict) -> bool:
     browsable -- and on such a cluster every finding this check could emit
     would be false.
 
+    Returns `(universal, namespaces)`: `universal` when a group in
+    `_UNIVERSAL_SA_GROUPS` is granted anything, which covers every
+    ServiceAccount; `namespaces` for each `system:serviceaccounts:<ns>` group
+    granted anything, which covers only the ServiceAccounts in `<ns>` -- one
+    namespace's grant must not silence the check for the rest of the cluster.
+
     The four roles in `_BASELINE_AUTHENTICATED_ROLES` are excluded because
-    Kubernetes ships them bound this way on every cluster. Anything else
-    grants real access to the whole group, so the check reports nothing here
-    rather than reporting something untrue.
+    Kubernetes ships them bound this way on every cluster.
     """
+    universal = False
+    namespaces: set[str] = set()
     for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or []):
         if (binding.get("roleRef") or {}).get("name") in _BASELINE_AUTHENTICATED_ROLES:
             continue
@@ -4391,9 +4457,11 @@ def _sa_grant_is_universal(context: dict) -> bool:
             if subject.get("kind") != "Group":
                 continue
             name = subject.get("name") or ""
-            if name in _UNIVERSAL_SA_GROUPS or name.startswith("system:serviceaccounts:"):
-                return True
-    return False
+            if name in _UNIVERSAL_SA_GROUPS:
+                universal = True
+            elif name.startswith(_SA_NAMESPACE_GROUP_PREFIX):
+                namespaces.add(name[len(_SA_NAMESPACE_GROUP_PREFIX):])
+    return universal, namespaces
 
 
 def check_unbound_sa_automount(context: dict) -> list[dict]:
@@ -4425,7 +4493,8 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
     across this fix. GKE Workload Identity likewise reaches Google Cloud
     through the metadata server rather than this token.
     """
-    if _sa_grant_is_universal(context):
+    universal, granted_namespaces = _sa_groups_granted(context)
+    if universal:
         return []
     bound = {
         (subject.get("namespace") or "", subject.get("name") or "")
@@ -4454,7 +4523,7 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
             continue
         if sa.get("automountServiceAccountToken") is False:
             continue
-        if key in bound:
+        if key in bound or wl["ns"] in granted_namespaces:
             continue
         hits.append(
             {
@@ -5096,7 +5165,13 @@ def _resolve_argv(container: dict) -> _Argv:
     return _Argv(argv, argv)
 
 
-TRUST_REMOTE_CODE_ARG_RE = re.compile(r"trust[-_]remote[-_]code(?!=(0|false|no))", re.IGNORECASE)
+# The setting and whatever value is written against it: `=false`,
+# `"trust_remote_code": false` inside an `--hf-overrides` JSON, or nothing, when
+# the value (if any) is the next argument. `no-`/`no_` is the explicit opt-out.
+TRUST_REMOTE_CODE_ARG_RE = re.compile(
+    r"(no[-_])?trust[-_]remote[-_]code[\"']?(?:\s*[=:]\s*[\"']?(\w+))?", re.IGNORECASE
+)
+TRUST_REMOTE_CODE_FALSE_VALUES = ("0", "false", "no", "off")
 TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
 
 
@@ -5114,9 +5189,20 @@ TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
 # independent settings the way §2.4's five are -- either one alone is the whole
 # finding, and the first one found is enough to act on.
 def _container_trusts_remote_code(c: dict) -> str | None:
-    for t in _resolve_argv(c).tokens:
-        match = TRUST_REMOTE_CODE_ARG_RE.search(t)
-        if match:
+    tokens = _resolve_argv(c).tokens
+    for i, t in enumerate(tokens):
+        for match in TRUST_REMOTE_CODE_ARG_RE.finditer(t):
+            if match.group(1):
+                continue  # `--no-trust-remote-code` refuses it
+            value = match.group(2)
+            if value is None and match.end() == len(t) and i + 1 < len(tokens):
+                # `--trust-remote-code false`: the value is the next argument.
+                # A flag followed by another flag, or by anything else, is the
+                # bare boolean switch and does enable it.
+                nxt = tokens[i + 1].lower()
+                value = nxt if nxt in TRUST_REMOTE_CODE_FALSE_VALUES else None
+            if value is not None and value.lower() in TRUST_REMOTE_CODE_FALSE_VALUES:
+                continue
             # The match, not the token: an inline `python3 -c` program is one
             # token, and it can carry a `token=` literal beside the setting.
             return f"arg setting {match.group(0)}"
@@ -5184,6 +5270,18 @@ def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
 
 
 AI_URL_RE = re.compile(r"(^|=)(http|ftp)://")
+# The URL itself, cut out of whatever token or value carries it: a token like
+# `--opts=--api-key=K,src=http://m/x` is published only as `http://m/x`.
+AI_URL_EXTRACT_RE = re.compile(r"(?:http|ftp)://[^\s,;'\"]+")
+# §3.4(a) is about a model artifact, not every plaintext URL an AI container
+# holds: `OPENAI_API_BASE=http://vllm:8000/v1` is a service endpoint. A URL
+# counts when the flag or variable carrying it names a model artifact, or when
+# its path ends in a model file.
+AI_MODEL_URL_FLAG_RE = re.compile(
+    r"^--(model|model-id|model-path|model-url|model-name|tokenizer|weights|checkpoint|adapter|lora[\w-]*)(=|$)"
+)
+AI_MODEL_ENV_NAME_RE = re.compile(r"MODEL|WEIGHT|CHECKPOINT|TOKENIZER|ADAPTER|LORA|HF_ENDPOINT|HF_HUB", re.IGNORECASE)
+AI_MODEL_FILE_RE = re.compile(r"\.(safetensors|gguf|bin|pt|pth|onnx|ckpt|h5|tflite|pb|tar|tgz|tar\.gz|zip)$", re.IGNORECASE)
 AI_MODEL_FLAG_RE = re.compile(r"^--model(-id)?(=|$)")
 AI_REVISION_FLAG_RE = re.compile(r"^--revision(=|$)")
 AI_UNPINNABLE_MODEL_PREFIXES = ("/", "./", "../", "gs://", "s3://", "file://")
@@ -5202,13 +5300,39 @@ def _ai_safe_url(value: str) -> str:
     return AI_URL_CREDENTIAL_RE.sub(lambda m: "://" if m.group(0).endswith("@") else "?…", value)
 
 
+def _names_model_file(url: str) -> bool:
+    return bool(AI_MODEL_FILE_RE.search(url.split("?", 1)[0].rstrip("/")))
+
+
+def _model_artifact_urls(tokens: list[str], env: list[dict]) -> list[str]:
+    """Plaintext URLs that name a model artifact (§3.4(a)), as bare URLs.
+
+    Only the URL is returned, never the token around it: the excerpt is
+    published, and the rest of a token or value can be a credential.
+    """
+    found = []
+    for i, token in enumerate(tokens):
+        if not AI_URL_RE.search(token):
+            continue
+        flag = token.split("=", 1)[0] if token.startswith("--") and "=" in token else (tokens[i - 1] if i else "")
+        for url in AI_URL_EXTRACT_RE.findall(token):
+            if AI_MODEL_URL_FLAG_RE.search(flag) or _names_model_file(url):
+                found.append(url)
+    for e in env:
+        value = str(e.get("value", ""))
+        if not AI_URL_RE.search(value):
+            continue
+        named = bool(AI_MODEL_ENV_NAME_RE.search(str(e.get("name", ""))))
+        found.extend(url for url in AI_URL_EXTRACT_RE.findall(value) if named or _names_model_file(url))
+    return found
+
+
 def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict | None:
     bad = []
     escalate = False
     for c in _ai_containers(workload["spec"]):
         argv = _resolve_argv(c)
-        env_vals = [str(e.get("value", "")) for e in (c.get("env") or [])]
-        urls = list(dict.fromkeys(v for v in argv.tokens + env_vals if AI_URL_RE.search(v)))
+        urls = list(dict.fromkeys(_model_artifact_urls(argv.tokens, c.get("env") or [])))
         # The flag arm reads only what a flag parser in this container would see,
         # which is not always the whole argv -- see `_resolve_argv`. The URL arm
         # above stays on every token, because a plaintext fetch is a plaintext
@@ -5566,7 +5690,7 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         hit = {
             "namespace": ns,
             "object": f"Service/{meta.get('name', '')}",
-            # §3.5 is always `manual` -- the correct caller range is a fact
+            # §3.1 is always `manual` -- the correct caller range is a fact
             # about intended usage this audit cannot read -- so the reader is
             # being told to go and edit something, and on 2026-09-06 that
             # something was a Service the Argo CD Application
@@ -5745,7 +5869,7 @@ def check_lb_world_open(context: dict) -> list[dict]:
     set in the values file used for every environment. A datastore moved out of
     `kube-system` into its own namespace with the Service carried across intact.
 
-    Scoped by port, and that is what makes the finding decidable. §3.5's
+    Scoped by port, and that is what makes the finding decidable. §3.1's
     `inference-endpoint-public` flags any world-reachable model endpoint and is
     always `manual`, because the range of callers a model server is supposed to
     serve is a fact about intended usage this audit cannot read. Here there is
@@ -7056,7 +7180,7 @@ _EMPTY_SCOPE_REASON: dict[str, str] = {
 # `"cluster"`-kind, so `commands` keeps an entry and `checks_run` is never
 # empty; the arm below writes `checks_not_applicable`, which is not
 # `limitations`; and `checks_not_applicable` leaves the coverage denominator
-# without producing a gap (`audit_report.checks_unevaluated`), so it could not
+# without producing a gap, so it could not
 # make a run `partial` even if it did fire. Do not re-derive the omission from
 # that chain -- it does not hold, and the argument above does not need it.
 #
@@ -7585,8 +7709,8 @@ def _kustomize_roots(releases: dict[tuple, dict]) -> dict[str, set[str]]:
     directory objects are applied *from*, even though every manifest in it
     parses and `workload_declarations` indexes each one under its own cluster.
     Kustomize builds what the kustomization lists, so a file dropped in renders
-    only once `resources:` names it -- the failure
-    `audit_report.wire_kustomize_additions` exists to catch.
+    only once `resources:` names it, which a one-file remediation cannot also
+    add -- so the SOPs make a fix landing there `kind: manual`.
 
     Keyed by cluster, because that is the destination of the Application the
     root belongs to, and every key `release_declarations` writes leads with it.
@@ -7646,8 +7770,8 @@ def namespace_directories(
       stands, so a file added to it needs no wiring at all.
     - `NAMESPACE_DIRECTORY_OVERLAY` — the local Kustomize root an Argo CD
       Application renders into the namespace. A file added here renders only
-      once the `resources:` list names it, which
-      `audit_report.wire_kustomize_additions` appends at publish time.
+      once the `resources:` list names it, which a one-file remediation cannot
+      also add, so the SOPs make such a fix `kind: manual`.
     - `NAMESPACE_DIRECTORY_CLUSTER` — the one directory in the clone declaring
       objects applied to that *cluster*, whatever their namespace, stored under
       `NAMESPACE_KEY_ANY` for the caller to fall back to. This is the arm with
@@ -7694,8 +7818,12 @@ def namespace_directories(
             parent = str(Path(path).parent)
             directories.setdefault((cluster, namespace), set()).add(parent)
             per_cluster.setdefault(cluster, set()).add(parent)
+    rendered = _kustomize_roots(releases)
     for key, found in directories.items():
-        if len(found) == 1:
+        # A directory inside a Kustomize root is not a sibling: a file added
+        # there renders only once `resources:` names it. Left to the overlay
+        # arm below, or unresolved, rather than answered as needing no wiring.
+        if len(found) == 1 and _plainly_applied(found, rendered.get(key[0]) or set()):
             resolved[key] = {
                 "path": next(iter(found)),
                 "source": NAMESPACE_DIRECTORY_SIBLING,
@@ -7712,7 +7840,6 @@ def namespace_directories(
             "declaration": entry["path"],
         }
     if not _projects_restrict_namespaces(root):
-        rendered = _kustomize_roots(releases)
         for cluster, found in per_cluster.items():
             applied = _plainly_applied(found, rendered.get(cluster) or set())
             if len(applied) != 1:
@@ -8017,6 +8144,26 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
     }
 
 
+def summary_line(manifest: dict) -> str:
+    """The one line the shell shows after stdout went to the manifest file.
+
+    The manifest runs to thousands of lines and the candidates sit below each
+    cluster's `commands`, so a run that reads its head sees commands only. One
+    did exactly that: it copied `commands` into `checks_run`, wrote an empty
+    `findings`, and published a clean audit over a fleet the collector had
+    flagged. The count is the one fact that run was missing.
+    """
+    clusters = manifest.get("clusters") or []
+    collected = [c for c in clusters if c.get("outcome") == OUTCOME_COLLECTED]
+    candidates = sum(len(c.get("candidates") or []) for c in collected)
+    others = len(clusters) - len(collected)
+    return (
+        f"{candidates} candidate(s) on {len(collected)} collected cluster(s), "
+        f"{others} other target(s). Every entry in `clusters[].candidates` is a "
+        "finding for the document: read them, not only `commands`."
+    )
+
+
 def collect_fleet(
     audit_id: str,
     project: str | None = None,
@@ -8168,6 +8315,7 @@ def main(argv: list[str] | None = None) -> int:
         workspace = None
     manifest = collect_fleet(args.audit, args.project, workspace=workspace)
     print(json.dumps(manifest, indent=2))
+    log(summary_line(manifest))
     if manifest.get("error"):
         # The manifest is still written -- the shell has already redirected
         # stdout -- but a run that found nothing to audit is a failed run.

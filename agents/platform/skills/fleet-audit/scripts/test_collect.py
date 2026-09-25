@@ -995,6 +995,25 @@ class TestBlockingPdb(unittest.TestCase):
         self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="100%"), replicas=0)), [])
 
 
+    def _two_deployments(self, pdb_entry, replicas=2):
+        items = []
+        for name in ("a", "b"):
+            d = deployment(name, **{"spec.replicas": replicas})
+            d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+            items.append(d)
+        return context_of(pdbs={"default": [pdb_entry]}, workloads=collect.normalize_workloads(dump_of(*items)))
+
+    def test_a_shared_pdb_is_measured_against_every_workload_it_selects(self):
+        # Two Deployments of two under one minAvailable: 2 leave two evictions.
+        self.assertEqual(collect.check_blocking_pdb(self._two_deployments(pdb("p", min_available=2))), [])
+        self.assertEqual(collect.check_blocking_pdb(self._two_deployments(pdb("p", min_available="60%"))), [])
+
+    def test_a_shared_pdb_that_does_block_names_every_workload(self):
+        hits = collect.check_blocking_pdb(self._two_deployments(pdb("p", min_available=4)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Deployment/b", hits[0]["excerpt"])
+        self.assertIn("4 pods selected", hits[0]["excerpt"])
+
 class TestPdbOverlapping(unittest.TestCase):
     def ctx(self, *pdb_entries, labels=None, ns="default", replicas=3):
         d = deployment("api", ns=ns, **{"spec.replicas": replicas})
@@ -1191,6 +1210,24 @@ class TestHpaCannotScale(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "minor")
         self.assertIn("Deployment/gone not found", hits[0]["excerpt"])
+
+
+class TestHpaDanglingGuards(unittest.TestCase):
+    def test_a_target_in_another_api_group_is_not_dangling(self):
+        # A `Deployment` from some CRD group is not an apps/v1 Deployment the
+        # dump could have carried.
+        ctx = context_of(hpas={"default": [hpa("h", target={"apiVersion": "example.com/v1", "kind": "Deployment", "name": "gone"})]})
+        self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    def test_an_hpa_the_controller_reports_able_to_scale_is_not_dangling(self):
+        h = hpa("h", target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "gone"})
+        h["status"] = {"conditions": [{"type": "AbleToScale", "status": "True"}]}
+        self.assertEqual(collect.check_hpa_cannot_scale(context_of(hpas={"default": [h]})), [])
+
+    def test_an_hpa_the_controller_cannot_resolve_is_dangling(self):
+        h = hpa("h", target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "gone"})
+        h["status"] = {"conditions": [{"type": "AbleToScale", "status": "False", "reason": "FailedGetScale"}]}
+        self.assertEqual(len(collect.check_hpa_cannot_scale(context_of(hpas={"default": [h]}))), 1)
 
 
 class TestHpaFloorsAtOne(unittest.TestCase):
@@ -2312,6 +2349,10 @@ def job(
         status["active"] = 1
     if reason is not None:
         status["conditions"] = [{"type": "Failed", "status": "True", "reason": reason}]
+    elif failed and not succeeded and "active" not in status:
+        # A failed Job is finished only once its terminal condition is set;
+        # the fixture's `failed=` means that one unless `reason=` says why.
+        status["conditions"] = [{"type": "Failed", "status": "True"}]
     # 3.15 measures a run from these two; 3.12 reads neither. Defaulting them
     # to absent keeps every 3.12 fixture above saying exactly what it said.
     if started is not None:
@@ -2395,6 +2436,7 @@ class TestScheduleNeverSucceeds(unittest.TestCase):
         noisy["status"]["conditions"] = [
             {"type": "Failed", "status": "False", "reason": "NotThisOne"},
             {"type": "SuccessCriteriaMet", "status": "True", "reason": "NorThis"},
+            {"type": "Failed", "status": "True"},
         ]
         excerpt = self.hits(cronjob(), noisy)[0]["excerpt"]
         self.assertNotIn("NotThisOne", excerpt)
@@ -3424,6 +3466,7 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         for item in items[1:]:
             item["status"]["failed"] = 1
             item["status"].pop("active", None)  # it has a completionTime
+            item["status"]["conditions"] = [{"type": "Failed", "status": "True"}]
         self.assertEqual(len(self.hits(*items)), 1)
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
@@ -4208,6 +4251,21 @@ class TestCollectFleet(unittest.TestCase):
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(collect.main(["obtainability-audit"]), 1)
         self.assertEqual(json.loads(out.getvalue()), failed)
+
+    def test_main_names_the_candidate_count_on_stderr(self):
+        """stdout is the manifest file; stderr is what the agent's shell shows,
+        and a run that read only the manifest's head never saw a candidate."""
+        manifest = {"clusters": [
+            {"name": "p/l/a", "outcome": "collected", "candidates": [{}, {}]},
+            {"name": "p/l/b", "outcome": "collected", "candidates": [{}]},
+            {"name": "project/q", "outcome": "gate-failed"},
+        ]}
+        with patch.object(collect, "collect_fleet", return_value=manifest), \
+                patch("sys.stdout", new_callable=io.StringIO), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(collect.main(["obtainability-audit"]), 0)
+        self.assertIn("3 candidate(s) on 2 collected cluster(s), 1 other target(s)", err.getvalue())
+        self.assertIn("clusters[].candidates", err.getvalue())
 
 
 class TestDiscovery(unittest.TestCase):
@@ -5150,7 +5208,7 @@ class TestAnonymousRbacBinding(unittest.TestCase):
 
     def test_authenticated_with_a_read_only_role_is_not_flagged(self):
         """`view` bound to `system:authenticated` is how many organisations
-        make a cluster browsable, and `_sa_grant_is_universal` already treats
+        make a cluster browsable, and `_sa_groups_granted` already treats
         it as a posture rather than a defect."""
         ctx = context_of(
             roles=[cluster_role("view", self.READ_RULE)],
@@ -5639,11 +5697,11 @@ class TestNetpolMissing(unittest.TestCase):
         )
         self.assertEqual(collect.check_netpol_missing(ctx), [])
 
-    def test_an_allow_all_alongside_a_real_policy_does_cover_every_pod(self):
+    def test_an_allow_all_alongside_a_real_policy_is_still_the_allow_all_finding(self):
         """The two branches have to compose. `podSelector: {}` selects every
         pod in the namespace, so a namespace holding one is never a coverage
-        gap -- it is the `minor` allow-all finding, and only when that is all
-        it holds."""
+        gap -- and policies are additive, so the narrower policy beside it
+        restricts nothing: it is the `minor` allow-all finding."""
         ctx = context_of(
             namespaces=[namespace("payments")],
             networkpolicies=[
@@ -5653,7 +5711,8 @@ class TestNetpolMissing(unittest.TestCase):
             pods=[netpol_pod("web-1", ns="payments", labels={"app": "web"})],
             pod_namespaces={"payments"},
         )
-        self.assertEqual(collect.check_netpol_missing(ctx), [])
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual([(h["object"], h["severity"]) for h in hits], [("NetworkPolicy/allow-all", "minor")])
 
     def test_a_cluster_network_policy_suppresses_a_partial_gap_too(self):
         """The Do-NOT-flag case does not stop applying because the namespace
@@ -5810,6 +5869,23 @@ class TestUnboundSaAutomount(unittest.TestCase):
         wl["reconciler"] = "argocd:workloads-shop"
         (hit,) = collect.check_unbound_sa_automount(self.ctx(workloads=[wl]))
         self.assertEqual(hit["reconciler"], "argocd:workloads-shop")
+
+    def test_a_namespace_service_account_group_covers_only_that_namespace(self):
+        # `system:serviceaccounts:shop` grants the SAs in `shop` and nobody
+        # else; one team's grant must not silence the check fleet-wide.
+        group = {
+            "kind": "RoleBinding",
+            "metadata": {"name": "shop-sas"},
+            "roleRef": {"kind": "Role", "name": "reader"},
+            "subjects": [{"kind": "Group", "name": "system:serviceaccounts:shop"}],
+        }
+        ctx = self.ctx(
+            serviceaccounts=[self.sa("api-sa"), self.sa("api-sa", ns="billing")],
+            workloads=[self.wl(), self.wl(ns="billing")],
+            rolebindings=[group],
+        )
+        hits = collect.check_unbound_sa_automount(ctx)
+        self.assertEqual([h["namespace"] for h in hits], ["billing"])
 
     def test_a_group_binding_to_every_service_account_suppresses_the_whole_cluster(self):
         # The correctness hole this check has to close. `view` bound to
@@ -10687,6 +10763,58 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertNotIn("no loadBalancerSourceRanges", hits[0]["excerpt"])
         self.assertIn("0.0.0.0/0", hits[0]["excerpt"])
+
+
+class TestSecondReviewFixes(unittest.TestCase):
+    def test_a_job_between_retries_has_not_finished(self):
+        retrying = job("j1", failed=1)
+        retrying["status"].pop("conditions")
+        self.assertFalse(collect._job_finished(retrying))
+        self.assertTrue(collect._job_finished(job("j2", failed=1)))
+        self.assertTrue(collect._job_finished(job("j3", succeeded=1)))
+
+    def test_trust_remote_code_opt_outs_are_not_findings(self):
+        for args in (
+            ["--no-trust-remote-code"],
+            ["--trust-remote-code", "false"],
+            ["--trust_remote_code=False"],
+            ["--hf-overrides", '{"trust_remote_code": false}'],
+        ):
+            self.assertIsNone(collect._container_trusts_remote_code({"name": "c", "args": args}), args)
+        for args in (["--trust-remote-code"], ["--trust-remote-code", "--port", "80"], ["--trust-remote-code=true"]):
+            self.assertIsNotNone(collect._container_trusts_remote_code({"name": "c", "args": args}), args)
+
+    def test_model_urls_are_published_without_the_token_around_them(self):
+        urls = collect._model_artifact_urls(
+            [], [{"name": "DOWNLOAD_OPTS", "value": "--api-key=sk-live-abc123 --src=http://mirror/models/m.safetensors"}]
+        )
+        self.assertEqual(urls, ["http://mirror/models/m.safetensors"])
+
+    def test_a_service_endpoint_url_is_not_a_model_artifact(self):
+        env = [
+            {"name": "OPENAI_API_BASE", "value": "http://vllm.ml.svc:8000/v1"},
+            {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://otel-collector:4317"},
+        ]
+        self.assertEqual(collect._model_artifact_urls(["--port=8000", "http://metrics:9090/push"], env), [])
+
+    def test_a_model_flag_or_variable_makes_a_url_a_model_artifact(self):
+        self.assertEqual(collect._model_artifact_urls(["--model", "http://mirror/llama"], []), ["http://mirror/llama"])
+        self.assertEqual(
+            collect._model_artifact_urls([], [{"name": "MODEL_URL", "value": "http://mirror/llama"}]),
+            ["http://mirror/llama"],
+        )
+
+    def test_a_role_binding_marks_only_its_own_namespaces_role_bound(self):
+        role_ref = {"kind": "Role", "name": "manager"}
+        self.assertNotEqual(
+            collect._role_ref_key(role_ref, "team-b"),
+            collect._role_ref_key({"kind": "Role"}, "team-a", name="manager"),
+        )
+        cluster_ref = {"kind": "ClusterRole", "name": "admin"}
+        self.assertEqual(
+            collect._role_ref_key(cluster_ref, "team-b"),
+            collect._role_ref_key({"kind": "ClusterRole"}, "", name="admin"),
+        )
 
 
 if __name__ == "__main__":

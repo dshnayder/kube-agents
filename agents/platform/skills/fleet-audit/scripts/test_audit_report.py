@@ -12726,6 +12726,26 @@ class TestCrossCheckManifest(unittest.TestCase):
     def test_a_check_the_manifest_verified_passes(self):
         audit_report.cross_check_manifest(self.doc(["no-requests"]), self.manifest())
 
+    def test_an_unevaluated_check_may_not_be_declared_not_applicable(self):
+        manifest = self.manifest(checks_unevaluated=[{"check": "kcc-object-wedged", "reason": "Undetermined: timed out"}])
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
+            {"check": "kcc-object-wedged", "reason": "Config Connector is not installed on this cluster"}
+        ]
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, manifest)
+        self.assertIn("checks_unevaluated", str(ctx.exception))
+
+    def test_an_unevaluated_check_requires_limitations(self):
+        manifest = self.manifest(checks_unevaluated=[{"check": "kcc-object-wedged", "reason": "Undetermined: timed out"}])
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("limitations", str(ctx.exception))
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
+        audit_report.cross_check_manifest(doc, manifest)
+
     def test_a_check_the_manifest_never_ran_is_rejected(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())

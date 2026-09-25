@@ -92,6 +92,12 @@ resource "null_resource" "defect" {
       gcloud container clusters get-credentials "${var.host_cluster_name}" \
         --location "${var.host_cluster_location}" --project "$project" --quiet
 
+      # Destroy deletes the namespace with --wait=false, and the next
+      # repetition can apply seconds later: applying into a namespace still
+      # Terminating is refused, so wait the old one out first.
+      if [ "$(kubectl get namespace "${local.ns}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Terminating" ]; then
+        kubectl wait --for=delete "namespace/${local.ns}" --timeout=180s
+      fi
       kubectl create namespace "${local.ns}" --dry-run=client -o yaml | kubectl apply -f -
       kubectl label namespace "${local.ns}" --overwrite \
         managed-by="${local.ci_labels["managed-by"]}" \
