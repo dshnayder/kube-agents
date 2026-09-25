@@ -615,6 +615,11 @@ class CallSiteTest(unittest.TestCase):
         )
         self.assertEqual(unit.count('"${lock_deadline}"'), 2)
         self.assertLess(unit.index('lock_deadline="$(('), task_lock)
+        # A stack-bearing case writing no ledger has no stream term, yet its
+        # previous rep holds the task lock while queued on lock-infra, so the
+        # task-lock deadline carries that queue itself.
+        stack_term = unit.index('if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then')
+        self.assertIn("lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))", unit[stack_term:task_lock])
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
         # Against the real task files: the two consistency cases share

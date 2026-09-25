@@ -4427,10 +4427,11 @@ _SA_NAMESPACE_GROUP_PREFIX = "system:serviceaccounts:"
 # sidecar logs in to Vault's `kubernetes` auth method with the default mounted
 # token. Vault reviews that token with its own identity, so the ServiceAccount
 # needs no binding in the cluster and §2.14's unbound test says nothing about
-# whether the token is used. The values are the injector's own
-# `strconv.ParseBool` spellings of true, lowercased.
+# whether the token is used. The values are exactly the spellings of true the
+# injector's `strconv.ParseBool` accepts; anything else gets no sidecar there,
+# so it is not skipped here either.
 _VAULT_AGENT_INJECT_ANNOTATION = "vault.hashicorp.com/agent-inject"
-_VAULT_AGENT_INJECT_TRUE = frozenset({"1", "t", "true"})
+_VAULT_AGENT_INJECT_TRUE = frozenset({"1", "t", "T", "true", "True", "TRUE"})
 _BASELINE_AUTHENTICATED_ROLES = frozenset({
     "system:basic-user",
     "system:discovery",
@@ -4550,7 +4551,7 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
         if key in bound or wl["ns"] in granted_namespaces:
             continue
         inject = str((wl.get("pod_annotations") or {}).get(_VAULT_AGENT_INJECT_ANNOTATION, ""))
-        if inject.strip().lower() in _VAULT_AGENT_INJECT_TRUE:
+        if inject in _VAULT_AGENT_INJECT_TRUE:
             continue
         hits.append(
             {
@@ -8099,9 +8100,10 @@ def collect_cluster(
         #
         # `outcome` is already "collected", so the dump succeeded; this is the
         # scope being empty, not the read failing. Cluster-scoped checks are
-        # untouched: an HPA pointing at a workload that no longer exists, a
-        # public control plane, a cluster-admin binding are all still true of
-        # a cluster running nothing.
+        # untouched, bar the ones `_WORKLOAD_ANCHORED_CLUSTER_CHECKS` names
+        # because they walk the workload set: an HPA pointing at a workload
+        # that no longer exists, a public control plane, a cluster-admin
+        # binding are all still true of a cluster running nothing.
         reason = _EMPTY_SCOPE_REASON[audit_id]
         for spec in checks:
             if spec.slug in not_applicable_slugs:

@@ -4,7 +4,7 @@
 
 **Cron:** id `obtainability-audit`, schedule `50 6 * * *` (daily 06:50 UTC). The id is a stable observability identifier and does not change even though the audit is named "Workload Reliability".
 
-**Data sources:** `kubectl` read verbs, `gcloud container ...`, the `gke` MCP server, and the Config Controller MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). **Nothing else** — no BigQuery, no Prometheus/GMP, no VPA recommendations, no Policy Controller, no external blueprint, no delegation to Cluster Agents via kanban. Every conclusion is derived from live cluster reads you performed in this run. The one thing a repository may decide is whether a posture is a finding: §4a reads the GitOps clone and the registered `context_repos` for a declaration that justifies it, and nothing else about a verdict comes from a repository.
+**Data sources:** `kubectl` read verbs, `gcloud container ...`, `gcloud projects list` (the collector's fleet enumeration), the `gke` MCP server, and the Config Controller MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). **Nothing else** — no BigQuery, no Prometheus/GMP, no VPA recommendations, no Policy Controller, no external blueprint, no delegation to Cluster Agents via kanban. Every conclusion is derived from live cluster reads you performed in this run. The one thing a repository may decide is whether a posture is a finding: §4a reads the GitOps clone and the registered `context_repos` for a declaration that justifies it, and nothing else about a verdict comes from a repository.
 
 ---
 

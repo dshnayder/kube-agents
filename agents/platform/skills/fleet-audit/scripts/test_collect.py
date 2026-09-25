@@ -5861,6 +5861,19 @@ class TestUnboundSaAutomount(unittest.TestCase):
         self.assertEqual(collect._pod_annotations_of(cronjob), {"c": "d"})
         pod = {"kind": "Pod", "metadata": {"annotations": {"e": "f"}}, "spec": {}}
         self.assertEqual(collect._pod_annotations_of(pod), {"e": "f"})
+        # And the normalizer the check actually reads carries them through.
+        (wl,) = collect.normalize_compliance_workloads(dump_of(item))
+        self.assertEqual(wl["pod_annotations"], {"a": "b"})
+
+    def test_only_the_injectors_own_spellings_of_true_skip_it(self):
+        # `strconv.ParseBool` neither trims nor folds case beyond these three.
+        for value, skipped in (("True", True), ("TRUE", True), ("1", True),
+                               (" true", False), ("tRuE", False), ("yes", False)):
+            with self.subTest(value=value):
+                wl = self.wl()
+                wl["pod_annotations"] = {"vault.hashicorp.com/agent-inject": value}
+                hits = collect.check_unbound_sa_automount(self.ctx(workloads=[wl]))
+                self.assertEqual(hits == [], skipped)
 
     def test_a_clusterrolebinding_naming_the_sa_suppresses_it(self):
         ctx = self.ctx(clusterrolebindings=[self.binding("api-sa", kind="ClusterRoleBinding")])

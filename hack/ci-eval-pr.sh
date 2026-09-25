@@ -2533,12 +2533,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # deadline is that figure times the cases on the stream, plus the infra
   # queue its stack-bearing cases may hold the stream through
   # (stream_stack_wait); alone on its stream, or writing none, a case keeps
-  # the single-unit figure. The infra
+  # the single-unit figure -- plus, for a stack-bearing case writing none, one
+  # INFRA_LOCK_DEADLINE, because its previous rep holds the task lock while
+  # queued on lock-infra, and no stream term counts that wait. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
   # held only while this unit's own stack is in use.
   local audit_id lock_deadline
   audit_id="$(ledger_audit_id_for_task "${task}")"
   lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"
+  if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
+    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
+  fi
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
