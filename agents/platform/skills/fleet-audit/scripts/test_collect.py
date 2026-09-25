@@ -5835,6 +5835,33 @@ class TestUnboundSaAutomount(unittest.TestCase):
             collect.check_unbound_sa_automount(self.ctx(rolebindings=[self.binding("api-sa")])), []
         )
 
+    def test_a_vault_injected_workload_is_not_flagged(self):
+        # The injector's sidecar logs in to Vault with the mounted token, and
+        # Vault reviews it with its own identity: no binding here, token used.
+        wl = self.wl()
+        wl["pod_annotations"] = {"vault.hashicorp.com/agent-inject": "true"}
+        self.assertEqual(collect.check_unbound_sa_automount(self.ctx(workloads=[wl])), [])
+
+    def test_a_vault_annotation_set_to_false_still_flags_it(self):
+        wl = self.wl()
+        wl["pod_annotations"] = {"vault.hashicorp.com/agent-inject": "false"}
+        self.assertEqual(len(collect.check_unbound_sa_automount(self.ctx(workloads=[wl]))), 1)
+
+    def test_normalization_carries_the_pod_template_annotations(self):
+        item = {
+            "kind": "Deployment", "metadata": {"namespace": "shop", "name": "api"},
+            "spec": {"template": {"metadata": {"annotations": {"a": "b"}}, "spec": {}}},
+        }
+        cronjob = {
+            "kind": "CronJob", "metadata": {"namespace": "shop", "name": "nightly"},
+            "spec": {"jobTemplate": {"spec": {"template": {
+                "metadata": {"annotations": {"c": "d"}}, "spec": {}}}}},
+        }
+        self.assertEqual(collect._pod_annotations_of(item), {"a": "b"})
+        self.assertEqual(collect._pod_annotations_of(cronjob), {"c": "d"})
+        pod = {"kind": "Pod", "metadata": {"annotations": {"e": "f"}}, "spec": {}}
+        self.assertEqual(collect._pod_annotations_of(pod), {"e": "f"})
+
     def test_a_clusterrolebinding_naming_the_sa_suppresses_it(self):
         ctx = self.ctx(clusterrolebindings=[self.binding("api-sa", kind="ClusterRoleBinding")])
         self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
@@ -8965,6 +8992,25 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
         if argv[:2] == ["gcloud", "container"] and argv[2] == "node-pools":
             return Run(argv, 0, "[]", "", 0.1)
         return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+
+    def test_an_empty_compliance_scope_declares_the_automount_checks_inapplicable(self):
+        # Both automount checks loop over the workload set, so with nothing in
+        # scope they examined nothing, exactly as a workload check did.
+        # netpol-missing reads the namespaces holding live Pods instead and
+        # still ran.
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                result = collect.collect_cluster(
+                    {"name": "c1", "location": "us-east4", "project": "p"},
+                    "compliance-audit",
+                    collect.COMPLIANCE_CHECKS,
+                    run=self._run,
+                )
+        na = {e["check"] for e in result.get("checks_not_applicable") or []}
+        self.assertLessEqual({"default-sa-automount", "unbound-sa-automount"}, na)
+        self.assertNotIn("netpol-missing", na)
+        self.assertIn("netpol-missing", {c["check"] for c in result["commands"]})
+        self.assertFalse(na & {c["check"] for c in result["commands"]})
 
 
 

@@ -610,7 +610,7 @@ class CallSiteTest(unittest.TestCase):
         # its turn on the stream before its own run, so a same-task successor
         # has to outlast the sibling case's unit as well as the predecessor's.
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"',
+            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
             unit,
         )
         self.assertEqual(unit.count('"${lock_deadline}"'), 2)
@@ -639,6 +639,34 @@ class CallSiteTest(unittest.TestCase):
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):
+        # The orphan-service case carries a stack and shares
+        # obtainability-audit with the stackless PDB case, which then waits on
+        # the stream through the orphan-service unit's infra queue as well as
+        # its run. A stream with no stack-bearing case adds nothing.
+        tasks = (
+            "./tasks/obtainability-planted-pdb/task.yaml",
+            "./tasks/obtainability-planted-orphan-service/task.yaml",
+            "./tasks/reliability-pdb-probe/task.yaml",
+        )
+        body = "\n".join(
+            [
+                f'BENCH_DIR="{REPO_ROOT / "bench"}"',
+                f"TASKS=({' '.join(tasks)})",
+                'TASK_HAS_STACK=("" "true" "true")',
+                "INFRA_LOCK_DEADLINE=5400",
+                lifted("ledger_audit_id_for_task"),
+                lifted("stream_stack_wait"),
+                'echo "obtainability=$(stream_stack_wait obtainability-audit)"',
+                'echo "compliance=$(stream_stack_wait compliance-audit)"',
+                'echo "none=$(stream_stack_wait "")"',
+            ]
+        )
+        result = run_bash(body)
+        got = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(got, {"obtainability": "5400", "compliance": "0", "none": "0"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):

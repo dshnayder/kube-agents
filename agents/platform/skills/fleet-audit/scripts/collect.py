@@ -516,7 +516,7 @@ DUMP_COMMAND_KINDS = (
     "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges"
     # `cronjobs,jobs` serve 3.12 alone. They are safe to add to the shared dump
     # because `normalize_workloads` filters on `WORKLOAD_KINDS`, so neither kind
-    # reaches the workload set the other ten checks read -- and this dump has
+    # reaches the workload set the other checks read -- and this dump has
     # exactly one caller, `_collect_obtainability`, so no other stream pays for
     # them either.
     ",cronjobs,jobs"
@@ -3065,7 +3065,7 @@ def _rfc3339(stamp: str) -> float | None:
     `None` rather than an exception because every caller here is deciding
     whether to *report* something: a timestamp the API served in a shape this
     does not expect is a reason to stay quiet about that object, not a reason
-    to fail the cluster's whole collection and lose the other ten checks.
+    to fail the cluster's whole collection and lose every other check.
     """
     if not stamp:
         return None
@@ -3128,7 +3128,7 @@ def _failure_summary(finished: list[dict]) -> str:
 def check_schedule_never_succeeds(context: dict) -> list[dict]:
     """Cluster-scoped: iterates CronJobs, which are not in `workloads` at all.
 
-    The other ten checks read pod templates and ask whether the workload is
+    The other checks read pod templates and ask whether the workload is
     configured to survive something. This one asks whether a schedule is still
     producing anything, which is not a question a template can answer -- so it
     reads `status` on the CronJob and on the Jobs it retains, and reports the
@@ -3431,7 +3431,7 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all fourteen checks of §2.
+# compliance-audit: all sixteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -3459,6 +3459,18 @@ def _pod_spec_of(item: dict) -> dict:
     if kind == "CronJob":
         return (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
     return (spec.get("template") or {}).get("spec") or {}
+
+
+def _pod_annotations_of(item: dict) -> dict:
+    """The annotations on the pod `_pod_spec_of` resolves, from the same place."""
+    kind, spec = item.get("kind"), item.get("spec") or {}
+    if kind == "Pod":
+        meta = item.get("metadata") or {}
+    elif kind == "CronJob":
+        meta = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("metadata") or {}
+    else:
+        meta = (spec.get("template") or {}).get("metadata") or {}
+    return meta.get("annotations") or {}
 
 
 # What every excerpt on a suspended CronJob gains, and why one is not enough to
@@ -3552,7 +3564,8 @@ def normalize_compliance_workloads(dump: dict) -> list[dict]:
             continue
         out.append({
             "kind": item["kind"], "ns": ns, "name": meta.get("name", ""),
-            "spec": _pod_spec_of(item), "suspended": _is_suspended_cronjob(item),
+            "spec": _pod_spec_of(item), "pod_annotations": _pod_annotations_of(item),
+            "suspended": _is_suspended_cronjob(item),
             "scaled_to_zero": _is_scaled_to_zero(item),
             "reconciler": reconciler_of(meta),
         })
@@ -4410,6 +4423,14 @@ def check_default_sa_automount(context: dict) -> list[dict]:
 # ServiceAccount on any cluster would ever qualify.
 _UNIVERSAL_SA_GROUPS = frozenset({"system:authenticated", "system:serviceaccounts"})
 _SA_NAMESPACE_GROUP_PREFIX = "system:serviceaccounts:"
+# Vault Agent's injector adds its sidecar on this pod annotation, and the
+# sidecar logs in to Vault's `kubernetes` auth method with the default mounted
+# token. Vault reviews that token with its own identity, so the ServiceAccount
+# needs no binding in the cluster and §2.14's unbound test says nothing about
+# whether the token is used. The values are the injector's own
+# `strconv.ParseBool` spellings of true, lowercased.
+_VAULT_AGENT_INJECT_ANNOTATION = "vault.hashicorp.com/agent-inject"
+_VAULT_AGENT_INJECT_TRUE = frozenset({"1", "t", "true"})
 _BASELINE_AUTHENTICATED_ROLES = frozenset({
     "system:basic-user",
     "system:discovery",
@@ -4424,8 +4445,8 @@ _IMPACT_UNBOUND_SA_AUTOMOUNT = (
     "path-traversal read, an SSRF the container proxies, a leaked log of the "
     "token, or code execution -- gets an authenticated identity on the API "
     "server for free, and authenticated is the boundary most of a cluster's "
-    "defences are written against. Turning the mount off costs this workload "
-    "nothing, because there is no grant behind the token for it to lose."
+    "defences are written against. No grant in this cluster stands behind the "
+    "token, so the workload loses nothing here by turning the mount off."
 )
 
 
@@ -4481,16 +4502,19 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
     a finding asserting it is one an owner can refute from memory, which is
     why §2.7's impact sentence deliberately does not claim it. "Nothing has
     granted this ServiceAccount anything" is a different statement: it is
-    provable from the RBAC dump, and it makes the remediation costless without
-    needing to know what the container does. Either the token is unused, or
-    the workload is already failing every API call it makes -- and in the
-    second case turning the mount off does not make it worse, it makes a
-    second problem visible.
+    provable from the RBAC dump, and it means the API server gives the token
+    nothing. It does not prove that nothing else reads the token: an external
+    verifier that reviews it with its own identity -- Vault's `kubernetes`
+    auth method, fed by the Vault Agent injector's sidecar -- needs no binding
+    here. The injector announces itself on the pod template, so that case is
+    skipped; any other such consumer is what the remediation's `risk` tells
+    the reviewer to rule out.
 
     An explicit projected `serviceAccountToken` volume is unaffected by
     `automountServiceAccountToken` and is therefore not an exclusion: a
-    workload federating to Vault or to an external audience keeps working
-    across this fix. GKE Workload Identity likewise reaches Google Cloud
+    workload federating to an external audience through its own declared
+    volume keeps working across this fix (the Vault Agent sidecar reads the
+    default mount, hence the skip above). GKE Workload Identity likewise reaches Google Cloud
     through the metadata server rather than this token.
     """
     universal, granted_namespaces = _sa_groups_granted(context)
@@ -4524,6 +4548,9 @@ def check_unbound_sa_automount(context: dict) -> list[dict]:
         if sa.get("automountServiceAccountToken") is False:
             continue
         if key in bound or wl["ns"] in granted_namespaces:
+            continue
+        inject = str((wl.get("pod_annotations") or {}).get(_VAULT_AGENT_INJECT_ANNOTATION, ""))
+        if inject.strip().lower() in _VAULT_AGENT_INJECT_TRUE:
             continue
         hits.append(
             {
@@ -7143,8 +7170,14 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 # Cluster-kind checks that match against `collected.workloads`, so an empty
 # workload set leaves them nothing to examine exactly as it does a workload
 # check: a PDB is only graded against the workload it covers, and an HPA's
-# floor only against the Service-backed workload it scales.
-_WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"})
+# floor only against the Service-backed workload it scales. Compliance's two
+# automount checks iterate the workload set too. `netpol-missing` does not: it
+# reads `pod_namespaces`, every namespace holding a live Pod, so it still has
+# something to examine on a cluster whose workloads are all out of scope.
+_WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({
+    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one",
+    "default-sa-automount", "unbound-sa-automount",
+})
 
 _EMPTY_SCOPE_REASON: dict[str, str] = {
     "obtainability-audit": (

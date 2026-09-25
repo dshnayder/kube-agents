@@ -2384,6 +2384,22 @@ stream_case_count() { # <audit-id>
   echo $(( n > 1 ? n : 1 ))
 }
 
+# How long a stream's lock can be held by holders still queued on lock-infra:
+# INFRA_LOCK_DEADLINE once per stack-bearing case on the stream, 0 for a
+# stream with none or an empty id. A stack-bearing unit takes its stream lock
+# before the infra lock, so its sibling on the stream waits out that queue
+# too, and a stream deadline that counted run time alone gave up first.
+stream_stack_wait() { # <audit-id>
+  local n=0 i
+  if [ -n "$1" ]; then
+    for i in "${!TASKS[@]}"; do
+      if [ -n "${TASK_HAS_STACK[i]}" ] \
+        && [ "$(ledger_audit_id_for_task "${TASKS[i]}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+    done
+  fi
+  echo $(( n * INFRA_LOCK_DEADLINE ))
+}
+
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
 # A case is graded the moment its last repetition finishes, by the unit that
 # finished it, not in one serial pass after the fan-out. Two reasons, both from
@@ -2514,13 +2530,15 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # running -- 24% of presubmit runs launch compliance rep 2 within 2090s of
   # rep 1 (385 logs, 09-04 to 09-15). On a stream another case in this run
   # also writes, the holder first waits its turn on the stream lock, so the
-  # deadline is that figure times the cases on the stream; alone on its
-  # stream, or writing none, a case keeps the single-unit figure. The infra
+  # deadline is that figure times the cases on the stream, plus the infra
+  # queue its stack-bearing cases may hold the stream through
+  # (stream_stack_wait); alone on its stream, or writing none, a case keeps
+  # the single-unit figure. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
   # held only while this unit's own stack is in use.
   local audit_id lock_deadline
   audit_id="$(ledger_audit_id_for_task "${task}")"
-  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"
+  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
@@ -2529,8 +2547,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # state files are written, released with the task lock below: two cases on
   # one stream (the consistency pair, the patch pair, the obtainability pair)
   # must not reset and rewrite each other's ledger mid-run. The same scaled
-  # deadline: a waiter here outlasts the other cases' units on the stream.
-  # Taken before the infra lock, not after: a stack-bearing unit that shares
+  # deadline: a waiter here outlasts the other cases' units on the stream,
+  # infra queue included. Taken before the infra lock, not after: a stack-bearing unit that shares
   # its stream with a stackless one would otherwise sit on the infra lock for
   # the whole of the other's audit, and every tofu unit behind it would run
   # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.

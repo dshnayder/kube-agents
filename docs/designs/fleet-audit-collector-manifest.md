@@ -150,6 +150,11 @@ before any `gh` call:
   inapplicable there, or the document's `checks_not_applicable` names a check the manifest ran to
   `rc == 0` without itself declaring inapplicable. Applicability is corroborated, never prohibited:
   a check the collector never reached still takes the model's judgement.
+- A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
+  target's `checks_unevaluated`, or the manifest lists any there and the target carries no
+  `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
+  in `limitations` makes the run partial and keeps what it filed open, where either list would let a
+  clean document resolve findings over a read that never happened.
 
 ### 3.2 Evidence — `adopt_collector_evidence`, `adopt_arm_impact`
 
