@@ -1,8 +1,12 @@
 # Predictive operations: warning before a resource runs out
 
 **Status:** proposal for review; nothing is built. A first experiment has run on real clusters, and
-the [Experiment](#experiment) section reports it. The [Scope](#scope) section lists what an install
-already has. Everything after it describes a direction for kube-agents, not a build plan with dates.
+the [Experiment](#experiment) section reports it. Its conclusion is that forecasting CPU, memory and
+node count hours to a day ahead is not worth building: TimesFM predicted little more than the
+current value, which the agent already watches. Resources that grow slowly toward a limit, such as
+disks and quotas, were not tested, and a backtest on them decides whether anything described here
+is built. The [Scope](#scope) section lists what an install already has. Everything after it
+describes the design that would be built if that backtest passes, not a build plan with dates.
 
 **Authors:** Dmitry Shnayder; Gari Singh, whose [prediction-plane design](https://gist.github.com/mastersingh24/ac4cce73bc57ae4a6d8e04a4ad2cb0e7) is merged into this one.
 
@@ -51,12 +55,14 @@ The feature is **opt-in and disabled by default**. Once enabled, a cluster uses 
 after a probe, a test on the cluster's own history, shows its load can be forecast. It stops if its
 predictions start going wrong.
 
-What the evidence says so far: TimesFM's forecasts are not yet accurate enough to act on. On bursty
+What the evidence says so far: for the series tested, prediction is not worth building. On bursty
 test clusters, forecasts a day ahead were too far off. On a staging cluster running real traffic,
 8-hour forecasts looked accurate, but only because the load changed little. Simply assuming the load
 would stay at its current level was just as accurate, and when the load did go up, TimesFM did not
 predict it. Forecasting is cheap, seconds per request on a CPU, so cost is not the obstacle;
-accuracy is. Nothing is built yet.
+accuracy is. The case that remains open is resources that grow slowly toward a limit over days, such
+as disks and quotas, which the experiment could not test. The next step is to test those, and
+nothing is built unless that test passes.
 
 ## Summary
 
@@ -118,7 +124,8 @@ a person merges. A problem expected within the next 24 hours is sent into the sa
 event watcher already uses, so a person sees it the same day.
 [How a prediction reaches people](#how-a-prediction-reaches-people) has the details.
 
-**What the experiment found.** Forecasts are not yet accurate enough to warn on. On 11 bursty test
+**What the experiment found.** For CPU, memory and node count, forecasts are not accurate enough to
+warn on. On 11 bursty test
 clusters, a forecast made a day ahead was close to the real value (no more than 5% too high or 10%
 too low) only 57% of the time. That is better than assuming today will repeat yesterday (45%), but
 far from good enough to act on. Forecasting 8 hours ahead instead of 24 halved the typical error. On
@@ -126,13 +133,16 @@ a staging cluster running real traffic, 8-hour forecasts were much closer to the
 mainly because that cluster's load changed little during the day. Assuming the load would stay at
 its last hourly value was just as accurate. When the load did go up, TimesFM predicted it would stay
 near its current level, so it would not have raised a warning. Speed is not a problem: one CPU
-container forecasts 64 series from 7 days of history in about 20 seconds. The
-[Experiment](#experiment) section has the numbers.
+container forecasts 64 series from 7 days of history in about 20 seconds. Disks and quotas, which
+grow slowly toward a limit, were not tested. The [Experiment](#experiment) section has the numbers.
 
-**What gets built first.** A metrics collector, then the forecaster service tested against past data
-from a real fleet, then the feature itself. Each type of series first runs in shadow mode, where
-predictions are recorded and scored but not acted on, until its track record shows it can be
-trusted. [Order of work](#order-of-work) lists the phases and the checks between them.
+**What would come next.** A backtest on slowly growing series such as disks and quotas, comparing
+TimesFM with a straight-line trend and with the current value. The build begins only if forecasts
+give reliable warnings earlier than the existing threshold checks do: a metrics collector, then the
+forecaster service tested against past data from a real fleet, then the feature itself. Each type of
+series first runs in shadow mode, where predictions are recorded and scored but not acted on, until
+its track record shows it can be trusted. [Order of work](#order-of-work) lists the phases and the
+checks between them.
 
 **Why the name "predictive".** _Proactive_ is already used for the audits and on the site's
 [Proactive autonomy](../site/src/content/docs/overview/proactive-autonomy.md) page, where it means
@@ -243,14 +253,14 @@ than about who makes the change:
 
 ### Enabling predictive mode: opt-in, per cluster
 
-The [experiment](#experiment) found that how accurate a forecast is depends more on the cluster than
-on the model. The same forecaster that overshot memory by 20% on a bad day on the bursty test
-clusters overshot by only 4% on a staging cluster with steady load. A low error is not
-enough on its own, though. On that steady cluster, assuming the value would stay at its last hourly
-level was just as accurate as TimesFM, and the proactive mode already watches the current value. So
-neither a single fleet-wide decision nor a check on error alone will do. The mode is enabled per
-cluster, and a cluster must show on its own history that predictions would have been right and
-would have told people something they did not already know.
+The [experiment](#experiment) found that forecast error differs a lot from one cluster to another.
+The same forecaster that overshot memory by 20% on a bad day on the bursty test clusters overshot by
+only 4% on a staging cluster with steady load. A low error does not make a forecast useful, though.
+On that steady cluster, assuming the value would stay at its last hourly level was just as accurate
+as TimesFM, and the proactive mode already watches the current value. So neither a single fleet-wide
+decision nor a check on error alone will do. If the mode is built, it is enabled per cluster, and a
+cluster must show on its own history that predictions would have been right and would have told
+people something they did not already know.
 
 Predictive mode is opt-in and off by default. When an operator enables it, each cluster under
 management moves between three states:
@@ -389,6 +399,9 @@ so storage and quota need long time frames, while memory needs short ones.
 
 Five series come first. Each has a declared limit the agent already reads, a metric a standard GKE
 cluster already exports, and a fix the existing declarative path already knows how to make.
+The experiment did not test them as they are used here. It tested container memory and node count
+only over the next 8 to 24 hours, where TimesFM added nothing over the current value. Growth over
+days, and disks and quotas at all, are untested.
 
 | Series                            | Used amount                                                                                               | Declared limit                    | Fix                                                                                                                                                                  |
 | --------------------------------- | --------------------------------------------------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -448,7 +461,10 @@ series are not straight lines. Examples are memory use that grows on weekdays an
 a batch namespace whose quota use spikes every night, and a node pool that grows and shrinks with
 traffic. A straight line through any of those either raises a false alarm every Friday or misses the
 real crossing by a week. A model that follows the shape of the series is what keeps people trusting
-the forecasts after the first few.
+the forecasts after the first few. The [experiment](#experiment) qualifies this argument. TimesFM
+followed the daily shape of CPU and memory better than repeating earlier days, but for the highest
+value in the next 8 hours, which is what a warning depends on, it predicted about the current value.
+Following the shape of the past is not the same as predicting a rise.
 
 Classical methods such as Holt-Winters, ARIMA and Prophet do follow the shape, but each series needs
 its own fitting, its own declaration of daily or weekly cycles, and a long history before it
@@ -855,7 +871,10 @@ merges in the same change that makes it pass.
 
 ### Order of work
 
-Each phase is a separate change with its own live test. Gari's design names five preliminary
+Each phase is a separate change with its own live test. None of them starts until a backtest on
+slowly growing series (see [Summary](#summary)) shows that forecasts warn earlier than the existing
+threshold checks; for CPU, memory and node count over hours, the [experiment](#experiment) already
+showed they do not. Gari's design names five preliminary
 investigations; each is done in the phase that depends on it.
 
 1. **The collector, as a library and a sandbox command.** Written to the relay's rules, it produces
@@ -875,8 +894,9 @@ investigations; each is done in the phase that depends on it.
    point:** a type of series uses TimesFM only where the backtest shows it beats the simple
    forecasts on how often breach warnings are right, at the same share of breaches found. Where it
    does not, that type uses a simple forecast, and the finding looks the same; the model is recorded
-   as a provenance field, not built into the design. If no type passes, the mode still ships on the
-   simple forecasts, and this document records why.
+   as a provenance field, not built into the design. A simple forecast counts only if it warns
+   earlier than the existing threshold checks; holding the current value never does. If no type
+   passes, the mode is not built, and this document records why.
 3. **The feature.** The SOP, the scheduled job, the ledger, the triage and decision rule, the opt-in
    switch and the per-cluster probe with its re-probe schedule, calibration, the kinds of fix per
    series, every type of series in shadow, the replay test case run failing and then passing, and
@@ -909,15 +929,15 @@ request:
 | Cost              | The forecaster's compute as a share of the install's own                                                              | 1%                                                                                      |
 | Reversal rate     | Share of merged predictive fixes reverted within a week                                                               | 0.02                                                                                    |
 
-| Risk                                                                 | Impact                                          | Mitigation                                                                                                       |
-| -------------------------------------------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| The model does no better than simple forecasts on the fleet's series | The case for using a model fails                | The phase 2 decision point; the simple forecasts keep the feature working either way                             |
-| The filters remove a series that was about to breach                 | A missed breach in a mode meant to predict them | The random sample of filtered-out series measures how often this happens; the ledger reports it                  |
-| Fixes make correct predictions look wrong                            | The feature is tuned until it is useless        | Precision is measured only on replay and in shadow mode, and the ledger's own record says so                     |
-| Findings become noise                                                | People mute the findings and miss the good ones | Shadow first, quiet defaults, a crossing must repeat before it is raised, related findings merged, UC-3 left out |
-| Forecasting costs more than the budget across a whole fleet          | The feature cannot run widely                   | The inference-cost investigation; a fixed budget that the filters fill                                           |
-| A new model version is worse                                         | Accuracy drops without anyone noticing          | A pinned image digest, the model recorded in each finding, and calibration to detect the drop                    |
-| An extra input is wrong about the future                             | A confident wrong forecast                      | Store the extra inputs with the forecast, so a review can tell an input error from a model error                 |
+| Risk                                                                 | Impact                                          | Mitigation                                                                                                                                        |
+| -------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The model does no better than simple forecasts on the fleet's series | The case for using a model fails                | The phase 2 decision point: use a straight-line forecast where it warns earlier than today's checks, and do not build the mode where nothing does |
+| The filters remove a series that was about to breach                 | A missed breach in a mode meant to predict them | The random sample of filtered-out series measures how often this happens; the ledger reports it                                                   |
+| Fixes make correct predictions look wrong                            | The feature is tuned until it is useless        | Precision is measured only on replay and in shadow mode, and the ledger's own record says so                                                      |
+| Findings become noise                                                | People mute the findings and miss the good ones | Shadow first, quiet defaults, a crossing must repeat before it is raised, related findings merged, UC-3 left out                                  |
+| Forecasting costs more than the budget across a whole fleet          | The feature cannot run widely                   | The inference-cost investigation; a fixed budget that the filters fill                                                                            |
+| A new model version is worse                                         | Accuracy drops without anyone noticing          | A pinned image digest, the model recorded in each finding, and calibration to detect the drop                                                     |
+| An extra input is wrong about the future                             | A confident wrong forecast                      | Store the extra inputs with the forecast, so a review can tell an input error from a model error                                                  |
 
 ### Out of scope
 
@@ -1013,13 +1033,15 @@ that existed long enough to forecast. The project's production install was colle
 out, because it does little apart from occasional pull-request tests, and its almost idle series
 made every forecast look better than it is. The experiment's README has the tables and caveats.
 
-**TimesFM follows the daily shape better than the simple forecasts.** TimesFM's typical MASE was
-0.61–0.63, against 0.92 for repeating earlier days and 0.97 for a straight line. (MASE is the error
-relative to repeating earlier days; lower is better.) It beat repeating earlier days on 78–82% of
-the forecasts, and its quantile loss was about 40% lower. It was strongest in the first hour, with a
-MASE of 0.08 against 0.71. The forecast ranges from 7 and 28 days of history were close to the 80%
-coverage they should have. Memory improved the most. CPU requests, which change in steps when
-something is deployed, improved the least.
+**TimesFM follows the daily shape better than forecasts built from earlier days.** TimesFM's typical
+MASE was 0.61–0.63, against 0.92 for repeating earlier days and 0.97 for a straight line. (MASE is
+the error relative to repeating earlier days; lower is better.) It beat repeating earlier days on
+78–82% of the forecasts, and its quantile loss was about 40% lower. It was strongest in the first
+hour, with a MASE of 0.08 against 0.71. The forecast ranges from 7 and 28 days of history were close
+to the 80% coverage they should have. Memory improved the most. CPU requests, which change in steps
+when something is deployed, improved the least. This compares TimesFM only with forecasts built from
+earlier days. For the highest value in the next 8 hours, it did no better than simply holding the
+current value, as the eight-hour finding below shows.
 
 **More history does not help much.** Seven days of history came within 0.01 MASE of 28 days, and
 averaging forecasts from different history lengths added nothing over the longest one alone. So
@@ -1061,7 +1083,7 @@ day; the proactive agent already sees the rest.
 On bursty clusters like these, day-ahead forecasts of CPU and memory are not accurate enough to act
 on. One busy staging cluster looked much better (on a bad day, an 8-hour memory forecast
 was 4% too high, against 20% on the test clusters), which suggested the answer depends on the
-cluster. That is why prediction is decided per cluster by a probe
+cluster. That is why the design decides per cluster with a probe
 ([Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster)). Series that grow
 steadily, such as disks, remain untested: no disk on these clusters existed long enough to forecast.
 The next finding shows that the staging cluster's better numbers do not mean TimesFM understood its
@@ -1184,9 +1206,10 @@ already uses Toto, without training, on Prometheus and OpenCost data to forecast
 p10, p50 and p90 ranges. It is the closest operations agent built on such a model, and it forecasts
 spending rather than failures.
 
-What this changes here. The positioning holds: no product combines a forecast, a finding with an
-owner, and a declarative fix in an agent that runs inside the install, and Dynatrace's workflow
-shows that the approach works in production. Two adjustments follow. First, the backtest in
+What this changes here. No product combines a forecast, a finding with an owner, and a declarative
+fix in an agent that runs inside the install, and Dynatrace's workflow shows that forecasting disk
+usage works in production. That supports testing disks next. It does not change the experiment's
+result for CPU, memory and node count. Two adjustments follow. First, the backtest in
 [Order of work](#order-of-work) phase 2 should run Toto and Chronos next to TimesFM, since both have
 open weights and Toto was trained on observability data. The forecaster's backend interface makes
 the best model for each type of series a configuration choice, not a redesign, and each model's
