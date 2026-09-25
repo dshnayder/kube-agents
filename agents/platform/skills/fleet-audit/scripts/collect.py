@@ -1686,13 +1686,17 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             # drain --ignore-daemonsets` and the node-pool upgrade path delete
             # their pods rather than evict them, so no budget over one wedges a
             # drain -- and with no `replicas`, one pod read as the whole floor.
-            matches = [
-                wl
-                for wl in context["workloads"]
-                if wl["ns"] == ns
-                and wl["kind"] != "DaemonSet"
-                and selector_matches(selector, wl["pod_labels"])
+            selected = [
+                wl for wl in context["workloads"] if wl["ns"] == ns and selector_matches(selector, wl["pod_labels"])
             ]
+            matches = [wl for wl in selected if wl["kind"] != "DaemonSet"]
+            # A DaemonSet beside a scalable workload is out of the report but
+            # not out of the arithmetic: the disruption controller counts its
+            # pods toward the floor, and they are slack. Its pod count is one
+            # per eligible node, which nothing read here records, so the floor
+            # is unknown and only the unconditional `maxUnavailable: 0` arm is
+            # decided.
+            daemonset_selected = len(matches) != len(selected)
             matched = matches[0] if matches else None
             replicas = sum(wl["spec"].get("replicas", 1) or 1 for wl in matches) if matches else None
             hpa = _hpa_targeting(matched, context) if len(matches) == 1 else None
@@ -1720,7 +1724,7 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                 else None
             )
             blocking = max_unavailable in (0, "0%")
-            if matched is not None:
+            if matched is not None and not daemonset_selected:
                 if isinstance(min_available, int) and min_available >= floor:
                     blocking = True
                 if desired_healthy is not None and desired_healthy >= floor:
@@ -5186,9 +5190,18 @@ _INTERPRETER_INLINE_FLAG_RE = re.compile(r"^-(c|e)$")
 # the module `-m` names -- and every token after it belongs to that program. A
 # `-c` there is the script's flag, so the scan stops rather than reading the
 # token after it as inline code. The few options that take a separate value
-# are skipped with their value so it is not mistaken for that operand.
-_INLINE_OPTIONS_END = ("--", "-m")
-_INLINE_OPTIONS_WITH_VALUE = frozenset({"-o", "+o", "-O", "+O", "-W", "-X", "-r", "-I"})
+# are skipped with their value so it is not mistaken for that operand. Both
+# tables are per family: Python's `-O` and `-I` are switches where bash's `-O`
+# takes a value, and `-m` names a module only to Python -- to a shell it is
+# the monitor switch.
+_INLINE_OPTIONS_END = {"shell": ("--",), "python": ("--", "-m")}
+_INLINE_OPTIONS_WITH_VALUE = {
+    "shell": frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}),
+    "python": frozenset({"-W", "-X"}),
+    "node": frozenset({"-r", "--require"}),
+    "ruby": frozenset({"-I", "-r"}),
+}
+_INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
 
 
 def _container_argv(container: dict) -> list[str]:
@@ -5263,14 +5276,17 @@ def _resolve_argv(container: dict) -> _Argv:
     if not shell and program not in _INLINE_CODE_INTERPRETERS:
         return _Argv(argv, argv)
     flag_re = _SHELL_INLINE_FLAG_RE if shell else _INTERPRETER_INLINE_FLAG_RE
+    family = "shell" if shell else _INTERPRETER_FAMILIES.get(program, program)
+    options_end = _INLINE_OPTIONS_END.get(family, ("--",))
+    options_with_value = _INLINE_OPTIONS_WITH_VALUE.get(family, frozenset())
     skip_value = False
     for i, token in enumerate(argv[1:], start=1):
         if skip_value:
             skip_value = False
             continue
-        if token in _INLINE_OPTIONS_END or not token.startswith(("-", "+")):
+        if token in options_end or not token.startswith(("-", "+")):
             break
-        if token in _INLINE_OPTIONS_WITH_VALUE:
+        if token in options_with_value:
             skip_value = True
             continue
         if not flag_re.fullmatch(token) or i + 1 >= len(argv):
@@ -5771,8 +5787,7 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         meta, spec = svc.get("metadata") or {}, svc.get("spec") or {}
         if spec.get("type") != "LoadBalancer":
             continue
-        annotations = meta.get("annotations") or {}
-        if any(annotations.get(key) == _INTERNAL_LB_ANNOTATION_VALUE for key in _INTERNAL_LB_ANNOTATIONS):
+        if _is_internal_load_balancer(meta):
             continue
         selector = spec.get("selector") or {}
         if not selector:
@@ -6244,8 +6259,8 @@ _IMPACT_IMAGE_FLOATING = (
 )
 _IMPACT_IMAGE_SPLIT = (
     "This workload's live pods are already running different builds of "
-    "{containers} at the same time, because the tag was re-resolved partway "
-    "through a rollout or a node replacement. Which version a request gets "
+    "{containers} at the same time, because the tag was re-resolved when "
+    "a pod restarted, rescaled or was replaced. Which version a request gets "
     "depends on which pod it lands on, and no deploy was made to cause it."
 )
 
@@ -6264,6 +6279,15 @@ def _running_digests(pod: dict) -> dict[str, str]:
         if match:
             out[cs.get("name", "")] = match.group("ref")
     return out
+
+
+def _pod_image_refs(pod: dict) -> dict[str, str]:
+    """`{container name: image reference as the pod spec writes it}`, init containers included."""
+    spec = pod.get("spec") or {}
+    return {
+        c.get("name", ""): str(c.get("image") or "")
+        for c in (spec.get("containers") or []) + (spec.get("initContainers") or [])
+    }
 
 
 #: The pod labels a controller stamps with the pod template revision a pod was
@@ -6298,21 +6322,41 @@ def _workload_running_digests(workload: dict, context: dict) -> dict[str, dict[s
     severity. One digest means the tag has resolved consistently and the pin
     is a no-op diff; more than one means the same container is running
     different bytes on different nodes *right now*, which is what an unpinned
-    tag does when a rollout or a node replacement re-resolves it partway.
-    Keyed by revision too, because only a split inside one revision proves it;
-    see `_pod_revision`.
+    tag does when a restart, rescale or node replacement re-resolves it.
+    Keyed by revision too, because a split across revisions can be a rollout
+    that changed the image; see `_pod_revision` and `_workload_image_refs`.
     """
-    ref = f"{workload['kind']}/{workload['name']}"
     seen: dict[str, dict[str, set[str]]] = {}
-    for pod in context.get("pods") or []:
-        if pod.get("ns") != workload["ns"] or not _is_live_pod(pod):
-            continue
-        if _pod_workload_ref(pod, context.get("workloads") or []) != ref:
-            continue
+    for pod in _workload_live_pods(workload, context):
         revision = _pod_revision(pod)
         for name, digest in (pod.get("images") or {}).items():
             seen.setdefault(name, {}).setdefault(revision, set()).add(digest)
     return seen
+
+
+def _workload_image_refs(workload: dict, context: dict) -> dict[str, set[str]]:
+    """`{container name: every image reference its live pods' specs write}`.
+
+    What separates a rollout from drift when each revision runs one digest: a
+    rollout that changed the image leaves two references live, while one
+    reference resolving to two digests is the tag moving under a template-only
+    change -- an env edit, a `rollout restart` -- which is the drift itself.
+    """
+    refs: dict[str, set[str]] = {}
+    for pod in _workload_live_pods(workload, context):
+        for name, image in (pod.get("image_refs") or {}).items():
+            refs.setdefault(name, set()).add(image)
+    return refs
+
+
+def _workload_live_pods(workload: dict, context: dict):
+    """The live pods owned by this workload, through the `netpol-missing` owner walk."""
+    ref = f"{workload['kind']}/{workload['name']}"
+    for pod in context.get("pods") or []:
+        if pod.get("ns") != workload["ns"] or not _is_live_pod(pod):
+            continue
+        if _pod_workload_ref(pod, context.get("workloads") or []) == ref:
+            yield pod
 
 
 def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
@@ -6329,6 +6373,7 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
     request the reviewer has to research into a diff that changes no bytes.
     """
     running = _workload_running_digests(workload, context)
+    image_refs = _workload_image_refs(workload, context)
     bad, split = [], []
     for container in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or []):
         image = container.get("image") or ""
@@ -6344,9 +6389,19 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
         elif any(len(revision_digests) > 1 for revision_digests in by_revision.values()):
             split.append(name)
             bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
+        elif len(image_refs.get(name) or ()) == 1:
+            # One digest per revision, but every revision writes the same
+            # reference: the template changed without the image, and the tag
+            # resolved differently at each revision's pull. That is the drift.
+            split.append(name)
+            bad.append(
+                f"{name}: {image} -> {len(by_revision)} pod-template revisions live, all writing this "
+                f"reference, resolved to {len(digests)} digests: {', '.join(digests)}"
+            )
         elif digests:
-            # One digest per revision: a rollout mid-flight, which proves no
-            # drift, so it stays at the unpinned-reference severity.
+            # One digest per revision under different references: a rollout
+            # mid-flight that changed the image, which proves no drift, so it
+            # stays at the unpinned-reference severity.
             bad.append(
                 f"{name}: {image} -> {len(by_revision)} pod-template revisions live, "
                 f"one digest each: {', '.join(digests)}"
@@ -7028,6 +7083,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             "phase": (i.get("status") or {}).get("phase", ""),
             "owners": _controller_refs(i.get("metadata") or {}),
             "images": _running_digests(i),
+            "image_refs": _pod_image_refs(i),
         }
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"

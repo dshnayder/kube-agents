@@ -921,6 +921,24 @@ class TestBlockingPdb(unittest.TestCase):
         ctx = context_of(pdbs={"default": [pdb("p", min_available=1)]}, workloads=collect.normalize_workloads(dump_of(d)))
         self.assertEqual(collect.check_blocking_pdb(ctx), [])
 
+    def test_daemonset_pods_beside_a_deployment_are_slack_the_floor_cannot_count(self):
+        # The disruption controller counts the DaemonSet's pods too, so
+        # `minAvailable: 2` over two replicas plus a DaemonSet permits
+        # evictions; its pod count is unread, so the minAvailable arm is left
+        # undecided rather than filed `critical`.
+        ds = deployment("agent")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        ds["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        api = deployment("api")
+        api["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        workloads = collect.normalize_workloads(dump_of(api, ds))
+        ctx = context_of(pdbs={"default": [pdb("p", min_available=2)]}, workloads=workloads)
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+        ctx = context_of(pdbs={"default": [pdb("p", max_unavailable=0)]}, workloads=workloads)
+        hits = collect.check_blocking_pdb(ctx)
+        self.assertEqual([h["object"] for h in hits], ["PodDisruptionBudget/p"])
+
     def test_an_orphan_pdb_matching_no_workload_is_not_reported(self):
         ctx = context_of(pdbs={"default": [pdb("p", max_unavailable=0, selector={"matchLabels": {"app": "nope"}})]},
                           workloads=collect.normalize_workloads(dump_of(deployment("api"))))
@@ -6973,10 +6991,24 @@ class TestImageFloatingTag(unittest.TestCase):
         pods = self.running(DIGEST_A, DIGEST_B)
         pods[0]["labels"] = {"pod-template-hash": "old"}
         pods[1]["labels"] = {"pod-template-hash": "new"}
+        pods[0]["image_refs"] = {"app": "gcr.io/acme/app:v1"}
+        pods[1]["image_refs"] = {"app": "gcr.io/acme/app:latest"}
         hit = self.hit("gcr.io/acme/app:latest", pods=pods)
         self.assertEqual(hit["severity"], "minor")
-        self.assertIn("2 pod-template revisions live", hit["excerpt"])
+        self.assertIn("2 pod-template revisions live, one digest each", hit["excerpt"])
         self.assertNotIn("running different builds", hit["impact"])
+
+    def test_two_revisions_writing_one_reference_are_drift(self):
+        # A `rollout restart` or an env-only edit makes a second revision with
+        # the same image string; two digests under it is the tag moving.
+        pods = self.running(DIGEST_A, DIGEST_B)
+        pods[0]["labels"] = {"pod-template-hash": "old"}
+        pods[1]["labels"] = {"pod-template-hash": "new"}
+        pods[0]["image_refs"] = pods[1]["image_refs"] = {"app": "gcr.io/acme/app:latest"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("all writing this reference, resolved to 2 digests", hit["excerpt"])
+        self.assertIn("running different builds of app", hit["impact"])
 
     def test_a_split_inside_one_revision_is_still_drift(self):
         pods = self.running(DIGEST_A, DIGEST_B, DIGEST_A)
@@ -7003,6 +7035,13 @@ class TestImageFloatingTag(unittest.TestCase):
         pods = self.running(DIGEST_A)
         pods[0]["ns"] = "elsewhere"
         self.assertIn("no running pod", self.hit("gcr.io/acme/app:latest", pods=pods)["excerpt"])
+
+
+class TestPodImageRefs(unittest.TestCase):
+    def test_every_container_and_init_container_reference_is_recorded(self):
+        pod = {"spec": {"containers": [{"name": "app", "image": "gcr.io/acme/app:latest"}],
+                        "initContainers": [{"name": "init", "image": "busybox"}]}}
+        self.assertEqual(collect._pod_image_refs(pod), {"app": "gcr.io/acme/app:latest", "init": "busybox"})
 
 
 class TestRunningDigests(unittest.TestCase):
@@ -8131,6 +8170,23 @@ class TestResolveArgv(unittest.TestCase):
         self.assertEqual(
             self.flags({"command": ["bash", "-o", "pipefail", "-c", "vllm --model foo"]}),
             ["vllm", "--model", "foo"],
+        )
+
+    def test_a_python_switch_is_not_read_as_taking_a_value(self):
+        # `-O` and `-I` take no value under Python, so `-c` after them is still
+        # the inline-code flag and nothing parses `--model`.
+        for switch in ("-O", "-I"):
+            self.assertEqual(
+                self.flags({"command": ["python3", switch, "-c", "print(1)"], "args": ["--model", "meta/x"]}), []
+            )
+
+    def test_a_shells_m_is_the_monitor_switch_not_a_module(self):
+        self.assertEqual(self.flags({"command": ["bash", "-m", "-c", "vllm serve --model foo"]}), ["vllm", "serve", "--model", "foo"])
+
+    def test_a_shells_long_option_value_is_skipped(self):
+        self.assertEqual(
+            self.flags({"command": ["bash", "--rcfile", "rc", "-c", "vllm serve --model foo"]}),
+            ["vllm", "serve", "--model", "foo"],
         )
 
     def test_a_shell_one_liner_is_read_as_the_command_line_it_is(self):
