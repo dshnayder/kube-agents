@@ -37,9 +37,12 @@ What this means for the predictive agent:
 
 - **As stated, the hypothesis is not confirmed.** A full day ahead, 4 of the 93 series have 90%
   of their values in the band.
-- **The model is clearly better than the simple rule.** On every series type, TimesFM puts more
-  values in the band than repeating yesterday, 57% against 45%, and it over-forecasts less
-  often, 19% against 32%. Prediction does add accuracy, and most of it on the costly side.
+- **TimesFM is better than repeating yesterday.** On every series type, it puts more values in
+  the band, 57% against 45%, and it over-forecasts less often, 19% against 32%.
+- **TimesFM is not better than holding the current value.** Eight hours ahead, its forecast of
+  the highest value is within a few points of the last hour's value, and it misses the rises a
+  warning is for
+  ([eight hours ahead](#eight-hours-ahead-timesfm-predicted-little-more-than-the-current-value)).
 - **Accuracy depends on how far ahead you look.** For the next 1–6 hours, 80% of memory and of
   node-count values are in the band. At 12–24 hours ahead the figures are 60% and 65%.
 - **Forecasting 8 hours ahead instead of 24 roughly halves the typical miss.** On a typical
@@ -50,17 +53,19 @@ What this means for the predictive agent:
 - **CPU is not predictable at this precision.** To take in 90% of hourly container-CPU values,
   the band would have to widen to −32%/+23%. For cluster CPU used, it would take −69%/+29%.
 
-**Recommendation:** do not build the predictive agent on the promise of 24-hour-ahead forecasts
-within −10%/+5% for CPU, memory or node count on clusters like these. The data supports
-forecasting memory and node count a few hours ahead, where TimesFM beats repeating yesterday
-and over-forecasts less. That use has not been tested against what the proactive agent already
-sees from current values. One busy staging cluster forecast far better than the
-evaluation hosts: a bad-day memory overshoot of 4% against 20%, 8 hours ahead
-([staging cluster](#a-busy-staging-cluster-forecasts-far-better)). Predictability is therefore a
-property of the cluster. The design gates prediction per cluster on a probe that runs this
-experiment on the cluster's own history
-([design](https://github.com/dshnayder/kube-agents/blob/design/predictive-operations/docs/designs/predictive-operations.md#enabling-predictive-mode-opt-in-per-cluster)). Forecasting itself takes seconds per request, so it
-never lags the horizon ([forecast time](#forecasting-takes-seconds-not-hours)).
+**Recommendation:** do not build the predictive agent for CPU, memory or node count. A day
+ahead, the forecasts are not accurate enough. A few hours ahead, memory and node-count forecasts
+are accurate, but only as accurate as holding the current value, which the proactive agent
+already sees. A staging cluster with steadier load had much smaller errors (a bad-day memory
+overshoot of 4% against 20%, 8 hours ahead), for the same reason: its load barely moved, and
+TimesFM matched the current value there too
+([staging cluster](#a-steadier-staging-cluster-has-smaller-errors)). The case left open is
+resources that grow slowly toward a limit, such as disks and quotas, which this experiment could
+not test. If a later backtest shows forecasts warn earlier on those, the design gates prediction
+per cluster on a probe that runs this experiment on the cluster's own history
+([design](https://github.com/dshnayder/kube-agents/blob/design/predictive-operations/docs/designs/predictive-operations.md#enabling-predictive-mode-opt-in-per-cluster)).
+Forecasting itself takes seconds per request, so cost is not the obstacle
+([forecast time](#forecasting-takes-seconds-not-hours)).
 
 ## What was tested
 
@@ -228,7 +233,7 @@ threshold. Each series got a threshold its busiest hour crossed on about one day
 Threshold crossings are the atypical days, and a forecast that cannot place a burst in time
 does not see them coming. [`results/decision.md`](results/decision.md) has the tables.
 
-### A busy staging cluster forecasts far better
+### A steadier staging cluster has smaller errors
 
 The evaluation hosts are small and bursty by design. To see whether that drives the result, we
 ran the 8-against-24-hour test on one staging cluster in our own organisation:
@@ -253,8 +258,9 @@ single disk stays within 1% high and 8% low at worst. CPU still misses bursts on
 hours of history, which changes these figures by at most 2 points.
 
 This is one cluster, and pointwise scoring was not run on it, so it shows the direction rather
-than a fleet-wide rate: on steady production-like load, over-forecasts are rare enough that
-memory, requested CPU and node-count forecasts could carry a warning.
+than a fleet-wide rate: on steadier load, forecast errors are much smaller. The next section
+shows that this does not make the forecasts useful, because holding the current value does as
+well.
 
 ### Eight hours ahead, TimesFM predicted little more than the current value
 
@@ -314,16 +320,16 @@ minutes on one such container. The GKE run, one replica with 14 cores, was faste
 - **Trend-driven series.** Disks, persistent volumes, quotas and memory that leaks grow rather
   than burst. No disk on these clusters lived long enough to forecast; a production fleet would
   have hundreds.
-- **Shorter horizons.** Memory and node count reach 80% in band 1–6 hours ahead. An agent that
-  forecasts a few hours ahead, several times a day, should be tested as its own design, against
-  what the proactive agent already sees.
+- **Shorter horizons are unlikely to help.** Memory and node count reach 80% in band 1–6 hours
+  ahead, but 8 hours ahead TimesFM did no better than holding the current value, which the
+  proactive agent already sees.
 - **Scheduled load as input.** Known events, such as release days or nightly runs, can be passed
   to TimesFM as covariates. That is the one way to forecast a burst's timing, and it was not
   tried.
-- **A different fleet.** The evaluation hosts run the harness's own bursty workloads. One
-  staging cluster with steadier traffic forecast far better
-  ([above](#a-busy-staging-cluster-forecasts-far-better)); a fleet of such clusters, scored point
-  by point, would test that properly.
+- **A different fleet is unlikely to help on its own.** One staging cluster with steadier
+  traffic had much smaller errors ([above](#a-steadier-staging-cluster-has-smaller-errors)), but
+  TimesFM matched the current value there too. A fleet with slowly growing disks and quotas would
+  test the open case above.
 
 ## Caveats
 

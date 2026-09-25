@@ -234,9 +234,10 @@ about eight minutes on one replica.
 
 ### What it answers
 
-- Feeding the model 7 days to forecast day T works. It beats every baseline, and 28 days adds
-  almost nothing to the day's shape. Longer context buys tighter peak bounds and nothing else,
-  and those bounds lose recall.
+- Feeding the model 7 days to forecast day T works better than repeating earlier days or a straight
+  line, and 28 days adds almost nothing to the day's shape. It was not compared here with holding
+  the current value, which RESULTS.md shows TimesFM barely beats 8 hours ahead. Longer context buys
+  tighter peak bounds and nothing else, and those bounds lose recall.
 - Averaging forecasts from several windows is no better than the longest window alone. The
   December case needs a year of archived series, fed either as one long hourly context or
   through a holiday covariate. Neither exists yet.
