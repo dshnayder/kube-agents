@@ -256,31 +256,40 @@ This is one cluster, and pointwise scoring was not run on it, so it shows the di
 than a fleet-wide rate: on steady production-like load, over-forecasts are rare enough that
 memory, requested CPU and node-count forecasts could carry a warning.
 
-### Eight hours ahead, TimesFM forecasts the last hour
+### Eight hours ahead, TimesFM predicted little more than the current value
 
-The staging result above measures error, and a quiet series has low error under any forecast. So
-we compared TimesFM's 8-hour peak with three forecasts that cost nothing: the last hour's value
-repeated, the same hours yesterday, and the same hours last week. A warning is about the peak, so
-each is scored by the highest value it forecast in the window against the highest that came.
-Median, then the worst miss and worst overshoot in 1 window in 10, on the staging cluster:
+The staging result above measures error, and a series that barely moves has low error under any
+forecast. So we compared TimesFM with three forecasts that cost nothing to compute: the last hour's
+value held constant, the same hours of yesterday, and the same hours of last week. A warning depends
+on the highest value in the coming hours, so each method was scored by the highest value it
+predicted for the next 8 hours against the highest value that actually occurred. Each cell shows
+the typical error, then in brackets the largest shortfall and the largest overshoot seen in 1
+forecast in 10. A negative number means the forecast was too low. Staging cluster:
 
-| Series           | Daily swing | TimesFM          | Last hour repeated | Same hours yesterday |
-| ---------------- | ----------: | ---------------- | ------------------ | -------------------- |
-| container memory |          5% | −1% (−8%, 0%)    | −1% (−7%, 0%)      | 0% (−6%, +6%)        |
-| node count       |         22% | −10% (−17%, +1%) | −9% (−17%, +2%)    | +2% (−17%, +17%)     |
-| CPU requested    |          7% | −3% (−7%, +1%)   | −3% (−7%, +1%)     | 0% (−6%, +7%)        |
-| container CPU    |         30% | −7% (−32%, +1%)  | −6% (−27%, +1%)    | 0% (−18%, +20%)      |
-| cluster CPU used |         27% | −9% (−23%, +2%)  | −9% (−23%, +2%)    | 0% (−21%, +25%)      |
+| Series           | Daily variation | TimesFM          | Last hour's value held | Same hours yesterday |
+| ---------------- | --------------: | ---------------- | ---------------------- | -------------------- |
+| container memory |              5% | −1% (−8%, 0%)    | −1% (−7%, 0%)          | 0% (−6%, +6%)        |
+| node count       |             22% | −10% (−17%, +1%) | −9% (−17%, +2%)        | +2% (−17%, +17%)     |
+| CPU requested    |              7% | −3% (−7%, +1%)   | −3% (−7%, +1%)         | 0% (−6%, +7%)        |
+| container CPU    |             30% | −7% (−32%, +1%)  | −6% (−27%, +1%)        | 0% (−18%, +20%)      |
+| cluster CPU used |             27% | −9% (−23%, +2%)  | −9% (−23%, +2%)        | 0% (−21%, +25%)      |
 
-TimesFM's peak is the last hour's value to within a point here, and within four on the evaluation
-hosts. The staging cluster forecasts well because its load moves little in a day (memory 5%,
-requested CPU 7%, against 22% and 54% on the evaluation hosts), not because the model reads it.
-When load rose more than 15% in the window, about 40% of CPU windows, TimesFM forecast a peak
-18–20% below the real one. Yesterday's hours centre on the real peak and miss less, but overshoot by
-17–25% in 1 window in 10 here and by up to 155% on the evaluation hosts, and each overshoot is a
-false alarm. A last-hour forecast is the current value, which the proactive agent already sees;
-where TimesFM matches it, forecasting adds nothing. [`results/baselines.md`](results/baselines.md)
-has both clusters, the last-week baseline and the rising windows.
+Daily variation is the gap between a typical day's highest and lowest hourly value, as a share of
+the day's average.
+
+TimesFM and the last-hour forecast differ by at most one point here, and by at most four on the
+evaluation hosts. The staging cluster forecasts well because its load changes little during a day
+(memory 5%, requested CPU 7%, against 22% and 54% on the evaluation hosts), not because the model
+understands it. In windows where the load rose more than 15%, about 40% of CPU windows, TimesFM
+predicted a peak 18–20% below the real one: it forecast that the load would stay roughly where it
+was.
+
+Yesterday's values have a typical error close to zero and underestimate rises less, but in 1
+forecast in 10 they predict a peak 17–25% too high here and up to 155% too high on the evaluation
+hosts. Each of those would be a false alarm. Holding the last hour's value is the current value,
+which the proactive agent already watches, so where TimesFM does no better than that, it tells
+people nothing new. [`results/baselines.md`](results/baselines.md) has both clusters, the last-week
+comparison, and the windows where the load rose.
 
 ### Forecasting takes seconds, not hours
 
