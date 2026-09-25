@@ -5218,8 +5218,9 @@ _INLINE_OPTIONS_END = {SHELL_FAMILY: _DEFAULT_INLINE_OPTIONS_END, "python": ("--
 _INLINE_OPTIONS_WITH_VALUE = {
     SHELL_FAMILY: frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}),
     "python": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
-    "node": frozenset({"-r", "--require"}),
-    "ruby": frozenset({"-I", "-r"}),
+    "node": frozenset({"-r", "--require", "-C", "--conditions", "--import", "--loader"}),
+    "ruby": frozenset({"-I", "-r", "-C", "-E"}),
+    "perl": frozenset({"-I", "-M", "-m"}),
 }
 _INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
 
@@ -5725,6 +5726,8 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
 AI_FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable)$")
 AI_TAG_RE = re.compile(r":[^/]*$")
 AI_DIGEST_RE = re.compile(r"@sha256:")
+# What joins a reference to the digest a webhook may have appended to it.
+DIGEST_SEPARATOR = "@"
 
 
 def check_model_image_floating_tag(workload: dict, context: dict) -> dict | None:
@@ -6339,8 +6342,10 @@ def _pod_revision(pod: dict) -> str:
     return owners[0].get("name", "") if owners else ""
 
 
-def _workload_running_images(workload: dict, context: dict) -> tuple[dict[str, dict[str, set[str]]], dict[str, set[str]]]:
-    """`({container: {revision: digests}}, {container: image references})` over the live pods.
+def _workload_running_images(
+    workload: dict, context: dict
+) -> tuple[dict[str, dict[str, set[str]]], dict[str, dict[str, set[str]]]]:
+    """`({container: {revision: digests}}, {container: {revision: image references}})` over the live pods.
 
     Joined through the same owner-reference walk `netpol-missing` uses, so a
     Deployment's pods reach it through their ReplicaSet, in one pass because
@@ -6354,10 +6359,16 @@ def _workload_running_images(workload: dict, context: dict) -> tuple[dict[str, d
     and the references the pods' specs write are what tells the two apart: a
     rollout leaves two references live, while one reference resolving to two
     digests is the tag moving under a template-only change -- an env edit, a
-    `rollout restart` -- which is the drift itself.
+    `rollout restart` -- which is the drift itself. References are keyed by
+    revision too, so a rollout's old revision beside two restarted ones does
+    not hide the drift between the two.
+
+    A reference is read without any `@sha256:` a mutating admission webhook
+    appended to it, so a digest-pinning policy does not make every pod look
+    as though it runs another reference than its template.
     """
     digests: dict[str, dict[str, set[str]]] = {}
-    refs: dict[str, set[str]] = {}
+    refs: dict[str, dict[str, set[str]]] = {}
     ref = f"{workload['kind']}/{workload['name']}"
     for pod in context.get("pods") or []:
         if pod.get("ns") != workload["ns"] or not _is_live_pod(pod):
@@ -6368,7 +6379,7 @@ def _workload_running_images(workload: dict, context: dict) -> tuple[dict[str, d
         for name, digest in (pod.get("images") or {}).items():
             digests.setdefault(name, {}).setdefault(revision, set()).add(digest)
         for name, image in (pod.get("image_refs") or {}).items():
-            refs.setdefault(name, set()).add(image)
+            refs.setdefault(name, {}).setdefault(revision, set()).add(image.split(DIGEST_SEPARATOR, 1)[0])
     return digests, refs
 
 
@@ -6396,8 +6407,16 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
         name = container.get("name", "")
         by_revision = running.get(name) or {}
         digests = sorted(set().union(*by_revision.values())) if by_revision else []
-        live_refs = image_refs.get(name) or set()
-        if live_refs and image not in live_refs:
+        refs_by_revision = image_refs.get(name) or {}
+        live_refs = set().union(*refs_by_revision.values()) if refs_by_revision else set()
+        # Revisions whose pods all write the template's reference: across
+        # those, more than one digest is the tag moving, not a rollout.
+        same_ref = [rev for rev, refs in refs_by_revision.items() if refs == {image} and rev in by_revision]
+        same_ref_digests = sorted(set().union(*(by_revision[rev] for rev in same_ref))) if same_ref else []
+        if any(len(revision_digests) > 1 for revision_digests in by_revision.values()):
+            split.append(name)
+            bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
+        elif live_refs and image not in live_refs:
             # The template names a reference no live pod runs yet -- an
             # `OnDelete` StatefulSet or DaemonSet, a paused Deployment after
             # `set image`. The running digest belongs to the old reference, so
@@ -6408,17 +6427,15 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
             )
         elif len(digests) == 1:
             bad.append(f"{name}: {image} -> currently running {digests[0]}")
-        elif any(len(revision_digests) > 1 for revision_digests in by_revision.values()):
-            split.append(name)
-            bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
-        elif live_refs == {image}:
-            # One digest per revision, but every revision writes the template's
-            # reference: the template changed without the image, and the tag
-            # resolved differently at each revision's pull. That is the drift.
+        elif len(same_ref_digests) > 1:
+            # One digest per revision, but revisions writing the template's
+            # reference disagree: the template changed without the image, and
+            # the tag resolved differently at each revision's pull. That is
+            # the drift.
             moved.append(name)
             bad.append(
-                f"{name}: {image} -> {len(by_revision)} pod-template revisions live, all writing this "
-                f"reference, resolved to {len(digests)} digests: {', '.join(digests)}"
+                f"{name}: {image} -> {len(same_ref)} pod-template revisions live, all writing this "
+                f"reference, resolved to {len(same_ref_digests)} digests: {', '.join(same_ref_digests)}"
             )
         elif digests:
             # One digest per revision under different references: a rollout

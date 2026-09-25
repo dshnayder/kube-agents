@@ -7043,6 +7043,38 @@ class TestImageFloatingTag(unittest.TestCase):
         self.assertIn("no live pod runs this reference yet; they still write gcr.io/acme/app:v1", hit["excerpt"])
         self.assertNotIn("currently running", hit["excerpt"])
 
+    def test_pods_that_report_no_digest_are_not_drift(self):
+        # Pending or ImagePullBackOff pods write the reference and run nothing.
+        pods = self.running(DIGEST_A, phase="Pending")
+        pods[0]["images"] = {}
+        pods[0]["image_refs"] = {"app": "gcr.io/acme/app:latest"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("no running pod to read a digest from", hit["excerpt"])
+
+    def test_a_webhook_appended_digest_is_the_same_reference(self):
+        pods = self.running(DIGEST_A)
+        pods[0]["image_refs"] = {"app": "gcr.io/acme/app:latest@sha256:" + "a" * 64}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertIn(f"currently running {DIGEST_A}", hit["excerpt"])
+
+    def test_drift_between_restarted_revisions_is_seen_beside_an_older_rollout(self):
+        # r1 still on :v1 from before the rollout; r2 and r3 both write
+        # :latest and resolved it differently.
+        pods = self.running("gcr.io/acme/app@sha256:" + "c" * 64, DIGEST_A, DIGEST_B)
+        for pod, rev, ref in zip(pods, ("r1", "r2", "r3"), ("v1", "latest", "latest")):
+            pod["labels"] = {"pod-template-hash": rev}
+            pod["image_refs"] = {"app": f"gcr.io/acme/app:{ref}"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("2 pod-template revisions live, all writing this reference, resolved to 2 digests", hit["excerpt"])
+
+    def test_a_split_under_a_stale_template_is_still_drift(self):
+        pods = self.running(DIGEST_A, DIGEST_B)
+        for pod in pods:
+            pod["image_refs"] = {"app": "gcr.io/acme/app:v1"}
+        self.assertEqual(self.hit("gcr.io/acme/app:latest", pods=pods)["severity"], "major")
+
     def test_a_split_inside_one_revision_is_still_drift(self):
         pods = self.running(DIGEST_A, DIGEST_B, DIGEST_A)
         pods[0]["labels"] = pods[1]["labels"] = {"pod-template-hash": "new"}
@@ -8232,6 +8264,9 @@ class TestResolveArgv(unittest.TestCase):
             ["nodejs", "--print", "1"],
             ["python3", "--check-hash-based-pycs", "always", "-c", "print(1)"],
             ["node", "-r", "dotenv/config", "-e", "console.log(1)"],
+            ["perl", "-I", "lib", "-e", "print 1"],
+            ["ruby", "-C", "/app", "-e", "puts 1"],
+            ["node", "--import", "tsx", "-e", "1"],
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.flags({"command": command, "args": ["--model", "meta/x"]}), [])
