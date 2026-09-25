@@ -11,21 +11,20 @@
 # hermes binary. An instruction that tells the Platform Agent to resolve a
 # Cluster Agent's profile with `cluster_agent_profile.py name`/`list` sends
 # every delegation through a command that prints "does not run in the shell
-# sandbox". kanban_notify_propagate.py, which copied a chat subscription, is
-# deleted; its pattern stays forbidden to catch a worker that still tries it. The workers then block their
-# cards or fall back to searching the fleet themselves. The answer can still
-# be right, which is why cluster-agent-crashloop-debug (same prompt, same
+# sandbox". The workers then block their cards or fall back to searching the
+# fleet themselves. The answer can still be right, which is why cluster-agent-crashloop-debug (same prompt, same
 # fixture) passes through the regression: its checks read the answer and the
 # fixture, not the route.
 #
 # So the objectives here are the route. worker_agents reads which profiles
 # the delegated workers ran as and requires a Cluster Agent among them;
-# worker_commands forbids both stubbed scripts in the terminal of the
+# worker_commands forbids the stubbed script, and kanban_notify_propagate.py
+# (deleted, which a worker could still try), in the terminal of the
 # `platform` worker that plans the fan-out -- the card the front door
 # delegated, and where main ran them. It does not reach the Cluster Agent
 # cards that worker files: the harness reads worker logs only for cards the
 # run delegated (docs/designs/bench-case-format.md), so a Cluster Agent
-# running either script passes it. Any invocation of cluster_agent_profile.py
+# running either passes it. Any invocation of cluster_agent_profile.py
 # is forbidden, not only the lookups: the stub refuses them all, and a cluster
 # with no profile is now investigated inline rather than scaffolded
 # mid-delegation. The profile

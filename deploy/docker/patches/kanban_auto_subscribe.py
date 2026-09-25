@@ -55,11 +55,10 @@ So the user's thread follows the work wherever a worker fans it out, one hop
 at a time: coordinator → sleep tasks → synthesizer, each inheriting from the
 card that created it.
 
-Same contract as the manual script it automates: the copied column set is
-``platform, chat_id, thread_id, user_id, notifier_profile`` (also exactly
-what upstream ``_inherit_notify_subs`` copies), ``INSERT OR IGNORE`` on the
-subscription primary key makes it idempotent — the script remains in place
-as a manual/back-fill tool and double-writes are harmless — and
+The copied column set is ``platform, chat_id, thread_id, user_id,
+notifier_profile`` (exactly what upstream ``_inherit_notify_subs`` copies),
+``INSERT OR IGNORE`` on the subscription primary key makes it idempotent —
+so a card upstream already subscribed takes no double write — and
 ``created_at`` is re-stamped.
 
 The cursor starts caught up
