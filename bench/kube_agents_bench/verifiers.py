@@ -432,6 +432,13 @@ _LEDGER_FOOTER_RE = re.compile(
 _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+# Its `all_findings_block`, same copy rule: every finding id in the document,
+# written only when the body cut some for space. The delta block above then
+# lists the rendered ones alone, and a finding filed but cut would read as
+# never filed.
+_ALL_FINDINGS_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
+)
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
@@ -774,12 +781,23 @@ def _parse_github_time(value: Any) -> datetime | None:
 
 
 def _finding_ids(body: str) -> list[str] | None:
-    """This run's finding ids from the hidden delta block, or None when absent."""
-    matches = _DELTA_RE.findall(body)
-    if not matches:
+    """This run's finding ids, or None when the ledger carries no block.
+
+    The complete-list block when the body has one, since only a truncated body
+    writes it and there the delta block holds the rendered subset; the delta
+    block otherwise, which then names every finding. Both by their last match,
+    for the reason ``_ledger_footer`` gives, and the complete list only BELOW
+    the last delta block, where ``_render_footer`` puts it: an untruncated
+    body has no real one, so a copy an agent wrote into a finding above the
+    footer would otherwise outrank the delta block that does.
+    """
+    deltas = list(_DELTA_RE.finditer(body))
+    if not deltas:
         return None
+    last = deltas[-1]
+    complete = [m for m in _ALL_FINDINGS_RE.finditer(body) if m.start() > last.end()]
     try:
-        ids = json.loads(matches[-1])
+        ids = json.loads((complete or deltas)[-1].group(1))
     except (ValueError, TypeError):
         return None
     if not isinstance(ids, list):
@@ -853,7 +871,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     recommendations, and the scope table.
 
     ``finding_ids`` — only the ids in the hidden ``<!-- audit-findings: … -->``
-    delta block, which ``audit_report.py`` derives as
+    delta block (or, on a body truncated for size, the
+    ``<!-- audit-findings-all: … -->`` block listing every filed finding),
+    which ``audit_report.py`` derives as
     ``<check>.<cluster>.<namespace>.<object>``. Use it whenever the phrase is a
     CLUSTER name: the body's scope table names every audited cluster on every
     run, so ``required_phrases: ["seeded-c"]`` against ``body`` would pass on a

@@ -7149,9 +7149,31 @@ class TestRenderBudget(BaseTestCase):
         # Every recorded id is genuinely in the body, and the first id that is
         # not recorded is genuinely absent — otherwise the next run reads a
         # truncated finding as resolved and announces a fix that never happened.
+        # The complete-list block is the one place a cut id may appear, and
+        # nothing joins against it.
+        prose = re.sub(r"(?m)^<!-- audit-findings-all: .*-->$", "", body)
         for fid in recorded:
-            self.assertIn(fid, body)
-        self.assertNotIn(ordered[len(recorded)], body)
+            self.assertIn(fid, prose)
+        self.assertNotIn(ordered[len(recorded)], prose)
+
+    def test_a_truncated_body_lists_every_finding_in_the_complete_block(self):
+        # A grader asking "was this filed?" has no other source once the body
+        # cuts a finding for space; the delta still joins on the rendered set.
+        findings = bulk_findings(250)
+        body = self.render(make_doc(findings=findings))
+        (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
+        self.assertEqual(sorted(json.loads(payload)), sorted(f["id"] for f in findings))
+        self.assertLess(len(audit_report.parse_delta_block(body)), len(findings))
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+
+    def test_an_untruncated_body_carries_no_complete_block(self):
+        body = self.render(make_doc(findings=bulk_findings(3)))
+        self.assertNotIn("audit-findings-all", body)
+
+    def test_a_complete_list_over_the_cap_is_left_out(self):
+        ids = [f"f-{i:05d}-" + "x" * 80 for i in range(400)]
+        self.assertEqual(audit_report.all_findings_block(ids), "")
+        self.assertTrue(audit_report.all_findings_block(ids[:10]))
 
     def test_criticals_survive_a_flood_of_minor_findings(self):
         findings = bulk_findings(5, severity="critical", prefix="crit") + bulk_findings(

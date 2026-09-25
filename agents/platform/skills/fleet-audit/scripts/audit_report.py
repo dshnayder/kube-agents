@@ -647,6 +647,10 @@ MAX_IDENT_CHARS = 320
 # between a stream that publishes and one that 422s every morning forever.
 MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
+# Ceiling on the `audit-findings-all` block a truncated ledger carries. It is
+# charged before findings are selected, so it is bounded to a slice of the
+# budget: past this a fleet keeps its findings and loses the complete list.
+ALL_FINDINGS_BLOCK_CAP = 12_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -4275,6 +4279,20 @@ def delta_block(ids: list[str]) -> str:
     )
 
 
+def all_findings_block(ids: list[str]) -> str:
+    """Every finding id in the document, for a body that could not render them all.
+
+    Machine-read by graders and never by `finish`: the delta still joins
+    against `audit-findings`, the rendered set, for the reason `compute_delta`
+    gives. What this adds is the one fact a truncated body otherwise loses --
+    that a finding cut for space was filed at all. Empty when the list would
+    exceed `ALL_FINDINGS_BLOCK_CAP`.
+    """
+    payload = json.dumps(sorted(set(ids)), separators=(",", ":"))
+    block = f"<!-- audit-findings-all: {payload} -->"
+    return block if len(block) <= ALL_FINDINGS_BLOCK_CAP else ""
+
+
 def parse_delta_block(body: str | None) -> list[str]:
     """Read the finding ids out of a previous issue body ([] when absent/unparseable)."""
     body = normalise_newlines(body)
@@ -6476,7 +6494,7 @@ def _render_findings(
 
 
 def _render_footer(
-    audit_id: str, generated_at: datetime, rendered_ids: list[str]
+    audit_id: str, generated_at: datetime, rendered_ids: list[str], all_block: str = ""
 ) -> list[str]:
     return [
         "",
@@ -6487,6 +6505,7 @@ def _render_footer(
         "live fleet; every one carries the exact command it was derived from.",
         "",
         delta_block(rendered_ids),
+        *([all_block] if all_block else []),
         "",
     ]
 
@@ -7041,7 +7060,11 @@ def render_issue_body(
     # select_rendered_findings. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
-    overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
+    # The complete id list is charged whether or not the body turns out to
+    # need it: which findings are cut is not known until they are selected,
+    # and a charge taken afterwards could only be paid by cutting more.
+    all_block = all_findings_block(finding_ids(findings))
+    overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids, all_block)))
     # And the held span's smallest form, so the list the next run carries
     # from is never the thing the findings squeeze out.
     overhead += len("\n".join(_render_held_ids_only(held_entries)))
@@ -7063,7 +7086,11 @@ def render_issue_body(
 
     # The held ids ride the block after the rendered ones: that is what makes
     # the next run's `previous_ids` remember them.
-    footer = _render_footer(audit_id, generated_at, rendered_ids + held_ids)
+    # The complete list rides only a truncated body; an untruncated one
+    # already names every finding in the block above.
+    footer = _render_footer(
+        audit_id, generated_at, rendered_ids + held_ids, all_block if omitted else ""
+    )
     # The held rows come out of whatever the document's findings left, ahead
     # of the evidence appendix and never ahead of a finding: full rows, then
     # identity lines alone, then a one-line note, then the span and its id

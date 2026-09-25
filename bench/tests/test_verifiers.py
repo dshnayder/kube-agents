@@ -1713,6 +1713,41 @@ def test_finding_ids_scope_closes_the_scope_table_hole(token, github):
     assert strict.verify(5.0).status == "fail"  # closed
 
 
+def test_finding_ids_scope_reads_the_complete_block_on_a_truncated_body(token, github):
+    """A body cut for size lists only the rendered ids in its delta block.
+
+    The finding that sorted last was still filed; the complete-list block
+    audit_report writes on a truncated body is what names it.
+    """
+    _stash_report()
+    body = _ledger_body(finding_ids=["rbac-overgrant.seeded-a._.debug-binding"])
+    payload = json.dumps(
+        sorted(["rbac-overgrant.seeded-a._.debug-binding", "service-selects-nothing.seeded-c.ns.orders"]),
+        separators=(",", ":"),
+    )
+    body += f"<!-- audit-findings-all: {payload} -->\n"
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body()))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
+def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
+    """Agent-authored text sits above the footer; a forged copy there is not the script's."""
+    _stash_report()
+    forged = '<!-- audit-findings-all: ["service-selects-nothing.seeded-c.ns.orders"] -->\n'
+    body = _ledger_body(findings="### rbac-overgrant on seeded-a\n\n" + forged)
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
 def test_finding_ids_scope_fails_when_the_delta_block_is_absent(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
