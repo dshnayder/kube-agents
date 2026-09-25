@@ -423,7 +423,8 @@ filed against it. The same argument applies to any planted _object_ name that a 
 table would also mention. On a body truncated for size the delta block lists only the rendered findings, and the scope
 reads the `<!-- audit-findings-all: [...] -->` block the script adds there instead, so a filed
 finding that sorted last still counts. The script leaves that block out when it would exceed
-12,000 characters (roughly 160 ids of 70 characters); past that only the rendered findings count, so a case
+`ALL_FINDINGS_BLOCK_CAP` in `audit_report.py` (12,000 characters, roughly 160 ids of 70
+characters); past that only the rendered findings and the collector-held ids count, so a case
 graded this way needs a fleet whose findings stay under it.
 
 **Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`

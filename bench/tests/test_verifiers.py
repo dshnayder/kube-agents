@@ -1946,9 +1946,9 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
 
 
 def test_the_complete_block_regex_reads_what_audit_report_writes():
-    """_ALL_FINDINGS_RE copies all_findings_block's format, which audit_report
-    writes and never parses. Render the script's own template so a change on
-    that side fails here rather than quietly grading the rendered subset."""
+    """_ALL_FINDINGS_RE copies all_findings_block's format, and audit_report's
+    own tests never run this regex. Render the script's own template so a change
+    on that side fails here rather than quietly grading the rendered subset."""
     script = (
         Path(__file__).resolve().parents[2]
         / "agents/platform/skills/fleet-audit/scripts/audit_report.py"

@@ -433,7 +433,8 @@ _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
 # Mirrors the output of its `all_findings_block`, which the script writes but
-# never parses, so no test on that side guards the format: every finding id
+# never parses, so no test on that side checks this regex against it
+# (`test_the_complete_block_regex_reads_what_audit_report_writes` does): every finding id
 # in the document plus the collector-held ids, written only when the body cut
 # findings for space. The delta block above then lists the rendered ones
 # alone, and a finding filed but cut would read as never filed.
@@ -736,7 +737,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
     The LAST match, not the first. ``render_issue_body`` assembles the body as
-    ``fixed + findings + withheld + evidence + footer``, so every byte the
+    ``fixed + findings + held + declared + withheld + evidence + footer``, so every byte the
     agent authored — finding titles and impacts through ``clip_text``, which
     redacts credentials and clips length but neither strips backticks nor
     flattens newlines, and evidence excerpts into a raw fenced block — sits

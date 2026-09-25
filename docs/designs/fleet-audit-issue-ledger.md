@@ -648,8 +648,7 @@ headroom for the trailing marker and for anything a later section appends.
   reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
   as new the first run it renders, whatever freed the room. Findings are selected once without the
   block and, only if that cut something, again with it charged, so it never truncates a body that
-  would have fit; on a body already truncated it costs the findings its length, a handful at
-  typical id lengths, which is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
