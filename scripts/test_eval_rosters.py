@@ -98,6 +98,7 @@ ADDED_AFTER_THE_SPLIT = [
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
+    "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
 ]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
