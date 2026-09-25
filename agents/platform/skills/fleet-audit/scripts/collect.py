@@ -5218,9 +5218,11 @@ _INLINE_OPTIONS_END = {SHELL_FAMILY: _DEFAULT_INLINE_OPTIONS_END, "python": ("--
 _INLINE_OPTIONS_WITH_VALUE = {
     SHELL_FAMILY: frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}),
     "python": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
-    "node": frozenset({"-r", "--require", "-C", "--conditions", "--import", "--loader"}),
+    "node": frozenset(
+        {"-r", "--require", "-C", "--conditions", "--import", "--loader", "--experimental-loader", "--input-type"}
+    ),
     "ruby": frozenset({"-I", "-r", "-C", "-E"}),
-    "perl": frozenset({"-I", "-M", "-m"}),
+    "perl": frozenset({"-I"}),
 }
 _INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
 
@@ -5726,8 +5728,6 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
 AI_FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable)$")
 AI_TAG_RE = re.compile(r":[^/]*$")
 AI_DIGEST_RE = re.compile(r"@sha256:")
-# What joins a reference to the digest a webhook may have appended to it.
-DIGEST_SEPARATOR = "@"
 
 
 def check_model_image_floating_tag(workload: dict, context: dict) -> dict | None:
@@ -6268,6 +6268,8 @@ FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable|edge)$")
 # tag is only the part after the last `/`.
 UNTAGGED_IMAGE_RE = re.compile(r":[^/]*$")
 DIGEST_RE = re.compile(r"@sha256:")
+# What joins a reference to the digest an admission webhook may have added to it.
+DIGEST_SEPARATOR = "@"
 # `status.containerStatuses[].imageID` is not always a digest reference. A
 # locally-loaded image (kind, minikube, `docker save`) records `docker://` or
 # a bare id, and pinning to one of those produces a manifest no other node can
@@ -6363,10 +6365,15 @@ def _workload_running_images(
     revision too, so a rollout's old revision beside two restarted ones does
     not hide the drift between the two.
 
-    A reference is read without any `@sha256:` a mutating admission webhook
-    appended to it, so a digest-pinning policy does not make every pod look
-    as though it runs another reference than its template.
+    A reference carrying a digest an admission webhook added -- appended to
+    the tag, or in place of it -- is read as the template's reference when
+    the repository is the same, so a digest-pinning policy does not make
+    every pod look as though it runs another reference than its template.
     """
+    templates = {
+        c.get("name", ""): c.get("image") or ""
+        for c in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or [])
+    }
     digests: dict[str, dict[str, set[str]]] = {}
     refs: dict[str, dict[str, set[str]]] = {}
     ref = f"{workload['kind']}/{workload['name']}"
@@ -6379,7 +6386,11 @@ def _workload_running_images(
         for name, digest in (pod.get("images") or {}).items():
             digests.setdefault(name, {}).setdefault(revision, set()).add(digest)
         for name, image in (pod.get("image_refs") or {}).items():
-            refs.setdefault(name, {}).setdefault(revision, set()).add(image.split(DIGEST_SEPARATOR, 1)[0])
+            if DIGEST_SEPARATOR in image:
+                base = image.split(DIGEST_SEPARATOR, 1)[0]
+                template = templates.get(name, "")
+                image = template if base in (template, UNTAGGED_IMAGE_RE.sub("", template)) else base
+            refs.setdefault(name, {}).setdefault(revision, set()).add(image)
     return digests, refs
 
 
@@ -6413,9 +6424,20 @@ def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
         # those, more than one digest is the tag moving, not a rollout.
         same_ref = [rev for rev, refs in refs_by_revision.items() if refs == {image} and rev in by_revision]
         same_ref_digests = sorted(set().union(*(by_revision[rev] for rev in same_ref))) if same_ref else []
-        if any(len(revision_digests) > 1 for revision_digests in by_revision.values()):
+        split_digests = sorted(set().union(*(d for d in by_revision.values() if len(d) > 1))) if by_revision else []
+        if split_digests:
             split.append(name)
-            bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
+            # Only the split revisions' digests: a rollout's older revision
+            # beside them runs another reference, and pinning to it reverts.
+            stale = (
+                f"; the pods still write {', '.join(sorted(live_refs))}, not this reference"
+                if live_refs and image not in live_refs
+                else ""
+            )
+            bad.append(
+                f"{name}: {image} -> live pods are split across {len(split_digests)} digests: "
+                f"{', '.join(split_digests)}{stale}"
+            )
         elif live_refs and image not in live_refs:
             # The template names a reference no live pod runs yet -- an
             # `OnDelete` StatefulSet or DaemonSet, a paused Deployment after

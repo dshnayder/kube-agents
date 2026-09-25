@@ -7073,7 +7073,24 @@ class TestImageFloatingTag(unittest.TestCase):
         pods = self.running(DIGEST_A, DIGEST_B)
         for pod in pods:
             pod["image_refs"] = {"app": "gcr.io/acme/app:v1"}
-        self.assertEqual(self.hit("gcr.io/acme/app:latest", pods=pods)["severity"], "major")
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("the pods still write gcr.io/acme/app:v1, not this reference", hit["excerpt"])
+
+    def test_a_webhook_replacing_the_tag_with_a_digest_is_the_same_reference(self):
+        pods = self.running(DIGEST_A)
+        pods[0]["image_refs"] = {"app": "gcr.io/acme/app@sha256:" + "a" * 64}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertIn(f"currently running {DIGEST_A}", hit["excerpt"])
+
+    def test_a_split_names_only_the_split_revisions_digests(self):
+        old = "gcr.io/acme/app@sha256:" + "c" * 64
+        pods = self.running(old, DIGEST_A, DIGEST_B)
+        pods[0]["labels"] = {"pod-template-hash": "r1"}
+        pods[1]["labels"] = pods[2]["labels"] = {"pod-template-hash": "r2"}
+        hit = self.hit("gcr.io/acme/app:latest", pods=pods)
+        self.assertIn("split across 2 digests", hit["excerpt"])
+        self.assertNotIn(old, hit["excerpt"])
 
     def test_a_split_inside_one_revision_is_still_drift(self):
         pods = self.running(DIGEST_A, DIGEST_B, DIGEST_A)
@@ -8267,6 +8284,7 @@ class TestResolveArgv(unittest.TestCase):
             ["perl", "-I", "lib", "-e", "print 1"],
             ["ruby", "-C", "/app", "-e", "puts 1"],
             ["node", "--import", "tsx", "-e", "1"],
+            ["node", "--experimental-loader", "ts-node/esm", "-e", "1"],
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.flags({"command": command, "args": ["--model", "meta/x"]}), [])
