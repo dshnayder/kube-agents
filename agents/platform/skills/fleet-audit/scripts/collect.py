@@ -76,9 +76,9 @@ from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
 
-# A digest of this file, published in the manifest. `audit_report.py` compares
-# it against the previous run's to tell a finding that stopped reproducing from
-# a check that stopped looking; see `render_delta_comment`.
+# A digest of this file, published in the manifest so a reader can tell which
+# collector source produced a run. It is carried, not read: nothing downstream
+# compares it today.
 # Long enough that two collector sources will not collide, short enough to
 # read in a log line. It has to agree across every collector: the comparison
 # is between one run's revision and the last one's, so a file that truncated
@@ -140,6 +140,8 @@ ZONE_TIMEOUT_MARKER = "did not respond"
 # answer reads as "absent"; a Forbidden, a 5xx or a refused connection also
 # exits non-zero and says nothing about whether the type exists.
 RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
+# How a collector read that failed says so in its reason; see `unevaluated`.
+UNDETERMINED_PREFIX = "Undetermined:"
 ERROR_EXCERPT_CHARS = 300
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -883,19 +885,22 @@ def services_by_namespace(dump: dict) -> dict[str, list[dict]]:
 
 
 def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
-    """Excludes any owned HPA (`ownerReferences` present), KEDA's included.
+    """Every HPA, owned ones included; see `_hpa_is_owned` for who skips them."""
+    return _by_namespace(dump, "HorizontalPodAutoscaler")
 
-    This is not `_defers_to_owner`, and deliberately so. A workload owned by a
-    CRD still has its own PDB and probe gaps to answer for, which is why S3 no
-    longer drops it. An HPA owned by a `ScaledObject` is different in kind: the
-    `min`/`max` this audit would read are a copy the operator writes from the
-    CRD, so 3.6 would be grading a projection of a configuration it cannot see.
-    The SOP calls that exclusion out under 3.6 for exactly that reason.
+
+def _hpa_is_owned(hpa: dict) -> bool:
+    """An HPA carrying `ownerReferences`, KEDA's `ScaledObject` included.
+
+    Skipped only by the checks that grade the HPA's own `min`/`max` (3.6,
+    3.22): on an owned HPA those are a copy the operator writes from a CRD
+    this audit cannot read, so grading them grades a projection. The checks
+    that ask whether a workload is autoscaled at all (3.4, 3.5, 3.11) keep
+    it -- a KEDA-scaled Deployment is autoscaled, and its floor is the one
+    KEDA wrote. This is not `_defers_to_owner`: a workload owned by a CRD
+    still answers for its own PDB and probe gaps.
     """
-    return {
-        ns: [hpa for hpa in hpas if not (hpa.get("metadata") or {}).get("ownerReferences")]
-        for ns, hpas in _by_namespace(dump, "HorizontalPodAutoscaler").items()
-    }
+    return bool((hpa.get("metadata") or {}).get("ownerReferences"))
 
 
 def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
@@ -1548,7 +1553,9 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
     if replicas < 2:
         return None
     for pdb in context["pdbs"].get(workload["ns"], []):
-        if selector_matches((pdb.get("spec") or {}).get("selector") or {}, workload["pod_labels"]):
+        # A null selector selects nothing in policy/v1; only `{}` selects all.
+        selector = (pdb.get("spec") or {}).get("selector")
+        if selector is not None and selector_matches(selector, workload["pod_labels"]):
             return None
     return {
         "object": f"{workload['kind']}/{workload['name']}",
@@ -1656,7 +1663,9 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):
                 continue
             max_unavailable, min_available = spec.get("maxUnavailable"), spec.get("minAvailable")
-            selector = spec.get("selector") or {}
+            selector = spec.get("selector")
+            if selector is None:
+                continue  # selects no pods in policy/v1, so it blocks nothing
             matched = next(
                 (
                     wl
@@ -1856,6 +1865,8 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
             meta = hpa.get("metadata") or {}
             if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
                 continue
+            if _hpa_is_owned(hpa):
+                continue
             name = meta.get("name", "")
             reconciler = reconciler_of(meta)
             spec = hpa.get("spec") or {}
@@ -1929,6 +1940,8 @@ def check_hpa_floors_at_one(context: dict) -> list[dict]:
             meta = hpa.get("metadata") or {}
             if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
                 continue
+            if _hpa_is_owned(hpa):
+                continue
             spec = hpa.get("spec") or {}
             floor = spec.get("minReplicas")
             floor = DEFAULT_HPA_MIN_REPLICAS if floor is None else floor
@@ -1977,6 +1990,9 @@ _HOSTNAME_KEY = "kubernetes.io/hostname"
 _ZONE_KEY = "topology.kubernetes.io/zone"
 
 
+NODE_SELECTOR_OP_IN = "In"
+
+
 def check_rigid_scheduling(workload: dict, context: dict) -> dict | None:
     node_selector = workload["template"].get("nodeSelector") or {}
     hits = []
@@ -1992,6 +2008,8 @@ def check_rigid_scheduling(workload: dict, context: dict) -> dict | None:
     for term in required.get("nodeSelectorTerms") or []:
         for expr in term.get("matchExpressions") or []:
             values = expr.get("values") or []
+            if expr.get("operator") != NODE_SELECTOR_OP_IN:
+                continue  # `NotIn` a node or zone excludes one; it pins nothing
             if expr.get("key") == _HOSTNAME_KEY and len(values) == 1:
                 hits.append(("critical", f"nodeAffinity pins {_HOSTNAME_KEY}={values[0]}"))
             elif expr.get("key") == _ZONE_KEY and len(values) == 1 and not zonal_storage:
@@ -3088,7 +3106,8 @@ def check_schedule_never_succeeds(context: dict) -> list[dict]:
         finished = [
             job
             for job in entry["jobs"]
-            if (job.get("status") or {}).get("succeeded") or (job.get("status") or {}).get("failed")
+            if ((job.get("status") or {}).get("succeeded") or (job.get("status") or {}).get("failed"))
+            and not (job.get("status") or {}).get("active")
         ]
         if not finished or any((job.get("status") or {}).get("succeeded") for job in finished):
             # An active Job counts as neither, deliberately: an hourly schedule
@@ -3294,7 +3313,7 @@ def check_service_selects_nothing(context: dict) -> list[dict]:
                 "severity": "critical" if svc_type in EXTERNAL_SERVICE_TYPES else "major",
                 "excerpt": (
                     f"type={svc_type} port(s)={ports or 'none'} selector={selector!r}; "
-                    "the EndpointSlices for this Service list no ready, non-terminating "
+                    "the EndpointSlices for this Service list no non-terminating "
                     "address, so every request to it is refused"
                 ),
                 "reconciler": reconciler_of(service.get("metadata") or {}),
@@ -3360,7 +3379,7 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
                 "severity": "critical" if svc_type in EXTERNAL_SERVICE_TYPES else "major",
                 "excerpt": (
                     f"type={svc_type} {asked}; the EndpointSlices carry "
-                    f"{entry['endpoints']} ready address(es) and no entry for that "
+                    f"{entry['endpoints']} non-terminating address(es) and no entry for that "
                     f"port, because {backend} declares {declared}"
                 ),
                 "reconciler": reconciler_of(service.get("metadata") or {}),
@@ -3574,6 +3593,8 @@ def check_host_namespace(workload: dict, context: dict) -> dict | None:
 
 
 _SENSITIVE_HOSTPATHS = ("/", "/etc", "/proc", "/var/run/docker.sock", "/run/containerd/containerd.sock")
+# §2.3's log-shipper pattern, `minor` when every mount of it is read-only.
+_LOG_SHIPPER_HOSTPATHS = ("/var/log", "/var/lib/docker/containers")
 
 
 def check_hostpath_mount(workload: dict, context: dict) -> dict | None:
@@ -3596,14 +3617,25 @@ def check_hostpath_mount(workload: dict, context: dict) -> dict | None:
         return path in _SENSITIVE_HOSTPATHS or path.startswith("/var/lib/kubelet")
 
     critical = any(sensitive(p) or not ro for p, ro in mounted)
+    log_shipper = all(ro and p.startswith(_LOG_SHIPPER_HOSTPATHS) for p, ro in mounted)
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": "; ".join(f"{p} readOnly={ro}" for p, ro in mounted),
-        "severity": "critical" if critical else "major",
+        "severity": "critical" if critical else "minor" if log_shipper else "major",
     }
 
 
 _SYSTEM_PRINCIPAL_RE = re.compile(r"^system:")
+# Kubernetes' own groups: dotless (`apps`, `batch`, `policy`) or under
+# `k8s.io` (`rbac.authorization.k8s.io`). `x-k8s.io` is the SIG-project
+# namespace for CRDs and stays a vendor group.
+_BUILTIN_API_GROUP_SUFFIX = ".k8s.io"
+
+
+def _is_builtin_api_group(group: str) -> bool:
+    """A `*`/`*` over one of these is not an operator owning its own CRDs:
+    over `rbac.authorization.k8s.io` it can grant itself cluster-admin."""
+    return "." not in group or group.endswith(_BUILTIN_API_GROUP_SUFFIX)
 _MANAGED_IDENTITY_RE = re.compile(r"^gke-|^service-\d+@|\.gserviceaccount\.com$")
 _ORG_EMAIL_GROUP_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
@@ -3844,6 +3876,7 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
             if (r.get("apiGroups") or []) == [""]
             or "*" in (r.get("apiGroups") or [])
             or len(set(r.get("apiGroups") or [])) != 1
+            or _is_builtin_api_group((r.get("apiGroups") or [""])[0])
         ]
         if not wildcard_rules:
             continue
@@ -4279,6 +4312,8 @@ def check_default_sa_automount(context: dict) -> list[dict]:
     unsafe_sa_namespaces = set()
     for sa in context.get("serviceaccounts") or []:
         meta = sa.get("metadata") or {}
+        if meta.get("name") != DEFAULT_SERVICE_ACCOUNT:
+            continue
         if sa.get("automountServiceAccountToken") is not False:
             unsafe_sa_namespaces.add(meta.get("namespace", ""))
 
@@ -5080,8 +5115,11 @@ TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
 # finding, and the first one found is enough to act on.
 def _container_trusts_remote_code(c: dict) -> str | None:
     for t in _resolve_argv(c).tokens:
-        if TRUST_REMOTE_CODE_ARG_RE.search(t):
-            return f"arg {t}"
+        match = TRUST_REMOTE_CODE_ARG_RE.search(t)
+        if match:
+            # The match, not the token: an inline `python3 -c` program is one
+            # token, and it can carry a `token=` literal beside the setting.
+            return f"arg setting {match.group(0)}"
     for e in c.get("env") or []:
         if TRUST_REMOTE_CODE_ENV_NAME_RE.search(e.get("name") or "") and str(e.get("value", "")).lower() in ("1", "true", "yes"):
             return f"env {e.get('name')}={e.get('value')}"
@@ -5148,10 +5186,16 @@ def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
 AI_URL_RE = re.compile(r"(^|=)(http|ftp)://")
 AI_MODEL_FLAG_RE = re.compile(r"^--model(-id)?(=|$)")
 AI_REVISION_FLAG_RE = re.compile(r"^--revision(=|$)")
+AI_UNPINNABLE_MODEL_PREFIXES = ("/", "./", "../", "gs://", "s3://", "file://")
+
+
+def _model_value(flag: str) -> str:
+    """`--model=x` and `--model x` both give `x`."""
+    return re.split(r"[=\s]", flag, maxsplit=1)[-1] if re.search(r"[=\s]", flag) else ""
 # Userinfo and query string are where a signed-URL token or a basic-auth
 # password rides along, and this excerpt is published to a public GitHub
 # issue. The scheme, host and path are the whole of what the finding needs.
-AI_URL_CREDENTIAL_RE = re.compile(r"://[^/@\s]*@|\?\S*")
+AI_URL_CREDENTIAL_RE = re.compile(r"://[^@\s]*@|\?\S*")
 
 
 def _ai_safe_url(value: str) -> str:
@@ -5177,6 +5221,10 @@ def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict 
             for i, a in enumerate(flag_argv)
             if AI_MODEL_FLAG_RE.search(a)
         ]
+        # The SOP's Do-NOT-flag: a path an image layer or volume already
+        # populated fetches nothing, and an object store's control is its
+        # versioning and IAM, which `--revision` does not touch.
+        models = [m for m in models if not _model_value(m).startswith(AI_UNPINNABLE_MODEL_PREFIXES)]
         has_revision_flag = any(AI_REVISION_FLAG_RE.search(a) for a in flag_argv)
         # Name the value that tripped the check, not just the container it sat
         # in. The two conditions fail for different reasons and take different
@@ -5763,14 +5811,20 @@ def check_lb_world_open(context: dict) -> list[dict]:
         if not exposed:
             continue
         named = ", ".join(f"{port}/TCP ({_WORLD_OPEN_LB_PORTS[port]})" for port in exposed)
+        ranges = [str(r) for r in spec.get("loadBalancerSourceRanges") or []]
+        ranges_clause = (
+            f"loadBalancerSourceRanges {', '.join(ranges[:3])} that restrict nothing"
+            if ranges
+            else "no loadBalancerSourceRanges"
+        )
         hits.append(
             {
                 "namespace": meta.get("namespace", ""),
                 "object": f"Service/{meta.get('name', '')}",
                 "reconciler": reconciler_of(meta),
                 "excerpt": (
-                    f"type=LoadBalancer, no internal-LB annotation and no "
-                    f"loadBalancerSourceRanges, publishing {named} to 0.0.0.0/0"
+                    f"type=LoadBalancer, no internal-LB annotation and "
+                    f"{ranges_clause}, publishing {named} to 0.0.0.0/0"
                     + (
                         f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, "
                         "none of them private"
@@ -6052,7 +6106,7 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "workload",
         check_no_memory_limit,
         "major",
-        None,
+        "minor",
         # Both arms of §3.2 set their own, so this is unreachable in practice.
         # It stays as the arm that describes a container with no memory request
         # -- the shape the fleet is actually made of -- rather than a third
@@ -6557,6 +6611,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "anonymous-rbac-binding": ("rbac",),
     "netpol-missing": ("netpol", "namespaces", "workloads", "ccnp"),
     "default-sa-automount": ("serviceaccounts", "workloads"),
+    "unbound-sa-automount": ("serviceaccounts", "rbac", "workloads"),
     "workload-identity-off": ("describe",),
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
@@ -6571,6 +6626,8 @@ KCC_CATEGORY = "gcp"
 
 # The four Autopilot CRDs that can lift the admission rules
 # `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` rests on.
+DEFAULT_SERVICE_ACCOUNT = "default"
+
 AUTOPILOT_ALLOWLIST_KINDS = (
     "workloadallowlists.auto.gke.io",
     "allowlistsynchronizers.auto.gke.io",
@@ -6732,6 +6789,18 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     ccnp_argv = ["kubectl", "get", "ccnp", "-A", "-o", "json"]
     ccnp_parsed, ccnp_result = run_and_gate(ccnp_argv, kubeconfig, run=run)
     context["cluster_network_policies"] = [i for i in (ccnp_parsed or {}).get("items", [])] if ccnp_parsed else []
+    # Only the API server's own "not served" answer is absence. A forbidden or
+    # timed-out read on a Dataplane V2 cluster would otherwise report every
+    # namespace a cluster-wide policy covers, and resolve them on the next
+    # good read.
+    if ccnp_parsed is None and RESOURCE_TYPE_ABSENT_MARKER not in ccnp_result.stderr:
+        stderr = ccnp_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        context.setdefault("unevaluated", {})["netpol-missing"] = (
+            f"{UNDETERMINED_PREFIX} `kubectl get ccnp -A` exited {ccnp_result.rc} "
+            f"without saying the type is unserved ({stderr}), so whether a "
+            "cluster-wide policy covers these namespaces was not established. "
+            "This check cleared nothing on this cluster."
+        )
 
     # Ungated for the reason `ccnp` above is: Config Connector is installed on
     # the hub that reconciles the fleet's GCP resources and on nothing else, so
@@ -6797,19 +6866,30 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             "whether anything it owns is stalled -- was not established. This "
             "check cleared nothing on this cluster."
         )
-    if kcc_reason:
+    if kcc_reason.startswith(UNDETERMINED_PREFIX):
+        # Not `not_applicable`: that list leaves the coverage denominator, so
+        # a read that timed out on the hub would publish as complete and let
+        # `finish` resolve every open finding this check filed there.
+        context.setdefault("unevaluated", {})["kcc-object-wedged"] = kcc_reason
+    elif kcc_reason:
         context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
     else:
         commands["kcc-object-wedged"] = _record(
             f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
         )
 
-    sa_argv = ["kubectl", "get", "sa", "-A", "--field-selector", "metadata.name=default", "-o", "json"]
+    # Every ServiceAccount, not only `default`: §2.14 looks up the one each
+    # workload names, and a read narrowed to `default` left it nothing to find
+    # -- every named account read as absent, so the check returned no hits on
+    # any cluster while its command recorded a clean run.
+    sa_argv = ["kubectl", "get", "sa", "-A", "-o", "json"]
     parsed, result = gated(sa_argv)
     if parsed is None:
         raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    commands["default-sa-automount"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
+    sa_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
+    commands["default-sa-automount"] = sa_record
+    commands["unbound-sa-automount"] = sa_record
 
     describe_argv = [
         "gcloud", "container", "clusters", "describe", name, "--location", location, "--project", project,
@@ -6898,7 +6978,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
 
 
 def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
-    """Two dumps, the same shape the SOP's own §2 describes: the workload
+    """Two dumps, the ones the SOP's §2 fallback issues by hand: the workload
     dump backs every `workload`-kind check, the Service dump backs
     `inference-endpoint-public` alone. Either failing fails the whole
     cluster closed, the same trade-off compliance-audit's several
@@ -6936,6 +7016,12 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 # ai-security keeps only what `_is_ai_workload` matches -- so "empty" means a
 # different thing in each and one sentence for all three would be false for two
 # of them.
+# Cluster-kind checks that match against `collected.workloads`, so an empty
+# workload set leaves them nothing to examine exactly as it does a workload
+# check: a PDB is only graded against the workload it covers, and an HPA's
+# floor only against the Service-backed workload it scales.
+_WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"})
+
 _EMPTY_SCOPE_REASON: dict[str, str] = {
     "obtainability-audit": (
         "No workload on this cluster is in scope: every Deployment, StatefulSet, "
@@ -7691,7 +7777,7 @@ def collect_cluster(
         arm_specific = bool(hit.get("impact"))
         if severity == spec.severity and cluster.get("autopilot") and spec.autopilot_severity:
             severity = spec.autopilot_severity
-            impact = f"{impact} (Autopilot: severity downgraded — the platform injects requests at admission.)"
+            impact = f"{impact} (Autopilot: severity downgraded — the platform sets requests and limits at admission.)"
         excerpt = hit["excerpt"]
         if workload and workload.get("suspended"):
             excerpt += _SUSPENDED_CRONJOB_NOTE
@@ -7773,7 +7859,12 @@ def collect_cluster(
             for hit in spec.run(collected.context):
                 candidates.append(emit(spec, hit, hit.get("namespace", "")))
 
-    not_applicable_slugs: set[str] = set()
+    # A check whose own read failed ran against nothing. Its candidates, if
+    # any, rest on the missing input, and a `commands` entry would let
+    # `cross_check_manifest` corroborate it as run and clean.
+    unevaluated = collected.context.get("unevaluated") or {}
+    candidates = [c for c in candidates if c["check"] not in unevaluated]
+    not_applicable_slugs: set[str] = set(unevaluated)
     checks_not_applicable: list[dict] = []
     if audit_id == "compliance-audit" and cluster.get("autopilot"):
         applicable = {spec.slug for spec in checks}
@@ -7818,16 +7909,19 @@ def collect_cluster(
                 f"declared inapplicable",
                 file=sys.stderr,
             )
+        # One candidate falsifies all three: each reason rests on the same
+        # admission rule, and a workload that got past it for one shape says
+        # the rule is not holding here.
+        trio_found = sorted(found & {slug for slug, _ in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE})
+        if trio_found:
+            print(
+                f"[collect] {project}/{name}: {', '.join(trio_found)} produced candidates "
+                f"on Autopilot, so admission is not holding here; §1's node-facing "
+                f"checks are reported as checks that ran",
+                file=sys.stderr,
+            )
         for slug, reason in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE:
-            if slug not in applicable or allowlists or unread:
-                continue
-            if slug in found:
-                print(
-                    f"[collect] {project}/{name}: {slug} is declared inapplicable on "
-                    f"Autopilot but produced candidates here; reporting it as a check "
-                    f"that ran",
-                    file=sys.stderr,
-                )
+            if slug not in applicable or allowlists or unread or trio_found:
                 continue
             not_applicable_slugs.add(slug)
             checks_not_applicable.append({"check": slug, "reason": reason})
@@ -7850,7 +7944,9 @@ def collect_cluster(
         # a cluster running nothing.
         reason = _EMPTY_SCOPE_REASON[audit_id]
         for spec in checks:
-            if spec.kind != "workload" or spec.slug in not_applicable_slugs:
+            if spec.slug in not_applicable_slugs:
+                continue
+            if spec.kind != "workload" and spec.slug not in _WORKLOAD_ANCHORED_CLUSTER_CHECKS:
                 continue
             not_applicable_slugs.add(spec.slug)
             checks_not_applicable.append({"check": spec.slug, "reason": reason})
@@ -7886,6 +7982,10 @@ def collect_cluster(
     }
     if checks_not_applicable:
         result["checks_not_applicable"] = checks_not_applicable
+    if unevaluated:
+        result["checks_unevaluated"] = [
+            {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())
+        ]
     return result
 
 

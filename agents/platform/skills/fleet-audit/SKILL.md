@@ -161,9 +161,9 @@ branch. It prints exactly one JSON line:
   "pending_remediation_requests": ["netpol-missing-payments"],
   "carried": [
     {
-      "id": "cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding",
+      "id": "cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding",
       "check": "cluster-admin-binding",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "",
       "object": "ClusterRoleBinding/debug-binding",
       "title": "ClusterRoleBinding debug-binding grants cluster-admin to a non-system subject"
@@ -329,7 +329,10 @@ coverage gap. An SOP that mentions neither runs `finish` without them, exactly a
 A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
 and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
-`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+`--manifest-file`. A manifest cluster may also carry `checks_unevaluated`, `{check, reason}` for a
+check whose own read failed: it did not run and is not inapplicable, so it goes in neither
+`checks_run` nor `checks_not_applicable` but in that cluster's `limitations`, which keeps the run
+partial and leaves open every finding that check filed there. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
 says how to read its manifest and what is still yours to write — the upgrade and patch readiness
 stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
 streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
@@ -356,7 +359,7 @@ absent on every other run:
   — the existing ledger was rewritten.
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
-- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding"]}`
   — zero findings, but the ledger was **not** closed: it carried findings whose checks this run's own
   `checks_run` says ran again, and the document neither reports nor explains them. Not a clean
   result; report it as [The clean run](#the-clean-run) says.
@@ -424,7 +427,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
   "scope": {
     "clusters": [
       {
-        "name": "prod-us-east",
+        "name": "acme-prod/us-east1/prod-us-east",
         "location": "us-east1",
         "project": "acme-prod",
         "checks_run": [
@@ -443,7 +446,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         ]
       },
       {
-        "name": "prod-autopilot",
+        "name": "acme-prod/us-central1/prod-autopilot",
         "location": "us-central1",
         "project": "acme-prod",
         "checks_run": [
@@ -462,6 +465,10 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
             "reason": "GKE Autopilot: admission rejects privileged: true and the SYS_ADMIN capability for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
           },
           {
+            "check": "host-namespace",
+            "reason": "GKE Autopilot: admission rejects hostNetwork, hostPID and hostIPC for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
+          },
+          {
             "check": "hostpath-mount",
             "reason": "GKE Autopilot: admission rejects write-mode hostPath for in-scope workloads and allows read access under /var/log alone, and this cluster carries no WorkloadAllowlist that would exempt one."
           }
@@ -476,7 +483,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
       "id": "netpol-missing-payments",
       "severity": "critical",
       "title": "payments namespace has no NetworkPolicy",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "payments",
       "object": "Namespace/payments",
       "evidence": {
@@ -499,7 +506,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
   "declared": [
     {
       "check": "no-hpa",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "payments",
       "object": "Deployment/api",
       "title": "api is pinned at three replicas by Terraform",
@@ -551,7 +558,7 @@ field, and publishes nothing:
   - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
     also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
   - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
-    it out ("GKE Autopilot: no user-managed node pools to carry a metadata setting"). Anything
+    it out ("GKE Autopilot: admission rejects privileged: true for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one"). Anything
     under sixteen characters is rejected, which is enough to stop "N/A" and "n/a — autopilot".
 
   These checks leave the coverage denominator instead of counting as missing, so a cluster that ran
@@ -570,7 +577,7 @@ field, and publishes nothing:
   "resolved_because": [
     {
       "check": "cluster-admin-binding",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "object": "ClusterRoleBinding/debug-binding",
       "reason": "kubectl get clusterrolebinding debug-binding returned NotFound; the binding was deleted on 2026-09-16."
     }

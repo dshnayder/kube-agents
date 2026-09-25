@@ -1103,18 +1103,14 @@ class TestNoHpa(unittest.TestCase):
         self.assertIsNone(collect.check_no_hpa(self.wl(kind="StatefulSet"), context_of()))
 
     def test_a_keda_owned_hpa_still_counts_because_it_is_a_real_hpa(self):
-        # hpas_by_namespace excludes KEDA-owned HPAs from other checks, but
-        # an HPA that DOES exist and targets this Deployment still means
-        # "this workload is autoscaled" -- so it should suppress no-hpa if
-        # it were included. Since hpas_by_namespace strips it, this proves
-        # the exclusion means the workload reads as unautoscaled instead,
-        # which is the documented limitation, not a bug: the real config
-        # lives in a CRD this audit does not read.
+        # A KEDA-scaled Deployment is autoscaled. Dropping owned HPAs at the
+        # context told 3.5 otherwise and filed "add an HPA" against a workload
+        # KEDA already scales; only the checks that grade the HPA's own
+        # min/max (3.6, 3.22) skip it.
         ctx = context_of()
-        dump = dump_of(hpa("h", owned=True))
-        ctx["hpas"] = collect.hpas_by_namespace(dump)
-        self.assertEqual(ctx["hpas"], {"default": []})  # namespace key kept, owned HPA filtered out
-        self.assertIsNotNone(collect.check_no_hpa(self.wl(), ctx))
+        ctx["hpas"] = collect.hpas_by_namespace(dump_of(hpa("h", owned=True)))
+        self.assertEqual(len(ctx["hpas"]["default"]), 1)
+        self.assertIsNone(collect.check_no_hpa(self.wl(), ctx))
 
 
 class TestHpaCannotScale(unittest.TestCase):
@@ -3427,6 +3423,7 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         items = self.overlapping()
         for item in items[1:]:
             item["status"]["failed"] = 1
+            item["status"].pop("active", None)  # it has a completionTime
         self.assertEqual(len(self.hits(*items)), 1)
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
@@ -3906,7 +3903,11 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
-        self.assertEqual(set(na), workload_slugs)
+        # The three cluster-kind checks that grade against the workload set
+        # examined nothing either: a PDB is only graded against the workload
+        # it covers, an HPA's floor only against a Service-backed workload.
+        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"}
+        self.assertEqual(set(na), workload_slugs | anchored)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has
         # stopped succeeding or whose runs overlap, and a Service selecting no
@@ -3914,20 +3915,12 @@ class TestCollectCluster(unittest.TestCase):
         # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
         # 3.17 in particular are only ever reachable this way -- neither a
         # CronJob nor a Service is a workload, so a cluster that holds nothing
-        # else still owes all four an answer. `hpa-floors-at-one` and
-        # `pdb-overlapping` are the two cluster-scoped checks that do need a
-        # workload -- the first reads the HPA's target to ask whether a Service
-        # selects it, the second counts the budgets reaching each workload --
-        # and neither is inapplicable here, because a cluster holding no HPA
-        # and no budget has answered both.
-        cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
+        # else still owes all four an answer.
+        cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"} - anchored
         self.assertEqual(
             cluster_slugs,
             {
                 "hpa-cannot-scale",
-                "hpa-floors-at-one",
-                "blocking-pdb",
-                "pdb-overlapping",
                 "schedule-never-succeeds",
                 "cronjob-runs-overlap",
                 "service-selects-nothing",
@@ -4023,7 +4016,7 @@ class TestCollectCluster(unittest.TestCase):
         self.assertIn("PROVISIONING", not_running[0]["error"])
         self.assertIsNone(error)
 
-    def test_autopilot_downgrades_no_requests_but_not_no_memory_limit(self):
+    def test_autopilot_downgrades_no_requests_and_no_memory_limit(self):
         cluster = {**self.CLUSTER, "autopilot": True}
         calls = []
 
@@ -4040,7 +4033,9 @@ class TestCollectCluster(unittest.TestCase):
                 result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
         by_slug = {c["check"]: c for c in result["candidates"]}
         self.assertEqual(by_slug["no-requests"]["severity"], "minor")
-        self.assertEqual(by_slug["no-memory-limit"]["severity"], "major")
+        # Autopilot sets limits equal to requests at admission, so an absent
+        # memory limit is not the unbounded pod §3.2 grades as major.
+        self.assertEqual(by_slug["no-memory-limit"]["severity"], "minor")
         # The downgrade rewrites `impact`, and the arm flag has to survive it:
         # an Autopilot candidate whose sentence lost the marker would let the
         # model's guess at the QoS class publish on exactly the clusters where
@@ -7059,8 +7054,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
                 if kinds == "svc":
                     return Run(argv, 0, json.dumps(dump_of(*svc_items)), "", 0.1)
-                if kinds == "ccnp" and ccnp_run is not None:
-                    return ccnp_run
+                if kinds == "ccnp":
+                    if ccnp_run is not None:
+                        return ccnp_run
+                    # A cluster without Dataplane V2's CRD, and the default:
+                    # only this answer reads as "no cluster-wide policies".
+                    return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "ccnp"', 0.05)
                 if kinds == collect.KCC_CATEGORY:
                     if kcc_items is None:
                         # A cluster not running Config Connector, which is
@@ -7288,7 +7287,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
 
     def kcc_reason(self, result):
-        for entry in result.get("checks_not_applicable") or []:
+        # Absence is a not-applicable reason; a failed read is an unevaluated
+        # one. Either way the reason text is what these tests grade.
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
             if entry["check"] == "kcc-object-wedged":
                 return entry["reason"]
         return None
@@ -7421,11 +7422,11 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("privileged-container", found)
         self.assertNotIn("privileged-container", not_applicable)
         self.assertIn("privileged-container", {c["check"] for c in result["commands"]})
-        # The other two still are: they found nothing, so nothing falsifies
-        # the claim that they cannot apply here.
-        self.assertEqual(
-            not_applicable, {"host-namespace", "hostpath-mount", "kcc-object-wedged"}
-        )
+        # Nor are the other two, though they found nothing: all three rest on
+        # one admission rule, and a privileged pod says it is not holding on
+        # this cluster, so a hostPath or host-namespace pod could be there too.
+        self.assertEqual(not_applicable, {"kcc-object-wedged"})
+        self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
         """The live regression: `node-pools list` 400s on Autopilot, and it was
@@ -7871,7 +7872,7 @@ class TestModelRemoteCodeTrusted(unittest.TestCase):
         env_hit = self.hit({"env": [{"name": "TRUST_REMOTE_CODE", "value": "true"}]})
         self.assertIn("env TRUST_REMOTE_CODE=true", env_hit["excerpt"])
         arg_hit = self.hit({"args": ["--trust-remote-code", "--model", "x"]})
-        self.assertIn("arg --trust-remote-code", arg_hit["excerpt"])
+        self.assertIn("arg setting trust-remote-code", arg_hit["excerpt"])
         self.assertNotIn("env ", arg_hit["excerpt"])
 
     def test_each_flagged_container_carries_its_own_reason(self):
@@ -7882,7 +7883,7 @@ class TestModelRemoteCodeTrusted(unittest.TestCase):
         ]
         w = collect.normalize_ai_workloads(dump_of(w))[0]
         excerpt = collect.check_model_remote_code_trusted(w, {})["excerpt"]
-        self.assertIn("server (arg --trust-remote-code)", excerpt)
+        self.assertIn("server (arg setting trust-remote-code)", excerpt)
         self.assertIn("fetch (env TRUST_REMOTE_CODE=1)", excerpt)
 
     def test_a_directive_inside_an_interpreter_one_liner_still_counts(self):
@@ -10555,6 +10556,137 @@ class TestChecksRevision(unittest.TestCase):
                 manifest = module.collect_fleet(*args, run=run)
                 self.assertEqual(manifest["checks_revision"], module.CHECKS_REVISION)
                 self.assertEqual(manifest["version"], module.MANIFEST_VERSION)
+
+
+class TestAdversarialReviewFixes(unittest.TestCase):
+    """One test per defect the pre-PR adversarial pass confirmed against the
+    collector; each names the failure it would have shipped."""
+
+    def compliance(self, **kw):
+        t = TestComplianceCollectCluster()
+        return t.run_with(**kw)
+
+    # §2.14: the ServiceAccount read was narrowed to `default`, so every named
+    # account read as absent and the check could not fire on any cluster.
+    def test_unbound_sa_automount_fires_end_to_end(self):
+        pod = TestComplianceCollectCluster.benign_pod()
+        pod["spec"]["serviceAccountName"] = "api-sa"
+        ns = pod["metadata"]["namespace"]
+        result = self.compliance(
+            workload_items=[pod],
+            sa_items=[default_sa(ns, automount=False), TestUnboundSaAutomount.sa("api-sa", ns=ns)],
+        )
+        self.assertIn("unbound-sa-automount", {c["check"] for c in result["candidates"]})
+        sa_command = next(c for c in result["commands"] if c["check"] == "unbound-sa-automount")
+        self.assertNotIn("--field-selector", sa_command["command"])
+
+    def test_default_sa_automount_ignores_named_accounts(self):
+        ctx = context_of(
+            serviceaccounts=[TestUnboundSaAutomount.sa("api-sa", ns="default")],
+            workloads=[{"kind": "Pod", "ns": "default", "name": "api", "spec": {}}],
+        )
+        self.assertEqual(collect.check_default_sa_automount(ctx), [])
+
+    # A failed Config Connector read went to `checks_not_applicable`, which
+    # leaves the coverage denominator: the run published complete and resolved
+    # every open kcc-object-wedged finding on the hub.
+    def test_an_undetermined_kcc_read_is_unevaluated_not_inapplicable(self):
+        result = self.compliance(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        na = {e["check"] for e in result.get("checks_not_applicable") or []}
+        self.assertNotIn("kcc-object-wedged", na)
+        self.assertNotIn("kcc-object-wedged", {c["check"] for c in result["commands"]})
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated["kcc-object-wedged"])
+
+    def test_an_absent_kcc_type_is_still_inapplicable(self):
+        result = self.compliance()
+        self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    # Any ccnp failure read as "no cluster-wide policies".
+    def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):
+        forbidden = Run(["kubectl"], 1, "", "Error from server (Forbidden): ccnp is forbidden", 0.05)
+        result = self.compliance(netpol_items=[namespace("default")], ccnp_run=forbidden)
+        self.assertNotIn("netpol-missing", {c["check"] for c in result["candidates"]})
+        self.assertNotIn("netpol-missing", {c["check"] for c in result["commands"]})
+        self.assertIn("netpol-missing", {e["check"] for e in result["checks_unevaluated"]})
+
+    # §3.2's excerpt published the whole token, which for `python3 -c` is the
+    # program -- secrets written inline included.
+    def test_trust_remote_code_excerpt_carries_only_the_setting(self):
+        program = "from x import load; load(token='hf_SECRETSECRET', trust_remote_code=True)"
+        w = ai_workload(container={"command": ["python3", "-c", program]})
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        hit = collect.check_model_remote_code_trusted(w, {})
+        self.assertIsNotNone(hit)
+        self.assertNotIn("hf_SECRET", hit["excerpt"])
+        self.assertIn("trust_remote_code", hit["excerpt"])
+
+    # The vendor-CRD exception suppressed Kubernetes' own groups too, where a
+    # `*` over `rbac.authorization.k8s.io` is self-granted cluster-admin.
+    def test_a_wildcard_over_a_builtin_group_is_flagged(self):
+        for group in ("rbac.authorization.k8s.io", "apps"):
+            with self.subTest(group=group):
+                rule = [{"verbs": ["*"], "resources": ["*"], "apiGroups": [group]}]
+                ctx = context_of(
+                    roles=[cluster_role("r", rule)],
+                    clusterrolebindings=[role_binding("ClusterRole", "r", [subject("ServiceAccount", "app", "default")])],
+                )
+                self.assertEqual(len(collect.check_wildcard_rbac(ctx)), 1)
+
+    def test_a_sig_project_crd_group_stays_a_vendor_group(self):
+        rule = [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["gateway.networking.x-k8s.io"]}]
+        ctx = context_of(
+            roles=[cluster_role("r", rule)],
+            clusterrolebindings=[role_binding("ClusterRole", "r", [subject("ServiceAccount", "app", "default")])],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    # Owned HPAs are skipped only where their min/max is graded.
+    def test_an_owned_hpa_with_one_min_is_not_graded_by_3_6(self):
+        ctx = context_of(hpas={"default": [hpa("h", min_replicas=3, max_replicas=3, owned=True)]})
+        self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    # policy/v1: a null selector selects no pods.
+    def test_a_selectorless_pdb_protects_and_blocks_nothing(self):
+        bare = pdb("p", max_unavailable=0)
+        del bare["spec"]["selector"]
+        ctx = TestBlockingPdb().ctx(bare)
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+        self.assertIsNotNone(collect.check_no_pdb(ctx["workloads"][0], ctx))
+
+    # §3.4's Do-NOT-flag for local and object-store paths.
+    def test_a_local_or_object_store_model_needs_no_revision(self):
+        for value in ("/models/llama", "./m", "gs://bucket/llama", "s3://b/m", "file:///m"):
+            with self.subTest(value=value):
+                self.assertIsNone(TestModelArtifactUnpinnedSource().hit({"args": ["--model", value]}))
+                self.assertIsNone(TestModelArtifactUnpinnedSource().hit({"args": [f"--model={value}"]}))
+        self.assertIsNotNone(TestModelArtifactUnpinnedSource().hit({"args": ["--model", "meta-llama/Llama-3"]}))
+
+    # A `/` in the userinfo password stopped the redaction early.
+    def test_a_password_with_a_slash_is_still_redacted(self):
+        self.assertEqual(collect._ai_safe_url("https://u:pa/ss@host/m"), "https://host/m")
+
+    # §2.3's read-only log-shipper mounts are minor.
+    def test_a_readonly_log_mount_is_minor(self):
+        for path in ("/var/log", "/var/lib/docker/containers"):
+            with self.subTest(path=path):
+                hit = collect.check_hostpath_mount(TestHostpathMount().wl(path, True), context_of())
+                self.assertEqual(hit["severity"], "minor")
+        self.assertEqual(collect.check_hostpath_mount(TestHostpathMount().wl("/var/log", False), context_of())["severity"], "critical")
+
+    # `NotIn` excludes a node; it does not pin to one.
+    def test_a_notin_hostname_affinity_is_not_rigid(self):
+        affinity = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "NotIn", "values": ["node-1"]}]}
+        ]}}}
+        self.assertIsNone(collect.check_rigid_scheduling(TestRigidScheduling().wl(affinity=affinity), context_of()))
+
+    def test_lb_world_open_names_the_ranges_it_found(self):
+        hits = collect.check_lb_world_open({"services": [lb_service(source_ranges=["0.0.0.0/0"])]})
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("no loadBalancerSourceRanges", hits[0]["excerpt"])
+        self.assertIn("0.0.0.0/0", hits[0]["excerpt"])
 
 
 if __name__ == "__main__":
