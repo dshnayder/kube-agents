@@ -432,10 +432,11 @@ _LEDGER_FOOTER_RE = re.compile(
 _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
-# Its `all_findings_block`, same copy rule: every finding id in the document,
-# written only when the body cut some for space. The delta block above then
-# lists the rendered ones alone, and a finding filed but cut would read as
-# never filed.
+# Mirrors the output of its `all_findings_block`, which the script writes but
+# never parses, so no test on that side guards the format: every finding id
+# in the document plus the collector-held ids, written only when the body cut
+# findings for space. The delta block above then lists the rendered ones
+# alone, and a finding filed but cut would read as never filed.
 _ALL_FINDINGS_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
@@ -786,7 +787,7 @@ def _finding_ids(body: str) -> tuple[list[str], str] | None:
     The complete-list block when the body has one, since only a truncated body
     writes it and there the delta block holds the rendered subset; the delta
     block otherwise, which then names every finding. Both by their last match,
-    for the reason ``_ledger_footer`` gives, and the complete list only BELOW
+    for the reason ``_parse_footer`` gives, and the complete list only BELOW
     the last delta block, where ``_render_footer`` puts it: an untruncated
     body has no real one, so a copy an agent wrote into a finding above the
     footer would otherwise outrank the delta block that does.
@@ -1201,14 +1202,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return done(
                     False,
                     f"{ledger['slug']} carries no readable "
-                    "<!-- audit-findings: [...] --> delta block, so the findings "
+                    "<!-- audit-findings: [...] --> delta block (or a malformed "
+                    "audit-findings-all block below it), so the findings "
                     "this run filed cannot be read off it",
                 )
             ids, source = parsed
             text = "\n".join(ids).lower()
-            # Which block: a truncated body whose complete list failed to
-            # parse falls back to the rendered subset, and the reason should
-            # say so rather than read as a finding the agent never filed.
+            # Which block: a truncated body with no complete list below its
+            # delta block (over the script's cap, or a drifted format) grades
+            # the rendered subset, and the reason should say so rather than
+            # read as a finding the agent never filed.
             surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
         else:
             text = ledger["body"].lower()

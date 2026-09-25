@@ -610,7 +610,7 @@ headroom for the trailing marker and for anything a later section appends.
 - **Table caps.** The scope and skipped tables cap at 60 rows each, with a trailing "…and N more"
   row. Without the cap a body with _zero findings_ overflows: 1,200 clusters plus 1,200 skipped
   entries renders 148,627 characters of pure scope.
-- **Order of measurement.** Header, scope, and footer are rendered and measured first; whatever
+- **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
   remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
   measured after the findings and before the evidence appendix, degrading to identity lines and then
   to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
@@ -645,10 +645,13 @@ headroom for the trailing marker and for anything a later section appends.
   ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
   omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
   with every current id and the collector-held ids. Nothing joins against it: the delta keeps
-  reading the rendered marker, for the reason the bullet above gives. Findings are selected once
-  without it and, only if that cut something, again with it charged, so it never truncates a body
-  that would have fit. Above `ALL_FINDINGS_BLOCK_CAP` (12,000 characters) it is left out rather
-  than truncated, since a partial complete list would be the same ambiguity with a different name.
+  reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
+  as new the first run it renders, whatever freed the room. Findings are selected once without the
+  block and, only if that cut something, again with it charged, so it never truncates a body that
+  would have fit; on a body already truncated it costs the findings its length, a handful at
+  typical id lengths, which is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  characters) it is left out rather than truncated, since a partial complete list would be the same
+  ambiguity with a different name.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40

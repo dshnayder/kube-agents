@@ -7164,7 +7164,7 @@ class TestRenderBudget(BaseTestCase):
         (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
         self.assertEqual(sorted(json.loads(payload)), sorted(f["id"] for f in findings))
         self.assertLess(len(audit_report.parse_delta_block(body)), len(findings))
-        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertLessEqual(len(body), GITHUB_BODY_LIMIT)
 
     def test_an_untruncated_body_carries_no_complete_block(self):
         body = self.render(make_doc(findings=bulk_findings(3)))

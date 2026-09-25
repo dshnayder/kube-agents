@@ -1945,6 +1945,21 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
 
 
+def test_the_complete_block_regex_reads_what_audit_report_writes():
+    """_ALL_FINDINGS_RE copies all_findings_block's format, which audit_report
+    writes and never parses. Render the script's own template so a change on
+    that side fails here rather than quietly grading the rendered subset."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (template,) = re.findall(r'f"(<!-- audit-findings-all: \{payload\} -->)"', script.read_text())
+    payload = json.dumps(["a.b.c.d", "e.f.g.h"], separators=(",", ":"))
+    body = _ledger_body() + template.replace("{payload}", payload) + "\n"
+    parsed = verifiers._finding_ids(body)
+    assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
     """A positive body-scoped phrase must not be a substring of any check slug.
 
