@@ -582,8 +582,9 @@ class CallSiteTest(unittest.TestCase):
         # Two cases grade fleet-consistency-drift; their task locks differ, so
         # without this one lane's reset closes the other lane's live ledger
         # and the other's finish lands in this lane's fresh one. The stream
-        # lock is taken after the task lock (one order everywhere, no cycle),
-        # only when the case names a stream, and released on every exit.
+        # lock is taken after the task lock and before the infra lock (one
+        # order everywhere, no cycle), only when the case names a stream, and
+        # released on every exit.
         unit = lifted("run_one_unit")
         task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
@@ -597,8 +598,13 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(launch, stream_release)
         self.assertLess(stream_release, task_release)
         self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
-        # Released on the mint-failure path as well as after the run.
-        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 2)
+        # Released on the infra-lock and mint-failure paths as well as after
+        # the run.
+        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 3)
+        # Before the infra lock: a stack-bearing unit waiting on its stream
+        # must not hold the one tofu lane while it waits.
+        infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
+        self.assertLess(stream_lock, infra_lock)
         # One deadline for both locks, and it is the single-unit figure times
         # the cases on the stream: a task-lock holder on a shared stream waits
         # its turn on the stream before its own run, so a same-task successor

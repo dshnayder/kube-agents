@@ -2516,7 +2516,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # also writes, the holder first waits its turn on the stream lock, so the
   # deadline is that figure times the cases on the stream; alone on its
   # stream, or writing none, a case keeps the single-unit figure. The infra
-  # lock keeps its default: audit units carry no stack.
+  # lock keeps its default: it is taken last, after any stream wait, so it is
+  # held only while this unit's own stack is in use.
   local audit_id lock_deadline
   audit_id="$(ledger_audit_id_for_task "${task}")"
   lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"
@@ -2524,20 +2525,24 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
-    lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
-    return 0
-  fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
-  # one stream (the consistency pair, the patch pair) must not reset and
-  # rewrite each other's ledger mid-run. The same scaled
+  # one stream (the consistency pair, the patch pair, the obtainability pair)
+  # must not reset and rewrite each other's ledger mid-run. The same scaled
   # deadline: a waiter here outlasts the other cases' units on the stream.
+  # Taken before the infra lock, not after: a stack-bearing unit that shares
+  # its stream with a stackless one would otherwise sit on the infra lock for
+  # the whole of the other's audit, and every tofu unit behind it would run
+  # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.
   if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
-    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2
+    return 0
+  fi
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
   fi
   # This unit's own token, minted rather than inherited, and minted after the

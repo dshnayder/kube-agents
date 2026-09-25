@@ -13,8 +13,8 @@
 # collector's candidate reaching a filed finding end to end.
 #
 # WHY THE CASE PLANTS ITS OWN SERVICE (prebuilt/orphan-service, on the host
-# cluster). The seeded fleet carries no selector-less-backend Service, and it
-# is shared by every case; a namespace-scoped plant created and torn down per
+# cluster). The seeded fleet carries no Service whose selector matches no
+# pod, and it is shared by every case; a namespace-scoped plant created and torn down per
 # run changes nothing another case reads. The plant runs nothing: no pod, no
 # image, no external address.
 #

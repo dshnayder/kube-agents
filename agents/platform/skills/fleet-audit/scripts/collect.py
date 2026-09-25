@@ -136,6 +136,10 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 # It still exits 0 with a JSON array, so the silent zones' clusters would read
 # as clusters that do not exist. See `fleet_drift.ZONE_TIMEOUT_MARKER`.
 ZONE_TIMEOUT_MARKER = "did not respond"
+# kubectl's words for a resource type the API server does not serve. Only this
+# answer reads as "absent"; a Forbidden, a 5xx or a refused connection also
+# exits non-zero and says nothing about whether the type exists.
+RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
 ERROR_EXCERPT_CHARS = 300
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -6565,6 +6569,15 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
 # ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
 KCC_CATEGORY = "gcp"
 
+# The four Autopilot CRDs that can lift the admission rules
+# `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` rests on.
+AUTOPILOT_ALLOWLIST_KINDS = (
+    "workloadallowlists.auto.gke.io",
+    "allowlistsynchronizers.auto.gke.io",
+    "allowlistedworkloads.auto.gke.io",
+    "allowlistedv2workloads.auto.gke.io",
+)
+
 # The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because a
 # category read is not one list call. `kubectl` expands `gcp` to every CRD
 # carrying the category -- 221 of them on this fleet's hub -- and issues a list
@@ -6757,13 +6770,24 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             "stalled -- was not established. This check cleared nothing on "
             "this cluster."
         )
-    elif kcc_result.rc != 0:
+    elif kcc_result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in kcc_result.stderr:
         kcc_reason = (
             f"Config Connector is not installed on this cluster: `kubectl get "
-            f"{KCC_CATEGORY} -A` exited {kcc_result.rc}, which is what the API "
-            "server answers for a resource type it does not serve. Nothing "
-            "here declares a GCP resource. This fleet runs one Config "
-            "Connector, on the hub cluster."
+            f"{KCC_CATEGORY} -A` answered that the server does not serve the "
+            "category. Nothing here declares a GCP resource. This fleet runs "
+            "one Config Connector, on the hub cluster."
+        )
+    elif kcc_result.rc != 0:
+        # Any other failure -- Forbidden, one CRD in the category refusing to
+        # list, an API server error -- is a read that failed, and the cluster
+        # most likely to produce one is the hub the check exists for.
+        stderr = kcc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        kcc_reason = (
+            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited "
+            f"{kcc_result.rc} without saying the category is unserved "
+            f"({stderr}), so whether Config Connector is installed here -- and "
+            "whether anything it owns is stalled -- was not established. This "
+            "check cleared nothing on this cluster."
         )
     elif kcc_parsed is None:
         kcc_reason = (
@@ -6849,24 +6873,26 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # shape rules out -- so read for it rather than assert its absence in a
     # reason string an operator is meant to trust.
     #
-    # Non-gated, for the reason the `ccnp` read above is: the four CRDs come
-    # from Autopilot itself, so a cluster without them answers "the server
-    # doesn't have a resource type", which is the answer (no allowlists) and
-    # not a missing input. The residual risk is an RBAC denial reading as
-    # absence; it is the same trade the `ccnp` read makes, and it fails to the
-    # behaviour that predates this read rather than past it.
+    # One read per type, not one multi-type read: kubectl resolves every type
+    # before listing any, so a cluster serving three of the four CRDs would
+    # fail the combined read outright. A type the server does not serve is the
+    # answer (none of that kind); any other failure leaves the allowlist state
+    # unknown, and `collect_cluster` then declares nothing, because each reason
+    # asserts no allowlist exists.
     if cluster.get("autopilot"):
-        allowlist_argv = [
-            "kubectl", "get",
-            "workloadallowlists.auto.gke.io,allowlistsynchronizers.auto.gke.io,"
-            "allowlistedworkloads.auto.gke.io,allowlistedv2workloads.auto.gke.io",
-            "-o", "json",
-        ]
-        allowlist_parsed, _ = run_and_gate(allowlist_argv, kubeconfig, run=run)
-        context["autopilot_allowlists"] = [
-            f"{i.get('kind') or '?'}/{(i.get('metadata') or {}).get('name', '')}"
-            for i in (allowlist_parsed or {}).get("items", []) or []
-        ]
+        allowlists: list[str] = []
+        unread: list[str] = []
+        for kind in AUTOPILOT_ALLOWLIST_KINDS:
+            parsed, result = run_and_gate(["kubectl", "get", kind, "-o", "json"], kubeconfig, run=run)
+            if parsed is not None:
+                allowlists.extend(
+                    f"{i.get('kind') or '?'}/{(i.get('metadata') or {}).get('name', '')}"
+                    for i in parsed.get("items", []) or []
+                )
+            elif not (result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in result.stderr):
+                unread.append(kind)
+        context["autopilot_allowlists"] = allowlists
+        context["autopilot_allowlists_unread"] = unread
 
     return CollectedContext(context, context["workloads"], commands)
 
@@ -7719,7 +7745,7 @@ def collect_cluster(
         #
         # This used to be workload-only, on the premise that "a cluster-scoped
         # hit has no object whose spec a controller could be holding". That is
-        # false for six of the ten cluster checks -- `inference-endpoint-public`
+        # false for most cluster checks -- `inference-endpoint-public`
         # names a Service, `blocking-pdb` a PodDisruptionBudget,
         # `hpa-cannot-scale` an HPA, the two RBAC checks a binding or a role,
         # and `default-sa-automount` a workload it reached without iterating
@@ -7775,6 +7801,7 @@ def collect_cluster(
         # or not any check fired. `_collect_compliance` reads for them; the
         # three then report as checks that ran, which they did.
         allowlists = collected.context.get("autopilot_allowlists") or []
+        unread = collected.context.get("autopilot_allowlists_unread") or []
         if allowlists:
             print(
                 f"[collect] {project}/{name}: {len(allowlists)} Autopilot workload "
@@ -7783,8 +7810,16 @@ def collect_cluster(
                 f"reported as checks that ran rather than declared inapplicable",
                 file=sys.stderr,
             )
+        elif unread:
+            print(
+                f"[collect] {project}/{name}: could not read {', '.join(unread)}; "
+                f"whether an allowlist exempts admission here is unknown, so §1's "
+                f"node-facing checks are reported as checks that ran rather than "
+                f"declared inapplicable",
+                file=sys.stderr,
+            )
         for slug, reason in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE:
-            if slug not in applicable or allowlists:
+            if slug not in applicable or allowlists or unread:
                 continue
             if slug in found:
                 print(

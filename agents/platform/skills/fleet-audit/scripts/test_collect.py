@@ -7073,11 +7073,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     if callable(kcc_items):
                         return kcc_items(argv, **kwargs)
                     return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
-                if kinds.startswith("workloadallowlists"):
-                    if allowlist_items is None:
-                        # What a cluster without the CRDs answers, which is
-                        # every Standard cluster and the default here.
-                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "workloadallowlists"', 0.05)
+                if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
+                    if callable(allowlist_items):
+                        return allowlist_items(argv, **kwargs)
+                    if allowlist_items is None or kinds != collect.AUTOPILOT_ALLOWLIST_KINDS[0]:
+                        # What a cluster without the CRD answers, which is
+                        # every Standard cluster and the default here. A list
+                        # answers the first kind alone.
+                        return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds}"', 0.05)
                     return Run(argv, 0, json.dumps(dump_of(*allowlist_items)), "", 0.05)
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return Run(argv, 0, json.dumps(describe), "", 0.1)
@@ -7235,7 +7238,40 @@ class TestComplianceCollectCluster(unittest.TestCase):
         """The CRDs only exist on Autopilot and the table only applies there,
         so the read has nothing to inform on a Standard cluster."""
         self.run_with()
-        self.assertEqual([a for a in self.issued if a[:2] == ["kubectl", "get"] and a[2].startswith("workloadallowlists")], [])
+        self.assertEqual([a for a in self.issued if a[:2] == ["kubectl", "get"] and a[2] in collect.AUTOPILOT_ALLOWLIST_KINDS], [])
+
+    def test_an_unreadable_allowlist_type_withdraws_every_declaration(self):
+        """kubectl resolves every type of a multi-type read before listing any,
+        so the read is one call per type. One type that fails for a reason
+        other than being unserved -- Forbidden here -- leaves the allowlist
+        state unknown, and every reason asserts no allowlist exists."""
+        def answer(argv, **kwargs):
+            if argv[2] == collect.AUTOPILOT_ALLOWLIST_KINDS[-1]:
+                return Run(argv, 1, "", 'Error from server (Forbidden): allowlistedv2workloads.auto.gke.io is forbidden', 0.05)
+            return Run(argv, 0, json.dumps(dump_of()), "", 0.05)
+
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"})
+        self.assertLessEqual(
+            {"privileged-container", "host-namespace", "hostpath-mount"},
+            {c["check"] for c in result["commands"]},
+        )
+
+    def test_an_unserved_allowlist_type_beside_served_empty_ones_still_declares(self):
+        """A cluster on a GKE version serving some of the four CRDs: the
+        unserved one is the answer for its kind, the served ones list nothing,
+        and the declarations stand."""
+        def answer(argv, **kwargs):
+            if argv[2] == collect.AUTOPILOT_ALLOWLIST_KINDS[-1]:
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.05)
+            return Run(argv, 0, json.dumps(dump_of()), "", 0.05)
+
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
+        self.assertEqual(
+            {e["check"] for e in result["checks_not_applicable"]},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+        )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
         """A Standard cluster with in-scope workloads rules out nothing the
@@ -7277,6 +7313,20 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(kcc_items=[])
         reason = self.kcc_reason(result)
         self.assertIn("declares no GCP resources", reason)
+        self.assertNotIn("not installed", reason)
+
+    def test_a_forbidden_gcp_read_is_undetermined_not_absence(self):
+        """Only kubectl's "doesn't have a resource type" says the category is
+        unserved. A Forbidden, or one CRD in the category refusing to list,
+        also exits non-zero, and on the hub it would otherwise publish that
+        Config Connector is not installed where it is."""
+        result = self.run_with(
+            kcc_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): computefirewalls.compute.cnrm.cloud.google.com is forbidden", 0.1)
+        )
+        reason = self.kcc_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("Forbidden", reason)
+        self.assertIn("cleared nothing", reason)
         self.assertNotIn("not installed", reason)
 
     def test_a_timed_out_gcp_read_is_undetermined_not_absence(self):
