@@ -112,7 +112,9 @@ already uses, so a person sees it the same day.
 **What the experiment found.** On 11 bursty test clusters, day-ahead forecasts landed within
 −10%/+5% of the real value 57% of the time: better than repeating yesterday (45%), far from good
 enough to act on. Forecasting 8 hours ahead halved the typical miss. On a real customer staging
-cluster with steady load, the bad-day overshoot of an 8-hour memory forecast fell from 20% to 4%.
+cluster with steady load, the bad-day overshoot of an 8-hour memory forecast fell from 20% to 4%,
+but only because the load barely moved: repeating the last hour's value did as well, and TimesFM
+missed the rises a warning is for.
 One CPU container forecasts 64 series in about 20 seconds from 7 days of history, so forecasting
 never lags the horizon. The [Experiment](#experiment) section has the numbers.
 
@@ -223,11 +225,13 @@ finding rather than the actuator:
 
 ### Enabling predictive mode: opt-in, per cluster
 
-The [experiment](#experiment) found that predictability belongs to the cluster, not the model. The
+The [experiment](#experiment) found that forecast error belongs to the cluster, not the model. The
 same forecaster that overshot memory by 20% on a bad day on the bursty evaluation hosts overshot by
-4% on a customer staging cluster with steady load. A fleet-wide yes or no would be wrong for one of
-them. The mode is therefore gated per cluster, and a cluster earns predictions by showing, on its
-own history, that they would have been right.
+4% on a customer staging cluster with steady load. A low error alone does not earn a prediction,
+though: on that steady cluster, repeating the last hour's value did as well as TimesFM, and that is
+what the proactive mode already sees. A fleet-wide yes or no would be wrong, and so would a bar on
+error alone. The mode is therefore gated per cluster, and a cluster earns predictions by showing, on
+its own history, that they would have been right.
 
 Predictive mode is opt-in and off by default. When an operator enables it, each cluster under
 management moves through three states:
@@ -235,9 +239,10 @@ management moves through three states:
 - **`probing`.** The probe runs the experiment on the cluster's own recent history: a rolling-origin
   backtest, cut at points in the past, forecasting forward only from what was known then, and
   scoring against what happened, as in the experiment. It checks the costly side first: how far
-  forecasts overshoot on a bad day at the horizons the mode uses, and whether TimesFM beats
-  seasonal-naive there. A cluster that clears the bar moves to `predicting`, and one that does not
-  moves to `unpredictable`. Nothing is acted on while probing.
+  forecasts overshoot on a bad day at the horizons the mode uses, and whether TimesFM beats both the
+  last value repeated and seasonal-naive on the peak of each window there. A series class that only
+  matches the last value has nothing to predict. A cluster that clears the bar moves to
+  `predicting`, and one that does not moves to `unpredictable`. Nothing is acted on while probing.
 - **`predicting`.** The sweep computes the cluster's future values and acts on them through the
   normal finding path. Every prediction is stored with its horizon. When the period it covers has
   passed and the real values are available, it is scored against them. That rolling score is the
@@ -653,8 +658,12 @@ cannot, and a mode built on forecasts is only as useful as its record of being r
 On the fleet's own series, a rolling-origin backtest: cut each series at points in the past,
 forecast forward from what was known at that point only, and compare against what happened. Point
 in time is strict; a context that leaks one future point invalidates the result. Report the
-forecast-level and decision-level [metrics](#metrics) per series class against two baselines,
-seasonal-naive and linear. This is the experiment the [order of work](#order-of-work) gates on.
+forecast-level and decision-level [metrics](#metrics) per series class against three baselines:
+the last value repeated, seasonal-naive and linear. Score the peak of each forecast window against
+the peak that came, both the miss and the overshoot, as well as the per-point error. The last value
+is the bar that matters most, because it is what the proactive mode already sees; the
+[experiment](#experiment) found TimesFM's 8-hour peak indistinguishable from it. This is the
+experiment the [order of work](#order-of-work) gates on.
 
 #### Calibration
 
@@ -976,6 +985,38 @@ On bursty clusters like these, day-ahead forecasts of CPU and memory are not acc
 act on. One busy customer staging cluster forecast far better than the evaluation hosts (a bad-day
 memory overshoot of 4% against 20%, 8 hours ahead), so the answer depends on the cluster. That is
 why prediction is gated per cluster by a probe
+**Eight hours ahead, TimesFM forecasts the last hour.** A later pass added the cheapest baseline
+the backtest had left out: repeat the last hour's value for the whole window. It then compared the
+peak each method forecast for the next 8 hours with the peak that came, since a warning is about
+the peak. On the staging cluster, 129 cut points with 7 days of history, the forecast peak against
+the actual peak was (median, then the worst miss and the worst overshoot in 1 window in 10):
+
+| Series           | TimesFM          | Last hour repeated | Same hours yesterday |
+| ---------------- | ---------------- | ------------------ | -------------------- |
+| Cluster CPU used | −9% (−23%, +2%)  | −9% (−23%, +2%)    | 0% (−21%, +25%)      |
+| Container CPU    | −7% (−32%, +1%)  | −6% (−27%, +1%)    | 0% (−18%, +20%)      |
+| Memory           | −1% (−8%, 0%)    | −1% (−7%, 0%)      | 0% (−6%, +6%)        |
+| Node count       | −10% (−17%, +1%) | −9% (−17%, +2%)    | +2% (−17%, +17%)     |
+
+On the staging cluster, TimesFM and the last hour are the same forecast to within a point, and on
+the evaluation hosts within four (cluster CPU −31% against −27%). Their average error agrees too:
+6.8% against 7.5% for staging cluster CPU over 8 hours, 9.4% against 9.5% over 24. The staging
+cluster did not forecast better because the model read its load. Its load changes less: memory
+moves 5% in a typical day and requested CPU 7%, against 22% and 54% on the evaluation hosts. Any
+forecast looks good on a quiet series. Where the staging load did rise, TimesFM missed it: about 40%
+of 8-hour CPU windows peaked more than 15% above the current value, and in those TimesFM forecast a
+peak 18–20% below the real one. The experiment's `results/baselines.md` has every series and both
+clusters.
+
+Repeating yesterday is no substitute. It centres on the real peak and misses less, but in 1 window
+in 10 it overshoots by 17–25% on the staging cluster and by up to 155% on the evaluation hosts, and
+each overshoot is a false alarm. A last-hour forecast is not a forecast at all: it is the current
+value, which the proactive mode already watches. So where TimesFM matches it, forecasting adds
+nothing and costs a forecaster. The [probe](#enabling-predictive-mode-opt-in-per-cluster) must
+therefore compare against both baselines, and a series class runs on TimesFM only where it beats
+them on the peak. The comparison used the median forecast. The day's q90 was already shown above
+to cover the real daily maximum only 26–29% of the time, so the upper quantiles do not rescue it.
+
 ([Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster)). Trend-driven resources
 such as disks remain untested: no disk on these clusters lived long enough to forecast.
 
