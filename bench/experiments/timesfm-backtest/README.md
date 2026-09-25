@@ -63,7 +63,7 @@ little beyond occasional tests of pull-request changes, so its near-idle series 
 score; the evaluation hosts carry the load the question is about. It is still collected and
 forecast, and taking it out of `EXCLUDED_CLUSTERS` restores it.
 
-A second corpus comes from one busy staging cluster of a Google first-party customer, GKE
+A second corpus comes from one busy staging cluster in our own organisation, GKE
 Autopilot with about ten nodes, collected the same way with `--target` for the 41 days to
 2026-09-24. It is not a test host: its load is a real service's. Only `window.py` runs on it,
 and neither its corpus nor its name is committed.

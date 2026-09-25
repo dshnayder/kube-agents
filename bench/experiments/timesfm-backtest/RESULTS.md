@@ -54,7 +54,7 @@ What this means for the predictive agent:
 within −10%/+5% for CPU, memory or node count on clusters like these. The data supports
 forecasting memory and node count a few hours ahead, where TimesFM beats repeating yesterday
 and over-forecasts less. That use has not been tested against what the proactive agent already
-sees from current values. One busy customer staging cluster forecast far better than the
+sees from current values. One busy staging cluster forecast far better than the
 evaluation hosts: a bad-day memory overshoot of 4% against 20%, 8 hours ahead
 ([staging cluster](#a-busy-staging-cluster-forecasts-far-better)). Predictability is therefore a
 property of the cluster. The design gates prediction per cluster on a probe that runs this
@@ -231,7 +231,7 @@ does not see them coming. [`results/decision.md`](results/decision.md) has the t
 ### A busy staging cluster forecasts far better
 
 The evaluation hosts are small and bursty by design. To see whether that drives the result, we
-ran the 8-against-24-hour test on one real staging cluster of a Google first-party customer:
+ran the 8-against-24-hour test on one staging cluster in our own organisation:
 GKE Autopilot, about ten nodes, serving a real service's load. Its corpus is 50 series over the
 same 41 days: 23 container memory, 23 container CPU, cluster CPU used and requested, node count,
 and one disk volume. Forecasts started every 6 hours, 129 start times, with 7 days of history:
@@ -321,7 +321,7 @@ minutes on one such container. The GKE run, one replica with 14 cores, was faste
   to TimesFM as covariates. That is the one way to forecast a burst's timing, and it was not
   tried.
 - **A different fleet.** The evaluation hosts run the harness's own bursty workloads. One
-  customer staging cluster with steadier traffic forecast far better
+  staging cluster with steadier traffic forecast far better
   ([above](#a-busy-staging-cluster-forecasts-far-better)); a fleet of such clusters, scored point
   by point, would test that properly.
 
