@@ -52,11 +52,11 @@ after a probe, a test on the cluster's own history, shows its load can be foreca
 predictions start going wrong.
 
 What the evidence says so far: TimesFM's forecasts are not yet accurate enough to act on. On bursty
-test clusters, forecasts a day ahead were too far off. On a real customer staging cluster, 8-hour
-forecasts looked accurate, but only because the load changed little. Simply assuming the load would
-stay at its current level was just as accurate, and when the load did go up, TimesFM did not predict
-it. Forecasting is cheap, seconds per request on a CPU, so cost is not the obstacle; accuracy is.
-Nothing is built yet.
+test clusters, forecasts a day ahead were too far off. On a staging cluster running real traffic,
+8-hour forecasts looked accurate, but only because the load changed little. Simply assuming the load
+would stay at its current level was just as accurate, and when the load did go up, TimesFM did not
+predict it. Forecasting is cheap, seconds per request on a CPU, so cost is not the obstacle;
+accuracy is. Nothing is built yet.
 
 ## Summary
 
@@ -122,12 +122,12 @@ event watcher already uses, so a person sees it the same day.
 clusters, a forecast made a day ahead was close to the real value (no more than 5% too high or 10%
 too low) only 57% of the time. That is better than assuming today will repeat yesterday (45%), but
 far from good enough to act on. Forecasting 8 hours ahead instead of 24 halved the typical error. On
-a real customer staging cluster, 8-hour forecasts were much closer to the real values, but mainly
-because that cluster's load changed little during the day. Assuming the load would stay at its last
-hourly value was just as accurate. When the load did go up, TimesFM predicted it would stay near its
-current level, so it would not have raised a warning. Speed is not a problem: one CPU container
-forecasts 64 series from 7 days of history in about 20 seconds. The [Experiment](#experiment)
-section has the numbers.
+a staging cluster running real traffic, 8-hour forecasts were much closer to the real values, but
+mainly because that cluster's load changed little during the day. Assuming the load would stay at
+its last hourly value was just as accurate. When the load did go up, TimesFM predicted it would stay
+near its current level, so it would not have raised a warning. Speed is not a problem: one CPU
+container forecasts 64 series from 7 days of history in about 20 seconds. The
+[Experiment](#experiment) section has the numbers.
 
 **What gets built first.** A metrics collector, then the forecaster service tested against past data
 from a real fleet, then the feature itself. Each type of series first runs in shadow mode, where
@@ -245,7 +245,7 @@ than about who makes the change:
 
 The [experiment](#experiment) found that how accurate a forecast is depends more on the cluster than
 on the model. The same forecaster that overshot memory by 20% on a bad day on the bursty test
-clusters overshot by only 4% on a customer staging cluster with steady load. A low error is not
+clusters overshot by only 4% on a staging cluster with steady load. A low error is not
 enough on its own, though. On that steady cluster, assuming the value would stay at its last hourly
 level was just as accurate as TimesFM, and the proactive mode already watches the current value. So
 neither a single fleet-wide decision nor a check on error alone will do. The mode is enabled per
@@ -981,7 +981,7 @@ The experiment is a backtest. It picks many starting points in the past. At each
 reads the days before that point and forecasts the next 24 hours in five-minute steps, and the
 forecast is compared with what actually happened. The same is done with simple forecasts for
 comparison. The data comes from two places: the 11 clusters this project's CI uses for evaluation
-(called the test clusters below), and one customer staging cluster.
+(called the test clusters below), and one staging cluster that runs real traffic.
 
 ### What it tested
 
@@ -1059,7 +1059,7 @@ crossing a threshold were rarely wrong, but they caught only 3 of 148 crossings 
 day; the proactive agent already sees the rest.
 
 On bursty clusters like these, day-ahead forecasts of CPU and memory are not accurate enough to act
-on. One busy customer staging cluster looked much better (on a bad day, an 8-hour memory forecast
+on. One busy staging cluster looked much better (on a bad day, an 8-hour memory forecast
 was 4% too high, against 20% on the test clusters), which suggested the answer depends on the
 cluster. That is why prediction is decided per cluster by a probe
 ([Enabling predictive mode](#enabling-predictive-mode-opt-in-per-cluster)). Series that grow
