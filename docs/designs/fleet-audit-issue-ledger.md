@@ -644,10 +644,11 @@ headroom for the trailing marker and for anything a later section appends.
   machine-readable record that a cut finding was filed at all, so a grader or a script reading the
   ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
   omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
-  with every current id. Nothing joins against it: the delta keeps reading the rendered marker, for
-  the reason the bullet above gives. It is charged against the budget up front and left out,
-  rather than truncated, above `ALL_FINDINGS_BLOCK_CAP` (12,000 characters), since a partial
-  complete list would be the same ambiguity with a different name.
+  with every current id and the collector-held ids. Nothing joins against it: the delta keeps
+  reading the rendered marker, for the reason the bullet above gives. Findings are selected once
+  without it and, only if that cut something, again with it charged, so it never truncates a body
+  that would have fit. Above `ALL_FINDINGS_BLOCK_CAP` (12,000 characters) it is left out rather
+  than truncated, since a partial complete list would be the same ambiguity with a different name.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -1166,6 +1167,8 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 
 - A run of 250 findings renders a body at or under the limit.
 - The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
+- A truncated body's `audit-findings-all` block lists every finding id; an untruncated body carries
+  none, and a list over `ALL_FINDINGS_BLOCK_CAP` is left out.
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
 - The clean-run comment stays under the limit with 900 skipped clusters.

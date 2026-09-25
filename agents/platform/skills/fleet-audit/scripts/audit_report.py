@@ -648,8 +648,9 @@ MAX_IDENT_CHARS = 320
 MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
 # Ceiling on the `audit-findings-all` block a truncated ledger carries. It is
-# charged before findings are selected, so it is bounded to a slice of the
-# budget: past this a fleet keeps its findings and loses the complete list.
+# charged against the findings when the body is truncated anyway, so it is
+# bounded to a slice of the budget: past this a fleet keeps its findings and
+# loses the complete list.
 ALL_FINDINGS_BLOCK_CAP = 12_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
@@ -4280,7 +4281,10 @@ def delta_block(ids: list[str]) -> str:
 
 
 def all_findings_block(ids: list[str]) -> str:
-    """Every finding id in the document, for a body that could not render them all.
+    """Every id the delta block would carry uncut, for a body that could not render them all.
+
+    The document's findings and the collector-held ids both, so a grader that
+    reads this block in place of the delta block loses neither half.
 
     Machine-read by graders and never by `finish`: the delta still joins
     against `audit-findings`, the rendered set, for the reason `compute_delta`
@@ -7060,11 +7064,14 @@ def render_issue_body(
     # select_rendered_findings. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
-    # The complete id list is charged whether or not the body turns out to
-    # need it: which findings are cut is not known until they are selected,
-    # and a charge taken afterwards could only be paid by cutting more.
-    all_block = all_findings_block(finding_ids(findings))
-    overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids, all_block)))
+    # The complete id list — the document's findings and the held ids, the
+    # delta block's two halves at full width — rides only a truncated body,
+    # and which findings are cut is not known until they are selected. So
+    # select once without it and, only when that cut something, again with it
+    # charged: charging it up front cut findings from a body that would
+    # otherwise have rendered them all, to make room for a list of the cut.
+    all_block = all_findings_block(finding_ids(findings) + held_ids)
+    overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
     # from is never the thing the findings squeeze out.
     overhead += len("\n".join(_render_held_ids_only(held_entries)))
@@ -7074,13 +7081,18 @@ def render_issue_body(
         # part of any single finding's charged cost.
         overhead += index_overhead(findings, states, pr_urls)
 
-    findings_lines, omitted = _render_findings(
-        findings,
-        max(BODY_BUDGET - overhead, 0),
-        states=states,
-        pr_urls=pr_urls,
-        gaps=gaps,
-    )
+    def select(extra: int) -> tuple[list[str], list[dict]]:
+        return _render_findings(
+            findings,
+            max(BODY_BUDGET - overhead - extra, 0),
+            states=states,
+            pr_urls=pr_urls,
+            gaps=gaps,
+        )
+
+    findings_lines, omitted = select(0)
+    if omitted and all_block:
+        findings_lines, omitted = select(len("\n" + all_block))
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 

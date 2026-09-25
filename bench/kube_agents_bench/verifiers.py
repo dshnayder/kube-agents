@@ -747,7 +747,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     hidden ``audit-findings`` delta block is rendered after it — but nothing
     the agent writes can ever appear below it, so the final match is the one
     ``audit_report.py`` wrote. Same reason ``_finding_ids`` reads
-    ``matches[-1]``.
+    the last match.
     """
     match = None
     for match in _LEDGER_FOOTER_RE.finditer(body):
@@ -780,8 +780,8 @@ def _parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _finding_ids(body: str) -> list[str] | None:
-    """This run's finding ids, or None when the ledger carries no block.
+def _finding_ids(body: str) -> tuple[list[str], str] | None:
+    """This run's finding ids and the block they came from, or None when the ledger carries no block.
 
     The complete-list block when the body has one, since only a truncated body
     writes it and there the delta block holds the rendered subset; the delta
@@ -796,13 +796,14 @@ def _finding_ids(body: str) -> list[str] | None:
         return None
     last = deltas[-1]
     complete = [m for m in _ALL_FINDINGS_RE.finditer(body) if m.start() > last.end()]
+    source = "audit-findings-all" if complete else "audit-findings"
     try:
         ids = json.loads((complete or deltas)[-1].group(1))
     except (ValueError, TypeError):
         return None
     if not isinstance(ids, list):
         return None
-    return [i for i in ids if isinstance(i, str)]
+    return [i for i in ids if isinstance(i, str)], source
 
 
 @VERIFIERS.register("ledger_issue_contains")
@@ -872,7 +873,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
 
     ``finding_ids`` — only the ids in the hidden ``<!-- audit-findings: … -->``
     delta block (or, on a body truncated for size, the
-    ``<!-- audit-findings-all: … -->`` block listing every filed finding),
+    ``<!-- audit-findings-all: … -->`` block listing every filed and
+    collector-held finding),
     which ``audit_report.py`` derives as
     ``<check>.<cluster>.<namespace>.<object>``. Use it whenever the phrase is a
     CLUSTER name: the body's scope table names every audited cluster on every
@@ -1194,16 +1196,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             )
 
         if self.scope == "finding_ids":
-            ids = _finding_ids(ledger["body"])
-            if ids is None:
+            parsed = _finding_ids(ledger["body"])
+            if parsed is None:
                 return done(
                     False,
                     f"{ledger['slug']} carries no readable "
                     "<!-- audit-findings: [...] --> delta block, so the findings "
                     "this run filed cannot be read off it",
                 )
+            ids, source = parsed
             text = "\n".join(ids).lower()
-            surface = f"the {len(ids)} finding id(s) on {ledger['slug']}"
+            # Which block: a truncated body whose complete list failed to
+            # parse falls back to the rendered subset, and the reason should
+            # say so rather than read as a finding the agent never filed.
+            surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"

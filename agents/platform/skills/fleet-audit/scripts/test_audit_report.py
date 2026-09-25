@@ -7170,6 +7170,34 @@ class TestRenderBudget(BaseTestCase):
         body = self.render(make_doc(findings=bulk_findings(3)))
         self.assertNotIn("audit-findings-all", body)
 
+    def test_the_complete_block_never_cuts_a_body_that_fits_without_it(self):
+        # Charged up front, the block truncated bodies of 36 and 37 findings
+        # that rendered whole without it. Sweep the boundary: wherever the
+        # body fits with the block stubbed out, it must fit, block-free, as is.
+        # Real ids run ~70 characters; `f-0000` would make the block too small
+        # to move the boundary at all.
+        prefix = "service-selects-nothing.acme/us-east1/fleet-member.payments.orders-api"
+        crossed = False
+        for n in range(20, 80):
+            doc = make_doc(findings=bulk_findings(n, prefix=prefix))
+            with patch.object(audit_report, "all_findings_block", return_value=""):
+                without = self.render(doc)
+            if len(audit_report.parse_delta_block(without)) < n:
+                crossed = True
+                continue
+            self.assertEqual(self.render(doc), without, n)
+        self.assertTrue(crossed, "the sweep never reached a truncated body")
+
+    def test_the_complete_block_carries_the_held_ids(self):
+        # A grader reads it in place of the delta block, which carries them.
+        held = audit_report.held_row_from_id("service-selects-nothing.seeded-c.ns.orders")
+        body = audit_report.render_issue_body(
+            make_doc(findings=bulk_findings(250)), generated_at=NOW, audit_id=AUDIT, held=[held]
+        ).body
+        (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
+        self.assertIn(held["id"], json.loads(payload))
+        self.assertIn(held["id"], audit_report.parse_delta_block(body))
+
     def test_a_complete_list_over_the_cap_is_left_out(self):
         ids = [f"f-{i:05d}-" + "x" * 80 for i in range(400)]
         self.assertEqual(audit_report.all_findings_block(ids), "")
