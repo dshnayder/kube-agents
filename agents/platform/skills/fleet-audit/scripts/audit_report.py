@@ -163,6 +163,11 @@ AUDITS: dict[str, AuditSpec] = {
             "legacy-metadata",
             "public-control-plane",
             "podsecurity-gaps",
+            "kcc-object-wedged",
+            "image-floating-tag",
+            "unbound-sa-automount",
+            "lb-world-open",
+            "anonymous-rbac-binding",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
@@ -196,6 +201,18 @@ AUDITS: dict[str, AuditSpec] = {
             "probes-readiness",
             "probes-liveness",
             "single-replica",
+            "schedule-never-succeeds",
+            "rollout-drops-traffic",
+            "strategy-causes-downtime",
+            "cronjob-runs-overlap",
+            "service-selects-nothing",
+            "service-port-unresolved",
+            "liveness-preempts-readiness",
+            "spread-not-achieved",
+            "prestop-outlives-grace",
+            "rwo-claim-contended",
+            "hpa-floors-at-one",
+            "pdb-overlapping",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -455,7 +472,11 @@ DELTA_RE = re.compile(
 # same rename for its stream, for the same reason, so every patch finding is
 # re-spelled on its first run under the collector and scheme 3's ledgers and
 # remediation pull requests cannot be joined against it.
-ID_SCHEME = 4
+#
+# 5: `collect.py` makes the same rename for the obtainability, compliance and
+# ai-security streams, which until then published the bare names their
+# documents wrote.
+ID_SCHEME = 5
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
 # `<project>/<location>/<name>`: the segments of a qualified cluster name.
@@ -4428,7 +4449,7 @@ def parse_held_ids(body: str | None) -> list[str]:
 def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
     """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
 
-    Schemes 3 and 4 moved a stream's cluster names from bare to qualified, so a
+    Schemes 3 to 5 moved a stream's cluster names from bare to qualified, so a
     `Where:` line written before the move names a cluster no collector
     candidate spells that way any more. The Scope row beside it has the
     project and location that qualify it; a name audited at two locations has
@@ -4474,7 +4495,7 @@ def _respelled_rows(
     Under another scheme a row naming a bare cluster is also spelled with the
     name qualified from the body's Scope table (`_scope_spellings`), and that
     spelling wins when the collector's `flagged` ids carry it and not the bare
-    one. Schemes 3 and 4 moved a stream's clusters from bare to qualified
+    one. Schemes 3 to 5 moved a stream's clusters from bare to qualified
     names; matched on the bare spelling alone, its first run under the
     collector held nothing, and a clean document closed the ledger over
     findings the collector still flagged. A name two clusters share is

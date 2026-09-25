@@ -183,6 +183,9 @@ NUMBER_WORDS = {
             "eighteen",
             "nineteen",
             "twenty",
+            "twenty-one",
+            "twenty-two",
+            "twenty-three",
         )
     )
 }
@@ -2424,7 +2427,7 @@ class TestAuditCatalogue(unittest.TestCase):
         span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
         # "Its eleven checks are section 2" / "Its nineteen facets are section
         # 4" — the noun differs by stream, the count must not.
-        counted = re.compile(r"\bIts ([a-z]+) \w+ are section\b")
+        counted = re.compile(r"\bIts ([a-z-]+) \w+ are section\b")
         # A `#### ` check heading names its slugs in a trailing parenthesis;
         # same anchoring as test_check_rosters_match_the_sops, and same reason.
         trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
@@ -2668,7 +2671,6 @@ class TestAuditCatalogue(unittest.TestCase):
                 "privileged-container",
                 "host-namespace",
                 "hostpath-mount",
-                "legacy-metadata",
             ],
             # security-patch-orchestrator is absent on purpose: its collector
             # runs all four node-pool checks on Autopilot rather than declaring
@@ -10419,7 +10421,8 @@ class TestCoverageGaps(unittest.TestCase):
         )
         self.assertEqual(len(gaps), 1)
         self.assertIn("prod-us-east", gaps[0])
-        self.assertIn("9 of 11 applicable checks did not run", gaps[0])
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"{roster - 2} of {roster} applicable checks did not run", gaps[0])
         self.assertIn("netpol-missing", gaps[0])
 
     def test_a_cluster_reports_one_gap_line_not_two(self):
@@ -10442,7 +10445,8 @@ class TestCoverageGaps(unittest.TestCase):
             )
         )
         self.assertEqual(len(gaps), 1)
-        self.assertIn("1 of 11 applicable checks did not run", gaps[0])
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"1 of {roster} applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
 
 
@@ -10595,7 +10599,8 @@ class TestChecksRun(unittest.TestCase):
             make_doc(findings=[], clusters=[self._cluster()]), generated_at=NOW
         )
         self.assertIn("| Checks |", body)
-        self.assertIn("11/11", body)
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"{roster}/{roster}", body)
         self.assertNotIn("⚠", body)
 
     def test_an_incomplete_cluster_is_flagged_in_the_scope_table(self):
@@ -10606,7 +10611,7 @@ class TestChecksRun(unittest.TestCase):
             ),
             generated_at=NOW,
         )
-        self.assertIn("1/11 ⚠", body)
+        self.assertIn(f"1/{len(audit_report.audit_checks(AUDIT))} ⚠", body)
 
     def test_every_stream_requires_its_own_roster(self):
         """A compliance check named by the cost audit is still a typo."""
@@ -16370,10 +16375,13 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
-    qualifying cluster names, and from 3 to 4 when the patch-readiness
-    collector did the same, and the stamp is global, so every stream's bodies
+    qualifying cluster names, from 3 to 4 when the patch-readiness
+    collector did the same, and from 4 to 5 when `collect.py` did it for three
+    more streams, and the stamp is global, so every stream's bodies
     carry the current number. That is the whole of the change here -- five
-    lines, one per body -- and this class is what proves it.
+    lines, one per body -- and this class is what proves it. The compliance
+    roster growing from eleven checks to sixteen is recorded the same way: the
+    Scope table's `n/n` column and the unrun-check prose count the roster.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

@@ -1,9 +1,10 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, two collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, three collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
-> `fleet-consistency-drift` stream and `patch_readiness.py` one for `security-patch-orchestrator`;
+> `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`, and
+> `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`;
 > each stream's SOP runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -113,7 +114,7 @@ narrowed reads as a complete one and lets `finish` resolve every finding outside
 within the manifest and stable between runs, so a collector sweeping clusters names each one
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
-finding announced resolved and refiled as new. The drift and patch collectors do this, and their SOPs carry
+finding announced resolved and refiled as new. The drift, patch and `collect.py` collectors do this, and their SOPs carry
 the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
