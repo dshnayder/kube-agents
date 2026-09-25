@@ -8147,20 +8147,31 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
 def summary_line(manifest: dict) -> str:
     """The one line the shell shows after stdout went to the manifest file.
 
-    The manifest runs to thousands of lines and the candidates sit below each
-    cluster's `commands`, so a run that reads its head sees commands only. One
+    The manifest runs to thousands of lines and each cluster's candidates sit
+    below its `commands`, so a run that reads the head sees commands only. One
     did exactly that: it copied `commands` into `checks_run`, wrote an empty
     `findings`, and published a clean audit over a fleet the collector had
-    flagged. The count is the one fact that run was missing.
+    flagged. `fleet_drift.candidate_summary` prints the same fact for the same
+    reason; unlike drift's, every check here is mechanical, so there is no
+    hand exclusion to name.
     """
     clusters = manifest.get("clusters") or []
     collected = [c for c in clusters if c.get("outcome") == OUTCOME_COLLECTED]
-    candidates = sum(len(c.get("candidates") or []) for c in collected)
-    others = len(clusters) - len(collected)
+    by_check: dict[str, int] = {}
+    for cluster in collected:
+        for candidate in cluster.get("candidates") or []:
+            check = candidate.get("check", "?")
+            by_check[check] = by_check.get(check, 0) + 1
+    head = (
+        f"{len(collected)} cluster(s) collected, {len(clusters) - len(collected)} "
+        f"other target(s); {sum(by_check.values())} candidate(s) to report"
+    )
+    if not by_check:
+        return head
+    counts = "; ".join(f"{check}: {n}" for check, n in sorted(by_check.items()))
     return (
-        f"{candidates} candidate(s) on {len(collected)} collected cluster(s), "
-        f"{others} other target(s). Every entry in `clusters[].candidates` is a "
-        "finding for the document: read them, not only `commands`."
+        f"{head} -- {counts}. Each one under `clusters[].candidates` is a "
+        "finding for the document, not only what `commands` shows"
     )
 
 

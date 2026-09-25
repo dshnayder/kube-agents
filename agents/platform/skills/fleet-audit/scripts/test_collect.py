@@ -4256,16 +4256,26 @@ class TestCollectFleet(unittest.TestCase):
         """stdout is the manifest file; stderr is what the agent's shell shows,
         and a run that read only the manifest's head never saw a candidate."""
         manifest = {"clusters": [
-            {"name": "p/l/a", "outcome": "collected", "candidates": [{}, {}]},
-            {"name": "p/l/b", "outcome": "collected", "candidates": [{}]},
+            {"name": "p/l/a", "outcome": "collected",
+             "candidates": [{"check": "no-pdb"}, {"check": "service-selects-nothing"}]},
+            {"name": "p/l/b", "outcome": "collected", "candidates": [{"check": "no-pdb"}]},
             {"name": "project/q", "outcome": "gate-failed"},
         ]}
         with patch.object(collect, "collect_fleet", return_value=manifest), \
                 patch("sys.stdout", new_callable=io.StringIO), \
                 patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertEqual(collect.main(["obtainability-audit"]), 0)
-        self.assertIn("3 candidate(s) on 2 collected cluster(s), 1 other target(s)", err.getvalue())
-        self.assertIn("clusters[].candidates", err.getvalue())
+        line = err.getvalue()
+        self.assertIn("2 cluster(s) collected, 1 other target(s); 3 candidate(s) to report", line)
+        self.assertIn("no-pdb: 2; service-selects-nothing: 1", line)
+        self.assertIn("clusters[].candidates", line)
+
+    def test_an_empty_fleet_summary_is_the_count_alone(self):
+        manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": []}]}
+        self.assertEqual(
+            collect.summary_line(manifest),
+            "1 cluster(s) collected, 0 other target(s); 0 candidate(s) to report",
+        )
 
 
 class TestDiscovery(unittest.TestCase):
