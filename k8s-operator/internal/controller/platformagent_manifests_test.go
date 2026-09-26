@@ -1498,6 +1498,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 				Deployment: &agentv1alpha1.DeploymentSpec{
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1521,6 +1522,13 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
+	// The concurrency cap is the other half of what the limit is sized
+	// against, so it is the operator's in the same way: set here, and not a
+	// CR's to raise past what the limit below can hold.
+	const wantConcurrent = "8"
+	if got := env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"]; got != wantConcurrent {
+		t.Errorf("expected the proxy concurrency cap %s, got %q — a CR override must not reach it", wantConcurrent, got)
+	}
 	// The measured worst case, so a future reduction of the cap has to argue
 	// with the number rather than pass silently.
 	const largestObservedDump = 3866719
@@ -1534,42 +1542,42 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. Five live copies of a capped output exist per in-flight command
-	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
-	// response -- and the commands in flight are one per kanban worker plus
-	// the front-door session. Nothing bounds that concurrency inside the
-	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
-	// memory limit alongside what the container holds at rest, or an OOMKill
-	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	// hold it. credential_proxy.py reads a command's output as it streams,
+	// keeps at most the cap per stream and bounds the decoded text to the
+	// same size, so what the broker holds per in-flight request is about six
+	// times the cap, transiently: the two capped stream buffers, their decoded
+	// text, and the JSON body and its encoding (measured at 48 MiB per request
+	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
+	// A request holds its slot until its response is written, and concurrency
+	// is bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// read here off the rendered env like the output cap, so the test models
+	// what the operator deploys rather than a copy of it. The burst has to
+	// fit under the memory limit alongside what the container holds at rest,
+	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
+	// the proxy serves.
 	//
-	// Five workers rather than defaultKanbanMaxInProgress, because that
-	// default is overridable and resolveResources sizes the agent container
-	// for the five-way fan-out it has actually observed. The proxy is sized
-	// for the same install.
-	//
-	// And two capped streams per command, not one. `_execute` truncates stdout
-	// and stderr in two independent calls -- see the pair of `self._truncate`
-	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
-	// single command can hold 2x it. Modelling one stream understates the
-	// burst by half, which is the direction that lets a too-large cap pass.
+	// The children -- one kubectl or gcloud per in-flight command -- are
+	// outside this arithmetic. A kubectl listing thousands of objects runs to
+	// hundreds of MiB on its own, and the rest of the limit is what holds it.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 5
-	const streamsPerCommand = 2
-	const observedFanOut = 5
-	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	const copiesPerCommand = 6
+	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
+	if err != nil || inFlight < 1 {
+		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
+	}
+	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
 }
@@ -5293,6 +5301,243 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
 			}
 		})
+	}
+}
+
+// agentWithDriftDetector builds a PlatformAgent whose harness names the drift
+// detector. The harness triple is filled in, because the detector's own gate
+// requires it and a fixture without it would make every "enabled" case look
+// like a disabled one for the wrong reason; the tests that care about a missing
+// triple clear a field themselves.
+func agentWithDriftDetector(drift *agentv1alpha1.DriftDetectorSpec) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:     "test-project",
+		Location:      "us-central1",
+		ClusterName:   "test-cluster",
+		DriftDetector: drift,
+	}
+	return a
+}
+
+// The default has to be "not detecting", which is the opposite of the watcher's
+// and for a reason the watcher does not have: the detector reads a Pub/Sub
+// subscription that only exists where the drift-pubsub Terraform module was
+// applied. A resolver that read absence as on would start, on every install
+// without one, a process that never exits and never reports a change: the
+// subscription is not checked at startup and the failing pull is retried for the
+// life of the pod, on a pod that stays Ready throughout.
+func TestDriftDetectorDefaultsOffWhenUnspecified(t *testing.T) {
+	if driftDetectorEnabled(newTestPlatformAgent()) {
+		t.Error("an agent with no harness at all must not run the detector")
+	}
+	if driftDetectorEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the detector must not run it")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{})) {
+		t.Error("a driftDetector block with no enabled key must not run the detector")
+	}
+	if !driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})) {
+		t.Error("enabled: true with a complete harness must run the detector")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})) {
+		t.Error("enabled: false must turn the detector off")
+	}
+}
+
+// Enabling it is necessary and not sufficient. The detector checks the cluster
+// name it is given against the cluster its credentials actually reach and stops
+// on a disagreement, so starting it with a half-filled harness gives a restart
+// loop rather than a degraded detector. The gate is here, in the operator,
+// because that is the layer that can see the whole harness.
+func TestDriftDetectorStaysOffWithoutTheWholeHarnessTriple(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		clear func(*agentv1alpha1.HarnessSpec)
+	}{
+		{"no project", func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" }},
+		{"no location", func(h *agentv1alpha1.HarnessSpec) { h.Location = "" }},
+		{"no cluster name", func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			tc.clear(agent.Spec.Harness)
+			if driftDetectorEnabled(agent) {
+				t.Errorf("enabled: true with %s must not start the detector", tc.name)
+			}
+		})
+	}
+}
+
+// A populated projectId is not a usable one. The detector refuses an all-digits
+// --project before it starts any loop, and start-services.sh always passes
+// --in-cluster and --profiles-dir, so that refusal is always reachable in the
+// shipped path -- which makes a numeric projectId the restart loop the gate's own
+// doc comment says it prevents. Nothing else reading the harness triple minds a
+// number, so the install is otherwise healthy and nothing else would catch it.
+//
+// The pairs below are the detector's own boundary, not a restatement of the gate:
+// a project ID must begin with a lowercase letter, so all-digits is the whole test
+// and anything with one non-digit is an ID. The mixed cases are what a mutation
+// widening the check to "contains a digit" would take down.
+func TestDriftDetectorGateRejectsAProjectNumber(t *testing.T) {
+	for _, tc := range []struct {
+		project string
+		want    bool
+	}{
+		{"123456789012", false},
+		{"0", false},
+		{"test-project", true},
+		{"project-123456789012", true},
+		{"123456789012-project", true},
+		{"my-project-2", true},
+	} {
+		t.Run(tc.project, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Spec.Harness.ProjectID = tc.project
+			if got := driftDetectorEnabled(agent); got != tc.want {
+				t.Errorf("driftDetectorEnabled with projectId %q = %v, want %v", tc.project, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate must refuse exactly what the detector refuses, and the two implement
+// the test separately -- isProjectNumber here, looksLikeProjectNumber in
+// cmd/drift-detector/main.go, each with its own copy of the digit set. A gate that
+// drifted narrower would admit a project the binary rejects, which is the defect
+// above returning; one that drifted wider would report a working install as off,
+// which is silent. This pins the character set rather than the two functions,
+// because the operator does not import the detector's package.
+func TestDriftDetectorGateUsesTheDetectorsDigitSet(t *testing.T) {
+	if driftDetectorProjectNumberDigits != "0123456789" {
+		t.Errorf("digit set = %q, want the detector's 0123456789", driftDetectorProjectNumberDigits)
+	}
+	if isProjectNumber("") {
+		t.Error("an empty project is absent, not a number; the triple check reports that")
+	}
+}
+
+// The entrypoint reads these six and nothing else carries the configuration into
+// the pod. Written on every reconcile rather than only when the detector is on,
+// for the same reason the watcher's switch is: from outside the container an
+// install that never asked for drift detection and one whose detector cannot
+// start look identical, and the Deployment is where that is answered.
+//
+// The harness triple is repeated under the detector's own names rather than read
+// from GKE_PROJECT_ID and friends, which buildPodTemplateSpec sets on the agent
+// container and not on this sidecar. Asserting the values here is what catches a
+// later change that assumes the two containers share an environment.
+func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{
+		Enabled:        ptr.To(true),
+		Subscription:   "drift-audit-sub",
+		GitopsManagers: "argocd-controller,flux",
+	})
+
+	want := map[string]string{
+		"DRIFT_DETECTOR_ENABLED":          "true",
+		"DRIFT_DETECTOR_PROJECT_ID":       "test-project",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION": "us-central1",
+		"DRIFT_DETECTOR_CLUSTER_NAME":     "test-cluster",
+		"DRIFT_DETECTOR_SUBSCRIPTION":     "drift-audit-sub",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS":  "argocd-controller,flux",
+	}
+
+	got := map[string][]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if _, ours := want[e.Name]; ours {
+			got[e.Name] = append(got[e.Name], e.Value)
+		}
+	}
+	for name, value := range want {
+		if len(got[name]) != 1 {
+			t.Fatalf("want exactly one %s, got %d (%q)", name, len(got[name]), got[name])
+		}
+		if got[name][0] != value {
+			t.Errorf("%s = %q, want %q", name, got[name][0], value)
+		}
+	}
+}
+
+// An unconfigured detector still gets its switch, set to "false" rather than
+// left out, and gets none of its settings. Both halves matter. The switch is
+// there so that a Deployment says whether the detector is meant to be running;
+// the settings are not, because every install that has not applied the
+// drift-pubsub module is in this state, and writing them would repeat the
+// harness triple under five more names on every credential proxy in the fleet
+// for a process that is not started.
+//
+// The CR supplies all six here to make the second half a real assertion rather
+// than an observation about a fixture: the names are reserved in
+// mergeCredentialProxyEnv whether or not the operator writes them, so an entry
+// the operator skips has to be dropped, not passed through.
+func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "DRIFT_DETECTOR_ENABLED", Value: "true"},
+			{Name: "DRIFT_DETECTOR_PROJECT_ID", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_LOCATION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+		},
+	}
+
+	var switches []string
+	var settings []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		switch {
+		case e.Name == "DRIFT_DETECTOR_ENABLED":
+			switches = append(switches, e.Value)
+		case strings.HasPrefix(e.Name, "DRIFT_DETECTOR_"):
+			settings = append(settings, e.Name+"="+e.Value)
+		}
+	}
+	if len(switches) != 1 || switches[0] != "false" {
+		t.Errorf("DRIFT_DETECTOR_ENABLED = %q, want exactly one \"false\"", switches)
+	}
+	if len(settings) != 0 {
+		t.Errorf("a detector that is off must carry no settings, got %q", settings)
+	}
+}
+
+// Same property as the watcher's switch, and the same failure mode if it breaks:
+// `containers[].env` is a listType=map keyed on name, so a duplicate makes the
+// Deployment unappliable and the operator stops reconciling altogether. The
+// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// thing standing between a CR naming one of them and a frozen reconcile is the
+// reserved list.
+func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
+	names := []string{
+		"DRIFT_DETECTOR_ENABLED",
+		"DRIFT_DETECTOR_PROJECT_ID",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION",
+		"DRIFT_DETECTOR_CLUSTER_NAME",
+		"DRIFT_DETECTOR_SUBSCRIPTION",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+	}
+
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	for _, name := range names {
+		agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: name, Value: "cr-supplied"})
+	}
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		counts[e.Name]++
+		values[e.Name] = e.Value
+	}
+	for _, name := range names {
+		if counts[name] != 1 {
+			t.Fatalf("want exactly one %s entry, got %d; server-side apply rejects a duplicate key in env", name, counts[name])
+		}
+		if values[name] == "cr-supplied" {
+			t.Errorf("%s took its value from spec.deployment.env; the operator's must win", name)
+		}
 	}
 }
 

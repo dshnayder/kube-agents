@@ -56,6 +56,9 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
 | `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
+| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription no stock install creates. See below.                                                                                                         |
+| `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
+| `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
@@ -172,6 +175,60 @@ Three consequences before you press it:
 Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
 mentions the field — which is every install today — keeps watching, and only an explicit `false`
 turns it off.
+
+### `spec.harness.driftDetector`
+
+The `drift-detector` runs beside the watcher in the gateway pod's `agent-api-auth` sidecar. It pulls
+GKE admin-activity audit records from a Pub/Sub subscription, drops every call that a person did not
+make or that changed nothing, and posts what is left to the same pod-local Session KV server the
+watcher posts to — so a change someone made to a cluster by hand arrives on the board as a card. The
+control plane, CI, and every service account are dropped alike; on a busy cluster that is the
+overwhelming majority of the stream.
+
+**It is off unless you ask for it, the opposite of the watcher.** The subscription it reads does not
+exist in a stock install: the audit log sink, topic, and subscription come from the
+`drift-pubsub` Terraform module, and an install that has not applied it has nothing for the detector
+to pull. Starting it anyway gives a process that retries a failing pull for the life of the pod
+without ever reporting a change, and the pod stays Ready throughout — so unset means off, and an
+install you switched on by mistake looks exactly like a fleet nobody has touched.
+
+```yaml
+spec:
+  harness:
+    driftDetector:
+      enabled: true
+```
+
+Enabling is necessary and not sufficient. The detector verifies the cluster name it was given
+against the cluster its credentials actually reach and exits on a mismatch, so the operator starts it
+only when `projectId`, `location`, and `clusterName` are all set on `spec.harness` as well. The API
+server already rejects a `PlatformAgent` that omits any of the three, so the case to watch for is one
+present but empty — that stays off however `enabled` reads, and unlike the watcher, nothing
+substitutes a placeholder name for it.
+
+`projectId` has to be the project ID, not the project number. The detector matches it against the
+project on each audit record, which is always the ID, so a value that is nothing but digits can
+match nothing; the operator reports the detector as off rather than starting a sidecar that exits on
+every launch. Everything else reading `spec.harness` accepts a number, so an install can be healthy
+in every other respect and still be refused here.
+
+`subscription` and `gitopsManagers` are the two knobs worth moving from a CR. Leave `subscription`
+unset unless you renamed the one the module creates.
+
+`gitopsManagers` is not what separates automation from people — the detector already does that by
+principal, and a controller's writes never reach a card. It names the **field managers** your GitOps
+controller writes under, as they appear in an object's `managedFields`: `argocd-controller`, `flux`,
+whatever your own controller sets. That is a field-manager string, not a service-account email, and
+the two are rarely the same.
+
+Matching one changes what a card says rather than whether it exists. When the detector finds a
+configured manager wrote the drifted fields after the change it is reporting, it marks the card as
+possibly already reconciled and names the manager. Unset is supported and simply loses that hint:
+ownership is still read and reported, and you get the same cards without the annotation.
+
+Nothing else about the detector is exposed here. Which principals count as human, and which calls
+are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
+set by the Terraform module's log sink, not by the CR.
 
 ### `spec.harness.tuning`
 
@@ -457,9 +514,21 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 ## `spec.scope`
 
 Optional. Which GCP projects, beyond the one the agent runs in, the hourly Cluster Agent reconcile
-enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. Not yet surfaced
-in the Helm chart, which owns the CR on a chart install: until the chart gains the values, the field
-is set by editing the `PlatformAgent` directly. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and marks nothing newly `retiring` (a project an earlier block already marked `retiring` is still pruned on a clean run); an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
+enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. The chart renders
+it from `platformAgent.scope`, and the Terraform composition sets that value from `scope` in its
+tfvars, which the installer generates from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and
+`SCOPE_EXCLUDE_CLUSTERS` in `install.env`, so on those paths the field is declared there and never
+by editing the `PlatformAgent`: the installer refuses a full upgrade over a `spec.scope` edited by
+hand until `install.env` records it (it prints the three lines that reproduce it) or the CR is put
+back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because
+Helm sends only the difference between its rendered manifests. An empty scope is a present block
+with empty lists, rendered whenever the chart is given one; a chart that is given nothing (the
+value is `null`, its default) renders no block, which leaves the field as it finds it while no earlier
+release rendered the block and removes it once one has, a removal the reconcile reads as no
+declaration (the management project alone, nothing retired). The
+composition binds the read roles before it writes the CR, which orders creation and not IAM
+propagation: a first install's one-shot inventory sweep may still name a scoped project as
+`denied`, and the hourly reconcile creates its profiles once the grant has propagated. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and marks nothing newly `retiring` (a project an earlier block already marked `retiring` is still pruned on a clean run); an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
 
 ```yaml
 spec:
@@ -485,8 +554,7 @@ spec:
 - `projects` — project IDs whose clusters get profiles. The agent's service account needs the
   read roles in each one (`roles/container.clusterViewer`, `roles/container.viewer`,
   `roles/compute.viewer`, `roles/monitoring.viewer`, `roles/logging.viewer`,
-  `roles/iam.securityReviewer`, the read subset of the `read_only_roles` the Terraform composition binds in the management project). No installer path grants them yet: until the Terraform
-  composition gains a scope input, grant them by hand in each project. A project it cannot list is reported as `denied` (no role left that grants `container.clusters.list`; `roles/iam.securityReviewer` alone keeps a project listable, so a project reads `denied` only once every such role is gone), `api-disabled` (GKE API off in that project) or `unreachable` (anything else, including a listing that did not finish within the run's listing budget) and its existing profiles are kept. Each list is capped at 100
+  `roles/iam.securityReviewer`, the read subset of the `read_only_roles` the Terraform composition binds in the management project). The composition binds the ones the management project holds, through the `kube-agents-iam` module's `scope` input, in every project the same value names; a CR edited by hand needs the same grants made by hand. A project it cannot list is reported as `denied` (no role left that grants `container.clusters.list`; `roles/iam.securityReviewer` alone keeps a project listable but not manageable, since it carries no `container.clusters.get`: its clusters list and every profile create fails, which is why the composition refuses a scope whose bindings carry neither `roles/container.clusterViewer` nor `roles/container.viewer`; a project reads `denied` only once every listing role is gone), `api-disabled` (GKE API off in that project) or `unreachable` (anything else, including a listing that did not finish within the run's listing budget) and its existing profiles are kept. Each list is capped at 100
   entries, and the run lists at most 100 projects in total, the management project included; an
   explicit project past that reads `over-cap` and is likewise kept but not listed.
 - `folders` and `organizations` — numeric IDs of GCP folders and organisations. The design recommends folders until the scoped service account pool grants authority: a folder binding reaches every project beneath it, an organisation binding every project in the organisation, including ones nobody meant to manage, and one service account holds the read roles across all of them ([Security & IAM](/kube-agents/reference/security-and-iam/#roles-per-set)). Each is resolved on every run with one Cloud Asset Inventory call (`gcloud asset search-all-resources --scope=folders/<id> --asset-types=container.googleapis.com/Cluster`), which names every GKE cluster in every project beneath it, at any depth, including projects created since the last run; no per-project listing follows for them. The asset index is what answers, not Resource Manager: a project moved into or out of a folder appears under its new parent once the index has caught up, which after a move can lag by more than an hour, and until then it reads as absent from the container. Because the index and not the declaration dropped it, a project that was reached through a still-declared container (whether or not it was also named in `projects`, so dropping the explicit entry while the project moves into the folder costs nothing, and the same holds when the folder is declared in the edit that drops the entry: a container the previous run did not know is what marks that edit, and the same day's grace applies) and is absent from the index is kept, listed under `unmanaged` with that reason and the time it was first found absent (`absentSince` on its row), and is back in scope the run the index places it again. It retires sooner when the declaration speaks, by the container leaving the CR or an `exclude.projects` entry naming it, and otherwise once it has been absent for a day, over the ordinary two clean runs: that is what retires a project that was deleted or moved under a parent the CR does not declare, since a deleted project answers 403 to `describe`, never NotFound. A project dropped from `projects`, or whose folder leaves the CR, in the same edit that declares the folder it moved into is held that day too, since the index may not place it yet. A rollback to an operator that predates these fields renders a declaration without them, which the reconcile likewise reads as saying nothing about containers, so their members are kept. The agent's service account needs `roles/cloudasset.viewer` and the read roles above on the container, and `cloudasset.googleapis.com` enabled in the management project; no installer path binds them yet, so grant them by hand. A container the run cannot read (`denied`, `api-disabled`, `unreachable`) is frozen: the members the previous snapshot reached through it are carried forward under that outcome, nothing is created under them, and the scope prune stays off for the run. A container whose members would cross the 100-project cap reads `over-cap`: the members the run just resolved are carried reading `over-cap`, with nothing created under them, and because the run holds the full member list the prune is not held back. A project under two declared containers takes the live listing when either resolves, whichever sorted first, unless the cap is already reached. A member whose per-cluster call answers 403 reads `denied` for the run, unless it is also explicit or the management project, whose own listing decides. The snapshot's `containers` array lists each container with its outcome and a project count: the projects the lookup returned for `ok` and `over-cap`, the members carried forward from the previous snapshot for a failed lookup, and a member project's `via` names it (`folders/<id>`), or several sources when more than one produced it. A container whose members would take the run past the resolved-set cap of 100 reads `over-cap` with nothing created under it; its members are carried but not listed, and do not count against the containers after it, so a small folder declared beside a large one still lists. What an operator above the cap does today: `exclude.projects` globs subtract members before the count, so a folder that carries sandboxes or archives is trimmed by pattern; or declare the sub-folders that hold the clusters, each counted on its own. A cap declared on the CR, for an estate of a few hundred projects, is planned and not yet shipped.
