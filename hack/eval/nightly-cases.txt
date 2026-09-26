@@ -21,7 +21,7 @@
 # presubmit" and "not admitted" are the same set and this file is where a
 # held-out case lives: the seven cases the presubmit had been running
 # without letting them block moved here that day, each with its hold-out
-# reason as the # line above it (the last section of this file). This is
+# reason as the # line above it (their own section of this file). This is
 # the default home for a new case too (decided 2026-09-15 on #1546 and
 # #1564): it lands here, the nightly builds its record in the evidence
 # store -- one data point a night, three repetitions -- and a presubmit
@@ -69,18 +69,21 @@
 # 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
 # band; its runs measured 327s-1191s, the audit band's spread again) and
 # gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
-# Forty-six cases, ~1111-1131min serial. The
+# Forty-six cases, ~1111-1131min serial. 2026-09-25 adds the two
+# obtainability probes (#1841), unhinted and probe-shaped (~200s a
+# repetition, ~10min each at three): forty-eight cases, ~1131-1151min serial.
+# The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
 # oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
 # six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
 # realised on whole-job wall clock at parallelism 4 under daytime quota
-# contention that would be ~966-983min, over the deadline; 480m holds only
+# contention that would be ~983-1001min, over the deadline; 480m holds only
 # if the nightly, alone on the model quota at that hour and two lanes
 # wider, realises ~2.3x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the seven additions since are priced inside its headroom. The first nights after this change measure it:
+# so the nine additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -113,7 +116,7 @@
 # 2026-09-23 adds cluster-agent-delegation-profile-lookup (#1840): one case,
 # three units, ~36 serial minutes at its 720s hint (four clean dev-install
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
-# grows the matrix to forty-seven cases and 141 units, ~1147-1167 serial
+# grows the matrix to forty-nine cases and 147 units, ~1167-1187 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
@@ -424,3 +427,12 @@
 
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
+
+# The two obtainability-journey probes: CUJ1's Day-0 design discipline and
+# CUJ3's Day-2 window planning, graded on the report and the worker
+# commands through the eval harness (their live siblings under bench/cuj/
+# need a full install and stay manual). Both probe live GCP advice APIs in
+# the eval project; neither reads the seeded fleet. `validated: false`
+# until their first observed runs.
+./tasks/obtainability-design-quota-vs-capacity/task.yaml
+./tasks/obtainability-window-planning-probe/task.yaml

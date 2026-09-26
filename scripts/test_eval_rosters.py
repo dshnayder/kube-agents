@@ -126,6 +126,12 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-issue-resolver-triage",
     "vcs-review-feedback-read-back",
 ]
+# Registered after the moved block, in file order, by the pull request that
+# authored each case.
+ADDED_AFTER_THE_MOVE = [
+    "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
+    "obtainability-window-planning-probe",
+]
 
 # Admitted after the split, each by a pull request that cited the record
 # (docs/eval-gate-roster.md, "Admitted on the record since the split"), as
@@ -241,7 +247,9 @@ class SplitLostNothingTest(unittest.TestCase):
             for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
             if c not in promoted
         ]
-        self.assertEqual(eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL)
+        self.assertEqual(
+            eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+        )
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
