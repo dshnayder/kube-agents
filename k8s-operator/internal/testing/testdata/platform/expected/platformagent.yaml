@@ -907,6 +907,8 @@ spec:
               value: /etc/credential-proxy/policy.json
             - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
               value: "8388608"
+            - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+              value: "8"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET

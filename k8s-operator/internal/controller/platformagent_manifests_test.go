@@ -1498,6 +1498,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 				Deployment: &agentv1alpha1.DeploymentSpec{
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1521,6 +1522,13 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
+	// The concurrency cap is the other half of what the limit is sized
+	// against, so it is the operator's in the same way: set here, and not a
+	// CR's to raise past what the limit below can hold.
+	const wantConcurrent = "8"
+	if got := env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"]; got != wantConcurrent {
+		t.Errorf("expected the proxy concurrency cap %s, got %q — a CR override must not reach it", wantConcurrent, got)
+	}
 	// The measured worst case, so a future reduction of the cap has to argue
 	// with the number rather than pass silently.
 	const largestObservedDump = 3866719
@@ -1534,42 +1542,42 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. Five live copies of a capped output exist per in-flight command
-	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
-	// response -- and the commands in flight are one per kanban worker plus
-	// the front-door session. Nothing bounds that concurrency inside the
-	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
-	// memory limit alongside what the container holds at rest, or an OOMKill
-	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	// hold it. credential_proxy.py reads a command's output as it streams,
+	// keeps at most the cap per stream and bounds the decoded text to the
+	// same size, so what the broker holds per in-flight request is about six
+	// times the cap, transiently: the two capped stream buffers, their decoded
+	// text, and the JSON body and its encoding (measured at 48 MiB per request
+	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
+	// A request holds its slot until its response is written, and concurrency
+	// is bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// read here off the rendered env like the output cap, so the test models
+	// what the operator deploys rather than a copy of it. The burst has to
+	// fit under the memory limit alongside what the container holds at rest,
+	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
+	// the proxy serves.
 	//
-	// Five workers rather than defaultKanbanMaxInProgress, because that
-	// default is overridable and resolveResources sizes the agent container
-	// for the five-way fan-out it has actually observed. The proxy is sized
-	// for the same install.
-	//
-	// And two capped streams per command, not one. `_execute` truncates stdout
-	// and stderr in two independent calls -- see the pair of `self._truncate`
-	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
-	// single command can hold 2x it. Modelling one stream understates the
-	// burst by half, which is the direction that lets a too-large cap pass.
+	// The children -- one kubectl or gcloud per in-flight command -- are
+	// outside this arithmetic. A kubectl listing thousands of objects runs to
+	// hundreds of MiB on its own, and the rest of the limit is what holds it.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 5
-	const streamsPerCommand = 2
-	const observedFanOut = 5
-	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	const copiesPerCommand = 6
+	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
+	if err != nil || inFlight < 1 {
+		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
+	}
+	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
 }

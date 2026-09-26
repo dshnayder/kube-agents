@@ -66,10 +66,15 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
-	// credentialProxyMaxOutputBytes caps each stream a brokered command returns;
-	// the paragraph above its use ties the figure to the proxy container's
-	// memory limit, and the cap test asserts the pair.
-	credentialProxyMaxOutputBytes = "8388608"
+	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
+	// and what the broker keeps of it while the command runs;
+	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
+	// The paragraph above their use ties the two to the proxy container's
+	// memory limit, and the cap test asserts the three from the rendered env.
+	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
+	// move neither, because the limit they are sized against is not a CR field.
+	credentialProxyMaxOutputBytes        = "8388608"
+	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -3809,31 +3814,41 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// collectors' parse gate and drops that whole cluster out of
 		// compliance-audit and ai-security-audit as a coverage gap.
 		//
-		// The cap does not bound the read: `_execute` takes the subprocess to
-		// completion with `communicate()` before it slices, so the full output
-		// is resident whatever this says. What it does bound is the slice that
-		// survives, and that copy is then JSON-escaped and encoded for the
-		// response -- so raising it costs on the order of three times the
-		// increase per in-flight request rather than nothing.
+		// The cap bounds the read as well as the response: credential_proxy.py
+		// reads a command's output as it streams and drops everything past
+		// the cap, and bounds the decoded text to the same size, so what a
+		// command prints beyond it costs the broker nothing and output that is
+		// not UTF-8 (every byte a three-byte replacement character) cannot
+		// cost more than text. (It used to hold the whole output until the
+		// command exited and truncate afterwards, which is what took the
+		// container past its limit under concurrent triage sessions.) What the
+		// broker does hold, per in-flight request and transiently, is about
+		// six times the cap: the two capped stream buffers, their decoded
+		// text, and the JSON body and its encoding -- measured at 48 MiB per
+		// request against this 8 MiB cap for text, 37 MiB for bytes that are
+		// not UTF-8.
 		//
-		// Which is what puts a ceiling on it, and the ceiling is the proxy
-		// container's own memory limit (buildCredentialProxyContainer) rather
-		// than anything about the fleet. Count five live copies of a capped
-		// output per stream -- the subprocess bytes, the slice, the decoded str,
-		// the JSON-escaped str, the encoded response -- and two capped streams
-		// per command, because `_execute` truncates stdout and stderr in two
-		// independent calls, so the cap is a per-stream ceiling. Ten copies,
-		// then, against the five-way kanban fan-out resolveResources sizes the
-		// agent container for, plus the front-door session, each issuing one
-		// command. At 8 MiB that is 480 MiB of burst on top of the 256Mi the
-		// container requests at rest, which its 1Gi limit absorbs; at 16 MiB --
-		// the value this carried while the proxy was a sidecar with a 2Gi limit
-		// -- it does not, and an OOMKill here takes gcloud, kubectl, gh and git
-		// away from every agent the proxy serves. Raising this means raising the
-		// limit with it, and the cap test asserts the pair so the two cannot
-		// drift apart silently -- it is the arithmetic above, so believe it over
-		// this paragraph if they ever disagree again.
+		// Which is what ties this figure to the proxy container's own memory
+		// limit (buildCredentialProxyContainer) rather than to anything about
+		// the fleet. Concurrency is bounded inside the broker at the value set
+		// just below, and a request holds its slot until its response is
+		// written, so the burst is six times the cap times that: at 8 MiB and
+		// eight slots, 384 MiB on top of the 256Mi the container requests at
+		// rest, which its 1Gi limit absorbs. The limit must also hold the
+		// child processes themselves, one kubectl or gcloud per in-flight
+		// request, and a kubectl listing thousands of objects runs to hundreds
+		// of MiB on its own; that term is outside this arithmetic and is what
+		// the rest of the limit is for. Raising either cap means raising the
+		// limit with it, which is why both are set here and so reserved rather
+		// than left to spec.deployment.env: the limit is not a CR field, and a
+		// CR that could raise a cap could not raise what holds it. The cap
+		// test asserts the three from the rendered env, so believe it over
+		// this paragraph if they ever disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
+		// How many brokered commands run at once. The broker's own default is
+		// the same figure; setting it here is what makes it the operator's to
+		// move, together with the limit above.
+		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
