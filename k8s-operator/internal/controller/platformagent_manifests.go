@@ -124,6 +124,34 @@ const (
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
 
+	// The drift-detector's environment, read by start_drift_detector in
+	// deploy/shared/start-services.sh and passed on to the binary as flags. Named
+	// here because every one of them also has to be reserved in
+	// mergeCredentialProxyEnv: they are appended after that merge runs, and an
+	// unreserved name would sit beside a same-named entry from spec.deployment.env
+	// rather than shadowing it, which server-side apply rejects outright.
+	//
+	// The harness triple is repeated for the detector rather than read from
+	// GKE_PROJECT_ID, GKE_LOCATION and GKE_CLUSTER_NAME, which buildPodTemplateSpec
+	// sets on the agent container and not on this sidecar.
+	driftDetectorEnabledEnv        = "DRIFT_DETECTOR_ENABLED"
+	driftDetectorProjectEnv        = "DRIFT_DETECTOR_PROJECT_ID"
+	driftDetectorLocationEnv       = "DRIFT_DETECTOR_CLUSTER_LOCATION"
+	driftDetectorClusterNameEnv    = "DRIFT_DETECTOR_CLUSTER_NAME"
+	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
+	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
+
+	// driftDetectorProjectNumberDigits is the character set a GCP project number
+	// is made of, and the whole of the test for one: a project ID must start with
+	// a lowercase letter, so a value that is nothing but digits cannot be an ID.
+	//
+	// Duplicated from projectNumberDigits in cmd/drift-detector/main.go rather
+	// than shared, because the operator does not import the detector's package
+	// and adding the dependency to reuse ten characters is the worse trade. The
+	// two are held in step by TestDriftDetectorGateRejectsAProjectNumber below,
+	// which asserts the gate refuses exactly what the detector refuses.
+	driftDetectorProjectNumberDigits = "0123456789"
+
 	// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
 	// `database.journal_mode`, rendered into the managed scope by renderConfigYAML
 	// when the agent pod has a runtime class. Under gVisor the data volume is a 9p
@@ -3448,6 +3476,89 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
+// driftDetectorEnabled reports whether the credential sidecar should start the
+// drift-detector. Absent means not started — the mirror image of
+// eventWatcherEnabled above, because drift detection reads a Pub/Sub subscription
+// that only exists where the drift-pubsub Terraform module was applied.
+//
+// The harness triple is part of the condition rather than a validation reported
+// elsewhere. The detector requires --project; --cluster-name requires
+// --cluster-location; and it checks that name against the cluster its credentials
+// actually reach, exiting on a mismatch. An install that asks for the detector
+// without naming its cluster would therefore get a restart loop for as long as the
+// pod lives, so the operator reports it as off and leaves the pod quiet.
+//
+// Populated is not sufficient for projectId, which is why isProjectNumber is here
+// and not only a non-empty check. The detector refuses an all-digits --project
+// outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
+// join matches it against each audit record's project_id, which is always the ID;
+// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
+// always on and that refusal is always reachable. Nothing else reading the triple
+// minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
+// so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
+// projectId, be healthy in every other respect, and get the restart loop the
+// paragraph above says this gate prevents. The check belongs here rather than as a
+// CRD pattern on HarnessSpec.ProjectID: that field predates the detector and is
+// shared by those other consumers, so constraining it would reject configurations
+// that work today for everything except this one sidecar.
+//
+// The zone-versus-region mismatch is the other half of this class and is not
+// covered, deliberately: deciding whether a location is the one the cluster
+// actually reports needs a GKE API call per reconcile. This half needs no call.
+func driftDetectorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.DriftDetector == nil || harness.DriftDetector.Enabled == nil {
+		return false
+	}
+	if !*harness.DriftDetector.Enabled {
+		return false
+	}
+	if isProjectNumber(harness.ProjectID) {
+		return false
+	}
+	return harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != ""
+}
+
+// isProjectNumber reports whether a project was given as a project number rather
+// than a project ID. Mirrors looksLikeProjectNumber in cmd/drift-detector/main.go.
+func isProjectNumber(project string) bool {
+	return project != "" && strings.TrimLeft(project, driftDetectorProjectNumberDigits) == ""
+}
+
+// driftDetectorSubscription and driftDetectorGitopsManagers read their fields
+// without a nil check at every call site. Both are empty by default and the
+// detector treats empty as "use my own default" and "claim no reconciliation"
+// respectively, so an absent block and an unset field mean the same thing.
+func driftDetectorSubscription(agent *agentv1alpha1.PlatformAgent) string {
+	if harness := agent.Spec.Harness; harness != nil && harness.DriftDetector != nil {
+		return harness.DriftDetector.Subscription
+	}
+	return ""
+}
+
+func driftDetectorGitopsManagers(agent *agentv1alpha1.PlatformAgent) string {
+	if harness := agent.Spec.Harness; harness != nil && harness.DriftDetector != nil {
+		return harness.DriftDetector.GitopsManagers
+	}
+	return ""
+}
+
+// driftDetectorHarness returns the project, location and cluster name the detector
+// is given, empty when the harness does not name them.
+//
+// Deliberately not resolveHarnessClusterName, whose "platform-agent-host" fallback
+// exists so the watcher always has a label to put on a payload. The detector does
+// not label with this value, it verifies against it: handed a made-up name it would
+// find the credentials reach a differently-named cluster and stop. An empty string
+// is the honest answer, and driftDetectorEnabled has already refused to start the
+// detector by the time one can occur.
+func driftDetectorHarness(agent *agentv1alpha1.PlatformAgent) (project, location, clusterName string) {
+	if harness := agent.Spec.Harness; harness != nil {
+		return harness.ProjectID, harness.Location, harness.ClusterName
+	}
+	return "", "", ""
+}
+
 // asNativeSidecar converts a container into a Kubernetes native sidecar: an init
 // container that never exits and that the kubelet keeps running for the life of
 // the pod.
@@ -3471,12 +3582,12 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
 // credential runtime moved out: the authenticated front door for the Hermes API,
-// and the k8s-event-watcher.
+// the k8s-event-watcher, and the drift-detector where an install has enabled it.
 //
-// Neither could follow the credential proxy into its own pod, and for the same
+// None could follow the credential proxy into its own pod, and for the same
 // reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
-// gateway in this pod; the watcher posts its events to the Session KV server on
-// 127.0.0.1:8699, which the agent container starts. Both are loopback peers of
+// gateway in this pod; the watcher and the detector post to the Session KV server
+// on 127.0.0.1:8699, which the agent container starts. All are loopback peers of
 // the agent, not of the credentials.
 //
 // What that leaves behind is a container with no credential path in it. It runs
@@ -3533,6 +3644,34 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// same-named entry in spec.deployment.env, it would sit beside it, and
 	// server-side apply refuses a duplicate key in `env`.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
+	// The drift-detector's switch, the second peer process in this container.
+	// Written on every reconcile rather than only when on, for the reason the
+	// watcher's block above gives: the pod stays Ready either way, so the Deployment
+	// is the only place a reader can tell a deliberately quiet install from a broken
+	// one.
+	driftEnabled := driftDetectorEnabled(agent)
+	envVars = append(envVars, corev1.EnvVar{Name: driftDetectorEnabledEnv, Value: strconv.FormatBool(driftEnabled)})
+	// Its settings, only when it is on. Every install that has not applied the
+	// drift-pubsub module is off, so writing these unconditionally would put the
+	// harness triple a second time on a container that does not read it — the same
+	// three values, under different names, on every credential proxy in the fleet,
+	// for a process that is not running. All six names are reserved in
+	// mergeCredentialProxyEnv whether or not this branch writes them, so the CR
+	// cannot supply the ones this skips.
+	//
+	// The triple is repeated at all because buildPodTemplateSpec sets GKE_PROJECT_ID,
+	// GKE_LOCATION and GKE_CLUSTER_NAME on the agent container and not on this
+	// sidecar.
+	if driftEnabled {
+		driftProject, driftLocation, driftClusterName := driftDetectorHarness(agent)
+		envVars = append(envVars,
+			corev1.EnvVar{Name: driftDetectorProjectEnv, Value: driftProject},
+			corev1.EnvVar{Name: driftDetectorLocationEnv, Value: driftLocation},
+			corev1.EnvVar{Name: driftDetectorClusterNameEnv, Value: driftClusterName},
+			corev1.EnvVar{Name: driftDetectorSubscriptionEnv, Value: driftDetectorSubscription(agent)},
+			corev1.EnvVar{Name: driftDetectorGitopsManagersEnv, Value: driftDetectorGitopsManagers(agent)},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
 	// The plain hardened context, with no UID of its own. The credential runtime
 	// used to sit in this Pod under a second uid, so that the shell could not
@@ -3545,8 +3684,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts two of the image's three peer services — the API authenticator
-		// and the k8s-event-watcher. See deploy/shared/start-services.sh.
+		// Starts three of the image's four peer services — the API authenticator,
+		// the k8s-event-watcher, and the drift-detector where it is enabled. See
+		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
 		Ports:   []corev1.ContainerPort{{Name: "proxy-api", ContainerPort: 8643}},
@@ -3897,8 +4037,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// All three appended by buildAgentAPIAuthSidecar after this merge runs,
-		// so none is in `managed` above and none reserves its own name.
+		// These nine are appended by buildAgentAPIAuthSidecar after this merge
+		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
 		// name. That is not last-wins: `containers[].env` is a listType=map,
@@ -3907,6 +4047,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"EVENT_WATCHER_CLUSTER_NAME",
 		"EVENT_WATCHER_ENABLED",
 		eventWatcherMemoryLimitEnv,
+		driftDetectorEnabledEnv,
+		driftDetectorProjectEnv,
+		driftDetectorLocationEnv,
+		driftDetectorClusterNameEnv,
+		driftDetectorSubscriptionEnv,
+		driftDetectorGitopsManagersEnv,
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {
