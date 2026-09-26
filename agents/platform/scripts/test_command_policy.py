@@ -1368,11 +1368,52 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
               "--region=us-central1", "--max-run-duration=12h",
               "--format=json"],
              "capacity probe, Flex-Start"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=SPOT",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--zones=us-central1-a",
+              "--format=json"],
+             "capacity probe, per-zone follow-up"),
             (["gcloud", "beta", "compute", "advice", "capacity-history",
               "--provisioning-model=SPOT", "--machine-type=a2-highgpu-8g",
               "--types=PREEMPTION,PRICE", "--region=us-central1",
               "--format=json"],
              "capacity history, single machine type"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_future_windows_spellings_reach_the_calendar_mode_entry(self):
+        # The spellings capacity-obtainability's Future windows section has
+        # the agent emit — the TPU probe (version + chips + workload type)
+        # and the VM-shape variant, one call per candidate region, with
+        # representative timestamp values where the skill shows
+        # placeholders computed from the clock. The verb path was allowed
+        # before any of its flags had arity entries, so every one of these
+        # spellings was refused as gcp.unreadable-command -- the entry existed
+        # and nothing could reach it.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--tpu-version=V5E", "--chip-count=256",
+              "--workload-type=BATCH", "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T12:00:00Z",
+              "--location-policy=us-central1-a=ALLOW", "--format=json"],
+             "calendar mode, TPU shape"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=a3-megagpu-8g",
+              "--vm-count=8", "--duration-range=min=1d,max=7d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--end-time-range=from=2026-09-23,to=2026-09-29",
+              "--format=json"],
+             "calendar mode, VM shape with an end-time range"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=c3-standard-88-lssd",
+              "--vm-count=4", "--local-ssd=interface=NVME,size=375",
+              "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--format=json"],
+             "calendar mode, VM shape with local SSD"),
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
