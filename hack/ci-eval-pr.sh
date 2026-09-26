@@ -31,6 +31,10 @@ set -euo pipefail
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
+# A fourth file, read beside them and applied on one lane only (#2039): the
+# cases the inject lane does not run, because their premise needs the chat
+# front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
+readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -1609,11 +1613,13 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: three files under hack/eval/, read here at
+# The matrix is data, not code: four files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
-# (NIGHTLY_TASKS), and blocking-roster.txt, read further down, is what can red
-# a pull request on a graded failure (BOOTSTRAP_ADMITTED). The split exists
+# (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED), and
+# inject-lane-exclusions.txt, read after the tier switch, is what the inject
+# lane leaves out of both (#2039). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;
@@ -1738,6 +1744,63 @@ case "${EVAL_TIER}" in
     exit 1
     ;;
 esac
+
+# ─── The inject lane's exclusions (#2039) ────────────────────────────────────
+# Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
+# EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
+# through the gateway's inject door, which addresses `platform` directly: a
+# case whose premise needs the chat front door cannot hold there whatever
+# the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
+# each with its reason as the comment block above it (the file's header and
+# scripts/test_eval_rosters.py hold every entry to one), and this drops them
+# from TASKS before TASK_NAMES and the fan-out are built from it, so the
+# suite grades and reports the cases that ran. Read on every lane, so a
+# missing file or an entry naming no case fails here rather than on the
+# lane that needs it; applied on the inject lane only, so the api lane's
+# matrix stays byte for byte the presubmit file. Not a demotion: the roster
+# files are untouched. The names dropped here are kept in
+# INJECT_LANE_DROPPED (empty on every other lane) so the BOOTSTRAP_ADMITTED
+# export below leaves them out too -- a roster name the suite never grades
+# would otherwise trip bench-gate's misspelled-roster banner on every run
+# of the lane. A check the transport blinds (tool_called, worker_commands,
+# worker_agents) is the scorer's to set aside, not this file's:
+# docs/designs/eval-scorer.md, "The inject lane".
+INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
+INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
+INJECT_LANE_DROPPED=""
+# Every entry must be a registered case id, spelled exactly as the matrix
+# spells it: the drop below is an exact match against the matrix's names,
+# so a variant a filesystem test would accept (`agent-kanban-smoke/`) would
+# pass here and match nothing there, leaving the case running on the lane
+# with nothing said. Registered means the presubmit or the nightly file --
+# a nightly-only case may be excluded from an inject nightly.
+REGISTERED_CASE_NAMES="$(printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | sed -e 's#^\./tasks/##' -e 's#/task\.yaml$##')"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${INJECT_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the inject lane." >&2
+    exit 1
+  fi
+done <<< "${INJECT_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
+  INJECT_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+      INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
+"
+    else
+      INJECT_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${INJECT_LANE_KEPT[@]+"${INJECT_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -2001,8 +2064,30 @@ while IFS= read -r NAME; do
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
   fi
+  # A roster case the inject lane's exclusion step dropped from the matrix
+  # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
+  # it is still checked against the presubmit above, because the file is
+  # the api lane's roster and stays a subset of it, but a name that arms a
+  # case the suite never grades would trip bench-gate's "BOOTSTRAP_ADMITTED
+  # names no graded case" banner on every run of the lane, and that banner
+  # exists to catch a misspelled roster entry.
+  if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
+# The file guard above cannot see the lane's drop: an exclusion list that
+# names every roster case would leave the export empty on the inject lane
+# with rung 4 disarmed for whatever the matrix still holds (the nightly tier
+# keeps its own cases past the every-case-excluded stop) and no banner,
+# because no name is misspelled. Stop instead: the exclusion file needs only
+# the normal approvers, and it must not be able to do what the roster file
+# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# environment, empty included, is the stated way to mean it, and wins below.
+if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  exit 1
+fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 
@@ -2677,6 +2762,18 @@ announce_suite_verdict() {
       "${verdict_json}" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
     not_evaluated="true"
   fi
+  # Two things write that outcome (bench/kube_agents_bench/scoring.py,
+  # grade_suite): weather that took an admitted case or every case, which
+  # lists the lost cases under `not_evaluated`, and an inject-lane run whose
+  # every case was set aside as not graded on its transport, which lists
+  # nothing there and the cases under `not_graded`. The final line says
+  # which, because the two ask for opposite actions: a rerun, or a roster.
+  local graded_nothing="false"
+  if [ "${not_evaluated}" = "true" ] && \
+    python3 -c 'import json, sys; v = json.load(open(sys.argv[1])); sys.exit(0 if not v.get("not_evaluated") and v.get("not_graded") else 1)' \
+      "${verdict_json}" 2>/dev/null; then
+    graded_nothing="true"
+  fi
   # The final line keeps the `PR Smoke Test Evaluation Failed` and
   # `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
   # matches, so a not-evaluated run does not lose its final line on the
@@ -2684,6 +2781,10 @@ announce_suite_verdict() {
   if [ "${suite_status}" -eq 0 ]; then
     echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${total_duration}s) ==="
     return 0
+  fi
+  if [ "${graded_nothing}" = "true" ]; then
+    echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded on this transport (every objective check not applicable), so this run graded nothing and cannot certify green. Not a finding against the change and not an environment failure: the lane's roster is what to fix. See ${verdict_md} (Total Duration: ${total_duration}s)"
+    return "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
   fi
   if [ "${not_evaluated}" = "true" ]; then
     echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${verdict_md} (Total Duration: ${total_duration}s)"
