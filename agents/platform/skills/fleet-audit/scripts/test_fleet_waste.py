@@ -1,0 +1,5187 @@
+#!/usr/bin/env python3
+"""Tests for fleet_waste.py, the fleet-wide-cost-analysis collector."""
+
+import json
+import os
+import sys
+import threading
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(__file__))
+import fleet_waste as fw  # noqa: E402
+
+NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> fw.Run:
+    return fw.Run(["x"], rc, stdout, stderr, 0.01)
+
+
+def dump_of(*items) -> dict:
+    return {"items": list(items)}
+
+
+def obj(kind, name, ns=None, **overrides):
+    meta = {"name": name, "creationTimestamp": "2026-01-01T00:00:00Z", "labels": {}, "annotations": {}}
+    if ns is not None:
+        meta["namespace"] = ns
+    doc = {"kind": kind, "metadata": meta, "spec": {}, "status": {}}
+    for path, value in overrides.items():
+        target = doc
+        keys = path.split(".")
+        for key in keys[:-1]:
+            target = target.setdefault(key, {})
+        target[keys[-1]] = value
+    return doc
+
+
+class ParseCpuMemTest(unittest.TestCase):
+    def test_millicores(self):
+        self.assertEqual(fw.parse_cpu_cores("150m"), 0.15)
+
+    def test_whole_cores(self):
+        self.assertEqual(fw.parse_cpu_cores("2"), 2.0)
+
+    def test_mebibytes(self):
+        self.assertEqual(fw.parse_mem_mib("512Mi"), 512.0)
+
+    def test_gibibytes(self):
+        self.assertEqual(fw.parse_mem_mib("2Gi"), 2048.0)
+
+    def test_kibibytes(self):
+        self.assertAlmostEqual(fw.parse_mem_mib("2048Ki"), 2.0)
+
+    def test_bare_number_is_bytes_not_mebibytes(self):
+        self.assertAlmostEqual(fw.parse_mem_mib(str(512 * 1024 * 1024)), 512.0)
+
+    def test_unparseable_is_none(self):
+        self.assertIsNone(fw.parse_cpu_cores("garbage"))
+        self.assertIsNone(fw.parse_mem_mib("garbage"))
+
+
+MIB = 1024 * 1024
+
+
+def series_of(ns, pod, *values, key="doubleValue"):
+    return {
+        "resource": {"labels": {"namespace_name": ns, "pod_name": pod}},
+        "points": [{"value": {key: v}} for v in values],
+    }
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code, self._payload, self.text = status_code, payload, text
+
+    def json(self):
+        return self._payload
+
+
+class FakeSession:
+    """Answers the two metric queries `fetch_usage_peaks` issues."""
+
+    def __init__(self, cpu=(), mem=(), status=200, text="", raises=None):
+        self.cpu, self.mem, self.status, self.text, self.raises = list(cpu), list(mem), status, text, raises
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        if self.raises:
+            raise self.raises
+        if self.status != 200:
+            return FakeResponse(self.status, text=self.text)
+        is_cpu = "cpu/core_usage_time" in params["filter"]
+        return FakeResponse(200, {"timeSeries": self.cpu if is_cpu else self.mem})
+
+
+def usage_session(*pods, **kwargs):
+    """A `FakeSession` answering with one series per `(ns, pod, cores, mib)`.
+
+    Collector tests need *some* usage data or `overrequest` reads as degraded,
+    which is a different code path from the one they are exercising.
+    """
+    pods = pods or (("default", "idle-1", 0.01, 8.0),)
+    return FakeSession(
+        cpu=[series_of(ns, pod, cores) for ns, pod, cores, _ in pods],
+        mem=[series_of(ns, pod, mib * MIB) for ns, pod, _, mib in pods],
+        **kwargs,
+    )
+
+
+NO_USAGE = dict(cpu=[], mem=[])
+
+
+class FetchUsagePeaksTest(unittest.TestCase):
+    def fetch(self, session, **kwargs):
+        return fw.fetch_usage_peaks("acme", "prod-usc1", session=session, now=NOW, **kwargs)
+
+    def test_cpu_and_memory_merge_into_one_peak_per_pod(self):
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.15)],
+            mem=[series_of("default", "api-1", 256 * MIB)],
+        )
+        peaks, ok, result = self.fetch(session)
+        self.assertTrue(ok)
+        self.assertEqual(result.rc, 0)
+        # Cores and MiB -- the units `check_overrequest` compares against
+        # parsed `resources.requests`, not the API's cores and raw bytes.
+        self.assertEqual(peaks[("default", "api-1")], (0.15, 256.0))
+
+    def test_the_peak_is_the_max_not_the_last_or_the_mean(self):
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.1, 4.0, 0.2)],
+            mem=[series_of("default", "api-1", MIB, 8 * MIB, 2 * MIB)],
+        )
+        peaks, _, _ = self.fetch(session)
+        self.assertEqual(peaks[("default", "api-1")], (4.0, 8.0))
+
+    def test_int64_values_are_read_as_well_as_double(self):
+        # Monitoring returns memory as an integer type; a reader that only
+        # understood doubleValue would see every pod using zero bytes.
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.5)],
+            mem=[series_of("default", "api-1", str(512 * MIB), key="int64Value")],
+        )
+        peaks, _, _ = self.fetch(session)
+        self.assertEqual(peaks[("default", "api-1")], (0.5, 512.0))
+
+    def test_a_pod_in_one_metric_only_still_appears(self):
+        session = FakeSession(cpu=[series_of("default", "api-1", 0.3)], mem=[])
+        peaks, ok, _ = self.fetch(session)
+        self.assertTrue(ok)
+        self.assertEqual(peaks[("default", "api-1")], (0.3, 0.0))
+
+    def test_an_empty_answer_is_unavailable_rather_than_zero_usage(self):
+        # The one failure mode that turns this check into a fleet-wide false
+        # positive. An empty result read as "every pod used nothing" flags
+        # every workload on the cluster as pure waste, with a plausible-looking
+        # peak of 0.00 vCPU behind it.
+        peaks, ok, result = self.fetch(FakeSession(cpu=[], mem=[]))
+        self.assertEqual(peaks, {})
+        self.assertFalse(ok)
+        self.assertIn("no time series", result.stderr)
+
+    def test_an_api_error_is_unavailable_and_keeps_the_status(self):
+        peaks, ok, result = self.fetch(FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertFalse(ok)
+        self.assertEqual(peaks, {})
+        self.assertEqual(result.rc, 403)
+        self.assertIn("monitoring.timeSeries.list", result.stderr)
+
+    def test_a_transport_exception_is_unavailable_not_a_crash(self):
+        peaks, ok, result = self.fetch(FakeSession(raises=OSError("connection reset")))
+        self.assertFalse(ok)
+        self.assertEqual(result.rc, -1)
+        self.assertIn("connection reset", result.stderr)
+
+    def test_no_session_degrades_instead_of_raising(self):
+        # `collect_fleet` passes None when ADC could not be resolved. Every
+        # object-state check still has to run.
+        peaks, ok, result = self.fetch(None)
+        self.assertFalse(ok)
+        self.assertEqual(peaks, {})
+        self.assertIn("ADC", result.stderr)
+
+    def test_pagination_follows_the_next_page_token(self):
+        pages = {
+            "cpu": [
+                {"timeSeries": [series_of("default", "api-1", 0.1)], "nextPageToken": "more"},
+                {"timeSeries": [series_of("default", "api-2", 0.2)]},
+            ],
+            "mem": [{"timeSeries": [series_of("default", "api-1", MIB)]}],
+        }
+        seen = []
+
+        class Paged:
+            def get(self, url, params=None, timeout=None):
+                seen.append(params.get("pageToken"))
+                key = "cpu" if "cpu/core_usage_time" in params["filter"] else "mem"
+                queue = pages[key]
+                return FakeResponse(200, queue.pop(0))
+
+        peaks, ok, _ = self.fetch(Paged())
+        self.assertTrue(ok)
+        self.assertEqual(sorted(peaks), [("default", "api-1"), ("default", "api-2")])
+        self.assertEqual(seen, [None, "more", None])
+
+    def test_the_query_asks_for_a_peak_per_pod_over_the_whole_window(self):
+        # These four parameters are the whole method. Without the secondary
+        # ALIGN_MAX the response is one point per alignment period and the
+        # caller would have to reduce it itself; without REDUCE_SUM grouped by
+        # namespace and pod the figures stay per-container and compare against
+        # a pod's summed requests as if each container were the whole pod.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        self.fetch(session, window_hours=24)
+        params = session.calls[0]
+        self.assertEqual(params["secondaryAggregation.perSeriesAligner"], "ALIGN_MAX")
+        self.assertEqual(params["secondaryAggregation.alignmentPeriod"], "86400s")
+        self.assertEqual(params["aggregation.crossSeriesReducer"], "REDUCE_SUM")
+        self.assertEqual(
+            params["aggregation.groupByFields"],
+            ["resource.labels.namespace_name", "resource.labels.pod_name"],
+        )
+        self.assertIn('resource.labels.cluster_name="prod-usc1"', params["filter"])
+        self.assertEqual(params["interval.startTime"], "2026-07-31T00:00:00Z")
+        self.assertEqual(params["interval.endTime"], "2026-08-01T00:00:00Z")
+
+    def test_cpu_is_a_rate_and_memory_is_not(self):
+        # `core_usage_time` is a cumulative counter in core-seconds: aligned
+        # any way but ALIGN_RATE it reports seconds of CPU consumed since the
+        # container started, which is not cores and grows without bound.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        self.fetch(session)
+        aligners = {c["filter"].split('"')[1]: c["aggregation.perSeriesAligner"] for c in session.calls}
+        self.assertEqual(aligners[fw.CPU_METRIC], "ALIGN_RATE")
+        self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
+
+
+class FetchMemoryMeansTest(unittest.TestCase):
+    def fetch(self, session, **kwargs):
+        return fw.fetch_memory_means("acme", "prod-usc1", session=session, now=NOW, **kwargs)
+
+    def test_the_secondary_aligner_is_the_mean_and_the_primary_is_not(self):
+        """The one line that separates this from `fetch_usage_peaks`.
+
+        Both collapse a week to one number per pod. The primary aligner buckets
+        five-minute samples and must stay ALIGN_MAX so a pod's number is its
+        real occupancy within each bucket; the secondary collapses those
+        buckets across the window, and ALIGN_MEAN there is what makes the
+        result sustained use rather than the high-water mark 3.1 reads.
+        """
+        session = FakeSession(mem=[series_of("default", "api-1", 512 * MIB)])
+        self.fetch(session)
+        self.assertEqual(len(session.calls), 1)
+        params = session.calls[0]
+        self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_MAX")
+        self.assertEqual(params["secondaryAggregation.perSeriesAligner"], "ALIGN_MEAN")
+        self.assertEqual(params["filter"].split('"')[1], fw.MEM_METRIC)
+
+    def test_cpu_is_never_queried(self):
+        # Memory only, by design: one extra round trip per cluster, not two.
+        # CPU is compressible, so a request under actual usage throttles rather
+        # than evicts and there is no `underrequest` finding to raise.
+        session = FakeSession(mem=[series_of("default", "api-1", MIB)])
+        self.fetch(session)
+        self.assertNotIn(fw.CPU_METRIC, " ".join(c["filter"] for c in session.calls))
+
+    def test_bytes_become_mib_keyed_like_the_peaks(self):
+        session = FakeSession(mem=[series_of("default", "api-1", 1536 * MIB)])
+        means, ok, result = self.fetch(session)
+        self.assertTrue(ok)
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(means[("default", "api-1")], 1536.0)
+
+    def test_an_empty_answer_is_unavailable_rather_than_zero_usage(self):
+        # Same failure mode `fetch_usage_peaks` guards, inverted: read as "this
+        # pod averaged nothing", an empty answer suppresses every finding
+        # instead of inventing them, so the check goes quiet and looks healthy.
+        means, ok, result = self.fetch(FakeSession(mem=[]))
+        self.assertEqual(means, {})
+        self.assertFalse(ok)
+        self.assertIn("no time series", result.stderr)
+
+    def test_an_api_error_is_unavailable_and_keeps_the_status(self):
+        means, ok, result = self.fetch(FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertFalse(ok)
+        self.assertEqual(means, {})
+        self.assertEqual(result.rc, 403)
+
+    def test_no_session_degrades_instead_of_raising(self):
+        means, ok, result = self.fetch(None)
+        self.assertFalse(ok)
+        self.assertEqual(means, {})
+        self.assertIn("ADC", result.stderr)
+
+    def test_the_label_names_the_aligner_that_produced_the_number(self):
+        """`adopt_collector_evidence` overwrites the model's command with this
+        label, so it is the only description of the query a reviewer ever sees.
+        ALIGN_MEAN in it is what distinguishes the finding's evidence from
+        3.1's, which is otherwise the same metric over the same window."""
+        _, _, result = self.fetch(FakeSession(mem=[series_of("d", "p", MIB)]))
+        self.assertIn("ALIGN_MEAN", result.argv[0])
+        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", result.argv[0])
+
+
+def lb_series(rule, *values, resource="loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule"):
+    return {
+        "resource": {"type": resource, "labels": {"project_id": "acme", "forwarding_rule_name": rule}},
+        "points": [{"value": {"int64Value": str(v)}} for v in values],
+    }
+
+
+class FakeLbSession:
+    """Answers the three queries `fetch_lb_traffic` issues, by metric."""
+
+    def __init__(self, *, ingress=(), egress_packets=(), egress_bytes=(), status=200, text="", raises=None):
+        self.by_metric = {
+            fw.LB_INGRESS_PACKETS_METRIC: list(ingress),
+            fw.LB_EGRESS_PACKETS_METRIC: list(egress_packets),
+            fw.LB_EGRESS_BYTES_METRIC: list(egress_bytes),
+        }
+        self.status, self.text, self.raises, self.calls = status, text, raises, []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        if self.raises:
+            raise self.raises
+        if self.status != 200:
+            return FakeResponse(self.status, text=self.text)
+        metric = params["filter"].split('"')[1]
+        return FakeResponse(200, {"timeSeries": self.by_metric[metric]})
+
+
+class FetchLbTrafficTest(unittest.TestCase):
+    """§3.13's traffic read -- what the rule in front of an idle workload met."""
+
+    RULES = [
+        {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        {"name": "rule-b", "IPAddress": "35.245.254.69", "loadBalancingScheme": "EXTERNAL"},
+    ]
+
+    def fetch(self, session, rules=None, **kwargs):
+        return fw.fetch_lb_traffic("acme", self.RULES if rules is None else rules, session=session, now=NOW, **kwargs)
+
+    def test_the_answer_is_keyed_by_address_not_by_rule_name(self):
+        # The join on the other end is a Service's
+        # `status.loadBalancer.ingress[].ip`, and nothing in the Monitoring
+        # answer carries an address.
+        traffic, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 100000)]))
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(traffic["34.186.100.26"]["rule"], "rule-a")
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 100000)
+
+    def test_points_within_a_series_are_summed(self):
+        # DELTA counters aligned to a day: seven buckets that add up to the
+        # window, not seven candidates for a maximum.
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 10, 20, 30)]))
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 60)
+
+    def test_the_duplicate_resource_type_is_not_double_counted(self):
+        """The trap that would have published 745,404 for a rule that saw 374,158.
+
+        Monitoring reports the same L4 traffic under the legacy `tcp_lb_rule`
+        resource and again under `ExternalNetworkLoadBalancerRule`, and
+        `crossSeriesReducer` does not merge across resource types -- so
+        grouping by the rule name still returns two near-equal series. The
+        figures below are the live pair read off adamparco-kage.
+        """
+        traffic, _ = self.fetch(
+            FakeLbSession(
+                ingress=[
+                    lb_series("rule-a", 374158),
+                    lb_series("rule-a", 371246, resource="tcp_lb_rule"),
+                ]
+            )
+        )
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 374158)
+
+    def test_a_rule_with_no_series_is_present_with_no_figures(self):
+        # Present, so the caller can say "unmeasured"; `None`, so it cannot
+        # say "zero".
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        self.assertIn("35.245.254.69", traffic)
+        self.assertIsNone(traffic["35.245.254.69"]["ingress_packets"])
+
+    def test_a_series_with_no_rule_label_is_dropped(self):
+        """The mis-grouped answer, which carries the project's whole traffic.
+
+        `metric.labels.forwarding_rule_name` is a valid thing to ask for and
+        returns exactly this: one unlabelled series holding every rule's
+        packets. Attributing it to a rule would be a fabricated number an
+        order of magnitude too large.
+        """
+        unlabelled = {"resource": {"type": "tcp_lb_rule", "labels": {"project_id": "acme"}}, "points": [{"value": {"int64Value": "743426"}}]}
+        traffic, _ = self.fetch(FakeLbSession(ingress=[unlabelled, lb_series("rule-a", 374158)]))
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 374158)
+
+    def test_only_external_rules_are_measured(self):
+        rules = [
+            {"name": "internal", "IPAddress": "10.150.0.78", "loadBalancingScheme": "INTERNAL"},
+            {"name": "psc", "IPAddress": "10.150.0.60"},
+            {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        ]
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 5)]), rules=rules)
+        self.assertEqual(sorted(traffic), ["34.186.100.26"])
+
+    def test_a_project_with_no_external_rule_reads_as_nothing_to_measure(self):
+        traffic, result = self.fetch(FakeLbSession(), rules=[])
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, 0)
+        self.assertIn("no EXTERNAL forwarding rule", result.stderr)
+
+    def test_an_api_error_keeps_its_status_and_measures_nothing(self):
+        traffic, result = self.fetch(FakeLbSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, 403)
+        self.assertIn("monitoring.timeSeries.list", result.stderr)
+
+    def test_a_transport_exception_is_a_failed_read_not_a_crash(self):
+        traffic, result = self.fetch(FakeLbSession(raises=OSError("connection reset")))
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, -1)
+
+    def test_no_session_degrades_the_way_every_other_read_here_does(self):
+        traffic, result = self.fetch(None)
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, -1)
+        self.assertIn("ADC", result.stderr)
+
+    def test_the_query_groups_by_the_resource_label(self):
+        session = FakeLbSession(ingress=[lb_series("rule-a", 1)])
+        self.fetch(session, window_hours=24)
+        params = session.calls[0]
+        self.assertEqual(params["aggregation.groupByFields"], ["resource.labels.forwarding_rule_name"])
+        self.assertEqual(params["aggregation.crossSeriesReducer"], "REDUCE_SUM")
+        self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_SUM")
+        self.assertEqual(params["aggregation.alignmentPeriod"], "86400s")
+        self.assertEqual(params["interval.startTime"], "2026-07-31T00:00:00Z")
+
+    def test_all_three_metrics_are_read(self):
+        session = FakeLbSession(ingress=[lb_series("rule-a", 1)])
+        self.fetch(session)
+        self.assertEqual(
+            [call["filter"].split('"')[1] for call in session.calls],
+            [fw.LB_INGRESS_PACKETS_METRIC, fw.LB_EGRESS_PACKETS_METRIC, fw.LB_EGRESS_BYTES_METRIC],
+        )
+
+    def test_pagination_follows_the_next_page_token(self):
+        pages = [
+            {"timeSeries": [lb_series("rule-a", 10)], "nextPageToken": "more"},
+            {"timeSeries": [lb_series("rule-b", 20)]},
+        ]
+        seen = []
+
+        class Paged:
+            def get(self, url, params=None, timeout=None):
+                seen.append(params.get("pageToken"))
+                if fw.LB_INGRESS_PACKETS_METRIC not in params["filter"]:
+                    return FakeResponse(200, {"timeSeries": []})
+                return FakeResponse(200, pages.pop(0) if pages else {"timeSeries": []})
+
+        traffic, _ = self.fetch(Paged())
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 10)
+        self.assertEqual(traffic["35.245.254.69"]["ingress_packets"], 20)
+        self.assertEqual(seen[:2], [None, "more"])
+
+    def test_the_recorded_label_names_what_a_reader_would_re_run(self):
+        _, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        label = result.argv[0]
+        self.assertIn("projects/acme/timeSeries", label)
+        self.assertIn(fw.LB_RULE_LABEL, label)
+        self.assertIn(fw.LB_INGRESS_PACKETS_METRIC, label)
+        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", label)
+
+    def test_the_digest_survives_an_unmeasured_rule(self):
+        # The rendered stand-in holds `None` in three columns for `rule-b`. A
+        # tuple sort that ever compared one against a number would raise, and
+        # the whole project's traffic read would come back as a crash.
+        _, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        rows = json.loads(result.stdout)
+        self.assertEqual([row[0] for row in rows], ["34.186.100.26", "35.245.254.69"])
+        self.assertIsNone(rows[1][2])
+
+
+class OrphanPvTest(unittest.TestCase):
+    def pv(self, phase, reclaim="Retain", **overrides):
+        doc = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": reclaim, "status.phase": phase, "spec.capacity": {"storage": "10Gi"}})
+        for path, value in overrides.items():
+            target = doc
+            keys = path.split(".")
+            for key in keys[:-1]:
+                target = target.setdefault(key, {})
+            target[keys[-1]] = value
+        return doc
+
+    def context(self, pvs, pvcs=None, sts=None):
+        return {"pvs": pvs, "pvcs": pvcs or [], "statefulsets": sts or []}
+
+    def test_flags_released_over_7_days(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
+        hits = fw.check_orphan_pv(self.context([pv]), now=NOW)
+        self.assertEqual(len(hits), 1)
+
+    def test_does_not_flag_released_under_7_days(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-07-30T00:00:00Z"})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
+
+    def test_delete_policy_is_never_flagged(self):
+        pv = self.pv("Released", reclaim="Delete", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
+
+    def test_falls_back_to_object_age_when_transition_time_absent(self):
+        pv = self.pv("Failed")  # creationTimestamp is 2026-01-01, > 7 days before NOW
+        hits = fw.check_orphan_pv(self.context([pv]), now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("lastPhaseTransitionTime absent", hits[0]["excerpt"])
+
+    def test_available_unclaimed_over_30_days_is_flagged(self):
+        pv = self.pv("Available")  # created 2026-01-01, unclaimed
+        self.assertEqual(len(fw.check_orphan_pv(self.context([pv]), now=NOW)), 1)
+
+    def test_available_with_claim_ref_is_not_flagged(self):
+        pv = self.pv("Available", **{"spec.claimRef": {"namespace": "default", "name": "x"}})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
+
+    def test_claim_ref_naming_a_live_pvc_is_suppressed(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.claimRef": {"namespace": "default", "name": "data"}})
+        pvc = obj("PersistentVolumeClaim", "data", ns="default")
+        self.assertEqual(fw.check_orphan_pv(self.context([pv], pvcs=[pvc]), now=NOW), [])
+
+    def test_scaled_to_zero_statefulset_claim_is_suppressed(self):
+        pv = self.pv(
+            "Released",
+            **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.claimRef": {"namespace": "default", "name": "data-mydb-0"}},
+        )
+        sts = obj("StatefulSet", "mydb", ns="default")
+        self.assertEqual(fw.check_orphan_pv(self.context([pv], sts=[sts]), now=NOW), [])
+
+    def test_backup_annotated_pv_is_suppressed(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
+        pv["metadata"]["annotations"]["velero.io/backup-name"] = "nightly"
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
+
+    def test_large_disk_is_major(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.capacity": {"storage": "500Gi"}})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW)[0]["severity"], "major")
+
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 30d 14h. The gate is 30, so this is the shape that matters: rounding
+        # to nearest printed "31d" and handed the model a number a day past a
+        # threshold it is entitled to quote back in a title.
+        pv = self.pv("Available", **{"metadata.creationTimestamp": "2026-07-01T10:00:00Z"})
+        self.assertIn("AGE=30d", fw.check_orphan_pv(self.context([pv]), now=NOW)[0]["excerpt"])
+
+
+class UnconsumedPvcTest(unittest.TestCase):
+    def pvc(self, name="data", ns="default", phase="Bound", created="2026-01-01T00:00:00Z", capacity="10Gi"):
+        return obj("PersistentVolumeClaim", name, ns=ns, **{"status.phase": phase, "status.capacity": {"storage": capacity}}, **{"metadata.creationTimestamp": created})
+
+    def test_flags_bound_unreferenced_over_14_days(self):
+        context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": []}
+        self.assertEqual(len(fw.check_unconsumed_pvc(context, now=NOW)), 1)
+
+    def test_does_not_flag_referenced_by_a_pod(self):
+        pod = obj("Pod", "p", ns="default", **{"spec.volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]})
+        context = {"pods": [pod], "pvcs": [self.pvc()], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_under_14_days(self):
+        context = {"pods": [], "pvcs": [self.pvc(created="2026-07-25T00:00:00Z")], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_scaled_to_zero_statefulset_claim(self):
+        sts = obj("StatefulSet", "mydb", ns="default")
+        context = {"pods": [], "pvcs": [self.pvc(name="data-mydb-0")], "statefulsets": [sts]}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_system_namespace(self):
+        context = {"pods": [], "pvcs": [self.pvc(ns="kube-system")], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_unbound(self):
+        context = {"pods": [], "pvcs": [self.pvc(phase="Pending")], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 14d 14h, against a 14-day gate. See the matching case in OrphanPvTest.
+        context = {"pods": [], "pvcs": [self.pvc(created="2026-07-17T10:00:00Z")], "statefulsets": []}
+        self.assertIn("AGE=14d", fw.check_unconsumed_pvc(context, now=NOW)[0]["excerpt"])
+
+
+class IdleNodepoolTest(unittest.TestCase):
+    def node(self, name, pool, cpu_alloc="4", mem_alloc="8Gi", unschedulable=False):
+        return obj(
+            "Node", name,
+            **{
+                "metadata.labels": {"cloud.google.com/gke-nodepool": pool},
+                "status.allocatable": {"cpu": cpu_alloc, "memory": mem_alloc},
+                "spec.unschedulable": unschedulable,
+                "metadata.creationTimestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    def pod_on(self, node, cpu_req="0", mem_req="0Mi", daemonset=False, phase="Running",
+               ns="default", name=None):
+        owners = [{"kind": "DaemonSet", "name": "ds"}] if daemonset else []
+        return obj(
+            "Pod", name or f"p-{node}", ns=ns,
+            **{
+                "spec.nodeName": node,
+                "spec.containers": [{"resources": {"requests": {"cpu": cpu_req, "memory": mem_req}}}],
+                "metadata.ownerReferences": owners,
+                "status.phase": phase,
+            },
+        )
+
+    def pool(self, name, min_nodes=1, autoscaling_enabled=True, machine_type="e2-standard-8",
+             accelerators=None, taints=None):
+        return {
+            "name": name,
+            "autoscaling": {"enabled": autoscaling_enabled, "minNodeCount": min_nodes},
+            "config": {"machineType": machine_type, "accelerators": accelerators or [],
+                       "taints": taints or []},
+        }
+
+    def small_node_with_addons(self, node="n1", pool="default-pool"):
+        """The `spot-capacity-test` shape measured on the fleet 2026-09-05: a
+        lone e2-small whose GKE add-ons alone book 61% CPU / 39% memory."""
+        return (
+            self.node(node, pool, cpu_alloc="940m", mem_alloc="1372Mi"),
+            [
+                self.pod_on(node, cpu_req="270m", mem_req="155Mi", ns="kube-system", name="kube-dns"),
+                self.pod_on(node, cpu_req="105m", mem_req="130Mi", ns="gke-managed-cim", name="ksm"),
+                self.pod_on(node, cpu_req="202m", mem_req="247Mi", ns="kube-system", name="rest"),
+            ],
+        )
+
+    def test_flags_idle_pool_with_nonzero_floor(self):
+        nodes = [self.node("n1", "idle-pool")]
+        pods = [self.pod_on("n1", cpu_req="200m", mem_req="200Mi")]  # well under 15% of 4 vCPU/8Gi
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("idle-pool"), self.pool("other-pool")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NodePool/idle-pool")
+
+    def test_does_not_flag_the_only_pool_in_the_cluster(self):
+        nodes = [self.node("n1", "only-pool")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("only-pool")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_does_not_flag_pool_at_min_zero(self):
+        nodes = [self.node("n1", "burst")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("burst", min_nodes=0), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_daemonset_pods_are_excluded_from_the_allocation_math(self):
+        nodes = [self.node("n1", "pool")]
+        pods = [self.pod_on("n1", cpu_req="3", mem_req="6Gi", daemonset=True)]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        # DaemonSet-only allocation still reads as idle -- 90% of a node
+        # would look "used" if the filter did not exclude it.
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_does_not_flag_a_well_utilized_pool(self):
+        nodes = [self.node("n1", "pool")]
+        pods = [self.pod_on("n1", cpu_req="3", mem_req="6Gi")]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_accelerator_pool_is_major_even_with_few_nodes(self):
+        nodes = [self.node("n1", "gpu-pool")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("gpu-pool", machine_type="a2-highgpu-1g", accelerators=[{"acceleratorType": "nvidia-tesla-a100"}]), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_small_machine_few_nodes_is_minor(self):
+        nodes = [self.node("n1", "pool", cpu_alloc="2", mem_alloc="4Gi")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_a_tpu_pool_is_major_without_an_accelerators_list(self):
+        """A TPU node pool carries its topology, not `config.accelerators`, so
+        `has_accelerator` is False there and the machine type is the only
+        signal. §3.7: an idle accelerator pool with a non-zero floor is the
+        largest reclaimable item this audit can find."""
+        nodes = [self.node("n1", "tpu-pool")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("tpu-pool", machine_type="ct5lp-hightpu-4t"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_one_busy_node_stops_the_pool_being_called_idle(self):
+        """§3.7 flags when *every* node in the pool is under 15%, not when the
+        pool averages under 15%. Nine empty nodes and one full one average 10%,
+        and the full one is exactly what stops the pool shrinking."""
+        nodes = [self.node(f"n{i}", "pool") for i in range(10)]
+        pods = [self.pod_on("n0", cpu_req="3800m", mem_req="7Gi")]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_a_pool_where_every_node_is_idle_is_still_flagged(self):
+        nodes = [self.node(f"n{i}", "pool") for i in range(10)]
+        pods = [self.pod_on(f"n{i}", cpu_req="100m", mem_req="100Mi") for i in range(10)]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_node_reporting_no_allocatable_is_not_evidence_of_idleness(self):
+        nodes = [self.node("n1", "pool"), self.node("n2", "pool", cpu_alloc="0", mem_alloc="0")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_pool_age_comes_from_the_oldest_node_not_the_first_listed(self):
+        """`kubectl get nodes` comes back name-sorted, so `nodes[0]` was the
+        alphabetically first node. A months-old pool that autoscaled up a node
+        named `a-...` yesterday exempted itself from the whole check."""
+        old = self.node("z-old", "pool")  # creationTimestamp 2026-01-01
+        new = self.node("a-new", "pool")
+        new["metadata"]["creationTimestamp"] = (NOW - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        context = {"nodes": [new, old], "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_genuinely_new_pool_is_still_skipped(self):
+        new = self.node("n1", "pool")
+        new["metadata"]["creationTimestamp"] = (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        context = {"nodes": [new], "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_system_addons_alone_do_not_make_a_pool_look_busy(self):
+        """§3.7 puts the 15% bar "below the point where DaemonSet and system
+        overhead (typically 10-25% of a small node) dominates". Measured, GKE's
+        non-DaemonSet add-ons come to ~0.57 vCPU per node, so on an e2-small
+        they are 61% on their own and the bar is unreachable. On the fleet of
+        2026-09-05 that silenced the check on every one of twelve Standard
+        pools -- including this shape, a lone untainted e2-small holding no
+        workload at all next to a pool with 1.5 vCPU free."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/default-pool"])
+        self.assertIn("no workload pods at all", hits[0]["excerpt"])
+
+    def test_one_real_workload_still_keeps_the_pool(self):
+        """The system-pod exclusion must not swallow the busy case: a pool
+        carrying an actual workload above the bar is in use, whatever the
+        add-ons around it add up to."""
+        node, addons = self.small_node_with_addons()
+        pods = addons + [self.pod_on("n1", cpu_req="500m", mem_req="100Mi", name="app")]
+        context = {"nodes": [node], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_a_workload_under_the_bar_is_flagged_and_quantified(self):
+        """Under 15% of allocatable is still an under-allocated pool, and the
+        excerpt has to say so rather than claiming the pool is empty."""
+        node, addons = self.small_node_with_addons()
+        pods = addons + [self.pod_on("n1", cpu_req="50m", mem_req="10Mi", name="tiny")]
+        context = {"nodes": [node], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("1 workload pod(s) requesting 5% CPU / 1% memory", hits[0]["excerpt"])
+
+    def test_the_excerpt_keeps_the_autoscaler_facing_figure(self):
+        """The add-ons are excluded from the *gate*, not from the reader: the
+        cluster autoscaler weighs them when it decides whether to drain, so the
+        all-non-DaemonSet number stays in the evidence."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("non-DS CPU is 61% / mem 39% of allocatable (0.58 vCPU / 0.5 GiB)", excerpt)
+
+    def test_the_excerpt_reports_headroom_on_the_other_pools(self):
+        """Everything on the pool has to land somewhere before a node drains,
+        add-ons included. Without the headroom figure the reader has to go and
+        work out for themselves whether kube-dns has anywhere to go."""
+        node, addons = self.small_node_with_addons()
+        busy = self.node("n2", "other", cpu_alloc="4", mem_alloc="8Gi")
+        pods = addons + [self.pod_on("n2", cpu_req="2", mem_req="4Gi", name="busy")]
+        context = {"nodes": [node, busy], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/default-pool"])
+        self.assertIn("other pools have 2.00 vCPU / 4.0 GiB unrequested to absorb it",
+                      hits[0]["excerpt"])
+        self.assertIn("before taints, selectors and zonal spread", hits[0]["excerpt"])
+
+    def test_taints_are_surfaced_so_a_dedicated_pool_can_be_dismissed(self):
+        """A pool tainted for add-ons is empty of workloads by design. That is
+        a judgement for triage, not a suppression here -- §3.7 refuses to
+        suppress tainted pools outright because a stranded accelerator pool is
+        the largest item this audit can find."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        taints = [{"key": "dedicated", "value": "system", "effect": "NO_SCHEDULE"}]
+        pools = [self.pool("default-pool", machine_type="e2-small", taints=taints),
+                 self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Nodes are tainted dedicated=system:NO_SCHEDULE", excerpt)
+        self.assertIn("dedicated on purpose", excerpt)
+
+    def test_drain_blockers_are_named_because_lowering_the_floor_would_do_nothing(self):
+        """The autoscaler skips a node holding a PDB-less `kube-system` pod or
+        an unannotated local-storage pod, and GKE does not let you turn either
+        rule off. Without this the finding reads as actionable while
+        `--min-nodes=0` sits there reclaiming nothing."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons, "pdbs": []}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Draining will not happen on its own: 2 pod(s)", excerpt)
+        self.assertIn("kube-system/kube-dns (kube-system, no PDB)", excerpt)
+        self.assertIn("deleting the pool is the remediation that works", excerpt)
+
+    def test_a_pdb_backed_kube_system_pod_is_not_a_blocker(self):
+        node, addons = self.small_node_with_addons()
+        for pod in addons:
+            pod["metadata"]["labels"] = {"k8s-app": "kube-dns"}
+        context = {"nodes": [node], "pods": addons,
+                   "pdbs": [{"spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}}}]}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_a_mirror_pod_is_not_a_blocker(self):
+        """kube-proxy is owned by the Node, not a DaemonSet, so the DaemonSet
+        filter does not reach it -- but it is static and goes with the node."""
+        node = self.node("n1", "pool")
+        mirror = self.pod_on("n1", ns="kube-system", name="kube-proxy-n1")
+        mirror["metadata"]["ownerReferences"] = [{"kind": "Node", "name": "n1"}]
+        mirror["spec"]["volumes"] = [{"hostPath": {"path": "/var/lib"}}]
+        context = {"nodes": [node], "pods": [mirror], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_local_storage_outside_kube_system_still_blocks(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"emptyDir": {}}]
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("gmp-system/gmp-op (local storage, not safe-to-evict)", excerpt)
+
+    def test_a_safe_to_evict_local_storage_pod_is_not_a_blocker(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"emptyDir": {}}]
+        pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: "true"}
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_an_empty_pool_gets_no_blocker_note(self):
+        context = {"nodes": [self.node("n1", "pool")], "pods": [], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_a_context_without_pdbs_does_not_crash_the_check(self):
+        """Every existing caller builds the full dump, but the check reads
+        `pdbs` only for this note and must not start requiring it."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_fixed_size_pool_says_so_rather_than_min_none(self):
+        """`min=None` reads as missing data; it means the pool has no
+        autoscaler, and §3.7's remediation then has to create one rather than
+        lower a floor. The live `default-pool` on `spot-capacity-test` is
+        exactly this shape."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small", autoscaling_enabled=False),
+                 self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("autoscaling disabled, so the node count is a fixed floor", excerpt)
+        self.assertNotIn("min=None", excerpt)
+
+    def test_an_autoscaled_pool_still_reports_its_floor(self):
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small", min_nodes=2), self.pool("other")]
+        self.assertIn("min=2", fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_an_untainted_pool_gets_no_taint_note(self):
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertNotIn("tainted", fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+
+class MachineTypeVcpusTest(unittest.TestCase):
+    def test_standard(self):
+        self.assertEqual(fw._machine_type_vcpus("e2-standard-8"), 8)
+
+    def test_highmem(self):
+        self.assertEqual(fw._machine_type_vcpus("n2-highmem-16"), 16)
+
+    def test_custom(self):
+        self.assertEqual(fw._machine_type_vcpus("custom-4-16384"), 4)
+
+    def test_small_is_unmatched(self):
+        self.assertIsNone(fw._machine_type_vcpus("e2-small"))
+
+    def test_a_local_ssd_variant_still_parses(self):
+        self.assertEqual(fw._machine_type_vcpus("c3-standard-8-lssd"), 8)
+
+    def test_an_accelerator_type_is_not_read_as_a_vcpu_count(self):
+        """`a3-highgpu-8g`'s `8` counts GPUs, not vCPUs -- it is a 208-vCPU
+        machine. Answering 8 would be luck; answering None and letting
+        `_is_big_machine` decide is the honest split."""
+        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "ct5lp-hightpu-4t"):
+            with self.subTest(machine_type=machine_type):
+                self.assertIsNone(fw._machine_type_vcpus(machine_type))
+
+
+class IsBigMachineTest(unittest.TestCase):
+    def test_eight_vcpus_is_the_line(self):
+        self.assertTrue(fw._is_big_machine("e2-standard-8"))
+        self.assertFalse(fw._is_big_machine("e2-standard-4"))
+
+    def test_every_accelerator_family_is_big(self):
+        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "a3-highgpu-8g", "ct5lp-hightpu-4t"):
+            with self.subTest(machine_type=machine_type):
+                self.assertTrue(fw._is_big_machine(machine_type))
+
+    def test_an_unparseable_type_is_not_assumed_big(self):
+        self.assertFalse(fw._is_big_machine("e2-micro"))
+        self.assertFalse(fw._is_big_machine(""))
+
+
+class ScaledownBlockedTest(unittest.TestCase):
+    def test_bare_pod_with_local_storage_is_critical(self):
+        pod = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "spec.volumes": [{"emptyDir": {}}], "metadata.ownerReferences": []})
+        context = {"pods": [pod], "pdbs": []}
+        hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_safe_to_evict_false_on_owned_pod_is_critical(self):
+        pod = obj(
+            "Pod", "app", ns="default",
+            **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}], "metadata.annotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"}},
+        )
+        context = {"pods": [pod], "pdbs": []}
+        hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_pdb_backed_pod_is_never_flagged_here(self):
+        pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": []})
+        pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": {"matchLabels": {"app": "web"}}})
+        context = {"pods": [pod], "pdbs": [pdb]}
+        self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_no_idle_pool_hits_means_nothing_to_check(self):
+        self.assertEqual(fw.check_scaledown_blocked({"pods": [], "pdbs": []}, []), [])
+
+    def test_ordinary_evictable_pod_is_not_flagged(self):
+        pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}]})
+        context = {"pods": [pod], "pdbs": []}
+        self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def evict_pod(self, value, node="n1"):
+        return obj(
+            "Pod", "app", ns="default",
+            **{
+                "spec.nodeName": node,
+                "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}],
+                "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: value},
+            },
+        )
+
+    def test_every_spelling_the_autoscaler_accepts_pins_the_node(self):
+        """The autoscaler parses this annotation with `strconv.ParseBool`, so
+        `"False"`, `"FALSE"` and `"0"` pin a pod exactly as `"false"` does. An
+        exact match against `"false"` read all three as the annotation being
+        absent and let the node through unreported."""
+        for value in ("false", "False", "FALSE", "0", "f", " false "):
+            with self.subTest(value=value):
+                context = {"pods": [self.evict_pod(value)], "pdbs": []}
+                hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+                self.assertEqual(len(hits), 1, value)
+                self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_capitalised_true_clears_the_local_storage_pin(self):
+        """The mirror-image error: `!= "true"` read `"True"` as unset, so a pod
+        whose owner had explicitly cleared the annotation was still reported."""
+        for value in ("true", "True", "TRUE", "1"):
+            with self.subTest(value=value):
+                pod = self.evict_pod(value)
+                pod["spec"]["volumes"] = [{"emptyDir": {}}]
+                context = {"pods": [pod], "pdbs": []}
+                self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_an_unparseable_value_is_treated_as_unset(self):
+        pod = self.evict_pod("maybe")
+        context = {"pods": [pod], "pdbs": []}
+        self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_the_excerpt_quotes_the_raw_annotation(self):
+        context = {"pods": [self.evict_pod("False")], "pdbs": []}
+        hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertIn("safe-to-evict=False", hits[0]["excerpt"])
+
+
+class OwnerKeyTest(unittest.TestCase):
+    def test_no_owners_is_none(self):
+        self.assertIsNone(fw._owner_key([]))
+
+    def test_the_controller_wins_wherever_it_sits_in_the_list(self):
+        owners = [
+            {"kind": "ThingBinding", "name": "zzz"},
+            {"kind": "ReplicaSet", "name": "web-abc", "controller": True},
+        ]
+        self.assertEqual(fw._owner_key(owners), ("ReplicaSet", "web-abc"))
+        self.assertEqual(fw._owner_key(list(reversed(owners))), ("ReplicaSet", "web-abc"))
+
+    def test_with_no_controller_the_answer_is_still_order_independent(self):
+        owners = [{"kind": "B", "name": "b"}, {"kind": "A", "name": "a"}]
+        self.assertEqual(fw._owner_key(owners), fw._owner_key(list(reversed(owners))))
+
+
+class SizingOwnerTest(unittest.TestCase):
+    @staticmethod
+    def meta(kind="ReplicaSet", name="web-74d7c4f678", hash_label="74d7c4f678"):
+        labels = {"pod-template-hash": hash_label} if hash_label else {}
+        return {
+            "name": "web-74d7c4f678-abcde",
+            "labels": labels,
+            "ownerReferences": [{"kind": kind, "name": name, "controller": True}],
+        }
+
+    def test_a_replicaset_resolves_to_the_deployment_that_declares_it(self):
+        self.assertEqual(fw._sizing_owner(self.meta()), ("Deployment", "web"))
+
+    def test_a_bare_replicaset_keeps_its_own_name(self):
+        # No `pod-template-hash` means no Deployment above it, so the
+        # ReplicaSet really is the object the repo declares.
+        self.assertEqual(
+            fw._sizing_owner(self.meta(name="standalone", hash_label=None)),
+            ("ReplicaSet", "standalone"),
+        )
+
+    def test_a_hash_that_is_not_the_name_suffix_is_not_stripped(self):
+        self.assertEqual(
+            fw._sizing_owner(self.meta(name="web-abc", hash_label="74d7c4f678")),
+            ("ReplicaSet", "web-abc"),
+        )
+
+    def test_other_kinds_pass_through(self):
+        self.assertEqual(
+            fw._sizing_owner(self.meta(kind="StatefulSet", name="db", hash_label=None)),
+            ("StatefulSet", "db"),
+        )
+
+    def test_an_unowned_pod_is_its_own_object(self):
+        self.assertEqual(
+            fw._sizing_owner({"name": "debug", "ownerReferences": []}), ("Pod", "debug")
+        )
+
+
+class JobFinishedAtTest(unittest.TestCase):
+    def test_picks_the_terminal_condition_not_the_first_one(self):
+        status = {
+            "conditions": [
+                {"type": "Suspended", "status": "False", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+                {"type": "Failed", "status": "True", "lastTransitionTime": "2026-07-01T00:00:00Z"},
+            ]
+        }
+        self.assertEqual(fw._job_finished_at(status), "2026-07-01T00:00:00Z")
+
+    def test_a_condition_that_is_not_true_does_not_count(self):
+        status = {"conditions": [{"type": "Failed", "status": "False", "lastTransitionTime": "2026-01-01T00:00:00Z"}]}
+        self.assertEqual(fw._job_finished_at(status), "")
+
+    def test_success_criteria_met_counts(self):
+        status = {"conditions": [{"type": "SuccessCriteriaMet", "status": "True", "lastTransitionTime": "2026-02-02T00:00:00Z"}]}
+        self.assertEqual(fw._job_finished_at(status), "2026-02-02T00:00:00Z")
+
+    def test_no_conditions_is_empty(self):
+        self.assertEqual(fw._job_finished_at({}), "")
+
+
+class TerminalPodsTest(unittest.TestCase):
+    def terminal_pod(self, ns="default", name="p", phase="Succeeded", created="2026-01-01T00:00:00Z"):
+        return obj("Pod", name, ns=ns, **{"status.phase": phase, "metadata.creationTimestamp": created})
+
+    def test_flags_a_namespace_with_50_or_more(self):
+        pods = [self.terminal_pod(name=f"p{i}") for i in range(50)]
+        context = {"pods": pods, "jobs": [], "cronjobs": []}
+        hits = fw.check_terminal_pods(context, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("50 terminal pods", hits[0]["excerpt"])
+
+    def test_flags_a_single_old_pod(self):
+        pods = [self.terminal_pod(created="2026-01-01T00:00:00Z")]
+        context = {"pods": pods, "jobs": [], "cronjobs": []}
+        self.assertEqual(len(fw.check_terminal_pods(context, now=NOW)), 1)
+
+    def test_does_not_flag_recent_small_backlog(self):
+        pods = [self.terminal_pod(created="2026-07-30T00:00:00Z") for _ in range(3)]
+        context = {"pods": pods, "jobs": [], "cronjobs": []}
+        self.assertEqual(fw.check_terminal_pods(context, now=NOW), [])
+
+    def test_flags_standalone_job_without_ttl(self):
+        job = obj("Job", "batch", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z"})
+        context = {"pods": [], "jobs": [job], "cronjobs": []}
+        hits = fw.check_terminal_pods(context, now=NOW)
+        self.assertTrue(any(h["object"] == "Job/batch" for h in hits))
+
+    def test_does_not_flag_job_with_ttl_set(self):
+        job = obj("Job", "batch", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z", "spec.ttlSecondsAfterFinished": 3600})
+        context = {"pods": [], "jobs": [job], "cronjobs": []}
+        self.assertEqual(fw.check_terminal_pods(context, now=NOW), [])
+
+    def test_does_not_flag_cronjob_owned_job(self):
+        job = obj(
+            "Job", "cron-123", ns="default",
+            **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z", "metadata.ownerReferences": [{"kind": "CronJob", "name": "cron"}]},
+        )
+        context = {"pods": [], "jobs": [job], "cronjobs": []}
+        self.assertEqual(fw.check_terminal_pods(context, now=NOW), [])
+
+    def test_flags_cronjob_with_excessive_history_limit(self):
+        cj = obj("CronJob", "chatty", ns="default", **{"spec.successfulJobsHistoryLimit": 20})
+        context = {"pods": [], "jobs": [], "cronjobs": [cj]}
+        hits = fw.check_terminal_pods(context, now=NOW)
+        self.assertTrue(any(h["object"] == "CronJob/chatty" for h in hits))
+
+
+class IdleNamespaceTest(unittest.TestCase):
+    def ns(self, name, created="2026-01-01T00:00:00Z"):
+        return obj("Namespace", name, **{"metadata.creationTimestamp": created})
+
+    def test_flags_idle_ns_with_loadbalancer(self):
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        hits = fw.check_idle_namespace(context, now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_flags_idle_ns_with_pvc(self):
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertEqual(len(fw.check_idle_namespace(context, now=NOW)), 1)
+
+    def test_does_not_flag_active_namespace(self):
+        pod = obj("Pod", "p", ns="demo", **{"status.phase": "Running"})
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        context = {"pods": [pod], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_does_not_flag_namespace_with_nothing_billable(self):
+        context = {"pods": [], "pvcs": [], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_does_not_flag_gitops_synced_namespace(self):
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        ns_doc = self.ns("demo")
+        ns_doc["metadata"]["annotations"]["configsync.gke.io/sync-name"] = "x"
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 30d 14h, against a 30-day gate. See the matching case in OrphanPvTest.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo", created="2026-07-01T10:00:00Z")]}
+        self.assertIn("for 30d;", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_capacity_just_under_the_severity_gate_is_not_printed_as_the_gate(self):
+        # 102000Mi is 99.6 GiB. Rounding to nearest printed "100 GiB" while the
+        # gate read the raw value and graded `minor`, so one finding said the
+        # threshold was met and denied it in the same breath.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "102000Mi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        hit = fw.check_idle_namespace(context, now=NOW)[0]
+        self.assertIn("99 GiB of PVCs", hit["excerpt"])
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_a_sub_gibibyte_claim_is_not_floored_away_to_zero(self):
+        # Flooring must not print "0 GiB of PVCs" about the very PVC that made
+        # the namespace billable; only a namespace billable through something
+        # other than storage gets a literal 0.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "500Mi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertIn("<1 GiB of PVCs", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_a_namespace_billable_only_by_a_loadbalancer_holds_zero(self):
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertIn("a LoadBalancer Service, 0 GiB of PVCs", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_a_resourcequota_does_not_make_an_empty_namespace_billable(self):
+        # A quota reserves nothing and bills nothing -- it gates admission on
+        # the requests of the pods in its own namespace, of which there are
+        # none. This namespace is the live `gitops-managed`: no pods, no PVCs,
+        # no Services, one quota with `used` all zeroes, costing zero. Flagged,
+        # it drew the impact "reserving 10 vCPU / 20 GiB of request headroom
+        # ... that no other namespace on this Autopilot cluster can use", which
+        # is false in all three of its claims.
+        rq = obj("ResourceQuota", "platform-baseline-quota", ns="demo", **{"status.hard": {"requests.cpu": "10"}})
+        context = {"pods": [], "pvcs": [], "services": [], "resourcequotas": [rq], "namespaces": [self.ns("demo")]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_a_resourcequota_beside_a_real_billable_object_still_flags(self):
+        # Dropping the quota arm must not suppress a namespace that a PVC or a
+        # LoadBalancer would have flagged on its own.
+        rq = obj("ResourceQuota", "q", ns="demo", **{"status.hard": {"requests.cpu": "10"}})
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [rq], "namespaces": [self.ns("demo")]}
+        hits = fw.check_idle_namespace(context, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("uota", hits[0]["excerpt"])
+
+
+class OverrequestTest(unittest.TestCase):
+    def deployment_pod(self, ns="default", name="api-1", cpu_req="12", mem_req="48Gi", cpu_lim=None, mem_lim=None, started="2026-01-01T00:00:00Z", owner_kind="ReplicaSet", owner_name="api"):
+        resources = {"requests": {"cpu": cpu_req, "memory": mem_req}}
+        if cpu_lim or mem_lim:
+            resources["limits"] = {"cpu": cpu_lim or cpu_req, "memory": mem_lim or mem_req}
+        return obj(
+            "Pod", name, ns=ns,
+            **{
+                "spec.containers": [{"resources": resources}],
+                "status.startTime": started,
+                "status.phase": "Running",
+                "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
+            },
+        )
+
+    IDLE = {("default", "api-1"): (0.0, 0.0)}
+
+    def test_flags_gross_overrequest(self):
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (0.9, 3072.0)}  # 0.9 vCPU / 3 GiB peak vs 12/48 requested
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_does_not_flag_when_the_peak_clears_the_bar(self):
+        # The window used to be three ten-minute samples and this rule used to
+        # be "every one of them agrees". A week-long peak is the same rule
+        # without the sampling error: a workload that reached 11 vCPU once is
+        # not over-requesting at 12, however idle it looked when we last
+        # happened to run `kubectl top`.
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (11.0, 40000.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
+
+    def test_an_unmeasured_controller_is_not_reported(self):
+        """Absent is not idle, and here absent reads as *maximally* idle.
+
+        Summing pods missing from the Monitoring answer as zero puts the
+        controller at 0% of its request on both dimensions at once, which
+        clears both ratio tests by the widest possible margin -- so the failure
+        mode is not a missed finding but a confident one, proposing to cut the
+        request of a workload nobody observed down to the 50m/64Mi floor. The
+        `if not usage_peaks` guard at the top of the check only catches a
+        cluster that answered nothing at all; a single namespace missing, or a
+        metrics agent down on one node, arrives here.
+        """
+        pod = self.deployment_pod()
+        populated = {("default", "somebody-else"): (4.0, 8192.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, populated, now=NOW, autopilot=False), [])
+        # Control: the same controller, same zero usage, but *present* in the
+        # answer is reported -- so it is the guard doing the silencing above
+        # and not the materiality floor or an eligibility exclusion.
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_one_measured_pod_is_enough_to_judge_a_controller(self):
+        """The guard drops the unmeasured, not the partially measured.
+
+        A controller mid-rollout has a pod the window has not seen yet.
+        Dropping it wholesale would make every over-request invisible for as
+        long as one replica stayed unmeasured, which is the opposite failure.
+        """
+        pods = [self.deployment_pod(name="api-1"), self.deployment_pod(name="api-2")]
+        peaks = {("default", "api-1"): (0.5, 1024.0)}  # api-2 absent
+        hits = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)
+        self.assertEqual([h["object"] for h in hits], ["ReplicaSet/api"])
+
+    def test_does_not_flag_below_the_absolute_floor(self):
+        pod = self.deployment_pod(cpu_req="50m", mem_req="64Mi")
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_the_floor_sits_where_the_constants_say_it_does(self):
+        """A 90m request is the sidecar the floor excludes; 110m is not.
+
+        The old floor was 2 vCPU / 4 GiB -- a node's worth of headroom inside a
+        single controller -- and on the sixteen-cluster fleet nothing ever
+        reached it, so the check published nothing while seven controllers sat
+        under 20% of their requests on both dimensions.
+        """
+        under = self.deployment_pod(name="small-1", owner_name="small", cpu_req="90m", mem_req="64Mi")
+        over = self.deployment_pod(name="big-1", owner_name="big", cpu_req="110m", mem_req="64Mi")
+        peaks = {("default", "small-1"): (0.0, 0.0), ("default", "big-1"): (0.0, 0.0)}
+        hits = fw.check_overrequest({"pods": [under, over]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual([h["object"] for h in hits], ["ReplicaSet/big"])
+        self.assertEqual(fw.OVERREQUEST_FLOOR_VCPU, 0.1)
+        self.assertEqual(fw.OVERREQUEST_FLOOR_GIB, 0.125)
+
+    def test_the_floor_tests_the_request_and_not_the_reclaimable_delta(self):
+        """The two differ by the usage, and that gap silenced real findings.
+
+        `github-token-minter` on the live fleet: 200m requested, peak 0.001
+        vCPU over a week -- half a percent -- and a 199m delta that failed a
+        250m test whose stated justification ("about the smallest request a
+        first-class service is given") describes a request. Comparing the
+        request is what makes the justification true of the code.
+        """
+        pod = self.deployment_pod(cpu_req="200m", mem_req="256Mi")
+        hits = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.001, 24.0)}, now=NOW, autopilot=False
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_a_request_exactly_on_the_floor_reports(self):
+        # The boundary is inclusive, so `hello-world`'s 100m -- the commonest
+        # request on the fleet -- is inside the check rather than one
+        # rounding-error away from it.
+        pod = self.deployment_pod(cpu_req="100m", mem_req="64Mi")
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_a_ten_milli_sidecar_is_still_excluded(self):
+        """What the floor exists for, and the reason not to simply delete it.
+
+        `cert-manager` and its webhook on the live fleet: 10m and 32Mi each,
+        both under 20% of both requests all week, and neither shrinkable in any
+        way worth an engineer's attention.
+        """
+        for label, cpu, mem in (("cert-manager", "10m", "32Mi"), ("bad-app", "50m", "64Mi")):
+            with self.subTest(label):
+                pod = self.deployment_pod(cpu_req=cpu, mem_req=mem)
+                self.assertEqual(
+                    fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), []
+                )
+
+    def test_flags_an_idle_deployment_the_old_floor_dropped(self):
+        """`ai-inference-hardened` on the live fleet: half a vCPU and 2 GiB
+        reserved, 0.001 vCPU and 0.15 GiB ever used in a week. The percentage
+        rule caught it and the 2 vCPU / 4 GiB floor threw it away."""
+        pod = self.deployment_pod(cpu_req="500m", mem_req="2Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.001, 150.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_flags_a_cpu_only_overrequest(self):
+        """The commonest real shape: sized for its memory, handed a
+        copy-pasted CPU request. Requiring both dimensions to be idle at once
+        let the memory ratio veto a 6.6x CPU over-request -- which is
+        `platform-agent-gateway` on the live fleet, at 15% of its CPU request
+        and 86% of its memory one."""
+        pod = self.deployment_pod(cpu_req="1100m", mem_req="1Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.167, 880.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on cpu only", hits[0]["excerpt"])
+        self.assertIn("must not be resized", hits[0]["excerpt"])
+
+    def test_flags_a_memory_only_overrequest(self):
+        pod = self.deployment_pod(cpu_req="1", mem_req="8Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 400.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+
+    def test_a_both_idle_finding_does_not_claim_one_dimension_is_in_use(self):
+        pod = self.deployment_pod()
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertNotIn("only", hits[0]["excerpt"])
+
+    def test_the_dimension_in_use_contributes_nothing_to_the_reclaimable_delta(self):
+        """§3.1's remediation resizes a request to 2x the observed peak, so a
+        dimension running at 94% of its request must not be part of the finding
+        at all -- neither reaching the materiality floor for it nor raising its
+        severity. 8 GiB of nominal slack under a 128 GiB request that is in use
+        is not 8 GiB anyone can reclaim."""
+        pod = self.deployment_pod(cpu_req="1", mem_req="128Gi")
+        peaks = {("default", "api-1"): (0.05, 120 * 1024.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_an_idle_dimension_under_the_floor_is_not_rescued_by_one_in_use(self):
+        # 64 GiB is far over the memory floor, but memory is the dimension in
+        # use. Only the idle dimension may satisfy the floor, and 50m does not.
+        pod = self.deployment_pod(cpu_req="50m", mem_req="64Gi")
+        peaks = {("default", "api-1"): (0.001, 60 * 1024.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
+
+    def test_does_not_flag_daemonset(self):
+        pod = self.deployment_pod(owner_kind="DaemonSet", owner_name="ds")
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_does_not_flag_job_owned_pod(self):
+        pod = self.deployment_pod(owner_kind="Job", owner_name="batch")
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_does_not_flag_a_pod_with_no_requests_at_all(self):
+        pod = self.deployment_pod(cpu_req="0", mem_req="0")
+        pod["spec"]["containers"][0]["resources"] = {}
+        # Peaks for some *other* pod, so the no-requests skip is what makes
+        # this pass rather than the empty-usage guard at the top.
+        peaks = {("default", "unrelated"): (0.0, 0.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
+
+    def test_no_usage_data_flags_nothing_rather_than_everything(self):
+        # `fetch_usage_peaks` returns `{}` for a cluster it could not read.
+        # Reading that as "this Deployment used no CPU and no memory" would
+        # flag every workload in the fleet as reclaimable waste.
+        pod = self.deployment_pod()
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, {}, now=NOW, autopilot=False), [])
+
+    def test_guaranteed_qos_is_marked_for_manual_remediation(self):
+        pod = self.deployment_pod(cpu_lim="12", mem_lim="48Gi")
+        peaks = {("default", "api-1"): (0.9, 3072.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertTrue(hits[0]["_guaranteed"])
+
+    def test_autopilot_bumps_minor_to_major(self):
+        pod = self.deployment_pod(cpu_req="3", mem_req="6Gi")
+        peaks = {("default", "api-1"): (0.1, 100.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=True)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_the_excerpt_names_the_window_it_rests_on(self):
+        pod = self.deployment_pod()
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
+
+    def test_the_window_shrinks_to_a_controller_younger_than_it(self):
+        # Monitoring holds a week of history; a Deployment rolled six hours ago
+        # has six hours of it. Reporting "over the trailing 168h" there claims
+        # to have watched something that did not exist for 162 of them.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn("trailing 6h", hits[0]["excerpt"])
+
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # `evidence.command` records the Monitoring read verbatim, so it says
+        # `window=168h` however young the controller is. Three findings of the
+        # 2026-09-06 cost report shipped that number beside an excerpt reading
+        # "trailing 12h", with nothing to reconcile them.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("oldest pod started 6h ago", excerpt)
+
+    def test_a_window_under_a_day_says_it_has_not_seen_one(self):
+        # Six hours cannot distinguish an idle workload from one whose traffic
+        # arrives overnight, and what follows the excerpt is an instruction to
+        # shrink a request.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn("under a full daily cycle", excerpt)
+
+    def test_a_window_over_a_day_but_under_the_read_omits_the_cycle_clause(self):
+        pod = self.deployment_pod(started="2026-07-29T00:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn("trailing 72h", excerpt)
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertNotIn("daily cycle", excerpt)
+
+    def test_a_full_window_says_nothing_about_the_read(self):
+        # The two numbers agree, so there is nothing to reconcile and the
+        # sentence stays the short one it has always been.
+        pod = self.deployment_pod()
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h (Cloud Monitoring)", excerpt)
+        self.assertNotIn("the read covers", excerpt)
+
+    def test_the_window_follows_the_longest_lived_pod_of_the_controller(self):
+        old = self.deployment_pod(name="api-1", started="2026-07-01T00:00:00Z")
+        fresh = self.deployment_pod(name="api-2", started="2026-07-31T18:00:00Z")
+        peaks = {("default", "api-1"): (0.4, 1536.0), ("default", "api-2"): (0.5, 1536.0)}
+        hits = fw.check_overrequest({"pods": [old, fresh]}, peaks, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
+
+    def test_an_unknown_start_time_falls_back_to_the_full_window(self):
+        pod = self.deployment_pod(started="")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
+
+    def test_pending_pod_is_never_flagged(self):
+        pod = self.deployment_pod()
+        pod["status"]["phase"] = "Pending"
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_a_multi_replica_excerpt_gives_the_per_replica_arithmetic(self):
+        """Every total is summed across the controller's pods, but §3.1 sizes
+        one container's request at 2x the peak -- so a reader handed only the
+        total triples a three-replica Deployment's request. The excerpt is the
+        only channel that survives `adopt_collector_evidence`."""
+        pods = [self.deployment_pod(name=f"api-{i}", cpu_req="1", mem_req="2Gi") for i in (1, 2, 3)]
+        peaks = {("default", f"api-{i}"): (0.05, 100.0) for i in (1, 2, 3)}
+        excerpt = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)[0]["excerpt"]
+        self.assertIn("requests 3.00 vCPU / 6.0 GiB", excerpt)
+        self.assertIn("Totals span 3 replicas", excerpt)
+        self.assertIn("1.000 vCPU / 2.00 GiB requested", excerpt)
+        self.assertIn("0.050 vCPU / 0.10 GiB peak", excerpt)
+        self.assertIn("per replica", excerpt)
+
+    def test_a_single_replica_excerpt_says_nothing_about_replicas(self):
+        # One pod means the total *is* the per-replica figure, and a sentence
+        # restating it is noise in an excerpt a human reads on every finding.
+        excerpt = fw.check_overrequest(
+            {"pods": [self.deployment_pod()]}, {("default", "api-1"): (0.9, 3072.0)},
+            now=NOW, autopilot=False,
+        )[0]["excerpt"]
+        self.assertNotIn("replica", excerpt)
+        self.assertTrue(excerpt.endswith("."), excerpt)
+
+    def test_the_single_dimension_clause_and_the_replica_clause_compose(self):
+        pods = [self.deployment_pod(name=f"api-{i}", cpu_req="1100m", mem_req="1Gi") for i in (1, 2)]
+        peaks = {("default", f"api-{i}"): (0.167, 880.0) for i in (1, 2)}
+        excerpt = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)[0]["excerpt"]
+        self.assertIn("Over-requested on cpu only", excerpt)
+        self.assertIn("must not be resized.", excerpt)
+        self.assertIn("Totals span 2 replicas", excerpt)
+
+
+class OverrequestPrescribesTheResizeTest(unittest.TestCase):
+    """The excerpt names the request each idle dimension must end up at.
+
+    Left to infer it, the model works the number out of the peaks the excerpt
+    quotes -- which are rounded to two decimals of a vCPU and one of a GiB, so
+    a small workload reads as `0.00 vCPU / 0.0 GiB` -- and it does not know
+    about the `50m`/`64Mi` clamp at all, because `ceil(peak x 2)` is the only
+    half of the rule the SOP states. The 2026-09-06 cost report asked for
+    `about 10m` on a dimension whose floor is `50m`.
+    """
+
+    pod = OverrequestTest().deployment_pod
+
+    def excerpt(self, pods, peaks):
+        hits = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1, hits)
+        return hits[0]["excerpt"]
+
+    def minter(self, cpu_req, mem_req):
+        """`github-token-minter` as the live fleet runs it: two replicas, and a
+        7-day peak of 0.4 millicores and 11.2 MiB per replica."""
+        pods = [
+            self.pod(name=f"gtm-{i}", owner_name="github-token-minter", cpu_req=cpu_req, mem_req=mem_req)
+            for i in (1, 2)
+        ]
+        return pods, {("default", f"gtm-{i}"): (0.0004, 11.2) for i in (1, 2)}
+
+    def test_names_both_dimensions_when_both_are_over_requested(self):
+        # The branch that names dimensions used to fire only at exactly one, so
+        # the finding that most needs the instruction went without it.
+        excerpt = self.excerpt(*self.minter("100m", "128Mi"))
+        self.assertIn("Over-requested on both dimensions", excerpt)
+        self.assertIn("resizing one alone does not clear this finding", excerpt)
+
+    def test_prescribes_the_floor_rather_than_twice_the_peak(self):
+        # 2 x 0.4m is 1m on CPU and 23Mi on memory; both clamp up.
+        excerpt = self.excerpt(*self.minter("100m", "128Mi"))
+        self.assertIn(
+            f"Resize to cpu {fw.OVERREQUEST_RESIZE_FLOOR_VCPU * 1000:.0f}m "
+            f"and memory {fw.OVERREQUEST_RESIZE_FLOOR_MIB:.0f}Mi per replica",
+            excerpt,
+        )
+
+    def test_the_prescribed_resize_actually_clears_the_finding(self):
+        # The property the wording exists to guarantee, asserted against the
+        # check rather than against the sentence: applying what the excerpt
+        # prescribes must leave nothing to report. A remediation that resizes
+        # CPU alone -- what the 2026-09-06 report proposed -- must not.
+        floor_cpu = f"{fw.OVERREQUEST_RESIZE_FLOOR_VCPU * 1000:.0f}m"
+        floor_mem = f"{fw.OVERREQUEST_RESIZE_FLOOR_MIB:.0f}Mi"
+        self.assertEqual(fw.check_overrequest({"pods": self.minter(floor_cpu, floor_mem)[0]},
+                                              self.minter(floor_cpu, floor_mem)[1],
+                                              now=NOW, autopilot=False), [])
+        still_open = fw.check_overrequest({"pods": self.minter(floor_cpu, "128Mi")[0]},
+                                          self.minter(floor_cpu, "128Mi")[1],
+                                          now=NOW, autopilot=False)
+        self.assertEqual(len(still_open), 1)
+        self.assertIn("Over-requested on memory only", still_open[0]["excerpt"])
+
+    def test_twice_the_peak_wins_where_it_clears_the_floor(self):
+        # The clamp is a floor, not the answer: a controller peaking well above
+        # it gets `ceil(peak x 2)`.
+        pods = [self.pod(cpu_req="12", mem_req="48Gi")]
+        excerpt = self.excerpt(pods, {("default", "api-1"): (0.9, 3072.0)})
+        self.assertIn("Resize to cpu 1800m and memory 6144Mi", excerpt)
+
+    def test_names_only_the_idle_dimension_where_the_other_is_in_use(self):
+        pods = [self.pod(name=f"api-{i}", cpu_req="1100m", mem_req="1Gi") for i in (1, 2)]
+        excerpt = self.excerpt(pods, {("default", f"api-{i}"): (0.167, 880.0) for i in (1, 2)})
+        self.assertIn("Resize to cpu ", excerpt)
+        self.assertNotIn("and memory", excerpt)
+
+    def test_a_single_replica_is_not_told_the_figure_is_per_replica(self):
+        excerpt = self.excerpt([self.pod()], {("default", "api-1"): (0.9, 3072.0)})
+        self.assertIn("Resize to cpu 1800m and memory 6144Mi.", excerpt)
+
+
+class OverrequestResizeIsANoOpTest(unittest.TestCase):
+    """A finding whose own remediation changes nothing is not reported.
+
+    §3.1 resizes an idle request to `ceil(peak x 2)` per replica, floored at
+    `50m` / `64Mi`. A controller already sitting on that floor on every
+    dimension the finding calls idle has a recommendation identical to the
+    request it already declares -- so no manifest edit closes it and the model,
+    following the rule correctly, answers "already at the sizing floor; no
+    resize is possible". The 2026-09-05 cost report carried three of them
+    (`hello-world` on `adam-new-cluster`, `adamparco-gitops` and
+    `ap-ap-deploy-test`), each graded `major` by the Autopilot bump.
+    """
+
+    pod = OverrequestTest().deployment_pod
+
+    def hits(self, pods, peaks, autopilot=False):
+        return fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=autopilot)
+
+    def test_a_controller_already_on_the_floor_is_not_reported(self):
+        # `hello-world` verbatim: two replicas at 50m/64Mi each, peaking at
+        # 0.010 vCPU / 19 MiB across both over the week. Idle on both
+        # dimensions, material on CPU at exactly 100m -- and unshrinkable,
+        # because 2x the per-replica peak clamps to the floor it is already on.
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", "hw-1"): (0.005, 9.5), ("default", "hw-2"): (0.005, 9.5)}
+        self.assertEqual(self.hits(pods, peaks), [])
+        # And the Autopilot bump does not resurrect it: the drop happens before
+        # severity is decided, so it is not merely graded down to `minor`.
+        self.assertEqual(self.hits(pods, peaks, autopilot=True), [])
+
+    def test_one_millicore_above_the_floor_is_still_reported(self):
+        """The control that says it is this gate and not the materiality floor.
+
+        51m per replica is over the resize floor by the smallest amount a
+        manifest can express, and 102m of request still clears the 100m
+        materiality floor -- so the only thing separating it from the case
+        above is whether a resize would change the number.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="51m", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", "hw-1"): (0.005, 9.5), ("default", "hw-2"): (0.005, 9.5)}
+        self.assertEqual([h["object"] for h in self.hits(pods, peaks)], ["ReplicaSet/hello-world"])
+
+    def test_a_three_replica_controller_on_the_floor_is_not_reported(self):
+        """The per-replica quotient is a float, and an exact `>` fails here.
+
+        Three pods of `50m` sum to 0.15000000000000002, so a third of the total
+        is a hair above the 50m the controller declares -- which an exact
+        comparison reads as a reclaimable delta and reports. Every
+        three-replica controller on the floor would come back.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in (1, 2, 3)]
+        peaks = {("default", f"hw-{i}"): (0.005, 9.5) for i in (1, 2, 3)}
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_a_floor_bound_dimension_does_not_veto_a_shrinkable_one(self):
+        """CPU is on the floor; memory is idle at 8 GiB with 7-and-change to
+        give back. The finding is about the memory, and it says so."""
+        pod = self.pod(cpu_req="50m", mem_req="8Gi")
+        hits = self.hits([pod], {("default", "api-1"): (0.001, 100.0)})
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+
+    def test_a_floor_bound_dimension_is_not_described_as_in_use(self):
+        """CPU at 2% of a 50m request is idle, just not reclaimable.
+
+        The excerpt's single-dimension clause exists to stop a reader resizing
+        a dimension the workload is consuming. Reusing that wording for a
+        floor-bound dimension would tell the reviewer something false about the
+        workload -- and this excerpt is what `adopt_collector_evidence`
+        substitutes for whatever the model wrote, so it is the version that
+        reaches the ledger.
+        """
+        pod = self.pod(cpu_req="50m", mem_req="8Gi")
+        excerpt = self.hits([pod], {("default", "api-1"): (0.001, 100.0)})[0]["excerpt"]
+        self.assertIn("cpu is already at the 50m/64Mi sizing floor", excerpt)
+        self.assertNotIn("in use", excerpt)
+
+    def test_a_dimension_genuinely_in_use_still_says_so(self):
+        # The control for the branch above: memory at 86% of its request is
+        # excluded for the original reason, and the original wording holds.
+        pod = self.pod(cpu_req="1100m", mem_req="1Gi")
+        excerpt = self.hits([pod], {("default", "api-1"): (0.167, 880.0)})[0]["excerpt"]
+        self.assertIn("memory is in use and must not be resized", excerpt)
+
+    def test_a_shrinkable_dimension_in_use_does_not_rescue_the_finding(self):
+        """Only the dimensions the finding calls idle are consulted.
+
+        Memory here is at 39% of its request -- not idle, so the excerpt never
+        proposes touching it -- and `2x peak` would nonetheless come out below
+        what it declares. Letting that count would publish a finding whose only
+        reclaimable dimension is one §3.1 forbids resizing.
+        """
+        pods = [self.pod(name=f"api-{i}", cpu_req="50m", mem_req="1Gi") for i in (1, 2, 3, 4)]
+        peaks = {("default", f"api-{i}"): (0.0005, 400.0) for i in (1, 2, 3, 4)}
+        # Material on CPU: 4 x 50m is 200m, twice the 100m floor.
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_memory_on_the_floor_is_dropped_when_cpu_is_in_use(self):
+        # The mirror of the case above: memory is the idle dimension, it clears
+        # the 0.125 GiB materiality floor only because there are two replicas,
+        # and 64Mi each is exactly the resize floor.
+        pods = [self.pod(name=f"api-{i}", cpu_req="1", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", f"api-{i}"): (0.9, 10.0) for i in (1, 2)}
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_the_resize_floors_match_the_sop(self):
+        self.assertEqual(fw.OVERREQUEST_RESIZE_FLOOR_VCPU, 0.05)
+        self.assertEqual(fw.OVERREQUEST_RESIZE_FLOOR_MIB, 64.0)
+        self.assertEqual(fw.OVERREQUEST_PEAK_MULTIPLIER, 2)
+
+    def test_the_gate_is_evaluated_per_replica_and_not_on_the_totals(self):
+        """Ten replicas on the floor total 500m, which shrinks; each does not.
+
+        Reading the gate off the summed request would report the largest
+        instance of exactly the shape it exists to drop -- and the
+        recommendation the reader then gets is `50m`, which is what all ten
+        pods already declare.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in range(10)]
+        peaks = {("default", f"hw-{i}"): (0.005, 9.5) for i in range(10)}
+        self.assertEqual(self.hits(pods, peaks), [])
+        self.assertFalse(
+            fw._resize_shrinks_request(0.5, 0.05, 10, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+        # The same totals read as a single replica do shrink, which is what a
+        # totals-based gate would have computed.
+        self.assertTrue(
+            fw._resize_shrinks_request(0.5, 0.05, 1, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+    def test_a_replica_count_of_zero_is_not_a_division(self):
+        self.assertFalse(
+            fw._resize_shrinks_request(1.0, 0.0, 0, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+    def test_a_request_below_the_floor_is_a_raise_and_not_a_shrink(self):
+        # 10m per replica is under the 50m the rule would resize it to, so the
+        # answer is not "shrink by a little", it is "do not touch this".
+        self.assertFalse(
+            fw._resize_shrinks_request(0.01, 0.0, 1, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+
+class IdleWorkloadTest(unittest.TestCase):
+    """§3.13 -- the population §3.1 measures correctly and then cannot act on.
+
+    Every fixture here is a controller `check_overrequest` sees, agrees is
+    idle, and drops because `ceil(peak x 2)` clamps up to the 50m/64Mi it
+    already declares. `test_the_partition_with_overrequest_is_exact` is the
+    load-bearing one: the two checks must never both fire on an object, or the
+    report asks a reader to shrink and delete the same Deployment.
+    """
+
+    NS = "hello-world"
+    HASH = "7d9f8c6b45"
+    POD = "hello-world-7d9f8c6b45-1"
+    # 0.2% of 50m and 9% of 64Mi -- the live shape of all four Deployments this
+    # check found on the 2026-09-06 fleet.
+    IDLE = {(NS, POD): (0.0021, 6.0)}
+
+    def pod(
+        self,
+        name=POD,
+        *,
+        ns=NS,
+        cpu_req="50m",
+        mem_req="64Mi",
+        cpu_lim=None,
+        mem_lim=None,
+        started="2026-07-25T00:00:00Z",
+        owner_kind="ReplicaSet",
+        owner_name="hello-world-7d9f8c6b45",
+        labels=None,
+    ):
+        requests = {}
+        if cpu_req:
+            requests["cpu"] = cpu_req
+        if mem_req:
+            requests["memory"] = mem_req
+        # Omitted entirely rather than empty: a pod with no `limits` key is
+        # Burstable, which is what every fixture predating the Guaranteed arm
+        # is and must stay.
+        resources = {"requests": requests}
+        limits = {}
+        if cpu_lim:
+            limits["cpu"] = cpu_lim
+        if mem_lim:
+            limits["memory"] = mem_lim
+        if limits:
+            resources["limits"] = limits
+        return obj(
+            "Pod",
+            name,
+            ns=ns,
+            **{
+                "spec.containers": [{"resources": resources}],
+                "status.startTime": started,
+                "status.phase": "Running",
+                "metadata.labels": {"app": "hello-world", "pod-template-hash": self.HASH} if labels is None else labels,
+                "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
+            },
+        )
+
+    def guaranteed_pod(self, *, cpu="500m", mem="2Gi", **kw):
+        """The live shape: `ai-inference-hardened`, requests == limits."""
+        return self.pod(cpu_req=cpu, mem_req=mem, cpu_lim=cpu, mem_lim=mem, **kw)
+
+    def controller(self, kind="Deployment", name="hello-world", *, ns=NS, created="2026-07-01T00:00:00Z"):
+        return obj(kind, name, ns=ns, **{"metadata.creationTimestamp": created})
+
+    def svc(self, name="hello-world", *, ns=NS, kind="LoadBalancer", selector=None, ip=None):
+        fields = {
+            "spec.type": kind,
+            "spec.selector": {"app": "hello-world"} if selector is None else selector,
+        }
+        # Only when asked. A Service still waiting on an address has no
+        # `status.loadBalancer.ingress` at all, and that is the shape every
+        # fixture predating the traffic read carries.
+        if ip:
+            fields["status.loadBalancer.ingress"] = [{"ip": ip}]
+        return obj("Service", name, ns=ns, **fields)
+
+    def context(self, pods=None, controllers=None, services=()):
+        pods = [self.pod()] if pods is None else pods
+        controllers = [self.controller()] if controllers is None else controllers
+        return {
+            "pods": pods,
+            "services": list(services),
+            "deployments": [c for c in controllers if c["kind"] == "Deployment"],
+            "statefulsets": [c for c in controllers if c["kind"] == "StatefulSet"],
+        }
+
+    def hits(self, peaks=None, *, lb_traffic=None, **kw):
+        return fw.check_idle_workload(
+            self.context(**kw),
+            self.IDLE if peaks is None else peaks,
+            now=NOW,
+            lb_traffic=lb_traffic,
+        )
+
+    def test_flags_a_floor_bound_deployment_nothing_is_using(self):
+        hits = self.hits()
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Deployment/hello-world")
+        self.assertEqual(hits[0]["namespace"], self.NS)
+        self.assertEqual(hits[0]["severity"], "minor")
+        # The three things a reader needs to act: what it holds, that nobody
+        # used it, and that no resize is the answer.
+        self.assertIn("requests 0.050 vCPU / 64 MiB", hits[0]["excerpt"])
+        self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
+        self.assertIn("no resize can reclaim", hits[0]["excerpt"])
+
+    def test_the_partition_with_overrequest_is_exact(self):
+        """Neither check may stay silent on a controller, nor both speak.
+
+        The four Deployments that motivated this check were already reported
+        by §3.1 until `bc437731` dropped them for having a no-op remediation.
+        If the two predicates ever overlap, the same object comes back with
+        one finding saying "resize it" and another saying "delete it".
+        """
+        floor_bound = self.context()
+        # Same controller, same idleness, a request with somewhere to go: 2
+        # vCPU / 4 GiB against a 100m / 100 MiB peak resizes to 200m / 200Mi.
+        shrinkable = self.context(pods=[self.pod(cpu_req="2", mem_req="4Gi")])
+        big_peak = {(self.NS, self.POD): (0.1, 100.0)}
+
+        self.assertEqual(len(fw.check_idle_workload(floor_bound, self.IDLE, now=NOW)), 1)
+        self.assertEqual(fw.check_overrequest(floor_bound, self.IDLE, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_idle_workload(shrinkable, big_peak, now=NOW), [])
+        self.assertEqual(len(fw.check_overrequest(shrinkable, big_peak, now=NOW, autopilot=False)), 1)
+
+    def test_a_fully_idle_guaranteed_controller_stands_down_instead_of_resizing(self):
+        """The `ai-inference` shape: §3.1 can resize it and refuses to.
+
+        Requests equal limits at 0.50 vCPU / 2.0 GiB against a peak of nothing.
+        `_resize_shrinks_request` is true on both dimensions -- 2 x nothing
+        clamps to 50m/64Mi, well under what it declares -- so before this arm
+        existed §3.1 took it and published `kind: manual`, and §3.13 stayed
+        silent. Neither offered the pull request that `spec.replicas: 0` is.
+        """
+        ctx = self.context(pods=[self.guaranteed_pod()])
+        peaks = {(self.NS, self.POD): (0.0, 0.0)}
+
+        hits = fw.check_idle_workload(ctx, peaks, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Deployment/hello-world")
+        # Graded on the reservation, not on the floor argument that grades the
+        # other arm: half a vCPU idle for a month is not `minor`.
+        self.assertEqual(hits[0]["severity"], "major")
+        # And §3.1 must have let go of it, or the object reports twice.
+        self.assertEqual(fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False), [])
+
+    def test_the_guaranteed_excerpt_names_the_ceiling_not_the_floor(self):
+        # Both arms answer "why is no resize offered", and they answer it
+        # differently. Naming the 50m/64Mi floor on a controller declaring
+        # 0.50 vCPU sends the reader to check something that is not true.
+        hits = fw.check_idle_workload(
+            self.context(pods=[self.guaranteed_pod()]), {(self.NS, self.POD): (0.0, 0.0)}, now=NOW
+        )
+        self.assertIn("enforcement ceiling", hits[0]["excerpt"])
+        self.assertNotIn("50m/64Mi floor", hits[0]["excerpt"])
+
+    def test_a_guaranteed_controller_idle_on_one_dimension_stays_overrequests(self):
+        """The narrow case is idle on *every* dimension, and only that.
+
+        A `Guaranteed` controller using all its memory and none of its CPU is
+        not unused -- one number is wrong. §3.1's `manual` note is the right
+        answer there and a stand-down would be destructive.
+        """
+        ctx = self.context(pods=[self.guaranteed_pod()])
+        # 0% of the CPU, 95% of the 2 GiB.
+        peaks = {(self.NS, self.POD): (0.0, 1945.6)}
+        self.assertEqual(fw.check_idle_workload(ctx, peaks, now=NOW), [])
+        over = fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(over), 1)
+        self.assertTrue(over[0]["_guaranteed"])
+
+    def test_a_guaranteed_controller_under_the_age_bar_stays_overrequests(self):
+        """§3.13's fortnight is not waived by the Guaranteed arm.
+
+        The two live findings were six days old when this was written. A
+        stand-down proposed against a workload somebody deployed on Monday is
+        the recommendation this age bar exists to refuse, so §3.1 keeps it and
+        the `manual` note stands until it has been idle long enough.
+        """
+        ctx = self.context(
+            pods=[self.guaranteed_pod()],
+            controllers=[self.controller(created="2026-07-27T00:00:00Z")],
+        )
+        peaks = {(self.NS, self.POD): (0.0, 0.0)}
+        self.assertEqual(fw.check_idle_workload(ctx, peaks, now=NOW), [])
+        self.assertEqual(len(fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)), 1)
+
+    def test_a_small_guaranteed_reservation_is_still_minor(self):
+        # The severity split is on the size of what is held, not on the QoS
+        # class: a Guaranteed controller sitting on 50m/64Mi has given up as
+        # little as the floor-bound one beside it.
+        ctx = self.context(pods=[self.guaranteed_pod(cpu="50m", mem="64Mi")])
+        hits = fw.check_idle_workload(ctx, self.IDLE, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_one_shrinkable_dimension_sends_the_whole_controller_to_overrequest(self):
+        # Either dimension having somewhere to go is enough, so both halves of
+        # the guard are checked: §3.1 reports the roomy one and says the other
+        # is already floored, and this check must not also claim the object.
+        for cpu_req, mem_req, peak in (("2", "64Mi", (0.1, 6.0)), ("50m", "4Gi", (0.0021, 100.0))):
+            with self.subTest(cpu=cpu_req, mem=mem_req):
+                pods = [self.pod(cpu_req=cpu_req, mem_req=mem_req)]
+                peaks = {(self.NS, self.POD): peak}
+                self.assertEqual(fw.check_idle_workload(self.context(pods=pods), peaks, now=NOW), [])
+                self.assertEqual(
+                    len(fw.check_overrequest(self.context(pods=pods), peaks, now=NOW, autopilot=False)), 1
+                )
+
+    def test_a_dimension_in_use_vetoes_the_finding(self):
+        """`cert-manager`'s shape: 17% of its CPU, 95% of its memory.
+
+        §3.1 is per-dimension because a copy-pasted CPU request beside a
+        carefully sized memory one is the common waste. This check is not: the
+        claim is "nothing uses this", and something using all of its memory
+        refutes it whatever the CPU says.
+        """
+        busy = {(self.NS, self.POD): (0.0085, 60.8)}
+        self.assertEqual(self.hits(peaks=busy), [])
+        # Control: the same request and the same CPU, memory idle -> reported.
+        self.assertEqual(len(self.hits(peaks={(self.NS, self.POD): (0.0085, 6.0)})), 1)
+
+    def test_a_dimension_the_controller_does_not_declare_is_skipped_not_divided(self):
+        # No CPU request at all. The ratio has no denominator, and treating the
+        # absence as a failed test would silence every memory-only controller.
+        pods = [self.pod(cpu_req=None)]
+        self.assertEqual(len(fw.check_idle_workload(self.context(pods=pods), self.IDLE, now=NOW)), 1)
+
+    def test_the_age_gate_reads_the_controller_and_not_its_pods(self):
+        """The regression that made the first live run of this check return zero.
+
+        GKE recreates a pod on every node upgrade, so the four Deployments
+        here ran untouched for a month behind pods under eight days old. A
+        fortnight gate on `status.startTime` excludes all four -- and goes on
+        excluding them, since nothing on a managed platform keeps a pod that
+        long.
+        """
+        young_pod = [self.pod(started="2026-07-30T00:00:00Z")]  # 2 days
+        self.assertEqual(len(fw.check_idle_workload(self.context(pods=young_pod), self.IDLE, now=NOW)), 1)
+        # And the converse: a month-old pod under a Deployment declared
+        # yesterday is a new workload nobody has had a chance to use yet.
+        new_controller = [self.controller(created="2026-07-31T00:00:00Z")]
+        self.assertEqual(
+            fw.check_idle_workload(self.context(controllers=new_controller), self.IDLE, now=NOW), []
+        )
+
+    def test_a_controller_the_dump_does_not_carry_is_skipped(self):
+        # No age to test, and this check does not guess one from the pods. The
+        # safe direction is silence: the cost of that is another month of a
+        # 50m reservation, the cost of a wrong guess is "delete this".
+        self.assertEqual(fw.check_idle_workload(self.context(controllers=[]), self.IDLE, now=NOW), [])
+
+    def test_a_statefulset_is_judged_the_same_way(self):
+        pods = [self.pod(owner_kind="StatefulSet", owner_name="hello-world", labels={"app": "hello-world"})]
+        controllers = [self.controller(kind="StatefulSet")]
+        hits = fw.check_idle_workload(self.context(pods=pods, controllers=controllers), self.IDLE, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["StatefulSet/hello-world"])
+
+    def test_an_unmeasured_controller_is_not_reported(self):
+        # Absent reads as zero on every dimension, which is maximally idle --
+        # so a metrics agent down on one node would otherwise produce a
+        # recommendation to delete whatever was running there.
+        self.assertEqual(self.hits(peaks={(self.NS, "somebody-else"): (4.0, 8192.0)}), [])
+        self.assertEqual(len(self.hits()), 1)
+
+    def test_no_usage_answer_at_all_reports_nothing(self):
+        self.assertEqual(self.hits(peaks={}), [])
+
+    def test_a_load_balancer_in_front_of_it_is_major(self):
+        """The forwarding rule is the larger half of the bill.
+
+        Three of these on the 2026-09-06 fleet held about $17/month of
+        Autopilot pod charges between them while their three L4 rules ran
+        about $66. No check joined the two, so the bigger number reached
+        neither the finding nor its severity.
+        """
+        hits = self.hits(services=[self.svc()])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("Service/hello-world still fronts it", hits[0]["excerpt"])
+        self.assertIn("external IP", hits[0]["excerpt"])
+
+    def test_a_load_balancer_selecting_something_else_is_not_fronting(self):
+        self.assertEqual(self.hits(services=[self.svc(selector={"app": "other"})])[0]["severity"], "minor")
+
+    def test_a_selectorless_service_is_not_fronting(self):
+        # Hand-written Endpoints feed it. Kubernetes matches nothing on an
+        # empty selector, and `all()` over no pairs is True -- so without the
+        # emptiness guard every idle workload in the namespace would inherit
+        # somebody else's load balancer and its severity.
+        self.assertEqual(self.hits(services=[self.svc(selector={})])[0]["severity"], "minor")
+
+    def test_a_cluster_ip_service_holds_no_forwarding_rule(self):
+        self.assertEqual(self.hits(services=[self.svc(kind="ClusterIP")])[0]["severity"], "minor")
+
+    def test_a_load_balancer_in_another_namespace_is_not_fronting(self):
+        self.assertEqual(self.hits(services=[self.svc(ns="elsewhere")])[0]["severity"], "minor")
+
+    def test_a_partial_selector_still_matches(self):
+        # Kubernetes' rule, not a set equality: every pair of the selector has
+        # to be on the pod, and the pod carries `pod-template-hash` besides.
+        self.assertEqual(self.hits(services=[self.svc(selector={"app": "hello-world"})])[0]["severity"], "major")
+
+    def test_replicas_are_summed_and_the_excerpt_says_how_many(self):
+        pods = [self.pod(name=f"hello-world-7d9f8c6b45-{i}") for i in range(3)]
+        peaks = {(self.NS, f"hello-world-7d9f8c6b45-{i}"): (0.0021, 6.0) for i in range(3)}
+        hits = fw.check_idle_workload(self.context(pods=pods), peaks, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("requests 0.150 vCPU / 192 MiB across 3 replicas", hits[0]["excerpt"])
+
+    def test_the_excerpt_states_the_window_it_really_measured(self):
+        """Age and window answer different questions and can disagree by weeks.
+
+        A Deployment declared 31 days ago whose pod rolled 12 hours ago has 12
+        hours of history, and the finding may not claim to have watched a
+        month of idleness it never saw.
+        """
+        pods = [self.pod(started="2026-07-31T12:00:00Z")]
+        hits = fw.check_idle_workload(self.context(pods=pods), self.IDLE, now=NOW)
+        self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
+        self.assertIn("trailing 12h", hits[0]["excerpt"])
+        self.assertIn("under a full daily cycle", hits[0]["excerpt"])
+
+    def test_a_service_selecting_it_marks_the_fix_for_triage(self):
+        """The gate the 2026-09-07 incident bought.
+
+        Three findings of this shape auto-promoted and merged unattended,
+        standing down three Deployments; two sat behind forwarding rules that
+        had metered 837,460 and 785,748 inbound packets across the very week
+        the finding quoted. Nothing in this check measures a call -- it reads
+        CPU and memory -- so the marker is what stops the sweep deciding.
+        """
+        hits = self.hits(services=[self.svc()])
+        self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+
+    def test_a_cluster_ip_service_marks_it_too_and_stays_minor(self):
+        """The reason `_selecting_services` is not `_fronting_load_balancers`.
+
+        A `ClusterIP` Service is free, so it must not lift the grade -- and it
+        is still a stable name something in the cluster may be calling, so the
+        stand-down must not open itself.
+        """
+        hits = self.hits(services=[self.svc(kind="ClusterIP")])
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+        self.assertIn("Service/hello-world also selects its pods", hits[0]["excerpt"])
+        self.assertIn("no endpoints", hits[0]["excerpt"])
+        self.assertIn("not whether anything still resolves that name", hits[0]["excerpt"])
+
+    def test_a_load_balancer_is_not_named_twice(self):
+        """Both clauses fire on a `LoadBalancer`, and they say different things
+        -- one about the bill, one about the endpoints. Naming the Service in
+        each reads as two findings about two objects."""
+        excerpt = self.hits(services=[self.svc()])[0]["excerpt"]
+        self.assertEqual(excerpt.count("Service/hello-world"), 1)
+        self.assertIn("That Service selects its pods", excerpt)
+
+    def test_nothing_selecting_it_leaves_the_fix_unmarked(self):
+        hits = self.hits()
+        self.assertEqual(hits[0]["_selected_by"], [])
+        self.assertNotIn("no endpoints", hits[0]["excerpt"])
+
+    def test_a_service_selecting_something_else_does_not_mark_it(self):
+        self.assertEqual(
+            self.hits(services=[self.svc(selector={"app": "other"})])[0]["_selected_by"], []
+        )
+
+    def test_a_selectorless_service_does_not_mark_it(self):
+        # `all()` over no pairs is True, so without the emptiness guard a
+        # hand-fed Service would freeze every stand-down in its namespace.
+        self.assertEqual(self.hits(services=[self.svc(selector={})])[0]["_selected_by"], [])
+
+    def test_a_service_in_another_namespace_does_not_mark_it(self):
+        self.assertEqual(self.hits(services=[self.svc(ns="elsewhere")])[0]["_selected_by"], [])
+
+    def test_the_impact_no_longer_claims_nobody_is_calling_it(self):
+        """The sentence itself. It read "a workload nobody is calling" for
+        eleven days over a check that has never measured a call."""
+        impact = fw.IMPACT["idle-workload"]
+        self.assertNotIn("nobody is calling", impact)
+        self.assertIn("CPU or memory", impact)
+        self.assertIn("packets are not sessions", impact)
+
+    # ----------------------------------------------------------------- #
+    # The traffic clause. Every one of these turns on the same question:
+    # what the excerpt is entitled to say about a forwarding rule it has,
+    # has not, or cannot measure.
+    # ----------------------------------------------------------------- #
+
+    IP = "34.186.100.26"
+
+    def traffic(self, *, ingress=None, egress_packets=None, egress_bytes=None, ip=None, rule="a-rule"):
+        return {
+            ip or self.IP: {
+                "rule": rule,
+                "ingress_packets": ingress,
+                "egress_packets": egress_packets,
+                "egress_bytes": egress_bytes,
+            }
+        }
+
+    def test_a_busy_rule_serving_no_payload_says_so(self):
+        """The live shape of the two findings that merged a stand-down.
+
+        374,158 inbound packets answered at 63.9 bytes each -- busy enough to
+        look like use and too small to be a response. Before this the excerpt
+        said nothing at all and the impact said nobody was calling it.
+        """
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("metered 374,158 inbound packets over 168h", excerpt)
+        self.assertIn("17,459,228 bytes across 273,430 outbound packets, 64 bytes each", excerpt)
+        self.assertIn("without ever sending a payload", excerpt)
+        self.assertIn("unsolicited connection attempts", excerpt)
+
+    def test_a_rule_serving_real_payload_warns_against_the_stand_down(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=200000, egress_packets=100000, egress_bytes=120000000),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("1,200 bytes each", excerpt)
+        self.assertIn("something is being served", excerpt)
+        self.assertIn("measured a forwarding rule, not a caller", excerpt)
+
+    def test_traffic_under_the_floor_reads_as_background(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=812, egress_packets=400, egress_bytes=25000),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("metered 812 inbound packets over 168h", excerpt)
+        self.assertIn("under the 10,000-packet floor", excerpt)
+        self.assertIn("nothing measurable reached it", excerpt)
+        # The payload ratio is 62.5 bytes here too, and saying so would be an
+        # observation about 400 packets. Below the floor there is nothing to
+        # characterise.
+        self.assertNotIn("bytes each", excerpt)
+
+    def test_a_rule_that_answered_nothing_says_that(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=50000, egress_packets=0, egress_bytes=0),
+        )
+        self.assertIn("answered none of them", hits[0]["excerpt"])
+
+    def test_an_unmeasured_rule_is_not_reported_as_quiet(self):
+        """The distinction the whole read exists for.
+
+        Monitoring holding no series for a rule is the answer §3.13 used to
+        treat as silence -- implicitly, by never asking. A zero here would be
+        a fabricated measurement.
+        """
+        hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=self.traffic())
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("no Cloud Monitoring traffic series", excerpt)
+        self.assertIn("unmeasured rather than zero", excerpt)
+        self.assertNotIn("metered", excerpt)
+
+    def test_no_traffic_read_at_all_writes_no_clause(self):
+        # `lb_traffic=None` is a run with no Monitoring session, or the
+        # collector invoked by hand. Silence, not a zero and not a caveat.
+        excerpt = self.hits(services=[self.svc(ip=self.IP)])[0]["excerpt"]
+        self.assertNotIn("forwarding rule metered", excerpt)
+        self.assertNotIn("unmeasured", excerpt)
+
+    def test_an_address_the_read_does_not_cover_writes_no_clause(self):
+        hits = self.hits(
+            services=[self.svc(ip="35.245.254.69")],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_a_service_with_no_address_yet_writes_no_clause(self):
+        hits = self.hits(
+            services=[self.svc()],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_a_cluster_ip_service_never_reaches_the_traffic_read(self):
+        # A `ClusterIP` Service holds no forwarding rule, so even an address
+        # the read covers is not this workload's load balancer.
+        hits = self.hits(
+            services=[self.svc(kind="ClusterIP", ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_two_rules_are_summed_and_named_in_the_plural(self):
+        second = "34.186.110.29"
+        traffic = self.traffic(ingress=20000, egress_packets=10000, egress_bytes=400000)
+        traffic.update(self.traffic(ingress=30000, egress_packets=10000, egress_bytes=600000, ip=second, rule="b-rule"))
+        hits = self.hits(
+            services=[self.svc(ip=self.IP), self.svc(name="hello-world-2", ip=second)],
+            lb_traffic=traffic,
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("The 2 forwarding rules in front of it metered 50,000 inbound packets", excerpt)
+        self.assertIn("1,000,000 bytes across 20,000 outbound packets, 50 bytes each", excerpt)
+
+    def test_the_traffic_clause_precedes_the_endpoints_clause(self):
+        """Order is the argument: what it costs, what it carried, what needs it."""
+        excerpt = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228),
+        )[0]["excerpt"]
+        self.assertLess(excerpt.index("still fronts it"), excerpt.index("metered"))
+        self.assertLess(excerpt.index("metered"), excerpt.index("no endpoints"))
+
+    def test_traffic_does_not_move_the_severity_or_the_triage_marker(self):
+        """Measuring the rule does not decide the stand-down; a reader does.
+
+        A rule serving real payload is the strongest reason not to promote
+        this finding, and a rule serving none is not a reason to promote it --
+        10,000 packets a week is a floor for noise, not evidence that nothing
+        needs the workload. Both stay `major`, both stay marked.
+        """
+        for label, traffic in (
+            ("payload", self.traffic(ingress=200000, egress_packets=100000, egress_bytes=120000000)),
+            ("scanning", self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228)),
+            ("quiet", self.traffic(ingress=1, egress_packets=1, egress_bytes=1)),
+            ("unmeasured", self.traffic()),
+        ):
+            with self.subTest(label):
+                hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=traffic)
+                self.assertEqual(hits[0]["severity"], "major")
+                self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+
+    def test_the_thresholds_match_the_sop(self):
+        self.assertEqual(fw.IDLE_WORKLOAD_UTILISATION, 0.2)
+        self.assertEqual(fw.IDLE_WORKLOAD_MIN_AGE_DAYS, 14)
+        self.assertEqual(fw.IDLE_SERVICE_TRIAGE, "service-fronted")
+        self.assertEqual(fw.LB_TRAFFIC_MIN_PACKETS, 10000)
+        self.assertEqual(fw.LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET, 100)
+        # The qualifier is the constant. `metric.labels.forwarding_rule_name`
+        # is accepted by the API and attributes the project's whole traffic to
+        # one rule.
+        self.assertEqual(fw.LB_RULE_LABEL, "resource.labels.forwarding_rule_name")
+
+
+class UnderrequestTest(unittest.TestCase):
+    """§3.11 -- the other direction of the same sizing edit as `overrequest`."""
+
+    def pod(self, ns="kubeagents-system", name="litellm-1", mem_req="512Mi", mem_lim="2Gi",
+            owner_name="litellm", **kwargs):
+        return OverrequestTest().deployment_pod(
+            ns=ns, name=name, cpu_req="100m", mem_req=mem_req,
+            cpu_lim="500m", mem_lim=mem_lim, owner_name=owner_name, **kwargs
+        )
+
+    def check(self, pods, means, peaks=None):
+        peaks = peaks or {k: (0.05, v) for k, v in means.items()}
+        return fw.check_underrequest({"pods": pods}, peaks, means, now=NOW)
+
+    def test_flags_a_controller_averaging_above_its_request(self):
+        """`litellm` on the live fleet, and the finding this check was built
+        for: 512Mi requested per replica against a ~0.95 GiB sustained mean, on
+        the proxy every agent call in the install traverses."""
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        means = {("kubeagents-system", "litellm-1"): 973.0, ("kubeagents-system", "litellm-2"): 973.0}
+        hits = self.check(pods, means)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ReplicaSet/litellm")
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("190% of request", hits[0]["excerpt"])
+
+    def test_a_burst_above_the_request_is_not_a_finding(self):
+        """The distinction the whole check rests on. Burstable QoS exists so a
+        pod may exceed its request; only a *mean* above it says the request was
+        sized wrong. Reading the peak here would flag every workload that ever
+        spikes -- which is the normal, intended use of a memory limit."""
+        pod = self.pod()
+        means = {("kubeagents-system", "litellm-1"): 300.0}   # under the 512Mi request
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1900.0)}  # far over it
+        self.assertEqual(self.check([pod], means, peaks), [])
+
+    def test_the_floor_is_on_the_overage_and_not_the_request(self):
+        """`cert-manager-cainjector`: 32Mi requested, 65Mi mean -- 203% of its
+        request, and 33 MiB of under-booking that distorts no node's
+        scheduling. A ratio test alone flags every pod a megabyte over."""
+        cainjector = self.pod(ns="cert-manager", name="cainjector-1", mem_req="32Mi", mem_lim="128Mi")
+        self.assertEqual(self.check([cainjector], {("cert-manager", "cainjector-1"): 65.0}), [])
+        self.assertEqual(fw.UNDERREQUEST_FLOOR_MIB, 128.0)
+
+    def test_the_floor_boundary_separates_the_two_live_examples(self):
+        under = self.pod(ns="a", name="a-1", owner_name="a", mem_req="100Mi", mem_lim="1Gi")
+        over = self.pod(ns="b", name="b-1", owner_name="b", mem_req="100Mi", mem_lim="1Gi")
+        means = {("a", "a-1"): 100.0 + 127.0, ("b", "b-1"): 100.0 + 129.0}
+        hits = self.check([under, over], means)
+        self.assertEqual([h["namespace"] for h in hits], ["b"])
+
+    def test_two_controllers_of_one_name_in_two_namespaces_stay_apart(self):
+        """`_eligible_pods_by_owner` groups by `(namespace, kind, name)`.
+
+        Keyed on `(kind, name)` alone, the same chart installed twice merges
+        into a single entry: one finding, naming whichever namespace was seen
+        first, whose request and usage totals silently include the other's.
+        A ReplicaSet's pod-template hash hides this; a StatefulSet owns pods
+        under its bare name and does not.
+        """
+        pods = [
+            self.pod(ns="tenant-a", name="redis-0", owner_name="redis"),
+            self.pod(ns="tenant-b", name="redis-0", owner_name="redis"),
+        ]
+        means = {("tenant-a", "redis-0"): 900.0, ("tenant-b", "redis-0"): 900.0}
+        hits = self.check(pods, means)
+        self.assertEqual(sorted(h["namespace"] for h in hits), ["tenant-a", "tenant-b"])
+        # Each finding measures only its own namespace's replica: one pod at
+        # 900 MiB against one 512Mi request, not two summed to 1800.
+        for hit in hits:
+            self.assertIn("0.88 GiB", hit["excerpt"])
+
+    def test_a_mean_near_the_limit_is_critical_rather_than_major(self):
+        # Above the request is a scheduling problem; within 10% of the limit is
+        # an OOMKill waiting for one bad request, so it outranks it.
+        pod = self.pod(mem_req="512Mi", mem_lim="1Gi")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 950.0})
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_no_memory_limit_is_major_and_says_so(self):
+        """Without a limit there is no OOMKill to escalate for -- the pod grows
+        until the node runs out and kubelet evicts it. The excerpt has to say
+        the ceiling is absent rather than print a misleading `0.0 GiB limit`."""
+        pod = self.pod(mem_lim=None)
+        pod["spec"]["containers"][0]["resources"].pop("limits")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("no memory limit", hits[0]["excerpt"])
+
+    def test_a_controller_monitoring_never_measured_is_skipped(self):
+        """A pod absent from the means is unmeasured, not idle. Summing a
+        missing key as 0.0 and comparing it to the request would be harmless
+        here -- but a *partially* measured controller must not have its
+        measured replicas judged against every replica's request."""
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        self.assertEqual(self.check(pods, {}), [])
+
+    def test_no_means_at_all_flags_nothing(self):
+        # `fetch_memory_means` returns `{}` for a cluster it could not read.
+        self.assertEqual(fw.check_underrequest({"pods": [self.pod()]}, {}, {}, now=NOW), [])
+
+    def test_the_excerpt_carries_the_peak_beside_the_mean(self):
+        """Remediation sizes the new request off the peak, so the number it
+        uses has to be in the evidence -- `adopt_collector_evidence` replaces
+        whatever the model wrote with this string."""
+        pod = self.pod()
+        means = {("kubeagents-system", "litellm-1"): 973.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1004.0)}
+        excerpt = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("peak 0.98 GiB", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("Sustained, not a burst", excerpt)
+
+    # `litellm` on `kube-agents-host` as the 2026-09-07 08:33 UTC run measured
+    # it, re-read from Cloud Monitoring at 14:13 the same day: two replicas,
+    # 512Mi requested and 2Gi limited each, per-replica mean 1011.25 MiB and
+    # per-replica peak 1655.96 MiB.
+    LIVE_MEAN_PR = 1011.25
+    LIVE_PEAK_PR = 1655.96
+
+    def live_litellm(self, mem_lim="2Gi"):
+        """The published finding's excerpt, from its own numbers."""
+        pods = [self.pod(name="litellm-1", mem_lim=mem_lim), self.pod(name="litellm-2", mem_lim=mem_lim)]
+        means = {("kubeagents-system", f"litellm-{i}"): self.LIVE_MEAN_PR for i in (1, 2)}
+        peaks = {("kubeagents-system", f"litellm-{i}"): (0.05, self.LIVE_PEAK_PR) for i in (1, 2)}
+        return self.check(pods, means, peaks)[0]["excerpt"]
+
+    def test_a_prescription_above_the_limit_says_to_raise_the_limit(self):
+        """The 2026-09-07 finding, and the regression this pins.
+
+        It was published prescribing 2153Mi per replica against a 2048Mi
+        per-replica limit -- a manifest the API server rejects at admission --
+        and its recommendation read "limits and CPU request untouched". The
+        model had no way to see it: the only limit the excerpt printed was the
+        4.0 GiB controller total, which is twice the prescription.
+        """
+        excerpt = self.live_litellm()
+        self.assertIn("Raise the memory request to 2153Mi per replica.", excerpt)
+        self.assertIn("exceeds the 2048Mi memory limit declared per replica", excerpt)
+        self.assertIn("rejected at admission", excerpt)
+        self.assertIn("raise the limit to 4306Mi in the same edit", excerpt)
+
+    def test_a_prescription_under_the_limit_says_nothing_about_the_limit(self):
+        # 17 of the 19 sizing-eligible controllers on the fleet are this case.
+        excerpt = self.live_litellm(mem_lim="4Gi")
+        self.assertIn("Raise the memory request to 2153Mi per replica.", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_limit_boundary_is_strict(self):
+        """A request equal to its limit is admissible, so equality says nothing.
+
+        `ceil(1000 x 1.3) = 1300`, and a 1300Mi limit is exactly reached.
+        """
+        pod = self.pod(mem_req="512Mi", mem_lim="1300Mi")
+        means = {("kubeagents-system", "litellm-1"): 900.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1000.0)}
+        excerpt = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("Raise the memory request to 1300Mi.", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_prescription_is_computed_from_the_unrounded_peak(self):
+        """§3.1's `about 10m` failure, transplanted.
+
+        The excerpt prints the per-replica peak to two decimals of a GiB, so
+        1655.96 MiB reads as 1.62 GiB and 1.62 x 1.3 comes to 2.11 GiB. The
+        measurement behind it gives 2153Mi, which is 2.10 GiB. Recomputing
+        from the printed figure is off by a MiB in the direction that matters,
+        because the comparison against the limit is what it decides.
+        """
+        excerpt = self.live_litellm()
+        self.assertIn("a 1.62 GiB peak", excerpt)  # the per-replica figure, rounded
+        self.assertIn("2153Mi", excerpt)
+        self.assertNotIn("2157Mi", excerpt)  # ceil(1.62 * 1024 * 1.3)
+
+    def test_no_memory_limit_gets_the_request_but_no_limit_clause(self):
+        # The 1 live controller with no memory limit at all: nothing to collide
+        # with, so the prescription stands alone.
+        pod = self.pod(mem_lim=None)
+        pod["spec"]["containers"][0]["resources"].pop("limits")
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn("Raise the memory request to", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_a_partially_limited_pod_gets_no_limit_clause(self):
+        """Admission is per container; the summed limit binds neither.
+
+        A pod pairing a limited sidecar with an unlimited main container has a
+        `mem_lim_total` that is a real number and enforces nothing. No
+        controller on the fleet is shaped this way on 2026-09-07 -- this pins
+        the guard against the first one that is.
+        """
+        pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
+        pod["spec"]["containers"].append(
+            {"name": "sidecar", "resources": {"requests": {"memory": "0"}}}
+        )
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn("Raise the memory request to", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_per_replica_suffix_tracks_the_replica_count(self):
+        # `check_overrequest`'s rule: on a single-replica controller the
+        # qualifier distinguishes nothing and reads as though it did.
+        pod = self.pod(mem_req="512Mi", mem_lim="8Gi")
+        means = {("kubeagents-system", "litellm-1"): 900.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1000.0)}
+        one = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("Raise the memory request to 1300Mi.", one)
+        self.assertNotIn("per replica", one)
+        self.assertIn("Raise the memory request to 2153Mi per replica.", self.live_litellm(mem_lim="8Gi"))
+
+    def test_resize_target_defaults_to_the_overrequest_multiplier(self):
+        """Adding the keyword must not have moved §3.1's number.
+
+        `_resize_target` is shared, and the three `check_overrequest` /
+        `check_unsized` call sites pass no multiplier.
+        """
+        self.assertEqual(fw.UNDERREQUEST_PEAK_MULTIPLIER, 1.3)
+        self.assertEqual(fw.UNDERREQUEST_LIMIT_MULTIPLIER, 2)
+        self.assertEqual(fw.OVERREQUEST_PEAK_MULTIPLIER, 2)
+        both = dict(floor=fw.OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0)
+        self.assertEqual(fw._resize_target(1000.0, 2, **both), 1000.0)
+        self.assertEqual(
+            fw._resize_target(1000.0, 2, **both, multiplier=fw.UNDERREQUEST_PEAK_MULTIPLIER), 650.0
+        )
+
+    def test_it_shares_overrequests_exclusions(self):
+        """Both directions of one edit must agree on which pods are eligible,
+        or a DaemonSet excluded from shrinking becomes eligible for growing.
+        `_eligible_pods_by_owner` is the shared implementation; this is the
+        test that it is actually shared."""
+        cases = {
+            "daemonset": dict(owner_kind="DaemonSet", owner_name="ds"),
+            "job": dict(owner_kind="Job", owner_name="batch"),
+            "young": dict(started="2026-07-31T23:30:00Z"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                pod = self.pod(**kwargs)
+                self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 900.0}), [])
+
+    def test_a_system_namespace_pod_is_excluded(self):
+        pod = self.pod(ns="kube-system", name="sys-1")
+        self.assertEqual(self.check([pod], {("kube-system", "sys-1"): 900.0}), [])
+
+    def test_a_pod_with_no_memory_request_is_left_to_obtainability(self):
+        # No request at all is `no-requests` in the obtainability audit, which
+        # owns the "declare something" finding. Dividing by it here would also
+        # be a ZeroDivisionError.
+        pod = self.pod()
+        pod["spec"]["containers"][0]["resources"] = {"requests": {"cpu": "100m"}}
+        self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 900.0}), [])
+
+    def test_the_window_shrinks_to_a_controller_younger_than_it(self):
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})
+        self.assertIn("trailing 6h", hits[0]["excerpt"])
+
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # Same clause as the over-request check: all three sizing checks share
+        # one helper, so a fix to the sentence reaches every one of them.
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("under a full daily cycle", excerpt)
+
+    def test_a_multi_replica_excerpt_gives_the_per_replica_arithmetic(self):
+        """Inflating a request is the wrong direction to be wrong in here.
+
+        §3.11 sizes the new request at ceil(peak x 1.3) and the manifest holds
+        one replica's. `litellm`'s summed 1.96 GiB peak read as one replica's
+        would book 2.5 GiB where 1.3 GiB is right -- on a finding whose entire
+        subject is the scheduler's booking being inaccurate.
+        """
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        means = {("kubeagents-system", "litellm-1"): 973.0, ("kubeagents-system", "litellm-2"): 973.0}
+        peaks = {k: (0.05, 1004.0) for k in means}
+        excerpt = self.check(pods, means, peaks)[0]["excerpt"]
+        self.assertIn("requests 1.00 GiB of memory", excerpt)
+        self.assertIn("Totals span 2 replicas", excerpt)
+        self.assertIn("0.50 GiB requested", excerpt)
+        self.assertIn("0.95 GiB mean", excerpt)
+        self.assertIn("0.98 GiB peak", excerpt)
+
+    def test_a_single_replica_excerpt_says_nothing_about_replicas(self):
+        excerpt = self.check([self.pod()], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertNotIn("replica", excerpt)
+
+
+class ReplacedPodPeaksTest(unittest.TestCase):
+    """The pods a controller has rolled away, and the peaks that went with them.
+
+    Cloud Monitoring answers for the whole window keyed by pod name. Joining
+    that answer to the *live* pod list threw away every series belonging to a
+    pod the controller had since replaced, and then reported the remainder as
+    the week's peak -- so a Deployment rolled this morning was sized off this
+    morning, under an excerpt claiming a week. On `kube-agents-host` on
+    2026-09-06 that was nine of twenty-two findings, `litellm` reading 1164 MiB
+    against a replaced pod's 1656, and `argocd-dex-server` 0.3m against 3.6m.
+    """
+
+    NS = "shop"
+    DEP = "web"
+    LIVE = f"{DEP}-aaaaaaaaaa-11111"
+    GONE = f"{DEP}-bbbbbbbbbb-22222"
+
+    def pod(self, name=LIVE, *, ns=NS, owner="web-aaaaaaaaaa", sized=True, kind="ReplicaSet"):
+        resources = {"requests": {"cpu": "12", "memory": "48Gi"}} if sized else {}
+        return obj(
+            "Pod", name, ns=ns,
+            **{
+                "spec.containers": [{"name": "web", "resources": resources}],
+                "status.startTime": "2026-07-31T15:00:00Z",
+                "status.phase": "Running",
+                "metadata.labels": {"pod-template-hash": "aaaaaaaaaa"},
+                "metadata.ownerReferences": [{"kind": kind, "name": owner}],
+            },
+        )
+
+    def context(self, pods, *, created="2026-07-01T00:00:00Z", name=DEP):
+        return {
+            "pods": pods,
+            "deployments": [obj("Deployment", name, ns=self.NS, **{"metadata.creationTimestamp": created})],
+        }
+
+    def over(self, ctx, peaks):
+        return fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+
+    # -- the peak the join used to discard -------------------------------- #
+
+    def test_a_replaced_pods_peak_suppresses_the_overrequest_finding(self):
+        """The whole defect in one assertion: the workload reached 11 vCPU this
+        week, on a pod that is no longer running, and was about to be told to
+        give 11 of its 12 back."""
+        ctx = self.context([self.pod()])
+        narrow = {(self.NS, self.LIVE): (0.9, 3072.0)}
+        self.assertEqual(len(self.over(ctx, narrow)), 1)
+        widened = {**narrow, (self.NS, self.GONE): (11.0, 40000.0)}
+        self.assertEqual(self.over(ctx, widened), [])
+
+    def test_the_excerpt_names_the_pods_it_reached_back_through(self):
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, self.GONE): (1.1, 4000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("1 pod it has replaced since", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        # The peak reported is the replaced pod's, not the live one's.
+        self.assertIn("1.10 vCPU", excerpt)
+
+    def test_the_window_clamps_to_the_controller_not_the_read(self):
+        """A controller younger than the read cannot have been watched for a
+        week however many pods it has been through."""
+        ctx = self.context([self.pod()], created="2026-07-30T00:00:00Z")
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, self.GONE): (1.1, 4000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("trailing 48h", excerpt)
+        self.assertIn("this controller's whole life", excerpt)
+
+    def test_without_a_replaced_pod_the_old_clamp_still_applies(self):
+        """The live pod started 9h before `NOW`, and nothing widens that."""
+        ctx = self.context([self.pod()])
+        excerpt = self.over(ctx, {(self.NS, self.LIVE): (0.9, 3072.0)})[0]["excerpt"]
+        self.assertIn("oldest pod started", excerpt)
+        self.assertNotIn("replaced since", excerpt)
+
+    # -- what the pattern must not claim ---------------------------------- #
+
+    def test_a_siblings_pods_are_not_this_controllers(self):
+        """`web` and `web-api` in one namespace. The two-segment tail is what
+        keeps them apart -- `[a-z0-9]+` cannot span `api`'s hyphen."""
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-api-cccccccc-33333"): (11.0, 40000.0)}
+        hits = self.over(ctx, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_a_live_pod_another_controller_owns_is_not_claimed(self):
+        """The name matches and the cluster says otherwise. The cluster wins."""
+        intruder = self.pod(name=f"{self.DEP}-cccccccccc-33333", owner="logger", kind="DaemonSet")
+        ctx = self.context([self.pod(), intruder])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, f"{self.DEP}-cccccccccc-33333"): (11.0, 40000.0)}
+        hits = self.over(ctx, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_another_namespace_is_not_this_controller(self):
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), ("other", self.GONE): (11.0, 40000.0)}
+        self.assertEqual(len(self.over(ctx, peaks)), 1)
+
+    def test_a_kind_with_no_pattern_is_not_widened(self):
+        """A bare Pod names nothing after itself, so there is no rule to apply
+        and the narrow answer is the honest one."""
+        pod = self.pod(name="standalone", owner="")
+        pod["metadata"]["ownerReferences"] = []
+        ctx = self.context([pod])
+        peaks = {(self.NS, "standalone"): (0.9, 3072.0), (self.NS, "standalone-bbbbb"): (11.0, 40000.0)}
+        self.assertEqual(len(self.over(ctx, peaks)), 1)
+
+    def test_a_statefulset_ordinal_is_matched(self):
+        """A StatefulSet keeps its pod names across a roll, so what this finds
+        is a replica the controller has scaled away -- whose peak is still a
+        replica's peak."""
+        pod = self.pod(name="db-0", owner="db", kind="StatefulSet")
+        ctx = {"pods": [pod], "statefulsets": [obj("StatefulSet", "db", ns=self.NS)]}
+        narrow = {(self.NS, "db-0"): (0.9, 3072.0)}
+        self.assertEqual(len(self.over(ctx, narrow)), 1)
+        self.assertEqual(self.over(ctx, {**narrow, (self.NS, "db-2"): (11.0, 40000.0)}), [])
+
+    # -- max per replica, never the sum ----------------------------------- #
+
+    def test_the_controller_total_is_the_worst_replica_times_replicas(self):
+        """Summing would be nonsense once replaced pods are in the set -- seven
+        pod names for a one-replica Deployment would total seven replicas of
+        usage. `max x replicas` is the rule, and it holds for the live pods too:
+        the hot replica is the one a request has to cover."""
+        pods = [self.pod(), self.pod(name=f"{self.DEP}-aaaaaaaaaa-99999")]
+        ctx = self.context(pods)
+        # 0.2 and 1.0: sum is 1.2 vCPU, max x 2 replicas is 2.0.
+        peaks = {(self.NS, self.LIVE): (0.2, 100.0), (self.NS, f"{self.DEP}-aaaaaaaaaa-99999"): (1.0, 100.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("2.00 vCPU", excerpt)
+
+    def test_unsized_sizes_off_the_replaced_pods_peak(self):
+        """§3.12 writes a number into a manifest, so this is the check with the
+        least margin for a short window: every Argo CD component on the live
+        hub was sized off six hours on 2026-09-06."""
+        pod = self.pod(sized=False)
+        ctx = self.context([pod])
+        peaks = {(self.NS, self.LIVE): (0.010, 40.0), (self.NS, self.GONE): (0.050, 200.0)}
+        hits = fw.check_unsized(ctx, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        # 2x the replaced pod's peak, not 2x the live one's 10m/40Mi.
+        self.assertIn("100m / 400Mi per replica", hits[0]["excerpt"])
+
+
+class UnsizedWorkloadTest(unittest.TestCase):
+    """§3.12 -- the population §3.1 and §3.11 both skip.
+
+    Both sizing checks drop a container that declares no request, on the
+    grounds that the Workload Reliability audit's `no-requests` owns it. That
+    audit reports the absence and, by design, proposes no number, deferring the
+    value to here. Until this check existed the deferral ended nowhere: on the
+    sixteen-cluster fleet on 2026-09-05 seven of twenty-one eligible
+    controllers -- every Argo CD component on the hub -- were named by neither.
+    """
+
+    def pod(self, ns="argocd", name="argocd-repo-server-1", owner_kind="ReplicaSet",
+            owner_name="argocd-repo-server", started="2026-01-01T00:00:00Z", containers=None):
+        return obj(
+            "Pod", name, ns=ns,
+            **{
+                "spec.containers": containers or [{"name": "repo-server", "resources": {}}],
+                "status.startTime": started,
+                "status.phase": "Running",
+                "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
+            },
+        )
+
+    def check(self, pods, peaks, autopilot=False):
+        return fw.check_unsized({"pods": pods}, peaks, now=NOW, autopilot=autopilot)
+
+    def test_flags_a_controller_that_declares_no_request(self):
+        """`argocd-application-controller` on the live hub: the scheduler books
+        zero for a workload peaking at 0.175 vCPU and 1.587 GiB."""
+        pod = self.pod(name="argocd-application-controller-0", owner_kind="StatefulSet",
+                       owner_name="argocd-application-controller")
+        peaks = {("argocd", "argocd-application-controller-0"): (0.175, 1625.0)}
+        hits = self.check([pod], peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "StatefulSet/argocd-application-controller")
+        self.assertEqual(hits[0]["namespace"], "argocd")
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_the_excerpt_carries_the_measured_peak_and_the_recommendation(self):
+        """`adopt_collector_evidence` overwrites whatever the model wrote with
+        this string, so the number remediation sizes off has to be in it."""
+        pod = self.pod()
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0071, 66.6)}
+        excerpt = self.check([pod], peaks)[0]["excerpt"]
+        self.assertIn("declares no CPU or memory request", excerpt)
+        self.assertIn("peak observed 7.1m vCPU / 67Mi", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("14m / 133Mi per replica", excerpt)
+        self.assertNotIn("floor", excerpt)
+
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # The third of the three sizing checks sharing the helper. On the live
+        # fleet this is the one that fired at 7h.
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        excerpt = self.check([pod], {("argocd", "argocd-repo-server-1"): (0.0071, 66.6)})[0]["excerpt"]
+        self.assertIn("trailing 6h", excerpt)
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("under a full daily cycle", excerpt)
+
+    def test_the_excerpt_is_written_in_the_units_of_the_manifest_edit(self):
+        """§3.1's vCPU and GiB round this population to zero -- nobody forgets
+        a request on the workload sized for the cluster, so everything here is
+        small. The live fleet on 2026-09-05 produced "peak observed 0.000 vCPU
+        / 0.03 GiB ... sized at 0.010 vCPU / 68Mi": a CPU peak that reads as
+        nothing, beside a memory recommendation in different units from the
+        measurement it is derived from."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0004, 34.0)}
+        excerpt = self.check([self.pod()], peaks)[0]["excerpt"]
+        self.assertIn("0.4m vCPU", excerpt)
+        self.assertIn("34Mi over the trailing", excerpt)
+        self.assertNotIn("0.000", excerpt)
+        self.assertNotIn("GiB", excerpt)
+
+    def test_a_floored_figure_says_it_is_the_floor(self):
+        """Otherwise the arithmetic in the excerpt is visibly wrong: a
+        controller peaking at 0.4m recommended 10m is off by twenty-five
+        times, and a reviewer who checks the doubling finds it."""
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.0004, 34.0)})[0]["excerpt"]
+        self.assertIn("the cpu figure is the 10m floor rather than 2x the peak", excerpt)
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.0004, 4.0)})[0]["excerpt"]
+        self.assertIn("the cpu and memory figure is the 10m/32Mi floor", excerpt)
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.5, 4.0)})[0]["excerpt"]
+        self.assertIn("the memory figure is the 32Mi floor", excerpt)
+
+    def test_it_never_reports_the_absence_itself(self):
+        """§3.1's boundary rule: the two audits do not restate one another's
+        half. This one states the number; `no-requests` states that there is
+        no number. An excerpt phrased as a missing-request finding would put
+        the same defect in two ledgers under two severities."""
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.01, 64.0)})[0]["excerpt"]
+        for phrasing in ("missing", "should declare", "no requests set", "unset"):
+            self.assertNotIn(phrasing, excerpt.lower())
+
+    def test_a_sized_controller_is_left_to_the_other_two_checks(self):
+        """The complement of `_eligible_pods_by_owner`: a pod lands in exactly
+        one of the two populations, so a controller cannot be both sized badly
+        and unsized."""
+        pod = OverrequestTest().deployment_pod()
+        self.assertEqual(self.check([pod], {("default", "api-1"): (0.9, 3072.0)}), [])
+
+    def test_a_partially_sized_controller_belongs_to_the_sizing_checks(self):
+        """One container with a request and one without is a pod the other two
+        checks already measure, and `_eligible_pods_by_owner` admits it on
+        `any(requests)`. Claiming it here too would double-report it."""
+        pod = self.pod(containers=[
+            {"name": "main", "resources": {"requests": {"cpu": "100m"}}},
+            {"name": "sidecar", "resources": {}},
+        ])
+        self.assertEqual(self.check([pod], {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}), [])
+
+    def test_an_unmeasured_controller_is_not_reported(self):
+        """The whole finding is the measurement. With no Monitoring answer the
+        recommendation would be to request zero, which is the state being
+        complained about."""
+        self.assertEqual(self.check([self.pod()], {("argocd", "other-pod"): (0.5, 500.0)}), [])
+        self.assertEqual(self.check([self.pod()], {}), [])
+
+    def test_a_measured_but_idle_controller_still_gets_a_floor(self):
+        """A near-silent sidecar measured at almost nothing must not be handed
+        a `0m`/`0Mi` request: no scheduler decision turns on it, and it is the
+        same BestEffort pod afterwards."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0001, 1.0)}
+        excerpt = self.check([self.pod()], peaks)[0]["excerpt"]
+        self.assertIn("10m / 32Mi per replica", excerpt)
+
+    def test_it_shares_the_sizing_checks_exclusions(self):
+        """A DaemonSet, a Job pod, or a pod under an hour old is out of scope
+        for the sizing checks, and declaring no request does not put it back
+        in. `no-requests` on a DaemonSet is a real reliability finding; the
+        request value still is not this stream's to set."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
+        cases = {
+            "daemonset": dict(owner_kind="DaemonSet", owner_name="ds"),
+            "job": dict(owner_kind="Job", owner_name="batch"),
+            "young": dict(started="2026-07-31T23:30:00Z"),
+            "system-namespace": dict(ns="kube-system"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                key = (kwargs.get("ns", "argocd"), "argocd-repo-server-1")
+                self.assertEqual(self.check([self.pod(**kwargs)], {key: (0.01, 64.0)}), [])
+        self.assertEqual(len(self.check([self.pod()], peaks)), 1)  # the control
+
+    def test_the_recommendation_is_per_replica(self):
+        """The peak sums across replicas; the manifest declares one replica's
+        request. Dividing is the difference between a 2x headroom and a 2N x
+        one -- which on a three-replica controller reserves six times what it
+        needs and turns this finding into an `overrequest` next week."""
+        # Three replicas, so 2x-per-replica (0.18) is distinct from both the
+        # summed peak (0.27) and one replica's share of it (0.09) -- at two
+        # replicas the first two collide and the test would pass either way.
+        pods = [self.pod(name=f"argocd-repo-server-{i}") for i in (1, 2, 3)]
+        peaks = {("argocd", f"argocd-repo-server-{i}"): (0.09, 100.0) for i in (1, 2, 3)}
+        excerpt = self.check(pods, peaks)[0]["excerpt"]
+        self.assertIn("peak observed 270.0m vCPU / 300Mi", excerpt)
+        self.assertIn("180m / 200Mi per replica", excerpt)
+        self.assertIn("spans 3 replicas", excerpt)
+        # `0.09 * 3 / 3 * 2` does not round-trip, and comparing the floored
+        # result back against a re-derivation of the raw value claimed this
+        # controller -- eighteen times the CPU floor -- was sitting on it.
+        self.assertNotIn("floor", excerpt)
+
+    def test_autopilot_takes_the_same_one_level_bump_as_overrequest(self):
+        """Autopilot bills on requests and substitutes its own default where a
+        manifest declares none, so the number is being paid for either way."""
+        pod = self.pod()
+        peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
+        self.assertEqual(self.check([pod], peaks, autopilot=True)[0]["severity"], "major")
+
+    def test_it_never_reaches_critical(self):
+        """§3 caps a manifest remediation below `critical`, which opens a
+        merge-ready pull request. A right-size patch is never that urgent."""
+        peaks = {("argocd", "argocd-repo-server-1"): (8.0, 65536.0)}
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                self.assertNotEqual(self.check([self.pod()], peaks, autopilot=autopilot)[0]["severity"], "critical")
+
+
+class UnattachedDiskTest(unittest.TestCase):
+    def disk(self, name="d1", size_gb=200, created="2026-01-01T00:00:00Z", disk_type="pd-standard", users=None):
+        return {"name": name, "sizeGb": str(size_gb), "type": disk_type, "creationTimestamp": created, "zone": "us-central1-a", "users": users or []}
+
+    def test_flags_unattached_over_30_days(self):
+        self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
+
+    def test_does_not_flag_attached(self):
+        self.assertEqual(fw.check_unattached_disk([self.disk(users=["some-vm"])], set(), now=NOW), [])
+
+    def test_does_not_flag_recently_created(self):
+        self.assertEqual(fw.check_unattached_disk([self.disk(created="2026-07-30T00:00:00Z")], set(), now=NOW), [])
+
+    def test_a_disk_detached_yesterday_is_churn_however_old_it_is(self):
+        """The 30 days are justified as outliving a maintenance cycle, and a
+        maintenance cycle detaches disks — it does not create them. Reading the
+        age off `creationTimestamp` flagged a year-old boot disk that PD-CSI
+        released this morning, which is the churn the threshold excludes."""
+        disk = self.disk(created="2025-01-01T00:00:00Z")
+        disk["lastDetachTimestamp"] = "2026-08-27T00:00:00Z"
+        self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW), [])
+
+    def test_the_excerpt_dates_the_detach_not_the_creation(self):
+        disk = self.disk(created="2025-01-01T00:00:00Z")
+        disk["lastDetachTimestamp"] = "2026-05-30T00:00:00Z"
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("unattached since 2026-05-30T00:00:00Z", hits[0]["excerpt"])
+        self.assertNotIn("2025-01-01", hits[0]["excerpt"])
+
+    def test_a_disk_never_attached_says_so_rather_than_implying_a_detach(self):
+        """No `lastDetachTimestamp` means GCE never attached it, so creation is
+        genuinely when it went idle — but "unattached since" would assert a
+        detach that never happened."""
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW)
+        self.assertIn("never attached, created 2026-01-01T00:00:00Z", hits[0]["excerpt"])
+
+    def test_does_not_flag_a_disk_matching_a_live_pv_handle(self):
+        self.assertEqual(fw.check_unattached_disk([self.disk(name="pv-handle-1")], {"pv-handle-1"}, now=NOW), [])
+
+    def test_large_ssd_is_major(self):
+        hits = fw.check_unattached_disk([self.disk(size_gb=600, disk_type="pd-ssd")], set(), now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_the_excerpt_shortens_the_disk_type_selflink(self):
+        """Live `disks list` returns `type` as a diskTypes URL. Printed whole it
+        put 100 characters of `googleapis.com` in the excerpt beside a `--zone`
+        flag `_scope_flag` had already shortened for being unreadable."""
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-b/diskTypes/pd-balanced"
+        hits = fw.check_unattached_disk([self.disk(disk_type=url)], set(), now=NOW)
+        self.assertIn("pd-balanced", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_severity_still_reads_ssd_out_of_a_selflink_type(self):
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-b/diskTypes/pd-ssd"
+        hits = fw.check_unattached_disk([self.disk(size_gb=10, disk_type=url)], set(), now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_a_zonal_disk_carries_its_zone_scope_flag(self):
+        """The excerpt used to print `zone=` with gcloud's raw selfLink in it.
+
+        A URL is not something you can paste after `--zone`, so the describe and
+        delete in §3.2's chain went out unscoped and resolved against gcloud's
+        configured zone.
+        """
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-a"
+        hits = fw.check_unattached_disk([{**self.disk(), "zone": url}], set(), now=NOW)
+        self.assertIn("--zone=us-east4-a", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_a_regional_disk_carries_a_region_flag_not_a_zone_one(self):
+        """A regional PD has `region` and no `zone`; `--zone` would not find it."""
+        disk = {k: v for k, v in self.disk().items() if k != "zone"}
+        disk["region"] = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("--zone", hits[0]["excerpt"])
+
+
+class DeadClusterDiskTest(unittest.TestCase):
+    """§3.4's short floor for a disk whose owning cluster no longer exists.
+
+    Live case this was written from: two `platform-agent-host` PDs detached on
+    2026-08-26 when that cluster was deleted, still billing ten days later, and
+    still three weeks short of the 30-day floor that assumes something will
+    reattach them.
+    """
+
+    def disk(self, name="d1", detached="2026-07-22T00:00:00Z", cluster="dead-cluster", size_gb=10):
+        disk = {
+            "name": name,
+            "sizeGb": str(size_gb),
+            "type": "pd-balanced",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "zone": "us-east4-b",
+            "users": [],
+            "lastDetachTimestamp": detached,
+        }
+        if cluster is not None:
+            disk["labels"] = {"goog-k8s-cluster-name": cluster}
+        return disk
+
+    def test_ten_days_off_a_deleted_cluster_is_a_finding(self):
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"live-one"})
+        self.assertEqual(len(hits), 1)
+
+    def test_the_same_disk_is_churn_while_its_cluster_still_runs(self):
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"dead-cluster"}),
+            [],
+        )
+
+    def test_an_unknown_fleet_does_not_read_as_an_empty_one(self):
+        """`known_clusters=None` is the enumeration having failed. Treating it
+        as "no clusters exist" would drop every GKE disk in the project to the
+        7-day floor on the one run that could not see the fleet."""
+        self.assertEqual(fw.check_unattached_disk([self.disk()], set(), now=NOW), [])
+
+    def test_the_short_floor_still_has_a_floor(self):
+        """Six days is inside the asynchronous-teardown and same-name-recreate
+        window the seven days exist to outlive."""
+        recent = self.disk(detached="2026-07-26T00:00:00Z")
+        self.assertEqual(fw.check_unattached_disk([recent], set(), now=NOW, known_clusters={"live"}), [])
+
+    def test_an_unlabelled_disk_keeps_the_thirty_day_floor(self):
+        """No `goog-k8s-cluster-name` means no cluster was shown to be gone —
+        an unlabelled disk is not evidence of a deleted cluster."""
+        bare = self.disk(cluster=None)
+        self.assertEqual(fw.check_unattached_disk([bare], set(), now=NOW, known_clusters={"live"}), [])
+
+    def test_the_excerpt_names_the_cluster_that_is_gone(self):
+        """`adopt_collector_evidence` makes this string the only evidence a
+        reader sees, and without the cluster there is nothing in it explaining
+        why a ten-day-old disk was reported when a twenty-day-old one was not.
+        """
+        excerpt = fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertIn("dead-cluster", excerpt)
+        self.assertIn("no longer runs", excerpt)
+
+    def test_a_thirty_day_disk_says_nothing_about_a_dead_cluster(self):
+        old = self.disk(detached="2026-06-01T00:00:00Z", cluster="live")
+        excerpt = fw.check_unattached_disk([old], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertNotIn("no longer runs", excerpt)
+
+    def test_a_live_pv_handle_still_wins(self):
+        """The claimed-but-detached exclusion is not weakened by the short
+        floor: a PV still bound to the handle is data, not waste."""
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk(name="h1")], {"h1"}, now=NOW, known_clusters={"live"}),
+            [],
+        )
+
+    def test_a_degraded_cluster_still_owns_its_disks(self):
+        """`enumerate_clusters` hands DEGRADED and PROVISIONING clusters back in
+        its second list rather than its first. They exist; a disk labelled for
+        one is not orphaned."""
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk(cluster="degraded-one")], set(), now=NOW, known_clusters={"live", "degraded-one"}),
+            [],
+        )
+
+
+class DiskPvcOriginTest(unittest.TestCase):
+    """A PD-CSI volume is named for a PV UID, so the finding's object is an
+    opaque handle. The claim it was cut for is what tells the operator whether
+    deleting it destroys anything they care about.
+    """
+
+    DESCRIPTION = json.dumps(
+        {
+            "kubernetes.io/created-for/pvc/name": "platform-agent-data",
+            "kubernetes.io/created-for/pvc/namespace": "kubeagents-system",
+            "kubernetes.io/created-for/pv/name": "pvc-d45cfdfd",
+        }
+    )
+
+    def disk(self, **overrides):
+        disk = {
+            "name": "pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34",
+            "sizeGb": "10",
+            "type": "pd-balanced",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "zone": "us-east4-b",
+            "users": [],
+            # Past the 30-day floor on its own, so these tests exercise the
+            # excerpt rather than the dead-cluster short floor.
+            "lastDetachTimestamp": "2026-06-01T00:00:00Z",
+        }
+        disk.update(overrides)
+        return disk
+
+    def test_the_excerpt_names_the_claim_the_disk_was_cut_for(self):
+        hits = fw.check_unattached_disk([self.disk(description=self.DESCRIPTION)], set(), now=NOW)
+        self.assertIn("kubeagents-system/platform-agent-data", hits[0]["excerpt"])
+
+    def test_a_disk_no_driver_provisioned_says_nothing_about_a_claim(self):
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW)
+        self.assertNotIn("PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_a_description_that_is_not_json_is_not_a_crash(self):
+        """`description` is a free-text field an operator can write anything
+        into, including the marker substring."""
+        disk = self.disk(description="notes about kubernetes.io/created-for, not JSON")
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_a_claim_with_no_namespace_is_named_bare(self):
+        disk = self.disk(
+            description=json.dumps({"kubernetes.io/created-for/pvc/name": "lonely"})
+        )
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("held the lonely PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_the_claim_rides_alongside_the_dead_cluster_note(self):
+        disk = self.disk(
+            description=self.DESCRIPTION,
+            labels={"goog-k8s-cluster-name": "platform-agent-host"},
+        )
+        excerpt = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertIn("kubeagents-system/platform-agent-data", excerpt)
+        self.assertIn("platform-agent-host", excerpt)
+        self.assertIn("no longer runs", excerpt)
+
+
+class IdleAddressTest(unittest.TestCase):
+    def address(self, name="addr1", addr_type="EXTERNAL", status="RESERVED", purpose="", created="2026-01-01T00:00:00Z", region="us-central1"):
+        return {"name": name, "address": "1.2.3.4", "addressType": addr_type, "status": status, "purpose": purpose, "creationTimestamp": created, "region": region}
+
+    def test_flags_reserved_external_over_14_days(self):
+        self.assertEqual(len(fw.check_idle_address([self.address()], set(), project="p", now=NOW)), 1)
+
+    def test_does_not_flag_internal(self):
+        self.assertEqual(fw.check_idle_address([self.address(addr_type="INTERNAL")], set(), project="p", now=NOW), [])
+
+    def test_does_not_flag_gce_endpoint_purpose(self):
+        self.assertEqual(fw.check_idle_address([self.address(purpose="GCE_ENDPOINT")], set(), project="p", now=NOW), [])
+
+    def test_does_not_flag_referenced_by_annotation(self):
+        self.assertEqual(fw.check_idle_address([self.address(name="my-ip")], {"my-ip"}, project="p", now=NOW), [])
+
+    def test_rolls_up_ten_or_more_into_one_major_finding(self):
+        addrs = [self.address(name=f"a{i}") for i in range(10)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_a_regional_address_carries_the_region_scope_flag(self):
+        hits = fw.check_idle_address([self.address()], set(), project="p", now=NOW)
+        self.assertIn("--region=us-central1", hits[0]["excerpt"])
+
+    def test_a_global_address_carries_the_global_scope_flag(self):
+        """gcloud omits `region` entirely for a global address.
+
+        Left to infer it, an agent writes the remediation with no scope flag at
+        all, gcloud resolves it against its configured default region, and the
+        command answers `was not found` on an address that is really there.
+        """
+        hits = fw.check_idle_address([self.address(region=None)], set(), project="p", now=NOW)
+        self.assertIn("--global", hits[0]["excerpt"])
+        self.assertNotIn("--region", hits[0]["excerpt"])
+
+    def test_a_region_selflink_is_reduced_to_its_name(self):
+        """The list API returns `region` as a full URL, not `us-central1`."""
+        url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        hits = fw.check_idle_address([self.address(region=url)], set(), project="p", now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_the_rollup_names_a_location_not_a_url(self):
+        url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        addrs = [self.address(name=f"a{i}", region=url) for i in range(10)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn("us-east4", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_the_rollup_is_named_after_the_project_not_one_members_region(self):
+        """§3.5's roll-up is per project and §5 forbids naming it after a member.
+
+        The old `Address/rollup-<region of the first address>` was both: it
+        claimed a region for addresses that were not in it, and it moved --
+        releasing that one address renamed the finding, so the ledger announced
+        the same leak as resolved and then as new.
+        """
+        addrs = [self.address(name=f"a{i}", region="us-east4") for i in range(6)]
+        addrs += [self.address(name=f"b{i}", region="europe-west1") for i in range(6)]
+        hits = fw.check_idle_address(addrs, set(), project="adamparco-kage", now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Project/adamparco-kage")
+        # Both regions named, with their own counts -- not one region's name
+        # over a total that spans two.
+        self.assertIn("us-east4 (6)", hits[0]["excerpt"])
+        self.assertIn("europe-west1 (6)", hits[0]["excerpt"])
+        self.assertTrue(hits[0]["excerpt"].startswith("12 external addresses"))
+
+    def test_the_rollup_identity_survives_releasing_one_member(self):
+        many = [self.address(name=f"a{i}", region="us-east4") for i in range(11)]
+        first = fw.check_idle_address(many, set(), project="p", now=NOW)
+        # Release the one that used to decide the name, in the region that used
+        # to decide the name.
+        rest = [a for a in many if a["name"] != "a0"]
+        rest[0]["region"] = "europe-west1"
+        second = fw.check_idle_address(rest, set(), project="p", now=NOW)
+        self.assertEqual(first[0]["object"], second[0]["object"])
+
+    def test_the_rollup_excerpt_names_its_members(self):
+        addrs = [self.address(name=f"a{i:02d}") for i in range(10)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn("a00", hits[0]["excerpt"])
+        self.assertIn("a09", hits[0]["excerpt"])
+
+    def test_a_long_rollup_says_how_many_it_did_not_name(self):
+        addrs = [self.address(name=f"a{i:03d}") for i in range(40)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn(f"and {40 - fw.ROLLUP_EXCERPT_MEMBERS} more", hits[0]["excerpt"])
+
+
+GIB = 1024**3
+
+
+class RegistryNoCleanupTest(unittest.TestCase):
+    """§3.14 -- the one waste class that grows while nobody touches it."""
+
+    def repo(
+        self,
+        name="projects/acme/locations/us-east4/repositories/images",
+        mode="STANDARD_REPOSITORY",
+        size=90 * GIB,
+        created="2026-06-02T00:00:00Z",
+        policies=None,
+        dry_run=None,
+    ):
+        r = {"name": name, "mode": mode, "format": "DOCKER", "createTime": created}
+        if size is not None:
+            # The API sends int64 as a JSON string; the collector has to cope.
+            r["sizeBytes"] = str(size)
+        if policies is not None:
+            r["cleanupPolicies"] = policies
+        if dry_run is not None:
+            r["cleanupPolicyDryRun"] = dry_run
+        return r
+
+    def check(self, *repos):
+        return fw.check_registry_no_cleanup(list(repos), project="acme", now=NOW)
+
+    def test_flags_a_large_old_repository_with_no_policy(self):
+        hits = self.check(self.repo())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ArtifactRegistryRepository/images")
+        self.assertIn("no cleanup policy", hits[0]["excerpt"])
+
+    def test_the_object_is_the_short_name_not_the_resource_path(self):
+        """`object` is half the finding's identity, and a resource path carries
+        the project and location -- move the repository and the ledger announces
+        the same leak as resolved and then as new."""
+        self.assertNotIn("projects/", self.check(self.repo())[0]["object"])
+
+    def test_a_live_policy_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(policies={"keep-recent": {}})), [])
+
+    def test_a_dry_run_policy_counts_as_no_policy(self):
+        """The forgotten case. `cleanupPolicyDryRun` deletes nothing, and both
+        the console and `gcloud ... list` render it as a configured policy, so a
+        check that tested only for the key's presence would call it clean."""
+        hits = self.check(self.repo(policies={"keep-recent": {}}, dry_run=True))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("dry-run", hits[0]["excerpt"])
+        self.assertIn("1 cleanup policy", hits[0]["excerpt"])
+
+    def test_the_dry_run_count_is_pluralised(self):
+        hits = self.check(self.repo(policies={"a": {}, "b": {}}, dry_run=True))
+        self.assertIn("2 cleanup policies", hits[0]["excerpt"])
+
+    def test_below_the_size_floor_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(size=fw.REGISTRY_SIZE_FLOOR_BYTES - 1)), [])
+
+    def test_below_the_age_floor_is_not_flagged(self):
+        """One day of pushes over one day of age reads as a runaway, and a
+        repository that new has no history to clean."""
+        self.assertEqual(self.check(self.repo(created="2026-07-25T00:00:00Z")), [])
+
+    def test_a_remote_repository_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(mode="REMOTE_REPOSITORY")), [])
+
+    def test_a_virtual_repository_is_not_flagged(self):
+        """It stores nothing; its `sizeBytes` double-counts the repositories
+        behind it, which this check reads on their own."""
+        self.assertEqual(self.check(self.repo(mode="VIRTUAL_REPOSITORY")), [])
+
+    def test_an_empty_repository_is_not_flagged(self):
+        """`sizeBytes` is absent, not zero, on a repository holding nothing."""
+        self.assertEqual(self.check(self.repo(size=None)), [])
+
+    def test_an_unparseable_size_is_skipped_rather_than_raising(self):
+        r = self.repo()
+        r["sizeBytes"] = "not-a-number"
+        self.assertEqual(self.check(r), [])
+
+    def test_a_repository_with_no_create_time_is_skipped(self):
+        self.assertEqual(self.check(self.repo(created="")), [])
+
+    def test_size_alone_reaches_major(self):
+        hits = self.check(self.repo(size=fw.REGISTRY_SIZE_MAJOR_BYTES, created="2025-01-01T00:00:00Z"))
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_growth_alone_reaches_major(self):
+        """100 GiB in 40 days is 2.5 GiB/day -- well under the size bar and
+        still worth a `major`, because the bill only goes one way."""
+        hits = self.check(self.repo(size=100 * GIB, created="2026-06-22T00:00:00Z"))
+        self.assertLess(100 * GIB, fw.REGISTRY_SIZE_MAJOR_BYTES)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_large_but_slow_stays_minor(self):
+        hits = self.check(self.repo(size=60 * GIB, created="2025-06-02T00:00:00Z"))
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_the_excerpt_carries_the_location_scope_flag(self):
+        """§3.5's lesson in a different API. An Artifact Registry verb with no
+        `--location` resolves against gcloud's configured default and answers
+        `NOT_FOUND`, which reads as a repository somebody already cleaned up."""
+        self.assertIn("--location=us-east4", self.check(self.repo())[0]["excerpt"])
+
+    def test_the_excerpt_names_the_age_rather_than_only_the_timestamp(self):
+        self.assertIn("(60d ago)", self.check(self.repo())[0]["excerpt"])
+
+
+class OrphanLbTest(unittest.TestCase):
+    def test_flags_forwarding_rule_targeting_deleted_service(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertEqual(len(hits), 1)
+
+    def test_does_not_flag_when_service_still_exists(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], {"staging/checkout"}, now=NOW), [])
+
+    def test_does_not_flag_multicluster_ingress(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout multiclusteringress", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    def test_flags_empty_target_pool(self):
+        hits = fw.check_orphan_lb([], [{"name": "tp1", "instances": []}], [], set(), now=NOW)
+        self.assertEqual(hits[0]["object"], "TargetPool/tp1")
+
+    def test_flags_empty_backend_service(self):
+        hits = fw.check_orphan_lb([], [], [{"name": "bs1", "backends": []}], set(), now=NOW)
+        self.assertEqual(hits[0]["object"], "BackendService/bs1")
+
+    #: What the GKE service controller actually writes into a forwarding rule's
+    #: description. Every test above uses the bare `key: value` form, which is
+    #: what the SOP's prose example shows and what no live rule carries -- so
+    #: the whole leg passed its tests while matching nothing in the fleet.
+    GKE_DESC = '{"kubernetes.io/service-name":"staging/checkout","kubernetes.io/api-version":"v1"}'
+
+    def test_the_json_description_gke_really_writes_is_matched(self):
+        rule = {"name": "fr1", "description": self.GKE_DESC, "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("staging/checkout", hits[0]["excerpt"])
+
+    def test_a_live_service_still_suppresses_the_json_form(self):
+        rule = {"name": "fr1", "description": self.GKE_DESC, "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], {"staging/checkout"}, now=NOW), [])
+
+    def test_a_rule_with_no_kubernetes_description_is_still_skipped(self):
+        rule = {"name": "tf-managed", "description": "managed by terraform", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    def test_does_not_flag_recent_forwarding_rule(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-07-30T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    REGION = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+
+    def test_a_regional_forwarding_rule_carries_its_scope_flag(self):
+        """The remediation chain deletes the rule, so it needs to find it.
+
+        Every resource in §3.6's chain is regional-or-global, and an unscoped
+        `gcloud compute` verb resolves against whatever region gcloud is
+        configured for -- answering `was not found` for a rule that is really
+        there, which reads as already-remediated.
+        """
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z", "region": self.REGION}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_a_global_forwarding_rule_carries_the_global_flag(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn("--global", hits[0]["excerpt"])
+
+    def test_a_target_pool_carries_its_region(self):
+        hits = fw.check_orphan_lb([], [{"name": "tp1", "instances": [], "region": self.REGION}], [], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+
+    def test_a_backend_service_carries_its_scope_flag(self):
+        """A backend service is regional or global, and the listing tells them
+        apart only by whether `region` is there at all."""
+        regional = fw.check_orphan_lb([], [], [{"name": "bs1", "backends": [], "region": self.REGION}], set(), now=NOW)
+        self.assertIn("--region=us-east4", regional[0]["excerpt"])
+        glob = fw.check_orphan_lb([], [], [{"name": "bs2", "backends": []}], set(), now=NOW)
+        self.assertIn("--global", glob[0]["excerpt"])
+
+
+class AgeInExcerptTest(unittest.TestCase):
+    """Every check that gates on age says the age it gated on.
+
+    A check computes an age, decides with it, and then quoted the raw ISO
+    timestamp. The model reading the manifest still has to say how long the
+    thing has been idle -- that is the finding -- so it did the date arithmetic
+    itself and got it wrong: `argocd-webhook-ip`, reserved 2026-08-02 and read
+    2026-09-01, was published as "unused for 28 days". `adopt_collector_evidence`
+    replaces the model's evidence with the collector's and leaves the title
+    alone, so the wrong number outlives the correct evidence beside it.
+
+    Each timestamp below is 2026-01-01 against a NOW of 2026-08-01: 212 days.
+    """
+
+    AGO = "(212d ago)"
+
+    def test_orphan_pv_dates_the_phase_transition(self):
+        pv = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": "Retain", "status.phase": "Released", "spec.capacity": {"storage": "10Gi"}, "status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
+        hits = fw.check_orphan_pv({"pvs": [pv], "pvcs": [], "statefulsets": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_terminal_pods_dates_the_oldest_pod(self):
+        pods = [obj("Pod", "p", ns="default", **{"status.phase": "Succeeded", "metadata.creationTimestamp": "2026-01-01T00:00:00Z"})]
+        hits = fw.check_terminal_pods({"pods": pods, "jobs": [], "cronjobs": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_a_ttl_less_job_dates_its_completion(self):
+        job = obj("Job", "batch", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z"})
+        hits = fw.check_terminal_pods({"pods": [], "jobs": [job], "cronjobs": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_an_unattached_disk_dates_the_detach(self):
+        disk = {"name": "d1", "sizeGb": "200", "type": "pd-standard", "creationTimestamp": "2020-01-01T00:00:00Z", "lastDetachTimestamp": "2026-01-01T00:00:00Z", "zone": "us-central1-a", "users": []}
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn(f"unattached since 2026-01-01T00:00:00Z {self.AGO}", hits[0]["excerpt"])
+
+    def test_an_idle_address_dates_its_reservation(self):
+        addr = {"name": "a1", "address": "1.2.3.4", "addressType": "EXTERNAL", "status": "RESERVED", "purpose": "", "creationTimestamp": "2026-01-01T00:00:00Z", "region": "us-central1"}
+        hits = fw.check_idle_address([addr], set(), project="p", now=NOW)
+        self.assertIn(f"since 2026-01-01T00:00:00Z {self.AGO}", hits[0]["excerpt"])
+
+    def test_an_orphan_forwarding_rule_dates_its_creation(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_the_age_belongs_to_the_address_it_is_printed_beside(self):
+        """`idle` was a list of addresses and the age a loop variable left over
+        from the filter pass, so reading it in the emit loop would have stamped
+        every address with the last one's age. Two addresses of different ages,
+        emitted separately, is the only shape that catches it."""
+        old = {"name": "old", "address": "1.1.1.1", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-01-01T00:00:00Z", "region": "us-central1"}
+        new = {"name": "new", "address": "2.2.2.2", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-07-01T00:00:00Z", "region": "us-central1"}
+        by_name = {h["object"]: h["excerpt"] for h in fw.check_idle_address([old, new], set(), project="p", now=NOW)}
+        self.assertIn("(212d ago)", by_name["Address/old"])
+        self.assertIn("(31d ago)", by_name["Address/new"])
+
+    def test_an_unreadable_timestamp_prints_no_age_rather_than_zero(self):
+        """`_age_days` returns None for a timestamp it cannot parse, and "(0d
+        ago)" would assert the thing went idle today."""
+        self.assertEqual(fw._ago(None), "")
+
+    def test_a_part_day_rounds_down_so_a_title_cannot_claim_the_threshold(self):
+        """The second half of the same bug, one release later.
+
+        Dating the excerpt stopped the model doing its own arithmetic, but
+        `{age:.0f}` rounds to nearest, so the same `argocd-webhook-ip` -- 29.69
+        days old when the 2026-09-01 cost run read it -- was published as "(30d
+        ago)" and the model titled the finding "unused for 30+ days". A claim
+        about a threshold, derived from a rounded number, and false. Anything
+        under a whole day has to round down, or the collector hands the model
+        the licence to state the threshold.
+        """
+        self.assertEqual(fw._ago(29.69), " (29d ago)")
+        self.assertEqual(fw._ago(29.999), " (29d ago)")
+        self.assertEqual(fw._ago(30.0), " (30d ago)")
+
+    def test_an_age_that_predates_the_read_prints_zero_not_a_negative(self):
+        """A clock that moved backwards between creation and read gives a
+        negative age. "(-1d ago)" would say the object is from the future."""
+        self.assertEqual(fw._ago(-0.5), " (0d ago)")
+
+
+class CollectProjectComputeTest(unittest.TestCase):
+    """The five gated project-scope reads, and what happens when one fails.
+
+    Six reads happen here, not five: §3.14's Artifact Registry list is gated by
+    itself, so it is deliberately absent from the "N of 5" arithmetic below.
+
+    The `run` here emulates gcloud's *argument parser*, not just its API, which
+    is the whole point: the disks read spent its entire life failing on a filter
+    value gcloud would not accept, and a fake that answers every argv with `[]`
+    cannot tell the difference between a command gcloud runs and one it rejects.
+    """
+
+    FACTS = {"pv_handles": set(), "referenced_addresses": set(), "service_names": set()}
+
+    def run_with(self, fail: dict | None = None):
+        fail = fail or {}
+
+        def run(argv, **kwargs):
+            # gcloud reads `--filter` followed by a token starting with `-` as
+            # two flags and rejects the command for the argument it thinks is
+            # missing. `--filter=-users:*` is one token and parses fine.
+            for i, tok in enumerate(argv):
+                if tok == "--filter" and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
+                    return run_of(2, "", f"ERROR: (gcloud.compute.{argv[2]}.list) argument --filter: expected one argument")
+            resource = argv[2] if len(argv) > 2 else ""
+            if resource in fail:
+                return run_of(1, "", fail[resource])
+            return run_of(0, "[]")
+
+        return run
+
+    def test_the_disks_read_survives_gcloud_argument_parsing(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertEqual(target["outcome"], "collected")
+
+    def test_the_collector_does_not_pass_a_filter_gcloud_would_reject(self):
+        """Guards the fake as much as the collector. If the parser emulation
+        above stopped rejecting the old spelling it would pass everything, and
+        the test above would go green against a disks read that never ran."""
+        broken = ["gcloud", "compute", "disks", "list", "--project", "acme", "--filter", "-users:*", "--format", "json"]
+        self.assertEqual(self.run_with()(broken).rc, 2)
+
+        seen = []
+
+        def recording(argv, **kwargs):
+            seen.append(argv)
+            return self.run_with()(argv, **kwargs)
+
+        fw.collect_project_compute("acme", True, self.FACTS, run=recording, now=NOW)
+        disks = next(argv for argv in seen if argv[2] == "disks")
+        self.assertIn("--filter=-users:*", disks)
+        self.assertNotIn("--filter", disks)
+
+    def test_a_failed_read_names_the_command_and_what_it_said(self):
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("1 of 5", target["error"])
+        self.assertIn("gcloud compute addresses list", target["error"])
+        self.assertIn("PERMISSION_DENIED", target["error"])
+
+    def test_the_error_names_every_read_that_failed_not_just_the_first(self):
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "denied-a", "target-pools": "denied-t"}), now=NOW
+        )
+        self.assertIn("2 of 5", target["error"])
+        self.assertIn("denied-a", target["error"])
+        self.assertIn("denied-t", target["error"])
+
+    def test_a_read_that_returns_no_stderr_still_names_its_command(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(fail={"disks": ""}), now=NOW)
+        self.assertIn("gcloud compute disks list", target["error"])
+        self.assertIn("no stderr", target["error"])
+
+    def test_withholding_orphan_lb_says_why_rather_than_just_dropping_it(self):
+        """§6's roster half names the missing check on its own, so the gap reads
+        "orphan-lb did not run" whatever this entry says. Without a reason that
+        sends a reader hunting a broken gcloud read: all three compute reads
+        succeeded here and the check was withheld deliberately."""
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertEqual(target["outcome"], "collected")
+        self.assertNotIn("orphan-lb", [c["check"] for c in target["commands"]])
+        self.assertIn("orphan-lb", target["limitations"])
+
+    def test_a_project_whose_clusters_all_read_carries_no_limitation(self):
+        """The other half of the pair. A limitation set unconditionally would
+        make every healthy run partial, which costs more than the silence did."""
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
+        self.assertNotIn("limitations", target)
+
+    def test_the_registry_read_is_recorded_alongside_the_compute_ones(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        entry = next(c for c in target["commands"] if c["check"] == "registry-no-cleanup")
+        self.assertIn("gcloud artifacts repositories list", entry["command"])
+
+    def test_a_failed_registry_read_does_not_gate_the_compute_checks(self):
+        """The whole reason §3.14 is outside the five-read gate. The Artifact
+        Registry API is enabled per project and the read needs its own IAM
+        permission, so on a project that has neither this must cost one check
+        rather than `unattached-disk` and `idle-address` as well."""
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"repositories": "PERMISSION_DENIED"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "collected")
+        self.assertIn("unattached-disk", [c["check"] for c in target["commands"]])
+        self.assertNotIn("registry-no-cleanup", [c["check"] for c in target["commands"]])
+        self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
+        self.assertIn("PERMISSION_DENIED", target["limitations"])
+
+    def test_a_failed_compute_read_still_gates_everything(self):
+        """The other direction. Splitting the registry read out must not have
+        loosened the five that cross-reference each other."""
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"disks": "denied"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("1 of 5", target["error"])
+
+    def test_a_withheld_orphan_lb_and_a_failed_registry_read_are_both_reported(self):
+        """`limitations` is one string and the orphan-lb branch assigns it
+        outright. Written in the other order the registry gap would vanish on
+        any project holding an unreadable cluster, which is most of them."""
+        target = fw.collect_project_compute(
+            "acme", False, self.FACTS, run=self.run_with(fail={"repositories": "denied-r"}), now=NOW
+        )
+        self.assertIn("orphan-lb was not evaluated", target["limitations"])
+        self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
+
+    def recording(self, fail=None):
+        seen = []
+        inner = self.run_with(fail)
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            return inner(argv, **kwargs)
+
+        return run, seen
+
+    def test_a_rule_list_read_before_the_pool_is_not_read_again_here(self):
+        """§3.13's traffic read needs these rules before any cluster is
+        collected, so `collect_fleet` hoists the call and hands the answer down.
+        Re-reading it would double a per-project gcloud call and leave two
+        answers that can disagree about the same project."""
+        run, seen = self.recording()
+        pre = ([{"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"}], run_of(0, "[]"))
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW, forwarding_rules=pre)
+        self.assertEqual(target["outcome"], "collected")
+        self.assertEqual([argv for argv in seen if argv[2] == "forwarding-rules"], [])
+        self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
+
+    def test_without_a_pre_read_the_rules_are_still_read_here(self):
+        """The fallback that keeps this file runnable on its own and keeps the
+        eleven call sites that predate the hoist honest."""
+        run, seen = self.recording()
+        fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW)
+        self.assertEqual(len([argv for argv in seen if argv[2] == "forwarding-rules"]), 1)
+
+    def test_a_pre_read_that_failed_still_fails_the_gate(self):
+        """§3.6 owns this read's failure whoever issued it. Passing the pair
+        down must not turn a PERMISSION_DENIED into a project that collected
+        cleanly with `orphan-lb` silently missing."""
+        pre = (None, run_of(1, "", "PERMISSION_DENIED: compute.forwardingRules.list"))
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW, forwarding_rules=pre)
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("gcloud compute forwarding-rules list", target["error"])
+        self.assertIn("PERMISSION_DENIED", target["error"])
+
+
+class CollectClusterTest(unittest.TestCase):
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+
+    def run_with(self, dump_items=(), pools=(), session=None, cluster=None):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*dump_items)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(list(pools)))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                return fw.collect_cluster(cluster or self.CLUSTER, run=run, session=session or usage_session(), now=NOW)
+
+    def test_every_outcome_publishes_the_mode(self):
+        # The mode is a cluster property `enumerate_clusters` already resolved,
+        # so it rides on the error shapes too: a cluster does not stop being
+        # Autopilot because this run failed to read inside it.
+        cluster = {**self.CLUSTER, "autopilot": True}
+
+        def denied(argv, **kwargs):
+            return run_of(1, "", "denied") if "get-credentials" in argv else run_of(0, "")
+
+        def gated(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(1, "", "forbidden")
+            return run_of(0, "")
+
+        entries = [self.run_with(cluster=cluster)[0]]
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                for runner in (denied, gated):
+                    entries.append(
+                        fw.collect_cluster(cluster, run=runner, session=usage_session(), now=NOW)[0]
+                    )
+        self.assertEqual(
+            [e["outcome"] for e in entries], ["collected", "unreachable", "gate-failed"]
+        )
+        for entry in entries:
+            with self.subTest(outcome=entry["outcome"]):
+                self.assertIs(entry["autopilot"], True)
+
+    def test_a_cluster_that_never_ran_still_publishes_the_mode(self):
+        entry = fw.not_running_entry(
+            {"name": "dr-west", "location": "us-west1", "status": "DEGRADED",
+             "autopilot": {"enabled": True}},
+            "acme",
+        )
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertIs(entry["autopilot"], True)
+        self.assertIs(
+            fw.not_running_entry({"name": "c", "status": "STOPPING"}, "acme")["autopilot"], False
+        )
+
+    def test_clean_cluster_collects_with_no_candidates(self):
+        entry, facts = self.run_with()
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("overrequest", {c["check"] for c in entry["commands"]})
+
+    def test_get_credentials_failure_is_unreachable(self):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(1, "", "denied")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, facts = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
+
+    def test_object_dump_failure_is_gate_failed(self):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(1, "", "forbidden")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "gate-failed")
+
+    def _metrics_down(self, *dump_items, session=None):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*dump_items)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(
+                    self.CLUSTER, run=run, session=session or FakeSession(**NO_USAGE), now=NOW
+                )
+        return entry
+
+    def test_metrics_unavailable_still_collects_object_checks(self):
+        # The node matters: without one this is the empty-cluster case below,
+        # where the check is not applicable rather than degraded.
+        entry = self._metrics_down(obj("Node", "node-1"))
+        self.assertEqual(entry["outcome"], "collected")
+        # All three read the same peak query, so they are lost together.
+        self.assertNotIn("overrequest", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("unsized-workload", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("idle-workload", {c["check"] for c in entry["commands"]})
+        # Dropping the check out of `commands` is only half the job: §6 raises
+        # it as a gap either way, and without this the ledger named a check
+        # nobody could explain.
+        self.assertIn(
+            "overrequest, unsized-workload and idle-workload could not be measured",
+            entry["limitations"],
+        )
+        self.assertIn("Cloud Monitoring", entry["limitations"])
+
+    def test_a_denied_usage_read_says_so_rather_than_saying_no_data(self):
+        # An IAM gap and a cluster that ships no metrics both stop the check,
+        # but only one of them is something an operator can fix, so the
+        # limitation has to carry which it was.
+        entry = self._metrics_down(
+            obj("Node", "node-1"),
+            session=FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"),
+        )
+        self.assertIn("rc=403", entry["limitations"])
+        self.assertIn("monitoring.timeSeries.list", entry["limitations"])
+
+    def test_a_cluster_with_no_nodes_cannot_be_over_requesting(self):
+        # An empty cluster is not a degraded one. The usage read comes back
+        # empty there because nothing ran to report any, and reading that as
+        # lost coverage published `partial: true` over two freshly created
+        # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
+        # object to run against.
+        #
+        # All four sizing checks take the same exemption, and for the same
+        # reason: neither an over- nor an under-sized request can exist where
+        # nothing is scheduled, an absent one cannot be sized from a history
+        # that was never recorded, and a controller that does not exist cannot
+        # be the one nobody is using.
+        entry = self._metrics_down()
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertNotIn("limitations", entry)
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"overrequest", "underrequest", "unsized-workload", "idle-workload"},
+        )
+        for na in entry["checks_not_applicable"]:
+            self.assertIn("no nodes", na["reason"])
+
+    def test_an_empty_cluster_whose_read_failed_is_a_gap_not_an_exemption(self):
+        """The exemption above rests on the read having come back — empty, but
+        come back. A read that never completed says nothing about the cluster,
+        and the same run says so out loud for every cluster that has nodes: a
+        403 that produces "no metrics because nothing ran on it" here and
+        "read failed (rc=403)" three clusters down is one report making two
+        claims about one failure."""
+        entry = self._metrics_down(
+            session=FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"),
+        )
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("rc=403", entry["limitations"])
+        self.assertIn("overrequest, unsized-workload and idle-workload could not be measured",
+                      entry["limitations"])
+        self.assertIn("underrequest could not be measured", entry["limitations"])
+
+    def test_a_transport_failure_does_not_exempt_an_empty_cluster(self):
+        # rc -1: the arm a credential fault at startup or a dropped connection
+        # takes. It fails every cluster's read at once, so this is where one
+        # fault would have become a fleet of structural verdicts.
+        entry = self._metrics_down(
+            session=FakeSession(raises=ConnectionError("connection reset")),
+        )
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("rc=-1", entry["limitations"])
+        self.assertIn("connection reset", entry["limitations"])
+
+    def test_an_empty_answer_is_not_described_as_a_failure(self):
+        """rc 0 is a 200 that carried no series — the cluster is not shipping
+        system metrics. Reporting that as `failed (rc=0)` asked the reader to
+        reconcile a failure with the exit status that means success."""
+        entry = self._metrics_down(obj("Node", "node-1"))
+        self.assertIn("not shipping system metrics", entry["limitations"])
+        self.assertNotIn("rc=0", entry["limitations"])
+        self.assertNotIn("failed", entry["limitations"])
+
+    def _unreadable_pools(self, cluster=None):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(1, "", "PERMISSION_DENIED: container.nodePools.list")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                return fw.collect_cluster(
+                    cluster or self.CLUSTER, run=run, session=usage_session(), now=NOW
+                )
+
+    def test_an_unreadable_node_pool_list_is_not_an_absence_of_idle_pools(self):
+        """The purest silent-clean shape this collector had.
+
+        `node-pools list` was run bare, so a denied or throttled read parsed to
+        `[]`, and a cluster with no node pools has no idle ones. Both 3.7 and
+        3.8 recorded their command and reported nothing found. The evidence
+        line carried `rc=1` and nothing downstream reads it.
+        """
+        entry, _ = self._unreadable_pools()
+        commands = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", commands)
+        self.assertNotIn("scaledown-blocked", commands)
+        self.assertEqual(entry["outcome"], "collected")
+
+    def test_the_unreadable_pool_list_says_why(self):
+        entry, _ = self._unreadable_pools()
+        self.assertIn("idle-nodepool and scaledown-blocked", entry["limitations"])
+        self.assertIn("rc=1", entry["limitations"])
+        self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_an_unreadable_pool_list_leaves_the_object_checks_alone(self):
+        """A degradation, not a gate failure: the object dump still backs 3.1–3.4."""
+        entry, _ = self._unreadable_pools()
+        commands = {c["check"] for c in entry["commands"]}
+        for slug in ("orphan-pv", "unconsumed-pvc", "terminal-pods", "idle-namespace", "overrequest"):
+            self.assertIn(slug, commands)
+
+    def test_autopilot_with_unreadable_pools_claims_no_pool_limitation(self):
+        """Autopilot owns its pools, so 3.7/3.8 are inapplicable rather than
+        unmeasured — naming them in `limitations` would raise a gap for a check
+        the cluster does not owe."""
+        entry, _ = self._unreadable_pools({**self.CLUSTER, "autopilot": True})
+        self.assertNotIn("limitations", entry)
+
+    def test_a_readable_empty_pool_list_still_records_the_checks(self):
+        """Zero pools is a measurement. It must not look like the failure above."""
+        entry, _ = self.run_with(pools=[])
+        commands = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", commands)
+        self.assertIn("scaledown-blocked", commands)
+        self.assertNotIn("limitations", entry)
+
+    def test_autopilot_skips_idle_nodepool_and_scaledown_blocked(self):
+        cluster = {**self.CLUSTER, "autopilot": True}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
+        commands = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", commands)
+        self.assertNotIn("scaledown-blocked", commands)
+
+    def test_fleet_facts_carry_pv_handles_and_service_names(self):
+        pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/p/disks/d1"}})
+        svc = obj("Service", "web", ns="default")
+        entry, facts = self.run_with(dump_items=[pv, svc])
+        self.assertIn("d1", facts["pv_handles"])
+        self.assertIn("default/web", facts["service_names"])
+
+
+class AutopilotNotApplicableTest(unittest.TestCase):
+    """The two node-pool checks Autopilot cannot owe, declared by the collector.
+
+    Leaving this to the model cost three false coverage gaps a week: it declared
+    `idle-nodepool` not-applicable and forgot `scaledown-blocked`, and a check
+    that is neither run nor dispositioned reads as one nobody performed.
+    """
+
+    def collect(self, autopilot: bool):
+        cluster = {"name": "ap-1", "project": "acme", "location": "us-central1", "autopilot": autopilot}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
+        return entry
+
+    def test_autopilot_declares_both_node_pool_checks_not_applicable(self):
+        entry = self.collect(autopilot=True)
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"idle-nodepool", "scaledown-blocked"},
+        )
+
+    def test_neither_check_is_also_reported_as_having_run(self):
+        """A check cannot be both dispositioned and performed -- that is the
+        double-count `_limitation_restates_na` exists to catch downstream."""
+        entry = self.collect(autopilot=True)
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", ran)
+        self.assertNotIn("scaledown-blocked", ran)
+
+    def test_every_not_applicable_entry_carries_a_reason(self):
+        for na in self.collect(autopilot=True)["checks_not_applicable"]:
+            self.assertTrue(na.get("reason", "").strip(), na)
+
+    def test_a_standard_cluster_declares_nothing_not_applicable(self):
+        """The disposition is Autopilot's alone. A Standard cluster owes both
+        checks, so declaring them here would hide a real gap."""
+        entry = self.collect(autopilot=False)
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
+
+
+class SoleNodePoolNotApplicableTest(unittest.TestCase):
+    """Autopilot's disposition reached from the other direction.
+
+    §3.7 will not flag a cluster's only node pool, so `check_idle_nodepool`
+    drops out before measuring and `scaledown-blocked` gets no idle pool to
+    read. The collector recorded both commands anyway, so issue #113 published
+    an rc=0 `node-pools list` against `idle-nodepool` for all eleven Standard
+    clusters on the fleet when ten of them have a single pool -- a denominator
+    of one presented to the reader as eleven.
+    """
+
+    CLUSTER = {"name": "sole-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    POOL = {"name": "default-pool", "config": {"machineType": "e2-standard-4"}}
+
+    def collect(self, pools):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(obj("Node", "node-1"))))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(pools))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(
+                    self.CLUSTER, run=run, session=usage_session(), now=NOW
+                )
+        return entry
+
+    def test_a_sole_node_pool_declares_both_checks_not_applicable(self):
+        entry = self.collect([self.POOL])
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"idle-nodepool", "scaledown-blocked"},
+        )
+
+    def test_neither_check_is_also_reported_as_having_run(self):
+        """The double-count that made the gap invisible: a check cannot be both
+        dispositioned and performed."""
+        entry = self.collect([self.POOL])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", ran)
+        self.assertNotIn("scaledown-blocked", ran)
+
+    def test_the_reason_names_the_sole_pool_rather_than_a_failure(self):
+        """A reader has to be able to tell this from the unreadable-pools
+        degradation, which is something they can go and fix."""
+        for na in self.collect([self.POOL])["checks_not_applicable"]:
+            self.assertIn("single node pool", na["reason"])
+        self.assertNotIn("limitations", self.collect([self.POOL]))
+
+    def test_two_pools_still_run_both_checks(self):
+        """The disposition is the sole pool's alone -- a cluster that owes the
+        checks must still be seen to owe them."""
+        entry = self.collect([self.POOL, {**self.POOL, "name": "second-pool"}])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", ran)
+        self.assertIn("scaledown-blocked", ran)
+        self.assertNotIn("checks_not_applicable", entry)
+
+    def test_zero_pools_stays_a_measurement(self):
+        """The boundary this fix must not cross. An empty pool list is a real
+        read over an empty set, so it keeps recording the commands; only
+        *exactly* one pool is the structural exemption."""
+        entry = self.collect([])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", ran)
+        self.assertIn("scaledown-blocked", ran)
+        self.assertNotIn("checks_not_applicable", entry)
+
+
+class FleetConcurrencyTest(unittest.TestCase):
+    def test_clusters_are_collected_in_parallel_up_to_the_pool_size(self):
+        """Per-cluster work runs concurrently, not one cluster after another.
+
+        This used to rendezvous on the injected `sleep` and assert the pool
+        grew to the whole fleet, because each cluster held a ten-minute
+        sampling window and serializing those would have taken hours. Nothing
+        sleeps now, so the pool is back to the stream's usual 8 and the
+        invariant worth holding is the plain one: a fleet larger than the pool
+        still saturates it.
+
+        The gate counts callers inside the Monitoring read and releases them
+        once `max_workers` are in flight at once, so it cannot deadlock on an
+        uneven split of clusters across workers the way a `threading.Barrier`
+        sized to a wave would.
+        """
+        cluster_count, workers = 12, 4
+        clusters_json = json.dumps(
+            [
+                {"name": f"c{i}", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                for i in range(cluster_count)
+            ]
+        )
+        lock, saturated = threading.Lock(), threading.Event()
+        state = {"live": 0, "peak": 0}
+
+        class GatedSession:
+            def get(self, url, params=None, timeout=None):
+                with lock:
+                    state["live"] += 1
+                    state["peak"] = max(state["peak"], state["live"])
+                    if state["live"] >= workers:
+                        saturated.set()
+                saturated.wait(timeout=10)
+                with lock:
+                    state["live"] -= 1
+                is_cpu = "cpu/core_usage_time" in params["filter"]
+                return FakeResponse(200, {"timeSeries": [series_of("d", "p", 1.0 if is_cpu else MIB)]})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=GatedSession(), max_workers=workers, now=NOW)
+
+        self.assertTrue(saturated.is_set(), "never reached the pool size; collection was serialized")
+        self.assertGreaterEqual(state["peak"], workers)
+        self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"c{i}" for i in range(cluster_count)}), cluster_count)
+
+
+class CrashIsolationTest(unittest.TestCase):
+    def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects this collector's
+        stdout into the manifest — so an unmodelled exception on one cluster
+        used to leave a zero-byte file and lose the whole fleet."""
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+                {"name": "boom", "location": "us-central1", "status": "RUNNING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("c1", "boom")}
+        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        self.assertIn("TypeError", boom["error"])
+
+
+class GetTargetProjectsTest(unittest.TestCase):
+    def test_project_override_skips_discovery(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"unexpected discovery call: {argv}")
+
+        self.assertEqual(fw.get_target_projects("acme-only", run=run), ["acme-only"])
+
+    def test_discovers_every_project_with_a_cluster(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nother\nempty\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                return run_of(0, json.dumps([{"name": "c1"}]) if project == "other" else "[]")
+            raise AssertionError(argv)
+
+        self.assertEqual(fw.get_target_projects(None, run=run), ["acme", "other"])
+
+    def test_project_list_failure_falls_back_to_the_base_project(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "permission denied")
+            raise AssertionError(argv)
+
+        self.assertEqual(fw.get_target_projects(None, run=run), ["acme"])
+
+
+class MultiProjectCollectFleetTest(unittest.TestCase):
+    def test_discovers_and_audits_every_project_with_a_cluster(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                name = "c1" if project == "acme" else "c2"
+                cluster = {"name": name, "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+
+        names = {c["name"] for c in manifest["clusters"]}
+        self.assertEqual(names, {"c1", "c2", "project/acme", "project/beta"})
+
+    def test_cross_project_facts_do_not_leak(self):
+        """A PV handle live in project acme's cluster must not suppress a
+        genuinely unattached disk of the same name in project beta -- the
+        cross-cluster fact union is scoped per project, not fleet-wide.
+        Beta gets its own (PV-less) cluster so project discovery includes
+        it at all; a project with zero clusters is out of scope entirely,
+        matching `patch_readiness.py`'s sibling discovery rule."""
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                name = "c1" if project == "acme" else "c2"
+                cluster = {"name": name, "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                kc = str(kwargs.get("env", {}).get("KUBECONFIG", ""))
+                if "_acme_" in kc:
+                    pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/acme/disks/shared-disk-id"}})
+                    return run_of(0, json.dumps(dump_of(pv)))
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                project = argv[argv.index("--project") + 1]
+                if project == "beta":
+                    disk = {"name": "shared-disk-id", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "z"}
+                    return run_of(0, json.dumps([disk]))
+                return run_of(0, "[]")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+
+        beta_entry = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
+        self.assertIn("unattached-disk", {c["check"] for c in beta_entry["candidates"]})
+
+    def test_a_project_whose_clusters_cannot_be_listed_is_recorded_not_skipped(self):
+        # `project/beta`'s compute entry still arrives as `collected`, so
+        # without a second entry for the enumeration itself the document sees a
+        # project with two of three checks and no clusters -- exactly what a
+        # genuinely cluster-free project looks like.
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                if project == "beta":
+                    return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+                cluster = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("project/beta/clusters", by_name)
+        self.assertEqual(by_name["project/beta/clusters"]["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", by_name["project/beta/clusters"]["error"])
+
+    def test_a_cluster_that_is_not_running_is_recorded_as_an_unreachable_target(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(
+                    0,
+                    json.dumps(
+                        [
+                            {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}},
+                            {"name": "sick", "location": "us-east4", "status": "DEGRADED"},
+                        ]
+                    ),
+                )
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["sick"]["outcome"], "unreachable")
+        self.assertIn("DEGRADED", by_name["sick"]["error"])
+        self.assertEqual(by_name["c1"]["outcome"], "collected")
+
+    def test_a_reconciling_cluster_is_audited_rather_than_skipped(self):
+        """GKE sets RECONCILING while work proceeds on a cluster whose API
+        server is up, and any config change puts one there for minutes. Skipped
+        as unreachable, a routine edit dropped the cluster from the whole audit
+        -- which on this fleet meant losing the only cluster with more than one
+        node pool, the only place `idle-nodepool` can run."""
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(
+                    0,
+                    json.dumps(
+                        [
+                            {"name": "busy", "location": "us-east4", "status": "RECONCILING", "autopilot": {"enabled": False}},
+                            {"name": "gone", "location": "us-west1", "status": "PROVISIONING"},
+                        ]
+                    ),
+                )
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["busy"]["outcome"], "collected")
+        self.assertEqual(by_name["gone"]["outcome"], "unreachable")
+        self.assertIn("PROVISIONING", by_name["gone"]["error"])
+
+    def fleet_with(self, clusters, orphan_rule=True):
+        rule = {
+            "name": "fr1",
+            "description": '{"kubernetes.io/service-name":"gone/svc"}',
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        }
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps(clusters))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
+                return run_of(0, json.dumps([rule] if orphan_rule else []))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        return {c["name"]: c for c in manifest["clusters"]}
+
+    RUNNING = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+    DEGRADED = {"name": "sick", "location": "us-east4", "status": "DEGRADED"}
+
+    def test_a_readable_fleet_evaluates_orphan_lb(self):
+        by_name = self.fleet_with([self.RUNNING])
+        project = by_name["project/acme"]
+        self.assertIn("orphan-lb", {c["check"] for c in project["commands"]})
+        self.assertIn("orphan-lb", {c["check"] for c in project["candidates"]})
+        self.assertNotIn("limitations", project)
+
+    def test_a_degraded_cluster_closes_the_orphan_lb_gate_for_its_project(self):
+        """§3.6 runs only if *every* cluster in the project was enumerated, and
+        a DEGRADED cluster goes straight into `scope.skipped` per §2. The gate
+        was read off the RUNNING clusters alone, so a project with a cluster in
+        `scope.skipped` still published `orphan-lb` findings against a Service
+        list it had not finished collecting -- the false positive §3.6 calls the
+        highest-risk cross-check in the audit."""
+        by_name = self.fleet_with([self.RUNNING, self.DEGRADED])
+        project = by_name["project/acme"]
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["candidates"]})
+        self.assertIn("orphan-lb was not evaluated", project["limitations"])
+        # The other project checks still run: only 3.6 needs the union.
+        self.assertEqual(
+            {c["check"] for c in project["commands"]},
+            {"unattached-disk", "idle-address", "registry-no-cleanup"},
+        )
+
+    def test_an_unlistable_project_also_closes_the_gate(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(1, "", "PERMISSION_DENIED")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
+
+
+class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
+    """The hoist: rules read once per project, before the worker pool.
+
+    §3.13 has to turn a Service's external address into a forwarding-rule name
+    before any cluster is collected, and only `gcloud compute forwarding-rules
+    list` holds both halves of that join. So the read moved out of
+    `collect_project_compute`, which runs after the pool, and the answer is
+    handed down to both consumers. The two things that can go wrong are
+    invisible in a report: reading it twice, or reading it in the right place
+    and never passing it to the check.
+    """
+
+    IP = "34.186.100.26"
+    RULE = {"name": "rule-a", "IPAddress": IP, "loadBalancingScheme": "EXTERNAL"}
+
+    class Session:
+        """`usage_session`'s answers plus the three load-balancer counters."""
+
+        def __init__(self, inner, ingress, egress_packets, egress_bytes):
+            self.inner = inner
+            self.lb = {
+                fw.LB_INGRESS_PACKETS_METRIC: ingress,
+                fw.LB_EGRESS_PACKETS_METRIC: egress_packets,
+                fw.LB_EGRESS_BYTES_METRIC: egress_bytes,
+            }
+            self.lb_calls = 0
+
+        def get(self, url, params=None, timeout=None):
+            metric = params["filter"].split('"')[1]
+            if metric not in self.lb:
+                return self.inner.get(url, params=params, timeout=timeout)
+            self.lb_calls += 1
+            return FakeResponse(200, {"timeSeries": [lb_series("rule-a", self.lb[metric])]})
+
+    def collect(self, *, ingress=500000, egress_packets=400000, egress_bytes=24000000, projects=("acme",)):
+        idle = IdleWorkloadTest()
+        items = [
+            idle.pod(),
+            obj("Deployment", "hello-world", ns=idle.NS, **{"spec.replicas": 1}),
+            obj(
+                "Service",
+                "hello-world",
+                ns=idle.NS,
+                **{
+                    "spec.type": "LoadBalancer",
+                    "spec.selector": {"app": "hello-world"},
+                    "status.loadBalancer.ingress": [{"ip": self.IP}],
+                },
+            ),
+        ]
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "".join(f"{p}\n" for p in projects))
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                cluster = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*items)))
+            if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
+                return run_of(0, json.dumps([self.RULE]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        session = self.Session(
+            usage_session((IdleWorkloadTest.NS, IdleWorkloadTest.POD, 0.0021, 6.0)),
+            ingress,
+            egress_packets,
+            egress_bytes,
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(
+                    None if len(projects) > 1 else projects[0], run=run, session=session, now=NOW
+                )
+        return manifest, seen, session
+
+    def cluster(self, manifest):
+        return next(c for c in manifest["clusters"] if c["name"] == "c1")
+
+    def idle_finding(self, manifest):
+        return next(c for c in self.cluster(manifest)["candidates"] if c["check"] == "idle-workload")
+
+    def test_the_rule_list_is_read_once_per_project(self):
+        _, seen, _ = self.collect()
+        self.assertEqual(len([a for a in seen if a[:4] == ["gcloud", "compute", "forwarding-rules", "list"]]), 1)
+
+    def test_each_project_gets_its_own_read_and_its_own_traffic(self):
+        _, seen, session = self.collect(projects=("acme", "beta"))
+        reads = [a for a in seen if a[:4] == ["gcloud", "compute", "forwarding-rules", "list"]]
+        self.assertEqual(sorted(a[a.index("--project") + 1] for a in reads), ["acme", "beta"])
+        # Three metrics per project, and no fourth read for the second
+        # consumer: §3.6 reuses the same list rather than re-querying.
+        self.assertEqual(session.lb_calls, 6)
+
+    def test_the_traffic_read_is_recorded_under_its_own_slug(self):
+        """Not under `idle-workload`. That key holds the usage read, and
+        `adopt_collector_evidence` publishes it as the command behind every
+        finding on the check -- overwriting it would leave each sizing claim
+        citing a load-balancer query."""
+        manifest, _, _ = self.collect()
+        commands = {c["check"]: c["command"] for c in self.cluster(manifest)["commands"]}
+        self.assertIn("cpu/core_usage_time", commands["idle-workload"])
+        self.assertIn("timeSeries", commands["idle-workload-traffic"])
+        self.assertIn(fw.LB_RULE_LABEL, commands["idle-workload-traffic"])
+
+    def test_the_traffic_slug_is_the_only_command_outside_the_sop_roster(self):
+        """It is a read, not a check, and the distinction has teeth.
+
+        `commands` is a lookup keyed by slug, so an extra entry costs nothing.
+        The document's `checks_run` is validated against §3's roster and would
+        reject the whole run for a slug that is not in it. Every other command
+        this collector records is a roster check; this one is deliberately not,
+        and the SOP tells the model so.
+        """
+        import audit_report
+
+        manifest, _, _ = self.collect()
+        roster = set(audit_report.audit_checks("fleet-wide-cost-analysis"))
+        self.assertTrue(roster)
+        slugs = {c["check"] for c in self.cluster(manifest)["commands"]}
+        self.assertIn("idle-workload-traffic", slugs)
+        self.assertEqual(slugs - roster, {"idle-workload-traffic"})
+
+    def test_the_measured_traffic_reaches_the_published_excerpt(self):
+        """End to end: rules read before the pool, joined to the Service's
+        assigned address, and the answer written into the evidence the ledger
+        carries. 24,000,000 bytes over 400,000 packets is 60 each -- headers
+        with no payload, the shape of the two rules whose findings merged a
+        stand-down on 2026-09-07."""
+        manifest, _, _ = self.collect()
+        excerpt = self.idle_finding(manifest)["excerpt"]
+        self.assertIn("metered 500,000 inbound packets", excerpt)
+        self.assertIn("60 bytes each", excerpt)
+        self.assertIn("without ever sending a payload", excerpt)
+
+    def test_a_rule_serving_payload_warns_in_the_published_excerpt(self):
+        manifest, _, _ = self.collect(egress_bytes=400000 * 1500)
+        self.assertIn("something is being served", self.idle_finding(manifest)["excerpt"])
+
+    def test_the_finding_is_still_gated_for_triage_whatever_the_traffic_said(self):
+        """Traffic informs the reader; it does not release the sweep. A rule
+        under the noise floor is not evidence nothing needs the workload, and
+        that population is exactly what merged PRs 184-186."""
+        manifest, _, _ = self.collect(ingress=10, egress_packets=0, egress_bytes=0)
+        finding = self.idle_finding(manifest)
+        self.assertIn("nothing measurable reached it", finding["excerpt"])
+        self.assertEqual(finding["needs_triage"], "service-fronted")
+
+
+class MonitoringReadsGoThroughTheRelayTest(unittest.TestCase):
+    """In the shell sandbox the only path to Monitoring is the broker's relay.
+
+    The pod holds no Google identity, so a read the relay's table does not
+    admit comes back 403 and the three usage checks go quiet fleet-wide with a
+    limitation that reads like a Monitoring outage. Both halves are checked
+    here: the session is the relay's when the broker is configured, and every
+    URL a collection actually requests is one `api_policy` admits.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for directory in fw.SHARED_SCRIPT_DIRS:
+            if directory not in sys.path:
+                sys.path.append(directory)
+
+    def test_the_broker_endpoint_selects_the_relay_session(self):
+        import credential_proxy_client
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker:8765"}):
+            session = fw.default_monitoring_session()
+        self.assertIsInstance(session, credential_proxy_client.ApiSession)
+        self.assertEqual(
+            session.relay_url("https://monitoring.googleapis.com/v3/projects/acme/timeSeries"),
+            "http://broker:8765/v1/gcp/monitoring.googleapis.com/v3/projects/acme/timeSeries",
+        )
+
+    def test_every_read_a_collection_makes_is_one_the_relay_admits(self):
+        import api_policy
+        from urllib.parse import urlsplit
+
+        requested = []
+        case = LbTrafficReachesTheIdleCheckTest()
+        base = case.Session
+
+        class Recording(base):
+            def get(self, url, params=None, timeout=None):
+                requested.append(url)
+                return super().get(url, params=params, timeout=timeout)
+
+        case.Session = Recording
+        # A real-shaped id: the relay holds the project segment to Google's
+        # grammar, which the four-letter fixture name elsewhere does not meet.
+        case.collect(projects=("acme-prod",))
+        self.assertTrue(requested)
+        for url in sorted(set(requested)):
+            parts = urlsplit(url)
+            with self.subTest(url=url):
+                decision = api_policy.evaluate("GET", parts.netloc, parts.path.lstrip("/"), parts.query)
+                self.assertTrue(decision.allowed, decision.message)
+
+
+class ManifestComposesWithAuditReportTest(unittest.TestCase):
+    def test_checks_run_copied_from_a_collected_cluster_survives_cross_check(self):
+        import audit_report
+
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "c1")
+        project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        data = {
+            "audit": "fleet-wide-cost-analysis",
+            "scope": {
+                "clusters": [
+                    {"name": "c1", "checks_run": [{"check": c["check"], "command": c["command"]} for c in cluster_entry["commands"]]},
+                    {"name": "project/acme", "checks_run": [{"check": c["check"], "command": c["command"]} for c in project_entry["commands"]]},
+                ],
+                "skipped": [],
+            },
+        }
+        audit_report.cross_check_manifest(data, manifest)  # must not raise
+
+    def test_a_check_absent_from_the_manifest_is_rejected(self):
+        import audit_report
+
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        data = {
+            "audit": "fleet-wide-cost-analysis",
+            "scope": {"clusters": [{"name": "c1", "checks_run": [{"check": "overrequest", "command": "x"}]}]},
+        }
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(data, manifest)
+
+
+class DeclarationIndexIsACopyTest(unittest.TestCase):
+    """`workload_declarations` and `declaration_for` are duplicated from
+    `collect.py`, because every collector here runs standalone under
+    `python3 <file>` and none imports a sibling.
+
+    Duplication is the convention, and drift is what it costs: two collectors
+    resolving the same object to different files, or one of them keeping a bug
+    the other fixed, with nothing failing to say so. These tests are the guard
+    the convention does not otherwise have -- they compare the executable code
+    and ignore the docstrings, which differ on purpose because each copy argues
+    from the findings its own stream published.
+    """
+
+    def bodies(self, name):
+        """Both copies of one function, as ASTs with the docstring dropped."""
+        import ast
+        import importlib
+        import inspect
+        import textwrap
+
+        out = []
+        for module in (fw, importlib.import_module("collect")):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(module, name))))
+            fn = tree.body[0]
+            if (
+                fn.body
+                and isinstance(fn.body[0], ast.Expr)
+                and isinstance(fn.body[0].value, ast.Constant)
+                and isinstance(fn.body[0].value.value, str)
+            ):
+                fn.body = fn.body[1:]
+            out.append(ast.dump(fn))
+        return out
+
+    def test_workload_declarations_matches_collect_py(self):
+        mine, theirs = self.bodies("workload_declarations")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_declaration_for_matches_collect_py(self):
+        mine, theirs = self.bodies("declaration_for")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_reconciler_of_matches_collect_py(self):
+        # Under the same convention and with the same cost of drift: the phrase
+        # this returns is published verbatim in a remediation note, so two
+        # collectors naming the same Helm release differently is visible to a
+        # reader and explicable to nobody.
+        mine, theirs = self.bodies("reconciler_of")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_the_release_resolver_matches_collect_py(self):
+        # Every half of the branch that resolves a rendered workload, under the
+        # same convention. Drift here is worse than in the pair above, because
+        # what these resolve to is a file a pull request rewrites: two
+        # collectors disagreeing about which Application declares a release
+        # means one of them opens a PR against the wrong chart.
+        for name in ("release_of", "_argocd_chart_source", "_argocd_kustomize_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
+            with self.subTest(function=name):
+                mine, theirs = self.bodies(name)
+                self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_the_constants_it_reads_match_too(self):
+        """An identical function over a different constant is a different
+        function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
+        are indexed at all, so a copy that drifted here would index the whole
+        repository or none of it and still pass the two tests above.
+        """
+        import importlib
+
+        collect = importlib.import_module("collect")
+        for const in (
+            "GITOPS_CLUSTER_TREE_ROOT",
+            "GITOPS_CLUSTER_TREE_DEPTH",
+            "GIT_DIR_NAME",
+            "KCC_API_GROUP_SUFFIX",
+            "_HELM_RELEASE_ANNOTATION",
+            "_HELM_NAMESPACE_ANNOTATION",
+            "_ARGOCD_TRACKING_ANNOTATION",
+            "_MANAGED_BY_LABEL",
+            "_HELM_MANAGED_BY",
+            "ARGOCD_APPLICATION_KIND",
+            "ARGOCD_CLUSTER_SECRET_LABEL",
+            "ARGOCD_CLUSTER_SECRET_VALUE",
+            "ARGOCD_IN_CLUSTER_SERVER",
+            "FLUX_HELM_RELEASE_KIND",
+            "FLUX_HELM_REPOSITORY_KIND",
+            "RELEASE_KEY_APPLICATION",
+            "RELEASE_KEY_RELEASE",
+            "ARGOCD_VALUES_OBJECT_FIELD",
+            "ARGOCD_VALUES_STRING_FIELD",
+            "FLUX_VALUES_FIELD",
+            "ARGOCD_KUSTOMIZE_PATCHES_FIELD",
+            "RENDERER_HELM",
+            "RENDERER_KUSTOMIZE",
+            "KUSTOMIZATION_FILE_NAMES",
+        ):
+            with self.subTest(const=const):
+                self.assertEqual(getattr(fw, const), getattr(collect, const))
+
+
+class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
+    """The annotation has to reach the candidate, or the model never sees it.
+
+    The index itself is `collect.py`'s, and tested there. What is new here is
+    the trip to a *cost* candidate: the index is built in `collect_fleet`,
+    handed across a thread pool to `collect_cluster`, and attached in the
+    `emit` closure. A break at any of those three joints leaves the index
+    correct and every candidate unannotated -- indistinguishable, from the
+    model's side, from a fleet whose objects are genuinely undeclared, and the
+    answer that sends a shrinkable request to `kind: manual`.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    DECLARED = "clusters/prod-usc1/workloads/data.yaml"
+
+    def clone(self, tmp):
+        """A GitOps tree declaring PersistentVolumeClaim/data, and nothing else.
+
+        `scratch` is deliberately absent, so one run covers both arms: a change
+        that annotates unconditionally fails here rather than passing a test
+        that only ever looks at declared objects.
+        """
+        path = Path(tmp) / "infra"
+        (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+        (path / self.DECLARED).write_text(
+            "apiVersion: v1\n"
+            "kind: PersistentVolumeClaim\n"
+            "metadata:\n"
+            "  name: data\n"
+            "  namespace: default\n"
+        )
+        return path
+
+    def pvc(self, name):
+        """Bound, unreferenced, 212 days old — one `unconsumed-pvc` candidate."""
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}},
+        )
+
+    def fleet(self, tmp, *, workspace):
+        """`collect_fleet` over one cluster holding two unconsumed PVCs."""
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(self.pvc("data"), self.pvc("scratch"))))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=workspace)
+
+    def candidates(self, manifest):
+        return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
+
+    def by_object(self, manifest, name):
+        return [c for c in self.candidates(manifest) if c["object"] == f"PersistentVolumeClaim/{name}"]
+
+    def test_a_declared_object_carries_its_path_and_directory(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=self.clone(tmp))
+
+        declared = self.by_object(manifest, "data")
+        undeclared = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(declared, "no candidate for the declared object")
+        self.assertTrue(undeclared, "no candidate for the undeclared object")
+
+        for candidate in declared:
+            self.assertEqual(
+                candidate["declaration"],
+                {"path": self.DECLARED, "directory": "clusters/prod-usc1/workloads"},
+                candidate["check"],
+            )
+        # `scratch` is in the same dump, same cluster, same namespace, and
+        # differs only in being absent from the clone.
+        for candidate in undeclared:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_the_path_is_relative_to_the_clone_not_the_filesystem(self):
+        """What ships is what a PR branch has to check out. An absolute path
+        leaks the agent's scratch directory into the ledger and names a file
+        the GitOps repository does not contain."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=self.clone(tmp))
+            path = self.by_object(manifest, "data")[0]["declaration"]["path"]
+            self.assertNotIn(tmp, path)
+        self.assertFalse(Path(path).is_absolute())
+
+    def test_without_a_workspace_nothing_is_annotated(self):
+        """Omitting `--workspace` has to stay the no-op it was before this flag
+        existed, on a run that actually produces candidates."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=None)
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_a_workspace_that_declares_nothing_annotates_nothing(self):
+        """An empty clone is not an error and must not be a wrong answer: an
+        absent annotation is not a claim that no declaration exists, so the
+        SOP's grep fallback still holds."""
+        with TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            manifest = self.fleet(tmp, workspace=empty)
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        """A disk, a reserved address and a forwarding rule are GCP resources
+        with no cluster tree and no namespace, so there is nothing for this
+        index to key on -- those three checks call `_emit` directly, and this
+        pins that they keep doing so. Annotating one would name a Kubernetes
+        manifest as the place to delete a persistent disk.
+        """
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("declaration", fw._emit("unattached-disk", hit))
+        # Even handed an index that resolves it, the call signature cannot.
+        index = {("prod-usc1", "Disk", "default", "orphaned-pd"): {"clusters/prod-usc1/x.yaml"}}
+        self.assertNotIn("declaration", fw._emit("unattached-disk", hit, declarations=index))
+
+
+class CandidatesCarryTheirReconcilerTest(unittest.TestCase):
+    """The other annotation `_emit` attaches, over the same three joints.
+
+    `reconciler_of` is tested in `test_collect.py`; what is new here is that a
+    cost candidate carries what it returns. Without it a `manual` remediation on
+    a reconciled object reads as a fix a human can just apply, and the next sync
+    puts it back -- so a break here is invisible in exactly the way the
+    declaration one is.
+    """
+
+    def pvc(self, name, **meta):
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}, **meta},
+        )
+
+    def fleet(self, tmp, *objects):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*objects)))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=None)
+
+    def by_object(self, manifest, name):
+        return [
+            c
+            for cluster in manifest["clusters"]
+            for c in cluster.get("candidates") or []
+            if c["object"] == f"PersistentVolumeClaim/{name}"
+        ]
+
+    def test_a_reconciled_object_carries_the_phrase(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(
+                tmp,
+                self.pvc("data", **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": "apps:/PersistentVolumeClaim:default/data"}}),
+                self.pvc("scratch"),
+            )
+        reconciled = self.by_object(manifest, "data")
+        plain = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(reconciled, "no candidate for the reconciled object")
+        self.assertTrue(plain, "no candidate for the unreconciled object")
+        for candidate in reconciled:
+            self.assertEqual(
+                candidate["reconciler"], "the Argo CD Application `apps`", candidate["check"]
+            )
+        for candidate in plain:
+            self.assertNotIn("reconciler", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        # Same argument as the declaration index: a persistent disk has no
+        # Kubernetes controller holding its spec, and those checks call `_emit`
+        # directly. Handed an index that would resolve it, the signature cannot.
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("reconciler", fw._emit("unattached-disk", hit))
+        index = {("", "Disk/orphaned-pd"): "the Helm release `x`"}
+        self.assertNotIn("reconciler", fw._emit("unattached-disk", hit, reconcilers=index))
+
+
+class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
+    """The third annotation, over the same three joints, on the arm that
+    matters most to this stream.
+
+    A right-size is the fix a pull request carries best, and `resources` is the
+    key nearly every chart publishes -- so a chart-rendered workload resolving
+    to the file declaring its release is the difference between a diff and a
+    paragraph. `release_declarations` itself is `collect.py`'s and tested
+    there; what is new here is the trip from `collect_fleet` through the thread
+    pool, into the per-cluster index `_releases_by_object` builds off the dump,
+    and out through the `emit` closure.
+    """
+
+    APPLICATION = "argocd/apps/data.yaml"
+    DECLARED = "clusters/prod-usc1/workloads/data.yaml"
+    ENTRY = {
+        "path": APPLICATION,
+        "kind": "Application",
+        "renderer": "helm",
+        "chart": "data-chart",
+        "repo": "https://charts.example.com",
+        "version": "1.2.3",
+        "values_field": "spec.source.helm.valuesObject",
+    }
+
+    def clone(self, tmp, *, declare_object=False):
+        """A GitOps tree declaring the chart release, and optionally the
+        object itself, so one fixture covers the precedence rule."""
+        path = Path(tmp) / "infra"
+        (path / "argocd/apps").mkdir(parents=True)
+        (path / self.APPLICATION).write_text(
+            "apiVersion: argoproj.io/v1alpha1\n"
+            "kind: Application\n"
+            "metadata:\n"
+            "  name: data-app\n"
+            "spec:\n"
+            "  source:\n"
+            "    repoURL: https://charts.example.com\n"
+            "    chart: data-chart\n"
+            "    targetRevision: 1.2.3\n"
+            "    helm:\n"
+            "      releaseName: data\n"
+            "  destination:\n"
+            "    name: prod-usc1\n"
+            "    namespace: default\n"
+        )
+        if declare_object:
+            (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+            (path / self.DECLARED).write_text(
+                "apiVersion: v1\n"
+                "kind: PersistentVolumeClaim\n"
+                "metadata:\n"
+                "  name: data\n"
+                "  namespace: default\n"
+            )
+        return path
+
+    def pvc(self, name, **meta):
+        """Bound, unreferenced — one `unconsumed-pvc` candidate."""
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}, **meta},
+        )
+
+    def tracked(self, name):
+        """The marker Argo CD leaves: it renders with `helm template`, so there
+        is no `meta.helm.sh` pair to read."""
+        return self.pvc(
+            name,
+            **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": f"data-app:/PersistentVolumeClaim:default/{name}"}},
+        )
+
+    def released(self, name):
+        """The marker `helm install` leaves, which Flux also produces."""
+        return self.pvc(
+            name,
+            **{"metadata.annotations": {"meta.helm.sh/release-name": "data", "meta.helm.sh/release-namespace": "default"}},
+        )
+
+    def fleet(self, tmp, *objects, workspace):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*objects)))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=workspace)
+
+    def by_object(self, manifest, name):
+        return [
+            c
+            for cluster in manifest["clusters"]
+            for c in cluster.get("candidates") or []
+            if c["object"] == f"PersistentVolumeClaim/{name}"
+        ]
+
+    def test_a_chart_rendered_object_carries_the_release_it_came_from(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), self.pvc("scratch"), workspace=self.clone(tmp))
+        rendered = self.by_object(manifest, "data")
+        plain = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(rendered, "no candidate for the chart-rendered object")
+        self.assertTrue(plain, "no candidate for the unrendered object")
+        for candidate in rendered:
+            self.assertEqual(candidate["release_declaration"], self.ENTRY, candidate["check"])
+        for candidate in plain:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_the_helm_annotation_pair_resolves_to_the_same_file(self):
+        """One Application is indexed under both key shapes, so a fleet where
+        Argo drives Helm through a plugin -- or where Flux installed the same
+        release -- resolves through the release coordinates too."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.released("data"), workspace=self.clone(tmp))
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the chart-rendered object")
+        for candidate in rendered:
+            self.assertEqual(candidate["release_declaration"], self.ENTRY, candidate["check"])
+
+    def test_an_object_the_repo_declares_outright_is_not_given_a_values_override(self):
+        """Precedence, and the reason for it: a workload with its own manifest
+        is edited there. Offering a values override beside it would give one
+        fix two files, and the values one would not even be applied on a
+        cluster where the object is not actually chart-rendered."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), workspace=self.clone(tmp, declare_object=True))
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the declared object")
+        for candidate in rendered:
+            self.assertEqual(candidate["declaration"]["path"], self.DECLARED, candidate["check"])
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_a_release_the_clone_does_not_declare_is_not_annotated(self):
+        """`helm install` run by hand, or an ApplicationSet this deliberately
+        does not index. Absent is the `manual` verdict that shipped before."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(
+                tmp,
+                self.pvc("data", **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": "other-app:/PersistentVolumeClaim:default/data"}}),
+                workspace=self.clone(tmp),
+            )
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the object")
+        for candidate in rendered:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_without_a_workspace_nothing_is_annotated(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), workspace=None)
+        candidates = self.by_object(manifest, "data")
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        # Same argument as the other two indexes: a persistent disk is not
+        # rendered by a chart, and those checks call `_emit` directly.
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit))
+        index = {("", "Disk/orphaned-pd"): dict(self.ENTRY)}
+        self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit, releases=index))
+
+
+if __name__ == "__main__":
+    unittest.main()

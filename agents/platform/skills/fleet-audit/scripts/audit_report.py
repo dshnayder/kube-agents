@@ -236,6 +236,48 @@ AUDITS: dict[str, AuditSpec] = {
             "scaledown-blocked",
             "terminal-pods",
             "idle-namespace",
+            # Reads as the odd one out, and is: `underrequest` is §3.1's other
+            # half and belongs beside it. It sits last because this tuple is
+            # the SOP's heading order, and inserting a §3.2 would renumber
+            # eight sections that fifteen lines of that SOP's prose refer to by
+            # number — churn no check can verify afterwards. §3.1 and §3.11
+            # cross-reference each other instead.
+            "underrequest",
+            "unsized-workload",
+            "idle-workload",
+            "registry-no-cleanup",
+        ),
+        # §3.4–3.6 and §3.14 read GCP objects that belong to a project, not to
+        # a cluster; the SOP's §3 project-scoped rule puts them on their own
+        # `project/<id>` entry.
+        scopes=(
+            (
+                "cluster",
+                # A membership test for which scope a slug belongs to, so
+                # `underrequest` sits next to its pair here rather than last
+                # the way the roster above has to order it.
+                (
+                    "overrequest",
+                    "underrequest",
+                    "unsized-workload",
+                    "orphan-pv",
+                    "unconsumed-pvc",
+                    "idle-nodepool",
+                    "scaledown-blocked",
+                    "terminal-pods",
+                    "idle-namespace",
+                    "idle-workload",
+                ),
+            ),
+            (
+                "project",
+                (
+                    "unattached-disk",
+                    "idle-address",
+                    "orphan-lb",
+                    "registry-no-cleanup",
+                ),
+            ),
         ),
     ),
     "fleet-consistency-drift": AuditSpec(
@@ -299,6 +341,29 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+        ),
+        # §4's manifest note: the `project/<id>` entry carries the two
+        # project-scoped checks. `reservation-mismatch-risk` sits under both
+        # kinds because the SOP gives it a cluster form and a project
+        # idle-capacity form.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "ccc-missing-fallbacks",
+                    "ccc-no-ondemand-floor",
+                    "ccc-large-vm-scarcity",
+                    "ccc-priority-starvation",
+                    "ccc-mixed-disk-generations",
+                    "ccc-hyperdisk-incompatible",
+                    "spot-scarcity-risk",
+                    "single-zone-nodepool",
+                    "reservation-mismatch-risk",
+                    "autoscaler-out-of-resources",
+                    "dangling-compute-class",
+                ),
+            ),
+            ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
         ),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
