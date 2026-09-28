@@ -949,3 +949,103 @@ func TestEveryUserAuthoredMountSurfaceIsReserved(t *testing.T) {
 		}
 	}
 }
+
+// TestGitIntegrationAdmission covers the declarative surface added in
+// docs/designs/version-control-support.md §6: `spec.integration.git`, the deprecated
+// `spec.integration.github` alias, and validation dispatched to the declared
+// provider rather than GitHub's rules applied to every host.
+func TestGitIntegrationAdmission(t *testing.T) {
+	ctx := context.Background()
+	val := &PlatformAgentCustomValidator{}
+
+	agentWith := func(integration agentv1alpha1.IntegrationSpec) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: integration},
+			},
+		}
+	}
+
+	cases := []struct {
+		name string
+		spec agentv1alpha1.IntegrationSpec
+		// path is the field the error must be reported against; empty means the
+		// declaration must be admitted.
+		path string
+	}{
+		{
+			name: "git spec with a repository is admitted",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: "https://github.com/gke-labs/kube-agents.git"}},
+		},
+		{
+			name: "git spec naming its provider and host explicitly is admitted",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Provider: "github", Host: "github.com", Namespace: "gke-labs", Repository: "kube-agents"}},
+		},
+		{
+			// The single-slash residue of #1085, at the layer that should have
+			// caught it: admission used to accept this as owner `gitlab.com`, and
+			// the operator then seeded https://github.com/gitlab.com/project.
+			name: "another forge's host in a single-slash shorthand is refused",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: "gitlab.com/project"}},
+			path: "spec.integration.github.gitRepo",
+		},
+		{
+			name: "a GitLab remote is refused rather than rewritten",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: "git@gitlab.com:group/project.git"}},
+			path: "spec.integration.git.repository",
+		},
+		{
+			name: "the same refusal through the deprecated alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: "git@gitlab.com:group/project.git"}},
+			path: "spec.integration.github.gitRepo",
+		},
+		{
+			name: "a host the declared provider does not serve",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Host: "gitlab.com", Repository: "group/project"}},
+			path: "spec.integration.git.host",
+		},
+		{
+			// The CRD enum blocks this at the API server, but the operator's own
+			// check has to hold too: a CR applied before the enum narrowed, or one
+			// reaching the webhook by another path, must not reconcile.
+			name: "a provider with no registered rules",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Provider: "gitlab", Repository: "group/project"}},
+			path: "spec.integration.git.provider",
+		},
+		{
+			name: "a namespace outside GitHub's grammar",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Namespace: "group.with_dots", Repository: "project"}},
+			path: "spec.integration.git.namespace",
+		},
+		{
+			name: "both spellings at once",
+			spec: agentv1alpha1.IntegrationSpec{
+				Git:    &agentv1alpha1.GitSpec{Repository: "gke-labs/kube-agents"},
+				GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+			path: "spec.integration",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := val.ValidateCreate(ctx, agentWith(tc.spec))
+			if tc.path == "" {
+				if err != nil {
+					t.Errorf("expected the declaration to be admitted, got: %v", err)
+				}
+				return
+			}
+			assertFieldError(t, err, tc.path)
+		})
+	}
+}
