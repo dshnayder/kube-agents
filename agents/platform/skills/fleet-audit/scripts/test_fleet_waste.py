@@ -4076,6 +4076,20 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(entry["outcome"], "unreachable")
         self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
 
+    def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps({"kind": "Status"}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, facts = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("items", entry["error"])
+
     def test_object_dump_failure_is_gate_failed(self):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -4540,6 +4554,20 @@ class GetTargetProjectsTest(unittest.TestCase):
 
         manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
         self.assertEqual(manifest["error"], fw.NO_PROJECT_IN_SCOPE_ERROR)
+        self.assertEqual(manifest["clusters"], [])
+
+    def test_listed_projects_that_hold_no_cluster_are_an_empty_fleet_not_an_error(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "proj-a\nproj-b\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        self.assertNotIn("error", manifest)
         self.assertEqual(manifest["clusters"], [])
 
     def test_project_list_failure_falls_back_to_the_base_project(self):

@@ -1539,6 +1539,13 @@ class CollectClusterTest(unittest.TestCase):
                 slugs = {c["check"] for c in entry["candidates"]}
                 self.assertEqual("ccc-mixed-disk-generations" in slugs, flagged)
 
+    def test_mixed_disk_generation_excerpt_names_the_control_plane_version(self):
+        cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="standard-rwo")
+        entry = self.run_with(dump_items=[cc, sts], cluster={**self.CLUSTER, "version": "1.35.2-gke.900"})
+        (hit,) = [c for c in entry["candidates"] if c["check"] == "ccc-mixed-disk-generations"]
+        self.assertIn("control plane 1.35.2-gke.900", hit["excerpt"])
+
     def test_mixed_disk_generation_not_flagged_without_persistent_volumes(self):
         cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
         sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"})  # no volumeClaimTemplates

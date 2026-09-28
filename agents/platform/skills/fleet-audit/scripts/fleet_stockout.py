@@ -1347,17 +1347,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         if (sts["metadata"].get("namespace", ""), sts["metadata"]["name"]) in stateful_names_using_hyperdisk:
             cc_referenced_by_hyperdisk.add(cc_ref)
 
-    # ai-security-audit's own inference discriminators, per §3.2: a serving
-    # image or an accelerator request. Not `_is_ai_workload` whole -- it also
-    # counts an AI-provider credential, which marks an app that *calls* a model,
-    # and a web app calling one is not a Spot-preemption SLA breach.
-    from collect import AI_ACCELERATOR_KEY_RE, AI_MODEL_IMAGE_RE
-
-    def _is_inference(template_spec: dict) -> bool:
-        containers = template_spec.get("containers") or []
-        return any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers) or any(
-            AI_ACCELERATOR_KEY_RE.search(key) for c in containers for key in ((c.get("resources") or {}).get("limits") or {})
-        )
+    # ai-security-audit's inference discriminators, per §3.2: a serving image
+    # or an accelerator request. Not `_is_ai_workload` whole -- it also counts
+    # an AI-provider credential, which marks an app that *calls* a model, and a
+    # web app calling one is not a Spot-preemption SLA breach.
+    from collect import _is_inference_workload as _is_inference
 
     cc_referenced_by_inference = set()
     for workload in workloads:
@@ -1395,6 +1389,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 candidates.append(_emit("ccc-priority-starvation", hit))
         for hit in [check_ccc_mixed_disk_generations(cc, cc_meta["name"] in cc_referenced_by_stateful)]:
             if hit:
+                if cluster.get("version"):
+                    # §3.5's fix differs on either side of 1.35.3.
+                    hit = {**hit, "excerpt": f"{hit['excerpt']} (control plane {cluster['version']})"}
                 candidates.append(_emit("ccc-mixed-disk-generations", hit))
         for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
             if hit:

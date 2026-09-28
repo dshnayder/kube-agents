@@ -5125,7 +5125,10 @@ AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
 )
 
 
-def _is_ai_workload(spec: dict) -> bool:
+def _is_inference_workload(spec: dict) -> bool:
+    """The serving half of `_is_ai_workload`: a serving image or an
+    accelerator request. `fleet_stockout.py` §3.2 reads this half alone,
+    because a provider credential marks a workload that calls a model."""
     containers = spec.get("containers") or []
     if any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers):
         return True
@@ -5133,6 +5136,13 @@ def _is_ai_workload(spec: dict) -> bool:
         limits = (c.get("resources") or {}).get("limits") or {}
         if any(AI_ACCELERATOR_KEY_RE.search(key) for key in limits):
             return True
+    return False
+
+
+def _is_ai_workload(spec: dict) -> bool:
+    if _is_inference_workload(spec):
+        return True
+    containers = spec.get("containers") or []
     for c in containers:
         # Named, not valued: a `secretKeyRef` is the correct way to hold one of
         # these and still means the workload holds it. Whether the value is a

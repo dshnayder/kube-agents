@@ -94,6 +94,10 @@ MAX_WORKERS = 8
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+class NoProjectInScope(Exception):
+    """Discovery named no project at all, which is not a fleet of empty projects."""
+
+
 NO_PROJECT_IN_SCOPE_ERROR = (
     "no project in scope: there is no active gcloud project and `gcloud projects list` "
     "returned none, so this credential sees nothing to audit"
@@ -548,6 +552,8 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
         return projects, partial
 
     candidates = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip() and p.strip() != base]
+    if not base and not candidates:
+        raise NoProjectInScope(NO_PROJECT_IN_SCOPE_ERROR)
     for candidate in candidates:
         parsed, _ = run_and_gate(
             ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
@@ -3924,6 +3930,11 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        # Read as empty, it would be a cluster with no Services or volumes --
+        # which 3.4 and 3.6 then take as proof a project's disks and rules are
+        # nobody's.
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}, empty_facts
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
@@ -4818,12 +4829,15 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         except Exception as exc:
             log(f"Cloud Monitoring credentials unavailable, overrequest will be skipped fleet-wide: {exc}")
 
-    projects, partial_discovery = get_target_projects(project, run=run)
-    if not projects and not partial_discovery:
+    try:
+        projects, partial_discovery = get_target_projects(project, run=run)
+    except NoProjectInScope:
         # No active project and a `projects list` that answered with nothing:
-        # the credential sees no project, which is not an empty fleet. The
-        # manifest contract's top-level `error`, as `fleet_stockout.py` sets
-        # when its enumeration fails, and `main` exits non-zero on it.
+        # the credential sees no project, which is not an empty fleet. Projects
+        # that were listed but hold no cluster are an empty fleet, and do not
+        # land here. The manifest contract's top-level `error`, as
+        # `fleet_stockout.py` sets when its enumeration fails, and `main` exits
+        # non-zero on it.
         return {
             "version": MANIFEST_VERSION,
             "checks_revision": CHECKS_REVISION,
