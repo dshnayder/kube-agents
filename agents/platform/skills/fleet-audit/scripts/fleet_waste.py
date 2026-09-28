@@ -1777,9 +1777,8 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     blockers = []
     for pod in pods:
         meta = pod.get("metadata") or {}
-        owners = meta.get("ownerReferences") or []
-        if any(o.get("kind") == "Node" for o in owners):
-            continue  # mirror pod -- static, goes with the node
+        if _pod_is_mirror(pod):
+            continue  # static, goes with the node
         ns, name = meta.get("namespace", ""), meta.get("name", "")
         labels = meta.get("labels") or {}
         evictable = _safe_to_evict(meta.get("annotations") or {})

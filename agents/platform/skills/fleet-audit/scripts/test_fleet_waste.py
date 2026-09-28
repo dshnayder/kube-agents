@@ -1068,10 +1068,12 @@ class ScaledownBlockedTest(unittest.TestCase):
                 pod = obj("Pod", "agent", ns="monitoring", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": kind, "name": "x"}], "spec.volumes": [{"hostPath": {"path": "/var/log"}}]})
                 self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
 
-    def test_a_daemonset_pod_marked_not_safe_to_evict_still_goes_with_the_node(self):
-        # The autoscaler skips DaemonSet pods before it reads the annotation.
-        pod = obj("Pod", "agent", ns="monitoring", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "DaemonSet", "name": "x"}], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "false"}})
-        self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
+    def test_daemonset_and_mirror_pods_marked_not_safe_to_evict_still_go_with_the_node(self):
+        # The autoscaler skips both before it reads the annotation.
+        for kind in ("DaemonSet", "Node"):
+            with self.subTest(kind=kind):
+                pod = obj("Pod", "agent", ns="monitoring", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": kind, "name": "x"}], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "false"}})
+                self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
 
     def test_the_node_carries_its_worst_blocker_whatever_the_listing_order(self):
         owned = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "false"}})
