@@ -180,6 +180,12 @@ type ScopeClusterRef struct {
 }
 
 // PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.
+//
+// The rule below is the schema half of ResolveGit's refusal of both forge
+// spellings. The webhook refuses the same CR, but the chart's default
+// failurePolicy is Ignore, and with the webhook unreachable a CR carrying both
+// would be admitted and then seed nothing, with only a reconcile log to say so.
+// +kubebuilder:validation:XValidation:rule="!(has(self.git) && has(self.github))",message="set at most one of integration.git and integration.github; integration.github is a deprecated alias for integration.git with provider github"
 type PlatformAgentIntegrationSpec struct {
 	IntegrationSpec `json:",inline"`
 

@@ -392,23 +392,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			"name", instance.Name, "namespace", instance.Namespace)
 	}
 
-	// gitRepo validation restricts repository URLs to github.com. CRs stored
-	// before that change still reconcile, but subsequent updates will be rejected
-	// at admission by the validating webhook until corrected. Warn loudly so an
-	// administrator discovers un-updatable CRs immediately upon operator upgrade.
-	if instance.Spec.Integration != nil && instance.Spec.Integration.GitHub != nil {
-		github := instance.Spec.Integration.GitHub
-		var gitRepoErr error
-		if github.Org != "" {
-			gitRepoErr = agentv1alpha1.ValidateGitHubOrg(github.Org)
-		}
-		if gitRepoErr == nil && github.GitRepo != "" {
-			gitRepoErr = agentv1alpha1.ValidateGitRepoURLWithOrg(github.GitRepo, github.Org)
-		}
-		if gitRepoErr != nil {
-			log.Info("WARNING: spec.integration.github contains invalid gitRepo URL or org; "+
+	// The forge declaration is checked against its provider's rules at
+	// admission. CRs stored before a rule tightened still reconcile, but
+	// subsequent updates will be rejected by the validating webhook until
+	// corrected. Warn loudly so an administrator discovers un-updatable CRs
+	// immediately upon operator upgrade. Both spellings go through ValidateGit,
+	// the same call admission makes, so the warning cannot pass a declaration
+	// the webhook refuses.
+	if instance.Spec.Integration != nil {
+		if err := instance.Spec.Integration.ValidateGit(); err != nil {
+			log.Info("WARNING: spec.integration.git (or its deprecated alias spec.integration.github) is invalid; "+
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
-				"name", instance.Name, "namespace", instance.Namespace, "error", gitRepoErr.Error())
+				"name", instance.Name, "namespace", instance.Namespace, "error", err.Error())
 		}
 	}
 

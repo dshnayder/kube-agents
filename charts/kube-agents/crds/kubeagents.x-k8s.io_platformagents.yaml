@@ -9888,6 +9888,12 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef)
                             && has(self.appPasswordSecretRef))"
                   type: object
+                  x-kubernetes-validations:
+                    - message:
+                        set at most one of integration.git and integration.github;
+                        integration.github is a deprecated alias for integration.git with
+                        provider github
+                      rule: "!(has(self.git) && has(self.github))"
                 mode:
                   description: |-
                     Mode selects which component stack the operator renders.  "today" is the
