@@ -1459,6 +1459,10 @@ def _pod_daemonset_owned(pod: dict) -> bool:
     return any(o.get("kind") == "DaemonSet" for o in (pod.get("metadata", {}).get("ownerReferences") or []))
 
 
+def _pod_is_mirror(pod: dict) -> bool:
+    return any(o.get("kind") == "Node" for o in (pod.get("metadata", {}).get("ownerReferences") or []))
+
+
 def _sum_requests(pods: list[dict]) -> tuple[float, float]:
     cpu_total, mem_total = 0.0, 0.0
     for pod in pods:
@@ -1812,9 +1816,9 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         # pods go with it; the autoscaler skips all three when it drains.
         if (pod.get("status") or {}).get("phase") in POD_TERMINAL_PHASES:
             continue
-        owners = pod.get("metadata", {}).get("ownerReferences") or []
-        if any(o.get("kind") in ("DaemonSet", "Node") for o in owners):
+        if _pod_daemonset_owned(pod) or _pod_is_mirror(pod):
             continue
+        owners = pod.get("metadata", {}).get("ownerReferences") or []
         annotations = pod.get("metadata", {}).get("annotations") or {}
         evictable = _safe_to_evict(annotations)
         has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
@@ -1832,12 +1836,12 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         # controller recreates its pod elsewhere once someone deletes it, so
         # `safe-to-evict: "false"` on a controlled pod is `major`.
         permanent = bare_pod and (has_local_storage or evictable is False)
+        if node_name in by_node and not permanent:
+            continue  # the node already carries a blocker at least this bad
         pod_name = pod.get("metadata", {}).get("name", "")
         # The raw annotation, not the parse: the excerpt is evidence, and a
         # reader checking it against `kubectl get pod -o yaml` needs to see what
         # is really on the object.
-        if node_name in by_node and not permanent:
-            continue
         by_node[node_name] = {
             "object": f"Node/{node_name}",
             "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage})",
