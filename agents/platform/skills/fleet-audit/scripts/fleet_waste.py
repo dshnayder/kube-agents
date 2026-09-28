@@ -200,6 +200,8 @@ SHORT_OBSERVATION_HOURS = 24
 # 0, 1 or 3. Matching that rather than `[a-z0-9]` is what keeps out a hook
 # Job's pods: `api-migrate-x7k2p` belongs to Job `api-migrate`, not to
 # Deployment `api`, and `migrate` has vowels no ReplicaSet hash can carry.
+# It keeps out most hook Jobs, not all: one whose name suffix is vowel-free
+# (`api-db`) still matches, and nothing in a pod name tells the two apart.
 K8S_GENERATED_CHARS = "[bcdfghjklmnpqrstvwxz2456789]"
 REPLACED_POD_PATTERNS = {
     "Deployment": rf"^{{name}}-{K8S_GENERATED_CHARS}+-{K8S_GENERATED_CHARS}{{{{5}}}}$",
