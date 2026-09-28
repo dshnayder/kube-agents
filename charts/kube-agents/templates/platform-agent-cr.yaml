@@ -233,13 +233,40 @@ spec:
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- $git := $integ.git | default dict }}
-  {{- $gitSet := or $git.provider $git.host $git.repository $git.namespace }}
+  {{- /* Mirrors kube-agents.gitProvider: provider or host alone declares nothing. */}}
+  {{- $gitSet := or $git.repository $git.namespace }}
   {{- $githubSet := and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
   {{- /* Renders the fail when both blocks are set, before either is written. */}}
-  {{- $_ := include "kube-agents.gitProvider" . }}
+  {{- $provider := include "kube-agents.gitProvider" . }}
+  {{- /*
+  A GitHub declaration renders as the deprecated `github` block, whichever
+  spelling the values file used. `helm upgrade` never touches crds/, so an
+  install upgraded that way still serves the CRD it was first installed with,
+  and that schema has no `git` field: the API server prunes it, the CR loses
+  its repository, and nothing reports it. The alias carries everything a GitHub
+  declaration can say except the host, and every host GitHub serves is the same
+  forge -- so a host outside that set is refused here rather than dropped,
+  since dropping it is exactly the rewrite onto github.com the provider rules
+  exist to prevent. The list mirrors githubHosts in
+  k8s-operator/api/v1alpha1/gitprovider.go.
+  */}}
+  {{- $asGitHubAlias := and $gitSet (eq $provider "github") }}
+  {{- if and $asGitHubAlias $git.host }}
+  {{- if not (has (lower $git.host) (list "github.com" "www.github.com" "ssh.github.com")) }}
+  {{- fail (printf "platformAgent.integration.git.host is %q, which provider github does not serve" $git.host) }}
+  {{- end }}
+  {{- end }}
   {{- if or $gitSet $githubSet $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
-    {{- if $gitSet }}
+    {{- if $asGitHubAlias }}
+    github:
+      {{- if $git.namespace }}
+      org: {{ $git.namespace | quote }}
+      {{- end }}
+      {{- if $git.repository }}
+      gitRepo: {{ $git.repository | quote }}
+      {{- end }}
+    {{- else if $gitSet }}
     git:
       provider: {{ $git.provider | default "github" | quote }}
       {{- if $git.host }}

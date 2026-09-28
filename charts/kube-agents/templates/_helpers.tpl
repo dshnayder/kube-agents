@@ -1372,6 +1372,10 @@ install: repositories can be registered in the gitops-state ConfigMap later.
 `gitRepo: None` is the sentinel for "no repository", so it does not count as a
 declaration -- reading it as one would make it collide with a `git` block that
 declares the forge properly, which is the migration every install has to make.
+For the same reason a `git` block holding only `provider` or `host` declares
+nothing: it names no repository and no namespace, and the operator would seed
+nothing from it. An unregistered `provider` still fails, so a typo is not
+silently dropped.
 
 The provider list mirrors the CRD's enum in
 k8s-operator/api/v1alpha1/common_types.go. Checking it here is what turns an
@@ -1385,8 +1389,11 @@ rather than an API-server enum rejection at apply time.
 {{- $git := $integ.git | default dict -}}
 {{- $github := $integ.github | default dict -}}
 {{- $gitRepo := $github.gitRepo | default "" -}}
-{{- $gitSet := or $git.provider $git.host $git.repository $git.namespace -}}
+{{- $gitSet := or $git.repository $git.namespace -}}
 {{- $githubSet := or $github.org (and $gitRepo (ne $gitRepo $sentinel)) -}}
+{{- if and $git.provider (not (has $git.provider $providers)) -}}
+{{- fail (printf "platformAgent.integration.git.provider is %q; must be one of %s" $git.provider (join ", " $providers)) -}}
+{{- end -}}
 {{- if and $gitSet $githubSet -}}
 {{- fail "set platformAgent.integration.git or platformAgent.integration.github, not both; github is a deprecated alias for git with provider: github" -}}
 {{- end -}}

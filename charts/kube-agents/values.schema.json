@@ -751,6 +751,24 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "git": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "provider": {
+                  "type": "string"
+                },
+                "host": {
+                  "type": "string"
+                },
+                "repository": {
+                  "type": "string"
+                },
+                "namespace": {
+                  "type": "string"
+                }
+              }
+            },
             "github": {
               "type": "object",
               "additionalProperties": false,

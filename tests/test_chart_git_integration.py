@@ -63,18 +63,19 @@ def _integration(*sets: str) -> dict:
 
 @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
 class ChartGitIntegrationTest(unittest.TestCase):
-    def test_git_block_reaches_the_cr_with_a_defaulted_provider(self):
+    def test_a_github_git_block_renders_as_the_alias(self):
+        """`helm upgrade` never updates crds/, so an install upgraded that way
+        serves a CRD with no `git` field and the API server would prune it --
+        taking the repository with it, silently. A GitHub declaration therefore
+        reaches the CR as `github`, which every CRD version accepts."""
         integration = _integration(
             "platformAgent.integration.git.repository=gke-labs/kube-agents"
         )
         self.assertEqual(
-            integration.get("git"),
-            {"provider": "github", "repository": "gke-labs/kube-agents"},
+            integration.get("github"), {"gitRepo": "gke-labs/kube-agents"}
         )
-        # The alias must not be synthesised alongside it: the operator refuses
-        # a CR carrying both, so rendering both makes every git-only install
-        # un-appliable.
-        self.assertNotIn("github", integration)
+        # Never both: the operator refuses a CR carrying both spellings.
+        self.assertNotIn("git", integration)
 
     def test_the_deprecated_alias_still_renders_unchanged(self):
         """Existing values files are the reason the alias exists at all."""
@@ -88,7 +89,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
         )
         self.assertNotIn("git", integration)
 
-    def test_an_explicit_provider_and_host_are_carried_through(self):
+    def test_an_explicit_provider_and_github_host_map_onto_the_alias(self):
         integration = _integration(
             "platformAgent.integration.git.provider=github",
             "platformAgent.integration.git.host=github.com",
@@ -96,14 +97,22 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "platformAgent.integration.git.repository=kube-agents",
         )
         self.assertEqual(
-            integration.get("git"),
-            {
-                "provider": "github",
-                "host": "github.com",
-                "namespace": "gke-labs",
-                "repository": "kube-agents",
-            },
+            integration.get("github"),
+            {"org": "gke-labs", "gitRepo": "kube-agents"},
         )
+        self.assertNotIn("git", integration)
+
+    def test_a_host_github_does_not_serve_fails_rather_than_dropping(self):
+        """The alias has no host field. Dropping a foreign host would seed
+        `https://github.com/group/project` for a repository on gitlab.com --
+        the rewrite the provider rules exist to refuse."""
+        result = _render(
+            _CR_TEMPLATE,
+            "platformAgent.integration.git.host=gitlab.com",
+            "platformAgent.integration.git.repository=group/project",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("platformAgent.integration.git.host", result.stderr)
 
     def test_declaring_both_spellings_fails_the_render(self):
         result = _render(
@@ -113,6 +122,20 @@ class ChartGitIntegrationTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("not both", result.stderr)
+
+    def test_a_git_block_naming_no_repository_is_not_a_second_declaration(self):
+        """`provider` and `host` alone name nothing the operator could seed, so
+        beside the deprecated alias they are not a conflict and not a block of
+        their own."""
+        integration = _integration(
+            "platformAgent.integration.git.provider=github",
+            "platformAgent.integration.git.host=github.com",
+            "platformAgent.integration.github.org=gke-labs",
+        )
+        self.assertEqual(integration, {"github": {"org": "gke-labs"}})
+        self.assertEqual(
+            _integration("platformAgent.integration.git.provider=github"), {}
+        )
 
     def test_no_forge_declaration_renders_no_integration_key(self):
         """`integration: {}` is not the same as an absent integration: the
@@ -156,8 +179,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "platformAgent.integration.git.repository=gke-labs/kube-agents",
         )
         self.assertEqual(
-            integration.get("git"),
-            {"provider": "github", "repository": "gke-labs/kube-agents"},
+            integration.get("github"), {"gitRepo": "gke-labs/kube-agents"}
         )
 
     def test_the_minter_renders_for_github_and_for_no_declaration(self):
