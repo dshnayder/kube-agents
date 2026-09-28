@@ -4747,10 +4747,9 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         entry["limitations"] = (
             "orphan-lb was not evaluated for this project: §3.6 compares "
             "forwarding rules against the Service names of every cluster in "
-            "the project, and this run holds a complete Service list for none "
-            "of them -- either a cluster could not be read or the project "
-            "contributed no readable cluster at all -- so a rule its Services "
-            "reference would read as orphaned. See this project's cluster "
+            "the project, and at least one of them could not be read, so a "
+            "rule that cluster's Services reference would read as orphaned. "
+            "See this project's cluster "
             "entries in this manifest for the reason each one failed."
         )
     if not disks_judged:
