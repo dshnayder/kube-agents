@@ -4556,6 +4556,18 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertEqual(manifest["error"], fw.NO_PROJECT_IN_SCOPE_ERROR)
         self.assertEqual(manifest["clusters"], [])
 
+    def test_no_active_project_and_a_failed_listing_is_an_error(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "permission denied")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        self.assertIn("permission denied", manifest["error"])
+        self.assertEqual(manifest["clusters"], [])
+
     def test_listed_projects_that_hold_no_cluster_are_an_empty_fleet_not_an_error(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:

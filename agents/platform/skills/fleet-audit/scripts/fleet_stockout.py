@@ -112,6 +112,7 @@ DEFAULT_STORAGE_CLASS_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
 # deadlocking a claim that uses it.
 DYNAMIC_RWO_CLASS = "dynamic-rwo"
 DYNAMIC_RWO_MIN_VERSION = (1, 35, 3)
+DYNAMIC_RWO_MIN_LABEL = ".".join(str(n) for n in DYNAMIC_RWO_MIN_VERSION)
 GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 # §3.11. The three message ids that mean a scale-up failed for want of
@@ -1389,9 +1390,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 candidates.append(_emit("ccc-priority-starvation", hit))
         for hit in [check_ccc_mixed_disk_generations(cc, cc_meta["name"] in cc_referenced_by_stateful)]:
             if hit:
-                if cluster.get("version"):
-                    # §3.5's fix differs on either side of 1.35.3.
-                    hit = {**hit, "excerpt": f"{hit['excerpt']} (control plane {cluster['version']})"}
+                # §3.5's fix differs on either side of DYNAMIC_RWO_MIN_VERSION.
+                side = "at or past" if dynamic_rwo_applies else "before"
+                plane = f"control plane {cluster['version']}, {side} {DYNAMIC_RWO_MIN_LABEL}" if version else "control plane version unknown"
+                hit = {**hit, "excerpt": f"{hit['excerpt']} ({plane})"}
                 candidates.append(_emit("ccc-mixed-disk-generations", hit))
         for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
             if hit:

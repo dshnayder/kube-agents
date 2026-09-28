@@ -1544,7 +1544,14 @@ class CollectClusterTest(unittest.TestCase):
         sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="standard-rwo")
         entry = self.run_with(dump_items=[cc, sts], cluster={**self.CLUSTER, "version": "1.35.2-gke.900"})
         (hit,) = [c for c in entry["candidates"] if c["check"] == "ccc-mixed-disk-generations"]
-        self.assertIn("control plane 1.35.2-gke.900", hit["excerpt"])
+        self.assertIn("control plane 1.35.2-gke.900, before 1.35.3", hit["excerpt"])
+
+    def test_mixed_disk_generation_excerpt_says_when_the_version_is_unknown(self):
+        cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="standard-rwo")
+        entry = self.run_with(dump_items=[cc, sts], cluster={**self.CLUSTER, "version": ""})
+        (hit,) = [c for c in entry["candidates"] if c["check"] == "ccc-mixed-disk-generations"]
+        self.assertIn("control plane version unknown", hit["excerpt"])
 
     def test_mixed_disk_generation_not_flagged_without_persistent_volumes(self):
         cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])

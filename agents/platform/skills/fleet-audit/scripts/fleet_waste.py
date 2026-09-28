@@ -94,10 +94,6 @@ MAX_WORKERS = 8
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
-class NoProjectInScope(Exception):
-    """Discovery named no project at all, which is not a fleet of empty projects."""
-
-
 NO_PROJECT_IN_SCOPE_ERROR = (
     "no project in scope: there is no active gcloud project and `gcloud projects list` "
     "returned none, so this credential sees nothing to audit"
@@ -524,6 +520,10 @@ def target_name(project: str, location: str, name: str) -> str:
     return QUALIFIED_TARGET_SEPARATOR.join([p for p in (project, location) if p] + [name])
 
 
+class NoProjectInScope(Exception):
+    """Discovery named no project at all, which is not a fleet of empty projects."""
+
+
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
     """§1's project scope: "every project the agent can see". A `--project`
     override skips discovery entirely, for a scoped or a test run; otherwise
@@ -535,7 +535,10 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     `--project` skipped discovery, or `gcloud projects list` failed -- and
     `collect_fleet` turns it into an `UNENUMERATED_PROJECTS_TARGET` entry, so
     the loss is a row the document has to account for rather than a fleet that
-    silently shrank to one project."""
+    silently shrank to one project.
+
+    Raises `NoProjectInScope` when there is no active project and the listing
+    failed or named none: that credential sees nothing, which is not a fleet."""
     if cli_project:
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
 
@@ -546,6 +549,12 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     _, list_result = run_and_gate(["gcloud", "projects", "list", "--format", "value(projectId)"], run=run)
     if list_result.rc != 0:
         stderr = list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        if not base:
+            # `collect.py`'s `discover_fleet` answers the same input the same way.
+            raise NoProjectInScope(
+                f"project discovery failed: `gcloud config get-value project` rc={result.rc} "
+                f"named no project and `gcloud projects list` rc={list_result.rc}: {stderr}"
+            )
         partial = (
             f"`gcloud projects list` rc={list_result.rc}: {stderr}. The scope fell back to "
             f"the active project {base!r}; how many other projects the fleet holds is unknown."
@@ -4833,7 +4842,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 
     try:
         projects, partial_discovery = get_target_projects(project, run=run)
-    except NoProjectInScope:
+    except NoProjectInScope as exc:
         # No active project and a `projects list` that answered with nothing:
         # the credential sees no project, which is not an empty fleet. Projects
         # that were listed but hold no cluster are an empty fleet, and do not
@@ -4846,7 +4855,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             "audit": "fleet-wide-cost-analysis",
             "started_at": started_at,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "error": NO_PROJECT_IN_SCOPE_ERROR,
+            "error": str(exc),
             "clusters": [],
         }
 
