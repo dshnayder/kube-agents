@@ -169,7 +169,7 @@ class EnumerateClustersTest(unittest.TestCase):
         clusters, not_running = fs.enumerate_clusters("acme", run=run)
         self.assertEqual([c["name"] for c in clusters], ["c1"])
         self.assertEqual(len(not_running), 1)
-        self.assertEqual(not_running[0]["name"], "sick")
+        self.assertEqual(not_running[0]["name"], "acme/us-east4/sick")
         self.assertEqual(not_running[0]["outcome"], "unreachable")
         self.assertEqual(not_running[0]["location"], "us-east4")
         self.assertIn("DEGRADED", not_running[0]["error"])
@@ -190,7 +190,7 @@ class EnumerateClustersTest(unittest.TestCase):
 
         clusters, not_running = fs.enumerate_clusters("acme", run=run)
         self.assertEqual([c["name"] for c in clusters], ["busy"])
-        self.assertEqual([c["name"] for c in not_running], ["new"])
+        self.assertEqual([c["name"] for c in not_running], ["acme/us-west1/new"])
 
 
 class RegionOfTest(unittest.TestCase):
@@ -853,14 +853,14 @@ class ReservationAffinityTest(unittest.TestCase):
 
 class QuotaTest(unittest.TestCase):
     def test_flags_over_90_percent(self):
-        hit = fs.check_quota({"metric": "N4_CPUS", "limit": 100, "usage": 92})
+        hit = fs.check_quota({"metric": "N4_CPUS", "limit": 100, "usage": 92}, "us-central1")
         self.assertIsNotNone(hit)
 
     def test_does_not_flag_under_90_percent(self):
-        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100, "usage": 70}))
+        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100, "usage": 70}, "us-central1"))
 
     def test_zero_limit_is_not_a_crash(self):
-        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 0, "usage": 0}))
+        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 0, "usage": 0}, "us-central1"))
 
     def test_only_node_capacity_metrics_count(self):
         """§3.7 is "GPU/TPU/CPU limits". A region describe returns every
@@ -869,14 +869,14 @@ class QuotaTest(unittest.TestCase):
         for metric in ("CPUS", "CPUS_ALL_REGIONS", "N4_CPUS", "PREEMPTIBLE_CPUS",
                        "NVIDIA_L4_GPUS", "COMMITTED_NVIDIA_A100_GPUS", "TPU_V5_LITEPOD_SLICES"):
             with self.subTest(metric=metric, capacity=True):
-                self.assertIsNotNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}))
+                self.assertIsNotNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}, "us-central1"))
         for metric in ("BACKEND_BUCKETS", "AFFINITY_GROUPS", "IN_USE_ADDRESSES",
                        "DISKS_TOTAL_GB", "LOCAL_SSD_TOTAL_GB", "FIREWALLS"):
             with self.subTest(metric=metric, capacity=False):
-                self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}))
+                self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}, "us-central1"))
 
     def test_absent_usage_is_not_a_crash(self):
-        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100}))
+        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100}, "us-central1"))
 
 
 class AutoscalerVisibilityTest(unittest.TestCase):
@@ -919,7 +919,7 @@ class AutoscalerVisibilityTest(unittest.TestCase):
         second = json.loads(json.dumps(ERROR_MSG_ENTRY))
         second["timestamp"] = "2026-08-14T06:00:00Z"
         found = fs.autoscaler_message_ids([ERROR_MSG_ENTRY, second])
-        hits = fs.check_autoscaler_out_of_resources(found, "prod-usc1")
+        hits = fs.check_autoscaler_out_of_resources(found)
         self.assertEqual(len(hits), 1)
         self.assertIn("2 occurrences", hits[0]["excerpt"])
         self.assertIn("2026-08-14T00:05:02 .. 2026-08-14T06:00:00", hits[0]["excerpt"])
@@ -928,21 +928,21 @@ class AutoscalerVisibilityTest(unittest.TestCase):
         """The read's `--freshness` belongs to the caller. Printing it here put
         "over the last 24h" next to timestamps thirteen days apart."""
         hits = fs.check_autoscaler_out_of_resources(
-            fs.autoscaler_message_ids([ERROR_MSG_ENTRY]), "prod-usc1"
+            fs.autoscaler_message_ids([ERROR_MSG_ENTRY])
         )
         self.assertNotIn("24h", hits[0]["excerpt"])
 
     def test_the_excerpt_names_the_instance_group_not_its_url(self):
         hits = fs.check_autoscaler_out_of_resources(
-            fs.autoscaler_message_ids([ERROR_MSG_ENTRY]), "prod-usc1"
+            fs.autoscaler_message_ids([ERROR_MSG_ENTRY])
         )
         self.assertIn("gk3-prod-usc1-pool-3-b07eba62-grp", hits[0]["excerpt"])
         self.assertNotIn("googleapis.com", hits[0]["excerpt"])
-        self.assertEqual(hits[0]["object"], "Cluster/prod-usc1")
+        self.assertEqual(hits[0]["object"], "ScaleUpError/scale.up.error.out.of.resources")
 
 
 class SpotScarcityTest(unittest.TestCase):
-    SHAPE = {"owners": ["ComputeClass/cc1"], "families": 1}
+    SHAPE = {"owners": ["ComputeClass/cc1"], "families": {"ComputeClass/cc1": 1}}
 
     def test_the_live_us_east4_response_is_not_a_finding(self):
         """26 daily intervals averaging 8.4%, which is what a healthy Spot
@@ -964,7 +964,7 @@ class SpotScarcityTest(unittest.TestCase):
     def test_a_multi_family_chain_over_the_ceiling_is_not_flagged(self):
         """§3.8's "without alternative family fallbacks" — a chain spanning two
         families survives its worst shape being preempted."""
-        shape = {"owners": ["ComputeClass/cc1"], "families": 3}
+        shape = {"owners": ["ComputeClass/cc1"], "families": {"ComputeClass/cc1": 3}}
         hit, limitation = fs.check_spot_scarcity(
             "a2-highgpu-1g", shape, "us-central1", capacity_history([0.3] * 10)
         )
@@ -1016,7 +1016,7 @@ class SpotShapeEnumerationTest(unittest.TestCase):
         nothing else is tried."""
         pools = [{"name": "p1", "config": {"spot": True, "machineType": "c3-standard-4"}}]
         shapes = fs.spot_shapes([], pools)
-        self.assertEqual(shapes["c3-standard-4"]["families"], 1)
+        self.assertEqual(shapes["c3-standard-4"]["families"], {"NodePool/p1": 1})
         self.assertEqual(shapes["c3-standard-4"]["owners"], ["NodePool/p1"])
 
     def test_the_family_count_spans_the_whole_chain_not_just_its_spot_arm(self):
@@ -1029,7 +1029,7 @@ class SpotShapeEnumerationTest(unittest.TestCase):
                 {"machineFamily": "c3"},
             ],
         )
-        self.assertEqual(fs.spot_shapes([cc], [])["a2-highgpu-1g"]["families"], 3)
+        self.assertEqual(fs.spot_shapes([cc], [])["a2-highgpu-1g"]["families"], {"ComputeClass/cc1": 3})
 
     def test_one_shape_requested_twice_is_read_once_and_names_both_owners(self):
         cc1 = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
@@ -1530,6 +1530,156 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("reservation-mismatch-risk", slugs)
 
 
+    def test_a_cluster_with_no_compute_class_records_every_ccc_check(self):
+        """No ComputeClass and no StatefulSet is an answer the dump gave, not
+        a check nobody ran; leaving the slugs out made the cluster partially
+        audited on every run."""
+        entry = self.run_with(dump_items=[])
+        run = {c["check"] for c in entry["commands"]}
+        for slug in (
+            "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity",
+            "ccc-priority-starvation", "ccc-mixed-disk-generations",
+            "ccc-hyperdisk-incompatible", "reservation-mismatch-risk",
+        ):
+            self.assertIn(slug, run)
+
+    def test_the_target_name_is_qualified(self):
+        entry = self.run_with(dump_items=[])
+        c = self.CLUSTER
+        self.assertEqual(entry["name"], f"{c['project']}/{c['location']}/{c['name']}")
+
+    def test_a_failed_node_pool_read_is_not_a_cluster_without_spot(self):
+        entry = self.run_with(dump_items=[], pools_rc=1)
+        self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
+        self.assertEqual(
+            {e["check"] for e in entry["checks_unevaluated"]},
+            {"single-zone-nodepool", "spot-scarcity-risk"},
+        )
+        self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
+
+    def test_a_failed_autoscaler_read_is_unevaluated(self):
+        entry = self.run_with(dump_items=[], log_rc=1)
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_the_autoscaler_read_is_pinned_to_the_location(self):
+        self.run_with(dump_items=[])
+        read = next(a for a in self.issued if a[:3] == ["gcloud", "logging", "read"])
+        self.assertIn(f'resource.labels.location="{self.CLUSTER["location"]}"', read[3])
+
+    def test_a_full_autoscaler_page_says_the_window_was_cut(self):
+        entry = self.run_with(dump_items=[], log_entries=[{"jsonPayload": {}}] * fs.AUTOSCALER_LOG_LIMIT)
+        self.assertIn("older entries", entry["limitations"])
+
+    def test_every_capacity_read_failing_leaves_spot_unevaluated(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        entry = self.run_with(dump_items=[cc], advice_rc=1)
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_two_hot_shapes_in_one_class_are_one_candidate(self):
+        cc = compute_class(
+            "cc1",
+            [{"machineType": "n2-standard-8", "spot": True}, {"machineType": "n2-standard-16", "spot": True}],
+        )
+        entry = self.run_with(
+            dump_items=[cc], advice=lambda mt: [capacity_history([0.5] * 10, machine_type=mt)]
+        )
+        spot = [c for c in entry["candidates"] if c["check"] == "spot-scarcity-risk"]
+        self.assertEqual(len(spot), 1)
+        self.assertIn("n2-standard-8", spot[0]["excerpt"])
+        self.assertIn("n2-standard-16", spot[0]["excerpt"])
+
+    def test_a_system_namespace_workload_is_excluded(self):
+        bad = deployment("dns", ns="kube-system", node_selector={"cloud.google.com/compute-class": "missing"})
+        entry = self.run_with(dump_items=[bad])
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "dangling-compute-class"], [])
+
+    def test_each_standard_exclusion_drops_a_dangling_reference(self):
+        cases = {
+            "S2": {"metadata": {"labels": {fs.ADDON_MANAGER_LABEL: "Reconcile"}}},
+            "S3": {"metadata": {"ownerReferences": [{"kind": "Operator", "name": "x"}]}},
+            "S4": {"metadata": {"labels": {fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE}}},
+            "S5": {"spec": {"replicas": 0}},
+        }
+        for rule, patch_ in cases.items():
+            with self.subTest(rule=rule):
+                d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})
+                d["metadata"].update(patch_.get("metadata", {}))
+                d["spec"].update(patch_.get("spec", {}))
+                self.assertEqual(fs.standard_excluded(d), rule)
+                entry = self.run_with(dump_items=[d])
+                self.assertEqual(entry["candidates"], [])
+
+    def test_an_excluded_workload_does_not_make_a_class_inference_referenced(self):
+        cc = compute_class("gpu-spot", [{"machineFamily": "a2", "spot": True}])
+        gpu = deployment(
+            "vllm", ns="kube-system", node_selector={"cloud.google.com/compute-class": "gpu-spot"},
+            containers=[{"name": "m", "image": "vllm/vllm-openai", "resources": {"limits": {"nvidia.com/gpu": 1}}}],
+        )
+        entry = self.run_with(dump_items=[cc, gpu])
+        floor = [c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"]
+        self.assertEqual([c["severity"] for c in floor], ["major"])
+
+    def test_a_non_production_class_is_not_flagged_for_its_spot_floor(self):
+        cc = compute_class("batch-staging", [{"machineFamily": "n2", "spot": True}])
+        entry = self.run_with(dump_items=[cc])
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"], [])
+
+
+class StockoutExclusionHelpersTest(unittest.TestCase):
+    def test_non_production_reads_name_tokens_not_substrings(self):
+        self.assertTrue(fs.is_non_production("api-dev"))
+        self.assertTrue(fs.is_non_production("qa_runner"))
+        self.assertFalse(fs.is_non_production("developer-portal"))
+        self.assertFalse(fs.is_non_production("latest"))
+
+    def test_non_production_reads_environment_labels(self):
+        self.assertTrue(fs.is_non_production("api", {"env": "Staging"}))
+        self.assertFalse(fs.is_non_production("api", {"env": "prod"}))
+
+    def test_a_gke_prefixed_namespace_is_a_system_namespace(self):
+        self.assertEqual(fs.standard_excluded({"metadata": {"namespace": "gke-managed-cim"}}), "S1")
+
+
+class LargeVmIdentityTest(unittest.TestCase):
+    def test_two_large_priorities_are_one_candidate(self):
+        cc = compute_class("big", [{"machineType": "n2-standard-64"}, {"machineType": "n2-standard-48"}])
+        hits = fs.check_ccc_large_vm_scarcity(cc)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("n2-standard-64", hits[0]["excerpt"])
+        self.assertIn("n2-standard-48", hits[0]["excerpt"])
+
+
+class SpotFamiliesPerOwnerTest(unittest.TestCase):
+    def test_a_single_family_pool_is_not_excused_by_another_owners_chain(self):
+        cc = compute_class("wide", [{"machineType": "n2-standard-8", "spot": True}, {"machineFamily": "c3"}])
+        pool = {"name": "p1", "config": {"spot": True, "machineType": "n2-standard-8"}}
+        shape = fs.spot_shapes([cc], [pool])["n2-standard-8"]
+        hit, _ = fs.check_spot_scarcity("n2-standard-8", shape, "us-central1", capacity_history([0.5] * 10))
+        self.assertEqual(hit["object"], "NodePool/p1")
+
+    def test_a_non_production_pool_is_not_a_spot_owner(self):
+        pool = {"name": "ci-test", "config": {"spot": True, "machineType": "n2-standard-8"}}
+        self.assertEqual(fs.spot_shapes([], [pool]), {})
+
+
+class EnumerationFailureTest(unittest.TestCase):
+    def test_a_failed_cluster_list_sets_the_manifest_error(self):
+        def run(argv, **kwargs):
+            return run_of(1, "", "denied")
+
+        manifest = fs.collect_fleet("acme", run=run)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("denied", manifest["error"])
+
+    def test_non_json_cluster_list_sets_the_manifest_error(self):
+        def run(argv, **kwargs):
+            return run_of(0, "WARNING: something")
+
+        manifest = fs.collect_fleet("acme", run=run)
+        self.assertIn("parseable JSON", manifest["error"])
+
+
 class CollectProjectTest(unittest.TestCase):
     def test_reservation_and_quota_findings(self):
         def run(argv, **kwargs):
@@ -1544,11 +1694,52 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("reservation-mismatch-risk", slugs)
         self.assertIn("quota-exhaustion-risk", slugs)
 
-    def test_no_data_returns_none(self):
+    def test_no_data_is_unevaluated_not_absent(self):
+        """Both reads failing used to drop the project entry, which reads as
+        a project with nothing to report."""
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
-        self.assertIsNone(fs.collect_project("acme", {"us-central1"}, run=run))
+        entry = fs.collect_project("acme", {"us-central1"}, run=run)
+        self.assertEqual(entry["commands"], [])
+        self.assertEqual(
+            {e["check"] for e in entry["checks_unevaluated"]},
+            {"quota-exhaustion-risk", "reservation-mismatch-risk"},
+        )
+        self.assertIn("us-central1", entry["limitations"])
+
+    def test_one_failed_region_is_named_rather_than_passed(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            if argv[:4] == ["gcloud", "compute", "regions", "describe"] and argv[4] == "europe-west1":
+                return run_of(1, "", "PERMISSION_DENIED")
+            return run_of(0, json.dumps({"quotas": []}))
+
+        entry = fs.collect_project("acme", {"us-central1", "europe-west1"}, run=run)
+        self.assertIn("quota-exhaustion-risk", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertIn("europe-west1", entry["limitations"])
+        self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_one_metric_over_the_line_in_two_regions_is_two_findings(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            return run_of(0, json.dumps({"quotas": [{"metric": "CPUS", "limit": 10, "usage": 10}]}))
+
+        entry = fs.collect_project("acme", {"us-central1", "us-east4"}, run=run)
+        objects = [c["object"] for c in entry["candidates"]]
+        self.assertEqual(sorted(objects), ["Quota/us-central1:CPUS", "Quota/us-east4:CPUS"])
+
+    def test_a_non_production_reservation_is_not_flagged(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, json.dumps([{"name": "gpu-staging", "specificReservation": {"count": 10, "inUseCount": 0}}]))
+            return run_of(0, json.dumps({"quotas": []}))
+
+        entry = fs.collect_project("acme", {"us-central1"}, run=run)
+        self.assertEqual(entry["candidates"], [])
 
 
 class CrashIsolationTest(unittest.TestCase):
@@ -1584,9 +1775,9 @@ class CrashIsolationTest(unittest.TestCase):
             with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fs.collect_fleet("acme", run=run)
 
-        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("c1", "boom")}
-        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
-        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if not c["name"].startswith("project/")}
+        self.assertEqual(outcomes, {"acme/us-central1/c1": "collected", "acme/us-central1/boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/boom")
         self.assertIn("TypeError", boom["error"])
 
 
@@ -1628,7 +1819,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
 
-    def test_a_check_absent_from_a_collected_entry_is_rejected(self):
+    def test_a_check_whose_read_failed_is_rejected_as_run(self):
         import audit_report
 
         clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
@@ -1639,7 +1830,9 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
-                return run_of(0, json.dumps(dump_of()))  # no ComputeClasses at all
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "logging", "read"]:
+                return run_of(1, "", "PERMISSION_DENIED")
             if argv[:3] == ["gcloud", "container", "node-pools"]:
                 return run_of(0, "[]")
             if argv[:3] == ["gcloud", "compute", "reservations"]:
@@ -1652,13 +1845,16 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fs.collect_fleet("acme", run=run)
 
-        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "c1")
+        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/c1")
         self.assertEqual(cluster_entry["outcome"], "collected")
-        self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in cluster_entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in cluster_entry["commands"]})
+        self.assertEqual(
+            [e["check"] for e in cluster_entry["checks_unevaluated"]], ["autoscaler-out-of-resources"]
+        )
 
         data = {
             "audit": "stockout-prevention",
-            "scope": {"clusters": [{"name": "c1", "checks_run": [{"check": "ccc-missing-fallbacks", "command": "x"}]}]},
+            "scope": {"clusters": [{"name": "acme/us-central1/c1", "checks_run": [{"check": "autoscaler-out-of-resources", "command": "x"}]}]},
         }
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)

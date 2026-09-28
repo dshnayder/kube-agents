@@ -1434,6 +1434,25 @@ def target_kind(name: str) -> str:
     return TARGET_KIND_SUBNET if "/" in name else TARGET_KIND_CLUSTER
 
 
+def scoped_target_kind(spec: "AuditSpec", name: str) -> str:
+    """`target_kind`, read against the kinds `spec` actually partitions by.
+
+    A qualified cluster, `<project>/<location>/<name>`, has the subnet's shape,
+    and the two cannot be told apart by the name alone. A stream that declares
+    no `subnet` scope has no subnet targets to confuse it with, so there the
+    shape is a cluster; reading it as a subnet would fall through to the whole
+    roster and owe every cluster the project-scoped checks too.
+    """
+    kind = target_kind(name)
+    if (
+        kind == TARGET_KIND_SUBNET
+        and name.count(QUALIFIED_TARGET_SEPARATOR) == QUALIFIED_CLUSTER_SEGMENTS - 1
+        and not any(declared == TARGET_KIND_SUBNET for declared, _ in spec.scopes)
+    ):
+        return TARGET_KIND_CLUSTER
+    return kind
+
+
 def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
     """The roster subset `target_name` is answerable for.
 
@@ -1448,7 +1467,7 @@ def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
         return ()
     if not spec.scopes:
         return spec.checks
-    kind = target_kind(str(target_name).strip())
+    kind = scoped_target_kind(spec, str(target_name).strip())
     for declared, checks in spec.scopes:
         if declared == kind:
             return checks
@@ -2940,7 +2959,7 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     spec = AUDITS.get(audit_id)
     if not spec or not spec.scopes or not targets:
         return []
-    seen = {target_kind(str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    seen = {scoped_target_kind(spec, str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
     gaps = []
     for kind, checks in spec.scopes:
         if kind in seen:

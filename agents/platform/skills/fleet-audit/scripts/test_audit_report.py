@@ -2651,11 +2651,13 @@ class TestAuditCatalogue(unittest.TestCase):
                         "for Standard/Autopilot",
                     )
 
-    def test_cost_sop_check_3_8_handles_autopilot_when_3_7_skipped(self):
-        """Check 3.8 must specify evaluation for Autopilot where 3.7 is skipped."""
+    def test_cost_sop_check_3_8_goes_with_3_7_on_autopilot(self):
+        """3.8 examines only 3.7's flagged nodes, so the SOP declares both
+        inapplicable on Autopilot, matching what `fleet_waste.py` writes."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-wide-cost-analysis"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("Autopilot clusters where 3.7 is skipped", text)
+        self.assertIn("skip 3.7 and 3.8, and declare both", text)
+        self.assertNotIn("Autopilot clusters where 3.7 is skipped", text)
 
     def test_drift_sop_declares_autopilot_non_configurable_facets_inapplicable(self):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
@@ -14230,6 +14232,21 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
         self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
 
+    def test_a_qualified_cluster_is_a_cluster_where_no_subnet_scope_exists(self):
+        qualified = "acme-stage/europe-west1/stage-eu"
+        self.assertEqual(
+            audit_report.audit_target_checks(self.STOCKOUT, qualified),
+            audit_report.audit_target_checks(self.STOCKOUT, "stage-eu"),
+        )
+        gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster(qualified)]))
+        self.assertEqual(gaps, [])
+
+    def test_the_same_shape_stays_a_subnet_where_a_subnet_scope_exists(self):
+        self.assertEqual(
+            audit_report.audit_target_checks(self.NETWORKING, "acme-prod/us-east4/gke-nodes"),
+            ("subnet-ip-exhaustion",),
+        )
+
     def test_a_project_target_owes_only_the_project_scoped_checks(self):
         gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
         self.assertEqual(gaps, [])
@@ -14293,8 +14310,9 @@ class TestScopedCoverage(unittest.TestCase):
         """A partitioned stream that meets an unexpected target must not go
         quiet: the safe reading is that the target owes the whole roster and
         shows up as a gap — the alternative, an empty denominator, reports the
-        target as fully audited."""
-        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        target as fully audited. Two segments, because three are a qualified
+        cluster in a stream with no subnet scope."""
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/net")
         self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
 
     def test_a_kind_with_no_targets_is_a_gap(self):

@@ -42,9 +42,10 @@ pinned by `test_fleet_stockout.py` against captured responses:
   node-auto-provisioning side, which never gets as far as an attempt. Healthy
   ticks carry neither and write `jsonPayload.status` instead.
 
-Two sub-conditions are still uncovered, both for the reason the two checks
-above used to have — this repository has not exercised the shape anywhere, and
-a guess encoded as tested code looks like a fact. Check both by hand:
+Some sub-conditions are still uncovered, and governance/stockout_prevention_sop.md
+§3 lists every one for the model to check by hand. Two are uncovered for the
+reason the two checks above used to be — this repository has not exercised
+the shape anywhere, and a guess encoded as tested code looks like a fact:
 
 - **3.10(b)**, a `ComputeClass` targeting a reservation that does not exist or
   sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
@@ -53,6 +54,11 @@ a guess encoded as tested code looks like a fact. Check both by hand:
 - **3.12(b)**, a ComputeClass whose own `status.conditions` reports invalid
   configuration. `check_dangling_compute_class` covers 3.12(a), (c) and (d);
   that CRD's condition `type`/`reason` values are the unexercised shape.
+
+The rest need a read this collector does not make: namespaces for 3.12(a)'s
+namespace default, `advice capacity` for 3.8's obtainability arm, node pool
+and workload shapes for 3.3, and the region's unreserved production workloads
+for 3.10(c)'s qualifier.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -129,9 +135,95 @@ SPOT_MIN_INTERVALS = 7
 # whole stream reports on.
 SPOT_MAX_SHAPES = 8
 
+# §3.3's ">32 cores", §3.4's "> 10" rules, §3.7's 90%, and §3.10(c)'s idle
+# reservation: at most half in use with at least this many instances idle.
+LARGE_VM_VCPUS = 32
+MAX_PRIORITY_RULES = 10
+QUOTA_EXHAUSTION_RATIO = 0.9
+RESERVATION_IDLE_RATIO = 0.5
+RESERVATION_IDLE_MIN_INSTANCES = 4
+# "Alternative family fallbacks" (§3.3, §3.8) means at least a second family.
+MIN_FALLBACK_FAMILIES = 2
+ERROR_EXCERPT_CHARS = 300
+STDERR_EXCERPT_CHARS = 200
+
+# A cluster target is `<project>/<location>/<name>`, the qualified name
+# `collect.py` publishes: a bare name is not unique once two locations of one
+# project hold a cluster of the same name, and `finish` refuses a document that
+# lists one name twice. Project-scoped checks keep `project/<id>`.
+QUALIFIED_TARGET_SEPARATOR = "/"
+PROJECT_TARGET_PREFIX = "project/"
+
+# §2's standard exclusions. S1's list is the one `fleet_waste.py` and
+# `collect.py` carry; each collector runs standalone, so it is copied, not
+# imported.
+SYSTEM_NAMESPACES = frozenset(
+    {
+        "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
+        "cnrm-system", "configconnector-operator-system", "krmapihosting-system", "istio-system",
+        "asm-system", "anthos-identity-service", "gatekeeper-system", "composer-system",
+    }
+)
+SYSTEM_NAMESPACE_PREFIXES = ("gke-", "config-management-")
+ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
+OPT_OUT_LABEL = "kubeagents.x-k8s.io/stockout-audit"
+OPT_OUT_VALUE = "exempt"
+# §2's "non-production": one of these as a `-`/`_`-delimited token of a name,
+# or as the value of one of the label keys below.
+NON_PRODUCTION_TOKENS = frozenset({"test", "staging", "stage", "dev", "sandbox", "qa"})
+ENVIRONMENT_LABEL_KEYS = ("environment", "env", "stage", "tier")
+NAME_TOKEN_RE = re.compile(r"[-_]")
+
 
 def log(msg: str) -> None:
     print(f"[fleet_stockout] {msg}", file=sys.stderr, flush=True)
+
+
+def target_name(project: str, location: str, name: str) -> str:
+    """The qualified cluster target; see `QUALIFIED_TARGET_SEPARATOR`."""
+    return QUALIFIED_TARGET_SEPARATOR.join(part for part in (project, location, name) if part)
+
+
+def _is_system_namespace(ns: str) -> bool:
+    return ns in SYSTEM_NAMESPACES or ns.startswith(SYSTEM_NAMESPACE_PREFIXES)
+
+
+def standard_excluded(obj: dict) -> str | None:
+    """Which of §2's S1–S5 excludes `obj`, or None.
+
+    Applied to every workload and ComputeClass before any check reads it, so
+    an excluded workload neither fires a check nor makes a ComputeClass count
+    as referenced by an inference or stateful workload.
+    """
+    meta = obj.get("metadata") or {}
+    labels = meta.get("labels") or {}
+    if _is_system_namespace(meta.get("namespace") or ""):
+        return "S1"
+    if ADDON_MANAGER_LABEL in labels:
+        return "S2"
+    if meta.get("ownerReferences"):
+        return "S3"
+    if labels.get(OPT_OUT_LABEL) == OPT_OUT_VALUE:
+        return "S4"
+    if (obj.get("spec") or {}).get("replicas") == 0:
+        return "S5"
+    return None
+
+
+def _has_non_production_token(name: str) -> bool:
+    return any(token in NON_PRODUCTION_TOKENS for token in NAME_TOKEN_RE.split((name or "").lower()))
+
+
+def is_non_production(name: str, labels: dict | None = None, namespace: str = "") -> bool:
+    """§2's "non-production", for the checks that name it (3.2, 3.8, 3.10)."""
+    labels = labels or {}
+    if labels.get(OPT_OUT_LABEL) == OPT_OUT_VALUE:
+        return True
+    if _has_non_production_token(name) or _has_non_production_token(namespace):
+        return True
+    return any(
+        str(labels.get(key) or "").lower() in NON_PRODUCTION_TOKENS for key in ENVIRONMENT_LABEL_KEYS
+    )
 
 
 class Run(NamedTuple):
@@ -197,9 +289,10 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
-# clusters from audits for the duration of any routine config change. Each
-# collector is a standalone script with no shared import, so the constant is
-# duplicated rather than imported.
+# clusters from audits for the duration of any routine config change. The
+# enumeration helpers here are near-copies of fleet_waste.py's; the two
+# collectors import only the leaf parsers they share, not each other's fleet
+# walk, so a change to one stream's enumeration cannot move the other's.
 AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 
 
@@ -215,10 +308,11 @@ def not_running_entry(c: dict, project: str) -> dict:
     non-`collected` target, the loss is something the document has to place in
     `scope.skipped` with a reason. `collect.py` carries the same helper.
     """
+    location = c.get("location") or c.get("zone") or ""
     return {
-        "name": c.get("name", ""),
+        "name": target_name(project, location, c.get("name", "")),
         "project": project,
-        "location": c.get("location") or c.get("zone") or "",
+        "location": location,
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
         "outcome": "unreachable",
@@ -234,8 +328,11 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         ]
     )
     if result.rc != 0:
-        raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
-    clusters = json.loads(result.stdout or "[]")
+        raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
+    try:
+        clusters = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cluster enumeration returned no parseable JSON: {exc}") from exc
     running = [
         {
             "name": c["name"],
@@ -417,19 +514,26 @@ def check_ccc_large_vm_scarcity(cc: dict) -> list[dict]:
 
     priorities = (cc.get("spec") or {}).get("priorities") or []
     families = {_priority_family(p) for p in priorities if _priority_family(p)}
-    hits = []
+    if len(families) >= MIN_FALLBACK_FAMILIES:
+        return []
+    # One candidate per ComputeClass, naming every large shape: the finding
+    # identity is (check, cluster, namespace, object), so one candidate per
+    # priority gave two findings the same id, which `finish` refuses.
+    large = []
     for p in priorities:
         mt = p.get("machineType") or ""
         vcpus = _machine_type_vcpus(mt)
-        if vcpus and vcpus > 32 and len(families) < 2:
-            hits.append({"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"priority requests {mt} ({vcpus} vCPU) with only {len(families)} machine famil{'y' if len(families) == 1 else 'ies'} in the chain"})
-    return hits
+        if vcpus and vcpus > LARGE_VM_VCPUS and f"{mt} ({vcpus} vCPU)" not in large:
+            large.append(f"{mt} ({vcpus} vCPU)")
+    if not large:
+        return []
+    return [{"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"priorities request {', '.join(large)} with only {len(families)} machine famil{'y' if len(families) == 1 else 'ies'} in the chain"}]
 
 
 def check_ccc_priority_starvation(cc: dict) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
-    if len(priorities) > 10:
-        return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priority rules (> 10)"}
+    if len(priorities) > MAX_PRIORITY_RULES:
+        return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priority rules (> {MAX_PRIORITY_RULES})"}
     return None
 
 
@@ -694,7 +798,7 @@ def check_reservation(reservation: dict) -> dict | None:
     if count is None or in_use is None or count == 0:
         return None
     ratio = in_use / count
-    if ratio <= 0.5 and (count - in_use) >= 4:
+    if ratio <= RESERVATION_IDLE_RATIO and (count - in_use) >= RESERVATION_IDLE_MIN_INSTANCES:
         return {
             "object": f"Reservation/{reservation.get('name', '')}",
             "excerpt": f"inUseCount={in_use}/{count} ({ratio * 100:.0f}% used, {count - in_use} idle)",
@@ -729,7 +833,7 @@ def check_reservation_affinity(cc: dict) -> dict | None:
 _CAPACITY_QUOTA_RE = re.compile(r"(?:^|_)(?:CPUS|GPUS)(?:_ALL_REGIONS)?$|TPU")
 
 
-def check_quota(quota: dict) -> dict | None:
+def check_quota(quota: dict, region: str) -> dict | None:
     metric = str(quota.get("metric") or "")
     if not _CAPACITY_QUOTA_RE.search(metric):
         return None
@@ -739,8 +843,11 @@ def check_quota(quota: dict) -> dict | None:
     if not limit:
         return None
     ratio = usage / limit
-    if ratio >= 0.9:
-        return {"object": f"Quota/{quota.get('metric', '')}", "excerpt": f"{quota.get('metric')}: {usage}/{limit} ({ratio * 100:.0f}%)"}
+    if ratio >= QUOTA_EXHAUSTION_RATIO:
+        # The region is in the object because the same metric is a separate
+        # quota in every region, and without it two regions' `CPUS` shared one
+        # finding id.
+        return {"object": f"Quota/{region}:{metric}", "excerpt": f"{region}: {metric}: {usage}/{limit} ({ratio * 100:.0f}%)"}
     return None
 
 
@@ -793,8 +900,10 @@ def autoscaler_message_ids(entries: object) -> dict[str, dict]:
     return found
 
 
-def check_autoscaler_out_of_resources(message_ids: dict[str, dict], cluster: str) -> list[dict]:
-    """One finding per distinct message id, not per log entry.
+def check_autoscaler_out_of_resources(message_ids: dict[str, dict]) -> list[dict]:
+    """One finding per distinct message id, not per log entry, and the id is
+    the object: §3.11's remediation branches on it, and two ids on one cluster
+    under one `Cluster/<name>` object shared a finding id.
 
     A cluster wedged against a regional stockout emits the same id every
     autoscaler tick, and the SOP's remediation branches on the id rather than
@@ -820,7 +929,7 @@ def check_autoscaler_out_of_resources(message_ids: dict[str, dict], cluster: str
         )
         hits.append(
             {
-                "object": f"Cluster/{cluster}",
+                "object": f"ScaleUpError/{message_id}",
                 "excerpt": (
                     f"{message_id}, {seen['count']} occurrence"
                     f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
@@ -838,27 +947,37 @@ def spot_shapes(compute_classes: list[dict], node_pools: list[dict]) -> dict[str
     priority naming only `machineFamily` has no shape to query — those are
     counted here and reported as unmeasured rather than dropped.
 
-    `families` is what §3.8's "without alternative family fallbacks" tests. A
-    node pool has no fallback chain at all, so it carries 1 by construction:
-    when its shape runs out, nothing else is tried.
+    `families` is what §3.8's "without alternative family fallbacks" tests,
+    kept per owner: a single-family node pool is not excused because some
+    other ComputeClass asking for the same shape spans two families. A node
+    pool has no fallback chain at all, so it carries 1 by construction: when
+    its shape runs out, nothing else is tried.
+
+    Owners §2 calls non-production are left out, since §3.8 does not flag
+    them.
     """
     shapes: dict[str, dict] = {}
 
     def add(machine_type: str, owner: str, families: int) -> None:
-        slot = shapes.setdefault(machine_type, {"owners": [], "families": families})
+        slot = shapes.setdefault(machine_type, {"owners": [], "families": {}})
         if owner not in slot["owners"]:
             slot["owners"].append(owner)
-        slot["families"] = max(slot["families"], families)
+        slot["families"][owner] = max(slot["families"].get(owner, 0), families)
 
     for cc in compute_classes:
+        meta = cc.get("metadata") or {}
+        if is_non_production(meta.get("name", ""), meta.get("labels")):
+            continue
         priorities = (cc.get("spec") or {}).get("priorities") or []
         families = len({_priority_family(p) for p in priorities if _priority_family(p)})
-        owner = f"ComputeClass/{cc.get('metadata', {}).get('name', '')}"
+        owner = f"ComputeClass/{meta.get('name', '')}"
         for priority in priorities:
             if _priority_is_spot(priority) and priority.get("machineType"):
                 add(str(priority["machineType"]), owner, families)
     for pool in node_pools:
         config = pool.get("config") or {}
+        if is_non_production(pool.get("name", ""), {**(config.get("resourceLabels") or {}), **(config.get("labels") or {})}):
+            continue
         if config.get("spot") and config.get("machineType"):
             add(str(config["machineType"]), f"NodePool/{pool.get('name', '')}", 1)
     return shapes
@@ -966,6 +1085,7 @@ def check_spot_scarcity(
     """
     rate, intervals = mean_preemption_rate(advice)
     owners = ", ".join(shape["owners"])
+    exposed = [o for o in shape["owners"] if shape["families"][o] < MIN_FALLBACK_FAMILIES]
     if rate is None:
         return None, (
             f"spot-scarcity-risk could not be measured for {machine_type} in "
@@ -978,17 +1098,18 @@ def check_spot_scarcity(
             f"{intervals} daily interval(s), under the {SPOT_MIN_INTERVALS} this "
             f"check needs to mean anything (requested by {owners})"
         )
-    if rate <= SPOT_PREEMPTION_CEILING or shape["families"] >= 2:
+    if rate <= SPOT_PREEMPTION_CEILING or not exposed:
         return None, None
     price = spot_list_price(advice)
+    families = shape["families"][exposed[0]]
     return {
-        "object": owners.split(", ")[0],
+        "object": exposed[0],
         "excerpt": (
             f"Spot {machine_type} in {region} preempted at a mean "
             f"{rate * 100:.1f}% per day over {intervals} days (ceiling "
-            f"{SPOT_PREEMPTION_CEILING * 100:.0f}%), and the requesting chain "
-            f"names {shape['families']} machine famil"
-            f"{'y' if shape['families'] == 1 else 'ies'} — no alternative to fall "
+            f"{SPOT_PREEMPTION_CEILING * 100:.0f}%), and {', '.join(exposed)} "
+            f"name{'s' if len(exposed) == 1 else ''} {families} machine famil"
+            f"{'y' if families == 1 else 'ies'} — no alternative to fall "
             f"back to" + (f"; list price {price}/h" if price else "")
         ),
     }, None
@@ -1079,40 +1200,48 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
         file=sys.stderr,
     )
     return {
-        "name": cluster.get("name", "?"),
+        "name": target_name(cluster.get("project", ""), cluster.get("location", ""), cluster.get("name", "?")),
         "project": cluster.get("project", "?"),
         "location": cluster.get("location", "?"),
         "autopilot": bool(cluster.get("autopilot")),
         "has_nap": bool(cluster.get("has_nap")),
         "outcome": "gate-failed",
-        "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+        "error": f"collector raised {type(exc).__name__}: {exc}"[:ERROR_EXCERPT_CHARS],
     }
 
 
 def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
+    # `name` stays bare for the gcloud and logging reads; `target` is what the
+    # manifest publishes.
+    target = target_name(project, location, name)
     # Both are cluster properties `enumerate_clusters` already resolved, and
     # both ride on every shape below: neither stops being true because this
     # run failed to read inside the cluster.
     mode = {"autopilot": bool(cluster.get("autopilot")), "has_nap": bool(cluster.get("has_nap"))}
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": name, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses,nodes", "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
-        return {"name": name, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
 
     items = parsed.get("items", [])
-    compute_classes = [i for i in items if i.get("kind") == "ComputeClass"]
-    deployments = [i for i in items if i.get("kind") == "Deployment"]
-    statefulsets = [i for i in items if i.get("kind") == "StatefulSet"]
+    all_compute_classes = [i for i in items if i.get("kind") == "ComputeClass"]
+    # §2's standard exclusions, applied before any check reads an object. An
+    # excluded workload also stops counting as a ComputeClass's inference or
+    # stateful referrer. `compute_classes_by_name` keeps every class, because
+    # whether a referenced class *exists* (3.12(a)) does not depend on it.
+    compute_classes = [cc for cc in all_compute_classes if not standard_excluded(cc)]
+    deployments = [i for i in items if i.get("kind") == "Deployment" and not standard_excluded(i)]
+    statefulsets = [i for i in items if i.get("kind") == "StatefulSet" and not standard_excluded(i)]
     storage_classes = {i["metadata"]["name"]: i for i in items if i.get("kind") == "StorageClass"}
     workloads = deployments + statefulsets
-    compute_classes_by_name = {cc["metadata"]["name"]: cc for cc in compute_classes}
+    compute_classes_by_name = {cc["metadata"]["name"]: cc for cc in all_compute_classes}
 
     # §3.9's ">= 90% of maxNodeCount" test needs the pool's *live* node
     # count, which the GKE `NodePool` resource itself never exposes --
@@ -1195,37 +1324,39 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         if cc_ref and _is_ai_workload(template_spec):
             cc_referenced_by_inference.add(cc_ref)
 
-    if compute_classes:
-        for cc_slug in ("ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation"):
-            commands[cc_slug] = dump_record
-        for cc in compute_classes:
-            for hit in [check_ccc_missing_fallbacks(cc)]:
-                if hit:
-                    candidates.append(_emit("ccc-missing-fallbacks", hit))
-            for hit in [check_ccc_no_ondemand_floor(cc, cc["metadata"]["name"] in cc_referenced_by_inference)]:
+    # Recorded whether or not the dump held a ComputeClass or a StatefulSet.
+    # The dump read both kinds, so "there are none" is this check's answer
+    # rather than a check nobody ran -- the reasoning single-zone-nodepool
+    # gives below for a cluster with no pools. Recording them only when the
+    # inputs existed left every cluster without a ComputeClass partially
+    # audited on every run, which keeps its findings from ever resolving.
+    for cc_slug in (
+        "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
+        "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "reservation-mismatch-risk",
+    ):
+        commands[cc_slug] = dump_record
+    for cc in compute_classes:
+        cc_meta = cc.get("metadata") or {}
+        # §3.2 and §3.10 do not flag non-production.
+        non_production = is_non_production(cc_meta.get("name", ""), cc_meta.get("labels"))
+        for hit in [check_ccc_missing_fallbacks(cc)]:
+            if hit:
+                candidates.append(_emit("ccc-missing-fallbacks", hit))
+        if not non_production:
+            for hit in [check_ccc_no_ondemand_floor(cc, cc_meta["name"] in cc_referenced_by_inference)]:
                 if hit:
                     candidates.append(_emit("ccc-no-ondemand-floor", hit))
-            candidates += [_emit("ccc-large-vm-scarcity", hit) for hit in check_ccc_large_vm_scarcity(cc)]
-            for hit in [check_ccc_priority_starvation(cc)]:
-                if hit:
-                    candidates.append(_emit("ccc-priority-starvation", hit))
-
-        if statefulsets:
-            commands["ccc-mixed-disk-generations"] = dump_record
-            for cc in compute_classes:
-                stateful_referencing = cc["metadata"]["name"] in cc_referenced_by_stateful
-                for hit in [check_ccc_mixed_disk_generations(cc, stateful_referencing)]:
-                    if hit:
-                        candidates.append(_emit("ccc-mixed-disk-generations", hit))
-            commands["ccc-hyperdisk-incompatible"] = dump_record
-            for cc in compute_classes:
-                uses_hyperdisk = cc["metadata"]["name"] in cc_referenced_by_hyperdisk
-                for hit in [check_ccc_hyperdisk_incompatible(cc, uses_hyperdisk)]:
-                    if hit:
-                        candidates.append(_emit("ccc-hyperdisk-incompatible", hit))
-
-        commands["reservation-mismatch-risk"] = dump_record
-        for cc in compute_classes:
+        candidates += [_emit("ccc-large-vm-scarcity", hit) for hit in check_ccc_large_vm_scarcity(cc)]
+        for hit in [check_ccc_priority_starvation(cc)]:
+            if hit:
+                candidates.append(_emit("ccc-priority-starvation", hit))
+        for hit in [check_ccc_mixed_disk_generations(cc, cc_meta["name"] in cc_referenced_by_stateful)]:
+            if hit:
+                candidates.append(_emit("ccc-mixed-disk-generations", hit))
+        for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
+            if hit:
+                candidates.append(_emit("ccc-hyperdisk-incompatible", hit))
+        if not non_production:
             for hit in [check_reservation_affinity(cc)]:
                 if hit:
                     candidates.append(_emit("reservation-mismatch-risk", hit))
@@ -1238,6 +1369,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
 
     not_applicable: list[dict] = []
     limitations: list[str] = []
+    # Checks whose read failed: neither run nor inapplicable. `finish` refuses
+    # a document that claims one as either, which is the enforcement a
+    # `limitations` sentence alone cannot give.
+    unevaluated: dict[str, str] = {}
     if autopilot:
         # Declared by the collector rather than left to the model, for the
         # reason cross_check_manifest's note on `checks_not_applicable` gives:
@@ -1266,12 +1401,16 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
+        pools_failure = (
+            f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
+            f"{pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
+        )
+        unevaluated["single-zone-nodepool"] = pools_failure
         limitations.append(
             f"single-zone-nodepool could not be measured on this cluster: "
-            f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
-            f"{pools_result.stderr.strip()[:200] or 'no stderr'}. The same failure "
-            f"left dangling-compute-class without node pool labels, so its "
-            f"nodePoolAutoCreation arm did not run either"
+            f"{pools_failure}. The same failure left dangling-compute-class "
+            f"without node pool labels, so its nodePoolAutoCreation arm did not "
+            f"run either, and spot-scarcity-risk read no Spot node pool"
         )
 
     # §3.11. One read per cluster, and it is recorded whether or not it found
@@ -1281,6 +1420,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     logging_argv = [
         "gcloud", "logging", "read",
         f'log_id("{AUTOSCALER_LOG_ID}") AND resource.labels.cluster_name="{name}" '
+        f'AND resource.labels.location="{location}" '
         f"AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)",
         "--project", project, "--freshness", AUTOSCALER_FRESHNESS,
         "--limit", str(AUTOSCALER_LOG_LIMIT), "--format", "json",
@@ -1292,14 +1432,23 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # output, because gcloud prints nothing at all when nothing matched.
         # rc == 0 already told us the read succeeded, so an empty window is a
         # clean cluster rather than a gap.
-        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries), name):
+        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries)):
             candidates.append(_emit("autoscaler-out-of-resources", hit))
+        if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
+            # gcloud returns newest first, so a full page drops the oldest
+            # entries of the window, and a stockout among them is unseen.
+            limitations.append(
+                f"autoscaler-out-of-resources read the newest {AUTOSCALER_LOG_LIMIT} "
+                f"visibility-log entries, the read's limit; older entries in the "
+                f"{AUTOSCALER_FRESHNESS} window were not read"
+            )
     else:
-        limitations.append(
-            f"autoscaler-out-of-resources could not be measured on this cluster: "
+        logging_failure = (
             f"`gcloud logging read` failed (rc={logging_result.rc}) — "
-            f"{logging_result.stderr.strip()[:200] or 'no stderr'}"
+            f"{logging_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
         )
+        unevaluated["autoscaler-out-of-resources"] = logging_failure
+        limitations.append(f"autoscaler-out-of-resources could not be measured on this cluster: {logging_failure}")
 
     # §3.8. `capacity-history` takes one machine type per call, so the cost is
     # one read per distinct Spot shape rather than one per cluster. Ordered so
@@ -1307,6 +1456,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # whichever ones a dict happened to yield first.
     shapes = spot_shapes(compute_classes, node_pools if pools_readable else [])
     region = region_of(location)
+    spot_hits: dict[str, dict] = {}
     for machine_type in sorted(shapes)[:SPOT_MAX_SHAPES]:
         advice_argv = [
             "gcloud", "beta", "compute", "advice", "capacity-history",
@@ -1319,7 +1469,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             limitations.append(
                 f"spot-scarcity-risk could not be measured for {machine_type} in "
                 f"{region}: `gcloud beta compute advice capacity-history` failed "
-                f"(rc={advice_result.rc}) — {advice_result.stderr.strip()[:200] or 'no stderr'}"
+                f"(rc={advice_result.rc}) — {advice_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
             )
             continue
         commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)
@@ -1329,9 +1479,18 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         hit, limitation = check_spot_scarcity(machine_type, shapes[machine_type], region, first)
         if hit:
             hit["command"] = shlex.join(advice_argv)
-            candidates.append(_emit("spot-scarcity-risk", hit))
+            # One candidate per object: two hot shapes in one ComputeClass
+            # would otherwise share a finding id. The first shape's command
+            # stays as the evidence; the excerpt names both.
+            if hit["object"] in spot_hits:
+                spot_hits[hit["object"]]["excerpt"] += f"; {hit['excerpt']}"
+            else:
+                spot_hits[hit["object"]] = hit
         if limitation:
             limitations.append(limitation)
+    candidates += [_emit("spot-scarcity-risk", hit) for hit in spot_hits.values()]
+    if shapes and "spot-scarcity-risk" not in commands:
+        unevaluated["spot-scarcity-risk"] = "every capacity-history read for this cluster's Spot shapes failed"
     if len(shapes) > SPOT_MAX_SHAPES:
         limitations.append(
             f"spot-scarcity-risk read {SPOT_MAX_SHAPES} of this cluster's "
@@ -1348,6 +1507,13 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"spot-scarcity-risk could not be measured for Spot requests that "
             f"name no machine type, which `capacity-history` has no way to "
             f"query: {', '.join(unqueryable)}"
+        )
+    elif not shapes and not autopilot and not pools_readable:
+        # The node pools were not read, so "nothing here requests Spot" is
+        # not something this run knows.
+        unevaluated["spot-scarcity-risk"] = (
+            "no ComputeClass names a Spot machine type and the node pools could "
+            "not be read, so whether a Spot node pool exists is unknown"
         )
     elif not shapes:
         # No command to record, so §6 would otherwise read the missing record as
@@ -1388,45 +1554,72 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         not_applicable.append({"check": "spot-scarcity-risk", "reason": reason})
 
     entry = {
-        "name": name, "project": project, "location": location, **mode,
+        "name": target, "project": project, "location": location, **mode,
         "outcome": "collected",
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
+    if unevaluated:
+        entry["checks_unevaluated"] = [
+            {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())
+        ]
     if limitations:
         entry["limitations"] = "; ".join(limitations)
     return entry
 
 
-def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict | None:
+def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict:
     res_argv = ["gcloud", "compute", "reservations", "list", "--project", project, "--format", "json"]
     reservations, res_result = run_and_gate(res_argv, run=run)
 
     quota_records: dict[str, dict] = {}
     quota_candidates: list[dict] = []
-    for region in cluster_regions:
+    failed_regions: list[str] = []
+    # Sorted so the recorded command, and the order of any limitation, is the
+    # same on every run.
+    for region in sorted(cluster_regions):
         q_argv = ["gcloud", "compute", "regions", "describe", region, "--project", project, "--format", "json(quotas)"]
         parsed, result = run_and_gate(q_argv, run=run)
-        if parsed is None:
+        if not isinstance(parsed, dict):
+            failed_regions.append(
+                f"{region} (rc={result.rc}: {result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no parseable output'})"
+            )
             continue
         quota_records[region] = _record(shlex.join(q_argv), result)
         for quota in parsed.get("quotas") or []:
-            for hit in [check_quota(quota)]:
+            for hit in [check_quota(quota, region)]:
                 if hit:
-                    hit["excerpt"] = f"{region}: {hit['excerpt']}"
                     hit["command"] = shlex.join(q_argv)
                     quota_candidates.append(_emit("quota-exhaustion-risk", hit))
 
-    if reservations is None and not quota_records:
-        return None
+    name = f"{PROJECT_TARGET_PREFIX}{project}"
+    unevaluated: dict[str, str] = {}
+    limitations: list[str] = []
+    if reservations is None:
+        reservations_failure = (
+            f"`gcloud compute reservations list` failed (rc={res_result.rc}) — "
+            f"{res_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no parseable output'}"
+        )
+        unevaluated["reservation-mismatch-risk"] = reservations_failure
+        limitations.append(f"reservation-mismatch-risk's idle-capacity form could not be measured: {reservations_failure}")
+    if failed_regions and not quota_records:
+        unevaluated["quota-exhaustion-risk"] = f"every regional quota read failed: {', '.join(failed_regions)}"
+    if failed_regions:
+        # A region that failed is a region nobody checked. Recording the check
+        # as run on the strength of the regions that answered, with nothing
+        # naming the one that did not, published an all-clear for it.
+        limitations.append(f"quota-exhaustion-risk could not read these regions: {', '.join(failed_regions)}")
 
     commands = []
     candidates = []
     if reservations is not None:
         commands.append({"check": "reservation-mismatch-risk", **_record(shlex.join(res_argv), res_result)})
-        for reservation in reservations:
+        for reservation in reservations if isinstance(reservations, list) else []:
+            # §3.10 does not flag non-production.
+            if is_non_production(reservation.get("name", ""), reservation.get("resourceLabels")):
+                continue
             for hit in [check_reservation(reservation)]:
                 if hit:
                     candidates.append(_emit("reservation-mismatch-risk", hit))
@@ -1434,14 +1627,21 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
         commands.append({"check": "quota-exhaustion-risk", **next(iter(quota_records.values()))})
         candidates.extend(quota_candidates)
 
-    return {
-        "name": f"project/{project}",
+    entry = {
+        "name": name,
         "project": project,
         "location": "global",
         "outcome": "collected",
         "commands": commands,
         "candidates": candidates,
     }
+    if unevaluated:
+        entry["checks_unevaluated"] = [
+            {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())
+        ]
+    if limitations:
+        entry["limitations"] = "; ".join(limitations)
+    return entry
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS) -> dict:
@@ -1451,7 +1651,21 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         result = run(["gcloud", "config", "get-value", "project"])
         resolved_project = result.stdout.strip() if result.rc == 0 else ""
 
-    clusters, not_running = enumerate_clusters(resolved_project, run=run)
+    try:
+        clusters, not_running = enumerate_clusters(resolved_project, run=run)
+    except RuntimeError as exc:
+        # The manifest contract's top-level `error`: a run that enumerated
+        # nothing says so rather than emitting an empty `clusters` array,
+        # which reads as an empty fleet. `main` exits non-zero on it.
+        return {
+            "version": MANIFEST_VERSION,
+            "checks_revision": CHECKS_REVISION,
+            "audit": "stockout-prevention",
+            "started_at": started_at,
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": str(exc),
+            "clusters": [],
+        }
     cluster_entries = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
@@ -1471,7 +1685,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         "audit": "stockout-prevention",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [e for e in cluster_entries if e] + ([project_entry] if project_entry else []) + not_running,
+        "clusters": [e for e in cluster_entries if e] + [project_entry] + not_running,
     }
 
 
@@ -1481,7 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
-    return 0
+    return 1 if manifest.get("error") else 0
 
 
 if __name__ == "__main__":

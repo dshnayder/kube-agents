@@ -438,8 +438,8 @@ site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 paragraph of `agent-shell-sandboxing.md`. It is useful without a consumer: any script in the
 sandbox can read the three Monitoring shapes through it today.
 
-What follows is the consumer's side, and it is a contract rather than code on `main`: a
-collector that needs Monitoring history obtains its `requests`-shaped session from
+The first consumer is `skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector,
+and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
 `limitations` note rather than as zero usage, which is the reading the cost SOP already
@@ -449,12 +449,11 @@ so a consumer written that way has no second path to remove.
 ## Rejected alternatives
 
 - **Keep sampling with proxied `kubectl top`.** Needs nothing new and is already allowed; it
-  is what the cost SOP's §3.1 does today, three samples about five minutes apart over a
-  ten-minute window, and the SOP's own
-  sampling-honesty paragraph says what that cannot see — a nightly batch peak, a weekday
-  curve. A week of history is what the follow-up collector adds so a proposed request value
-  rests on more than one Monday morning; the sampling stays as the fallback where the relay
-  answers with a `limitations` note.
+  is what the cost SOP's §3.1 did before its collector, three samples about five minutes
+  apart over a ten-minute window, which cannot see a nightly batch peak or a weekday curve. A
+  week of history lets a proposed request value rest on more than one Monday morning. Where
+  the relay refuses, the usage checks are a `limitations` note rather than a sampled
+  fallback, because a point sample is the evidence the week replaced.
 - **Ship `google-auth` in the sandbox.** The import would succeed and the call would fail with
   the unbound identity. The sandbox Dockerfile does not install the package for that reason.
 - **Run the Monitoring read on the gateway as a `no_agent` job.** Works only because the

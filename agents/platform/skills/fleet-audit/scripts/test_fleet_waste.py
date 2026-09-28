@@ -55,6 +55,18 @@ class ParseCpuMemTest(unittest.TestCase):
     def test_kibibytes(self):
         self.assertAlmostEqual(fw.parse_mem_mib("2048Ki"), 2.0)
 
+    def test_decimal_suffixes_are_powers_of_a_thousand(self):
+        self.assertAlmostEqual(fw.parse_mem_mib("1G"), 1e9 / (1024 * 1024))
+        self.assertAlmostEqual(fw.parse_mem_mib("500M"), 500e6 / (1024 * 1024))
+        self.assertAlmostEqual(fw.parse_mem_mib("128k"), 128e3 / (1024 * 1024))
+
+    def test_the_large_binary_suffixes_parse(self):
+        self.assertEqual(fw.parse_mem_mib("1Pi"), 1024.0**3)
+
+    def test_pv_capacity_in_decimal_units_counts_toward_the_size_floor(self):
+        self.assertAlmostEqual(fw._gib("200G"), 200e9 / 1024**3)
+        self.assertEqual(fw._gib("1Ti"), 1024.0)
+
     def test_bare_number_is_bytes_not_mebibytes(self):
         self.assertAlmostEqual(fw.parse_mem_mib(str(512 * 1024 * 1024)), 512.0)
 
@@ -238,6 +250,13 @@ class FetchUsagePeaksTest(unittest.TestCase):
         self.assertEqual(aligners[fw.CPU_METRIC], "ALIGN_RATE")
         self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
 
+    def test_memory_excludes_page_cache_and_cpu_is_unfiltered(self):
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        self.fetch(session)
+        filters = {c["filter"].split('"')[1]: c["filter"] for c in session.calls}
+        self.assertIn('memory_type="non-evictable"', filters[fw.MEM_METRIC])
+        self.assertNotIn("memory_type", filters[fw.CPU_METRIC])
+
 
 class FetchMemoryMeansTest(unittest.TestCase):
     def fetch(self, session, **kwargs):
@@ -407,6 +426,25 @@ class FetchLbTrafficTest(unittest.TestCase):
         traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 5)]), rules=rules)
         self.assertEqual(sorted(traffic), ["34.186.100.26"])
 
+    def test_rules_sharing_an_address_are_summed_not_overwritten(self):
+        """A TCP and a UDP Service on one static IP: the quiet rule must not
+        stand in for the busy one."""
+        rules = [
+            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        ]
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-tcp", 900000), lb_series("rule-udp", 5)]), rules=rules)
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 900005)
+        self.assertEqual(traffic["34.186.100.26"]["rule"], "rule-tcp,rule-udp")
+
+    def test_one_unmeasured_rule_leaves_the_shared_address_unknown(self):
+        rules = [
+            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        ]
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-udp", 5)]), rules=rules)
+        self.assertIsNone(traffic["34.186.100.26"]["ingress_packets"])
+
     def test_a_project_with_no_external_rule_reads_as_nothing_to_measure(self):
         traffic, result = self.fetch(FakeLbSession(), rules=[])
         self.assertEqual(traffic, {})
@@ -530,6 +568,18 @@ class OrphanPvTest(unittest.TestCase):
         pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.claimRef": {"namespace": "default", "name": "data"}})
         pvc = obj("PersistentVolumeClaim", "data", ns="default")
         self.assertEqual(fw.check_orphan_pv(self.context([pv], pvcs=[pvc]), now=NOW), [])
+
+    def test_a_claim_recreated_under_the_same_name_leaves_the_old_pv_orphaned(self):
+        pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.claimRef": {"namespace": "default", "name": "data-mydb-0", "uid": "old"}})
+        pvc = obj("PersistentVolumeClaim", "data-mydb-0", ns="default", **{"metadata.uid": "new"})
+        sts = obj("StatefulSet", "mydb", ns="default")
+        self.assertEqual(len(fw.check_orphan_pv(self.context([pv], pvcs=[pvc], sts=[sts]), now=NOW)), 1)
+        pvc["metadata"]["uid"] = "old"
+        self.assertEqual(fw.check_orphan_pv(self.context([pv], pvcs=[pvc], sts=[sts]), now=NOW), [])
+
+    def test_the_age_fallback_takes_the_longer_floor(self):
+        pv = self.pv("Released", **{"metadata.creationTimestamp": "2026-07-20T00:00:00Z"})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
 
     def test_scaled_to_zero_statefulset_claim_is_suppressed(self):
         pv = self.pv(
@@ -834,10 +884,21 @@ class IdleNodepoolTest(unittest.TestCase):
         for pod in addons:
             pod["metadata"]["labels"] = {"k8s-app": "kube-dns"}
         context = {"nodes": [node], "pods": addons,
-                   "pdbs": [{"spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}}}]}
+                   "pdbs": [{"metadata": {"namespace": "kube-system"}, "spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}}}]}
         pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
         excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
         self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_a_pdb_in_another_namespace_covers_nothing_here(self):
+        pdb = ("default", {"matchLabels": {"k8s-app": "kube-dns"}})
+        self.assertFalse(fw._selector_matches(pdb, "kube-system", {"k8s-app": "kube-dns"}))
+        self.assertTrue(fw._selector_matches(pdb, "default", {"k8s-app": "kube-dns"}))
+
+    def test_match_expressions_are_honoured(self):
+        pdb = ("app", {"matchExpressions": [{"key": "tier", "operator": "In", "values": ["db"]}]})
+        self.assertTrue(fw._selector_matches(pdb, "app", {"tier": "db"}))
+        self.assertFalse(fw._selector_matches(pdb, "app", {"tier": "web"}))
+        self.assertFalse(fw._selector_matches(pdb, "app", {}))
 
     def test_a_mirror_pod_is_not_a_blocker(self):
         """kube-proxy is owned by the Node, not a DaemonSet, so the DaemonSet
@@ -1248,6 +1309,43 @@ class OverrequestTest(unittest.TestCase):
         )
 
     IDLE = {("default", "api-1"): (0.0, 0.0)}
+
+    def hashed_pod(self):
+        pod = self.deployment_pod(owner_name="api-5d8f7")
+        pod["metadata"]["labels"]["pod-template-hash"] = "5d8f7"
+        return pod
+
+    def test_an_hpa_target_is_not_resized(self):
+        pod = self.hashed_pod()
+        hpa = obj("HorizontalPodAutoscaler", "api", ns="default", **{"spec.scaleTargetRef": {"kind": "Deployment", "name": "api"}})
+        self.assertEqual(fw.check_overrequest({"pods": [pod], "hpas": [hpa]}, self.IDLE, now=NOW, autopilot=False), [])
+        # Control: the same controller with no HPA is reported.
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_a_request_the_limitrange_filled_in_is_not_resized(self):
+        pod = self.deployment_pod()
+        lr = obj("LimitRange", "defaults", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "12", "memory": "48Gi"}}]})
+        self.assertEqual(fw.check_overrequest({"pods": [pod], "limitranges": [lr]}, self.IDLE, now=NOW, autopilot=False), [])
+        other = obj("LimitRange", "defaults", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "1", "memory": "1Gi"}}]})
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod], "limitranges": [other]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_a_deleting_or_failed_pod_is_not_a_replica(self):
+        deleting = self.deployment_pod(name="api-2")
+        deleting["metadata"]["deletionTimestamp"] = "2026-07-31T00:00:00Z"
+        failed = self.deployment_pod(name="api-3")
+        failed["status"]["phase"] = "Failed"
+        by_owner = fw._eligible_pods_by_owner({"pods": [self.deployment_pod(), deleting, failed]}, now=NOW)
+        self.assertEqual([len(e["pods"]) for e in by_owner.values()], [1])
+
+    def test_guaranteed_is_decided_per_container(self):
+        def entry(*containers):
+            return {"pods": [{"requests": [c[0] for c in containers], "limits": [c[1] for c in containers]}]}
+        full = ({"cpu": "1", "memory": "1Gi"}, {"cpu": "1", "memory": "1Gi"})
+        self.assertTrue(fw._is_guaranteed(entry(full)))
+        # A request left unset defaults to the limit.
+        self.assertTrue(fw._is_guaranteed(entry(({}, {"cpu": "1", "memory": "1Gi"}))))
+        self.assertFalse(fw._is_guaranteed(entry(({"cpu": "1"}, {"cpu": "1"}))))
+        self.assertFalse(fw._is_guaranteed(entry(full, ({}, {}))))
 
     def test_flags_gross_overrequest(self):
         pod = self.deployment_pod()
@@ -2339,6 +2437,12 @@ class UnderrequestTest(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "major")
         self.assertIn("190% of request", hits[0]["excerpt"])
 
+    def test_a_container_with_no_memory_request_makes_the_mean_unattributable(self):
+        pod = self.pod()
+        pod["spec"]["containers"].append({"resources": {}})
+        means = {("kubeagents-system", "litellm-1"): 973.0}
+        self.assertEqual(self.check([pod], means), [])
+
     def test_a_burst_above_the_request_is_not_a_finding(self):
         """The distinction the whole check rests on. Burstable QoS exists so a
         pod may exceed its request; only a *mean* above it says the request was
@@ -2932,6 +3036,38 @@ class UnattachedDiskTest(unittest.TestCase):
 
     def test_flags_unattached_over_30_days(self):
         self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
+
+    def test_a_disk_labelled_for_an_unread_cluster_is_not_judged(self):
+        """Its PersistentVolumes were never read, so a detached disk it still
+        binds is missing from `live_pv_handles` and would read as abandoned."""
+        disk = self.disk()
+        disk["labels"] = {fw.GKE_CLUSTER_LABEL: "sick"}
+        self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW, unread_clusters=frozenset({"sick"})), [])
+
+    def test_an_unlabelled_pvc_disk_is_not_judged_while_any_cluster_is_unread(self):
+        disk = self.disk()
+        disk["description"] = json.dumps({"kubernetes.io/created-for/pvc/name": "data"})
+        self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW, unread_clusters=frozenset({"sick"})), [])
+
+    def test_a_disk_no_pvc_created_is_still_judged_beside_an_unread_cluster(self):
+        self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW, unread_clusters=frozenset({"sick"}))), 1)
+
+    def test_a_disk_labelled_for_a_read_cluster_is_still_judged(self):
+        disk = self.disk()
+        disk["labels"] = {fw.GKE_CLUSTER_LABEL: "healthy"}
+        self.assertEqual(len(fw.check_unattached_disk([disk], set(), now=NOW, unread_clusters=frozenset({"sick"}))), 1)
+
+    def test_managed_service_disks_are_not_judged(self):
+        for label in ("goog-composer-environment", "goog-dataproc-cluster-name"):
+            disk = self.disk()
+            disk["labels"] = {label: "x"}
+            self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW), [])
+
+    def test_a_node_boot_disk_is_judged_only_once_its_cluster_is_gone(self):
+        disk = self.disk()
+        disk["labels"] = {fw.GKE_NODE_DISK_LABEL: "", fw.GKE_CLUSTER_LABEL: "prod"}
+        self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"prod"}), [])
+        self.assertEqual(len(fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"other"})), 1)
 
     def test_does_not_flag_attached(self):
         self.assertEqual(fw.check_unattached_disk([self.disk(users=["some-vm"])], set(), now=NOW), [])
@@ -4141,7 +4277,7 @@ class FleetConcurrencyTest(unittest.TestCase):
 
         self.assertTrue(saturated.is_set(), "never reached the pool size; collection was serialized")
         self.assertGreaterEqual(state["peak"], workers)
-        self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"c{i}" for i in range(cluster_count)}), cluster_count)
+        self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"acme/us-central1/c{i}" for i in range(cluster_count)}), cluster_count)
 
 
 class CrashIsolationTest(unittest.TestCase):
@@ -4173,9 +4309,9 @@ class CrashIsolationTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
-        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("c1", "boom")}
-        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
-        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("acme/us-central1/c1", "acme/us-central1/boom")}
+        self.assertEqual(outcomes, {"acme/us-central1/c1": "collected", "acme/us-central1/boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/boom")
         self.assertIn("TypeError", boom["error"])
 
 
@@ -4184,7 +4320,10 @@ class GetTargetProjectsTest(unittest.TestCase):
         def run(argv, **kwargs):
             raise AssertionError(f"unexpected discovery call: {argv}")
 
-        self.assertEqual(fw.get_target_projects("acme-only", run=run), ["acme-only"])
+        projects, partial = fw.get_target_projects("acme-only", run=run)
+        self.assertEqual(projects, ["acme-only"])
+        # Discovery was skipped, so the run cannot vouch for the rest of the fleet.
+        self.assertIn("acme-only", partial)
 
     def test_discovers_every_project_with_a_cluster(self):
         def run(argv, **kwargs):
@@ -4197,7 +4336,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, json.dumps([{"name": "c1"}]) if project == "other" else "[]")
             raise AssertionError(argv)
 
-        self.assertEqual(fw.get_target_projects(None, run=run), ["acme", "other"])
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
 
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
@@ -4207,7 +4346,9 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(1, "", "permission denied")
             raise AssertionError(argv)
 
-        self.assertEqual(fw.get_target_projects(None, run=run), ["acme"])
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["acme"])
+        self.assertIn("permission denied", partial)
 
 
 class MultiProjectCollectFleetTest(unittest.TestCase):
@@ -4235,7 +4376,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
 
         names = {c["name"] for c in manifest["clusters"]}
-        self.assertEqual(names, {"c1", "c2", "project/acme", "project/beta"})
+        self.assertEqual(names, {"acme/us-central1/c1", "beta/us-central1/c2", "project/acme", "project/beta"})
 
     def test_cross_project_facts_do_not_leak(self):
         """A PV handle live in project acme's cluster must not suppress a
@@ -4281,10 +4422,9 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertIn("unattached-disk", {c["check"] for c in beta_entry["candidates"]})
 
     def test_a_project_whose_clusters_cannot_be_listed_is_recorded_not_skipped(self):
-        # `project/beta`'s compute entry still arrives as `collected`, so
-        # without a second entry for the enumeration itself the document sees a
-        # project with two of three checks and no clusters -- exactly what a
-        # genuinely cluster-free project looks like.
+        # A `collected` compute entry and no clusters is exactly what a
+        # genuinely cluster-free project looks like, so the failed enumeration
+        # takes the project's own entry down with it.
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
@@ -4309,9 +4449,88 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
 
         by_name = {c["name"]: c for c in manifest["clusters"]}
-        self.assertIn("project/beta/clusters", by_name)
-        self.assertEqual(by_name["project/beta/clusters"]["outcome"], "gate-failed")
-        self.assertIn("PERMISSION_DENIED", by_name["project/beta/clusters"]["error"])
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", by_name["project/beta"]["error"])
+        self.assertEqual(by_name["project/acme"]["outcome"], "collected")
+        # One entry per project name: audit_report rejects a duplicate.
+        self.assertEqual(len(by_name), len(manifest["clusters"]))
+
+    def test_a_failed_project_list_is_recorded_as_an_unenumerated_target(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "PERMISSION_DENIED: resourcemanager.projects.list")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, "[]")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        entry = by_name[fw.UNENUMERATED_PROJECTS_TARGET]
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", entry["error"])
+
+    def test_disks_an_unreachable_cluster_may_own_are_withheld_with_a_limitation(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps([
+                    {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}},
+                    {"name": "sick", "location": "us-east4", "status": "RUNNING", "autopilot": {"enabled": False}},
+                ]))
+            if "get-credentials" in argv:
+                return run_of(1, "", "unreachable") if "sick" in argv else run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                disk = {"name": "pvc-1", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "us-east4-a", "labels": {fw.GKE_CLUSTER_LABEL: "sick"}}
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertNotIn("unattached-disk", {c["check"] for c in project["candidates"]})
+        self.assertIn("unattached-disk skipped", project["limitations"])
+        self.assertIn("sick", project["limitations"])
+
+    def test_a_project_with_no_readable_cluster_withholds_unattached_disk(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps([{"name": "sick", "location": "us-east4", "status": "RUNNING", "autopilot": {"enabled": False}}]))
+            if "get-credentials" in argv:
+                return run_of(1, "", "unreachable")
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                return run_of(0, json.dumps([{"name": "boot", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "us-east4-a"}]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(project["candidates"], [])
+        self.assertNotIn("unattached-disk", {c["check"] for c in project["commands"]})
+        self.assertIn("unattached-disk was not evaluated", project["limitations"])
+
+    def test_unparseable_cluster_list_fails_that_project_not_the_run(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, "WARNING: something printed to stdout")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(project["outcome"], "gate-failed")
+        self.assertIn("parseable JSON", project["error"])
 
     def test_a_cluster_that_is_not_running_is_recorded_as_an_unreachable_target(self):
         def run(argv, **kwargs):
@@ -4338,9 +4557,9 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
         by_name = {c["name"]: c for c in manifest["clusters"]}
-        self.assertEqual(by_name["sick"]["outcome"], "unreachable")
-        self.assertIn("DEGRADED", by_name["sick"]["error"])
-        self.assertEqual(by_name["c1"]["outcome"], "collected")
+        self.assertEqual(by_name["acme/us-east4/sick"]["outcome"], "unreachable")
+        self.assertIn("DEGRADED", by_name["acme/us-east4/sick"]["error"])
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "collected")
 
     def test_a_reconciling_cluster_is_audited_rather_than_skipped(self):
         """GKE sets RECONCILING while work proceeds on a cluster whose API
@@ -4373,9 +4592,9 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
         by_name = {c["name"]: c for c in manifest["clusters"]}
-        self.assertEqual(by_name["busy"]["outcome"], "collected")
-        self.assertEqual(by_name["gone"]["outcome"], "unreachable")
-        self.assertIn("PROVISIONING", by_name["gone"]["error"])
+        self.assertEqual(by_name["acme/us-east4/busy"]["outcome"], "collected")
+        self.assertEqual(by_name["acme/us-west1/gone"]["outcome"], "unreachable")
+        self.assertIn("PROVISIONING", by_name["acme/us-west1/gone"]["error"])
 
     def fleet_with(self, clusters, orphan_rule=True):
         rule = {
@@ -4442,7 +4661,8 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
         project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
-        self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
+        self.assertEqual(project["outcome"], "gate-failed")
+        self.assertNotIn("orphan-lb", {c["check"] for c in project.get("commands", [])})
 
 
 class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
@@ -4528,7 +4748,7 @@ class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
         return manifest, seen, session
 
     def cluster(self, manifest):
-        return next(c for c in manifest["clusters"] if c["name"] == "c1")
+        return next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/c1")
 
     def idle_finding(self, manifest):
         return next(c for c in self.cluster(manifest)["candidates"] if c["check"] == "idle-workload")
@@ -4673,16 +4893,18 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
-        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "c1")
+        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/c1")
         project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
         data = {
             "audit": "fleet-wide-cost-analysis",
             "scope": {
                 "clusters": [
-                    {"name": "c1", "checks_run": [{"check": c["check"], "command": c["command"]} for c in cluster_entry["commands"]]},
+                    {"name": "acme/us-central1/c1", "checks_run": [{"check": c["check"], "command": c["command"]} for c in cluster_entry["commands"]]},
                     {"name": "project/acme", "checks_run": [{"check": c["check"], "command": c["command"]} for c in project_entry["commands"]]},
                 ],
-                "skipped": [],
+                # `--project` skipped discovery, so the rest of the fleet is a
+                # target the document has to account for.
+                "skipped": [{"cluster": fw.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}],
             },
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
@@ -4709,7 +4931,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
         data = {
             "audit": "fleet-wide-cost-analysis",
-            "scope": {"clusters": [{"name": "c1", "checks_run": [{"check": "overrequest", "command": "x"}]}]},
+            "scope": {"clusters": [{"name": "acme/us-central1/c1", "checks_run": [{"check": "overrequest", "command": "x"}]}]},
         }
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)

@@ -7,10 +7,11 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/fleet_wide_cost_analysis_sop.md.
 
-This stream's own collector: its targets are both GKE clusters (the eleven
+This stream's own collector: its targets are both GKE clusters (the fourteen
 `kubectl` object kinds in `collect_cluster`'s `dump_kinds`, plus a Cloud
 Monitoring usage read) and GCP projects
-(`gcloud compute disks/addresses/forwarding-rules/target-pools/backend-services`),
+(`gcloud compute disks/addresses/forwarding-rules/target-pools/backend-services`
+and `gcloud artifacts repositories list`),
 so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
@@ -35,8 +36,8 @@ blind spot.
 
 GKE already ships per-container CPU and memory to Cloud Monitoring on every
 cluster, retained for weeks. `fetch_usage_peaks` asks it for the peak over the
-trailing `USAGE_WINDOW_HOURS` instead, which is both faster (two HTTP reads
-per cluster, no sleeping at all) and strictly better evidence: a week-long
+trailing `USAGE_WINDOW_HOURS` instead, which is both faster (a handful of HTTP
+reads per cluster, no sleeping at all) and strictly better evidence: a week-long
 peak has already seen the batch job the sample window missed. It reads through
 the credential broker's read-only Cloud API relay
 (`docs/designs/gcp-api-relay.md`), so no token is ever materialized in the
@@ -79,11 +80,25 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 DEFAULT_TIMEOUT_S = 60
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
-# more -- per-cluster work is a handful of subprocess reads and two HTTP
+# more -- per-cluster work is a handful of subprocess reads and a few HTTP
 # reads -- so this drops back to the 8 every other collector in the stream
 # uses, which also keeps the shared Monitoring session inside urllib3's
 # default connection pool.
 MAX_WORKERS = 8
+
+# What the manifest calls a target. A GKE name is unique only inside one
+# project and location, so every cluster is `<project>/<location>/<name>`, and
+# a failed or narrowed project discovery is one `project/UNENUMERATED_PROJECTS`
+# target. Copied from `collect.py` under the standalone-collector rule below;
+# `audit_report.py` reads both shapes, so keep them in step with it.
+QUALIFIED_TARGET_SEPARATOR = "/"
+PROJECT_TARGET_PREFIX = "project/"
+UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+SCOPED_RUN_NOTE = (
+    "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
+    "project in this fleet was named or read, and this run cannot speak for their clusters."
+)
+ERROR_EXCERPT_CHARS = 300
 
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
@@ -201,6 +216,12 @@ NO_SESSION_MESSAGE = (
 MONITORING_TIMEOUT_S = 120
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# Pod phases that do not count as a running replica of their controller.
+NOT_A_REPLICA_PHASES = ("Pending", "Failed", "Succeeded")
+# `used_bytes` is split by `memory_type`, and the `evictable` half is page
+# cache the kernel reclaims under pressure. Kubelet evicts on the working set,
+# so summing the two would size requests, and flag underrequest, on cache.
+MEM_NON_EVICTABLE_FILTER = ' AND metric.labels.memory_type="non-evictable"'
 # What §3.13 reads to say what reached the load balancer in front of an idle
 # workload. Three DELTA counters on the L4 external forwarding rule, which is
 # what a GKE `type: LoadBalancer` Service creates.
@@ -465,14 +486,31 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
     return kc, result
 
 
-def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
+def target_name(project: str, location: str, name: str) -> str:
+    """`<project>/<location>/<name>`, as `collect.target_name` spells it.
+
+    Every cluster is qualified, not only one that collides today: a name
+    qualified only on collision moves when the rest of the fleet changes, and
+    a finding's id moves with it. A candidate's `object` stays the bare
+    resource, and the GitOps tree is still keyed by the bare name.
+    """
+    return QUALIFIED_TARGET_SEPARATOR.join([p for p in (project, location) if p] + [name])
+
+
+def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
     """§1's project scope: "every project the agent can see". A `--project`
     override skips discovery entirely, for a scoped or a test run; otherwise
     this discovers the active project plus every other project with at
     least one cluster, the same way `patch_readiness.py`'s
-    `get_target_projects` does for its own sibling stream."""
+    `get_target_projects` does for its own sibling stream.
+
+    The second value is set when the scope is provably short of the fleet --
+    `--project` skipped discovery, or `gcloud projects list` failed -- and
+    `collect_fleet` turns it into an `UNENUMERATED_PROJECTS_TARGET` entry, so
+    the loss is a row the document has to account for rather than a fleet that
+    silently shrank to one project."""
     if cli_project:
-        return [cli_project]
+        return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -480,7 +518,13 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
 
     _, list_result = run_and_gate(["gcloud", "projects", "list", "--format", "value(projectId)"], run=run)
     if list_result.rc != 0:
-        return projects  # discovery unavailable; the base project is the whole scope
+        stderr = list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        partial = (
+            f"`gcloud projects list` rc={list_result.rc}: {stderr}. The scope fell back to "
+            f"the active project {base!r}; how many other projects the fleet holds is unknown."
+        )
+        log(f"WARNING: {partial}")
+        return projects, partial
 
     candidates = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip() and p.strip() != base]
     for candidate in candidates:
@@ -495,7 +539,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
         # clusters. `patch_readiness.py` carries the same guard.
         if parsed is None or parsed:
             projects.append(candidate)
-    return projects
+    return projects, None
 
 
 # `RECONCILING` is not a cluster you cannot read. GKE sets it while work is in
@@ -534,10 +578,11 @@ def not_running_entry(c: dict, project: str) -> dict:
     non-`collected` target, the loss is something the document has to place in
     `scope.skipped` with a reason. `collect.py` carries the same helper.
     """
+    location = c.get("location") or c.get("zone") or ""
     return {
-        "name": c.get("name", ""),
+        "name": target_name(project, location, c.get("name", "")),
         "project": project,
-        "location": c.get("location") or c.get("zone") or "",
+        "location": location,
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": "unreachable",
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
@@ -550,7 +595,10 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     )
     if result.rc != 0:
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
-    clusters = json.loads(result.stdout or "[]")
+    try:
+        clusters = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cluster enumeration returned no parseable JSON: {exc}") from exc
     running = [
         {"name": c["name"], "location": c.get("location"), "project": project, "autopilot": bool((c.get("autopilot") or {}).get("enabled"))}
         for c in clusters
@@ -564,7 +612,10 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
 # --------------------------------------------------------------------------- #
 
 CPU_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
-MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$")
+# Both suffix families a resource.Quantity accepts: `512M` and `1G` are as
+# common in manifests as `512Mi`, and a request the regex rejects drops the
+# container out of §3.1 and §3.11 without a word.
+MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$")
 
 
 def parse_cpu_cores(s: str) -> float | None:
@@ -575,8 +626,16 @@ def parse_cpu_cores(s: str) -> float | None:
     return float(value) / 1000.0 if unit == "m" else float(value)
 
 
-MEM_UNIT_TO_MIB = {"Ki": 1 / 1024, "Mi": 1.0, "Gi": 1024.0, "Ti": 1024.0 * 1024.0}
 BYTES_PER_MIB = 1024.0 * 1024.0
+BINARY_UNIT_STEP = 1024.0
+DECIMAL_UNIT_STEP = 1000.0
+BINARY_UNITS = ("Ki", "Mi", "Gi", "Ti", "Pi", "Ei")
+DECIMAL_UNITS = ("k", "M", "G", "T", "P", "E")
+MEM_UNIT_TO_MIB = {
+    **{unit: BINARY_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(BINARY_UNITS)},
+    **{unit: DECIMAL_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(DECIMAL_UNITS)},
+}
+MIB_PER_GIB = 1024.0
 
 
 def parse_mem_mib(s: str) -> float | None:
@@ -663,7 +722,7 @@ def _read_pod_series(
     page_token = None
     while True:
         params = {
-            "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"',
+            "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
             "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
@@ -723,9 +782,10 @@ def fetch_usage_peaks(
     every workload on it as pure waste.
 
     Both metrics are per-*container*. `REDUCE_SUM` over
-    `(namespace_name, pod_name)` adds a pod's containers back together -- and,
-    for memory, its `memory_type` breakdown, so the figure is comparable to
-    the pod's summed requests.
+    `(namespace_name, pod_name)` adds a pod's containers back together, so the
+    figure is comparable to the pod's summed requests. Memory is read for
+    `memory_type="non-evictable"` only: page cache is not what a request has
+    to hold.
     """
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
@@ -961,13 +1021,20 @@ def fetch_lb_traffic(
         for rule, value in sink.items():
             totals.setdefault(rule, {})[key] = value
 
-    by_address = {
-        address: {
-            "rule": rule,
-            **{key: totals.get(rule, {}).get(key) for key, _ in metrics},
-        }
-        for rule, address in addresses.items()
-    }
+    # Several rules can share one address -- a TCP and a UDP Service on one
+    # static IP is a documented GKE pattern -- so their traffic is summed
+    # rather than the last rule read overwriting the others. One unmeasured
+    # rule leaves the sum unknown rather than understated.
+    by_address: dict[str, dict] = {}
+    for rule, address in sorted(addresses.items()):
+        measured = {key: totals.get(rule, {}).get(key) for key, _ in metrics}
+        entry = by_address.get(address)
+        if entry is None:
+            by_address[address] = {"rule": rule, **measured}
+            continue
+        entry["rule"] = f"{entry['rule']},{rule}"
+        for key, _ in metrics:
+            entry[key] = None if entry[key] is None or measured[key] is None else entry[key] + measured[key]
     # Stands in for the stdout the manifest digests, the way `fetch_usage_peaks`'
     # rendering does. Sorted by address explicitly rather than by the whole row:
     # the rows carry `None` where a rule went unmeasured, and a tuple sort that
@@ -1104,7 +1171,53 @@ def build_context(dump: dict) -> dict:
         "resourcequotas": _by_kind(dump, "ResourceQuota"),
         "statefulsets": _by_kind(dump, "StatefulSet"),
         "deployments": _by_kind(dump, "Deployment"),
+        "hpas": _by_kind(dump, "HorizontalPodAutoscaler"),
+        "limitranges": _by_kind(dump, "LimitRange"),
     }
+
+
+def _hpa_targets(context: dict) -> set[tuple[str, str, str]]:
+    """`(namespace, kind, name)` of every workload an HPA scales.
+
+    §3.1 leaves these alone: an HPA's target utilisation is a fraction of the
+    request, so halving the request doubles the utilisation it reads and the
+    autoscaler answers with replicas -- the `minReplicas` floor is the lever.
+    """
+    targets = set()
+    for hpa in context.get("hpas", []):
+        ref = (hpa.get("spec") or {}).get("scaleTargetRef") or {}
+        if ref.get("kind") and ref.get("name"):
+            targets.add(((hpa.get("metadata") or {}).get("namespace", ""), ref["kind"], ref["name"]))
+    return targets
+
+
+def _limitrange_defaults(context: dict) -> dict[str, dict]:
+    """Per namespace, the container `defaultRequest` its LimitRanges set."""
+    defaults: dict[str, dict] = {}
+    for lr in context.get("limitranges", []):
+        ns = (lr.get("metadata") or {}).get("namespace", "")
+        for limit in (lr.get("spec") or {}).get("limits") or []:
+            if limit.get("type") == "Container" and limit.get("defaultRequest"):
+                defaults.setdefault(ns, {}).update(limit["defaultRequest"])
+    return defaults
+
+
+def _requests_are_the_namespace_default(entry: dict, defaults: dict) -> bool:
+    """Whether every container's request is exactly what the LimitRange filled in.
+
+    §3.1 says to fix the LimitRange rather than the workload, so a request
+    nobody wrote is not this workload's sizing decision."""
+    if not defaults:
+        return False
+    for pod in entry["pods"]:
+        for req in pod["requests"]:
+            for resource in ("cpu", "memory"):
+                if resource not in defaults:
+                    continue
+                parse = parse_cpu_cores if resource == "cpu" else parse_mem_mib
+                if parse(str(req.get(resource, ""))) != parse(str(defaults[resource])):
+                    return False
+    return True
 
 
 def _age_days(timestamp: str, *, now: datetime) -> float | None:
@@ -1171,8 +1284,12 @@ def _matches_live_statefulset_pvc(claim_name: str, sts_names: set[str]) -> bool:
     return any(re.match(rf"^.+-{re.escape(sts)}-\d+$", claim_name) for sts in sts_names if sts)
 
 
+ORPHAN_PV_RELEASED_DAYS = 7
+ORPHAN_PV_UNCLAIMED_DAYS = 30
+
+
 def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
-    pvc_exists = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")) for p in context["pvcs"]}
+    pvc_uid = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")): p["metadata"].get("uid", "") for p in context["pvcs"]}
     sts_names = {s.get("metadata", {}).get("name", "") for s in context.get("statefulsets", [])}
     hits = []
     for pv in context["pvs"]:
@@ -1189,16 +1306,23 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
         claim_ref = spec.get("claimRef") or {}
         claim_ns, claim_name = claim_ref.get("namespace", ""), claim_ref.get("name", "")
         if claim_name:
-            if (claim_ns, claim_name) in pvc_exists:
-                continue
-            if _matches_live_statefulset_pvc(claim_name, sts_names):
+            # The name alone is not the claim: a StatefulSet PVC deleted and
+            # recreated binds a fresh PV under the same name, and the old
+            # Released one is exactly the orphan §3.2 is for.
+            live_uid = pvc_uid.get((claim_ns, claim_name))
+            if live_uid is not None:
+                if not claim_ref.get("uid") or not live_uid or claim_ref.get("uid") == live_uid:
+                    continue
+            elif _matches_live_statefulset_pvc(claim_name, sts_names):
                 continue
 
         if phase in ("Released", "Failed"):
             transition = status.get("lastPhaseTransitionTime", "")
             age = _age_days(transition, now=now) if transition else _age_days(meta.get("creationTimestamp", ""), now=now)
             fallback_note = "" if transition else " (lastPhaseTransitionTime absent; using object AGE)"
-            if age is None or age < 7:
+            # Creation is older than the release it stands in for, so the
+            # fallback takes the Available arm's longer floor.
+            if age is None or age < (ORPHAN_PV_RELEASED_DAYS if transition else ORPHAN_PV_UNCLAIMED_DAYS):
                 continue
             hits.append(
                 {
@@ -1209,7 +1333,7 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
             )
         elif phase == "Available" and not claim_ref:
             age = _age_days(meta.get("creationTimestamp", ""), now=now)
-            if age is None or age < 30:
+            if age is None or age < ORPHAN_PV_UNCLAIMED_DAYS:
                 continue
             hits.append(
                 {
@@ -1222,14 +1346,8 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
 
 
 def _gib(quantity: str) -> float:
-    quantity = quantity or "0"
-    if quantity.endswith("Ti"):
-        return float(quantity[:-2]) * 1024
-    if quantity.endswith("Gi"):
-        return float(quantity[:-2])
-    if quantity.endswith("Mi"):
-        return float(quantity[:-2]) / 1024
-    return 0.0
+    mib = parse_mem_mib(quantity or "0")
+    return mib / MIB_PER_GIB if mib is not None else 0.0
 
 
 def _is_large_or_ssd(spec: dict) -> bool:
@@ -1557,12 +1675,36 @@ def _safe_to_evict(annotations: dict) -> bool | None:
     return None
 
 
-def _selector_matches(selector: dict, labels: dict) -> bool:
-    return all(labels.get(k) == v for k, v in (selector.get("matchLabels") or {}).items())
+def _expression_matches(expr: dict, labels: dict) -> bool:
+    key, op, values = expr.get("key", ""), expr.get("operator", ""), expr.get("values") or []
+    if op == "In":
+        return labels.get(key) in values
+    if op == "NotIn":
+        return key not in labels or labels[key] not in values
+    if op == "Exists":
+        return key in labels
+    if op == "DoesNotExist":
+        return key not in labels
+    return False  # an operator this does not know matches nothing, as the API server would reject it
 
 
-def _pdb_selectors(context: dict) -> list[dict]:
-    return [((pdb.get("spec") or {}).get("selector") or {}) for pdb in (context.get("pdbs") or [])]
+def _selector_matches(pdb: tuple[str, dict], ns: str, labels: dict) -> bool:
+    """A PDB covers only pods in its own namespace, and both selector halves
+    have to hold: `matchLabels` and every `matchExpressions` term. An empty
+    selector matches every pod in the namespace, as it does for a PDB."""
+    pdb_ns, selector = pdb
+    if pdb_ns != ns:
+        return False
+    return all(labels.get(k) == v for k, v in (selector.get("matchLabels") or {}).items()) and all(
+        _expression_matches(expr, labels) for expr in selector.get("matchExpressions") or []
+    )
+
+
+def _pdb_selectors(context: dict) -> list[tuple[str, dict]]:
+    return [
+        ((pdb.get("metadata") or {}).get("namespace", ""), (pdb.get("spec") or {}).get("selector") or {})
+        for pdb in (context.get("pdbs") or [])
+    ]
 
 
 def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
@@ -1594,7 +1736,7 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
         evictable = _safe_to_evict(meta.get("annotations") or {})
         volumes = (pod.get("spec") or {}).get("volumes") or []
         local = any(("emptyDir" in v or "hostPath" in v) for v in volumes)
-        has_pdb = any(_selector_matches(sel, labels) for sel in pdb_selectors)
+        has_pdb = any(_selector_matches(sel, ns, labels) for sel in pdb_selectors)
         if ns == "kube-system" and not has_pdb:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
         elif local and evictable is not True:
@@ -1625,7 +1767,7 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         evictable = _safe_to_evict(annotations)
         has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
 
-        blocked_by_pdb = any(_selector_matches(sel, (pod.get("metadata", {}).get("labels") or {})) for sel in pdb_selectors)
+        blocked_by_pdb = any(_selector_matches(sel, ns, (pod.get("metadata", {}).get("labels") or {})) for sel in pdb_selectors)
         if blocked_by_pdb:
             continue  # already reported by obtainability-audit's 3.3/3.4
 
@@ -1888,7 +2030,9 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         ns, name = meta.get("namespace", ""), meta.get("name", "")
         if _is_system_namespace(ns):
             continue
-        if status.get("phase") in ("Pending", "Terminating"):
+        # `Terminating` is not a phase: deletion shows as `deletionTimestamp`.
+        # A Failed pod (an eviction, typically) is no replica either.
+        if status.get("phase") in NOT_A_REPLICA_PHASES or meta.get("deletionTimestamp"):
             continue
         age = _age_days(status.get("startTime", ""), now=now)
         if age is not None and age < (1 / 24):
@@ -2146,28 +2290,26 @@ def _resize_shrinks_request(
 def _is_guaranteed(entry: dict) -> bool:
     """Whether this controller's pods are `Guaranteed` QoS: requests == limits.
 
-    Aggregated across the controller's pods, which is safe for this question
-    because equality is preserved by summation in the only direction that
-    matters: pods that each declare `requests == limits` sum to equal totals,
-    and it takes an implausible coincidence -- one pod over on CPU by exactly
-    what another is under -- for unequal pods to sum to equal ones. Both checks
-    that read this then say `Guaranteed` about a controller kubelet would agree
-    with.
+    Per container, as kubelet decides it: every container needs a CPU and a
+    memory limit, and a request that is set must equal its limit. A sidecar
+    with no resources, or a missing memory limit, makes the pod Burstable
+    however the totals add up.
 
     Read by `check_overrequest`, which refuses to propose a resize here, and by
     `check_idle_workload`, which needs the same verdict because that refusal is
     what hands it the finding. Spelt once so the two cannot drift into either
     reporting one controller twice or dropping it between them.
     """
-    cpu_req = mem_req = cpu_lim = mem_lim = 0.0
     for pod in entry["pods"]:
-        for req in pod["requests"]:
-            cpu_req += parse_cpu_cores(str(req.get("cpu", "0"))) or 0
-            mem_req += parse_mem_mib(str(req.get("memory", "0"))) or 0
-        for lim in pod["limits"]:
-            cpu_lim += parse_cpu_cores(str(lim.get("cpu", "0"))) or 0
-            mem_lim += parse_mem_mib(str(lim.get("memory", "0"))) or 0
-    return cpu_req == cpu_lim and mem_req == mem_lim and cpu_lim > 0
+        for req, lim in zip(pod["requests"], pod["limits"]):
+            for resource, parse in (("cpu", parse_cpu_cores), ("memory", parse_mem_mib)):
+                limit = parse(str(lim.get(resource, "")))
+                if not limit:
+                    return False
+                # An unset request defaults to the limit, which is still Guaranteed.
+                if resource in req and parse(str(req[resource])) != limit:
+                    return False
+    return bool(entry["pods"])
 
 
 def _idle_on_every_dimension(
@@ -2246,9 +2388,15 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         return []
     by_owner = _eligible_pods_by_owner(context, now=now)
     live_owners = _live_pod_owners(context)
+    hpa_targets = _hpa_targets(context)
+    lr_defaults = _limitrange_defaults(context)
 
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
+        if (entry["ns"], kind, name) in hpa_targets:
+            continue
+        if _requests_are_the_namespace_default(entry, lr_defaults.get(entry["ns"], {})):
+            continue
         cpu_req_total = mem_req_total = 0.0
         for pod in entry["pods"]:
             for req in pod["requests"]:
@@ -2807,6 +2955,11 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
                 mem_lim_total += parse_mem_mib(str(lim.get("memory", "0"))) or 0
         if mem_req_total <= 0:
             continue  # obtainability-audit's `no-requests` owns a missing request
+        # The mean is summed over the pod's containers, and a container with no
+        # memory request adds usage with no request to set it against -- so the
+        # overage would land on whichever container did declare one.
+        if any("memory" not in req for pod in entry["pods"] for req in pod["requests"]):
+            continue
 
         replicas = len(entry["pods"])
         keys, replaced = _observed_pod_keys(entry, kind, name, memory_means, live_owners)
@@ -2931,7 +3084,9 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
         ns, name = meta.get("namespace", ""), meta.get("name", "")
         if _is_system_namespace(ns):
             continue
-        if status.get("phase") in ("Pending", "Terminating"):
+        # `Terminating` is not a phase: deletion shows as `deletionTimestamp`.
+        # A Failed pod (an eviction, typically) is no replica either.
+        if status.get("phase") in NOT_A_REPLICA_PHASES or meta.get("deletionTimestamp"):
             continue
         age = _age_days(status.get("startTime", ""), now=now)
         if age is not None and age < (1 / 24):
@@ -3600,7 +3755,7 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
         file=sys.stderr,
     )
     return {
-        "name": cluster.get("name", "?"),
+        "name": target_name(cluster.get("project", "?"), cluster.get("location", "?"), cluster.get("name", "?")),
         "project": cluster.get("project", "?"),
         "location": cluster.get("location", "?"),
         "autopilot": bool(cluster.get("autopilot")),
@@ -3636,6 +3791,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
+    target = target_name(project, location, name)
     # A cluster property `enumerate_clusters` already resolved, so it rides on
     # every shape below: the mode does not stop being true because this run
     # failed to read inside the cluster.
@@ -3644,15 +3800,15 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": name, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
 
-    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy"
+    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange"
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
-        return {"name": name, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
@@ -3927,7 +4083,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         )
 
     entry = {
-        "name": name, "project": project, "location": location, **mode, "outcome": "collected",
+        "name": target, "project": project, "location": location, **mode, "outcome": "collected",
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
@@ -3987,6 +4143,9 @@ UNATTACHED_AGE_DAYS = 30
 DEAD_CLUSTER_AGE_DAYS = 7
 #: The label GKE stamps on every PD it provisions, naming the owning cluster.
 GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+# §3.4's managed-service exclusions.
+MANAGED_DISK_LABEL_PREFIXES = ("goog-composer", "goog-dataproc")
+GKE_NODE_DISK_LABEL = "goog-gke-node"
 #: The key PD-CSI writes into a provisioned disk's `description`, whose value is
 #: a JSON object naming the PersistentVolumeClaim the disk was cut for.
 CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
@@ -4043,10 +4202,27 @@ def check_unattached_disk(
     *,
     now: datetime,
     known_clusters: set[str] | None = None,
+    unread_clusters: frozenset[str] = frozenset(),
 ) -> list[dict]:
+    """`unread_clusters` are this project's clusters whose PersistentVolumes
+    this run does not hold. A detached disk one of them still binds is not in
+    `live_pv_handles`, so it would read as abandoned: a disk labelled for one
+    is skipped, and so is an unlabelled one that a PVC created, which could
+    belong to any of them. A disk no PVC created is judged as usual.
+
+    A managed service's disk (Composer, Dataproc) is that service's to
+    reclaim, and a node boot disk is the node pool's while its cluster lives."""
     hits = []
     for disk in disks:
         if disk.get("users"):
+            continue
+        labels = disk.get("labels") or {}
+        if any(key.startswith(MANAGED_DISK_LABEL_PREFIXES) for key in labels):
+            continue
+        owner = (labels.get(GKE_CLUSTER_LABEL) or "").strip()
+        if GKE_NODE_DISK_LABEL in labels and not _dead_cluster_of(disk, known_clusters):
+            continue
+        if unread_clusters and (owner in unread_clusters or (not owner and _pvc_origin(disk))):
             continue
         idle_since, idle_phrase = _idle_since(disk)
         age = _age_days(idle_since, now=now)
@@ -4315,7 +4491,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset()) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -4374,7 +4550,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
     reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
 
-    candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters)]
+    # §3.4: with none of the project's clusters read there is no PV handle to
+    # clear any disk against, so the check is withheld rather than judged.
+    disks_judged = not (known_clusters and unread_clusters >= known_clusters)
+    candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
@@ -4386,10 +4565,8 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         "project": project,
         "location": "global",
         "outcome": "collected",
-        "commands": [
-            {"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)},
-            {"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)},
-        ]
+        "commands": ([{"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)}] if disks_judged else [])
+        + [{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}]
         + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else [])
         # Recorded only when the read succeeded, which is what puts
         # `registry-no-cleanup` into §6's `coverage_gaps` when it did not. A
@@ -4419,6 +4596,21 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "reference would read as orphaned. See this project's cluster "
             "entries in this manifest for the reason each one failed."
         )
+    if not disks_judged:
+        disk_gap = (
+            "unattached-disk was not evaluated for this project: none of its clusters "
+            f"({', '.join(sorted(unread_clusters))}) could be read, so no disk can be "
+            "cleared against a live PersistentVolume."
+        )
+        entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
+    elif unread_clusters:
+        disk_gap = (
+            "unattached-disk skipped every disk that a PersistentVolumeClaim created "
+            "and that could belong to a cluster this run did not read "
+            f"({', '.join(sorted(unread_clusters))}): those clusters' PersistentVolumes "
+            "are unknown, so a detached disk one of them still binds would read as abandoned."
+        )
+        entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     # After the block above, not before it: that one assigns `limitations`
     # outright rather than appending, so a registry gap written first would be
     # overwritten on any project with an unreadable cluster -- which is most of
@@ -4461,7 +4653,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         except Exception as exc:
             log(f"Cloud Monitoring credentials unavailable, overrequest will be skipped fleet-wide: {exc}")
 
-    projects = get_target_projects(project, run=run)
+    projects, partial_discovery = get_target_projects(project, run=run)
 
     clusters: list[dict] = []
     unaudited: list[dict] = []
@@ -4472,6 +4664,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # of `enumerate_clusters` rather than over the RUNNING one this loop feeds
     # to the workers.
     known_by_project: dict[str, set[str] | None] = {}
+    enumeration_failed: dict[str, str] = {}
     for p in projects:
         try:
             running, not_running = enumerate_clusters(p, run=run)
@@ -4485,19 +4678,13 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             # not be listed used to leave nothing in it -- its `project/<p>`
             # compute entry still arrived as `collected`, so the document saw a
             # project with two of three checks and zero clusters, which is
-            # exactly what a genuinely cluster-free project looks like. Recorded
-            # as a target, the loss is something the document has to account for
-            # and §6 turns it into a coverage gap.
+            # exactly what a genuinely cluster-free project looks like. The
+            # project's own `project/<p>` entry carries the loss instead, as
+            # `gate-failed`: §3.4 and §3.6 both need the cluster list to tell
+            # an orphan from a disk or rule a cluster still owns, so the
+            # project checks cannot run honestly without it either.
             log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
-            unaudited.append(
-                {
-                    "name": f"project/{p}/clusters",
-                    "project": p,
-                    "location": "global",
-                    "outcome": "gate-failed",
-                    "error": str(exc),
-                }
-            )
+            enumeration_failed[p] = str(exc)[:ERROR_EXCERPT_CHARS]
 
     # Built once for the whole fleet, before the pool: every cluster's
     # candidates resolve against the same clone, and walking it per cluster
@@ -4540,8 +4727,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # B's checks, and a PV handle from project A's cluster must not suppress
     # a genuinely unattached disk in project B.
     by_project: dict[str, list[tuple[dict, dict]]] = {}
+    collected_by_project: dict[str, set[str]] = {}
     for cluster, result in zip(clusters, results):
         by_project.setdefault(cluster["project"], []).append(result)
+        if result[0].get("outcome") == "collected":
+            collected_by_project.setdefault(cluster["project"], set()).add(cluster["name"])
     # The clusters that never reached a worker belong to the gate too. §3.6
     # withholds `orphan-lb` unless *every* cluster in the project was read, and
     # a DEGRADED or PROVISIONING cluster is one that was not: it goes straight
@@ -4566,13 +4756,38 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             and not skipped_by_project.get(p)
             and all(e["outcome"] == "collected" for e in group_entries)
         )
+        if p in enumeration_failed:
+            project_entries.append(
+                {
+                    "name": f"{PROJECT_TARGET_PREFIX}{p}",
+                    "project": p,
+                    "location": "global",
+                    "outcome": "gate-failed",
+                    "error": enumeration_failed[p],
+                }
+            )
+            continue
         fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
+        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=frozenset((known_by_project.get(p) or set()) - collected_by_project.get(p, set())))
         if project_entry:
             project_entries.append(project_entry)
+
+    # One rung up from a failed `clusters list`: a `projects list` that failed,
+    # or a `--project` that skipped it, took the other projects' names with it.
+    discovery_entries = []
+    if partial_discovery:
+        discovery_entries.append(
+            {
+                "name": UNENUMERATED_PROJECTS_TARGET,
+                "project": "",
+                "location": "global",
+                "outcome": "gate-failed",
+                "error": partial_discovery[:ERROR_EXCERPT_CHARS],
+            }
+        )
 
     return {
         "version": MANIFEST_VERSION,
@@ -4580,7 +4795,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         "audit": "fleet-wide-cost-analysis",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": cluster_entries + project_entries + unaudited,
+        "clusters": cluster_entries + project_entries + unaudited + discovery_entries,
     }
 
 
