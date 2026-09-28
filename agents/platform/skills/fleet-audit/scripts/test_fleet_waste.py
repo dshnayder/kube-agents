@@ -569,6 +569,18 @@ class OrphanPvTest(unittest.TestCase):
         pv = self.pv("Available")  # created 2026-01-01, unclaimed
         self.assertEqual(len(fw.check_orphan_pv(self.context([pv]), now=NOW)), 1)
 
+    def test_available_with_a_pending_claim_for_its_class_is_pre_staged(self):
+        pv = self.pv("Available", **{"spec.storageClassName": "manual"})
+        waiting = obj("PersistentVolumeClaim", "data", ns="default", **{"spec.storageClassName": "manual", "status.phase": "Pending"})
+        bound = obj("PersistentVolumeClaim", "other", ns="default", **{"spec.storageClassName": "manual", "status.phase": "Bound"})
+        self.assertEqual(fw.check_orphan_pv(self.context([pv], pvcs=[waiting]), now=NOW), [])
+        self.assertEqual(len(fw.check_orphan_pv(self.context([pv], pvcs=[bound]), now=NOW)), 1)
+
+    def test_a_pending_claim_for_another_class_does_not_excuse_it(self):
+        pv = self.pv("Available", **{"spec.storageClassName": "manual"})
+        waiting = obj("PersistentVolumeClaim", "data", ns="default", **{"spec.storageClassName": "standard-rwo", "status.phase": "Pending"})
+        self.assertEqual(len(fw.check_orphan_pv(self.context([pv], pvcs=[waiting]), now=NOW)), 1)
+
     def test_available_with_claim_ref_is_not_flagged(self):
         pv = self.pv("Available", **{"spec.claimRef": {"namespace": "default", "name": "x"}})
         self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])

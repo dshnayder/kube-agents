@@ -1350,6 +1350,13 @@ ORPHAN_PV_UNCLAIMED_DAYS = 30
 def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
     pvc_uid = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")): p["metadata"].get("uid", "") for p in context["pvcs"]}
     sts_names = {s.get("metadata", {}).get("name", "") for s in context.get("statefulsets", [])}
+    # A statically provisioned PV waiting on a claim that has not bound yet is
+    # pre-staged, not abandoned. Only this cluster's claims can bind it.
+    pending_classes = {
+        (p.get("spec") or {}).get("storageClassName") or ""
+        for p in context["pvcs"]
+        if (p.get("status") or {}).get("phase") == "Pending"
+    }
     hits = []
     for pv in context["pvs"]:
         meta, spec, status = pv.get("metadata", {}), pv.get("spec", {}), pv.get("status", {})
@@ -1393,6 +1400,8 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
         elif phase == "Available" and not claim_ref:
             age = _age_days(meta.get("creationTimestamp", ""), now=now)
             if age is None or age < ORPHAN_PV_UNCLAIMED_DAYS:
+                continue
+            if (spec.get("storageClassName") or "") in pending_classes:
                 continue
             hits.append(
                 {
