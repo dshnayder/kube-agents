@@ -11235,7 +11235,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if stale_scheme and delta_known:
         # A scheme bump re-spells every id; the rows were re-derived from their
         # `Where:` lines (`previous_marker_ids`), and only ids with no row —
-        # the note and empty tiers write none — are lost by the bump.
+        # the note and empty tiers write none — are counted here. A bump that
+        # re-spells an object (scheme 6's stockout quota and autoscaler rows)
+        # also loses those rows, which this count does not include.
         _, residual = previous_marker_ids(previous_body)
         if residual:
             log(

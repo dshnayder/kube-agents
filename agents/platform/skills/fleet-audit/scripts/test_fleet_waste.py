@@ -1333,10 +1333,23 @@ class OverrequestTest(unittest.TestCase):
         """GKE's stock LimitRange defaults CPU only; the memory request is the workload's own."""
         pod = self.deployment_pod()
         cpu_only = obj("LimitRange", "limits", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "12"}}]})
-        self.assertEqual(len(fw.check_overrequest({"pods": [pod], "limitranges": [cpu_only]}, self.IDLE, now=NOW, autopilot=False)), 1)
+        hits = fw.check_overrequest({"pods": [pod], "limitranges": [cpu_only]}, self.IDLE, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("memory only", hits[0]["excerpt"])
+
+    def test_the_defaulted_dimension_alone_is_never_the_finding(self):
+        """Memory written by hand and in use, CPU filled in by the LimitRange and
+        idle: the only resize on offer is of a value nobody declared, which §3.1
+        sends to the LimitRange."""
+        pod = self.deployment_pod()
+        cpu_only = obj("LimitRange", "limits", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "12"}}]})
+        memory_in_use = {("default", "api-1"): (0.01, 45000.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod], "limitranges": [cpu_only]}, memory_in_use, now=NOW, autopilot=False), [])
 
     def test_a_defaulted_limit_counts_as_the_filled_in_request(self):
-        """LimitRanger copies `default` into a missing request when no `defaultRequest` is set."""
+        """A LimitRange read before object defaulting (a manifest, a dump) may
+        carry only `default`; the API server would have filled `defaultRequest`
+        from it, so it counts as the filled-in request."""
         pod = self.deployment_pod()
         lr = obj("LimitRange", "defaults", ns="default", **{"spec.limits": [{"type": "Container", "default": {"cpu": "12", "memory": "48Gi"}}]})
         self.assertEqual(fw.check_overrequest({"pods": [pod], "limitranges": [lr]}, self.IDLE, now=NOW, autopilot=False), [])
@@ -3076,6 +3089,17 @@ class UnattachedDiskTest(unittest.TestCase):
         collected = {("prod", "us-central1"), ("ok", "us-central1")}
         self.assertEqual(fw._unread_names(known, collected), frozenset({"prod"}))
         self.assertEqual(fw._unread_names(known, known), frozenset())
+
+    def test_a_not_running_cluster_is_unread_under_its_bare_name(self):
+        """`not_running_entry` qualifies its name as a manifest target, and a
+        disk's `goog-k8s-cluster-name` label never is: a DEGRADED `prod` must be
+        known and unread as `prod`, or its detached data disk reads as the
+        leftover of a deleted cluster."""
+        degraded = fw.not_running_entry({"name": "prod", "location": "us-central1", "status": "DEGRADED"}, "p")
+        running = {"name": "ok", "location": "us-central1"}
+        self.assertEqual(fw._bare_cluster_name(degraded), "prod")
+        known = {(fw._bare_cluster_name(c), c.get("location")) for c in (degraded, running)}
+        self.assertEqual(fw._unread_names(known, {("ok", "us-central1")}), frozenset({"prod"}))
 
     def test_managed_service_disks_are_not_judged(self):
         for label in ("goog-composer-environment", "goog-dataproc-cluster-name"):

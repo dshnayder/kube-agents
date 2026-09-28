@@ -1194,8 +1194,10 @@ def _hpa_targets(context: dict) -> set[tuple[str, str, str]]:
 def _limitrange_defaults(context: dict) -> dict[str, dict]:
     """Per namespace, the container request its LimitRanges fill in.
 
-    `defaultRequest` where set; otherwise `default`, because the LimitRanger
-    admission plugin copies a defaulted limit into a missing request too."""
+    `defaultRequest` where set; otherwise `default`. The API server fills
+    `defaultRequest` from `default` when it stores the object, so on a live
+    read the merge changes nothing; it covers a LimitRange read before that
+    defaulting, as a manifest or a dump is."""
     defaults: dict[str, dict] = {}
     for lr in context.get("limitranges", []):
         ns = (lr.get("metadata") or {}).get("namespace", "")
@@ -1229,6 +1231,24 @@ def _requests_are_the_namespace_default(entry: dict, defaults: dict) -> bool:
                 if parse(str(req.get(resource, ""))) != parse(str(defaults[resource])):
                     return False
     return True
+
+
+def _namespace_defaulted_dimensions(entry: dict, defaults: dict) -> frozenset[str]:
+    """The request dimensions on which every container carries the LimitRange default.
+
+    A controller with one hand-written dimension stays in scope, but the
+    dimension the LimitRange filled in is still nobody's sizing decision, so
+    §3.1's fix-the-LimitRange rule drops that dimension from the verdict rather
+    than proposing a resize of a value the workload never declared."""
+    defaulted = set()
+    for resource in ("cpu", "memory"):
+        if resource not in defaults:
+            continue
+        parse = parse_cpu_cores if resource == "cpu" else parse_mem_mib
+        default = parse(str(defaults[resource]))
+        if all(parse(str(req.get(resource, ""))) == default for pod in entry["pods"] for req in pod["requests"]):
+            defaulted.add(resource)
+    return frozenset(defaulted)
 
 
 def _age_days(timestamp: str, *, now: datetime) -> float | None:
@@ -2408,6 +2428,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             continue
         if _requests_are_the_namespace_default(entry, lr_defaults.get(entry["ns"], {})):
             continue
+        defaulted = _namespace_defaulted_dimensions(entry, lr_defaults.get(entry["ns"], {}))
         cpu_req_total = mem_req_total = 0.0
         for pod in entry["pods"]:
             for req in pod["requests"]:
@@ -2458,8 +2479,9 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # separate sizing decision and gets a separate verdict; only the idle
         # one contributes to the reclaimable delta, so a finding never proposes
         # shrinking a request the workload is actually consuming.
-        cpu_unused = bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
-        mem_unused = bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
+        # A dimension the LimitRange filled in gets no verdict at all.
+        cpu_unused = "cpu" not in defaulted and bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
+        mem_unused = "memory" not in defaulted and bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
         if not (cpu_unused or mem_unused):
             continue
         # Idle is not the same as reclaimable. §3.1 resizes a request to
@@ -4207,6 +4229,15 @@ def _dead_cluster_of(disk: dict, known_clusters: set[str] | None) -> str:
     return owner
 
 
+def _bare_cluster_name(entry: dict) -> str:
+    """The cluster's own name, which is what a disk's `goog-k8s-cluster-name` carries.
+
+    `not_running_entry` qualifies its `name` as a manifest target, while the
+    running half of `enumerate_clusters` keeps `clusters list`'s bare one, so
+    both halves are reduced to the last segment before they are compared."""
+    return entry.get("name", "").rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
+
+
 def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> frozenset[str]:
     """The names of this project's clusters whose PersistentVolumes were not read.
 
@@ -4694,8 +4725,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             running, not_running = enumerate_clusters(p, run=run)
             clusters.extend(running)
             unaudited.extend(not_running)
-            known_by_project[p] = {c["name"] for c in running} | {c["name"] for c in not_running}
-            known_pairs_by_project[p] = {(c["name"], c.get("location")) for c in running + not_running}
+            known_by_project[p] = {_bare_cluster_name(c) for c in running + not_running}
+            known_pairs_by_project[p] = {(_bare_cluster_name(c), c.get("location")) for c in running + not_running}
         except RuntimeError as exc:
             known_by_project[p] = None
             # A log line is not a record. The manifest is the only account of

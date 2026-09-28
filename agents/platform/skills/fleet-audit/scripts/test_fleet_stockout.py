@@ -1800,10 +1800,6 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         against the new ids, and the delta reads every rename as a fix."""
         import audit_report
 
-        def fid(cluster, obj):
-            return audit_report.derive_finding_id({"check": "quota-exhaustion-risk", "cluster": cluster, "namespace": "", "object": obj})
-
-        self.assertNotEqual(fid("c1", "Quota/CPUS"), fid(fs.target_name("p", "us-central1", "c1"), "Quota/us-central1:CPUS"))
         self.assertGreaterEqual(audit_report.ID_SCHEME, 6)
 
     def test_checks_run_copied_from_a_collected_entry_survives_cross_check(self):

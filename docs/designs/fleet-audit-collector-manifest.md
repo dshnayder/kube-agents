@@ -250,7 +250,7 @@ comment opener renders that text differently from main; the recorded transcripts
 path, and none of the five carries an opener in free text. A marker minted under
 another identity scheme is deliberately not this case: the stamp is refreshed only by the rewrite,
 so a scheme bump rewrites the body as it always has; the holds survive it by re-derivation from
-their rows (below), and only ids with no row are lost. And the set is capped at `MAX_HELD_IDS` in
+their rows (below), and only ids with no row, or whose object the bump re-spelled, are lost. And the set is capped at `MAX_HELD_IDS` in
 sorted id order — the ids are a monotone term in the marker that no SOP-side edit can shrink. An id
 past the cap leaves the marker for good: the ledger stops tracking it, it stays on each run's JSON
 line as an unpublished candidate while the collector flags it, its pull request stays open, and the
@@ -339,7 +339,11 @@ rows, from this run's manifest clusters — and the spelling the collector flags
 not flag the bare one. A name two clusters share takes the one the collector flags, and the first by
 id when it flags both: either keeps the ledger open over a finding the collector reports. Only held ids with no row — the note and fourth tiers write none — are
 the residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
-naming their count. That residual is the cost of a
+naming their count. A bump that re-spells an object rather than a cluster name loses those rows the
+same way, because the re-derived id keeps the old object and matches nothing the collector emits:
+scheme 6 re-spells the stockout stream's quota (`Quota/<region>:<metric>`) and autoscaler
+(`ScaleUpError/<message-id>`) objects, which leave the ledger unheld on the bump run and are not in
+the warning's count. That residual is the cost of a
 bump, which is rare and operator-initiated.
 
 ### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_marked_findings`
