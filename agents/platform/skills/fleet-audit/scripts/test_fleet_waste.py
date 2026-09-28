@@ -250,6 +250,15 @@ class FetchUsagePeaksTest(unittest.TestCase):
         self.assertEqual(aligners[fw.CPU_METRIC], "ALIGN_RATE")
         self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
 
+    def test_both_reads_are_filtered_to_the_clusters_location(self):
+        # Two clusters named `prod-usc1` in one project, at different
+        # locations, would otherwise have their pods' series summed together.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        _, _, result = self.fetch(session, location="us-central1")
+        for params in session.calls:
+            self.assertIn('resource.labels.location="us-central1"', params["filter"])
+        self.assertIn('resource.labels.location="us-central1"', result.argv[0])
+
     def test_memory_excludes_page_cache_and_cpu_is_unfiltered(self):
         session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
         self.fetch(session)
@@ -2897,7 +2906,7 @@ class ReplacedPodPeaksTest(unittest.TestCase):
 
     def test_a_siblings_pods_are_not_this_controllers(self):
         """`web` and `web-api` in one namespace. The two-segment tail is what
-        keeps them apart -- `[a-z0-9]+` cannot span `api`'s hyphen."""
+        keeps them apart -- the hash segment cannot span `api`'s hyphen."""
         ctx = self.context([self.pod()])
         peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-api-cccccccc-33333"): (11.0, 40000.0)}
         hits = self.over(ctx, peaks)
@@ -2906,9 +2915,19 @@ class ReplacedPodPeaksTest(unittest.TestCase):
 
     def test_a_live_pod_another_controller_owns_is_not_claimed(self):
         """The name matches and the cluster says otherwise. The cluster wins."""
-        intruder = self.pod(name=f"{self.DEP}-cccccccccc-33333", owner="logger", kind="DaemonSet")
+        intruder = self.pod(name=f"{self.DEP}-cccccccccc-44444", owner="logger", kind="DaemonSet")
         ctx = self.context([self.pod(), intruder])
-        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, f"{self.DEP}-cccccccccc-33333"): (11.0, 40000.0)}
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, f"{self.DEP}-cccccccccc-44444"): (11.0, 40000.0)}
+        hits = self.over(ctx, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_a_hook_jobs_pods_are_not_this_deployments(self):
+        """Job `web-migrate` leaves `web-migrate-x7k2p` behind. Two segments,
+        like a Deployment pod's -- but `migrate` has vowels, and a ReplicaSet
+        hash is drawn from an alphabet with none."""
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, f"{self.DEP}-migrate-x7k2p"): (11.0, 40000.0)}
         hits = self.over(ctx, peaks)
         self.assertEqual(len(hits), 1)
         self.assertIn("0.90 vCPU", hits[0]["excerpt"])

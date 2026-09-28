@@ -183,13 +183,20 @@ SHORT_OBSERVATION_HOURS = 24
 #
 # Anchored at both ends and namespaced by the caller. The two-segment tail is
 # what keeps a sibling out: `argocd-repo-server-5fcf7766cd-vjp6f` does not match
-# `argocd`'s pattern, because `[a-z0-9]+` cannot span the hyphen that `repo` and
+# `argocd`'s pattern, because the hash segment cannot span the hyphen that `repo` and
 # `server` are separated by. A kind absent from this table is not widened, which
 # costs the old, narrow answer rather than a wrong one.
+#
+# Both generated segments -- the pod-template-hash and the pod's own suffix --
+# are drawn from Kubernetes' `utilrand` alphabet, which has no vowels and no
+# 0, 1 or 3. Matching that rather than `[a-z0-9]` is what keeps out a hook
+# Job's pods: `api-migrate-x7k2p` belongs to Job `api-migrate`, not to
+# Deployment `api`, and `migrate` has vowels no ReplicaSet hash can carry.
+K8S_GENERATED_CHARS = "[bcdfghjklmnpqrstvwxz2456789]"
 REPLACED_POD_PATTERNS = {
-    "Deployment": r"^{name}-[a-z0-9]+-[a-z0-9]{{5}}$",
+    "Deployment": rf"^{{name}}-{K8S_GENERATED_CHARS}+-{K8S_GENERATED_CHARS}{{{{5}}}}$",
     "StatefulSet": r"^{name}-[0-9]+$",
-    "ReplicaSet": r"^{name}-[a-z0-9]{{5}}$",
+    "ReplicaSet": rf"^{{name}}-{K8S_GENERATED_CHARS}{{{{5}}}}$",
 }
 # Alignment happens twice. The primary period buckets each container's raw
 # points before they are summed across the containers of a pod -- it has to
@@ -704,12 +711,21 @@ def _point_value(point: dict) -> float | None:
     return None
 
 
+def _cluster_filter(cluster: str, location: str | None) -> str:
+    """The resource-label clause naming one cluster. A name is unique only per
+    location, so without `location` two same-named clusters in one project have
+    their pods' series summed together by the caller's `REDUCE_SUM`."""
+    clause = f'resource.labels.cluster_name="{cluster}"'
+    return f'{clause} AND resource.labels.location="{location}"' if location else clause
+
+
 def _read_pod_series(
     session: SessionFn,
     url: str,
     *,
     metric: str,
     cluster: str,
+    location: str | None,
     start: datetime,
     now: datetime,
     primary: str,
@@ -732,7 +748,7 @@ def _read_pod_series(
     page_token = None
     while True:
         params = {
-            "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
+            "filter": f'metric.type="{metric}" AND {_cluster_filter(cluster, location)}' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
             "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
@@ -773,6 +789,7 @@ def fetch_usage_peaks(
     project: str,
     cluster: str,
     *,
+    location: str | None = None,
     session: SessionFn,
     now: datetime,
     window_hours: int = USAGE_WINDOW_HOURS,
@@ -805,7 +822,7 @@ def fetch_usage_peaks(
     # what a reader checking the evidence behind a finding needs.
     label = (
         f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-        f' filter=resource.labels.cluster_name="{cluster}"'
+        f" filter={_cluster_filter(cluster, location)}"
         f" metrics={CPU_METRIC},{MEM_METRIC} window={window_hours}h"
     )
 
@@ -818,7 +835,7 @@ def fetch_usage_peaks(
     peaks: dict[str, dict[tuple[str, str], float]] = {"cpu": {}, "mem": {}}
     for metric, aligner, key in ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem")):
         sink, err = _read_pod_series(
-            session, url, metric=metric, cluster=cluster, start=start, now=now,
+            session, url, metric=metric, cluster=cluster, location=location, start=start, now=now,
             primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
         )
         if err is not None:
@@ -845,6 +862,7 @@ def fetch_memory_means(
     project: str,
     cluster: str,
     *,
+    location: str | None = None,
     session: SessionFn,
     now: datetime,
     window_hours: int = USAGE_WINDOW_HOURS,
@@ -870,7 +888,7 @@ def fetch_memory_means(
     url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
     label = (
         f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-        f' filter=resource.labels.cluster_name="{cluster}"'
+        f" filter={_cluster_filter(cluster, location)}"
         f" metric={MEM_METRIC} aligner=ALIGN_MEAN window={window_hours}h"
     )
 
@@ -881,7 +899,7 @@ def fetch_memory_means(
         return fail(-1, NO_SESSION_MESSAGE)
 
     sink, err = _read_pod_series(
-        session, url, metric=MEM_METRIC, cluster=cluster, start=start, now=now,
+        session, url, metric=MEM_METRIC, cluster=cluster, location=location, start=start, now=now,
         primary="ALIGN_MAX", secondary="ALIGN_MEAN", window_hours=window_hours,
     )
     if err is not None:
@@ -3923,13 +3941,13 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # `limitations` sentence alone cannot make it do.
     unevaluated: dict[str, str] = {}
 
-    usage_peaks, metrics_ok, usage_result = fetch_usage_peaks(project, name, session=session, now=now)
+    usage_peaks, metrics_ok, usage_result = fetch_usage_peaks(project, name, location=location, session=session, now=now)
     usage_record = _record(usage_result.argv[0], usage_result)
     # Only worth the extra round trip where the peak read already succeeded:
     # the two fail for the same reasons, and `underrequest` has nothing to say
     # about a cluster `overrequest` could not measure either.
     if metrics_ok:
-        memory_means, means_ok, means_result = fetch_memory_means(project, name, session=session, now=now)
+        memory_means, means_ok, means_result = fetch_memory_means(project, name, location=location, session=session, now=now)
     else:
         memory_means, means_ok, means_result = {}, False, usage_result
     means_record = _record(means_result.argv[0], means_result)
