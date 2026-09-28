@@ -133,6 +133,14 @@ from outside the session.
 stream — the stream, and that it is queued for the next tick (or that the on-demand trigger is unavailable). The reports arrive through each run's
 own `deliver` setting; repeating them here sends the same content twice.
 
+### 3. Asked what an audit found
+
+A question about a run that already happened — what a stream last found, what changed since
+yesterday, which findings the ledger omitted for space, whether a stream is stuck — is not a request
+to run anything. Every `finish` that exits 0 keeps its report on the volume, and
+[`fleet-audit-reports`](../fleet-audit-reports/SKILL.md) answers from it without a `start`, a lease
+or a GitHub call. Do not re-run a stream to answer a question its last report already answers.
+
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the profile directory, where `./skills/...`
@@ -226,7 +234,8 @@ parsed from the ledger's comments. **Write those manifests during inspection** �
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it
-is, and its title — read off the ledger body `finish` will compare your document against. **These
+is, and its title — read off the previous run's stored report, the body `finish` will compare your
+document against. **These
 are the findings you are answering for.** For each one, this run ends one of four ways: you report
 it again; you re-ran its check on that cluster, saw it gone, and say so under
 [`resolved_because`](#the-findings-document) with the same `check`, `cluster`, `namespace` and `object`;
@@ -235,8 +244,8 @@ check there and your `checks_run` does not claim you did. A run whose
 `checks_run` says the check ran and whose document neither reports nor explains the finding is
 **held** — see [The clean run](#the-clean-run). On a stream that passes `--manifest-file` there is
 a fifth ending for a finding the collector still emits: `resolved_because` does not release it, and
-only the collector no longer emitting it or a `declared` entry does. Empty when there is no open ledger or its body could
-not be read (`start` says so on stderr).
+only the collector no longer emitting it or a `declared` entry does. Empty when there is no open ledger or the
+report store holds no record of it (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
@@ -419,8 +428,9 @@ note, any cluster whose `checks_run` is short of the checks that _apply_ to it, 
 with a declared-intent step — posture checks that ran without a complete search record
 ([`declared_intent_searched`](#declared_intent_searched)). The other two belong to the run rather
 than to the document, so a document that reads as complete can still produce them: a collector
-manifest waived with `--no-collector-manifest`, whose reason becomes the gap, and a previous ledger
-body `finish` could not read and therefore left as it was. `coverage_gaps` says which, and why — so
+manifest waived with `--no-collector-manifest`, whose reason becomes the gap, and a clean run over
+an open ledger the report store has no record of while the collector still flags something (see
+[The clean run](#the-clean-run)). `coverage_gaps` says which, and why — so
 `partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
 
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
@@ -872,7 +882,7 @@ and what pull request sits on its branch. Nothing is stored between runs.
 Every row above says "reproduces", and that is not an accident: **a finding that stopped reproducing
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
-resolution is announced in the delta comment, by id and title recovered from the previous body, and
+resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
 the finding's open pull request is closed as stale. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
@@ -953,9 +963,9 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   never carried is named only on
   the run's JSON line as an unpublished candidate. Either way there is no finding to open a pull
   request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
-  would be false there. A run that could not read the ledger body and passed no manifest cannot
-  know which ids are held, so it answers no `/remediate` at all; the next run that can read the
-  body answers them. One reply says the request is on hold and why, under its own
+  would be false there. A run whose report store has no record of the open ledger and that passed no manifest cannot
+  know which ids are held, so it answers no `/remediate` at all; the next run with a record answers
+  them. One reply says the request is on hold and why, under its own
   `audit-deferred` marker, which nothing reads as an answer: the same comment is acted on, and
   acknowledged, by the first run that records the search and still sees the posture, or whose
   document carries the held finding again. The refused marker is never written for it, so the
@@ -1095,7 +1105,7 @@ notice: four streams did exactly that on 2026-08-03, and the only reason it surf
 happened to have a ledger open from the day before.
 
 **Zero findings over a finding the run checked again is not a clean run either.** Before it
-closes, `finish` reads the previous body — the same findings `start` handed you as `carried`. For
+closes, `finish` reads the previous run's stored report — the same findings `start` handed you as `carried`. For
 every finding it carried, if this run's `checks_run` says the check that found it ran on that
 cluster — the SOP's fleet-wide `kubectl get clusterrolebindings -o json | jq …` counts; it lists
 every binding, `debug-binding` included — and the document neither reports the finding again,
@@ -1148,15 +1158,17 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   flagged something the document did not carry. The check reads as having run and found nothing;
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
 
-There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
-previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
-declaring every live finding new. The ledger body is the only record of what a collector holds, so
-a run that cannot read it leaves the body, title, label and promotions exactly as they were, answers
-only `/remediate` refusals and deferrals when it passed a manifest — and none at all when it passed
-no manifest, since without one it cannot tell a held id from a typo — and reports `partial: true`
-with a coverage gap saying the body was left as it was — `silent_ok` is `false`. The run logs
-`Previous ledger body was unreadable; skipping the delta comment` to stderr, and the ledger body may
-be a day stale until a run can read it; report the gap as you would any other partial run.
+There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
+report store holds no record of the open ledger — the volume was replaced, or the stored report was
+written for a different issue — the previous run's findings are unknowable, so the run announces
+nothing rather than declaring every live finding new, and logs `The previous run's findings are
+unknowable; skipping the delta comment` to stderr. It holds nothing it cannot name: the body is
+rewritten from this document, and a findings run leaves the next run a trusted record. A clean run
+closes unless it passed a manifest whose collector still flags something the document dropped; then
+the ledger stays open with a coverage gap saying the store had no record, `partial: true` and
+`silent_ok: false`. Without a manifest it answers no `/remediate` — it cannot tell a held id from a
+typo — and logs `No stored report and no manifest` to say so; report that as you would any other
+partial run.
 
 ## Red lines
 

@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""report_query.py — bounded answers out of the fleet-audit report store.
+
+Seven subcommands, one small JSON document each, so that a question about a
+past run costs a number instead of a findings document. Design of record:
+docs/designs/fleet-audit-report-store.md.
+
+One rule holds all seven together: **every output is bounded and the full
+document is opt-in.** `latest.json` embeds the whole findings document,
+deliberately un-clipped, so it can run past the 60k characters the ledger body
+is held to — times eight streams, times a fourteen-run ring. An agent that
+answers "how many criticals are open on compliance?" by reading that file
+spends tens of thousands of tokens on an integer. So `show` omits `document`,
+`findings` returns identity columns and no prose, and `finding` is the one path
+that returns a finding whole: the expensive read, at the granularity somebody
+actually asked for. `checks` is the same bargain over `document.scope`, for the
+one part of a run the ledger issue is expected to be missing.
+
+The files are read through `report_status.py`'s helpers rather than parsed a
+second time here. Two parsers of one envelope is one more thing to keep in step
+with the writer, and the writer is the only party that gets to define the
+envelope.
+
+Exit 0 means answered. Exit 2 means the question could not be answered, and
+stdout still carries one JSON object whose `error` says why — an absent store,
+an absent stream, an absent stamp, a file that would not parse. **A missing
+`latest.json` is unknown, never clean.**
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+# The reading helpers live in the sibling writer skill. Both bundles are
+# scaffolded into the same profile `skills/` directory, so this is a fixed hop
+# rather than a search: .../skills/fleet-audit-reports/scripts/ -> .../skills/.
+HELPERS_DIR = Path(__file__).resolve().parents[2] / "fleet-audit" / "scripts"
+if str(HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPERS_DIR))
+
+try:
+    import report_status
+except ImportError as exc:  # noqa: BLE001 — reported below, never fallen back from
+    # No second parser here as a consolation prize. A store read that silently
+    # switched to a private copy of the envelope rules is a divergence nobody
+    # would see until it answered a question wrongly; a missing sibling skill
+    # is an install to fix, and it says so.
+    report_status = None  # type: ignore[assignment]
+    IMPORT_ERROR = (
+        f"cannot import report_status from {HELPERS_DIR}: {exc}. "
+        "The fleet-audit skill must be installed alongside this one — it owns "
+        "the report store and the helpers that read it."
+    )
+else:
+    IMPORT_ERROR = None
+
+# Findings sort severity-first, exactly as the ledger body renders them, so a
+# `--limit` that truncates only ever drops the least-severe end.
+SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2}
+
+# Enough for a finding-heavy stream (compliance carries 57) and still bounded
+# against a stream that grows one. `matched` and `truncated` say when it bit.
+DEFAULT_LIMIT = 100
+
+# How many ids a "no such finding" answer offers back. A typo wants candidates,
+# not the roster it just failed to match against.
+MAX_ID_HINTS = 20
+
+
+class QueryError(Exception):
+    """A question this store cannot answer, plus the keys that help next time.
+
+    Every subcommand raises it rather than tracebacking: the caller is an agent
+    parsing stdout, and a stack trace is an unparseable answer to a question
+    that has a real one ("the ring holds these stamps, not that one").
+    """
+
+    def __init__(self, message: str, **fields: object) -> None:
+        super().__init__(message)
+        self.fields = fields
+
+
+def _oneline(exc: Exception) -> str:
+    return " ".join(str(exc).split()) or type(exc).__name__
+
+
+def _root_of(args: argparse.Namespace) -> str:
+    return report_status.reports_root(getattr(args, "root", None))
+
+
+def _stream_ids(root: str) -> list[str]:
+    try:
+        return report_status.stream_ids(root)
+    except OSError as exc:
+        raise QueryError(f"{root} could not be listed: {_oneline(exc)}") from exc
+
+
+def _inside_store(value: str, what: str) -> str:
+    """A stream id and a run stamp are each one name inside the store.
+
+    Both reach `os.path.join(root, audit_id, "runs", name)` straight from the
+    command line, and `join` walks wherever a `../` tells it to: `--run
+    ../../../../etc/hosts` read a file the store does not contain and printed
+    it as a run envelope. This subcommand set exists to be the constrained way
+    to read the store — an agent that can be handed a stream and a stamp
+    without being handed the filesystem — so the constraint has to hold against
+    the arguments, not just against well-behaved ones.
+    """
+    if value != os.path.basename(value) or value in ("", os.curdir, os.pardir) or os.sep in value:
+        raise QueryError(f"{what} {value!r} is not a name inside the report store")
+    return value
+
+
+def _require_stream(root: str, audit_id: str) -> None:
+    """Absent store and absent stream are different answers, so they are
+    different messages — one is "I could not look", the other "nothing to look
+    at"."""
+    _inside_store(audit_id, "stream")
+    if not os.path.isdir(root):
+        raise QueryError(
+            f"report store not found at {root}. Nothing can be answered from "
+            "it — this is unknown, not clean.",
+            root=root,
+            root_exists=False,
+        )
+    if not os.path.isdir(os.path.join(root, audit_id)):
+        raise QueryError(
+            f"no reports for stream {audit_id!r} under {root}",
+            root=root,
+            streams=_stream_ids(root),
+            liveness=_liveness(root, audit_id),
+        )
+
+
+def _ring(root: str, audit_id: str) -> list[str]:
+    try:
+        return report_status.list_runs(root, audit_id)
+    except OSError as exc:
+        raise QueryError(f"{audit_id}: runs/ could not be listed: {_oneline(exc)}") from exc
+
+
+def _liveness(root: str, audit_id: str) -> str:
+    try:
+        return report_status.liveness(
+            report_status.in_flight_since(report_status.scratch_root(), audit_id),
+            report_status.load_latest(root, audit_id),
+            time.time(),
+        )
+    except (OSError, ValueError):
+        return "error"
+
+
+def _run_name(run: str | None) -> str:
+    """A stamp as the ring spells it. `--run 20260826T063100.123456Z` and the
+    same string with `.json` are the same run; no argument means the newest."""
+    if run is None or run in ("latest", "latest.json"):
+        return "latest.json"
+    return _inside_store(run if run.endswith(".json") else f"{run}.json", "run")
+
+
+def load_envelope(root: str, audit_id: str, run: str | None) -> tuple[str, dict]:
+    """One run's envelope, whole, `document` included. Raises QueryError."""
+    _require_stream(root, audit_id)
+    name = _run_name(run)
+    try:
+        if name == "latest.json":
+            envelope = report_status.load_latest(root, audit_id)
+        else:
+            envelope = report_status.load_run(root, audit_id, name)
+    except (OSError, ValueError) as exc:
+        raise QueryError(f"{audit_id}/{name} could not be read: {_oneline(exc)}") from exc
+    if envelope is None:
+        if name == "latest.json":
+            raise QueryError(
+                f"{audit_id} has no latest.json: the store holds no record of a "
+                "run for it. That means unknown, not clean — say so and read "
+                "the ledger issue.",
+                liveness=_liveness(root, audit_id),
+                runs=_ring(root, audit_id),
+            )
+        raise QueryError(
+            f"{audit_id} has no run {name!r} in the ring",
+            runs=_ring(root, audit_id),
+        )
+    return name, envelope
+
+
+def _findings_of(audit_id: str, name: str, envelope: dict) -> list[dict]:
+    document = envelope.get("document")
+    if not isinstance(document, dict):
+        raise QueryError(f"{audit_id}/{name} carries no findings document")
+    findings = document.get("findings")
+    if not isinstance(findings, list):
+        raise QueryError(f"{audit_id}/{name}: document.findings is not a list")
+    if not all(isinstance(finding, dict) for finding in findings):
+        raise QueryError(f"{audit_id}/{name}: document.findings holds a non-object entry")
+    return findings
+
+
+def _scope_clusters(audit_id: str, name: str, envelope: dict) -> list[dict]:
+    document = envelope.get("document")
+    if not isinstance(document, dict):
+        raise QueryError(f"{audit_id}/{name} carries no findings document")
+    scope = document.get("scope")
+    if not isinstance(scope, dict):
+        raise QueryError(f"{audit_id}/{name}: document.scope is not an object")
+    clusters = scope.get("clusters")
+    if not isinstance(clusters, list):
+        raise QueryError(f"{audit_id}/{name}: document.scope.clusters is not a list")
+    if not all(isinstance(entry, dict) for entry in clusters):
+        raise QueryError(f"{audit_id}/{name}: document.scope.clusters holds a non-object entry")
+    return clusters
+
+
+def _severity_key(finding: dict) -> tuple[int, str]:
+    severity = str(finding.get("severity", "")).strip().lower()
+    return (SEVERITY_ORDER.get(severity, len(SEVERITY_ORDER)), str(finding.get("id", "")))
+
+
+def _identity(finding: dict) -> dict:
+    """The columns that name a finding, and nothing that carries prose.
+
+    Evidence excerpts, impact and the three `recommendation` fields are what
+    make a document megabyte-scale, and none of them are needed to answer
+    "which criticals are open" — `finding` returns them for the one id the
+    answer landed on.
+    """
+    return {
+        "id": finding.get("id"),
+        "severity": finding.get("severity"),
+        "title": finding.get("title"),
+        "cluster": finding.get("cluster"),
+        "check": finding.get("check"),
+    }
+
+
+def _matches(finding: dict, severity: str | None, cluster: str | None, check: str | None) -> bool:
+    for wanted, key in ((severity, "severity"), (cluster, "cluster"), (check, "check")):
+        if wanted is None:
+            continue
+        if str(finding.get(key, "")).strip().lower() != wanted.strip().lower():
+            return False
+    return True
+
+
+def cmd_streams(args: argparse.Namespace) -> dict:
+    """One row per stream — the fleet at a glance, no document read into the
+    answer. `report_status.project` already computes this; the rows here are
+    its projection with the per-stream `latest` flattened and the ring reduced
+    to a count."""
+    projection = report_status.project(_root_of(args))
+    rows = [
+        _stream_row(audit_id, stream)
+        for audit_id, stream in sorted(projection["streams"].items())
+    ]
+    unreadable = [row["audit_id"] for row in rows if row["error"]]
+    error = None
+    if not projection["root_exists"]:
+        error = (
+            f"report store not readable at {projection['root']}: no stream can "
+            "be answered from it. This is unknown, not clean."
+        )
+    elif unreadable:
+        error = "streams that could not be read: " + ", ".join(unreadable)
+    return {
+        "root": projection["root"],
+        "root_exists": projection["root_exists"],
+        "generated_at": projection["generated_at"],
+        "ttl_s": projection["ttl_s"],
+        "streams": rows,
+        "error": error,
+    }
+
+
+def _stream_row(audit_id: str, stream: dict) -> dict:
+    latest = stream.get("latest") or {}
+    started = stream.get("started") or {}
+    gaps = latest.get("coverage_gaps")
+    return {
+        "audit_id": audit_id,
+        "liveness": stream.get("liveness"),
+        "finished_at": latest.get("finished_at"),
+        "status": latest.get("status"),
+        "findings": latest.get("findings"),
+        "critical": latest.get("critical"),
+        "new": latest.get("new"),
+        "resolved": latest.get("resolved"),
+        "current": latest.get("current"),
+        "clusters": latest.get("clusters"),
+        "skipped": latest.get("skipped"),
+        "partial": latest.get("partial"),
+        # A count, not the gap strings: eight streams' worth of prose is the
+        # unbounded shape this command exists to avoid. `show` names them.
+        "gaps": len(gaps) if isinstance(gaps, list) else None,
+        "issue_number": latest.get("issue_number"),
+        "issue_url": latest.get("issue_url"),
+        "runs": len(stream.get("runs") or []),
+        "running_since": started.get("started_at"),
+        "age_s": started.get("age_s"),
+        "error": stream.get("error"),
+    }
+
+
+def cmd_show(args: argparse.Namespace) -> dict:
+    """One run's envelope without `document` — status, delta counts, coverage
+    gaps, issue link."""
+    root = _root_of(args)
+    name, envelope = load_envelope(root, args.stream, args.run)
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "run": name,
+        # The projection the status view renders off-pod, reused rather than
+        # re-derived. The leading underscore marks it module-private to
+        # report_status' own callers; this script is one of them by design,
+        # and a second copy of "every key except these, plus these counts" is
+        # exactly the drift that sharing the helpers prevents.
+        "envelope": report_status._project_latest(envelope),
+        "error": None,
+    }
+
+
+def cmd_findings(args: argparse.Namespace) -> dict:
+    """Identity columns for the findings of one run, filterable. Never a body,
+    never an excerpt, never recommendation prose."""
+    root = _root_of(args)
+    name, envelope = load_envelope(root, args.stream, args.run)
+    findings = _findings_of(args.stream, name, envelope)
+    matched = sorted(
+        (f for f in findings if _matches(f, args.severity, args.cluster, args.check)),
+        key=_severity_key,
+    )
+    shown = matched[: args.limit]
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "run": name,
+        "finished_at": envelope.get("finished_at"),
+        "status": envelope.get("status"),
+        "filters": {
+            "severity": args.severity,
+            "cluster": args.cluster,
+            "check": args.check,
+        },
+        "total": len(findings),
+        "matched": len(matched),
+        "returned": len(shown),
+        "truncated": len(shown) < len(matched),
+        "findings": [_identity(finding) for finding in shown],
+        "error": None,
+    }
+
+
+def cmd_finding(args: argparse.Namespace) -> dict:
+    """One finding, whole. The only subcommand that returns prose."""
+    root = _root_of(args)
+    name, envelope = load_envelope(root, args.stream, args.run)
+    findings = _findings_of(args.stream, name, envelope)
+    for finding in findings:
+        if str(finding.get("id", "")) == args.id:
+            return {
+                "root": root,
+                "audit_id": args.stream,
+                "run": name,
+                "finished_at": envelope.get("finished_at"),
+                "finding": finding,
+                "error": None,
+            }
+    ordered = sorted(findings, key=_severity_key)
+    raise QueryError(
+        f"{args.stream}/{name} has no finding with id {args.id!r}",
+        available=len(findings),
+        ids=[f.get("id") for f in ordered[:MAX_ID_HINTS]],
+    )
+
+
+def cmd_checks(args: argparse.Namespace) -> dict:
+    """The command behind every check one run says it performed.
+
+    The ledger publishes these itself, in a collapsed table that is last in line
+    for the body budget — so on a finding-heavy run it is dropped whole and
+    replaced by a notice saying the commands are kept in the stored report and
+    to ask the agent for that report to re-run any of them. This subcommand is
+    what makes that sentence true: the alternative on offer was opening a
+    138 KB envelope with a file tool, which the skill forbids for good reason.
+
+    Rows come back in the document's own order, so a truncated answer lines up
+    with the published table rather than a re-sort of it. `--cluster` and
+    `--check` narrow before `--limit` bites.
+
+    `checks_not_applicable` comes back alongside, because the notice counts
+    those too and they are the claims most worth a second reader: an excluded
+    check leaves the coverage denominator, which is the one way a partial run
+    can read as complete.
+    """
+    root = _root_of(args)
+    name, envelope = load_envelope(root, args.stream, args.run)
+    clusters = _scope_clusters(args.stream, name, envelope)
+    ran: list[dict] = []
+    excluded: list[dict] = []
+    for cluster in clusters:
+        where = cluster.get("name")
+        for entry in cluster.get("checks_run") or []:
+            if isinstance(entry, dict):
+                ran.append(
+                    {
+                        "cluster": where,
+                        "check": entry.get("check"),
+                        "command": entry.get("command"),
+                    }
+                )
+        for entry in cluster.get("checks_not_applicable") or []:
+            if isinstance(entry, dict):
+                excluded.append(
+                    {
+                        "cluster": where,
+                        "check": entry.get("check"),
+                        "reason": entry.get("reason"),
+                    }
+                )
+    matched = [row for row in ran if _matches(row, None, args.cluster, args.check)]
+    na_matched = [row for row in excluded if _matches(row, None, args.cluster, args.check)]
+    shown = matched[: args.limit]
+    na_shown = na_matched[: args.limit]
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "run": name,
+        "finished_at": envelope.get("finished_at"),
+        "status": envelope.get("status"),
+        "filters": {"cluster": args.cluster, "check": args.check},
+        "scope_entries": len(clusters),
+        "total": len(ran),
+        "matched": len(matched),
+        "returned": len(shown),
+        "truncated": len(shown) < len(matched),
+        "checks": shown,
+        "not_applicable_total": len(excluded),
+        "not_applicable_matched": len(na_matched),
+        "not_applicable_returned": len(na_shown),
+        "not_applicable_truncated": len(na_shown) < len(na_matched),
+        "not_applicable": na_shown,
+        "error": None,
+    }
+
+
+def cmd_diff(args: argparse.Namespace) -> dict:
+    """What two ring entries disagree about: ids and titles added and resolved.
+
+    Computed from each run's whole `document.findings`, not from the envelope's
+    `new_ids`/`resolved_ids` — those are one run's delta against the run before
+    it, which answers a different question than "what changed between Monday
+    and Friday", and `current_ids` is the rendered subset rather than the set.
+    """
+    root = _root_of(args)
+    _require_stream(root, args.stream)
+    ring = _ring(root, args.stream)
+    if not ring:
+        raise QueryError(f"{args.stream}: the run ring is empty, so there is nothing to diff")
+    later = _run_name(args.to) if args.to else ring[-1]
+    if later == "latest.json":
+        later = ring[-1]
+    if later not in ring:
+        raise QueryError(f"{args.stream} has no run {later!r} in the ring", runs=ring)
+    if args.frm:
+        earlier = _run_name(args.frm)
+    else:
+        index = ring.index(later)
+        if index == 0:
+            raise QueryError(
+                f"{args.stream}: {later} is the oldest entry in the ring, so there "
+                "is no earlier run to diff it against",
+                runs=ring,
+            )
+        earlier = ring[index - 1]
+    if earlier not in ring:
+        raise QueryError(f"{args.stream} has no run {earlier!r} in the ring", runs=ring)
+
+    _, before_envelope = load_envelope(root, args.stream, earlier)
+    _, after_envelope = load_envelope(root, args.stream, later)
+    before = {str(f.get("id")): f for f in _findings_of(args.stream, earlier, before_envelope)}
+    after = {str(f.get("id")): f for f in _findings_of(args.stream, later, after_envelope)}
+    added = sorted((f for fid, f in after.items() if fid not in before), key=_severity_key)
+    resolved = sorted((f for fid, f in before.items() if fid not in after), key=_severity_key)
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "from": earlier,
+        "to": later,
+        "from_finished_at": before_envelope.get("finished_at"),
+        "to_finished_at": after_envelope.get("finished_at"),
+        "added": [_identity(f) for f in added[: args.limit]],
+        "resolved": [_identity(f) for f in resolved[: args.limit]],
+        "added_total": len(added),
+        "resolved_total": len(resolved),
+        "unchanged": len(set(before) & set(after)),
+        "truncated": len(added) > args.limit or len(resolved) > args.limit,
+        "error": None,
+    }
+
+
+def cmd_runs(args: argparse.Namespace) -> dict:
+    """What the ring holds, so a `diff` can name real stamps.
+
+    Filenames only. Reading fourteen envelopes to decorate a listing would
+    spend the whole store to answer "which runs are there".
+    """
+    root = _root_of(args)
+    _require_stream(root, args.stream)
+    ring = _ring(root, args.stream)
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "count": len(ring),
+        "runs": ring,
+        "newest": ring[-1] if ring else None,
+        "liveness": _liveness(root, args.stream),
+        "error": None,
+    }
+
+
+def _positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Bounded reads of the fleet-audit report store.",
+        epilog="Exit 0 answered the question; exit 2 could not, and the JSON says why.",
+    )
+    default_root = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or getattr(
+        report_status, "REPORTS_DIR", "/opt/data/fleet-audit/reports"
+    )
+    parser.add_argument("--root", help=f"store root to read (default: {default_root})")
+    # Repeated on every subparser so `… findings compliance-audit --root X`
+    # works too, and suppressed so the subparser's absent value never
+    # overwrites one given before the subcommand.
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    run_flag = argparse.ArgumentParser(add_help=False)
+    run_flag.add_argument(
+        "--run",
+        help="a stamp from `runs` (with or without .json); default is the newest run",
+    )
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    streams = subcommands.add_parser(
+        "streams", parents=[shared], help="one row per stream: last run, status, counts, liveness"
+    )
+    streams.set_defaults(handler=cmd_streams)
+
+    show = subcommands.add_parser(
+        "show", parents=[shared, run_flag], help="one run's envelope without its document"
+    )
+    show.add_argument("stream")
+    show.set_defaults(handler=cmd_show)
+
+    findings = subcommands.add_parser(
+        "findings", parents=[shared, run_flag], help="finding id/severity/title/cluster/check"
+    )
+    findings.add_argument("stream")
+    findings.add_argument("--severity", help="critical, major or minor")
+    findings.add_argument("--cluster")
+    findings.add_argument("--check")
+    findings.add_argument("--limit", type=_positive, default=DEFAULT_LIMIT)
+    findings.set_defaults(handler=cmd_findings)
+
+    finding = subcommands.add_parser(
+        "finding", parents=[shared, run_flag], help="one finding in full, prose included"
+    )
+    finding.add_argument("stream")
+    finding.add_argument("id")
+    finding.set_defaults(handler=cmd_finding)
+
+    checks = subcommands.add_parser(
+        "checks",
+        parents=[shared, run_flag],
+        help="the command behind each check a run ran, and the checks it excluded",
+    )
+    checks.add_argument("stream")
+    checks.add_argument("--cluster")
+    checks.add_argument("--check")
+    checks.add_argument("--limit", type=_positive, default=DEFAULT_LIMIT)
+    checks.set_defaults(handler=cmd_checks)
+
+    diff = subcommands.add_parser(
+        "diff", parents=[shared], help="what changed between two runs in the ring"
+    )
+    diff.add_argument("stream")
+    diff.add_argument("--from", dest="frm", help="older stamp (default: the one before --to)")
+    diff.add_argument("--to", dest="to", help="newer stamp (default: the newest run)")
+    diff.add_argument("--limit", type=_positive, default=DEFAULT_LIMIT)
+    diff.set_defaults(handler=cmd_diff)
+
+    runs = subcommands.add_parser("runs", parents=[shared], help="the stamps the ring holds")
+    runs.add_argument("stream")
+    runs.set_defaults(handler=cmd_runs)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if report_status is None:
+        print(json.dumps({"error": IMPORT_ERROR, "looked_in": str(HELPERS_DIR)}, sort_keys=True))
+        return 2
+    try:
+        payload = args.handler(args)
+    except QueryError as exc:
+        payload = {"error": str(exc), **exc.fields}
+    print(json.dumps(payload, sort_keys=True))
+    return 2 if payload.get("error") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

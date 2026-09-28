@@ -7460,6 +7460,17 @@ class TestRenderBudget(BaseTestCase):
     def test_truncation_notice_names_the_omitted_count(self):
         body = self.render(make_doc(findings=bulk_findings(250)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
+        self.assertIn("kept in full in this run's stored report", body)
+
+    def test_an_evidence_table_that_does_not_fit_says_where_it_went(self):
+        clusters = make_doc()["scope"]["clusters"]
+        whole = audit_report._render_check_evidence(clusters, AUDIT, 10**6)
+        self.assertIn("</details>", whole)
+        dropped = audit_report._render_check_evidence(clusters, AUDIT, 400)
+        self.assertNotIn("</details>", "\n".join(dropped))
+        self.assertIn("omitted here", "\n".join(dropped))
+        self.assertIn("stored report", "\n".join(dropped))
+        self.assertEqual(audit_report._render_check_evidence(clusters, AUDIT, 10), [])
 
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)

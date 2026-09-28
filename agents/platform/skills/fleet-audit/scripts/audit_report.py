@@ -6927,7 +6927,8 @@ def _render_findings(
             f"_{len(omitted)} further finding(s) are omitted from this description to "
             "stay inside GitHub's body limit. The counts in the title and in the "
             "summary above are the true totals; the omitted findings are the "
-            "least severe._",
+            "least severe. They are kept in full in this run's stored report; ask "
+            "the agent for that report to read them._",
         ]
     return out, omitted
 
@@ -7423,7 +7424,22 @@ def _render_check_evidence(
             out.append(f"| `{_cell(name)}` | `{_cell(check)}` | {_cell(reason)} |")
     out.append("")
     out.append("</details>")
-    return out if len("\n".join(out)) <= budget else []
+    if len("\n".join(out)) <= budget:
+        return out
+    # Dropping the table whole is right; dropping it silently is not. The
+    # section is last in line for the budget, so it disappears on exactly the
+    # runs whose findings crowded it out, which are the runs where a fabricated
+    # check would matter most, and silence there leaves a document that looks
+    # complete. Name the omission and say where the commands survive.
+    excluded = f" and the {len(na_rows)} exclusion(s)" if na_rows else ""
+    notice = [
+        "",
+        f"_The {len(rows)} command(s) behind this run's checks{excluded} do not "
+        "fit GitHub's body limit and are omitted here. They are kept in full in "
+        "this run's stored report; ask the agent for that report to re-run any "
+        "of them._",
+    ]
+    return notice if len("\n".join(notice)) <= budget else []
 
 
 def render_issue_body(
