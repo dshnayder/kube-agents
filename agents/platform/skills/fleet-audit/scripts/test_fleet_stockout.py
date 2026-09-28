@@ -1617,6 +1617,22 @@ class CollectClusterTest(unittest.TestCase):
         ):
             self.assertIn(slug, run)
 
+    def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
+        target = self.CLUSTER
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps({"kind": "Status"}))
+            raise AssertionError(argv)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                entry = fs.collect_cluster(target, run=run)
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("items", entry["error"])
+
     def test_the_target_name_is_qualified(self):
         entry = self.run_with(dump_items=[])
         c = self.CLUSTER

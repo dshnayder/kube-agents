@@ -1241,6 +1241,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        # Parsed but not a List: read as `items: []` it would be a cluster with
+        # nothing on it, audited clean.
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
 
     items = parsed.get("items", [])
