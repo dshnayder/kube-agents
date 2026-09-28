@@ -4391,11 +4391,15 @@ def check_unattached_disk(
         # whole reason a 9-day-old disk is a finding when the one beside it at
         # 20 days is not, and `adopt_collector_evidence` makes this string the
         # only evidence a reader sees.
-        orphan_note = (
-            f", provisioned for cluster {dead_cluster} which this project no longer runs"
-            if dead_cluster
-            else ""
-        )
+        # A live owner is named too: the finding stays on `project/<p>` so its
+        # identity does not move with attribution, which leaves the excerpt as
+        # the one place the owning cluster is recorded.
+        if dead_cluster:
+            orphan_note = f", provisioned for cluster {dead_cluster} which this project no longer runs"
+        elif owner:
+            orphan_note = f", labelled for cluster {owner}"
+        else:
+            orphan_note = ""
         pvc = _pvc_origin(disk)
         pvc_note = f", held the {pvc} PersistentVolumeClaim" if pvc else ""
         hits.append(

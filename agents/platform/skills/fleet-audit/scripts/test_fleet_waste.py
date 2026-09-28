@@ -3180,6 +3180,15 @@ class UnattachedDiskTest(unittest.TestCase):
     def test_flags_unattached_over_30_days(self):
         self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
 
+    def test_a_live_owner_is_named_in_the_excerpt(self):
+        """The finding stays on `project/<p>`, so the excerpt is where the
+        owning cluster is recorded."""
+        disk = self.disk()
+        disk["labels"] = {fw.GKE_CLUSTER_LABEL: "prod"}
+        hits = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"prod"})
+        self.assertIn("labelled for cluster prod", hits[0]["excerpt"])
+        self.assertNotIn("labelled for", fw.check_unattached_disk([self.disk()], set(), now=NOW)[0]["excerpt"])
+
     def test_a_disk_labelled_for_an_unread_cluster_is_not_judged(self):
         """Its PersistentVolumes were never read, so a detached disk it still
         binds is missing from `live_pv_handles` and would read as abandoned."""
