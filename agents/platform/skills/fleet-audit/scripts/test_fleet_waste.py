@@ -610,6 +610,14 @@ class OrphanPvTest(unittest.TestCase):
         sts = obj("StatefulSet", "mydb", ns="default")
         self.assertEqual(fw.check_orphan_pv(self.context([pv], sts=[sts]), now=NOW), [])
 
+    def test_a_same_named_statefulset_in_another_namespace_does_not_suppress_it(self):
+        pv = self.pv(
+            "Released",
+            **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.claimRef": {"namespace": "default", "name": "data-mydb-0"}},
+        )
+        sts = obj("StatefulSet", "mydb", ns="other")
+        self.assertEqual(len(fw.check_orphan_pv(self.context([pv], sts=[sts]), now=NOW)), 1)
+
     def test_backup_annotated_pv_is_suppressed(self):
         pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
         pv["metadata"]["annotations"]["velero.io/backup-name"] = "nightly"

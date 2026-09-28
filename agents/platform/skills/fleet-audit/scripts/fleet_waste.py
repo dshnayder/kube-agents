@@ -1353,7 +1353,10 @@ ORPHAN_PV_UNCLAIMED_DAYS = 30
 
 def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
     pvc_uid = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")): p["metadata"].get("uid", "") for p in context["pvcs"]}
-    sts_names = {s.get("metadata", {}).get("name", "") for s in context.get("statefulsets", [])}
+    # Per namespace, as 3.3 keys it: a StatefulSet only ever claims in its own.
+    sts_by_ns: dict[str, set[str]] = {}
+    for sts in context.get("statefulsets", []):
+        sts_by_ns.setdefault(sts.get("metadata", {}).get("namespace", ""), set()).add(sts.get("metadata", {}).get("name", ""))
     # A statically provisioned PV waiting on a claim that has not bound yet is
     # pre-staged, not abandoned. Only this cluster's claims can bind it.
     pending_classes = {
@@ -1383,7 +1386,7 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
             if live_uid is not None:
                 if not claim_ref.get("uid") or not live_uid or claim_ref.get("uid") == live_uid:
                     continue
-            elif _matches_live_statefulset_pvc(claim_name, sts_names):
+            elif _matches_live_statefulset_pvc(claim_name, sts_by_ns.get(claim_ns, set())):
                 continue
 
         if phase in ("Released", "Failed"):
