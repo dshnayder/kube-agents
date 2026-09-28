@@ -57,7 +57,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
   1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
-  2. Enumerate clusters and run the checks per the SOP.
+  2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding your document carries, and `finish` holds, rather than publishes, every candidate a document leaves out.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
