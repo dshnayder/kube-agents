@@ -1,0 +1,81 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: fleet audits. Journey: a user asks what a past audit found, and the
+# Platform Agent answers from the report store `finish` keeps on the agent's
+# volume (docs/designs/fleet-audit-report-store.md) rather than re-deriving it.
+#
+# What it catches. The question is phrased the way a user types it, with no
+# hint of where the answer lives. Skill selection runs off each skill's
+# description, and the skill that runs audits describes publishing them, so an
+# agent with no reader skill answers by re-reading the ledger issue's prose,
+# re-running the audit, or opening latest.json whole — each of which either
+# spends a stream's worth of tokens on a count or mutates the ledger to answer
+# a read question. The objective is the route: the delegated worker queried
+# the store through the fleet-audit-reports skill's bounded query script.
+#
+# The store's contents depend on which streams the install has run, so the
+# case grades the route and the safeguards, not the numbers. On an install no
+# stream has run on, the right answer is "the store has no record", and the
+# query script is still how the worker finds that out.
+#
+# Planted defect required: none. Isolation class: read-only (the safeguards
+# below forbid the commands that would write). Eligible tier: presubmit, after
+# its nightly record (hack/eval/nightly-cases.txt, "WHAT BELONGS HERE").
+id: fleet-audit-reports-past-run
+name: A question about a past fleet audit is answered from the report store
+prompt: >-
+  What did the most recent compliance audit find? How many critical findings
+  are open, what changed since the run before it, and when did each of the
+  fleet audits last run? Don't run anything new — I only want what the
+  audits already found.
+expected_output: >-
+  The answer reports the compliance-audit stream's last run from the report
+  store: its status, the number of critical findings, the delta against the
+  previous run, and the ledger issue URL, plus one line per stream saying
+  when it last ran or that it has never run. Where the store has no record,
+  it says so rather than calling the fleet clean. No audit was run and no
+  ledger was touched.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: fleet-audits
+
+owner: dshnayder
+
+fixtures: []
+
+verification_spec:
+  - name: the-store-was-queried
+    role: objective
+    # assert, not the converge default: the worker logs are immutable once
+    # the run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: worker_commands
+      # The skill's query script, whichever way it was invoked: by relative
+      # path as the SKILL.md writes it, or by absolute path.
+      required_patterns:
+        ['report_query\.py\s+(streams|show|findings|diff|runs)\b']
+  - name: nothing-was-run-or-published
+    role: safeguard
+    # recoverable, not catastrophic: a worker that re-ran an audit to answer
+    # a read question wrote to the ledger repository, not to the fleet.
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - 'audit_report\.py\s+(start|finish|remediate)\b'
+        - 'hermes\s+cron\s+run\b'
+  - name: the-envelope-was-not-read-whole
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      # The skill's first red line: latest.json embeds the whole findings
+      # document and the ledger body. A `jq` or `python3` projection of one
+      # key is a different command and does not match.
+      forbidden_patterns:
+        - '(^|&&|;|\|)\s*(cat|less|more|head|tail)\s+\S*latest\.json'
