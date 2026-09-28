@@ -107,6 +107,12 @@ GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 l
 HYPERDISK_INCOMPATIBLE_FAMILIES = {"c2", "n2", "e2"}
 HYPERDISK_TYPES = {"hyperdisk-balanced", "hyperdisk-throughput", "hyperdisk-extreme"}
 DEFAULT_STORAGE_CLASS_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
+# §3.5's exclusion: from this control-plane version the `dynamic-rwo` class
+# makes the autoscaler disk-topology aware, so mixed generations stop
+# deadlocking a claim that uses it.
+DYNAMIC_RWO_CLASS = "dynamic-rwo"
+DYNAMIC_RWO_MIN_VERSION = (1, 35, 3)
+GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 # §3.11. The three message ids that mean a scale-up failed for want of
 # capacity, quota or pod IPs. Every other id the autoscaler emits is a
@@ -325,7 +331,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     result = run(
         [
             "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,status,autopilot.enabled,autoscaling.enableNodeAutoprovisioning)",
+            "--format", "json(name,location,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning)",
         ]
     )
     if result.rc != 0:
@@ -343,6 +349,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             # A cluster-level setting, not derivable from any one node
             # pool's own autoscaling config -- see `check_single_zone_nodepool`.
             "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
+            "version": c.get("currentMasterVersion") or "",
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -1302,12 +1309,17 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         (n for n, sc in storage_classes.items() if ((sc.get("metadata") or {}).get("annotations") or {}).get(DEFAULT_STORAGE_CLASS_ANNOTATION) == "true"),
         None,
     )
+
+    def claim_class(vct: dict) -> str | None:
+        sc_name = (vct.get("spec") or {}).get("storageClassName")
+        return default_class if sc_name is None else sc_name
+
+    version = GKE_VERSION_RE.match(cluster.get("version") or "")
+    dynamic_rwo_applies = bool(version) and tuple(int(g) for g in version.groups()) >= DYNAMIC_RWO_MIN_VERSION
     stateful_names_using_hyperdisk = set()
     for sts in statefulsets:
         for vct in sts.get("spec", {}).get("volumeClaimTemplates", []) or []:
-            sc_name = (vct.get("spec") or {}).get("storageClassName")
-            if sc_name is None:
-                sc_name = default_class
+            sc_name = claim_class(vct)
             provisioner = (storage_classes.get(sc_name) or {}).get("provisioner", "")
             params = (storage_classes.get(sc_name) or {}).get("parameters", {}) or {}
             if params.get("type") in HYPERDISK_TYPES or "hyperdisk" in provisioner.lower():
@@ -1323,7 +1335,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # StatefulSet with no `volumeClaimTemplates` has nothing that can
         # deadlock on a machine-family mismatch, so it does not count here
         # even though it references the ComputeClass.
-        if sts.get("spec", {}).get("volumeClaimTemplates"):
+        # Nor does one whose every claim is on `dynamic-rwo` where the control
+        # plane is new enough to honour it: §3.5's Do-NOT-flag.
+        vcts = sts.get("spec", {}).get("volumeClaimTemplates") or []
+        if vcts and not (dynamic_rwo_applies and all(claim_class(v) == DYNAMIC_RWO_CLASS for v in vcts)):
             cc_referenced_by_stateful.add(cc_ref)
         if (sts["metadata"].get("namespace", ""), sts["metadata"]["name"]) in stateful_names_using_hyperdisk:
             cc_referenced_by_hyperdisk.add(cc_ref)

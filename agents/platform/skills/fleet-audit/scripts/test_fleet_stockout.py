@@ -152,6 +152,18 @@ class EnumerateClustersTest(unittest.TestCase):
         self.assertFalse(next(c for c in clusters if c["name"] == "c2")["has_nap"])
         self.assertEqual(not_running, [])
 
+    def test_reads_the_control_plane_version(self):
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.3-gke.1200"}])
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, clusters_json)
+
+        clusters, _ = fs.enumerate_clusters("acme", run=run)
+        self.assertEqual(clusters[0]["version"], "1.35.3-gke.1200")
+        self.assertIn("currentMasterVersion", issued[0][-1])
+
     def test_a_cluster_that_is_not_running_comes_back_as_an_unreachable_target(self):
         # Dropped rather than recorded, a DEGRADED cluster is indistinguishable
         # from one that does not exist, and the run can publish a fleet-wide
@@ -1510,6 +1522,22 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc, sts])
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("ccc-mixed-disk-generations", slugs)
+
+    def test_mixed_disk_generation_on_dynamic_rwo_is_excluded_only_from_1_35_3(self):
+        cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="dynamic-rwo")
+        other = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="standard-rwo")
+        for version, items, flagged in (
+            ("1.35.3-gke.1200", [cc, sts], False),
+            ("1.36.0-gke.100", [cc, sts], False),
+            ("1.35.2-gke.900", [cc, sts], True),
+            ("", [cc, sts], True),
+            ("1.35.3-gke.1200", [cc, other], True),
+        ):
+            with self.subTest(version=version, items=items[1]["spec"]["volumeClaimTemplates"]):
+                entry = self.run_with(dump_items=items, cluster={**self.CLUSTER, "version": version})
+                slugs = {c["check"] for c in entry["candidates"]}
+                self.assertEqual("ccc-mixed-disk-generations" in slugs, flagged)
 
     def test_mixed_disk_generation_not_flagged_without_persistent_volumes(self):
         cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
