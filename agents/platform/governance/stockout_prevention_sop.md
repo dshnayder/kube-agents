@@ -192,7 +192,7 @@ The `project/<project-id>` entry is covered on the same terms. `gcloud compute r
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `gcloud compute regions describe <region> --project=<project> --format="json(quotas)"`
 - **Flag when:** a GPU, TPU or CPU quota's `usage` in a project's region reaches >=90% of its `limit` (e.g. 22 of 24 L4 GPUs in use). One finding per region and metric, object `Quota/<region>:<metric>`.
-- **Do NOT flag:** a quota whose `usage` is under 90% of its `limit`, however much demand the fleet's workloads could add to it.
+- **Do NOT flag:** a quota whose `usage` is under 90% of its `limit`, however much demand the fleet's workloads could add to it; a `COMMITTED_*` metric at any usage, because it counts a committed-use discount meant to run full, and usage past it bills on demand rather than failing.
 - **Severity:** `critical`.
 - **Impact:** "`<metric>` quota in `<region>` is at `<usage>` of `<limit>`; once it is reached, Cluster Autoscaler cannot provision additional nodes there even if physical capacity exists."
 - **Remediation:** `kind: manifest`. Adjust workload request caps in GitOps manifests to fit strictly within quota limits, and submit a quota increase recommendation for the GCP project.

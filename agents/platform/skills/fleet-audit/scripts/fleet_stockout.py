@@ -831,11 +831,15 @@ def check_reservation_affinity(cc: dict) -> dict | None:
 # `AFFINITY_GROUPS` publishes a `critical` stockout finding, and 95 of the 164
 # metrics have nothing to do with whether the autoscaler can get a node.
 _CAPACITY_QUOTA_RE = re.compile(r"(?:^|_)(?:CPUS|GPUS)(?:_ALL_REGIONS)?$|TPU")
+# A `COMMITTED_*` metric counts a committed-use discount, a billing commitment
+# that is meant to run full. At 100% it caps nothing the autoscaler asks for:
+# usage past it bills on demand against the ordinary quota beside it.
+_COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
 
 
 def check_quota(quota: dict, region: str) -> dict | None:
     metric = str(quota.get("metric") or "")
-    if not _CAPACITY_QUOTA_RE.search(metric):
+    if not _CAPACITY_QUOTA_RE.search(metric) or metric.startswith(_COMMITMENT_QUOTA_PREFIX):
         return None
     limit, usage = quota.get("limit"), quota.get("usage", 0)
     if not isinstance(limit, (int, float)) or not isinstance(usage, (int, float)):

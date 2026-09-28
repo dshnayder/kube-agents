@@ -411,6 +411,14 @@ SYSTEM_NAMESPACES = frozenset(
     }
 )
 
+# §3.2/§3.3 grade a volume `major` at this size, or on an SSD class. GKE's
+# SSD-backed class is `premium-rwo`, which names no `ssd` at all.
+LARGE_VOLUME_GIB = 100
+SSD_STORAGE_CLASS_MARKERS = ("ssd", "extreme", "premium")
+
+# §3.10: a namespace under an active GitOps sync is the controller's to delete.
+GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.io/")
+
 
 def _is_system_namespace(ns: str) -> bool:
     return ns in SYSTEM_NAMESPACES or ns.startswith("gke-") or ns.startswith("config-management-")
@@ -1381,10 +1389,14 @@ def _gib(quantity: str) -> float:
     return mib / MIB_PER_GIB if mib is not None else 0.0
 
 
+def _is_ssd_class(storage_class: str) -> bool:
+    sc = storage_class.lower()
+    return any(marker in sc for marker in SSD_STORAGE_CLASS_MARKERS)
+
+
 def _is_large_or_ssd(spec: dict) -> bool:
     gib = _gib((spec.get("capacity") or {}).get("storage", "0"))
-    sc = (spec.get("storageClassName") or "").lower()
-    return gib >= 100 or "ssd" in sc or "extreme" in sc
+    return gib >= LARGE_VOLUME_GIB or _is_ssd_class(spec.get("storageClassName") or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -1430,7 +1442,7 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
                 "namespace": ns,
                 "object": f"PersistentVolumeClaim/{name}",
                 "excerpt": f"Bound, {capacity}, {sc}, unreferenced by any pod, AGE={_whole_days(age)}d",
-                "severity": "major" if gib >= 100 or "ssd" in sc else "minor",
+                "severity": "major" if gib >= LARGE_VOLUME_GIB or _is_ssd_class(sc) else "minor",
             }
         )
     return hits
@@ -1803,11 +1815,14 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
             continue  # already reported by obtainability-audit's 3.3/3.4
 
         bare_pod = not owners
-        unevictable = evictable is False or (bare_pod and has_local_storage) or (has_local_storage and evictable is not True)
+        unevictable = evictable is False or ((bare_pod or has_local_storage) and evictable is not True)
         if not unevictable:
             continue
 
-        permanent = (bare_pod and has_local_storage) or evictable is False
+        # §3.8: permanent only when nothing will ever reschedule the pod. A
+        # controller recreates its pod elsewhere once someone deletes it, so
+        # `safe-to-evict: "false"` on a controlled pod is `major`.
+        permanent = bare_pod and (has_local_storage or evictable is False)
         pod_name = pod.get("metadata", {}).get("name", "")
         # The raw annotation, not the parse: the excerpt is evidence, and a
         # reader checking it against `kubectl get pod -o yaml` needs to see what
@@ -1885,6 +1900,8 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
             continue
         if any(o.get("kind") == "CronJob" for o in (meta.get("ownerReferences") or [])):
             continue
+        if any(k.startswith(p) for k in (meta.get("labels") or {}) for p in GC_OWNED_LABEL_PREFIXES):
+            continue
         if spec.get("ttlSecondsAfterFinished") is not None:
             continue
         done = status.get("completionTime") or _job_finished_at(status)
@@ -1943,8 +1960,10 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
             continue
         if (ns_obj.get("status") or {}).get("phase") == "Terminating":
             continue
-        annotations = ns_obj.get("metadata", {}).get("annotations") or {}
-        if any(k.startswith("configsync.gke.io/") or k.startswith("kustomize.toolkit.fluxcd.io/") for k in annotations):
+        # Config Sync marks what it manages with annotations; Flux's
+        # kustomize-controller stamps labels. Either one owns the lifecycle.
+        markers = {**(ns_obj.get("metadata", {}).get("annotations") or {}), **(ns_obj.get("metadata", {}).get("labels") or {})}
+        if any(k.startswith(GITOPS_SYNC_MARKER_PREFIXES) for k in markers):
             continue
         age = _age_days(ns_obj.get("metadata", {}).get("creationTimestamp", ""), now=now)
         if age is None or age < 30:

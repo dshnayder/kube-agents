@@ -867,13 +867,20 @@ class QuotaTest(unittest.TestCase):
         Compute quota there is -- 164 on `us-east4` -- and without a filter a
         project at 92% of `BACKEND_BUCKETS` publishes a `critical` stockout."""
         for metric in ("CPUS", "CPUS_ALL_REGIONS", "N4_CPUS", "PREEMPTIBLE_CPUS",
-                       "NVIDIA_L4_GPUS", "COMMITTED_NVIDIA_A100_GPUS", "TPU_V5_LITEPOD_SLICES"):
+                       "NVIDIA_L4_GPUS", "TPU_V5_LITEPOD_SLICES"):
             with self.subTest(metric=metric, capacity=True):
                 self.assertIsNotNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}, "us-central1"))
         for metric in ("BACKEND_BUCKETS", "AFFINITY_GROUPS", "IN_USE_ADDRESSES",
                        "DISKS_TOTAL_GB", "LOCAL_SSD_TOTAL_GB", "FIREWALLS"):
             with self.subTest(metric=metric, capacity=False):
                 self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}, "us-central1"))
+
+    def test_a_commitment_quota_is_not_a_capacity_cap(self):
+        """A `COMMITTED_*` metric counts a committed-use discount, which is
+        meant to run full; usage past it bills on demand."""
+        for metric in ("COMMITTED_CPUS", "COMMITTED_N2_CPUS", "COMMITTED_NVIDIA_A100_GPUS"):
+            with self.subTest(metric=metric):
+                self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 100}, "us-central1"))
 
     def test_absent_usage_is_not_a_crash(self):
         self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100}, "us-central1"))

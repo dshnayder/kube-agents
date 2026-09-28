@@ -636,6 +636,13 @@ class UnconsumedPvcTest(unittest.TestCase):
         context = {"pods": [], "pvcs": [self.pvc(phase="Pending")], "statefulsets": []}
         self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
 
+    def test_premium_rwo_is_an_ssd_class(self):
+        """GKE's SSD-backed class is `premium-rwo`, which names no `ssd`."""
+        pvc = self.pvc()
+        pvc["spec"]["storageClassName"] = "premium-rwo"
+        context = {"pods": [], "pvcs": [pvc], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW)[0]["severity"], "major")
+
     def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
         # 14d 14h, against a 14-day gate. See the matching case in OrphanPvTest.
         context = {"pods": [], "pvcs": [self.pvc(created="2026-07-17T10:00:00Z")], "statefulsets": []}
@@ -1018,14 +1025,31 @@ class ScaledownBlockedTest(unittest.TestCase):
         hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
         self.assertEqual(hits[0]["severity"], "critical")
 
-    def test_safe_to_evict_false_on_owned_pod_is_critical(self):
+    def test_safe_to_evict_false_on_owned_pod_is_major(self):
+        """§3.8 keeps `critical` for a pod nothing will ever reschedule. A
+        controller recreates this one once it is deleted, so it is `major`."""
         pod = obj(
             "Pod", "app", ns="default",
             **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}], "metadata.annotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"}},
         )
         context = {"pods": [pod], "pdbs": []}
         hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_safe_to_evict_false_on_bare_pod_is_critical(self):
+        pod = obj(
+            "Pod", "app", ns="default",
+            **{"spec.nodeName": "n1", "metadata.ownerReferences": [], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "false"}},
+        )
+        hits = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])
         self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_bare_pod_without_local_storage_is_a_major_blocker(self):
+        """§3.8 names a bare pod as a blocker on its own: the autoscaler will
+        not evict a pod no controller would recreate."""
+        pod = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "metadata.ownerReferences": []})
+        hits = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])
+        self.assertEqual([h["severity"] for h in hits], ["major"])
 
     def test_pdb_backed_pod_is_never_flagged_here(self):
         pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": []})
@@ -1061,7 +1085,7 @@ class ScaledownBlockedTest(unittest.TestCase):
                 context = {"pods": [self.evict_pod(value)], "pdbs": []}
                 hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
                 self.assertEqual(len(hits), 1, value)
-                self.assertEqual(hits[0]["severity"], "critical")
+                self.assertEqual(hits[0]["severity"], "major")
 
     def test_a_capitalised_true_clears_the_local_storage_pin(self):
         """The mirror-image error: `!= "true"` read `"True"` as unset, so a pod
@@ -1189,6 +1213,11 @@ class TerminalPodsTest(unittest.TestCase):
         hits = fw.check_terminal_pods(context, now=NOW)
         self.assertTrue(any(h["object"] == "Job/batch" for h in hits))
 
+    def test_does_not_flag_a_job_whose_controller_collects_it(self):
+        job = obj("Job", "step", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z", "metadata.labels": {"workflows.argoproj.io/workflow": "w"}})
+        context = {"pods": [], "jobs": [job], "cronjobs": []}
+        self.assertEqual(fw.check_terminal_pods(context, now=NOW), [])
+
     def test_does_not_flag_job_with_ttl_set(self):
         job = obj("Job", "batch", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z", "spec.ttlSecondsAfterFinished": 3600})
         context = {"pods": [], "jobs": [job], "cronjobs": []}
@@ -1238,6 +1267,15 @@ class IdleNamespaceTest(unittest.TestCase):
         svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
         ns_doc = self.ns("demo")
         ns_doc["metadata"]["annotations"]["configsync.gke.io/sync-name"] = "x"
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_does_not_flag_a_flux_labelled_namespace(self):
+        """Flux's kustomize-controller marks what it applies with labels, not
+        annotations."""
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        ns_doc = self.ns("demo")
+        ns_doc["metadata"].setdefault("labels", {})["kustomize.toolkit.fluxcd.io/name"] = "apps"
         context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
         self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
 
