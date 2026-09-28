@@ -106,6 +106,7 @@ GEN2_FAMILIES = {"n2", "n2d", "c2"}
 GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 lists a different, wider set for its own check
 HYPERDISK_INCOMPATIBLE_FAMILIES = {"c2", "n2", "e2"}
 HYPERDISK_TYPES = {"hyperdisk-balanced", "hyperdisk-throughput", "hyperdisk-extreme"}
+DEFAULT_STORAGE_CLASS_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
 
 # §3.11. The three message ids that mean a scale-up failed for want of
 # capacity, quota or pod IPs. Every other id the autoscaler emits is a
@@ -1295,10 +1296,18 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     candidates: list[dict] = []
     commands: dict[str, dict] = {}
 
+    # A claim that names no class gets the cluster's default, and most charts
+    # name none -- reading only an explicit `storageClassName` missed them.
+    default_class = next(
+        (n for n, sc in storage_classes.items() if ((sc.get("metadata") or {}).get("annotations") or {}).get(DEFAULT_STORAGE_CLASS_ANNOTATION) == "true"),
+        None,
+    )
     stateful_names_using_hyperdisk = set()
     for sts in statefulsets:
         for vct in sts.get("spec", {}).get("volumeClaimTemplates", []) or []:
             sc_name = (vct.get("spec") or {}).get("storageClassName")
+            if sc_name is None:
+                sc_name = default_class
             provisioner = (storage_classes.get(sc_name) or {}).get("provisioner", "")
             params = (storage_classes.get(sc_name) or {}).get("parameters", {}) or {}
             if params.get("type") in HYPERDISK_TYPES or "hyperdisk" in provisioner.lower():

@@ -1526,6 +1526,26 @@ class CollectClusterTest(unittest.TestCase):
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("ccc-hyperdisk-incompatible", slugs)
 
+    def test_a_claim_naming_no_class_uses_the_default_hyperdisk_class(self):
+        sc = storage_class("hd", params={"type": "hyperdisk-balanced"})
+        sc["metadata"]["annotations"] = {"storageclass.kubernetes.io/is-default-class": "true"}
+        cc = compute_class("cc1", [{"machineFamily": "c4"}, {"machineFamily": "e2"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"})
+        sts["spec"]["volumeClaimTemplates"] = [{"spec": {}}]
+        entry = self.run_with(dump_items=[sc, cc, sts])
+        slugs = {c["check"] for c in entry["candidates"]}
+        self.assertIn("ccc-hyperdisk-incompatible", slugs)
+
+    def test_an_empty_class_name_is_static_binding_not_the_default(self):
+        sc = storage_class("hd", params={"type": "hyperdisk-balanced"})
+        sc["metadata"]["annotations"] = {"storageclass.kubernetes.io/is-default-class": "true"}
+        cc = compute_class("cc1", [{"machineFamily": "c4"}, {"machineFamily": "e2"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"})
+        sts["spec"]["volumeClaimTemplates"] = [{"spec": {"storageClassName": ""}}]
+        entry = self.run_with(dump_items=[sc, cc, sts])
+        slugs = {c["check"] for c in entry["candidates"]}
+        self.assertNotIn("ccc-hyperdisk-incompatible", slugs)
+
     def test_no_ondemand_floor_escalates_for_a_referencing_inference_workload(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
         gpu_container = {"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}
