@@ -3909,6 +3909,7 @@ class CollectProjectComputeTest(unittest.TestCase):
         )
         self.assertIn("orphan-lb was not evaluated", target["limitations"])
         self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
+        self.assertEqual([c["check"] for c in target["checks_unevaluated"]], ["orphan-lb", "registry-no-cleanup"])
 
     def recording(self, fail=None):
         seen = []
@@ -4135,6 +4136,14 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("rc=-1", entry["limitations"])
         self.assertIn("connection reset", entry["limitations"])
 
+    def test_a_failed_usage_read_marks_its_checks_unevaluated(self):
+        """So `finish` can refuse a document that files them as not applicable."""
+        entry = self._metrics_down(obj("Node", "node-1"))
+        self.assertEqual(
+            [c["check"] for c in entry["checks_unevaluated"]],
+            ["idle-workload", "overrequest", "underrequest", "unsized-workload"],
+        )
+
     def test_an_empty_answer_is_not_described_as_a_failure(self):
         """rc 0 is a 200 that carried no series — the cluster is not shipping
         system metrics. Reporting that as `failed (rc=0)` asked the reader to
@@ -4179,6 +4188,10 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("idle-nodepool and scaledown-blocked", entry["limitations"])
         self.assertIn("rc=1", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_an_unreadable_pool_list_marks_both_pool_checks_unevaluated(self):
+        entry, _ = self._unreadable_pools()
+        self.assertEqual([c["check"] for c in entry["checks_unevaluated"]], ["idle-nodepool", "scaledown-blocked"])
 
     def test_an_unreadable_pool_list_leaves_the_object_checks_alone(self):
         """A degradation, not a gate failure: the object dump still backs 3.1–3.4."""
@@ -5016,7 +5029,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]) or "node-pools" in argv:
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -5039,6 +5052,21 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             },
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
+
+    def test_a_project_with_no_clusters_evaluates_orphan_lb(self):
+        """No cluster means no Service can still claim a forwarding rule, so the
+        project is fully read rather than withheld every week."""
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, "[]")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertIn("orphan-lb", [c["check"] for c in project_entry["commands"]])
+        self.assertNotIn("checks_unevaluated", project_entry)
 
     def test_a_check_absent_from_the_manifest_is_rejected(self):
         import audit_report

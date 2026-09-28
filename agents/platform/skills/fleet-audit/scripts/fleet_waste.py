@@ -3918,6 +3918,10 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     pools_record = _record(shlex.join(node_pools_argv), pools_result)
     limitations: list[str] = []
     not_applicable: list[dict] = []
+    # A check whose read failed: neither run nor inapplicable. `finish` rejects
+    # a document that files one of these under either list, which a
+    # `limitations` sentence alone cannot make it do.
+    unevaluated: dict[str, str] = {}
 
     usage_peaks, metrics_ok, usage_result = fetch_usage_peaks(project, name, session=session, now=now)
     usage_record = _record(usage_result.argv[0], usage_result)
@@ -3956,6 +3960,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # is the same on every run.
     if not cluster.get("autopilot"):
         if not pools_readable:
+            for slug in ("idle-nodepool", "scaledown-blocked"):
+                unevaluated[slug] = f"`gcloud container node-pools list` failed (rc={pools_result.rc})"
             limitations.append(
                 f"idle-nodepool and scaledown-blocked could not be measured on "
                 f"this cluster: `gcloud container node-pools list` failed "
@@ -4130,6 +4136,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # `commands` on its own, so §6 was raising it as a gap with no reason
         # attached -- a reader saw the check named and had nothing to tell them
         # whether it was denied, throttled, or never attempted.
+        for slug in ("overrequest", "unsized-workload", "idle-workload"):
+            unevaluated[slug] = f"the Cloud Monitoring usage read failed: {_metrics_gap_phrase(usage_result, 'usage')}"
         limitations.append(
             f"overrequest, unsized-workload and idle-workload could not be "
             f"measured on this cluster: {_metrics_gap_phrase(usage_result, 'usage')}"
@@ -4158,6 +4166,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             }
         )
     else:
+        unevaluated["underrequest"] = f"the Cloud Monitoring mean-memory read failed: {_metrics_gap_phrase(means_result, 'mean-memory')}"
         limitations.append(
             f"underrequest could not be measured on this cluster: "
             f"{_metrics_gap_phrase(means_result, 'mean-memory')}"
@@ -4172,6 +4181,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         entry["limitations"] = "; ".join(limitations)
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
+    if unevaluated:
+        entry["checks_unevaluated"] = [{"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())]
     return entry, fleet_facts
 
 
@@ -4719,6 +4730,15 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "are unknown, so a detached disk one of them still binds would read as abandoned."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
+    unevaluated = {}
+    if not all_reachable:
+        unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
+    if not disks_judged:
+        unevaluated["unattached-disk"] = "none of this project's clusters could be read"
+    if reg_parsed is None:
+        unevaluated["registry-no-cleanup"] = f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
+    if unevaluated:
+        entry["checks_unevaluated"] = [{"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())]
     # After the block above, not before it: that one assigns `limitations`
     # outright rather than appending, so a registry gap written first would be
     # overwritten on any project with an unreadable cluster -- which is most of
@@ -4862,9 +4882,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         group = by_project.get(p, [])
         group_entries = [entry for entry, _ in group]
         cluster_entries.extend(group_entries)
+        # A project with no clusters is fully read: no Service anywhere can
+        # still claim its forwarding rules, which is §3.6's orphan at its
+        # plainest. Requiring one cluster withheld the check there every week
+        # and pinned the run `partial`.
         all_reachable = (
-            bool(group_entries)
-            and not skipped_by_project.get(p)
+            not skipped_by_project.get(p)
             and all(e["outcome"] == "collected" for e in group_entries)
         )
         if p in enumeration_failed:
