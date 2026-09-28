@@ -503,6 +503,17 @@ func TestPrimaryNamespace(t *testing.T) {
 		{name: "first forge without a gitops repository", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{ghForge("a", "first"), ghForge("b", "second")}},
 			want: "first"},
+		{name: "a declared namespace GitHub refuses is not used", spec: &IntegrationSpec{
+			Forges:       []ForgeSpec{ghForge("github", "platform_team")},
+			Repositories: []RepositorySpec{repo("github", "https://github.com/gke-labs/infra", RepositoryRoleGitOps)}},
+			want: ""},
+		{name: "an invalid gitops forge falls through to the next valid one", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{ghForge("bad", "my.org"), ghForge("good", "gke-labs")},
+			Repositories: []RepositorySpec{
+				repo("bad", "infra", RepositoryRoleGitOps),
+				repo("good", "app", RepositoryRoleManaged),
+			}},
+			want: "gke-labs"},
 		{name: "alias inferred", spec: &IntegrationSpec{GitHub: &GitHubSpec{
 			GitRepo: "git@github.com:gke-labs/kube-agents.git"}}, want: "gke-labs"},
 		{name: "unresolvable", spec: &IntegrationSpec{GitHub: &GitHubSpec{

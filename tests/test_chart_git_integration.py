@@ -168,6 +168,33 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].host", result.stderr)
 
+    def test_a_namespace_github_refuses_fails_naming_the_forge(self):
+        """A single-forge declaration renders as the alias, whose `org` carries
+        GitHub's grammar in the CRD. Unchecked, the API server would refuse
+        `spec.integration.github.org` -- a key no values file set."""
+        for namespace in ("my_org", "my.org", "a" * 40):
+            with self.subTest(namespace=namespace):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace=namespace),
+                    *_repo(0, forge="github", repository="infra", role="gitops"),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].namespace", result.stderr)
+
+    def test_an_empty_repository_fails_the_render(self):
+        """Under `gitops` an empty repository folds into the alias as no
+        `gitRepo` at all, and the declaration vanishes without an error."""
+        for role in ("gitops", "managed"):
+            with self.subTest(role=role):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository="", role=role),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}repositories[0].repository is required", result.stderr)
+
     def test_declaring_both_spellings_fails_the_render(self):
         result = _render(
             _CR_TEMPLATE,

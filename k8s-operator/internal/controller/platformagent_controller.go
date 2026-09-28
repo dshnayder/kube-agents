@@ -3033,7 +3033,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		// two fields only the deprecated alias has.
 		condReason = conditionReasonInvalidGitRepoURL
 		degradedReason = conditionReasonInvalidGitRepoURL
-		condMsg = fmt.Sprintf("Invalid git integration (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		// Not "GitOps disabled": with the lists, every entry validation
+		// accepts is still seeded, the gitops repository included.
+		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"

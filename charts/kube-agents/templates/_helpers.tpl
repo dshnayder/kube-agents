@@ -570,6 +570,84 @@ topologySpreadConstraints:
 {{- end }}
 {{- end }}
 
+{{- /*
+The providers of the forges the install declares, comma-separated and
+deduplicated, folding the deprecated `integration.github` alias in as one
+`github` forge. Two spellings of one setting is how a values file ends up
+declaring one forge and provisioning another's credentials, so nothing reads
+the forge values directly to decide which forge this is -- everything calls
+this, and the minter guard is the reason it has to be one answer.
+
+It also carries the checks the chart can make before the API server does, so
+the failure names the values key: the two spellings are exclusive, a provider
+must be registered, a GitHub forge's host must be one GitHub serves and its
+namespace a GitHub organisation or user name, and a repository must name a
+declared forge and be neither empty nor the alias's `None`. The namespace check
+matters beyond the error text: a single-forge declaration renders as the alias,
+whose `org` has GitHub's grammar in the CRD, so without it the API server would
+refuse `github.org`, a key the values file never set.
+
+Renders the empty string when no forge is declared at all, which is a valid
+install: repositories can be registered in the gitops-state ConfigMap later.
+`gitRepo: None` is the alias's sentinel for "no repository", so on its own it
+declares nothing -- reading it as a declaration would make it collide with the
+`forges` list that replaces it, which is the migration every install has to
+make.
+
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
+list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
+*/}}
+{{- define "kube-agents.forgeProviders" -}}
+{{- $registered := list "github" -}}
+{{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
+{{- $integ := .Values.platformAgent.integration -}}
+{{- $forges := $integ.forges | default list -}}
+{{- $repos := $integ.repositories | default list -}}
+{{- $github := $integ.github | default dict -}}
+{{- $gitRepo := $github.gitRepo | default "" -}}
+{{- $githubSet := or $github.org (and $gitRepo (ne $gitRepo "None")) -}}
+{{- if and (or $forges $repos) $githubSet -}}
+{{- fail "set platformAgent.integration.forges and repositories, or platformAgent.integration.github, not both; github is a deprecated alias for one forge with provider: github" -}}
+{{- end -}}
+{{- $names := list -}}
+{{- $providers := list -}}
+{{- range $i, $f := $forges -}}
+{{- if not $f.name -}}
+{{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
+{{- end -}}
+{{- $provider := $f.provider | default "github" -}}
+{{- if not (has $provider $registered) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is %q; must be one of %s" $i $provider (join ", " $registered)) -}}
+{{- end -}}
+{{- $host := $f.host | default "" -}}
+{{- if and (eq $provider "github") $host (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
+{{- end -}}
+{{- $namespace := $f.namespace | default "" -}}
+{{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitHub organisation or user name" $i $namespace) -}}
+{{- end -}}
+{{- $names = append $names $f.name -}}
+{{- $providers = append $providers $provider -}}
+{{- end -}}
+{{- range $i, $r := $repos -}}
+{{- if not (has $r.forge $names) -}}
+{{- fail (printf "platformAgent.integration.repositories[%d].forge is %q, which is not a name in platformAgent.integration.forges" $i ($r.forge | default "")) -}}
+{{- end -}}
+{{- $repository := $r.repository | default "" -}}
+{{- if not $repository -}}
+{{- fail (printf "platformAgent.integration.repositories[%d].repository is required" $i) -}}
+{{- end -}}
+{{- if eq $repository "None" -}}
+{{- fail (printf "platformAgent.integration.repositories[%d].repository is \"None\", the deprecated github.gitRepo's \"no repository\" value; omit the entry instead" $i) -}}
+{{- end -}}
+{{- end -}}
+{{- if $githubSet -}}
+{{- $providers = list "github" -}}
+{{- end -}}
+{{- join "," (uniq $providers) -}}
+{{- end }}
+
 {{/*
 Admission-webhook object names, mirroring k8s-operator/config/webhook and
 config/certmanager.
@@ -1357,70 +1435,4 @@ a Go template cannot catch the error `lookup` raises.
   {{- include "kube-agents.quotaCheckItems" (dict "ctx" . "items" $items "required" $required) -}}
 {{- end -}}
 {{- end -}}
-{{- end }}
-
-{{- /*
-The providers of the forges the install declares, comma-separated and
-deduplicated, folding the deprecated `integration.github` alias in as one
-`github` forge. Two spellings of one setting is how a values file ends up
-declaring one forge and provisioning another's credentials, so nothing reads
-the forge values directly to decide which forge this is -- everything calls
-this, and the minter guard is the reason it has to be one answer.
-
-It also carries the checks the chart can make before the API server does, so
-the failure names the values key: the two spellings are exclusive, a provider
-must be registered, a GitHub forge's host must be one GitHub serves, and a
-repository must name a declared forge and must not be the alias's `None`.
-
-Renders the empty string when no forge is declared at all, which is a valid
-install: repositories can be registered in the gitops-state ConfigMap later.
-`gitRepo: None` is the alias's sentinel for "no repository", so on its own it
-declares nothing -- reading it as a declaration would make it collide with the
-`forges` list that replaces it, which is the migration every install has to
-make.
-
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
-list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
-*/}}
-{{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" -}}
-{{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
-{{- $integ := .Values.platformAgent.integration -}}
-{{- $forges := $integ.forges | default list -}}
-{{- $repos := $integ.repositories | default list -}}
-{{- $github := $integ.github | default dict -}}
-{{- $gitRepo := $github.gitRepo | default "" -}}
-{{- $githubSet := or $github.org (and $gitRepo (ne $gitRepo "None")) -}}
-{{- if and (or $forges $repos) $githubSet -}}
-{{- fail "set platformAgent.integration.forges and repositories, or platformAgent.integration.github, not both; github is a deprecated alias for one forge with provider: github" -}}
-{{- end -}}
-{{- $names := list -}}
-{{- $providers := list -}}
-{{- range $i, $f := $forges -}}
-{{- if not $f.name -}}
-{{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
-{{- end -}}
-{{- $provider := $f.provider | default "github" -}}
-{{- if not (has $provider $registered) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].provider is %q; must be one of %s" $i $provider (join ", " $registered)) -}}
-{{- end -}}
-{{- $host := $f.host | default "" -}}
-{{- if and (eq $provider "github") $host (not (has (lower $host) $githubHosts)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
-{{- end -}}
-{{- $names = append $names $f.name -}}
-{{- $providers = append $providers $provider -}}
-{{- end -}}
-{{- range $i, $r := $repos -}}
-{{- if not (has $r.forge $names) -}}
-{{- fail (printf "platformAgent.integration.repositories[%d].forge is %q, which is not a name in platformAgent.integration.forges" $i ($r.forge | default "")) -}}
-{{- end -}}
-{{- if eq ($r.repository | default "") "None" -}}
-{{- fail (printf "platformAgent.integration.repositories[%d].repository is \"None\", the deprecated github.gitRepo's \"no repository\" value; omit the entry instead" $i) -}}
-{{- end -}}
-{{- end -}}
-{{- if $githubSet -}}
-{{- $providers = list "github" -}}
-{{- end -}}
-{{- join "," (uniq $providers) -}}
 {{- end }}

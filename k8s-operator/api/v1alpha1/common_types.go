@@ -1382,8 +1382,10 @@ type ForgeSpec struct {
 
 	// Namespace is the organisation, user, or group path the agent acts for on
 	// this forge — the GitHub org that GitHubSpec called Org. A repository
-	// given as a bare name is qualified by it. If omitted, it is inferred from
-	// the GitOps repository when that is on this forge.
+	// given as a bare name is qualified by it, so without it every repository
+	// on this forge must name its namespace. If omitted, the organisation the
+	// token minter and GITHUB_ORG use is read from the GitOps repository when
+	// that is on this forge; bare repository names are not qualified by it.
 	//
 	// On GitHub it is also the organisation the token minter scopes the
 	// agent's credentials to; a repository in another organisation is not

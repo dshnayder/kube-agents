@@ -258,15 +258,21 @@ func (ri *ResolvedIntegration) WithRole(role string) []*ResolvedRepository {
 // A GitHub App token is scoped to one organisation, and GITHUB_ORG names one,
 // so where several GitHub forges are declared something has to pick; the
 // repository the agent's GitOps work lands in is the one that must work.
+//
+// A forge its provider refuses is skipped, as Accepted and the egress policy
+// skip it. Its namespace would otherwise become GITHUB_ORG and the minter's
+// primary organisation, and the minter prunes every policy outside that
+// organisation — with the webhook off, one mistyped namespace would revoke
+// tokens for repositories that were working.
 func (ri *ResolvedIntegration) PrimaryForge(provider string) *ResolvedForge {
 	if ri == nil {
 		return nil
 	}
-	if gitops := ri.GitOps(); gitops != nil && gitops.Forge != nil && gitops.Forge.Provider == provider {
+	if gitops := ri.GitOps(); gitops != nil && gitops.Forge != nil && gitops.Forge.Provider == provider && gitops.Forge.valid() {
 		return gitops.Forge
 	}
 	for _, f := range ri.Forges {
-		if f.Provider == provider {
+		if f.Provider == provider && f.valid() {
 			return f
 		}
 	}
