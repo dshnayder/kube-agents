@@ -1051,6 +1051,31 @@ class ScaledownBlockedTest(unittest.TestCase):
         hits = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])
         self.assertEqual([h["severity"] for h in hits], ["major"])
 
+    def test_a_bare_pod_marked_safe_to_evict_is_not_a_blocker(self):
+        pod = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "metadata.ownerReferences": [], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "true"}})
+        self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
+
+    def test_a_finished_bare_pod_is_not_a_blocker(self):
+        """The autoscaler ignores a pod that has already exited."""
+        for phase in ("Succeeded", "Failed"):
+            with self.subTest(phase=phase):
+                pod = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "metadata.ownerReferences": [], "status.phase": phase, "spec.volumes": [{"emptyDir": {}}]})
+                self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
+
+    def test_daemonset_and_mirror_pods_go_with_the_node(self):
+        for kind in ("DaemonSet", "Node"):
+            with self.subTest(kind=kind):
+                pod = obj("Pod", "agent", ns="monitoring", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": kind, "name": "x"}], "spec.volumes": [{"hostPath": {"path": "/var/log"}}]})
+                self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
+
+    def test_the_node_carries_its_worst_blocker_whatever_the_listing_order(self):
+        owned = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "false"}})
+        bare = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "metadata.ownerReferences": [], "spec.volumes": [{"emptyDir": {}}]})
+        for pods in ([owned, bare], [bare, owned]):
+            with self.subTest(first=pods[0]["metadata"]["name"]):
+                hits = fw.check_scaledown_blocked({"pods": pods, "pdbs": []}, [{"_node_names": {"n1"}}])
+                self.assertEqual([(h["severity"], "ci/debug" in h["excerpt"]) for h in hits], [("critical", True)])
+
     def test_pdb_backed_pod_is_never_flagged_here(self):
         pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": []})
         pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": {"matchLabels": {"app": "web"}}})

@@ -419,6 +419,8 @@ SSD_STORAGE_CLASS_MARKERS = ("ssd", "extreme", "premium")
 # §3.10: a namespace under an active GitOps sync is the controller's to delete.
 GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.io/")
 
+POD_TERMINAL_PHASES = ("Succeeded", "Failed")
+
 
 def _is_system_namespace(ns: str) -> bool:
     return ns in SYSTEM_NAMESPACES or ns.startswith("gke-") or ns.startswith("config-management-")
@@ -1796,16 +1798,23 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
 
     pdb_selectors = _pdb_selectors(context)
 
-    hits = []
-    seen_nodes = set()
+    # One finding per node, carrying its worst blocker: a node pinned for good
+    # by one pod is `critical` whichever pod the listing happens to put first.
+    by_node: dict[str, dict] = {}
     for pod in context["pods"]:
         node_name = (pod.get("spec") or {}).get("nodeName", "")
-        if node_name not in flagged_nodes or node_name in seen_nodes:
+        if node_name not in flagged_nodes or by_node.get(node_name, {}).get("severity") == "critical":
             continue
         ns = pod.get("metadata", {}).get("namespace", "")
         if _is_system_namespace(ns):
             continue
+        # A finished pod holds nothing on the node, and DaemonSet and mirror
+        # pods go with it; the autoscaler skips all three when it drains.
+        if (pod.get("status") or {}).get("phase") in POD_TERMINAL_PHASES:
+            continue
         owners = pod.get("metadata", {}).get("ownerReferences") or []
+        if any(o.get("kind") in ("DaemonSet", "Node") for o in owners):
+            continue
         annotations = pod.get("metadata", {}).get("annotations") or {}
         evictable = _safe_to_evict(annotations)
         has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
@@ -1827,15 +1836,14 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         # The raw annotation, not the parse: the excerpt is evidence, and a
         # reader checking it against `kubectl get pod -o yaml` needs to see what
         # is really on the object.
-        hits.append(
-            {
-                "object": f"Node/{node_name}",
-                "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage})",
-                "severity": "critical" if permanent else "major",
-            }
-        )
-        seen_nodes.add(node_name)
-    return hits
+        if node_name in by_node and not permanent:
+            continue
+        by_node[node_name] = {
+            "object": f"Node/{node_name}",
+            "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage})",
+            "severity": "critical" if permanent else "major",
+        }
+    return list(by_node.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -1869,7 +1877,7 @@ def _job_finished_at(status: dict) -> str:
 
 
 def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
-    terminal = [p for p in context["pods"] if (p.get("status") or {}).get("phase") in ("Succeeded", "Failed")]
+    terminal = [p for p in context["pods"] if (p.get("status") or {}).get("phase") in POD_TERMINAL_PHASES]
     by_ns: dict[str, list[dict]] = {}
     for pod in terminal:
         ns = pod.get("metadata", {}).get("namespace", "")
