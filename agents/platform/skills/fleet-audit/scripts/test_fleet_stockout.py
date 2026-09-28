@@ -1554,6 +1554,14 @@ class CollectClusterTest(unittest.TestCase):
         hit = next(c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor")
         self.assertEqual(hit["severity"], "critical")
 
+    def test_no_ondemand_floor_stays_major_for_an_app_that_only_calls_a_model(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        caller = {"name": "app", "image": "example/web:1", "env": [{"name": "OPENAI_API_KEY", "value": "x"}]}
+        d = deployment("chat-ui", node_selector={"cloud.google.com/compute-class": "cc1"}, containers=[caller])
+        entry = self.run_with(dump_items=[cc, d])
+        hit = next(c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor")
+        self.assertEqual(hit["severity"], "major")
+
     def test_no_ondemand_floor_stays_major_for_a_non_inference_referencing_workload(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
         d = deployment("web", node_selector={"cloud.google.com/compute-class": "cc1"})

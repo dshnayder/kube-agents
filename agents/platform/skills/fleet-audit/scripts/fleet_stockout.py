@@ -501,8 +501,8 @@ def check_ccc_no_ondemand_floor(cc: dict, referenced_by_inference: bool) -> dict
         return None
     hit = {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priorities, all Spot, no On-Demand floor"}
     if referenced_by_inference:
-        # §3.2's escalation, reusing ai-security-audit's own discriminator
-        # (`collect.py`'s `_is_ai_workload`) rather than a second "which
+        # §3.2's escalation, reusing ai-security-audit's own discriminators
+        # (`collect.py`'s image and accelerator patterns) rather than a second "which
         # workloads count as inference" rule the two SOPs could drift apart
         # on.
         hit["severity"] = "critical"
@@ -1328,14 +1328,24 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         if (sts["metadata"].get("namespace", ""), sts["metadata"]["name"]) in stateful_names_using_hyperdisk:
             cc_referenced_by_hyperdisk.add(cc_ref)
 
-    from collect import _is_ai_workload  # ai-security-audit's own inference-workload discriminator, per §3.2
+    # ai-security-audit's own inference discriminators, per §3.2: a serving
+    # image or an accelerator request. Not `_is_ai_workload` whole -- it also
+    # counts an AI-provider credential, which marks an app that *calls* a model,
+    # and a web app calling one is not a Spot-preemption SLA breach.
+    from collect import AI_ACCELERATOR_KEY_RE, AI_MODEL_IMAGE_RE
+
+    def _is_inference(template_spec: dict) -> bool:
+        containers = template_spec.get("containers") or []
+        return any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers) or any(
+            AI_ACCELERATOR_KEY_RE.search(key) for c in containers for key in ((c.get("resources") or {}).get("limits") or {})
+        )
 
     cc_referenced_by_inference = set()
     for workload in workloads:
         spec = workload.get("spec") or {}
         template_spec = ((spec.get("template") or {}).get("spec")) or spec
         cc_ref = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
-        if cc_ref and _is_ai_workload(template_spec):
+        if cc_ref and _is_inference(template_spec):
             cc_referenced_by_inference.add(cc_ref)
 
     # Recorded whether or not the dump held a ComputeClass or a StatefulSet.
