@@ -228,9 +228,13 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 self.assertIn(f"{_P}repositories[0].repository", result.stderr)
 
     def test_no_forge_declaration_renders_no_integration_key(self):
-        """`integration: {}` is not the same as an absent integration: the
-        operator reads a present-but-empty block as a declaration."""
-        self.assertEqual(_integration(), {})
+        """With no forge declared the chart writes none of the three git keys.
+        `forges: []` is not the same as no `forges`: CEL's has() counts an
+        empty list as set, so an empty list beside `github` is refused as two
+        spellings."""
+        integration = _integration()
+        for key in ("github", "forges", "repositories"):
+            self.assertNotIn(key, integration)
 
     def test_an_unregistered_provider_fails_the_render(self):
         """The CRD's enum would reject it at apply; the chart names the values

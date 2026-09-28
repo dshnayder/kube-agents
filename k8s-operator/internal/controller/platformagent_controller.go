@@ -1091,8 +1091,10 @@ func parseManagedRepos(raw string) ([]string, error) {
 // reconciles without removing any additional repositories added to the ConfigMap.
 //
 // Repository lifecycle and removal:
-// The reconciler appends each declared repository to its list if it is not already present in
-// the ConfigMap, preserving all existing entries. Repository removal/unregistration is
+// The reconciler adds each declared repository to its list if it is not already present in
+// the ConfigMap, preserving all existing entries. A missing GitOps repository goes to the front
+// of managed_repos, because agent-side consumers read the first entry as the GitOps repository;
+// the rest are appended. An entry already present is never moved. Repository removal/unregistration is
 // administrator-driven via the ConfigMap: to unregister a repository, remove its entry directly
 // from the list in the <agent-name>-gitops-state ConfigMap. If the repository to be removed is
 // declared on the CR, remove it there as well so the reconciler does not re-append it on

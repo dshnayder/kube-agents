@@ -388,8 +388,8 @@ sidecar validates across a trust boundary and must not pull in a module that she
 - `CleanRepoSlugWithOrg` in the operator was the Go one. It is now a deprecated wrapper over the
   GitHub provider's resolution: `repo_ref.go` parses the value with its host kept, and the
   provider refuses any host that is not one of its spellings — `github.com`, `www.github.com`,
-  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, the CRD's
-  admission check, goes through the same `Resolve`, so admission and normalisation are still one
+  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
+  the admission path, goes through the same `Resolve`, so it and normalisation are still one
   rule, now a provider's.
 
 The regex behind the bare-slug form used to be copy-pasted under its own name into `forge.py`,
