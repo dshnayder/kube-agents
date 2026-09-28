@@ -876,8 +876,8 @@ class QuotaTest(unittest.TestCase):
                 self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}, "us-central1"))
 
     def test_a_commitment_quota_is_not_a_capacity_cap(self):
-        """A `COMMITTED_*` metric counts a committed-use discount, which is
-        meant to run full; usage past it bills on demand."""
+        """A `COMMITTED_*` metric limits what committed-use discounts can
+        buy, not how many nodes can run."""
         for metric in ("COMMITTED_CPUS", "COMMITTED_N2_CPUS", "COMMITTED_NVIDIA_A100_GPUS"):
             with self.subTest(metric=metric):
                 self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 100}, "us-central1"))
