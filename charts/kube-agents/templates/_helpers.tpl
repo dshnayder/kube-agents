@@ -582,10 +582,11 @@ It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, a provider
 must be registered, a GitHub forge's host must be one GitHub serves and its
 namespace a GitHub organisation or user name, and a repository must name a
-declared forge and be neither empty nor the alias's `None`. The namespace check
-matters beyond the error text: a single-forge declaration renders as the alias,
-whose `org` has GitHub's grammar in the CRD, so without it the API server would
-refuse `github.org`, a key the values file never set.
+declared forge, be neither empty nor the alias's `None`, and be qualified by a
+namespace if it is a bare name. The namespace checks matter beyond the error
+text: a single-forge declaration renders as the alias, so without them the
+refusal would name `github.org` or `github.gitRepo`, keys the values file never
+set.
 
 Renders the empty string when no forge is declared at all, which is a valid
 install: repositories can be registered in the gitops-state ConfigMap later.
@@ -611,6 +612,7 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $names := list -}}
 {{- $providers := list -}}
+{{- $namespaces := dict -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -629,6 +631,7 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
+{{- $_ := set $namespaces $f.name $namespace -}}
 {{- end -}}
 {{- range $i, $r := $repos -}}
 {{- if not (has $r.forge $names) -}}
@@ -640,6 +643,9 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if eq $repository "None" -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is \"None\", the deprecated github.gitRepo's \"no repository\" value; omit the entry instead" $i) -}}
+{{- end -}}
+{{- if and (not (contains "/" $repository)) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
+{{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}
 {{- end -}}
 {{- if $githubSet -}}

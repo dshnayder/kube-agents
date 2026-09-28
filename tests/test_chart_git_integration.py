@@ -195,6 +195,27 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"{_P}repositories[0].repository is required", result.stderr)
 
+    def test_a_bare_repository_with_no_namespace_fails_the_render(self):
+        """One forge and one gitops repository fold into the alias, so the
+        operator would refuse `github.gitRepo`, a key the values file never
+        set. A namespace on the entry, or a qualified name, is enough."""
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="github"),
+            *_repo(0, forge="github", repository="infra", role="gitops"),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}repositories[0].repository", result.stderr)
+        for repo in (
+            {"repository": "infra", "namespace": "gke-labs"},
+            {"repository": "gke-labs/infra"},
+        ):
+            with self.subTest(**repo):
+                _integration(
+                    *_forge(0, name="github"),
+                    *_repo(0, forge="github", role="gitops", **repo),
+                )
+
     def test_declaring_both_spellings_fails_the_render(self):
         result = _render(
             _CR_TEMPLATE,

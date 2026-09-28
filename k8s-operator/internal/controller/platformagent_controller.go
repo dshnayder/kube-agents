@@ -1483,6 +1483,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		// Admission and the reconcile-status check both report it; the minter
 		// policy sync is not the place to surface it a third time.
 		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
+			// A github forge is declared but validation refuses every one:
+			// PrimaryNamespace is then empty, and an empty primaryOrg accepts
+			// every organisation, which would widen the policies rather than
+			// leave them as they were. Skip the sync until the declaration is
+			// fixed; the reconcile status already reports it.
+			if resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil && slices.ContainsFunc(resolved.Forges, func(f *agentv1alpha1.ResolvedForge) bool {
+				return f.Provider == agentv1alpha1.GitProviderGitHub
+			}) {
+				logger.Info("skipping minter policy sync: every declared github forge is invalid")
+				return nil
+			}
 			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
 		}
 	}
@@ -3037,7 +3048,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonInvalidGitRepoURL
 		// Not "GitOps disabled": with the lists, every entry validation
 		// accepts is still seeded, the gitops repository included.
-		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr))
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"
@@ -3349,6 +3360,22 @@ func hostPathDroppedEntryList(entries []string) string {
 		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
 	}
 	return b.String()
+}
+
+// gitProblemList lists ValidateGit's problems under the same budget as the
+// dropped hostPath entries. There is one problem per refused list entry, and
+// each can quote an author-chosen repository of up to 2048 characters, so the
+// joined error is just as able to fail the whole status write.
+func gitProblemList(err error) string {
+	problems := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		problems = joined.Unwrap()
+	}
+	entries := make([]string, 0, len(problems))
+	for _, p := range problems {
+		entries = append(entries, p.Error())
+	}
+	return hostPathDroppedEntryList(entries)
 }
 
 // truncateToValidUTF8 cuts s to at most max bytes, dropping any rune the cut

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -5067,6 +5068,54 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 
 	if _, exists := updatedCM.Data["forbidden-repo.yaml"]; exists {
 		t.Errorf("expected cross-org forbidden-repo.yaml to be skipped when primaryOrg is inferred from GitRepo")
+	}
+
+	// 5. The only github forge has a namespace GitHub refuses. Its primary org
+	// is empty, which would accept every organisation, so the sync must leave
+	// the policies as they were rather than widen them to other-org.
+	before := updatedCM.DeepCopy()
+	agentBadForge := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-bad-forge", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test_org"}},
+				},
+			},
+		},
+	}
+	err = r.syncGithubTokenMinterConfigMap(ctx, agentBadForge, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with an invalid forge failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if _, exists := updatedCM.Data["other-repo.yaml"]; exists {
+		t.Errorf("an invalid forge namespace must not turn the org scope off, got other-repo.yaml")
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("an invalid forge namespace must leave the policies as they were, got %v", updatedCM.Data)
+	}
+}
+
+// Each refused repository adds a problem that can quote up to 2048 characters,
+// and the CRD caps a condition message at 32768: the list must be bounded or
+// the whole status write fails.
+func TestGitProblemListIsBounded(t *testing.T) {
+	var problems []error
+	for i := 0; i < 64; i++ {
+		problems = append(problems, fmt.Errorf("integration.repositories[%d].repository: %s", i, strings.Repeat("c", 4000)))
+	}
+	got := gitProblemList(stderrors.Join(problems...))
+	if len(got) > hostPathDroppedEntryBudget+64 {
+		t.Errorf("gitProblemList is %d characters, want at most about %d", len(got), hostPathDroppedEntryBudget)
+	}
+	if !strings.Contains(got, "repositories[0]") || !strings.Contains(got, "more") {
+		t.Errorf("gitProblemList must name the first problem and count the rest, got %q", got[:200])
+	}
+	if one := gitProblemList(stderrors.New("integration.github.gitRepo: bad")); one != "integration.github.gitRepo: bad" {
+		t.Errorf("a single problem must be listed as it is, got %q", one)
 	}
 }
 
