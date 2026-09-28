@@ -1336,6 +1336,10 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod], "limitranges": [cpu_only]}, self.IDLE, now=NOW, autopilot=False)
         self.assertEqual(len(hits), 1)
         self.assertIn("memory only", hits[0]["excerpt"])
+        # Idle as it is, the CPU is the LimitRange's, and "in use" would be
+        # false evidence in front of the reviewer.
+        self.assertIn("cpu is the namespace LimitRange default", hits[0]["excerpt"])
+        self.assertNotIn("in use", hits[0]["excerpt"])
 
     def test_the_defaulted_dimension_alone_is_never_the_finding(self):
         """Memory written by hand and in use, CPU filled in by the LimitRange and
@@ -2016,6 +2020,19 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertEqual(fw.check_overrequest(floor_bound, self.IDLE, now=NOW, autopilot=False), [])
         self.assertEqual(fw.check_idle_workload(shrinkable, big_peak, now=NOW), [])
         self.assertEqual(len(fw.check_overrequest(shrinkable, big_peak, now=NOW, autopilot=False)), 1)
+
+    def test_a_limitrange_defaulted_dimension_does_not_break_the_partition(self):
+        """CPU filled in by the LimitRange, memory on the floor, both idle.
+
+        §3.1 gives the defaulted CPU no verdict and the memory has nowhere to
+        go, so it stays silent; this check must not then decline on the
+        strength of a CPU resize §3.1 will never propose."""
+        lr = obj("LimitRange", "limits", ns=self.NS, **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "2"}}]})
+        ctx = {**self.context(pods=[self.pod(cpu_req="2")]), "limitranges": [lr]}
+        self.assertEqual(fw.check_overrequest(ctx, self.IDLE, now=NOW, autopilot=False), [])
+        hits = fw.check_idle_workload(ctx, self.IDLE, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("LimitRange default", hits[0]["excerpt"])
 
     def test_a_fully_idle_guaranteed_controller_stands_down_instead_of_resizing(self):
         """The `ai-inference` shape: §3.1 can resize it and refuses to.
@@ -3097,9 +3114,9 @@ class UnattachedDiskTest(unittest.TestCase):
         leftover of a deleted cluster."""
         degraded = fw.not_running_entry({"name": "prod", "location": "us-central1", "status": "DEGRADED"}, "p")
         running = {"name": "ok", "location": "us-central1"}
-        self.assertEqual(fw._bare_cluster_name(degraded), "prod")
-        known = {(fw._bare_cluster_name(c), c.get("location")) for c in (degraded, running)}
-        self.assertEqual(fw._unread_names(known, {("ok", "us-central1")}), frozenset({"prod"}))
+        names, pairs = fw._known_clusters([running, degraded])
+        self.assertEqual(names, {"ok", "prod"})
+        self.assertEqual(fw._unread_names(pairs, {("ok", "us-central1")}), frozenset({"prod"}))
 
     def test_managed_service_disks_are_not_judged(self):
         for label in ("goog-composer-environment", "goog-dataproc-cluster-name"):

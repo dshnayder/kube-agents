@@ -1196,8 +1196,8 @@ def _limitrange_defaults(context: dict) -> dict[str, dict]:
 
     `defaultRequest` where set; otherwise `default`. The API server fills
     `defaultRequest` from `default` when it stores the object, so on a live
-    read the merge changes nothing; it covers a LimitRange read before that
-    defaulting, as a manifest or a dump is."""
+    read the merge changes nothing. Only this one fill-in is applied, not the
+    server's `max`/`min` ones, because the only caller reads live objects."""
     defaults: dict[str, dict] = {}
     for lr in context.get("limitranges", []):
         ns = (lr.get("metadata") or {}).get("namespace", "")
@@ -2480,8 +2480,8 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # one contributes to the reclaimable delta, so a finding never proposes
         # shrinking a request the workload is actually consuming.
         # A dimension the LimitRange filled in gets no verdict at all.
-        cpu_unused = "cpu" not in defaulted and bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
-        mem_unused = "memory" not in defaulted and bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
+        cpu_unused = "cpu" not in defaulted and bool(cpu_req_total) and peak_cpu / cpu_req_total <= IDLE_WORKLOAD_UTILISATION
+        mem_unused = "memory" not in defaulted and bool(mem_req_total) and peak_mem / mem_req_total <= IDLE_WORKLOAD_UTILISATION
         if not (cpu_unused or mem_unused):
             continue
         # Idle is not the same as reclaimable. §3.1 resizes a request to
@@ -2562,12 +2562,16 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             # dimension would be a false statement about the workload, and the
             # excerpt is the one part of the finding `adopt_collector_evidence`
             # guarantees reaches the reviewer.
+            # A third reason: the other dimension is the namespace LimitRange's
+            # default, which gets no verdict here at all -- idle or not, it is
+            # fixed in the LimitRange, and "in use" would be false of it.
             other, other_unused = ("memory", mem_unused) if over == "cpu" else ("cpu", cpu_unused)
-            why = (
-                "already at the 50m/64Mi sizing floor and cannot be reduced further"
-                if other_unused
-                else "in use and must not be resized"
-            )
+            if other in defaulted:
+                why = "the namespace LimitRange default, which is fixed in the LimitRange rather than resized here"
+            elif other_unused:
+                why = "already at the 50m/64Mi sizing floor and cannot be reduced further"
+            else:
+                why = "in use and must not be resized"
             excerpt += f". Over-requested on {over} only ({at * 100:.0f}% of request); {other} is {why}"
         # Both dimensions idle used to say nothing at all: the branch above
         # fires only at `len(dimensions) == 1`, so the finding that most needs
@@ -2815,6 +2819,7 @@ def check_idle_workload(
     if not usage_peaks:
         return []
     live_owners = _live_pod_owners(context)
+    lr_defaults = _limitrange_defaults(context)
     hits = []
     for (_ns, kind, name), entry in _eligible_pods_by_owner(context, now=now).items():
         # A controller the dump does not carry -- anything but a Deployment or
@@ -2847,14 +2852,23 @@ def check_idle_workload(
         if not _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem):
             continue
         # The partition with §3.1. Anything shrinkable belongs there -- unless
-        # §3.1 refuses to shrink it, which is what `Guaranteed` means here.
+        # §3.1 refuses to shrink it, which is what `Guaranteed` means here, or
+        # the shrinkable dimension is the namespace LimitRange's default, which
+        # §3.1 gives no verdict.
         guaranteed = _is_guaranteed(entry)
+        defaulted = _namespace_defaulted_dimensions(entry, lr_defaults.get(entry["ns"], {}))
         if not guaranteed and (
-            _resize_shrinks_request(
-                cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+            (
+                "cpu" not in defaulted
+                and _resize_shrinks_request(
+                    cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+                )
             )
-            or _resize_shrinks_request(
-                mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+            or (
+                "memory" not in defaulted
+                and _resize_shrinks_request(
+                    mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+                )
             )
         ):
             continue
@@ -2870,6 +2884,10 @@ def check_idle_workload(
             "enforcement ceiling with them -- a sizing observation is not a "
             "safe limit, which is why no resize is offered"
             if guaranteed
+            else "Every dimension is already at the 50m/64Mi floor or is the "
+            "namespace LimitRange default, which is fixed in the LimitRange "
+            "rather than here, so no resize of this workload can reclaim any of it"
+            if defaulted
             else "Every dimension is already at the 50m/64Mi floor, so no "
             "resize can reclaim any of it"
         )
@@ -4238,6 +4256,14 @@ def _bare_cluster_name(entry: dict) -> str:
     return entry.get("name", "").rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
 
 
+def _known_clusters(clusters: list[dict]) -> tuple[set[str], set[tuple[str, str | None]]]:
+    """A project's cluster names, and its (name, location) pairs, whatever their status."""
+    return (
+        {_bare_cluster_name(c) for c in clusters},
+        {(_bare_cluster_name(c), c.get("location")) for c in clusters},
+    )
+
+
 def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> frozenset[str]:
     """The names of this project's clusters whose PersistentVolumes were not read.
 
@@ -4725,8 +4751,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             running, not_running = enumerate_clusters(p, run=run)
             clusters.extend(running)
             unaudited.extend(not_running)
-            known_by_project[p] = {_bare_cluster_name(c) for c in running + not_running}
-            known_pairs_by_project[p] = {(_bare_cluster_name(c), c.get("location")) for c in running + not_running}
+            known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
         except RuntimeError as exc:
             known_by_project[p] = None
             # A log line is not a record. The manifest is the only account of

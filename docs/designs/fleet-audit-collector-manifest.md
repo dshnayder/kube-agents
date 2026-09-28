@@ -337,8 +337,8 @@ naming the bare cluster, so on the manifest path a row is also spelled with each
 qualify it — from the previous body's Scope table, or, for a cluster past its `MAX_SCOPE_ROWS`
 rows, from this run's manifest clusters — and the spelling the collector flags is used when it does
 not flag the bare one. A name two clusters share takes the one the collector flags, and the first by
-id when it flags both: either keeps the ledger open over a finding the collector reports. Only held ids with no row — the note and fourth tiers write none — are
-the residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
+id when it flags both: either keeps the ledger open over a finding the collector reports. Held ids with no row — the note and fourth tiers write none — are
+the counted residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
 naming their count. A bump that re-spells an object rather than a cluster name loses those rows the
 same way, because the re-derived id keeps the old object and matches nothing the collector emits:
 scheme 6 re-spells the stockout stream's quota (`Quota/<region>:<metric>`) and autoscaler

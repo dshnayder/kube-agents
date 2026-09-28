@@ -4883,7 +4883,10 @@ def previous_marker_ids(
     row, so a hold survives an identity-scheme bump instead of matching no
     marker id, dropping out of the bump run's marker and leaving the ledger
     unannounced; held ids with no row — the note and empty tiers write none —
-    are the residual, which the caller reports and which the bump loses.
+    are the residual, which the caller reports and which the bump loses. A
+    row whose object the bump re-spelled (scheme 6's stockout `Quota/` and
+    `ScaleUpError/` rows) re-derives to an id nothing emits, and is lost
+    without being counted.
     `flagged` picks between a row's bare and qualified spellings
     (`_respelled_rows`), qualifying names past the Scope table from `clusters`.
     """
@@ -4934,7 +4937,8 @@ def carried_held_entries(previous_body: str | None, *, exclude: set[str]) -> lis
     the identity its held row had where the previous body had one
     (`parse_held_rows`) and as an id-only row otherwise (`held_row_from_id`).
     Under another identity scheme the rows with a location are re-spelled and
-    ids without one are the residual the bump loses (`previous_marker_ids`).
+    ids without one are the residual the bump loses (`previous_marker_ids`),
+    as are rows whose object the bump re-spelled.
     """
     held_raw = parse_held_ids(previous_body)
     if not held_raw:
