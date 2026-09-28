@@ -94,6 +94,10 @@ MAX_WORKERS = 8
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+NO_PROJECT_IN_SCOPE_ERROR = (
+    "no project in scope: there is no active gcloud project and `gcloud projects list` "
+    "returned none, so this credential sees nothing to audit"
+)
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."
@@ -4813,6 +4817,20 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             log(f"Cloud Monitoring credentials unavailable, overrequest will be skipped fleet-wide: {exc}")
 
     projects, partial_discovery = get_target_projects(project, run=run)
+    if not projects and not partial_discovery:
+        # No active project and a `projects list` that answered with nothing:
+        # the credential sees no project, which is not an empty fleet. The
+        # manifest contract's top-level `error`, as `fleet_stockout.py` sets
+        # when its enumeration fails, and `main` exits non-zero on it.
+        return {
+            "version": MANIFEST_VERSION,
+            "checks_revision": CHECKS_REVISION,
+            "audit": "fleet-wide-cost-analysis",
+            "started_at": started_at,
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": NO_PROJECT_IN_SCOPE_ERROR,
+            "clusters": [],
+        }
 
     clusters: list[dict] = []
     unaudited: list[dict] = []
@@ -4990,7 +5008,7 @@ def main(argv: list[str] | None = None) -> int:
         workspace = None
     manifest = collect_fleet(args.project, workspace=workspace)
     print(json.dumps(manifest, indent=2))
-    return 0
+    return 1 if manifest.get("error") else 0
 
 
 if __name__ == "__main__":

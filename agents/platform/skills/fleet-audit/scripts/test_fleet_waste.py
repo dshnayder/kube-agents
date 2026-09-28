@@ -4522,6 +4522,18 @@ class GetTargetProjectsTest(unittest.TestCase):
 
         self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
 
+    def test_a_credential_that_sees_no_project_is_an_error_not_an_empty_fleet(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        self.assertEqual(manifest["error"], fw.NO_PROJECT_IN_SCOPE_ERROR)
+        self.assertEqual(manifest["clusters"], [])
+
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
