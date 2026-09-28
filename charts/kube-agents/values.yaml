@@ -927,25 +927,33 @@ platformAgent:
   # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
   networkPolicy: {}
   integration:
-    # The forge holding the GitOps repository. Set this or `github` below, not
-    # both — `github` is a deprecated alias for `git` with provider: github.
-    git:
-      # Which forge. "github" is the only registered provider; the operator
-      # rejects any other value, and it is what the agent reads back as a
-      # managed repository's `type`. Empty means github.
-      provider: ""
-      # Forge hostname. Empty is the provider's default (github.com). A host the
-      # declared provider does not serve is rejected.
-      host: ""
-      # Primary GitOps repository: a clone URL, an scp-style remote, a
-      # namespace-qualified path, or a bare name qualified by `namespace`.
-      # If omitted or empty, the agent starts with no registered repos, and
-      # repositories can be registered in the gitops-state ConfigMap by a cluster administrator.
-      repository: ""
-      # Owning organization, user, or group path. If omitted and `repository`
-      # names one, it is inferred from the repository.
-      namespace: ""
-    # Deprecated: use `git` above. Kept so existing values files keep working.
+    # The forges the agent talks to, and the repositories on them. Set these
+    # or `github` below, not both — `github` is a deprecated alias for one
+    # forge with provider: github and one gitops repository. If neither is
+    # set, the agent starts with no registered repos, and repositories can be
+    # registered in the gitops-state ConfigMap by a cluster administrator.
+    #
+    # forges:
+    #   - name: github            # what repositories[].forge refers to
+    #     provider: github        # the only registered provider; default github
+    #     host: ""                # empty is the provider's default (github.com)
+    #     namespace: my-org       # default owner for this forge's repositories
+    #     credentialsRef:         # Secret for providers that need one; ignored
+    #       name: ""              # for github, which uses the GitHub App
+    forges: []
+    # repositories:
+    #   - forge: github
+    #     repository: infra       # URL, scp remote, namespace/path, or bare name
+    #     role: gitops            # gitops (at most one), managed, or context
+    #   - forge: github
+    #     repository: my-org/app
+    #     role: managed           # read-write, like the gitops repository
+    #   - forge: github
+    #     repository: my-org/runbooks
+    #     namespace: ""           # overrides the forge's namespace
+    #     role: context           # read-only reference material
+    repositories: []
+    # Deprecated: use `forges` and `repositories` above. Kept so existing values files keep working.
     github:
       # Target GitHub Organization where the GitHub App is installed (optional).
       # If omitted and gitRepo is specified, the organization is inferred from the repository owner.

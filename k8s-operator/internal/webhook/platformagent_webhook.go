@@ -267,22 +267,23 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		}
 	}
 
-	// 4. Validate the forge integration. Provider, host, namespace and repository
-	// are all optional; each is checked by the declared provider's own rules
-	// rather than by GitHub's applied to everyone. `spec.integration.github` is a
-	// deprecated alias that resolves to the same declaration, so the field paths
-	// below are rendered in whichever spelling was written.
-	allErrs = append(allErrs, validateGitIntegration(platformAgent.Spec.Integration)...)
+	// 4. Validate the forge integration. Each forge and each repository on it is
+	// checked by the declared provider's own rules rather than by GitHub's
+	// applied to everyone. `spec.integration.github` is a deprecated alias that
+	// resolves to the same declaration, so the field paths below are rendered in
+	// whichever spelling was written.
+	gitErrs, warnings := validateGitIntegration(platformAgent.Spec.Integration)
+	allErrs = append(allErrs, gitErrs...)
 
 	if len(allErrs) > 0 {
-		return nil, apierrors.NewInvalid(
+		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 			platformAgent.Name,
 			allErrs,
 		)
 	}
 
-	return nil, nil
+	return warnings, nil
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
@@ -357,76 +358,39 @@ func validateBusCredentialSource(vol corev1.Volume, agentName string, path *fiel
 	return errs
 }
 
-// integrationFieldRoot is the spec path the forge declaration hangs off; the
-// leaf under it depends on which of the two spellings was written, which
-// ResolvedGit.FieldPath decides.
-var integrationFieldRoot = []string{"spec", "integration"}
-
-// gitDeclarationParts pairs each part of a forge declaration with the check
-// that applies to it, so admission reports one error per field rather than
-// stopping at the first.
-type gitDeclarationPart struct {
-	name  string
-	value func(*agentv1alpha1.ResolvedGit) string
-	check func(*agentv1alpha1.ResolvedGit) error
-}
-
-var gitDeclarationParts = []gitDeclarationPart{
-	{
-		name:  "host",
-		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Host },
-		check: (*agentv1alpha1.ResolvedGit).ValidateHost,
-	},
-	{
-		name:  "namespace",
-		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Namespace },
-		check: (*agentv1alpha1.ResolvedGit).ValidateNamespace,
-	},
-	{
-		name:  "repository",
-		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Repository },
-		check: (*agentv1alpha1.ResolvedGit).ValidateRepository,
-	},
-}
+// integrationFieldRoot is the spec path the forge declaration hangs off.
+var integrationFieldRoot = field.NewPath("spec", "integration")
 
 // validateGitIntegration checks the forge declaration against the rules of the
-// provider it names.
-func validateGitIntegration(integration *agentv1alpha1.PlatformAgentIntegrationSpec) field.ErrorList {
+// providers it names, one error per field rather than stopping at the first,
+// and returns the declarations that are valid but do nothing as warnings.
+func validateGitIntegration(integration *agentv1alpha1.PlatformAgentIntegrationSpec) (field.ErrorList, admission.Warnings) {
 	var errs field.ErrorList
 	if integration == nil {
-		return errs
+		return errs, nil
 	}
-	root := field.NewPath(integrationFieldRoot[0], integrationFieldRoot[1:]...)
-
 	resolved, err := integration.ResolveGit()
 	if err != nil {
 		// Both spellings set. Neither field is at fault on its own, so the error
 		// hangs off the integration itself.
-		return append(errs, field.Invalid(root, "", err.Error()))
+		return append(errs, field.Invalid(integrationFieldRoot, "", err.Error())), nil
 	}
-	if resolved == nil {
-		return errs
+	for _, p := range resolved.Problems() {
+		errs = append(errs, field.Invalid(integrationPath(p.Path), p.Value, p.Err.Error()))
 	}
-	if _, err := resolved.GitProvider(); err != nil {
-		return append(errs, field.Invalid(
-			childPath(root, resolved.FieldPath("provider")), resolved.Provider, err.Error()))
-	}
-	for _, part := range gitDeclarationParts {
-		if err := part.check(resolved); err != nil {
-			errs = append(errs, field.Invalid(
-				childPath(root, resolved.FieldPath(part.name)), part.value(resolved), err.Error()))
-		}
-	}
-	return errs
+	return errs, resolved.Warnings()
 }
 
-// childPath descends a field.Path by a slice, which its variadic Child cannot
-// take directly.
-func childPath(root *field.Path, parts []string) *field.Path {
-	if len(parts) == 0 {
-		return root
+// integrationPath renders an IntegrationFieldPath under spec.integration.
+func integrationPath(p agentv1alpha1.IntegrationFieldPath) *field.Path {
+	path := integrationFieldRoot.Child(p.List)
+	if p.Index >= 0 {
+		path = path.Index(p.Index)
 	}
-	return root.Child(parts[0], parts[1:]...)
+	if p.Field != "" {
+		path = path.Child(p.Field)
+	}
+	return path
 }
 
 func validateContainerSecurity(sc *corev1.SecurityContext, path *field.Path) field.ErrorList {

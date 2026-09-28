@@ -1500,26 +1500,43 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
 
-	// Seed the primary repository from the CR spec, if one was declared. The
-	// entry's `type` is the declared provider, which is how the discriminator
-	// reaches the agent — written down rather than inferred from the URL's text.
+	// Seed the declared repositories from the CR spec: the GitOps repository and
+	// the managed ones into managed_repos, GitOps first, and the context ones
+	// into context_repos. Each entry's `type` is its forge's provider, which is
+	// how the discriminator reaches the agent — written down rather than
+	// inferred from the URL's text. Only entries Problems accepts are seeded:
+	// with the webhook off, nothing else stops a refused one reaching the
+	// agent and the minter.
 	if agent.Spec.Integration != nil {
 		resolved, err := agent.Spec.Integration.ResolveGit()
-		switch {
-		case err != nil:
+		if err != nil {
 			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
-		case resolved.HasRepository():
-			ref, err := resolved.Resolve()
-			if err != nil {
-				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid repository",
-					"raw", resolved.Repository, "provider", resolved.Provider, "error", err)
-				break
+		} else {
+			lists := []struct {
+				key   string
+				repos []*agentv1alpha1.ResolvedRepository
+			}{
+				{gitopsStateManagedReposKey, append(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps),
+					resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)...)},
+				{gitopsStateContextReposKey, resolved.Accepted(agentv1alpha1.RepositoryRoleContext)},
 			}
-			entries := []agentv1alpha1.ManagedRepoEntry{
-				{Type: resolved.Provider, URL: ref.URL()},
-			}
-			if jsonBytes, err := json.Marshal(entries); err == nil {
-				data["managed_repos"] = string(jsonBytes)
+			for _, list := range lists {
+				var entries []agentv1alpha1.ManagedRepoEntry
+				for _, repo := range list.repos {
+					entry, err := repo.ManagedRepoEntry()
+					if err != nil {
+						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
+							"raw", repo.Repository, "forge", repo.ForgeName, "role", repo.Role, "error", err)
+						continue
+					}
+					entries = append(entries, entry)
+				}
+				if len(entries) == 0 {
+					continue
+				}
+				if jsonBytes, err := json.Marshal(entries); err == nil {
+					data[list.key] = string(jsonBytes)
+				}
 			}
 		}
 	}
@@ -1535,6 +1552,24 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 		},
 		Data: data,
 	}
+}
+
+// seededGitOpsEntry is the managed_repos entry the CR's GitOps repository
+// seeds, or nil when it declares none or declares an invalid one.
+func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ManagedRepoEntry {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return nil
+	}
+	for _, repo := range resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps) {
+		if entry, err := repo.ManagedRepoEntry(); err == nil {
+			return &entry
+		}
+	}
+	return nil
 }
 
 // renderConfigYAML builds the MANAGED config the pod runs under.
@@ -2612,10 +2647,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// GITHUB_ORG still names GitHub because that is what the agent reads it
 		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
 		// and doing it here would rename a variable the pod's scripts still spell
-		// the old way. Until then it is set only for a GitHub declaration.
-		if resolved, err := integration.ResolveGit(); err == nil && resolved != nil &&
-			resolved.Provider == agentv1alpha1.GitProviderGitHub {
-			if org := resolved.EffectiveNamespace(); org != "" {
+		// the old way. Until then it names the primary GitHub forge's namespace,
+		// and is unset when no GitHub forge is declared.
+		if resolved, err := integration.ResolveGit(); err == nil {
+			if org := resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub); org != "" {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GITHUB_ORG",
 					Value: org,

@@ -401,7 +401,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// the webhook refuses.
 	if instance.Spec.Integration != nil {
 		if err := instance.Spec.Integration.ValidateGit(); err != nil {
-			log.Info("WARNING: spec.integration.git (or its deprecated alias spec.integration.github) is invalid; "+
+			log.Info("WARNING: spec.integration.forges/repositories (or the deprecated spec.integration.github) is invalid; "+
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
 				"name", instance.Name, "namespace", instance.Namespace, "error", err.Error())
 		}
@@ -1068,17 +1068,18 @@ func parseManagedRepos(raw string) ([]string, error) {
 }
 
 // reconcileGitopsStateConfigMap ensures the <agent-name>-gitops-state ConfigMap exists to track
-// managed repositories. If spec.integration.github.gitRepo is defined on the CR, it is seeded
-// into managed_repos and kept present on subsequent reconciles without removing any additional
-// repositories added to the ConfigMap.
+// the agent's repositories. The repositories declared in spec.integration.repositories (or the
+// deprecated spec.integration.github.gitRepo) are seeded into it — the GitOps and managed ones
+// into managed_repos, the context ones into context_repos — and kept present on subsequent
+// reconciles without removing any additional repositories added to the ConfigMap.
 //
 // Repository lifecycle and removal:
-// The reconciler appends any repository declared in spec.integration.github.gitRepo to managed_repos
-// if it is not already present in the ConfigMap, preserving all existing entries.
-// Repository removal/unregistration is administrator-driven via the ConfigMap: to unregister a
-// repository, remove its entry directly from managed_repos in the <agent-name>-gitops-state ConfigMap.
-// If the repository to be removed was declared in spec.integration.github.gitRepo on the CR, clear or
-// update gitRepo on the CR as well so the reconciler does not re-append it on subsequent passes.
+// The reconciler appends each declared repository to its list if it is not already present in
+// the ConfigMap, preserving all existing entries. Repository removal/unregistration is
+// administrator-driven via the ConfigMap: to unregister a repository, remove its entry directly
+// from the list in the <agent-name>-gitops-state ConfigMap. If the repository to be removed is
+// declared on the CR, remove it there as well so the reconciler does not re-append it on
+// subsequent passes.
 func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	logger := logf.FromContext(ctx)
 	cm := buildGitopsStateConfigMap(agent)
@@ -1099,31 +1100,45 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 		return err
 	}
 
-	// If the CR spec provides a repository and the existing ConfigMap does not include it,
-	// ensure the repository is recorded without overwriting other dynamically added repositories.
-	if cmRepo, ok := cm.Data["managed_repos"]; ok && cmRepo != "" {
+	// For each list the CR seeds, ensure its repositories are recorded without
+	// overwriting other dynamically added repositories. A list that cannot be
+	// parsed, on either side, is left as it is: the ConfigMap is
+	// administrator-writable, and rewriting a value the operator does not
+	// understand would lose it.
+	updated := false
+	gitops := seededGitOpsEntry(agent)
+	for _, key := range []string{gitopsStateManagedReposKey, gitopsStateContextReposKey} {
+		seeded := cm.Data[key]
+		if seeded == "" {
+			continue
+		}
 		if found.Data == nil {
 			found.Data = map[string]string{}
 		}
-		existing := strings.TrimSpace(found.Data["managed_repos"])
+		existing := strings.TrimSpace(found.Data[key])
 		if existing == "" {
-			found.Data["managed_repos"] = cmRepo
-			if err := r.Update(ctx, found); err != nil {
-				return err
-			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo, found.Data[gitopsStateContextReposKey])
+			found.Data[key] = seeded
+			updated = true
+			continue
 		}
-		specEntries, err := parseManagedRepoEntries(cmRepo)
+		specEntries, err := parseManagedRepoEntries(seeded)
 		if err != nil {
-			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON", "list", key)
+			continue
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
-			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			logger.Error(err, "skipping gitops state reconcile due to unparseable existing list in ConfigMap",
+				"configMap", found.Name, "list", key)
+			continue
 		}
-		updated := false
+		// A GitOps repository the list lacks goes first rather than last. The
+		// entries carry no role, and the agent falls back to the first
+		// managed entry when it needs the GitOps repository and nothing else
+		// names it, so appending would leave whichever repository was first
+		// before -- the previous GitOps repository, typically -- answering
+		// for it. An entry already in the list is never moved.
+		var front, missing []agentv1alpha1.ManagedRepoEntry
 		for _, se := range specEntries {
 			present := false
 			for _, ee := range existingEntries {
@@ -1133,22 +1148,69 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 				}
 			}
 			if !present {
+				if key == gitopsStateManagedReposKey && gitops != nil && sameManagedRepo(se, *gitops) {
+					front = append(front, se)
+				} else {
+					missing = append(missing, se)
+				}
 				existingEntries = append(existingEntries, se)
-				updated = true
 			}
 		}
-		if updated {
-			if jsonBytes, err := json.Marshal(existingEntries); err == nil {
-				found.Data["managed_repos"] = string(jsonBytes)
+		if len(front)+len(missing) > 0 {
+			merged, err := mergeRepoEntries(existing, front, missing)
+			if err != nil {
+				logger.Error(err, "skipping gitops state reconcile; could not append to the list", "list", key)
+				continue
 			}
-			if err := r.Update(ctx, found); err != nil {
-				return err
-			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			found.Data[key] = merged
+			updated = true
+		}
+	}
+	if updated {
+		if err := r.Update(ctx, found); err != nil {
+			return err
 		}
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+}
+
+// mergeRepoEntries puts front before a repository list's JSON and back after
+// it, keeping every existing element's content as written; encoding/json only
+// compacts its whitespace. Round-tripping the list through ManagedRepoEntry
+// would drop what that type does not model — a context_repos entry's `ref`,
+// or any field an administrator or a later agent version adds — and the
+// entries parseManagedRepoEntries skips as incomplete.
+func mergeRepoEntries(existing string, front, back []agentv1alpha1.ManagedRepoEntry) (string, error) {
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(existing), &raw); err != nil {
+		return "", err
+	}
+	encode := func(entries []agentv1alpha1.ManagedRepoEntry) ([]json.RawMessage, error) {
+		var out []json.RawMessage
+		for _, e := range entries {
+			b, err := json.Marshal(e)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b)
+		}
+		return out, nil
+	}
+	head, err := encode(front)
+	if err != nil {
+		return "", err
+	}
+	tail, err := encode(back)
+	if err != nil {
+		return "", err
+	}
+	raw = append(append(head, raw...), tail...)
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // sameManagedRepo reports whether two managed_repos URLs name one repository.
@@ -1402,7 +1464,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		// Admission and the reconcile-status check both report it; the minter
 		// policy sync is not the place to surface it a third time.
 		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
-			primaryOrg = resolved.EffectiveNamespace()
+			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
 		}
 	}
 

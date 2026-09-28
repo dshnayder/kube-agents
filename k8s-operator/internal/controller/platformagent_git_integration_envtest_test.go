@@ -28,12 +28,13 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// TestIntegrationSpellingsAreExclusiveInTheSchemaEnvtest pins the CEL rule on
-// PlatformAgentIntegrationSpec against a real API server. The webhook refuses
-// both spellings too, but the chart ships it off, so the schema is the refusal
-// every install has; a dropped or mistyped marker would otherwise go unnoticed,
-// because no unit test evaluates CEL.
-func TestIntegrationSpellingsAreExclusiveInTheSchemaEnvtest(t *testing.T) {
+// TestIntegrationSchemaRulesEnvtest pins the CEL rules on the forge declaration
+// against a real API server: the two spellings are exclusive, a repository
+// names a declared forge, and at most one repository is the GitOps one. The
+// webhook refuses the same CRs, but the chart ships it off, so the schema is
+// the refusal every install has; a dropped or mistyped marker would otherwise
+// go unnoticed, because no unit test evaluates CEL.
+func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 	cl, _ := startEnvtest(t)
 	ctx := context.Background()
 
@@ -56,21 +57,48 @@ func TestIntegrationSpellingsAreExclusiveInTheSchemaEnvtest(t *testing.T) {
 		return agent
 	}
 
-	both := newAgent("both", agentv1alpha1.IntegrationSpec{
-		Git:    &agentv1alpha1.GitSpec{Repository: "gke-labs/kube-agents"},
-		GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"},
-	})
-	err := cl.Create(ctx, both)
-	if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "set at most one of integration.git and integration.github") {
-		t.Fatalf("creating a PlatformAgent with both spellings = %v, want the schema's Invalid refusal", err)
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}}
+	refused := map[string]struct {
+		integration agentv1alpha1.IntegrationSpec
+		message     string
+	}{
+		"both": {agentv1alpha1.IntegrationSpec{
+			Forges: gh,
+			GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"},
+		}, "or integration.github, not both"},
+		"dangling": {agentv1alpha1.IntegrationSpec{
+			Forges: gh,
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "context"}},
+		}, "must name a forge declared in integration.forges"},
+		"no-forges": {agentv1alpha1.IntegrationSpec{
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "gke-labs/kube-agents", Role: "gitops"}},
+		}, "must name a forge declared in integration.forges"},
+		"two-gitops": {agentv1alpha1.IntegrationSpec{
+			Forges: gh,
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "infra", Role: "gitops"},
+				{Forge: "github", Repository: "infra2", Role: "gitops"}},
+		}, "at most one repository may have role gitops"},
+	}
+	for name, tc := range refused {
+		err := cl.Create(ctx, newAgent(name, tc.integration))
+		if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), tc.message) {
+			t.Errorf("creating a PlatformAgent (%s) = %v, want the schema's Invalid refusal %q", name, err, tc.message)
+		}
 	}
 
 	for name, integration := range map[string]agentv1alpha1.IntegrationSpec{
-		"git":   {Git: &agentv1alpha1.GitSpec{Repository: "gke-labs/kube-agents"}},
-		"alias": {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
+		"lists": {Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "infra", Role: "gitops"},
+			{Forge: "github", Repository: "apps", Role: "managed"},
+			{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"}}},
+		"forge-only": {Forges: gh},
+		"alias":      {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
 	} {
 		if err := cl.Create(ctx, newAgent(name, integration)); err != nil {
-			t.Errorf("creating a PlatformAgent with only %s = %v, want it admitted", name, err)
+			t.Errorf("creating a PlatformAgent (%s) = %v, want it admitted", name, err)
 		}
 	}
 }

@@ -1292,33 +1292,73 @@ type ScopedServiceAccount struct {
 
 // IntegrationSpec isolates common platform-specific external connections.
 type IntegrationSpec struct {
-	// Git configures the forge this agent's GitOps repository lives on.
-	// Set at most one of Git and GitHub; declaring both is rejected, because
+	// Forges declares the forges this agent works with: which provider each
+	// one is, where it is, and which organisation it acts for. Repositories
+	// name a forge from this list.
+	//
+	// Set Forges and Repositories, or the deprecated GitHub alias, not both;
 	// there is no rule for which one wins that would not surprise somebody.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
 	// +optional
-	Git *GitSpec `json:"git,omitempty"`
+	Forges []ForgeSpec `json:"forges,omitempty"`
+
+	// Repositories declares the repositories this agent works with, each on
+	// one of Forges, and what the agent does with it. The operator seeds them
+	// into the gitops-state ConfigMap: the GitOps repository and the managed
+	// ones into managed_repos, in that order, and the context ones into
+	// context_repos. Seeding only adds; an entry removed here stays in the
+	// ConfigMap until an administrator removes it there too.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:XValidation:rule="self.filter(r, r.role == 'gitops').size() <= 1",message="at most one repository may have role gitops"
+	// +optional
+	Repositories []RepositorySpec `json:"repositories,omitempty"`
 
 	// GitHub configures the GitHub integration.
 	//
-	// Deprecated: use Git instead, which names its forge. This field is kept as
-	// an alias and maps onto Git with provider "github"; it will be removed in a
-	// future API version.
+	// Deprecated: use Forges and Repositories, which name their forge. This
+	// field is kept as an alias: it means one forge named "github" with
+	// provider "github" and namespace Org, and, when GitRepo is set, one
+	// repository on it with role "gitops". It will be removed in a future API
+	// version.
 	// +optional
 	GitHub *GitHubSpec `json:"github,omitempty"`
 }
 
-// GitSpec declares which forge holds the GitOps repository, and where.
+// Repository roles: what the agent does with a declared repository.
+const (
+	// RepositoryRoleGitOps is the repository the agent's GitOps work lands in.
+	// It is seeded first into managed_repos, and at most one repository has it.
+	RepositoryRoleGitOps = "gitops"
+	// RepositoryRoleManaged is a further repository the agent writes to. It is
+	// seeded into managed_repos after the GitOps one.
+	RepositoryRoleManaged = "managed"
+	// RepositoryRoleContext is a repository the agent only reads. It is seeded
+	// into context_repos, for which the token minter renders read-only scopes.
+	RepositoryRoleContext = "context"
+)
+
+// ForgeSpec declares one forge: which provider it is, where, and which
+// organisation the agent acts for there.
 //
-// It replaces GitHubSpec, whose field path named a forge that its validation
-// never checked for: the repository was reduced to "exactly one slash once the
-// host has been discarded", so a remote on another host was rewritten into a
-// same-named GitHub repository rather than refused. Here the provider is
-// declared, and each provider asserts its own hosts, namespace grammar, and
-// path depth. See docs/designs/version-control-support.md §6.
-type GitSpec struct {
-	// Provider names the forge. It is the discriminator the operator writes into
-	// the gitops-state ConfigMap as a managed repository's `type`, so the agent
-	// reads which forge was declared rather than guessing from the URL's text.
+// Each provider asserts its own hosts, namespace grammar, and path depth, so a
+// repository on another host is refused rather than rewritten into a
+// same-named repository on this one. See
+// docs/designs/version-control-support.md §6.
+type ForgeSpec struct {
+	// Name identifies the forge within this PlatformAgent. Repositories refer
+	// to it by this name. The deprecated GitHub alias is the forge "github".
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// Provider names the forge's kind. It is the discriminator the operator
+	// writes into the gitops-state ConfigMap as each repository's `type`, so
+	// the agent reads which forge was declared rather than guessing from the
+	// URL's text.
 	//
 	// Only "github" is registered today; the enum grows with each agent-side
 	// provider. Defaults to "github".
@@ -1340,37 +1380,69 @@ type GitSpec struct {
 	// +optional
 	Host string `json:"host,omitempty"`
 
-	// Repository is the GitOps repository: a clone URL, an scp-style remote, a
-	// namespace-qualified path, or a bare name to be qualified by Namespace.
-	// When omitted or empty, no repository is initially configured, and
-	// repositories can be registered in the gitops-state ConfigMap by a cluster
-	// administrator.
-	// +kubebuilder:validation:MaxLength=2048
-	// +optional
-	Repository string `json:"repository,omitempty"`
-
-	// Namespace is the owning organization, user, or group path — the GitHub org
-	// that GitHubSpec called Org. If omitted and Repository names one, it is
-	// inferred from the repository.
+	// Namespace is the organisation, user, or group path the agent acts for on
+	// this forge — the GitHub org that GitHubSpec called Org. A repository
+	// given as a bare name is qualified by it. If omitted, it is inferred from
+	// the GitOps repository when that is on this forge.
+	//
+	// On GitHub it is also the organisation the token minter scopes the
+	// agent's credentials to; a repository in another organisation is not
+	// given a token.
 	//
 	// The schema pattern is every forge's grammar at once, not GitHub's: the
 	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
 	// sibling field, so the provider applies that one. What the schema is for is
 	// the part that does not vary — a namespace holds no whitespace and no
-	// control characters, which is the guard GitHubSpec.Org's pattern was also
-	// providing and which the API server must keep enforcing when the operator
-	// runs with ENABLE_WEBHOOKS=false.
+	// control characters, which the API server must keep enforcing when the
+	// operator runs with ENABLE_WEBHOOKS=false.
 	// +kubebuilder:validation:MaxLength=255
 	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+
+	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
+	// the credentials for this forge. It is for providers whose credentials an
+	// administrator supplies. GitHub's come from the install's GitHub App
+	// through the token minter, so it is ignored for provider "github", and
+	// admission warns when it is set there.
+	// +optional
+	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
+}
+
+// RepositorySpec declares one repository on a declared forge, and what the
+// agent does with it.
+type RepositorySpec struct {
+	// Forge is the name of the entry in Forges this repository lives on.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Forge string `json:"forge"`
+
+	// Repository is a clone URL, an scp-style remote, a namespace-qualified
+	// path, or a bare name to be qualified by Namespace. A URL or remote must
+	// name one of the forge's own hosts.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Repository string `json:"repository"`
+
+	// Namespace qualifies a bare repository name, overriding the forge's
+	// namespace for this repository only.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Role is what the agent does with the repository: "gitops" for the
+	// repository its GitOps work lands in, "managed" for a further repository
+	// it writes to, "context" for one it only reads.
+	// +kubebuilder:validation:Enum=gitops;managed;context
+	Role string `json:"role"`
 }
 
 // GitHubSpec contains the configuration for the GitHub integration.
 //
-// Deprecated: use GitSpec. Kept so existing PlatformAgent resources keep
-// applying unchanged; ResolveGit folds it into a ResolvedGit with provider
-// "github" and every consumer reads that instead.
+// Deprecated: use ForgeSpec and RepositorySpec. Kept so existing
+// PlatformAgent resources keep applying unchanged; ResolveGit folds it into
+// the same ResolvedIntegration and every consumer reads that instead.
 type GitHubSpec struct {
 	// Org is the target GitHub organization or user account for the agent environment.
 	// If omitted and GitRepo is provided, the organization is inferred from the repository owner.
@@ -1718,7 +1790,7 @@ var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0
 // CleanRepoSlug cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format.
 //
 // Deprecated: GitHub-bound. Resolve through the declared provider —
-// ResolvedGit.Resolve — for anything that has one.
+// ResolvedRepository.Resolve — for anything that has one.
 func CleanRepoSlug(rawURL string) (string, error) {
 	return CleanRepoSlugWithOrg(rawURL, "")
 }
@@ -1732,7 +1804,7 @@ func CleanRepoSlug(rawURL string) (string, error) {
 // repo_ref.go's header.
 //
 // Deprecated: GitHub-bound, and kept for the deprecated
-// `spec.integration.github` alias. Use ResolvedGit.Resolve.
+// `spec.integration.github` alias. Use ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)
 	if err != nil {
@@ -1743,7 +1815,7 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 
 // CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
 //
-// Deprecated: GitHub-bound. Use ResolvedGit.Resolve, whose RepoRef.URL is the
+// Deprecated: GitHub-bound. Use ResolvedRepository.Resolve, whose RepoRef.URL is the
 // same rendering against the declared provider's host.
 func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)

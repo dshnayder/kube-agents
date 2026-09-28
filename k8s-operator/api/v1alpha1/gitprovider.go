@@ -48,14 +48,14 @@ const (
 	// a `managed_repos` entry the agent has a provider for.
 	GitProviderGitHub = "github"
 
-	// DefaultGitProvider is assumed when `spec.integration.git.provider` is
+	// DefaultGitProvider is assumed when a forge's `provider` is
 	// omitted, and is what the deprecated `spec.integration.github` alias means.
 	DefaultGitProvider = GitProviderGitHub
 
-	// MaxGitHostLength bounds `spec.integration.git.host` at the DNS limit.
+	// MaxGitHostLength bounds a forge's `host` at the DNS limit.
 	MaxGitHostLength = 253
 
-	// MaxGitNamespaceLength bounds `spec.integration.git.namespace` in the CRD
+	// MaxGitNamespaceLength bounds a forge's or repository's `namespace` in the CRD
 	// schema. It is deliberately looser than any provider's own limit — a nested
 	// GitLab group path is longer than a GitHub org — because the tight bound is
 	// the provider's to apply, and a schema pattern cannot dispatch on a sibling
@@ -203,7 +203,7 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 // because everything downstream compares hosts by string. Every entry in Hosts
 // is an alternative spelling of DefaultHost, so a host from either source — the
 // repository or the declaration — folds to DefaultHost. Declaring
-// `git.host: ssh.github.com` and writing it inside the repository URL therefore
+// a forge `host: ssh.github.com` and writing it inside the repository URL therefore
 // agree, where before the declared spelling was carried through verbatim and
 // seeded a clone URL git cannot fetch over HTTPS.
 //

@@ -3267,7 +3267,10 @@ func TestReconcileGitopsStateConfigMap(t *testing.T) {
 		t.Errorf("expected ConfigMap to retain its data, but got %v", verifyCM.Data)
 	}
 
-	// 4. Updating CR spec with a new repo should append it to the existing ConfigMap
+	// 4. Updating the CR's GitOps repository adds it to the existing ConfigMap,
+	// first rather than last: agent-side consumers fall back to the first
+	// managed entry for the GitOps repository, so appending would leave the
+	// previous first entry answering for it.
 	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
 		IntegrationSpec: agentv1alpha1.IntegrationSpec{
 			GitHub: &agentv1alpha1.GitHubSpec{
@@ -3283,7 +3286,7 @@ func TestReconcileGitopsStateConfigMap(t *testing.T) {
 	if err := fakeClient.Get(ctx, cmKey, &verifyCM); err != nil {
 		t.Fatalf("failed to get ConfigMap after third reconcile: %v", err)
 	}
-	expectedMergedJSON := `[{"type":"github","url":"some-repo"},{"type":"github","url":"https://github.com/test-org/new-repo"}]`
+	expectedMergedJSON := `[{"type":"github","url":"https://github.com/test-org/new-repo"},{"type":"github","url":"some-repo"}]`
 	if verifyCM.Data["managed_repos"] != expectedMergedJSON {
 		t.Errorf("expected ConfigMap to contain merged repos, but got %v", verifyCM.Data["managed_repos"])
 	}
@@ -6059,5 +6062,103 @@ func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testi
 
 	if phase == "Degraded" {
 		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)
+	}
+}
+
+// TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields covers the
+// seeding of context repositories into an existing ConfigMap. The merge used
+// to re-marshal the whole list through ManagedRepoEntry, which models only
+// type and url; on context_repos that would silently strip the `ref` an
+// administrator pinned, the first time the CR declared one more repository.
+func TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+					{Forge: "github", Repository: "kubernetes/kubernetes", Role: agentv1alpha1.RepositoryRoleContext},
+				},
+			}},
+		},
+	}
+	const pinned = `{"type":"github","url":"https://github.com/gke-labs/docs","ref":"release"}`
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			// Already present under another spelling: must not be appended twice.
+			"managed_repos": `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`,
+			"context_repos": `[` + pinned + `]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if want := `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`; got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected it untouched: %s", got.Data["managed_repos"], want)
+	}
+	want := `[` + pinned + `,{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`
+	if got.Data["context_repos"] != want {
+		t.Errorf("context_repos = %s, expected %s", got.Data["context_repos"], want)
+	}
+}
+
+// A GitOps repository the list lacks goes first. The entries carry no role and
+// the agent falls back to the first managed entry for its GitOps repository,
+// so appending would leave the previous one answering for it.
+func TestReconcileGitopsStatePutsANewGitOpsRepositoryFirst(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					{Forge: "github", Repository: "infra-v2", Role: agentv1alpha1.RepositoryRoleGitOps},
+				},
+			}},
+		},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/gke-labs/infra"}]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"type":"github","url":"https://github.com/gke-labs/infra-v2"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/infra"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/apps"}]`
+	if got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected %s", got.Data["managed_repos"], want)
+	}
+
+	// Once present it is never moved: the order is the administrator's.
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("second reconcileGitopsStateConfigMap() = %v", err)
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Data["managed_repos"] != want {
+		t.Errorf("second reconcile changed managed_repos to %s", got.Data["managed_repos"])
 	}
 }

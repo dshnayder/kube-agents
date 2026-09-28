@@ -6798,28 +6798,33 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 }
 
 // TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider covers the state
-// ConfigMap half of docs/designs/version-control-support.md §6: the entry's `type`
-// is the provider that was declared, and a repository on a host the provider
-// does not serve seeds nothing rather than being rewritten onto a host it does.
+// ConfigMap half of docs/designs/version-control-support.md §6: each entry's
+// `type` is its forge's provider, each role lands in its own list, and a
+// repository on a host the provider does not serve seeds nothing rather than
+// being rewritten onto a host it does.
 func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 	const githubEntry = `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "gke-labs"}}
+	gitops := func(repository string) []agentv1alpha1.RepositorySpec {
+		return []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: repository, Role: "gitops"}}
+	}
 
 	cases := []struct {
-		name string
-		spec agentv1alpha1.IntegrationSpec
-		want string
+		name    string
+		spec    agentv1alpha1.IntegrationSpec
+		managed string
+		context string
 	}{
 		{
-			name: "git spelling",
-			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
-				Provider: "github", Namespace: "gke-labs", Repository: "kube-agents"}},
-			want: githubEntry,
+			name:    "lists",
+			spec:    agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("kube-agents")},
+			managed: githubEntry,
 		},
 		{
-			name: "git spelling with the provider defaulted",
-			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
-				Repository: "https://github.com/gke-labs/kube-agents.git"}},
-			want: githubEntry,
+			name: "lists with the provider defaulted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "github"}},
+				Repositories: gitops("https://github.com/gke-labs/kube-agents.git")},
+			managed: githubEntry,
 		},
 		{
 			// The two spellings must seed the identical entry, or the deprecated
@@ -6827,7 +6832,52 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 			name: "deprecated github alias",
 			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
 				Org: "gke-labs", GitRepo: "kube-agents"}},
-			want: githubEntry,
+			managed: githubEntry,
+		},
+		{
+			// GitOps first whatever the declaration order, because the agent
+			// reads the first managed entry as the repository its GitOps work
+			// lands in; context entries go to their own list.
+			name: "every role",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"},` +
+				`{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			// An invalid entry is skipped, not the list: one typo must not take
+			// the GitOps repository out of the ConfigMap with it.
+			name: "an invalid repository does not drop its neighbours",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "git@gitlab.com:group/project.git", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			// With the webhook off (the chart default) nothing but the seeding
+			// itself stops an entry Problems refuses: "None" would qualify into
+			// gke-labs/None, a duplicate would be written twice, and a namespace
+			// outside GitHub's grammar would reach the minter's scopes.
+			name: "entries Problems refuses are not seeded",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "None", Role: "managed"},
+				{Forge: "github", Repository: "https://github.com/gke-labs/kube-agents", Role: "context"},
+				{Forge: "github", Repository: "apps", Namespace: "my.org", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			name: "a repository on a forge with a bad namespace is not seeded",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "my.org"}},
+				Repositories: gitops("kube-agents"),
+			},
 		},
 		{
 			// Before this change the operator wrote
@@ -6836,28 +6886,32 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 			// and the URL was rebuilt against github.com. The agent then had a
 			// registered repository nobody had declared.
 			name: "an scp remote on another forge seeds nothing",
-			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
-				Repository: "git@gitlab.com:group/project.git"}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("git@gitlab.com:group/project.git")},
 		},
 		{
 			// The other half of the same defect: CleanRepoURLWithOrg returned an
 			// https URL verbatim, so this seeded a gitlab.com URL under
 			// "type":"github" — an entry whose two fields named different forges.
 			name: "an https URL on another forge seeds nothing",
-			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
-				Repository: "https://gitlab.com/group/project"}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("https://gitlab.com/group/project")},
+		},
+		{
+			name: "a repository on an undeclared forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "gitops"}}},
 		},
 		{
 			name: "both spellings at once seed nothing",
 			spec: agentv1alpha1.IntegrationSpec{
-				Git:    &agentv1alpha1.GitSpec{Repository: "gke-labs/kube-agents"},
-				GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+				Forges:       gh,
+				Repositories: gitops("kube-agents"),
+				GitHub:       &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
 			},
 		},
 		{
 			name: "the no-repository sentinel seeds nothing",
-			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
-				Repository: agentv1alpha1.NoRepositorySentinel}},
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: agentv1alpha1.NoRepositorySentinel}},
 		},
 	}
 
@@ -6869,8 +6923,12 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: tc.spec},
 				},
 			}
-			if got := buildGitopsStateConfigMap(agent).Data["managed_repos"]; got != tc.want {
-				t.Errorf("managed_repos = %q, expected %q", got, tc.want)
+			data := buildGitopsStateConfigMap(agent).Data
+			if got := data["managed_repos"]; got != tc.managed {
+				t.Errorf("managed_repos = %q, expected %q", got, tc.managed)
+			}
+			if got := data["context_repos"]; got != tc.context {
+				t.Errorf("context_repos = %q, expected %q", got, tc.context)
 			}
 		})
 	}
@@ -6878,7 +6936,7 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 
 // TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub is the upgrade half
 // of deriving the forge egress: an install that declares nothing, one on the
-// deprecated `github` alias, and one on `git` with provider github must all
+// deprecated `github` alias, and one on the forge lists with GitHub must all
 // render the identical allowlist — and the forge patterns must sit where the
 // literals used to, so an upgrade re-renders a GitHub install's policy
 // unchanged rather than churning every FQDNNetworkPolicy in the fleet.
@@ -6906,8 +6964,12 @@ func TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub(t *testing.T) {
 	for name, integration := range map[string]*agentv1alpha1.PlatformAgentIntegrationSpec{
 		"deprecated alias": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
 			GitHub: &agentv1alpha1.GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}}},
-		"git spelling": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
-			Git: &agentv1alpha1.GitSpec{Provider: "github", Host: "github.com", Repository: "gke-labs/kube-agents"}}},
+		"lists": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "github.com"}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "gke-labs/kube-agents", Role: "gitops"}}}},
+		"two github forges": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "ours", Namespace: "gke-labs"}, {Name: "upstream", Host: "www.github.com"}}}},
 	} {
 		if got := render(integration); !slices.Equal(got, baseline) {
 			t.Errorf("%s renders %v, expected the undeclared install's %v", name, got, baseline)

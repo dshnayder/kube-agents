@@ -181,11 +181,13 @@ type ScopeClusterRef struct {
 
 // PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.
 //
-// The rule below is the schema half of ResolveGit's refusal of both forge
-// spellings. The webhook refuses the same CR, but the chart's default
-// failurePolicy is Ignore, and with the webhook unreachable a CR carrying both
-// would be admitted and then seed nothing, with only a reconcile log to say so.
-// +kubebuilder:validation:XValidation:rule="!(has(self.git) && has(self.github))",message="set at most one of integration.git and integration.github; integration.github is a deprecated alias for integration.git with provider github"
+// The rules below are the schema half of the forge declaration's checks: the
+// two spellings are exclusive, and a repository names a declared forge. The
+// webhook refuses the same CRs, but the chart ships it off and its default
+// failurePolicy is Ignore, and a CR the schema admitted would seed nothing,
+// with only a reconcile log to say so.
+// +kubebuilder:validation:XValidation:rule="!(has(self.github) && (has(self.forges) || has(self.repositories)))",message="set integration.forges and integration.repositories, or integration.github, not both; integration.github is a deprecated alias for one forge with provider github"
+// +kubebuilder:validation:XValidation:rule="!has(self.repositories) || self.repositories.all(r, has(self.forges) && self.forges.exists(f, f.name == r.forge))",message="every integration.repositories entry must name a forge declared in integration.forges"
 type PlatformAgentIntegrationSpec struct {
 	IntegrationSpec `json:",inline"`
 
