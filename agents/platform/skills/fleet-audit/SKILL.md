@@ -355,10 +355,11 @@ All three exit 2 in directory mode, where the clone already holds the file.
   [--manifest-file <path> | --no-collector-manifest "<why>"]
 ```
 
-The last pair is optional and belongs to a stream whose SOP runs a collector (the repository's
-collector-manifest design says what the manifest holds): `--manifest-file` names the manifest the
-collector wrote and `--no-collector-manifest` publishes without one, reporting the reason as a
-coverage gap. An SOP that mentions neither runs `finish` without them, exactly as before.
+The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
+design says what the manifest holds), and on such a stream one of the two is **required**:
+`--manifest-file` names the manifest the collector wrote and `--no-collector-manifest` publishes
+without one, reporting the reason as a coverage gap. A collector stream given neither exits 2, dry
+run included. An SOP that mentions neither runs `finish` without them.
 
 A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
@@ -411,7 +412,8 @@ the message names and re-run; never delete the finding that tripped it. What rea
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, or `--no-collector-manifest` was given a blank reason. A manifest that finished before
+empty path, `--no-collector-manifest` was given a blank reason, or a collector stream was given
+neither. A manifest that finished before
 this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking

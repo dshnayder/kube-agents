@@ -325,6 +325,25 @@ AUDITS: dict[str, AuditSpec] = {
     ),
 }
 
+# The streams whose SOP runs a collector, and so the streams whose `finish`
+# must say what the collector did: `--manifest-file` with what it wrote, or
+# `--no-collector-manifest` with why it wrote nothing. Omitting both was the
+# silent path — on 2026-08-29 a security-patch run passed the manifest on four
+# dry runs and dropped it from the publishing call, and nothing checked the
+# document that shipped. A stream is added here as the last step of its
+# collector's rollout, once its SOP passes the flag on every run;
+# `test_every_collector_stream_requires_its_manifest` holds the set to the
+# collectors that exist.
+COLLECTOR_AUDITS = frozenset(
+    {
+        "ai-security-audit",
+        "compliance-audit",
+        "fleet-consistency-drift",
+        "obtainability-audit",
+        "security-patch-orchestrator",
+    }
+)
+
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
@@ -11086,9 +11105,10 @@ def handle_finish(args: argparse.Namespace) -> None:
 
 def _finish(args: argparse.Namespace, audit_id: str) -> None:
     data = load_findings(args.findings_file, audit_id)
-    # The collector's side of the run, when there is one. Both flags are
-    # optional: a stream whose SOP has no collector yet publishes on the
-    # document's own attestation, exactly as before either flag existed. See
+    # The collector's side of the run, when there is one. A stream in
+    # COLLECTOR_AUDITS must pass one of the two flags (checked below, once the
+    # waiver is parsed); a stream whose SOP has no collector yet publishes on
+    # the document's own attestation. See
     # docs/designs/fleet-audit-collector-manifest.md for what each does.
     manifest = None
     manifest_file = getattr(args, "manifest_file", None)
@@ -11132,6 +11152,17 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         raise ValidationError(
             "--no-collector-manifest: give the reason the collector produced no "
             "manifest; it is published as this run's coverage gap."
+        )
+    # Refused on a dry run too: the publishing call is the one that dropped
+    # the flag, so a preview that accepts the omission previews a run the real
+    # call will refuse.
+    if manifest is None and not waiver and audit_id in COLLECTOR_AUDITS:
+        raise ValidationError(
+            f"--manifest-file is required for {audit_id}: its SOP runs a collector, "
+            "and without the manifest nothing checks this document against what the "
+            "collector actually ran. Pass the manifest the collector wrote, or, on a "
+            "run where it produced none, --no-collector-manifest '<why>' — which "
+            "publishes but reports the run as partial."
         )
     opt_repo = getattr(args, "repo", None)
     # Once, here, ahead of the dry-run split: both paths then see the same
@@ -12218,8 +12249,10 @@ def build_parser() -> argparse.ArgumentParser:
             "cluster the manifest marks 'collected' are cross-checked against "
             "the manifest's own rc=0 commands, a 'collected' cluster the "
             "document omits is refused, and the collector's evidence replaces "
-            "the model's — see cross_check_manifest. Optional: without it the "
-            "document is published on its own attestation, as before."
+            "the model's — see cross_check_manifest. Required on a stream "
+            "whose SOP runs a collector (COLLECTOR_AUDITS) unless "
+            "--no-collector-manifest is given; elsewhere the document is "
+            "published on its own attestation."
         ),
     )
     collector.add_argument(

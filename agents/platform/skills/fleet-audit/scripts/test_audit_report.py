@@ -46,6 +46,10 @@ import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 import workspace_paths  # noqa: E402
 
+# `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
+# need not each carry a manifest; the guard's own tests put this back.
+REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
+
 
 @dataclass
 class GitResult:
@@ -605,6 +609,11 @@ class BaseTestCase(unittest.TestCase):
         # tests about the note itself put the real check back.
         self.real_claim_in_flight = audit_report.claim_in_flight
         self.patch_attr("claim_in_flight", lambda *a, **k: None)
+        # `compliance-audit` is a collector stream, so on the real set every
+        # `finish` here would need a manifest, and passing one is not neutral:
+        # it changes holds, `unpublished_candidates` and the lost-store answer.
+        # `TestCollectorStreamsRequireAManifest` holds the real set.
+        self.patch_attr("COLLECTOR_AUDITS", frozenset())
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -14429,12 +14438,64 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestCollectorStreamsRequireAManifest(HarnessTestCase):
+    """A stream whose SOP runs a collector cannot publish on the model's word
+    alone: `finish` refuses it without `--manifest-file` or a waiver."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("COLLECTOR_AUDITS", REAL_COLLECTOR_AUDITS)
+
+    def test_every_collector_stream_requires_its_manifest(self):
+        import collect
+        import fleet_drift
+        import patch_readiness
+
+        expected = set(collect.CHECK_TABLES) | {fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID}
+        self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
+        self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
+
+    def test_streams_with_no_collector_are_not_held_to_it(self):
+        for audit in ("gce-compute-fleet-audit", "gcp-networking-fabric-audit"):
+            with self.subTest(audit=audit):
+                self.assertIn(audit, audit_report.AUDITS)
+                self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)
+
+    def test_no_flag_is_refused_and_nothing_is_published(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required for compliance-audit", self.err)
+        self.assertIn("--no-collector-manifest", self.err)
+        self.assertFalse(self.harness.matching("issue"))
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_a_dry_run_is_refused_too(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+
+    def test_the_waiver_publishes_as_partial(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+
+    def test_a_manifest_is_accepted(self):
+        self.harness.replies = {"issue list": "[]"}
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest()), encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 0, self.err)
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
-    Both flags are optional, and `TestFinishWithoutAManifestIsUnchanged` holds
-    the run without either to its recorded transcript; this class is about
-    what each flag adds.
+    The suite's base class lifts the collector-stream requirement, which
+    `TestCollectorStreamsRequireAManifest` holds; with it lifted,
+    `TestFinishWithoutAManifestIsUnchanged` holds the run without either flag
+    to its recorded transcript, and this class is about what each flag adds.
     """
 
     NETPOL_COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
