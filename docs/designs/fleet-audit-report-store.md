@@ -1,0 +1,162 @@
+# Fleet Audit — The Report Store
+
+> **Status — implemented.** `finish` writes the store and reads its own previous-run memory from
+> it; `report_status.py` projects it, the `fleet-audit-reports` skill answers questions off it, and
+> `make fleet-audit-view` renders it for an operator.
+
+**Scope:** where an audit run's structured output is kept after `finish` publishes it, what reads
+it, and what a run does when it is missing.
+**Builds on:** [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md), which stays the design
+of record for the ledger, delta, promotion and rendering contracts. This document changes one thing
+there: where the delta's memory of the previous run comes from.
+[`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.3 and §4 describe the
+held set and the coverage gap a lost memory costs.
+
+## 1. The problem
+
+Two costs share one cause. A user asking "what did the last compliance audit find?" or "what changed
+since last week?" cost a `gh issue view` plus model turns re-parsing rendered prose back into facts
+the harness held in structured form seconds before it published. The findings document survived
+only until the next run overwrote it in scratch, and the ledger rewrites itself in place, so
+run-over-run comparison had no source at all. And `finish` re-fetched the previous ledger body every
+run to parse its own hidden `<!-- audit-findings: … -->` block back out: a public issue body, which
+anyone with write access can edit between runs, was the harness's database.
+
+Both are the same missing thing: the run's structured output, kept where it was produced.
+
+## 2. The store
+
+`finish` keeps what it publishes. On the exit-0 path only — clean and findings branches alike, never
+on `--dry-run`, never after a rejection, never from `remediate` — it writes one envelope under
+`<root>/<audit-id>/`:
+
+- `runs/<finished-at, UTC, filename-safe>.json` — the envelope. The ring prunes to the newest 14 at
+  write time: two weeks of a daily stream.
+- `latest.json` — a byte-identical copy of the newest envelope. A copy rather than a symlink, so the
+  store asks nothing of the mount.
+
+Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
+the run's outcome (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`, the PR URL
+lists, `silent_ok`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
+`resolved_ids`, `current_ids`, `id_scheme`), `repo`, `ledger_body` — the body this run left on the
+issue — and `document`, the validated findings document the ledger rendered, whole rather than
+clipped to the body's budget. The body's redaction backstop is applied to every string on the way
+in, so the envelope never holds a credential shape the public issue blanked. `current_ids` is the
+**rendered** set, exactly what the body's hidden block lists; the full set is derivable from
+`document`.
+
+The write is best-effort: a store that cannot be written logs a warning and never changes the run's
+exit code. A failed write deletes `latest.json` on its way out, because the file left behind
+describes an older run and nothing in it says so — the next run would trust it, and a reader would
+quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
+indistinguishable from a fresh one. Pruning runs in its own `try`: a failed prune has not damaged
+the memory the run just wrote.
+
+`issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
+ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
+body still renders the previous run's findings. That path stores the previous body, ids and document
+forward instead of its own empty set; recording `[]` would hand the next run a trusted memory of an
+empty ledger, and every finding the body carries would be announced as new. Where the previous
+memory is itself lost, the envelope names no issue, so the next run's trust check fails as a lost
+memory should.
+
+## 3. Where it lives
+
+The root is `/opt/data/fleet-audit/reports`, overridable with `FLEET_AUDIT_REPORTS_DIR` (the test
+suites point it at a temp tree). It is fixed rather than under `$HERMES_HOME` because the cron or
+kanban worker that runs `finish` has `HERMES_HOME` set to its profile directory and a chat session
+has it set to `/opt/data`; a store rooted there is written to one path and read from another, and
+the only symptom is a chat path that never finds a report.
+
+`finish` runs in the agent's shell, so the store is on whichever pod that shell runs in. With the
+shell sandbox enabled that is the sandbox pod's `shell` container, whose `/opt/data` is a volume of
+its own, separate from the gateway's; without it, the gateway pod's `platform-agent` container. The
+in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make fleet-audit-view`
+probes the agent pods for both containers and reads the sandbox first.
+
+## 4. `finish`'s own memory
+
+The previous run's memory is `latest.json`, trusted when its `issue_number` is the open ledger
+`find_existing_issue` just returned and its `repo` is this run's. The repository is part of the
+check because the store is keyed by stream alone, and an SOP that walks several managed repositories
+finishes one stream once per repository: `acme/a#38` and `acme/b#38` would otherwise pass against
+each other's memory.
+
+The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
+stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did
+when the body came from GitHub, so a scheme bump costs what it always cost.
+
+`finish` parses the previous ids and titles out of the stored `ledger_body` with the same readers it
+used on the fetched body, so every join — delta, held set, carried held rows, the clean-close hold —
+is unchanged. Titles are also read from the stored `document`, which names findings the body budget
+cut. The issue body is no longer fetched for this at all; there is no fallback to it, because two
+memories with a precedence rule is how a divergence becomes undetectable, and the one failure a
+fallback would save costs a single cycle.
+
+When no ledger is open, the run is first and everything present is new. When a ledger is open but
+the store is absent, unreadable, or written for another issue, the memory is **lost** — unknowable,
+not empty:
+
+- The run publishes with no delta claim: `new: 0`, `resolved: 0`, the delta comment skipped, and a
+  log line saying the previous run's findings are unknowable.
+- The body is rewritten. Freezing it until a run could read its memory would freeze it for good,
+  since only a run that writes the body restores the store. Ids held on the lost body are no longer
+  carried; with a manifest their pull requests stay protected by the still-flagged set.
+- A clean run closes, unless the collector still flags something the document does not carry. Then
+  it files the lost-memory coverage gap, stays open, and reports partial.
+- A run with neither a memory nor a manifest answers no `/remediate`; the next run with a memory
+  answers them.
+
+A wiped volume therefore never puts a wrong count in a public issue. It costs one cycle of delta
+annotation, restored by the write that same run makes.
+
+The hidden block stays in every ledger body. It was never only `finish`'s round-trip state: the
+bench verifiers grade audit evals by parsing ids out of the published body, and it is the one way a
+human or an external tool recovers a run's id set with no pod access. The identical block in
+remediation pull request bodies keeps both its write and its read, because reconciliation has to
+work from the live pull request list, which humans change between runs.
+
+## 5. Liveness
+
+Whether a run is in flight comes from the lease `start` takes — the in-flight note
+`/opt/data/scratch/inflight_<audit-id>.json` — not from a file in the store. `report_status.py`
+reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, pinned by a test) and reports each stream
+as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
+`error` (a store file that would not parse). A note that exists but cannot be parsed is a `start`
+that has claimed the lease and not yet written it, and counts from its mtime. A first run in flight
+is `running` before its store directory exists.
+
+## 6. Readers
+
+**The agent.** The Planning Agent has no file tools; a question about an audit is delegated to the
+platform specialist, which runs in the same shell `finish` does. The `fleet-audit-reports` skill
+answers from the store through `report_query.py`, whose subcommands (`streams`, `show`, `findings`,
+`finding`, `checks`, `diff`, `runs`) each return one small JSON object. Every answer is bounded and
+the full document is opt-in: `show` omits `document` so the cheap call stays cheap, and `finding`
+returns one finding's prose. `checks` reaches `scope.clusters[].checks_run[]`, which a finding-heavy
+ledger drops from its body with a notice pointing at the stored report. The reader is its own skill
+because skill selection runs off the description, and `fleet-audit`'s describes publishing; a
+question about a past run should not pull the publish procedure into context.
+
+**The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
+(`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and
+renders one row per stream. `report_status.py` therefore imports nothing outside the standard
+library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
+not grow two parsers of the same files.
+
+## 7. Rejected alternatives
+
+- **A ConfigMap.** Findings documents at 60,000-character scale, times every stream, times history,
+  are the wrong side of etcd's 1 MiB object cap.
+- **A SQLite ring beside the agent's own databases.** The unit is one whole document per run, read
+  with a query script, not rows anything joins; a second database on the volume buys only a new
+  corruption class.
+- **Committing reports into the GitOps repository.** Durable and diffable, but it writes machine
+  telemetry into the user's repository, a commit per stream per day, and a network read is what the
+  store exists to remove.
+- **Keeping the ledger read-back as a fallback.** Rejected in §4.
+- **Removing the hidden block from bodies.** Breaks the bench verifiers and every external consumer
+  of the published interface; only its read-back was worth retiring.
+- **Giving the Planning Agent file tools** to skip a delegation hop. It would turn the one profile
+  with no infrastructure access into one with filesystem access, for latency on a question that is
+  already asynchronous.
