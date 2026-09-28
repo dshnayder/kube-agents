@@ -255,3 +255,43 @@ func (in *IntegrationSpec) ValidateGit() error {
 	}
 	return resolved.Validate()
 }
+
+// ForgeEgressPatterns derives the forge half of the operator's FQDN egress
+// allowlist from the declaration, rather than listing hosts where the policy is
+// written.
+//
+// GitHub is always included. A repository can be registered in the
+// gitops-state ConfigMap without being declared, an install with no
+// declaration at all still reaches GitHub today, and a declaration that fails
+// validation must not be the thing that takes egress away from a running
+// install — the reconcile warning and the webhook are how that gets fixed, not
+// a pod that silently loses its forge. So an invalid or absent declaration
+// yields GitHub's patterns alone, and a valid one adds its own to them.
+func ForgeEgressPatterns(in *IntegrationSpec) []string {
+	github, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		// The registry always carries GitHub; a table without it is a build
+		// defect, and gitspec_test.go fails on it.
+		panic(err)
+	}
+	patterns := github.EgressPatterns("")
+	resolved, err := in.ResolveGit()
+	if err != nil || resolved == nil || resolved.Validate() != nil {
+		return patterns
+	}
+	provider, err := resolved.GitProvider()
+	if err != nil {
+		return patterns
+	}
+	seen := make(map[string]bool, len(patterns))
+	for _, p := range patterns {
+		seen[p] = true
+	}
+	for _, p := range provider.EgressPatterns(resolved.Host) {
+		if !seen[p] {
+			seen[p] = true
+			patterns = append(patterns, p)
+		}
+	}
+	return patterns
+}

@@ -100,6 +100,10 @@ type GitProvider struct {
 	// MaxPathDepth of 0 means unbounded, for a forge with nested groups.
 	MinPathDepth int
 	MaxPathDepth int
+	// Egress are the FQDN patterns the provider's traffic needs: its API,
+	// its clone endpoints, and any host it serves content from. They cover
+	// every entry in Hosts, so a declaration naming one of those adds nothing.
+	Egress []string
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -113,6 +117,10 @@ var gitProviders = map[string]*GitProvider{
 		MaxNamespaceLength: MaxGitHubOrgLength,
 		MinPathDepth:       githubPathDepth,
 		MaxPathDepth:       githubPathDepth,
+		// raw.githubusercontent.com and the release/archive download hosts
+		// sit under githubusercontent.com; api.github.com and codeload under
+		// the wildcard.
+		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
 	},
 }
 
@@ -273,3 +281,15 @@ func (p *GitProvider) schemelessHosts() map[string]bool {
 	return hosts
 }
 
+// EgressPatterns returns the FQDN patterns a declaration on host needs. A host
+// this provider serves, or none, is covered by the provider's own patterns; any
+// other host is added as a literal, which is the case a self-managed forge at a
+// customer-chosen hostname needs and no pattern in this repository could cover.
+func (p *GitProvider) EgressPatterns(host string) []string {
+	patterns := append([]string(nil), p.Egress...)
+	trimmed := strings.ToLower(strings.TrimSpace(host))
+	if trimmed == "" || p.Hosts[trimmed] {
+		return patterns
+	}
+	return append(patterns, trimmed)
+}

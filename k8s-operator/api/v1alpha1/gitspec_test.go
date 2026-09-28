@@ -439,3 +439,60 @@ func TestFieldPathNamesWhatWasWritten(t *testing.T) {
 		})
 	}
 }
+
+// TestForgeEgressPatternsNeverDropGitHub pins the fail-safe: whatever the
+// declaration says, and whether or not it validates, GitHub's patterns are in
+// the list. An invalid declaration is fixed through the webhook and the
+// reconcile warning, never by a pod that quietly loses its forge.
+func TestForgeEgressPatternsNeverDropGitHub(t *testing.T) {
+	github := []string{"github.com", "*.github.com", "*.githubusercontent.com"}
+	cases := map[string]*IntegrationSpec{
+		"nil integration":   nil,
+		"empty integration": {},
+		"deprecated alias":  {GitHub: &GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}},
+		"git spelling":      {Git: &GitSpec{Repository: "gke-labs/kube-agents"}},
+		"git with github host": {Git: &GitSpec{
+			Provider: "github", Host: "www.github.com", Repository: "gke-labs/kube-agents"}},
+		"both spellings": {
+			Git:    &GitSpec{Repository: "gke-labs/kube-agents"},
+			GitHub: &GitHubSpec{GitRepo: "other/repo"},
+		},
+		"unregistered provider": {Git: &GitSpec{Provider: "gitlab", Repository: "group/project"}},
+		"host github does not serve": {Git: &GitSpec{
+			Host: "gitlab.example.com", Repository: "group/project"}},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := ForgeEgressPatterns(in)
+			if strings.Join(got, ",") != strings.Join(github, ",") {
+				t.Errorf("ForgeEgressPatterns = %v, expected exactly %v", got, github)
+			}
+		})
+	}
+}
+
+// TestEgressPatternsAddAForeignHostAsALiteral covers the case derivation exists
+// for: a forge at a customer-chosen hostname, which no pattern could name in
+// advance. GitHub's validation refuses such a host, so this reaches the method
+// directly; a self-managed provider is where a declaration will produce it.
+func TestEgressPatternsAddAForeignHostAsALiteral(t *testing.T) {
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"", "github.com", "SSH.GitHub.com"} {
+		if got := provider.EgressPatterns(host); len(got) != len(provider.Egress) {
+			t.Errorf("EgressPatterns(%q) = %v; a host the provider serves must add nothing", host, got)
+		}
+	}
+	got := provider.EgressPatterns(" Git.Example.COM ")
+	if got[len(got)-1] != "git.example.com" || len(got) != len(provider.Egress)+1 {
+		t.Errorf("EgressPatterns(foreign) = %v, expected the provider's patterns plus git.example.com", got)
+	}
+	// The result must not alias the registry's slice: a caller appending to it
+	// would otherwise rewrite every later install's allowlist.
+	got[0] = "mutated"
+	if provider.Egress[0] == "mutated" {
+		t.Error("EgressPatterns returned the registry's own slice")
+	}
+}

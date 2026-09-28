@@ -6875,3 +6875,42 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 		})
 	}
 }
+
+// TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub is the upgrade half
+// of deriving the forge egress: an install that declares nothing, one on the
+// deprecated `github` alias, and one on `git` with provider github must all
+// render the identical allowlist — and the forge patterns must sit where the
+// literals used to, so an upgrade re-renders a GitHub install's policy
+// unchanged rather than churning every FQDNNetworkPolicy in the fleet.
+func TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub(t *testing.T) {
+	render := func(integration *agentv1alpha1.PlatformAgentIntegrationSpec) []string {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec:       agentv1alpha1.PlatformAgentSpec{Integration: integration},
+		}
+		spec := buildFQDNNetworkPolicy(agent).Object["spec"].(map[string]interface{})
+		rule := spec["egress"].([]interface{})[0].(map[string]interface{})
+		var patterns []string
+		for _, m := range rule["matches"].([]interface{}) {
+			patterns = append(patterns, m.(map[string]interface{})["pattern"].(string))
+		}
+		return patterns
+	}
+
+	baseline := render(nil)
+	at := slices.Index(baseline, "*.pkg.dev")
+	if at < 0 || !slices.Equal(baseline[at+1:at+4], []string{"github.com", "*.github.com", "*.githubusercontent.com"}) {
+		t.Fatalf("GitHub's patterns moved from their pre-derivation position after *.pkg.dev: %v", baseline)
+	}
+
+	for name, integration := range map[string]*agentv1alpha1.PlatformAgentIntegrationSpec{
+		"deprecated alias": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}}},
+		"git spelling": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Git: &agentv1alpha1.GitSpec{Provider: "github", Host: "github.com", Repository: "gke-labs/kube-agents"}}},
+	} {
+		if got := render(integration); !slices.Equal(got, baseline) {
+			t.Errorf("%s renders %v, expected the undeclared install's %v", name, got, baseline)
+		}
+	}
+}

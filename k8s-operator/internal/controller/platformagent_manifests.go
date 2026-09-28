@@ -5310,6 +5310,10 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 
 // buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
 // for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+//
+// It selects the gateway pod only. The credential broker, which is the pod that
+// actually calls the forge, is not covered by it; how the broker's egress should
+// be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
@@ -5337,10 +5341,17 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.gcr.io",
 		"pkg.dev",
 		"*.pkg.dev",
-		// GitOps & Source Control
-		"github.com",
-		"*.github.com",
-		"*.githubusercontent.com",
+	}
+	// GitOps & Source Control: derived from the forge declaration, so a forge
+	// at a customer-chosen hostname is reachable without a literal here. Kept
+	// in its old position in the list, so an upgrade re-renders a GitHub
+	// install's policy byte for byte.
+	var integration *agentv1alpha1.IntegrationSpec
+	if agent != nil && agent.Spec.Integration != nil {
+		integration = &agent.Spec.Integration.IntegrationSpec
+	}
+	patterns = append(patterns, agentv1alpha1.ForgeEgressPatterns(integration)...)
+	patterns = append(patterns,
 		// Chat Integrations
 		"slack.com",
 		"*.slack.com",
@@ -5350,7 +5361,7 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.login.microsoftonline.com",
 		"botframework.com",
 		"*.botframework.com",
-	}
+	)
 
 	matches := make([]interface{}, 0, len(patterns))
 	for _, p := range patterns {
