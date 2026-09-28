@@ -953,6 +953,17 @@ class SpotScarcityTest(unittest.TestCase):
         self.assertIsNone(hit)
         self.assertIsNone(limitation)
 
+    def test_the_object_is_the_same_owner_whatever_order_they_are_listed_in(self):
+        """The object is the finding's identity, so listing order must not move it."""
+        owners = ["NodePool/zeta", "ComputeClass/alpha"]
+        shape = {"owners": owners, "families": {o: 1 for o in owners}}
+        reordered = {"owners": owners[::-1], "families": shape["families"]}
+        history = capacity_history([0.5] * 8)
+        first, _ = fs.check_spot_scarcity("n2-standard-8", shape, "us-east4", history)
+        second, _ = fs.check_spot_scarcity("n2-standard-8", reordered, "us-east4", history)
+        self.assertEqual(first["object"], "ComputeClass/alpha")
+        self.assertEqual(second["object"], first["object"])
+
     def test_a_shape_over_the_ceiling_with_no_fallback_is_flagged(self):
         hit, limitation = fs.check_spot_scarcity(
             "a2-highgpu-1g", self.SHAPE, "us-central1", capacity_history([0.3] * 10)
@@ -1782,6 +1793,19 @@ class CrashIsolationTest(unittest.TestCase):
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
+    def test_the_renames_this_collector_makes_needed_an_id_scheme_bump(self):
+        """Qualified cluster names and the region- and message-id-bearing
+        objects re-spell every stockout finding on the collector's first run.
+        Without a new `ID_SCHEME` a ledger stamped by the previous scheme joins
+        against the new ids, and the delta reads every rename as a fix."""
+        import audit_report
+
+        def fid(cluster, obj):
+            return audit_report.derive_finding_id({"check": "quota-exhaustion-risk", "cluster": cluster, "namespace": "", "object": obj})
+
+        self.assertNotEqual(fid("c1", "Quota/CPUS"), fid(fs.target_name("p", "us-central1", "c1"), "Quota/us-central1:CPUS"))
+        self.assertGreaterEqual(audit_report.ID_SCHEME, 6)
+
     def test_checks_run_copied_from_a_collected_entry_survives_cross_check(self):
         import audit_report
 

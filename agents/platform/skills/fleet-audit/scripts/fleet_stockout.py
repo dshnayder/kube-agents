@@ -1085,7 +1085,8 @@ def check_spot_scarcity(
     """
     rate, intervals = mean_preemption_rate(advice)
     owners = ", ".join(shape["owners"])
-    exposed = [o for o in shape["owners"] if shape["families"][o] < MIN_FALLBACK_FAMILIES]
+    # Sorted, so the finding's object (the first) is the same owner every run.
+    exposed = sorted(o for o in shape["owners"] if shape["families"][o] < MIN_FALLBACK_FAMILIES)
     if rate is None:
         return None, (
             f"spot-scarcity-risk could not be measured for {machine_type} in "

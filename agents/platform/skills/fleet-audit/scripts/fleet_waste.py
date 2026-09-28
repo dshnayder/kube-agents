@@ -1192,13 +1192,19 @@ def _hpa_targets(context: dict) -> set[tuple[str, str, str]]:
 
 
 def _limitrange_defaults(context: dict) -> dict[str, dict]:
-    """Per namespace, the container `defaultRequest` its LimitRanges set."""
+    """Per namespace, the container request its LimitRanges fill in.
+
+    `defaultRequest` where set; otherwise `default`, because the LimitRanger
+    admission plugin copies a defaulted limit into a missing request too."""
     defaults: dict[str, dict] = {}
     for lr in context.get("limitranges", []):
         ns = (lr.get("metadata") or {}).get("namespace", "")
         for limit in (lr.get("spec") or {}).get("limits") or []:
-            if limit.get("type") == "Container" and limit.get("defaultRequest"):
-                defaults.setdefault(ns, {}).update(limit["defaultRequest"])
+            if limit.get("type") != "Container":
+                continue
+            filled = {**(limit.get("default") or {}), **(limit.get("defaultRequest") or {})}
+            if filled:
+                defaults.setdefault(ns, {}).update(filled)
     return defaults
 
 
@@ -1206,13 +1212,18 @@ def _requests_are_the_namespace_default(entry: dict, defaults: dict) -> bool:
     """Whether every container's request is exactly what the LimitRange filled in.
 
     §3.1 says to fix the LimitRange rather than the workload, so a request
-    nobody wrote is not this workload's sizing decision."""
+    nobody wrote is not this workload's sizing decision. A request for a
+    resource the LimitRange does not default was written by hand, so it keeps
+    the workload in scope: GKE's stock CPU-only default must not hide an
+    oversized memory request."""
     if not defaults:
         return False
     for pod in entry["pods"]:
         for req in pod["requests"]:
             for resource in ("cpu", "memory"):
                 if resource not in defaults:
+                    if req.get(resource):
+                        return False
                     continue
                 parse = parse_cpu_cores if resource == "cpu" else parse_mem_mib
                 if parse(str(req.get(resource, ""))) != parse(str(defaults[resource])):
@@ -4196,6 +4207,16 @@ def _dead_cluster_of(disk: dict, known_clusters: set[str] | None) -> str:
     return owner
 
 
+def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> frozenset[str]:
+    """The names of this project's clusters whose PersistentVolumes were not read.
+
+    Keyed on (name, location) and reduced to names, because a disk's
+    `goog-k8s-cluster-name` label is all `check_unattached_disk` matches on:
+    when two clusters share a name and only one was read, the name counts as
+    unread, which skips the read one's disks rather than flag the other's."""
+    return frozenset(name for name, _ in known - collected)
+
+
 def check_unattached_disk(
     disks: list[dict],
     live_pv_handles: set[str],
@@ -4664,6 +4685,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # of `enumerate_clusters` rather than over the RUNNING one this loop feeds
     # to the workers.
     known_by_project: dict[str, set[str] | None] = {}
+    # The same, as (name, location): a name is unique only per location, so
+    # which clusters went unread is decided on the pair.
+    known_pairs_by_project: dict[str, set[tuple[str, str | None]]] = {}
     enumeration_failed: dict[str, str] = {}
     for p in projects:
         try:
@@ -4671,6 +4695,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             clusters.extend(running)
             unaudited.extend(not_running)
             known_by_project[p] = {c["name"] for c in running} | {c["name"] for c in not_running}
+            known_pairs_by_project[p] = {(c["name"], c.get("location")) for c in running + not_running}
         except RuntimeError as exc:
             known_by_project[p] = None
             # A log line is not a record. The manifest is the only account of
@@ -4727,11 +4752,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # B's checks, and a PV handle from project A's cluster must not suppress
     # a genuinely unattached disk in project B.
     by_project: dict[str, list[tuple[dict, dict]]] = {}
-    collected_by_project: dict[str, set[str]] = {}
+    collected_by_project: dict[str, set[tuple[str, str | None]]] = {}
     for cluster, result in zip(clusters, results):
         by_project.setdefault(cluster["project"], []).append(result)
         if result[0].get("outcome") == "collected":
-            collected_by_project.setdefault(cluster["project"], set()).add(cluster["name"])
+            collected_by_project.setdefault(cluster["project"], set()).add((cluster["name"], cluster.get("location")))
     # The clusters that never reached a worker belong to the gate too. §3.6
     # withholds `orphan-lb` unless *every* cluster in the project was read, and
     # a DEGRADED or PROVISIONING cluster is one that was not: it goes straight
@@ -4771,7 +4796,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=frozenset((known_by_project.get(p) or set()) - collected_by_project.get(p, set())))
+        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
         if project_entry:
             project_entries.append(project_entry)
 

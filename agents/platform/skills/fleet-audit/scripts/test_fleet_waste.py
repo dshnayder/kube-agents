@@ -1329,6 +1329,18 @@ class OverrequestTest(unittest.TestCase):
         other = obj("LimitRange", "defaults", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "1", "memory": "1Gi"}}]})
         self.assertEqual(len(fw.check_overrequest({"pods": [pod], "limitranges": [other]}, self.IDLE, now=NOW, autopilot=False)), 1)
 
+    def test_a_cpu_only_default_does_not_hide_a_hand_written_memory_request(self):
+        """GKE's stock LimitRange defaults CPU only; the memory request is the workload's own."""
+        pod = self.deployment_pod()
+        cpu_only = obj("LimitRange", "limits", ns="default", **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "12"}}]})
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod], "limitranges": [cpu_only]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_a_defaulted_limit_counts_as_the_filled_in_request(self):
+        """LimitRanger copies `default` into a missing request when no `defaultRequest` is set."""
+        pod = self.deployment_pod()
+        lr = obj("LimitRange", "defaults", ns="default", **{"spec.limits": [{"type": "Container", "default": {"cpu": "12", "memory": "48Gi"}}]})
+        self.assertEqual(fw.check_overrequest({"pods": [pod], "limitranges": [lr]}, self.IDLE, now=NOW, autopilot=False), [])
+
     def test_a_deleting_or_failed_pod_is_not_a_replica(self):
         deleting = self.deployment_pod(name="api-2")
         deleting["metadata"]["deletionTimestamp"] = "2026-07-31T00:00:00Z"
@@ -3056,6 +3068,14 @@ class UnattachedDiskTest(unittest.TestCase):
         disk = self.disk()
         disk["labels"] = {fw.GKE_CLUSTER_LABEL: "healthy"}
         self.assertEqual(len(fw.check_unattached_disk([disk], set(), now=NOW, unread_clusters=frozenset({"sick"}))), 1)
+
+    def test_a_name_counts_as_unread_when_any_cluster_by_that_name_went_unread(self):
+        """Two `prod` clusters in one project, one read: a disk labelled `prod`
+        may be the unread one's, so the name is unread."""
+        known = {("prod", "us-central1"), ("prod", "europe-west1"), ("ok", "us-central1")}
+        collected = {("prod", "us-central1"), ("ok", "us-central1")}
+        self.assertEqual(fw._unread_names(known, collected), frozenset({"prod"}))
+        self.assertEqual(fw._unread_names(known, known), frozenset())
 
     def test_managed_service_disks_are_not_judged(self):
         for label in ("goog-composer-environment", "goog-dataproc-cluster-name"):

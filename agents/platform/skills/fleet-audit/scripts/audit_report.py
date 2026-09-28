@@ -542,7 +542,15 @@ DELTA_RE = re.compile(
 # 5: `collect.py` makes the same rename for the obtainability, compliance and
 # ai-security streams, which until then published the bare names their
 # documents wrote.
-ID_SCHEME = 5
+#
+# 6: `fleet_waste.py` and `fleet_stockout.py` make the same rename for the cost
+# and stockout streams, and the stockout collector also re-spells two objects:
+# a quota finding names its region (`Quota/<region>:<metric>`) and an
+# autoscaler finding its message id (`ScaleUpError/<message-id>`). The
+# qualified cluster names re-spell through the Scope table as before; the two
+# objects cannot, so those rows leave the ledger unheld on the first run, and
+# `resolved` is withheld for that run rather than reporting them fixed.
+ID_SCHEME = 6
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
 # `<project>/<location>/<name>`: the segments of a qualified cluster name.
@@ -4783,7 +4791,7 @@ def parse_held_ids(body: str | None) -> list[str]:
 def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
     """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
 
-    Schemes 3 to 5 moved a stream's cluster names from bare to qualified, so a
+    Schemes 3 to 6 moved a stream's cluster names from bare to qualified, so a
     `Where:` line written before the move names a cluster no collector
     candidate spells that way any more. The Scope row beside it has the
     project and location that qualify it; a name audited at two locations has
@@ -4829,7 +4837,7 @@ def _respelled_rows(
     Under another scheme a row naming a bare cluster is also spelled with the
     name qualified from the body's Scope table (`_scope_spellings`), and that
     spelling wins when the collector's `flagged` ids carry it and not the bare
-    one. Schemes 3 to 5 moved a stream's clusters from bare to qualified
+    one. Schemes 3 to 6 moved a stream's clusters from bare to qualified
     names; matched on the bare spelling alone, its first run under the
     collector held nothing, and a clean document closed the ledger over
     findings the collector still flagged. A name two clusters share is
