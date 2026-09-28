@@ -135,16 +135,6 @@
   ],
   [
    "gh",
-   "issue",
-   "view",
-   "42",
-   "-R",
-   "acme/fleet",
-   "--json",
-   "body"
-  ],
-  [
-   "gh",
    "pr",
    "list",
    "-R",
@@ -207,11 +197,9 @@
   null,
   null,
   null,
-  null,
   null
  ],
  "bodies": [
-  null,
   null,
   null,
   null,
