@@ -1313,7 +1313,10 @@ class HistoryLocalForge(LocalForge):
         found = list(self.history.get(payload.get("source"), []))
         if payload.get("state") == "open":
             found = [item for item in found if item.get("state") == "open"]
-        return {"proposals": found, "truncated": False}
+        # One page, as the real forge answers: newest first, `limit` long, and
+        # truncated when full.
+        limit = int(payload.get("limit") or 100)
+        return providers.listing(found[:limit], limit, "proposals")
 
 
 class BranchVerbTest(unittest.TestCase):
@@ -1519,6 +1522,26 @@ class BranchVerbTest(unittest.TestCase):
             self.delete(self.SPENT, tip)
         self.assertTrue(self.exists(self.SPENT))
 
+    def test_delete_the_remote_refuses_is_refused_rather_than_left_to_retry(self):
+        # A hook or branch rule answers every attempt alike; GIT_FAILED would
+        # send the caller round again.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        hook = Path(self.origin) / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "while read old new ref; do\n"
+            "  case $new in 0000000000000000000000000000000000000000)"
+            " echo 'deletions are restricted' >&2; exit 1;; esac\n"
+            "done\n"
+        )
+        hook.chmod(0o755)
+        with self.assertRaises(WorkspaceError) as caught:
+            self.delete(self.SPENT, tip)
+        self.assertEqual(caught.exception.fields.get("code"), "DELETE_REFUSED")
+        self.assertIn("remote rejected", str(caught.exception))
+        self.assertTrue(self.exists(self.SPENT))
+
     def test_delete_whose_push_failed_after_it_landed_answers_gone(self):
         # Not BRANCH_MOVED: nothing moved it, and "whatever moved it is kept"
         # would be false about a branch that is not there.
@@ -1555,6 +1578,17 @@ class BranchVerbTest(unittest.TestCase):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="a-maintainer")
         self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_history_longer_than_the_page_it_reads(self):
+        # Ten of this install's proposals at the tip, newest first, and a
+        # person's before them: the page shows only ours, and says it is a page.
+        tip = self.push_branch(self.SPENT)
+        for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.closed(self.SPENT, tip, author="a-maintainer")
         self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))

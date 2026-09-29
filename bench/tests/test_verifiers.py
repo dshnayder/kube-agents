@@ -2377,6 +2377,21 @@ def _route_patterns() -> list[str]:
         # A path that starts at the sanctioned git and resolves to the shim.
         "/opt/vcs/libexec/../../credential-proxy/bin/git push origin :platform-agent/fix",
         "GH_TOKEN=x gh pr close 5",
+        # Wrappers that take options, and the one-line shell keywords.
+        "timeout -k 5 60 gh pr close 5",
+        "nice -n 10 gh pr close 5",
+        "env -i gh pr close 5",
+        "sudo -u agent gh pr close 5",
+        "exec -a x gh pr close 5",
+        "if gh pr view 5 --json state | grep -q CLOSED; then gh pr close 5; fi",
+        "for n in 5 6; do gh pr close $n; done",
+        '[ -n "$x" ] && { gh pr close 5; }',
+        'eval "gh pr close 5"',
+        "gh pr list --json number | xargs gh pr close",
+        "gh pr view 5 --json number -q .number | xargs -n 1 gh pr close",
+        "! gh pr view 5",
+        'bash -lc "gh pr close 5"',
+        "if ! git push origin :platform-agent/fix; then echo refused; fi",
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2398,6 +2413,7 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         # Free prose on the command line is not a route.
         'python3 /opt/vcs/vcs.py commit -m "git push was refused as BRANCH_DIVERGED, cleared the spent branch"',
         "python3 submit_suggestion.py publish --title 'Second proposal after gh pr close'",
+        'python3 /opt/vcs/vcs.py commit -m "retry if git push is refused, then gh pr close"',
     ],
 )
 def test_the_spent_branch_route_check_passes_the_verbs(command):
@@ -2412,6 +2428,16 @@ def test_the_spent_branch_route_check_is_linear_on_a_long_proxied_command():
     command = "python3 credential_proxy_client.py " + " ".join(
         f"--p{i}" for i in range(20)
     )
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
+def test_the_spent_branch_route_check_is_linear_on_a_long_wrapper_run():
+    # Wrappers with options, and nothing after them. An option's value may not
+    # be a wrapper's name; before that rule `env -i env -i ...` could split
+    # each `env` as a value or a wrapper, and doubled in time every two.
+    command = "env -i " * 40 + "nice -n 1 " * 20 + "true"
     began = time.monotonic()
     assert not any(re.search(p, command) for p in _route_patterns())
     assert time.monotonic() - began < 1.0

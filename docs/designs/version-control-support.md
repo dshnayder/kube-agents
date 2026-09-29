@@ -878,7 +878,9 @@ following the branch; a forge whose closed proposals keep tracking their branch
 cannot serve `branch-delete` until it reports the revision at close. The prefix is a convention anyone who can push
 can use, so the proposal that carried the tip must also be this install's —
 opened from this repository by the credential's own login — and no proposal
-from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too; a
+from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too — a
+history longer than the one page the broker reads included, since that page
+cannot show it; a
 credential that cannot name itself leaves the prefix and the same-repository
 rule as the bar, as it does for `advance`. That bar holds against a mistake,
 not against the caller itself, which can open and close a proposal on a branch
@@ -888,6 +890,10 @@ person proposed from stays refused. `revision` is the tip the
 caller read, and the push is conditional on it: a sibling that published to the
 name in between wins, and the delete is refused `BRANCH_MOVED`. A branch already
 gone is answered `deleted: false`, not refused — the caller wanted it gone.
+A remote that answers the delete with a refusal of its own — a branch rule or
+hook, or a credential without the right — is `DELETE_REFUSED`, not
+`GIT_FAILED`: it answers every attempt alike, so the name is not usable and a
+retry is pointless.
 The gate does not know which flow kept a branch on purpose: fleet-audit leaves a
 closed remediation pull request's branch in place so the fix can be proposed
 again on it, and that branch passes every check above. Keeping it is that skill's
@@ -899,7 +905,7 @@ repository has.
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `BRANCH_NOT_OURS`,
-`OPEN_PROPOSAL`, `BRANCH_MOVED` and `NOT_SPENT`, 502 `GIT_FAILED` and
+`OPEN_PROPOSAL`, `BRANCH_MOVED`, `NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it

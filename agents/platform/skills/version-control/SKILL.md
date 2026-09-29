@@ -212,12 +212,14 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
   the closed proposal is not this install's), `OPEN_PROPOSAL`, `NOT_SPENT` (it
   holds revisions no proposal carried); each of those is somebody's work — pick
-  another name or report it. Never open and close a proposal on a branch to make
+  another name or report it. `DELETE_REFUSED` means the remote itself refuses
+  the delete (a branch rule, a hook, or a credential without the right); it
+  answers every attempt alike, so pick another name or report it too. Never open and close a proposal on a branch to make
   it deletable: the delete reads that proposal as proof the branch is yours. `BRANCH_MOVED` means it moved since you read it:
   view it again, and delete only if it is still spent.
   `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
   `GIT_FAILED` mean the delete did not complete, and it may have landed before
-  the failure: read the branch again, and retry only if it is still there. A forge without `proposal-list`
+  the failure: read the branch again, and retry once if it is still there. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
   `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**

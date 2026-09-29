@@ -132,12 +132,14 @@ code. `NOT_SPENT` means the branch moved on after its proposal closed;
 more, which reads it again; if a person or a sibling card on the same name added
 to it, that second run refuses it as `NOT_SPENT`. `BRANCH_NOT_OURS` means a proposal from it was
 not this install's, or the name is not under `platform-agent/`. Those revisions
-are somebody's; do not delete them another way. Choose a different name where
+are somebody's; do not delete them another way. `DELETE_REFUSED` means the
+repository itself refuses to delete the branch (a branch rule, a hook, or a
+credential without the right), and it will refuse again. Choose a different name where
 the derived one is only a default, or report the refusal and stop where the name
 is fixed. `FORGE_CALL_FAILED`, `GIT_FAILED`, or a delete refused with no code
 is different: the delete did not complete (it may have landed before the
-failure), and running `prepare` again, which reads the branch afresh, is the
-move. A proxy older than the
+failure), and running `prepare` once more, which reads the branch afresh, is
+the move; a second failure is reported, not retried. A proxy older than the
 sandbox cannot read the branch at all; `prepare` then refuses the name without
 a code and says so — use another name, or report it where the name is fixed.
 

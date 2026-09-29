@@ -108,11 +108,21 @@ _INCOMING = "refs/vcs/incoming"
 # another tool's, whatever its history says.
 AGENT_BRANCH_PREFIX = "platform-agent/"
 
-# How far back `branch-delete` reads a branch's proposals. The one it needs is
-# the proposal that carried the tip, which is the newest when the branch is
-# spent, and `proposal-list` answers newest first; the rest are slack for a
-# forge that orders differently, and an open proposal anywhere in them refuses.
+# How many of a branch's proposals `branch-delete` reads. It needs all of them:
+# the one that carried the tip, and every other, since a branch any of them
+# shows a person proposed from is not this install's to delete. A history the
+# forge answers as truncated is therefore refused rather than judged on its
+# first page. A spent agent branch carries one or two; ten is a branch
+# somebody has been reusing, and one page is as far as this reads before it
+# says so.
 PROPOSAL_HISTORY_ON_A_BRANCH = 10
+
+# What git prints when the remote answered the delete and said no: a hook or
+# branch rule (`[remote rejected] <ref> (<reason>)`), or a credential without
+# the right to push (HTTP 403). Every run gets the same answer, so it is
+# refused as DELETE_REFUSED rather than left to GIT_FAILED, which callers
+# retry.
+_REMOTE_REFUSED = re.compile(r"\[remote rejected\][^\n]*|returned error: 403|Permission to \S+ denied")
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -767,7 +777,8 @@ class VcsBroker:
         by the credential's own login, from this repository rather than a fork.
         So must every other proposal the branch's history lists: a branch a
         person ever proposed from is theirs too, whatever this install later
-        opened on it. A credential that cannot name itself leaves the prefix and the
+        opened on it. All of them, so a history the forge answers in more than
+        one page is refused rather than judged on the first. A credential that cannot name itself leaves the prefix and the
         same-repository rule as the bar, the same weaker bar `advance` settles for and for the reason
         `_viewer` gives; one whose lookup failed is refused, since that
         silence is an outage rather than an answer.
@@ -873,7 +884,9 @@ class VcsBroker:
                     status=409,
                     code="NOT_SPENT",
                 )
-            self._refuse_a_carrier_not_ours(bound, branch, carriers, proposals)
+            self._refuse_a_carrier_not_ours(
+                bound, branch, carriers, proposals, complete=not answer.get("truncated")
+            )
             # Conditional on the tip just compared, so a publish that lands
             # between the read and this push is refused by the remote rather
             # than silently undone.
@@ -903,6 +916,17 @@ class VcsBroker:
                         "and whatever moved it is kept.",
                         status=409,
                         code="BRANCH_MOVED",
+                    )
+                refused = _REMOTE_REFUSED.search(pushed.stderr or "")
+                if refused:
+                    raise WorkspaceError(
+                        f"the remote refused to delete {branch} "
+                        f"({refused.group(0).strip()[:200]}): a branch rule or "
+                        "hook covers it, or this install's credential may not "
+                        "delete branches there. Asking again gets the same "
+                        "answer, so the branch stays and its name is not usable.",
+                        status=409,
+                        code="DELETE_REFUSED",
                     )
                 raise subprocess.CalledProcessError(
                     pushed.returncode, ["git", *argv], pushed.stdout, pushed.stderr
@@ -951,6 +975,7 @@ class VcsBroker:
         branch: str,
         carriers: list[dict[str, Any]],
         history: list[dict[str, Any]],
+        complete: bool = True,
     ) -> None:
         """Refuse to delete a branch whose spent proposal this install did not open.
 
@@ -958,7 +983,8 @@ class VcsBroker:
         them has to be from this repository and, when the credential can name
         itself, by this install. `history` is every proposal listed from it,
         and when the credential can name itself none of those may be anybody
-        else's. See `branch_delete` for why each.
+        else's -- which one page cannot show when there are more, so an
+        incomplete `history` is refused too. See `branch_delete` for why each.
         """
         here = bound.repo.casefold()
         ours = [
@@ -992,6 +1018,14 @@ class VcsBroker:
                 f"the proposal that carried {branch}'s tip is {named}'s, not this "
                 f"install's ({viewer}), so the branch is not this install's to "
                 "delete.",
+                status=409,
+                code="BRANCH_NOT_OURS",
+            )
+        if not complete:
+            raise WorkspaceError(
+                f"{branch} carried more than {len(history)} proposals, more than "
+                "one page, so whether every one of them was this install's "
+                "cannot be established and the branch is not deleted.",
                 status=409,
                 code="BRANCH_NOT_OURS",
             )
