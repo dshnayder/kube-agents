@@ -603,6 +603,15 @@ func TestPrimaryNamespace(t *testing.T) {
 				repo("b", "acme/lib", RepositoryRoleManaged),
 			}},
 			want: ""},
+		// The CRD's CEL rule refuses an undeclared forge name at admission, so
+		// only a spec built in Go reaches this; ScopeRefused still owes it.
+		{name: "a gitops repository under a mistyped forge does not move it to another forge's", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "ours"}, ghForge("upstream", "kubernetes")},
+			Repositories: []RepositorySpec{
+				repo("ourz", "infra", RepositoryRoleGitOps),
+				repo("upstream", "kubernetes/x", RepositoryRoleManaged),
+			}},
+			want: ""},
 		{name: "a refused gitops repository cannot move a namespace every forge declares", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{ghForge("github", "gke-labs")},
 			Repositories: []RepositorySpec{

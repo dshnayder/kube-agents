@@ -367,8 +367,11 @@ func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
 		return false
 	}
 	_, rejected := ri.check()
+	// A repository naming no declared forge has no provider to exclude it by,
+	// so it counts against every provider: it may be this one's GitOps
+	// repository under a mistyped forge name.
 	return slices.ContainsFunc(ri.Repositories, func(r *ResolvedRepository) bool {
-		return rejected[r] && r.Role != RepositoryRoleContext && r.Forge != nil && r.Forge.Provider == provider
+		return rejected[r] && r.Role != RepositoryRoleContext && (r.Forge == nil || r.Forge.Provider == provider)
 	})
 }
 

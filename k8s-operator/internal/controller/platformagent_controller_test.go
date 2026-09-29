@@ -6365,3 +6365,67 @@ func TestReconcileGitopsStatePutsANewGitOpsRepositoryFirst(t *testing.T) {
 		t.Errorf("second reconcile changed managed_repos to %s", got.Data["managed_repos"])
 	}
 }
+
+// TestARefusedGitHubScopeKeepsTheLiveGitHubOrg covers an upgrade from a release
+// that accepted a spelling this one refuses. The minter keeps its policies
+// while the declaration is refused; the gateway keeps its GITHUB_ORG the same
+// way, so the pod neither rolls nor loses the agent's cross-organisation guard.
+func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
+	scheme := setupScheme()
+	agentWith := func(gitRepo string) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{
+						GitHub: &agentv1alpha1.GitHubSpec{GitRepo: gitRepo},
+					},
+				},
+			},
+		}
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	for _, refused := range []string{
+		"https://github.com:gke-labs/infra",
+		"ssh://git@github.com:gke-labs/infra",
+	} {
+		agent := agentWith(refused)
+		held := r.heldGitHubOrg(ctx, agent)
+		if held != "gke-labs" {
+			t.Errorf("%s: heldGitHubOrg() = %q, expected the live gke-labs", refused, held)
+		}
+		dep := buildDeployment(agent, "", "", "", "", nil, renderOptions{heldGitHubOrg: held})
+		if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+			t.Errorf("%s: rendered GITHUB_ORG = %q, expected the held gke-labs", refused, got)
+		}
+	}
+
+	// A declaration that names the organisation renders its own, whatever
+	// the live pod carries.
+	accepted := agentWith("https://github.com/other-org/infra")
+	if held := r.heldGitHubOrg(ctx, accepted); held != "" {
+		t.Errorf("heldGitHubOrg() = %q for an accepted declaration, expected nothing held", held)
+	}
+	dep := buildDeployment(accepted, "", "", "", "", nil, renderOptions{})
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "other-org" {
+		t.Errorf("rendered GITHUB_ORG = %q, expected other-org", got)
+	}
+
+	// Nothing live holds nothing.
+	empty := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+	if held := empty.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); held != "" {
+		t.Errorf("heldGitHubOrg() = %q with no live gateway, expected nothing", held)
+	}
+}

@@ -266,7 +266,8 @@ spec:
   `owner/name`, in the grammar the operator applies. Scheme and host fold
   case, as the operator's do. Anything else -- another host, a deeper path,
   an owner GitHub would not accept, a name that is `.`, `..` or `.git` once
-  its `.git` suffix is dropped, or starts with `-` -- would be refused by the
+  its `.git` suffix is dropped, or starts with `-`, a value over the CRD's
+  2048 characters -- would be refused by the
   operator against `github.gitRepo`, a key the values file never set, and a forge with neither a namespace nor a repository
   would fold into no key at all. Those render as the lists, so the refusal
   names the entry the administrator wrote. A credentialsRef with an empty name
@@ -287,7 +288,7 @@ spec:
   {{- $repo = (first .).repository | default "" }}
   {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
   {{- $github := `(?i:(https?|ssh|git)://([^/@:]+@)?((www|ssh)\.)?github\.com/|([^/@:]+@)?((www|ssh)\.)?github\.com[:/])` }}
-  {{- $plain = and (regexMatch (printf `^(%s%s|(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/?$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) }}
+  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/?$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) }}
   {{- end }}
   {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
   {{- end }}

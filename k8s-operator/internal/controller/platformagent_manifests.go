@@ -2172,6 +2172,9 @@ type renderOptions struct {
 	// otlpEndpoint because empty already means the managed collector, and the two
 	// outcomes need opposite manifests.
 	otlpDisabled bool
+	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
+	// the declaration cannot name the organisation (see heldGitHubOrg).
+	heldGitHubOrg string
 }
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
@@ -2653,14 +2656,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
 		// and doing it here would rename a variable the pod's scripts still spell
 		// the old way. Until then it names the primary GitHub forge's namespace,
-		// and is unset when no GitHub forge is declared.
+		// and is unset when no GitHub forge is declared. While the declaration
+		// cannot name it, the pod keeps the one it has, as the minter does.
+		org := ""
 		if resolved, err := integration.ResolveGit(); err == nil {
-			if org := resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub); org != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GITHUB_ORG",
-					Value: org,
-				})
-			}
+			org = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+		}
+		if org == "" {
+			org = opts.heldGitHubOrg
+		}
+		if org != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GITHUB_ORG",
+				Value: org,
+			})
 		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			allowAll := false

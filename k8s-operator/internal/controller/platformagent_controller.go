@@ -1661,6 +1661,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
 	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	opts.heldGitHubOrg = r.heldGitHubOrg(ctx, agent)
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -1694,6 +1695,44 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return err
 	}
 	return r.applyManaged(ctx, agent, dep)
+}
+
+// heldGitHubOrg returns the GITHUB_ORG the live gateway carries, read only
+// while the declaration cannot name the organisation: it does not resolve, or
+// validation refuses something the organisation is read from. The minter sync
+// leaves its policies as they were in that state, and the pod does the same.
+// Rendering the variable unset would roll the gateway and switch off the
+// agent's cross-organisation guard for as long as the refusal lasts, on an
+// upgrade from a release that accepted the spelling now refused.
+//
+// Nothing live to read, or a read that fails, holds nothing: the variable is
+// then rendered unset, as it would have been.
+func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Integration == nil || r.Client == nil {
+		return ""
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err == nil && !resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+		return ""
+	}
+	var live client.Object = &appsv1.Deployment{}
+	if useStatefulSet(agent) {
+		live = &appsv1.StatefulSet{}
+	}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, live); err != nil {
+		return ""
+	}
+	for _, container := range podTemplateOf(live).Spec.Containers {
+		if container.Name != appNamePlatformAgent {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name == "GITHUB_ORG" && env.ValueFrom == nil {
+				return env.Value
+			}
+		}
+	}
+	return ""
 }
 
 // deleteLegacyCredentialIsolationResources removes the workload objects left

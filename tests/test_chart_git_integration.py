@@ -275,8 +275,9 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "https://github.com/gke-labs/.git",
             "git@github.com:gke-labs/.git",
             ".git",
+            "a" * 2049,
         ):
-            with self.subTest(repo=repo):
+            with self.subTest(repo=repo[:80]):
                 integration = _integration(
                     *_forge(0, name="github", namespace="gke-labs"),
                     *_repo(0, forge="github", repository=repo, role="gitops"),
