@@ -299,7 +299,8 @@ def _fit_columns(
     wide is hard-wrapped by the terminal into something less readable than the
     JSON it renders. So the least load-bearing columns come out first, and the
     caller is told which -- a table that silently drops a column is a table
-    that lies about what its source holds.
+    that lies about what its source holds. When no amount of dropping would
+    fit, nothing is dropped.
     """
     kept = list(columns)
     trimmed = [list(row) for row in rows]
@@ -314,6 +315,10 @@ def _fit_columns(
         for row in trimmed:
             if victim < len(row):
                 row.pop(victim)
+    if dropped and _minimum_width(kept, trimmed) > total:
+        # Dropping every candidate still leaves it too wide: the terminal
+        # wraps it either way, so keep what the columns said and claim no fit.
+        return list(columns), [list(row) for row in rows], []
     return kept, trimmed, dropped
 
 def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[Any]]], total: int) -> List[int]:

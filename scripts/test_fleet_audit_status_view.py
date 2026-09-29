@@ -212,7 +212,7 @@ class TestNextFire(unittest.TestCase):
 
     def test_an_out_of_range_field_abstains_rather_than_raising(self):
         # These parse as ints and then blow up in `.replace()`. Uncaught, one
-        # mistyped roster entry took down all eight rows on its way through
+        # mistyped roster entry took down every row on its way through
         # `render` — a worse outcome than the schedule column it belongs to.
         for expr in ("99 3 * * *", "20 25 * * *", "-1 6 * * *"):
             with self.subTest(expr=expr):
@@ -729,7 +729,7 @@ class TestDashboard(unittest.TestCase):
         self.assertIn("2 critical", out)
 
     def test_the_header_reports_the_widest_scope_not_the_sum(self):
-        """Seven of the eight streams audit the same fleet, so adding their
+        """Most streams audit the same fleet, so adding their
         scopes together would report one 16-cluster fleet as a hundred and
         fifty clusters audited."""
         streams = {
@@ -842,6 +842,14 @@ class TestContextDiscovery(unittest.TestCase):
         rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("no context in the kubeconfig has one", err)
+
+    def test_a_capped_probe_does_not_claim_no_context_has_one(self):
+        many = tuple("ctx-%02d" % i for i in range(view.CONTEXT_PROBE_LIMIT + 2))
+        fake = FakeKubectl(pods=(), contexts=many, current="managed")
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("no context in the kubeconfig has one", err)
+        self.assertIn("none of the first 12 of 14 other contexts", err)
 
     def test_an_explicit_context_reaches_both_kubectl_calls(self):
         fake = FakeKubectl()
@@ -1165,10 +1173,10 @@ class TestOfflineRoundTrip(unittest.TestCase):
 
 
 class TestRosterLoading(unittest.TestCase):
-    def test_the_checked_in_roster_yields_the_eight_streams(self):
+    def test_the_checked_in_roster_yields_every_fleet_audit_stream(self):
         roster, error = view.load_roster(view.DEFAULT_ROSTER)
         self.assertEqual(error, "")
-        self.assertGreaterEqual(len(roster), 8)
+        self.assertGreaterEqual(len(roster), 9)
         self.assertIn("compliance-audit", roster)
         for job in roster.values():
             self.assertIn("expr", job)
@@ -1321,6 +1329,19 @@ class TestFormatting(unittest.TestCase):
         kept, _, dropped = terminal_table._fit_columns(columns, rows, natural_total)
         self.assertEqual(dropped, [])
         self.assertEqual([c.title for c in kept], ["S", "AGE"])
+
+    def test_nothing_is_dropped_when_dropping_everything_would_not_fit(self):
+        # The load-bearing column alone is wider than the terminal: dropping
+        # AGE loses it and the table still wraps, so it stays and no note says
+        # the table was fitted.
+        columns = [
+            terminal_table.Column("STREAM"),
+            terminal_table.Column("AGE", expendable=1),
+        ]
+        rows = [[("x" * 60,), ("3h",)]]
+        kept, _, dropped = terminal_table._fit_columns(columns, rows, 40)
+        self.assertEqual(dropped, [])
+        self.assertEqual([c.title for c in kept], ["STREAM", "AGE"])
 
     def test_a_cell_that_fits_is_not_split_for_its_zero_width_characters(self):
         text = "compliance\u200daudit"

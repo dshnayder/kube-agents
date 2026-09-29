@@ -755,8 +755,10 @@ class HarnessTestCase(BaseTestCase):
         report store's `latest.json` for the issue `gh issue list` names. A
         failing read is an absent store. With neither, the store is left as the
         runs before it wrote it, so a test that runs `finish` twice sees the
-        first run's memory — unless there is no store at all, where the
-        recorder's default reply, an empty body, is what the test described.
+        first run's memory — unless there is no store directory at all, where
+        the recorder's default reply, an empty body, is what the test described.
+        A directory without `latest.json` is left alone, as production reads it:
+        a lost memory, never an empty one.
         """
         self._audit_in_flight = argv[argv.index("--audit") + 1] if "--audit" in argv else None
         audit = self._audit_in_flight or AUDIT
@@ -766,7 +768,7 @@ class HarnessTestCase(BaseTestCase):
         elif listed and "--json body" in self.harness.replies:
             body = json.loads(self.harness.replies["--json body"]).get("body") or ""
             self.seed_report(body, issue=int(listed[0]["number"]))
-        elif listed and not (self.store_dir(audit) / "latest.json").exists():
+        elif listed and not self.store_dir(audit).exists():
             self.seed_report("", issue=int(listed[0]["number"]))
         return super().run_main(argv)
 
@@ -15841,6 +15843,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["status"], "UPDATED")
         self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
+
     def test_the_carried_rendering_names_the_last_recorded_command_or_nothing(self):
         recorded = self.held_entry(1)
         unrecorded = self.held_entry(2, commands=[audit_report.COLLECTOR_COMMAND_UNRECORDED])
@@ -17301,6 +17306,25 @@ class TestReportStore(HarnessTestCase):
                 self.run_finish(make_doc())
         self.assertFalse((self.store_dir() / "latest.json").exists())
         self.assertTrue(list((self.store_dir() / "runs").glob("*.json")))
+
+    def test_the_run_after_a_killed_one_reads_a_lost_memory(self):
+        """The directory survives the kill, so the next run finds a store with
+        no `latest.json`: a lost memory, never an empty one to delta against."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotEqual(payload["status"], "CLOSED")
+        self.assertTrue(
+            {audit_report.LOST_MEMORY_GAP, audit_report.LOST_MEMORY_UNGUARDED_GAP}
+            & set(payload["coverage_gaps"]),
+            payload["coverage_gaps"],
+        )
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
 
     def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)

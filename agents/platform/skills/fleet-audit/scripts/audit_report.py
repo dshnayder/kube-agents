@@ -458,8 +458,10 @@ MAX_FINDING_ID = 100
 # the id into `/remediate`.
 ID_DIGEST_CHARS = 6
 
-# The hidden block that makes the run-over-run delta computable without keeping
-# any state outside the report itself.
+# The hidden block of finding ids a ledger body, and each remediation pull
+# request's body, carries. The run-over-run delta joins against the report
+# store's memory, not the live issue; the block is what seeds that memory for a
+# ledger the store has never held, and what ties a pull request to its findings.
 #
 # Every character class here is single-line (`[ \t]`, `[^\n]`) and the flags are
 # `re.M` alone. An earlier version combined `re.M` with `re.S`, which let the

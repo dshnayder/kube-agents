@@ -13,7 +13,7 @@ one built before the store existed.
 The projection is also the offline format: `--json` emits exactly what `--file`
 consumes, so the view is reproducible without a cluster.
 
-The ENABLED and SCHEDULE columns come from the checked-in cron roster
+The ON and SCHEDULE columns come from the checked-in cron roster
 (`agents/platform/cron/jobs.json`), not the runtime copy on the pod, and the
 header says which file it read; a stream disabled at runtime therefore shows
 its seed state. A roster that cannot be read is named in that field and in the
@@ -111,8 +111,9 @@ DEFAULT_CONTAINER = STORE_CONTAINERS[0]
 STALE_SLACK = timedelta(hours=1)
 
 #: How many kubeconfig contexts the "no agent pod" path will probe looking for
-#: the install, and how long it gives each. A laptop that has collected forty
-#: contexts should not turn one wrong `--context` into a forty-second wait.
+#: the install, and how long it gives each. The probes run in parallel, one
+#: kubectl process each, so the cap bounds how many a laptop that has collected
+#: forty contexts spawns at once; the hint says when it left some unasked.
 CONTEXT_PROBE_LIMIT = 12
 CONTEXT_PROBE_TIMEOUT = 6
 
@@ -403,10 +404,17 @@ def context_hint(exc: ProjectionError, context: str | None) -> list[str]:
         )
         lines += [f"    --context {name}" for name in found]
     elif kubeconfig_contexts():
-        lines.append(
-            f"  no context in the kubeconfig has one in {namespace}; "
-            "--namespace, or the install is down"
-        )
+        others = len([c for c in kubeconfig_contexts() if c != here])
+        if others > CONTEXT_PROBE_LIMIT:
+            lines.append(
+                f"  none of the first {CONTEXT_PROBE_LIMIT} of {others} other contexts "
+                f"has one in {namespace}; --context, --namespace, or the install is down"
+            )
+        else:
+            lines.append(
+                f"  no context in the kubeconfig has one in {namespace}; "
+                "--namespace, or the install is down"
+            )
     return lines
 
 
@@ -1169,7 +1177,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--roster",
         default=str(DEFAULT_ROSTER),
-        help="cron roster for ENABLED/SCHEDULE (default: the checked-in seed)",
+        help="cron roster for ON/SCHEDULE (default: the checked-in seed)",
     )
     parser.add_argument(
         "--stream", "-s", action="append", default=[], metavar="NAME",
