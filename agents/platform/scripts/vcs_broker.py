@@ -118,12 +118,18 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 # page is the largest a forge serves in one call, and it is still one call.
 PROPOSAL_HISTORY_ON_A_BRANCH = MAX_PAGE_SIZE
 
-# What git prints when the remote answered the delete and said no: a hook or
-# branch rule (`[remote rejected] <ref> (<reason>)`), or a credential without
-# the right to push (HTTP 403). Every run gets the same answer, so it is
+# What git prints when the remote answered the delete and said no for good: a
+# hook, branch rule or ruleset (`[remote rejected] <ref> (... declined)`), a
+# remote that forbids deletes (`... prohibited`), or a credential without the
+# right to push (`denied`, HTTP 403). Every run gets the same answer, so it is
 # refused as DELETE_REFUSED rather than left to GIT_FAILED, which callers
-# retry.
-_REMOTE_REFUSED = re.compile(r"\[remote rejected\][^\n]*|returned error: 403|Permission to \S+ denied")
+# retry. Only those reasons: receive-pack also answers a lock race or a
+# backend fault as `[remote rejected] <ref> (failed to lock)` and the like,
+# and a second attempt clears those.
+_REMOTE_REFUSED = re.compile(
+    r"\[remote rejected\] [^\n]*\([^)\n]*(declined|prohibited|denied)[^)\n]*\)"
+    r"|returned error: 403|Permission to \S+ denied"
+)
 
 
 def _positive_int(name: str, default: int) -> int:

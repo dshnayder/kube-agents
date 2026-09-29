@@ -1542,6 +1542,53 @@ class BranchVerbTest(unittest.TestCase):
         self.assertIn("remote rejected", str(caught.exception))
         self.assertTrue(self.exists(self.SPENT))
 
+    def test_a_transient_remote_rejection_is_a_git_failure_to_retry(self):
+        # receive-pack answers a lock race or a backend fault with the same
+        # `[remote rejected]` a hook gets. The next attempt clears it, so it
+        # is not a verdict on the name.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+        for reason in ("failed to lock", "failed to update ref", "Internal Server Error"):
+            with self.subTest(reason=reason):
+
+                def rejecting(argv, cwd, check=True, config=()):
+                    if "push" in argv:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "",
+                            f" ! [remote rejected] {self.SPENT} ({reason})\n"
+                            "error: failed to push some refs\n",
+                        )
+                    return runner(argv, cwd, check, config)
+
+                self.broker._git_runner = rejecting
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.delete(self.SPENT, tip)
+                self.assertTrue(self.exists(self.SPENT))
+
+    def test_a_ruleset_or_denied_delete_is_still_refused(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+        for reason in (
+            "protected branch hook declined",
+            "push declined due to repository rule violations",
+            "deletion prohibited",
+        ):
+            with self.subTest(reason=reason):
+
+                def rejecting(argv, cwd, check=True, config=()):
+                    if "push" in argv:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "", f" ! [remote rejected] {self.SPENT} ({reason})\n"
+                        )
+                    return runner(argv, cwd, check, config)
+
+                self.broker._git_runner = rejecting
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.delete(self.SPENT, tip)
+                self.assertEqual(caught.exception.fields.get("code"), "DELETE_REFUSED")
+
     def test_delete_whose_push_failed_after_it_landed_answers_gone(self):
         # Not BRANCH_MOVED: nothing moved it, and "whatever moved it is kept"
         # would be false about a branch that is not there.
