@@ -78,7 +78,8 @@ GIT_SUFFIX = ".git"
 
 #: Segments that are a filesystem instruction rather than a name. The character
 #: class permits "." and "-", so it matches ".." as happily as a real name.
-TRAVERSAL_SEGMENTS = frozenset({".", ".."})
+#: `.git` addresses a clone's own git directory, and is no repository name.
+TRAVERSAL_SEGMENTS = frozenset({".", "..", ".git"})
 
 #: A leading dash makes `gh -R <slug>` parse the slug as a flag.
 FLAG_PREFIX = "-"
@@ -166,10 +167,15 @@ def _safe_segment(segment: str) -> bool:
 
 
 def _trim(path: str) -> str:
-    """Drop surrounding slashes and one trailing `.git`, in either order."""
+    """Drop surrounding slashes and one trailing `.git`, in either order.
+
+    The suffix is dropped only from a name: a `.git` that is a whole segment
+    stays for `_safe_segment` to refuse, as the Go counterpart does.
+    """
     path = path.strip(PATH_SEPARATOR)
-    if path.endswith(GIT_SUFFIX):
-        path = path[: -len(GIT_SUFFIX)]
+    name = path[: -len(GIT_SUFFIX)] if path.endswith(GIT_SUFFIX) else path
+    if name != path and name and not name.endswith(PATH_SEPARATOR):
+        path = name
     return path.strip(PATH_SEPARATOR)
 
 

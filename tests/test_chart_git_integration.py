@@ -267,6 +267,11 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs/.",
             "gke-labs/.git",
             "gke-labs/..git",
+            "gke-labs/.git.git",
+            "https://github.com:443/gke-labs/infra",
+            "ssh://git@github.com:gke-labs/infra",
+            "file://github.com/gke-labs/infra",
+            "https://github.com/gke-labs/infra/tree",
             "https://github.com/gke-labs/.git",
             "git@github.com:gke-labs/.git",
             ".git",
@@ -284,8 +289,9 @@ class ChartGitIntegrationTest(unittest.TestCase):
 
     def test_a_name_github_accepts_still_folds(self):
         """The tightened fold must not unfold what the operator accepts: a
-        leading dot, a github.com URL or remote, and an empty credentialsRef
-        name included."""
+        leading dot, every GitHub host, scheme and remote spelling, a
+        trailing slash, upper-case scheme and host, and an empty
+        credentialsRef name included."""
         for repo in (
             "gke-labs/.github",
             "gke-labs/my_repo.v2",
@@ -293,6 +299,17 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "https://github.com/gke-labs/infra",
             "https://www.github.com/gke-labs/infra.git",
             "git@github.com:gke-labs/infra",
+            "ssh://git@github.com/gke-labs/infra",
+            "ssh://git@ssh.github.com/gke-labs/infra.git",
+            "git://github.com/gke-labs/infra",
+            "https://ssh.github.com/gke-labs/infra",
+            "github.com/gke-labs/infra",
+            "www.github.com/gke-labs/infra",
+            "git@github.com/gke-labs/infra",
+            "git@ssh.github.com:gke-labs/infra",
+            "https://github.com/gke-labs/infra/",
+            "infra/",
+            "HTTPS://GitHub.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

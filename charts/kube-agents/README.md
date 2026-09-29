@@ -471,8 +471,7 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a
   namespace or the repository, and the repository is one the operator would
-  accept for GitHub (`name`, `owner/name`, or a github.com URL or remote
-  naming `owner/name`). Anything else renders as the lists, and on a live
+  accept for GitHub (`name`, `owner/name`, or an `http(s)://`, `ssh://` or `git://` URL, a schemeless host or an scp remote on `github.com`, `www.github.com` or `ssh.github.com`, with no port, naming `owner/name`). Anything else renders as the lists, and on a live
   install the render fails unless the installed CRD has them — apply
   `charts/kube-agents/crds/` first. Enabling `githubMinter` when forges are
   declared and none is GitHub fails the render, since minty issues GitHub App

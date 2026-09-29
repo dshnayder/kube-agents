@@ -86,6 +86,12 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(repo_ref.RepoRefError):
             repo_ref.parse("../..")
 
+    def test_a_git_segment_is_refused_not_trimmed_away(self):
+        for value in ("acme/.git", ".git", "acme/toolkit/.git", "acme/.git.git"):
+            with self.subTest(value=value), self.assertRaises(repo_ref.RepoRefError):
+                repo_ref.parse(value)
+        self.assertEqual(repo_ref.parse("acme/toolkit.git").path, "acme/toolkit")
+
     def test_leading_dash_would_be_parsed_as_a_flag(self):
         with self.assertRaises(repo_ref.RepoRefError):
             repo_ref.parse("-oops/repo")

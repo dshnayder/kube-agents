@@ -1541,24 +1541,27 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	primaryOrg := ""
 	if agent.Spec.Integration != nil {
-		// A declaration this cannot resolve leaves primaryOrg empty, which is the
-		// same outcome the per-field reads had for an unparseable GitRepo.
-		// Admission and the reconcile-status check both report it; the minter
-		// policy sync is not the place to surface it a third time.
-		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
-			// An empty primaryOrg accepts every organisation, and a primary
-			// organisation chosen from what validation left standing can be
-			// another forge's or another repository's. Where validation refused
-			// something the organisation is read from, syncing would widen or
-			// move the policies rather than leave them as they were. Skip the
-			// sync until the declaration is fixed; the reconcile status already
-			// reports it.
-			if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
-				logger.Info("skipping minter policy sync: validation refuses something the github organisation is read from")
-				return nil
-			}
-			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+		resolved, err := agent.Spec.Integration.ResolveGit()
+		if err != nil {
+			// Both spellings set. Nothing can say which forge the organisation
+			// is read from, and an empty primaryOrg would accept every
+			// organisation, so leave the policies as they were. The reconcile
+			// status already reports the declaration.
+			logger.Info("skipping minter policy sync: git integration does not resolve", "error", err.Error())
+			return nil
 		}
+		// An empty primaryOrg accepts every organisation, and a primary
+		// organisation chosen from what validation left standing can be
+		// another forge's or another repository's. Where validation refused
+		// something the organisation is read from, syncing would widen or
+		// move the policies rather than leave them as they were. Skip the
+		// sync until the declaration is fixed; the reconcile status already
+		// reports it.
+		if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+			logger.Info("skipping minter policy sync: validation refuses something the github organisation is read from")
+			return nil
+		}
+		primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
 	}
 
 	// Both lists are parsed before anything is computed from either: an

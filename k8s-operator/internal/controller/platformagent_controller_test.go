@@ -5125,8 +5125,14 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	// 7. A refusal must not move the organisation to what validation left
 	// standing either: another forge's namespace, or a managed repository's
 	// organisation. Either would scope the sync to other-org and prune the
-	// policy of test-org's repository, which was working.
+	// policy of test-org's repository, which was working. Nor may a
+	// declaration that does not resolve at all widen it: an empty organisation
+	// would render a policy for other-org's repository.
 	for name, integration := range map[string]agentv1alpha1.IntegrationSpec{
+		"both spellings at once": {
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org", GitRepo: "repo-1"},
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org"}},
+		},
 		"a typo in the gitops forge's namespace": {
 			Forges: []agentv1alpha1.ForgeSpec{
 				{Name: "ours", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org_"},

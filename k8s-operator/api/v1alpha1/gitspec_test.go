@@ -137,6 +137,24 @@ func TestGitHubResolveDoesNotQualifyAHostedSingleSegment(t *testing.T) {
 	}
 }
 
+// A `.git` that is a whole segment is no suffix. Trimming it would leave the
+// owner as a bare name for the namespace to requalify: `gke-labs/.git` would
+// resolve to gke-labs/gke-labs.
+func TestGitHubResolveRefusesAGitSegment(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, repo := range []string{"gke-labs/.git", ".git", "gke-labs/.git.git", "gke-labs/infra/.git", "/gke-labs/.git/"} {
+		t.Run(repo, func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
+				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref)
+			}
+		})
+	}
+	ref, err := provider.Resolve("", "gke-labs/infra.git/", "gke-labs")
+	if err != nil || ref.Path != "gke-labs/infra" {
+		t.Errorf("Resolve(gke-labs/infra.git/) = %q, %v, expected gke-labs/infra", ref, err)
+	}
+}
+
 func TestGitHubResolveQualifiesAndCanonicalises(t *testing.T) {
 	provider, _ := LookupGitProvider(GitProviderGitHub)
 	cases := []struct {

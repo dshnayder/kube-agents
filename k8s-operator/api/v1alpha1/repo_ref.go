@@ -88,9 +88,11 @@ var allowedRepoSchemes = map[string]bool{
 
 // traversalSegments are filesystem instructions rather than names. The segment
 // class permits "." and "-", so it matches ".." as happily as a real name.
+// `.git` addresses a clone's own git directory, and is no repository name.
 var traversalSegments = map[string]bool{
-	".":  true,
-	"..": true,
+	".":    true,
+	"..":   true,
+	".git": true,
 }
 
 // RepoRef is a parsed repository: a host, which is empty when the value stated
@@ -257,9 +259,16 @@ func splitSCPRemote(text string) (string, string, bool) {
 
 // trimRepoPath drops surrounding separators and one trailing `.git`, in either
 // order, so `/owner/repo.git/` and `owner/repo` come out the same.
+//
+// The suffix is dropped only from a name. A `.git` that is a whole segment
+// stays for safeRepoSegment to refuse: dropping it would turn `owner/.git`
+// into the one-segment `owner`, which a namespace then requalifies into
+// `namespace/owner`, a repository nobody wrote.
 func trimRepoPath(path string) string {
 	path = strings.Trim(path, pathSeparator)
-	path = strings.TrimSuffix(path, gitSuffix)
+	if name := strings.TrimSuffix(path, gitSuffix); name != path && name != "" && !strings.HasSuffix(name, pathSeparator) {
+		path = name
+	}
 	return strings.Trim(path, pathSeparator)
 }
 
