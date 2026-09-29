@@ -775,9 +775,9 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertEqual(armed["impact"], "arm sentence")
         # Which arm fired is the collector's observation, not the model's
         # inference from the excerpt -- so `finish` restores it. Without this
-        # flag a corrected sentence never reaches a finding already in the
-        # ledger, because `carry_unchanged_findings` reuses the stale prose
-        # whenever `adopt_collector_evidence` has made the evidence identical.
+        # flag a corrected sentence would never reach a finding already in the
+        # ledger once `finish` gains its planned pass reusing the previous
+        # run's prose wherever `adopt_collector_evidence` made evidence identical.
         self.assertIs(armed["impact_authoritative"], True)
         default = fs._emit("single-zone-nodepool", {"object": "NodePool/p1", "excerpt": "x"})
         self.assertEqual(default["impact"], fs.IMPACT["single-zone-nodepool"])

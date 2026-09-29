@@ -117,6 +117,8 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 ERROR_EXCERPT_CHARS = 300
+# The shorter excerpt a stderr gets where it sits inside a longer sentence.
+DETAIL_EXCERPT_CHARS = 200
 # gcloud's words for a project whose Kubernetes Engine API is off. Such a
 # project cannot hold a cluster, so its `clusters list` failure is an answer
 # rather than a read that failed; otherwise every non-GKE project a credential
@@ -780,7 +782,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
                 f"project other than {project!r}, such as a quota project, so this project's clusters are "
                 f"unknown: {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
             )
-        raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
+        raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     try:
         clusters = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
@@ -3342,7 +3344,7 @@ def check_idle_workload(
             f"requests {cpu_req:.3f} vCPU / {mem_req:.0f} MiB across {replicas} "
             f"replica{'s' if replicas != 1 else ''}; peak observed "
             f"{peak_cpu * 1000:.1f}m vCPU / {peak_mem:.1f} MiB {measured_over}. "
-            f"Declared {age_days:.0f} days ago. {no_resize}"
+            f"Declared {_whole_days(age_days)} days ago. {no_resize}"
         )
         # The reservation is the smaller half of the bill. A LoadBalancer
         # Service in front of an unused Deployment holds a forwarding rule and
@@ -4306,7 +4308,7 @@ def _metrics_gap_phrase(result: Run, read: str) -> str:
         )
     return (
         f"the Cloud Monitoring {read} read failed (rc={result.rc}) — "
-        f"{result.stderr.strip()[:200] or 'no detail'}"
+        f"{result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no detail'}"
     )
 
 
@@ -4417,7 +4419,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
                 f"idle-nodepool and scaledown-blocked could not be measured on "
                 f"this cluster: `gcloud container node-pools list` failed "
                 f"(rc={pools_result.rc}) — "
-                f"{pools_result.stderr.strip()[:200] or 'no stderr'}"
+                f"{pools_result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'}"
             )
         elif len(node_pools) == 1:
             # The same shape as the Autopilot branch below, reached from the
@@ -4517,10 +4519,10 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             emitted = emit("idle-workload", hit)
             # Without this the retracted impact never reaches a reader.
             # `adopt_arm_impact` adopts the collector's sentence only for
-            # candidates that mark it authoritative, and `carry_unchanged_findings`
-            # reuses last run's prose whenever evidence is byte-identical -- which
-            # for a workload that has been idle for a month is every run. The
-            # findings that stood down three Deployments would have gone on
+            # candidates that mark it authoritative, and the pass `finish` plans
+            # for reusing last run's prose on byte-identical evidence would reuse
+            # it -- which for a workload idle for a month is every run. The
+            # findings that stood down three Deployments would go on
             # publishing "a workload nobody is calling" forever with the constant
             # above corrected.
             emitted["impact_authoritative"] = True
@@ -5124,7 +5126,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         (bs_argv, bs_parsed, bs_result),
     )
     failed = [
-        f"{shlex.join(argv)} rc={result.rc}: {result.stderr.strip()[:200] or 'no stderr'}"
+        f"{shlex.join(argv)} rc={result.rc}: {result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'}"
         for argv, parsed, result in compute_reads
         if parsed is None
     ]
@@ -5266,7 +5268,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # non-zero exit. A gap that said "exited 0" over an empty or unparseable
         # answer would send a reader to look for an error gcloud never reported.
         why = (
-            f"exited {reg_result.rc} ({reg_result.stderr.strip()[:200] or 'no stderr'})"
+            f"exited {reg_result.rc} ({reg_result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'})"
             if reg_result.rc != 0
             else "exited 0 and returned no parseable JSON"
         )
@@ -5595,7 +5597,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # rather than a manifest nothing can be built from. A target the
         # collector read and gate-failed is not in that set: §2's manual
         # retry can still bring it into scope.
-        first = next((e for e in entries if e.get("error")), None)
+        # The `--project` note is an error only in form: it says what this run
+        # did not look at, never why the project it did look at yielded nothing.
+        first = next(
+            (e for e in entries if e.get("error") and e.get("name") != UNENUMERATED_PROJECTS_TARGET), None
+        )
         return {
             "version": MANIFEST_VERSION,
             "checks_revision": CHECKS_REVISION,

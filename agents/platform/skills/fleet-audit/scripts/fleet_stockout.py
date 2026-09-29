@@ -215,8 +215,9 @@ NOTHING_COLLECTED_ERROR = (
 )
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
-# `collect.py` carry; each collector runs standalone, so it is copied, not
-# imported.
+# `collect.py` carry, copied rather than imported: this collector imports only
+# the leaf parsers it shares with them, so a change to either sibling's
+# exclusions cannot move this stream's.
 SYSTEM_NAMESPACES = frozenset(
     {
         "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
@@ -233,6 +234,68 @@ OPT_OUT_VALUE = "exempt"
 NON_PRODUCTION_TOKENS = frozenset({"test", "staging", "stage", "dev", "sandbox", "qa"})
 ENVIRONMENT_LABEL_KEYS = ("environment", "env", "stage", "tier")
 NAME_TOKEN_RE = re.compile(r"[-_]")
+# §3.7 is about node capacity -- "GPU/TPU/CPU limits" in its own words -- and a
+# region describe returns every Compute quota there is, 164 of them on
+# `us-east4`. Without this filter a project at 92% of `BACKEND_BUCKETS` or
+# `AFFINITY_GROUPS` publishes a `critical` stockout finding, and 95 of the 164
+# metrics have nothing to do with whether the autoscaler can get a node.
+_CAPACITY_QUOTA_RE = re.compile(r"(?:^|_)(?:CPUS|GPUS)(?:_ALL_REGIONS)?$|TPU")
+# A `COMMITTED_*` metric limits how much capacity committed-use discounts can
+# buy. At 100% it caps nothing the autoscaler asks for: nodes are bounded by
+# the ordinary quota beside it.
+_COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
+# How full a pool has to be for the ceiling arm to fire. §3.9 calls the
+# ceiling "a hard stop, not a soft one, so 'close to it' means measurably
+# close, not a judgment call".
+NODEPOOL_CEILING_FRACTION = 0.9
+
+# §3.9's Impact, one per arm. The arms share a slug and nothing else, so no
+# single sentence is true of both: the zone-locked arm is about a stockout in
+# one zone, and the ceiling arm fires on regional pools spanning three of
+# them, where a zonal-stockout sentence is simply false. The blended sentence
+# this replaces claimed both at once ("locked to a single zone or near its
+# scaling ceiling: any zonal stockout or scale event halts cluster
+# auto-scaling") and so was half wrong whichever arm published it.
+_IMPACT_ZONE_LOCKED = (
+    "Node pool is locked to a single zone: a stockout in that zone halts "
+    "scale-up of this pool, and pods that can only run there -- pinned by a "
+    "nodeSelector, or by a PersistentVolume that is a zonal disk in that zone "
+    "-- stay Pending. The autoscaler backs off the failing node group on its "
+    "own and keeps scaling the others, so the stall belongs to this pool "
+    "rather than the cluster, until enough nodes cluster-wide go unready to "
+    "trip the autoscaler's 45% health check and stop every operation."
+)
+# The ceiling arm's Impact is assembled rather than stored, because three of
+# its clauses are contingent and the previous single sentence asserted all
+# three unconditionally. See `_ceiling_impact`.
+_CEILING_AT_LIMIT = "The pool is at its effective node ceiling ({live}/{ceiling}), so the autoscaler adds no further node to it"
+_CEILING_NEAR_LIMIT = "The pool is at {percent:.0f}% of its effective node ceiling ({live}/{ceiling}), so at most {headroom} more {noun} can be added before scale-up stops there"
+# Cluster autoscaler skips a node group only on `currentTargetSize >=
+# MaxSize`, and target size is what it compares -- not the live Node count
+# this check can see. A pool at 27 live may already be targeting 30.
+_CEILING_TARGET_CAVEAT = (
+    " -- and fewer if the autoscaler's target already sits above the live count, "
+    "which is what it actually compares."
+)
+# Arm 2 does not require `not has_nap`, so on a NAP cluster every at-ceiling
+# pool lands here, single-zone ones included. NAP creates a new pool for
+# pending workloads, so "the next scale-up stops there" is false of the
+# cluster even where it is true of the pool.
+_CEILING_NAP_CLAUSE = (
+    " Node auto-provisioning is on, so the cluster can create a different pool "
+    "instead; what stops is this pool's growth, not the cluster's."
+)
+# "The limit is configuration rather than anything about supply" was the
+# earlier claim and it is only half true. The *value* is configuration --
+# nothing shrinks `maxSize` at runtime -- but reaching it is often a supply
+# artefact: when one zonal MIG is backed off the autoscaler pushes the whole
+# delta into the surviving zones, so "27/30" can be the footprint of a
+# stockout next door. Regional CPU quota can also bind below the field.
+_CEILING_SUPPLY_CLAUSE = (
+    " That ceiling is configuration, not capacity -- but the pool may have "
+    "reached it because scale-up was displaced here from a zone that could not "
+    "supply, or because regional quota binds below the configured limit."
+)
 
 
 def log(msg: str) -> None:
@@ -777,60 +840,6 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
 # --------------------------------------------------------------------------- #
 
 
-# How full a pool has to be for the ceiling arm to fire. §3.9 calls the
-# ceiling "a hard stop, not a soft one, so 'close to it' means measurably
-# close, not a judgment call".
-NODEPOOL_CEILING_FRACTION = 0.9
-
-# §3.9's Impact, one per arm. The arms share a slug and nothing else, so no
-# single sentence is true of both: the zone-locked arm is about a stockout in
-# one zone, and the ceiling arm fires on regional pools spanning three of
-# them, where a zonal-stockout sentence is simply false. The blended sentence
-# this replaces claimed both at once ("locked to a single zone or near its
-# scaling ceiling: any zonal stockout or scale event halts cluster
-# auto-scaling") and so was half wrong whichever arm published it.
-_IMPACT_ZONE_LOCKED = (
-    "Node pool is locked to a single zone: a stockout in that zone halts "
-    "scale-up of this pool, and pods that can only run there -- pinned by a "
-    "nodeSelector, or by a PersistentVolume that is a zonal disk in that zone "
-    "-- stay Pending. The autoscaler backs off the failing node group on its "
-    "own and keeps scaling the others, so the stall belongs to this pool "
-    "rather than the cluster, until enough nodes cluster-wide go unready to "
-    "trip the autoscaler's 45% health check and stop every operation."
-)
-# The ceiling arm's Impact is assembled rather than stored, because three of
-# its clauses are contingent and the previous single sentence asserted all
-# three unconditionally. See `_ceiling_impact`.
-_CEILING_AT_LIMIT = "The pool is at its effective node ceiling ({live}/{ceiling}), so the autoscaler adds no further node to it"
-_CEILING_NEAR_LIMIT = "The pool is at {percent:.0f}% of its effective node ceiling ({live}/{ceiling}), so at most {headroom} more {noun} can be added before scale-up stops there"
-# Cluster autoscaler skips a node group only on `currentTargetSize >=
-# MaxSize`, and target size is what it compares -- not the live Node count
-# this check can see. A pool at 27 live may already be targeting 30.
-_CEILING_TARGET_CAVEAT = (
-    " -- and fewer if the autoscaler's target already sits above the live count, "
-    "which is what it actually compares."
-)
-# Arm 2 does not require `not has_nap`, so on a NAP cluster every at-ceiling
-# pool lands here, single-zone ones included. NAP creates a new pool for
-# pending workloads, so "the next scale-up stops there" is false of the
-# cluster even where it is true of the pool.
-_CEILING_NAP_CLAUSE = (
-    " Node auto-provisioning is on, so the cluster can create a different pool "
-    "instead; what stops is this pool's growth, not the cluster's."
-)
-# "The limit is configuration rather than anything about supply" was the
-# earlier claim and it is only half true. The *value* is configuration --
-# nothing shrinks `maxSize` at runtime -- but reaching it is often a supply
-# artefact: when one zonal MIG is backed off the autoscaler pushes the whole
-# delta into the surviving zones, so "27/30" can be the footprint of a
-# stockout next door. Regional CPU quota can also bind below the field.
-_CEILING_SUPPLY_CLAUSE = (
-    " That ceiling is configuration, not capacity -- but the pool may have "
-    "reached it because scale-up was displaced here from a zone that could not "
-    "supply, or because regional quota binds below the configured limit."
-)
-
-
 def _ceiling_impact(ceiling: int, live: int, has_nap: bool) -> str:
     """§3.9's ceiling Impact, with only the clauses that hold.
 
@@ -985,18 +994,6 @@ def check_reservation_affinity(cc: dict) -> dict | None:
 # --------------------------------------------------------------------------- #
 # 3.7 quota-exhaustion-risk
 # --------------------------------------------------------------------------- #
-
-
-# §3.7 is about node capacity -- "GPU/TPU/CPU limits" in its own words -- and a
-# region describe returns every Compute quota there is, 164 of them on
-# `us-east4`. Without this filter a project at 92% of `BACKEND_BUCKETS` or
-# `AFFINITY_GROUPS` publishes a `critical` stockout finding, and 95 of the 164
-# metrics have nothing to do with whether the autoscaler can get a node.
-_CAPACITY_QUOTA_RE = re.compile(r"(?:^|_)(?:CPUS|GPUS)(?:_ALL_REGIONS)?$|TPU")
-# A `COMMITTED_*` metric limits how much capacity committed-use discounts can
-# buy. At 100% it caps nothing the autoscaler asks for: nodes are bounded by
-# the ordinary quota beside it.
-_COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
 
 
 def check_quota(quota: dict, region: str) -> dict | None:
@@ -2019,7 +2016,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         # unlisted or unreached project, a cluster not running -- and `finish`
         # rejects an empty `scope.clusters`, so this is the top-level `error`
         # rather than a manifest nothing can be built from.
-        first = next((e for e in entries if e.get("error")), None)
+        # The `--project` note is an error only in form: it says what this run
+        # did not look at, never why the project it did look at yielded nothing.
+        first = next(
+            (e for e in entries if e.get("error") and e.get("name") != UNENUMERATED_PROJECTS_TARGET), None
+        )
         return failed(NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else "no project yielded any target"))
 
     return {

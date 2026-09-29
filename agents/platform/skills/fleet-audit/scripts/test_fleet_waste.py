@@ -5234,6 +5234,17 @@ class DisabledApiProjectTest(unittest.TestCase):
     COMPUTE_OFF = "ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project acme"
     REGISTRY_OFF = "ERROR: accessNotConfigured: Artifact Registry API has not been used in project acme"
 
+    def test_a_scoped_project_with_both_apis_off_does_not_blame_the_scope(self):
+        """`--project acme`, whose Compute and Artifact Registry APIs are both
+        off: nothing is collected, and the run error named the `--project`
+        note as the first failure, which says nothing about why acme yielded
+        nothing."""
+        run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
+        manifest = fw.collect_fleet("acme", run=run, session=None, now=NOW)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("nothing collected", manifest["error"])
+        self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
+
     def test_compute_off_declares_its_checks_inapplicable_and_still_reads_the_registry(self):
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: None)
         entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
@@ -5296,7 +5307,7 @@ class ClustersListedMarkerTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:3] == ["gcloud", "container", "node-pools"]:
+            if argv[:3] in (["gcloud", "container", "node-pools"], ["gcloud", "container", "operations"]):
                 return run_of(0, "[]")
             return base(argv, **kwargs)
 
@@ -6102,11 +6113,25 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
+        # Faithful to the manifest in every other respect, so the one claim it
+        # does not back is what the rejection is about: the pool read failed,
+        # and idle-nodepool is not among c1's commands.
+        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/c1")
+        project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertNotIn("idle-nodepool", {c["check"] for c in cluster_entry["commands"]})
+        claimed = [{"check": c["check"], "command": c["command"]} for c in cluster_entry["commands"]]
+        claimed.append({"check": "idle-nodepool", "command": "gcloud container node-pools list --cluster c1"})
         data = {
             "audit": "fleet-wide-cost-analysis",
-            "scope": {"clusters": [{"name": "acme/us-central1/c1", "checks_run": [{"check": "overrequest", "command": "x"}]}]},
+            "scope": {
+                "clusters": [
+                    {"name": "acme/us-central1/c1", "checks_run": claimed},
+                    {"name": "project/acme", "checks_run": [{"check": c["check"], "command": c["command"]} for c in project_entry["commands"]]},
+                ],
+                "skipped": [{"cluster": fw.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}],
+            },
         }
-        with self.assertRaises(audit_report.ValidationError):
+        with self.assertRaisesRegex(audit_report.ValidationError, "idle-nodepool"):
             audit_report.cross_check_manifest(data, manifest)
 
 
@@ -6329,9 +6354,10 @@ class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
     def test_a_project_scoped_candidate_is_never_annotated(self):
         """A disk, a reserved address and a forwarding rule are GCP resources
         with no cluster tree and no namespace, so there is nothing for this
-        index to key on -- those three checks call `_emit` directly, and this
-        pins that they keep doing so. Annotating one would name a Kubernetes
-        manifest as the place to delete a persistent disk.
+        index to key on. This pins that `_emit` cannot annotate such a
+        candidate even when handed an index that resolves it; which arguments
+        the three checks' call sites pass is not asserted here. Annotating one
+        would name a Kubernetes manifest as the place to delete a persistent disk.
         """
         hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
         self.assertNotIn("declaration", fw._emit("unattached-disk", hit))
