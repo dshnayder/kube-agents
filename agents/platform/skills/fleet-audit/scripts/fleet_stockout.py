@@ -1029,10 +1029,16 @@ def spot_without_a_shape(
     `unqueryable` belongs in `limitations` and the other two in
     `checks_not_applicable`, saying different things; reporting all three as
     "this cluster does not use Spot" was wrong about each.
+
+    Owners §2 calls non-production are left out, as `spot_shapes` leaves them
+    out: §3.8 does not flag them, so a gap in measuring them is no gap.
     """
     unqueryable, unpinned, inert = [], [], []
     for cc in compute_classes:
-        name = cc.get("metadata", {}).get("name", "")
+        meta = cc.get("metadata") or {}
+        if is_non_production(meta.get("name", ""), meta.get("labels")):
+            continue
+        name = meta.get("name", "")
         for priority in (cc.get("spec") or {}).get("priorities") or []:
             if not _priority_is_spot(priority) or priority.get("machineType"):
                 continue
@@ -1046,6 +1052,8 @@ def spot_without_a_shape(
                 bucket.append(label)
     for pool in node_pools:
         config = pool.get("config") or {}
+        if is_non_production(pool.get("name", ""), {**(config.get("resourceLabels") or {}), **(config.get("labels") or {})}):
+            continue
         if config.get("spot") and not config.get("machineType"):
             unqueryable.append(f"NodePool/{pool.get('name', '')}")
     return unqueryable, unpinned, inert
@@ -1580,12 +1588,14 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             # `nap-e2-standard-2-spot-rbu9q0zw` there to place a pod that
             # selected `autopilot-spot`. The check does not need the claim
             # either way; what makes it inapplicable is that no shape was
-            # named, so keep the reason to what was actually read.
+            # named, so keep the reason to what was actually read. That rules
+            # out "nothing requests Spot" and "GKE's pre-installed" as well:
+            # neither the workloads nor the class's origin were read, and a
+            # hand-authored pod-family Spot class lands here too.
             reason = (
-                f"Nothing on this cluster requests Spot capacity. The only Spot "
-                f"priority here is GKE's pre-installed {', '.join(inert)}, which "
-                f"names no machine shape, so there is no shape to ask "
-                f"`capacity-history` about."
+                f"The only Spot priority on this cluster is in {', '.join(inert)}, "
+                f"which names no machine family or machine type, so there is no "
+                f"shape to ask `capacity-history` about."
             )
         else:
             reason = (

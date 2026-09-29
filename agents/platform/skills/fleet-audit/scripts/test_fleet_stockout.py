@@ -1124,6 +1124,15 @@ class SpotShapeEnumerationTest(unittest.TestCase):
                     (["cc1:c3", "NodePool/p1"], [], []),
                 )
 
+    def test_non_production_owners_are_no_measurement_gap(self):
+        # `spot_shapes` leaves them out because §3.8 does not flag them, so a
+        # shape-free Spot request on one is no coverage gap either.
+        cc = compute_class("batch-staging", [{"machineFamily": "c3", "spot": True}])
+        pools = [{"name": "ci-dev", "config": {"spot": True}}]
+        for brokered in (True, False):
+            with self.subTest(brokered=brokered):
+                self.assertEqual(fs.spot_without_a_shape([cc], pools, brokered=brokered), ([], [], []))
+
     def test_a_spot_pool_with_no_machine_type_is_unqueryable(self):
         pools = [{"name": "p1", "config": {"spot": True}}]
         self.assertEqual(fs.spot_without_a_shape([], pools, brokered=True), (["NodePool/p1"], [], []))
@@ -1484,7 +1493,7 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(cluster={**self.CLUSTER, "has_nap": True}, dump_items=[cc])
         self.assertIn("leaves the machine shape entirely to GKE", self.spot_non_applicability(entry))
 
-    def test_a_standard_cluster_without_nap_says_nothing_asks_for_spot(self):
+    def test_a_standard_cluster_without_nap_says_no_shape_was_named(self):
         """GKE pre-installs `autopilot-spot` on Standard clusters. Ten of this
         fleet's sixteen clusters are Standard with cluster-level
         auto-provisioning off, and every one published "Every Spot request on
@@ -1502,13 +1511,22 @@ class CollectClusterTest(unittest.TestCase):
         cc = compute_class("autopilot-spot", [{"spot": True}])
         entry = self.run_with(dump_items=[cc])
         reason = self.spot_non_applicability(entry)
-        self.assertIn("Nothing on this cluster requests Spot capacity", reason)
-        self.assertIn("ComputeClass/autopilot-spot", reason)
-        self.assertIn("names no machine shape", reason)
+        self.assertIn("The only Spot priority on this cluster is in ComputeClass/autopilot-spot", reason)
+        self.assertIn("names no machine family or machine type", reason)
         self.assertNotIn("Every Spot request", reason)
         self.assertNotIn("auto-provisioning", reason)
         self.assertNotIn("no node can be created", reason)
         self.assertNotIn("limitations", entry)
+
+    def test_a_hand_authored_shape_free_class_is_not_called_pre_installed(self):
+        # The collector reads neither the class's origin nor the workloads, so
+        # the reason claims neither: `spot-batch` may be selected and provision
+        # through its own `nodePoolAutoCreation`.
+        cc = compute_class("spot-batch", [{"podFamily": "general-purpose", "spot": True}])
+        reason = self.spot_non_applicability(self.run_with(dump_items=[cc]))
+        self.assertIn("ComputeClass/spot-batch", reason)
+        self.assertNotIn("pre-installed", reason)
+        self.assertNotIn("Nothing on this cluster requests Spot", reason)
 
     def test_dangling_reference_reported(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})
@@ -1965,11 +1983,20 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             [e["check"] for e in cluster_entry["checks_unevaluated"]], ["autoscaler-out-of-resources"]
         )
 
-        data = {
-            "audit": "stockout-prevention",
-            "scope": {"clusters": [{"name": "acme/us-central1/c1", "checks_run": [{"check": "autoscaler-out-of-resources", "command": "x"}]}]},
-        }
-        with self.assertRaises(audit_report.ValidationError):
+        # Every manifest entry, copied as the sibling test above copies them,
+        # so no other rejection fires first -- a document naming only the
+        # cluster trips the "scope.clusters omits project/acme" check -- plus
+        # the unevaluated check claimed as run on the cluster.
+        clusters = [
+            {"name": e["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]]}
+            for e in manifest["clusters"]
+        ]
+        for entry in clusters:
+            if entry["name"] == "acme/us-central1/c1":
+                entry["checks_run"].append({"check": "autoscaler-out-of-resources", "command": "x"})
+                entry["limitations"] = "the Cloud Logging read failed"
+        data = {"audit": "stockout-prevention", "scope": {"clusters": clusters, "skipped": []}}
+        with self.assertRaisesRegex(audit_report.ValidationError, "as run or not applicable"):
             audit_report.cross_check_manifest(data, manifest)
 
 
