@@ -3,7 +3,7 @@
 
 Read side of docs/designs/fleet-audit-report-store.md. The store lives on the
 volume of the pod the audit's shell runs in (`/opt/data/fleet-audit/reports/
-<audit-id>/`) — the shell sandbox's, or the gateway's on an install without
+<audit-id>/<owner>/<name>/`) — the shell sandbox's, or the gateway's on an install without
 one — so this tool reads it through one projection: it streams the harness's own
 `report_status.py` into the pod (`kubectl exec -i … -- python3 -`) and parses
 the single JSON document that comes back. Streaming the script in rather than

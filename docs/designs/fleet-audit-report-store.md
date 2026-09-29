@@ -42,13 +42,13 @@ lost. `repo` must be exactly `owner/name` with no `.` or `..` segment before it 
 run whose repository fails that stores nothing.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
-the run's outcome (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`, the PR URL
-lists, `silent_ok`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
-`resolved_ids`, `current_ids`, `id_scheme`), `repo`, `ledger_body` — the body this run left on the
-issue — and `document`, this run's validated findings document, whole rather than clipped to the
-body's budget. The body's redaction backstop is applied to every string on the way in, so the
-envelope never holds a credential shape the public issue blanked. `current_ids` is the **rendered**
-set, exactly what the body's hidden block lists.
+the run's outcome (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`, `declared`,
+`unaccounted`, the PR URL lists, `silent_ok`, `ledger_held_open`), the collector keys the JSON line
+carried, the delta as id lists (`new_ids`, `resolved_ids`, `current_ids`, `id_scheme`), `repo`,
+`ledger_body` — the body this run left on the issue — and `document`, this run's validated findings
+document, whole rather than clipped to the body's budget. The body's redaction backstop is applied
+to every string on the way in, so the envelope never holds a credential shape the public issue
+blanked. `current_ids` is the **rendered** set, exactly what the body's hidden block lists.
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
@@ -64,8 +64,9 @@ instead of its own empty set; recording `[]` would hand the next run a trusted m
 ledger, and every finding the body carries would be announced as new. The document that body renders
 rides beside it as `ledger_document`, which only `finish` reads, for titles. `document` stays this
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
-handed the previous run's scope under this run's status. Where the previous memory is itself lost,
-the envelope names no issue, so the next run's trust check fails as a lost memory should.
+handed the previous run's scope under this run's status; `ledger_held_open` tells that reader the
+issue still lists findings this run's zero does not. Where the previous memory is itself lost, the
+envelope names no issue, so the next run's trust check fails as a lost memory should.
 
 ## 3. Where it lives
 
@@ -114,11 +115,13 @@ not empty:
   answers them.
 
 A wiped volume therefore never puts a wrong count in a public issue. The delta annotation costs one
-cycle, restored by the write that same run makes. The held rows cost more: a findings run rewrites
-the body without them, so the next run's memory has no marker id to hold and they are not rendered
-again. While the collector flags them they stay on each run's JSON line as `unpublished_candidates`,
-and their pull requests stay open; what is lost for good is their row on the ledger. The first run after an upgrade that introduces the store is such a run on
-every stream with an open ledger.
+cycle when that run writes the body, which a findings run or a close does. A clean run held open
+writes nothing to it, so the memory stays lost, and each such run files the gap again, until one
+rewrites the body or closes the ledger. The held rows cost more: a findings run rewrites the body
+without them, so the next run's memory has no marker id to hold and they are not rendered again.
+While the collector flags them they stay on each run's JSON line as `unpublished_candidates`, and
+their pull requests stay open; what is lost for good is their row on the ledger. The first run
+after an upgrade that introduces the store is such a run on every stream with an open ledger.
 
 The hidden block stays in every ledger body. It was never only `finish`'s round-trip state: the
 bench verifiers grade audit evals by parsing ids out of the published body, and it is the one way a
@@ -130,8 +133,9 @@ work from the live pull request list, which humans change between runs.
 
 Whether a run is in flight comes from the lease `start` takes — the in-flight note
 `/opt/data/scratch/inflight_<audit-id>.json` — not from a file in the store. `report_status.py`
-reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, copied into `report_status.py` and
-pinned equal by a test) and reports each stream, across all its repositories, as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
+reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, copied into `report_status.py` as
+`INFLIGHT_TTL_S` and pinned equal by a test) and reports each stream, across all its repositories,
+as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
 `error` (a store file that would not parse). A note that exists but cannot be parsed is a `start`
 that has claimed the lease and not yet written it, and counts from its mtime. A first run in flight
 is `running` before its store directory exists.

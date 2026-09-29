@@ -323,6 +323,13 @@ def test_github_target_repository_configuration(
         )
 
 
+def _collector_waiver(audit_id: str, collector_audits: frozenset) -> List[str]:
+    """`finish` on a collector stream requires a manifest or a waiver; these runs have no collector."""
+    if audit_id not in collector_audits:
+        return []
+    return ["--no-collector-manifest", "e2e fixture document; no collector ran"]
+
+
 @pytest.mark.parametrize(
     "audit_id,human_name",
     AUDIT_STREAMS,
@@ -359,7 +366,7 @@ def test_audit_report_ledger_dryrun_all_streams(
     if platform_scripts_dir not in sys.path:
         sys.path.insert(0, platform_scripts_dir)
 
-    from audit_report import AUDITS
+    from audit_report import AUDITS, COLLECTOR_AUDITS
 
     assert audit_id in AUDITS, f"Audit stream '{audit_id}' not found in audit_report.AUDITS"
     roster = AUDITS[audit_id].checks
@@ -433,6 +440,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                 f"--audit={audit_id}",
                 f"--findings-file={temp_path}",
                 "--dry-run",
+                *_collector_waiver(audit_id, COLLECTOR_AUDITS),
             ],
             capture_output=True,
             text=True,
@@ -585,7 +593,14 @@ def test_audit_report_github_api_lifecycle_mocked(
         findings_file = tmp_path / f"findings_{audit_id}.json"
         findings_file.write_text(json.dumps(doc), encoding="utf-8")
 
-        exit_code = audit_report.main(["finish", f"--audit={audit_id}", f"--findings-file={findings_file}"])
+        exit_code = audit_report.main(
+            [
+                "finish",
+                f"--audit={audit_id}",
+                f"--findings-file={findings_file}",
+                *_collector_waiver(audit_id, audit_report.COLLECTOR_AUDITS),
+            ]
+        )
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
         all_commands = [" ".join(c) for c in calls]

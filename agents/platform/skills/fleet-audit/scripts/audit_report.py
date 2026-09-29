@@ -1775,6 +1775,7 @@ def report_envelope(
     resolved_ids: list[str],
     rendered_ids: list[str],
     ledger_document: dict | None = None,
+    ledger_held_open: bool = False,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -1792,6 +1793,9 @@ def report_envelope(
     the document that body rendered: `document`
     answers "what did this run find", `ledger_document` is `finish`'s memory
     of the ledger, and a reader of one must never be handed the other.
+    `ledger_held_open` says the run left the issue open without rewriting it,
+    so the issue still lists findings this run's document does not: a reader
+    counting this run's findings must not report the ledger as clear.
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
 
@@ -1817,6 +1821,7 @@ def report_envelope(
         "prs_opened": list(payload.get("prs_opened") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
+        "ledger_held_open": ledger_held_open,
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
@@ -11818,6 +11823,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 resolved_ids=[] if (gaps or unaccounted) else previous_ids,
                 rendered_ids=stored_ids,
                 ledger_document=ledger_document,
+                ledger_held_open=body_untouched,
             ),
             now,
         )

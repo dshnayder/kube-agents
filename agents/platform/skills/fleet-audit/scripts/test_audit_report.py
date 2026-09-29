@@ -17185,6 +17185,7 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["issue_number"], 42)
         self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(body)))
         self.assertEqual(stored["status"], self.stdout_json()["status"])
+        self.assertIs(stored["ledger_held_open"], False)
 
     def test_a_clean_run_held_open_carries_the_previous_body_forward(self):
         previous = published_body(make_doc(), generated_at=NOW)
@@ -17203,9 +17204,13 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["document"]["findings"], [])
         self.assertEqual(stored["document"]["scope"]["skipped"][0]["cluster"], "dr-west")
         self.assertIn("ledger_document", stored)
-        self.assertNotIn("ledger_document", audit_report.report_envelope(
+        # A reader counting this run's zero must be told the issue is not clear.
+        self.assertIs(stored["ledger_held_open"], True)
+        normal = audit_report.report_envelope(
             AUDIT, {"status": "UPDATED"}, make_doc(), NOW, repo="acme/fleet", issue_number=42,
-            ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[]))
+            ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[])
+        self.assertNotIn("ledger_document", normal)
+        self.assertIs(normal["ledger_held_open"], False)
 
     def test_titles_come_from_the_document_the_ledger_renders(self):
         own = {"findings": [{"id": "own", "title": "This run"}]}

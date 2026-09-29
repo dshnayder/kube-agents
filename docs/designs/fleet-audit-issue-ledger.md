@@ -244,8 +244,8 @@ could not read the cluster has no standing to assert it.
 The comment does **not** print the command that no longer reproduces, or its output, and an earlier
 draft of this section promising both was wrong about what is knowable at that moment. A resolved
 finding is by definition absent from the current document, so its evidence is not in hand; the only
-place it survives is the previous run's stored report, and recovering it would mean parsing rendered
-Markdown back into fields. The renderer emits the command only on the rare path where a caller
+place it survives is the previous run's stored report, whose document `finish` reads only for
+titles; carrying the evidence through to the comment is not built. The renderer emits the command only on the rare path where a caller
 supplies the finding — and says nothing rather than print an empty code fence.
 
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
@@ -584,7 +584,7 @@ lose and anything present is debris from a run that did not finish.
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                           |
 | Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1).       |
-| Scope                 | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver and a report-store memory the run lacked ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). |
+| Scope                 | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in a clean comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). |
 | Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                 |
 | Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the caller-appended holds — a collector-manifest waiver, a report-store memory the run lacked ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                       |
@@ -846,8 +846,10 @@ cluster's `checks_not_applicable`, which is what keeps a check the cluster's sha
 reading as a check nobody ran. On a run that passed a collector flag, `finish` appends up to two
 more that no document field expresses — a waived collector manifest, and a clean run whose report
 store holds no record of the open ledger while the collector still flags something
-([collector design §3.3, §4](fleet-audit-collector-manifest.md));
-they count toward `partial` like the rest and render in the Scope section's own list.
+([collector design §3.3, §4](fleet-audit-collector-manifest.md)); they count toward `partial` like
+the rest. The waiver renders in the Scope section's own list. The lost-memory gap arises only on a
+clean run, which comments rather than rewriting the body, so it appears in that comment, the JSON
+line and the stored report.
 
 The fourth is fleet-wide and comes from `withhold_unsearched_postures`, which `finish` runs once,
 after the document loads and `start`'s search record and declarations have been folded into it

@@ -542,6 +542,14 @@ class TestDiff(StoreTestCase):
         payload = self.ok("diff", AUDIT, "--to", later)
         self.assertTrue(payload["to_partial"])
 
+    def test_a_run_that_held_the_ledger_open_is_flagged(self):
+        payload = self.ok("diff", AUDIT)
+        self.assertFalse(payload["to_held_open"])
+        later = self.write_run(AUDIT, "20260904T060000.000000Z", [], ledger_held_open=True)
+        payload = self.ok("diff", AUDIT, "--to", later)
+        self.assertTrue(payload["to_held_open"])
+        self.assertTrue(self.ok("show", AUDIT)["envelope"]["ledger_held_open"])
+
     def test_the_oldest_entry_has_nothing_behind_it(self):
         payload = self.refused("diff", AUDIT, "--to", self.first)
         self.assertIn("oldest entry", payload["error"])

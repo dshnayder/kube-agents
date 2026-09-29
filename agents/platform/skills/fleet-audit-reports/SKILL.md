@@ -21,16 +21,16 @@ repository — a stream publishes one ledger per managed repository:
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
-`new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`, `document`, and sometimes
-`ledger_document`.
+`ledger_held_open`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
+`document`, and sometimes `ledger_document`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. A `CLEAN` or `HELD` run that left the issue
-  open (partial, or holding it over findings it did not account for) did not rewrite the body, so
-  the issue still shows the previous run's findings, and `current` counts those rather than this
-  run's zero. `ledger_document` is that previous document, kept for `fleet-audit`; do not answer
-  from it.
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. `ledger_held_open` true means a `CLEAN` or
+  `HELD` run left the issue open (partial, or over findings it did not account for) without
+  rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
+  run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `ledger_document` is
+  that previous document, kept for `fleet-audit`; do not answer from it.
 - `current_ids` is the **rendered** id set, exactly what the body's hidden block published. Derive
   the full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
@@ -61,7 +61,8 @@ object per call.
 
 - Exit 0 answered the question. Exit 2 could not, and stdout still holds one JSON object whose
   `error` says why — absent store, absent stream, absent stamp, a file that would not parse. Every
-  answer carries an `error` key, null on success.
+  answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
+  unreadable; its other rows still stand — report them and name the unreadable ones.
 - Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
@@ -84,8 +85,9 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py show compliance-aud
 python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
 ```
 
-`show` gives `status`, `findings`, `critical`, `partial`, the delta counts and `issue_url`; name the
-criticals from `findings`. Always hand back the issue URL — the store is where you read, the ledger
+`show` gives `status`, `findings`, `critical`, `partial`, `ledger_held_open`, the delta counts and
+`issue_url`; name the criticals from `findings`. When `ledger_held_open` is true, this run found
+nothing new but the issue still carries `current` findings — say both, and point at the issue. Always hand back the issue URL — the store is where you read, the ledger
 is where a human acts.
 
 **"What changed since the last run?"**
@@ -96,7 +98,8 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-aud
 
 Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. When
 `from_partial` or `to_partial` is true, that run could not see the whole fleet: a finding under
-`resolved` may be one it did not look at, so say "not seen", never "fixed". For a wider span, list
+`resolved` may be one it did not look at, so say "not seen", never "fixed". When `to_held_open`
+is true, the audit itself refused to resolve them; they are still on the issue. For a wider span, list
 the ring first and name two stamps, older as `--from` — a reversed pair is refused:
 
 ```bash

@@ -396,9 +396,11 @@ The reason, passed through the same redactor as a skipped cluster's reason, is a
 nothing is announced resolved, no remediation pull request is retired, and the ledger is not closed,
 by the same rule any other gap applies. A document-authored gap shows in the Scope table's rows; the
 waiver has no row, so the ledger body lists it under a _Coverage_ heading in the Scope section and
-the delta comment, when one is posted, repeats it. The same list carries the other hold the
-document cannot express: a clean run whose report store holds no record of the open ledger while the
-collector still flags something the document does not carry (§3.3). The waiver and `--manifest-file` are mutually
+the delta comment, when one is posted, repeats it. The other hold the document cannot express — a
+clean run whose report store holds no record of the open ledger while the collector still flags
+something the document does not carry (§3.3) — arises only on a clean run, which comments rather
+than rewriting the body, so it is named in that comment instead. The waiver and `--manifest-file`
+are mutually
 exclusive, a blank reason is a validation error, and `--dry-run` appends the same gap so the preview
 shows the hold the real run will apply.
 

@@ -576,6 +576,10 @@ def cmd_diff(args: argparse.Namespace) -> dict:
         # never announces one resolved over a partial run, and nor may this.
         "from_partial": bool(before_envelope.get("partial")),
         "to_partial": bool(after_envelope.get("partial")),
+        # A run that held the ledger open refused to call the previous
+        # findings resolved; its empty document says nothing more than that.
+        "from_held_open": bool(before_envelope.get("ledger_held_open")),
+        "to_held_open": bool(after_envelope.get("ledger_held_open")),
         "added": [_identity(f) for f in added[: args.limit]],
         "resolved": [_identity(f) for f in resolved[: args.limit]],
         "added_total": len(added),
