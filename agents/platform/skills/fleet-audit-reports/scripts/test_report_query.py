@@ -613,6 +613,12 @@ class TestDiff(StoreTestCase):
         rows = [row for row in self.ok("streams")["streams"] if row["audit_id"] == AUDIT]
         self.assertTrue(rows[0]["ledger_held_open"])
 
+    def test_a_withheld_delta_is_carried_by_streams_and_show(self):
+        self.write_run(AUDIT, "20260904T060000.000000Z", [], delta_known=False)
+        self.assertIs(self.ok("show", AUDIT)["envelope"]["delta_known"], False)
+        rows = [row for row in self.ok("streams")["streams"] if row["audit_id"] == AUDIT]
+        self.assertIs(rows[0]["delta_known"], False)
+
     def test_the_oldest_entry_has_nothing_behind_it(self):
         payload = self.refused("diff", AUDIT, "--to", self.first)
         self.assertIn("oldest entry", payload["error"])

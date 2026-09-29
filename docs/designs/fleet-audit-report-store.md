@@ -61,11 +61,15 @@ exit code. A failed write deletes `latest.json` on its way out, because the file
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
 quote it as current. An absent store is unknowable, and every reader handles that; a stale one
 passes the issue and repository checks, and only the comparison against the live block in §4 tells
-it from a fresh one. For the same reason `finish` deletes `latest.json` just before
-each call that changes what the ledger says: the findings rewrite, the clean close, and the coverage
-issue a clean run opens. A run killed between that call and writing the store leaves no envelope
-rather than one describing the run before. A lookup that fails earlier, or a clean run held open that
-only comments, has changed nothing the envelope describes and leaves the memory in place. The ring
+it from a fresh one. For the same reason `finish` deletes `latest.json` just before each call that
+rewrites the ledger: the findings rewrite and the coverage issue a clean run opens. A run killed
+between that call and writing the store leaves no envelope rather than one describing the run before.
+The clean close is the exception, and `finish` deletes the file just after it: a close leaves the
+body as it was, so until it lands the stored memory is still exactly the open ledger, and a close
+that fails leaves the memory in place. A run killed between the close and the delete leaves a record
+naming an issue that is now closed, which no later run trusts, since the trust check needs that issue
+to be the open ledger. A lookup that fails earlier, or a clean run held open that only comments, has
+changed nothing the envelope describes and leaves the memory in place. The ring
 is left alone, and the readers answer from its newest entry with `latest_missing: true`: the stream
 did run, and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a
 failed prune has not damaged the memory the run just wrote.
@@ -79,7 +83,11 @@ rides beside it as `ledger_document`, which only `finish` reads, for titles. `do
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
 handed the previous run's scope under this run's status; `ledger_held_open` tells that reader the
 issue still lists findings this run's zero does not. Where the previous memory is itself lost, the
-envelope names no issue, so the next run's trust check fails as a lost memory should. A run that
+envelope names no issue, so the next run's trust check fails as a lost memory should. Any run over
+a lost memory also writes `delta_known: false`: its `new_ids` and `resolved_ids` are empty because
+the delta was withheld, and the readers (`make fleet-audit-view`, `report_query.py streams` and
+`show`) render it as unknown rather than as a run that changed nothing. Envelopes written before the
+key existed lack it and read as they always did. A run that
 closes the ledger names no issue either: reopened by hand, the issue is not the empty ledger that
 run left.
 
@@ -139,7 +147,8 @@ volume is replaced. That run would otherwise have no previous ids, so the guard 
 close over findings the document does not account for would have nothing to check, and an empty
 document would close the ledger and its pull requests. The body's hidden block is the id set the
 last run published, so it stands in for the store this once; the run writes the store, and every
-later run reads that.
+later run reads that. The seed is the body `find_existing_issue` already listed, so it has no failure
+point of its own; `gh issue view` fetches it only when the listing brought no body.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
 its `latest.json` is missing, unreadable, written for another issue, or names a different id set from the ledger's

@@ -312,6 +312,13 @@ class TestFlags(unittest.TestCase):
         doc = stream(liveness="running", last=old, started=started(age_s=3900))
         self.assertEqual(self.flags(doc), [])
 
+    def test_stale_waits_for_the_leases(self):
+        # With the scratch directory unlisted a run in flight reads as idle,
+        # so silence cannot be told from a run that is going right now.
+        old = latest(finished_at=(NOW - timedelta(days=3)).isoformat())
+        (_, _, source), = view.stream_rows({"cost-audit": stream(last=old)}, {})
+        self.assertEqual(view.flags_for(source, self.JOB, NOW, True, leases_read=False), [])
+
     def test_a_disabled_stream_abstains_from_stale_and_never(self):
         old = latest(finished_at=(NOW - timedelta(days=30)).isoformat())
         self.assertEqual(self.flags(stream(last=old), {"enabled": False}), [])
@@ -344,6 +351,18 @@ class TestRender(unittest.TestCase):
         self.assertIn("57 (2 c)", out)
         self.assertIn("+3 / −1", out)
         self.assertIn("#12", out)
+
+    def test_a_withheld_delta_renders_as_unknown_not_zero(self):
+        # `finish` stores empty id lists over a lost memory; the envelope's
+        # `delta_known: false` is what tells that from a run that changed nothing.
+        out = self.render(
+            {"compliance-audit": stream(last=latest(new=0, resolved=0, delta_known=False))}
+        )
+        self.assertNotIn("+0 / −0", out)
+
+    def test_an_envelope_without_delta_known_renders_its_counts(self):
+        out = self.render({"compliance-audit": stream(last=latest(delta_known=None))})
+        self.assertIn("+3 / −1", out)
 
     def test_a_stream_on_two_repositories_is_two_labelled_rows(self):
         doc = stream(last=latest())
@@ -1229,7 +1248,12 @@ class TestRosterLoading(unittest.TestCase):
         self.assertGreaterEqual(len(roster), 9)
         self.assertIn("compliance-audit", roster)
         for job in roster.values():
-            self.assertIn("expr", job)
+            # A schedule the view can read, not just a key: an empty or
+            # unparsable `expr` would leave STALE unable to fire for it.
+            self.assertIsNotNone(
+                view.next_fire(job["expr"], datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                job,
+            )
 
     def test_a_roster_with_no_fleet_audit_job_is_empty_and_not_an_error(self):
         roster, error = view.load_roster(Path(NO_ROSTER))

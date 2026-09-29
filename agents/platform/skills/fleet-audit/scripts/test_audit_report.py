@@ -17042,7 +17042,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     Scope table's `n/n` column and the unrun-check prose count the roster.
     The report store is the other: the previous body is read from the store
     rather than from `gh issue view --json body`, so that one call is gone
-    from every transcript that had an open ledger, and nothing else moved.
+    from every transcript that had an open ledger, and the `gh issue list`
+    that finds the ledger asks for `number,url,body` rather than
+    `number,url`, the body being what the store's record is checked against
+    and, where the store never held the ledger, what seeds it. Nothing else
+    moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,
@@ -17336,17 +17340,86 @@ class TestReportStore(HarnessTestCase):
     def body_reads(self):
         return [c for c in self.harness.calls if "--json" in c and "body" in c]
 
+    def listing(self, body, number=42):
+        return json.dumps(
+            [{"number": number, "url": f"https://github.com/acme/fleet/issues/{number}", "body": body}]
+        )
+
+    def test_a_seed_from_the_listing_survives_a_failing_issue_view(self):
+        """The listing already carried the body, so a `gh issue view` that
+        would fail has no say: the seed still holds the ledger open."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertNotIn("could not be read to seed one", self.err)
+
+    def test_start_seeds_from_the_listing_without_a_second_read(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.body_reads(), [])
+        self.assertTrue(json.loads(self.out.strip())["carried"])
+
+    def test_a_listing_without_a_body_falls_back_to_issue_view(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"--json body": json.dumps({"body": previous})}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertEqual(memory["ledger_body"], previous)
+        self.assertEqual(len(self.body_reads()), 1)
+
+    def test_a_failed_close_leaves_the_memory_intact(self):
+        """The close leaves the body as it was, so until it lands the stored
+        memory is still the open ledger; a transient failure must not cost the
+        next run it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.seed_report(previous)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"issue close": 1}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertNotEqual(self.run_finish_unseeded(clean), 0)
+        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertEqual(
+            (self.stored()["issue_number"], self.stored()["ledger_body"]), (42, previous)
+        )
+        self.assertIsNotNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", previous))
+
+    def test_a_withheld_delta_is_recorded_on_the_envelope(self):
+        """A lost memory stores empty `new_ids`/`resolved_ids` because the
+        delta was withheld; the envelope must say so, or a reader prints +0/−0."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        stored = self.stored()
+        self.assertIs(stored["delta_known"], False)
+        self.assertEqual((stored["new_ids"], stored["resolved_ids"]), ([], []))
+
+    def test_a_known_delta_is_recorded_on_the_envelope(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIs(self.stored()["delta_known"], True)
+
     def test_a_never_stored_ledger_is_seeded_once_from_its_block(self):
         """The first run after the store lands, or after the volume is replaced,
         must still refuse to close over findings its empty document does not
         account for; the ledger's hidden block stands in for the store once."""
         previous = published_body(make_doc(), generated_at=NOW)
-        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        self.harness.replies = {"issue list": self.listing(previous)}
         shutil.rmtree(self.reports_dir, ignore_errors=True)
         self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertEqual(self.stdout_json()["status"], "HELD")
         self.assertIn("seeding this run's memory once", self.err)
+        # The listing brought the body, so the seed is read off it, not re-fetched.
+        self.assertEqual(self.body_reads(), [])
         stored = self.stored()
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
         self.assertIs(stored["ledger_held_open"], True)

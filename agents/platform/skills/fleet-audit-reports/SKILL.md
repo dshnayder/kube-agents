@@ -21,7 +21,7 @@ repository — a stream publishes one ledger per managed repository:
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
-`ledger_held_open`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
+`ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
 `document`, and sometimes `ledger_document`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
@@ -33,6 +33,10 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   `findings` all carry it. Held open over a lost memory, the envelope's `issue_number` is null and
   `current` is 0: the store does not know what the issue lists, so read the issue. `ledger_document`
   is that previous document, kept for `fleet-audit`; do not answer from it.
+- `delta_known` false means `fleet-audit` lost its memory of the previous run and withheld the
+  delta: `new_ids` and `resolved_ids` are empty, and `new`/`resolved` 0, because nothing was claimed,
+  not because nothing changed. Say the delta is unknown for that run. Envelopes written before the
+  key existed lack it; read their counts as they are. `streams` and `show` carry it.
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous

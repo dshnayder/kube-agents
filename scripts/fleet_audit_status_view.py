@@ -405,8 +405,8 @@ def context_hint(exc: ProjectionError, context: str | None) -> list[str]:
             % ("another context" if len(found) == 1 else "%d other contexts" % len(found))
         )
         lines += [f"    --context {name}" for name in found]
-    elif kubeconfig_contexts():
-        others = len([c for c in kubeconfig_contexts() if c != here])
+    elif known := kubeconfig_contexts():
+        others = len([c for c in known if c != here])
         if others > CONTEXT_PROBE_LIMIT:
             lines.append(
                 f"  none of the first {CONTEXT_PROBE_LIMIT} of {others} other contexts "
@@ -594,6 +594,9 @@ def flags_for(
     and the STATUS cell already says how long it has been going. NEVER also
     needs the leases read: a first run in flight has a lease and no store
     directory yet, so with the scratch directory unlisted "never" is unknown.
+    STALE needs them for the same reason: with the scratch directory unlisted
+    every liveness reads as "never", so a run in flight right now would be
+    called silent.
     """
     flags = []
     unreadable = not root_exists or bool(stream.get("error"))
@@ -607,7 +610,7 @@ def flags_for(
     enabled = bool(job.get("enabled"))
     if liveness == "never" and enabled and not unreadable and leases_read:
         flags.append("NEVER")
-    if enabled and liveness != "running":
+    if enabled and liveness != "running" and leases_read:
         at = parse_iso((stream.get("latest") or {}).get("finished_at"))
         expected = next_fire(job.get("expr", ""), at) if at else None
         if expected is not None and now > expected + STALE_SLACK:
@@ -783,7 +786,11 @@ def row_for(
         findings_text, findings_style = "—", "dim"
 
     new, resolved = latest.get("new"), latest.get("resolved")
-    if isinstance(new, int) and isinstance(resolved, int):
+    # `is False`, not falsy: an envelope written before the key existed
+    # carries null here and renders its counts as it always did.
+    if latest.get("delta_known") is False:
+        delta_text, delta_style = "—", "dim"
+    elif isinstance(new, int) and isinstance(resolved, int):
         delta_text = f"+{new} / −{resolved}"
         delta_style = "yellow" if new else ("green" if resolved else "dim")
     else:

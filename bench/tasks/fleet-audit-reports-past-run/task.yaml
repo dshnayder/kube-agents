@@ -102,5 +102,11 @@ verification_spec:
       # is a byte-identical copy of one. A `jq` or `python3` projection of one
       # key is a different command and does not match. Flags may sit between
       # the command and the file (`head -n 40`, `cat -n`); a separator may not.
+      # No start anchor, so a wrapper (`timeout 30 cat`, `sudo cat`) does not
+      # hide the read. The other three name the file before the reader: `find
+      # -exec`, a list piped to `xargs`, and a bare glob after `cd` into runs/.
       forbidden_patterns:
-        - '(^|&&|;|\|)\s*(cat|less|more|head|tail)\b[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
+        - '\b(cat|less|more|head|tail)\b[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
+        - '\bfind\b[^\n|;&]*(latest\.json|runs\b)[^\n|;&]*\s-exec(dir)?\s+(\S*/)?(cat|less|more|head|tail)\b'
+        - '(latest\.json|runs/[^\s|;&]*)[^\n;&]*\|\s*xargs\b[^\n|;&]*\b(cat|less|more|head|tail)\b'
+        - '\bcd\s+(\S*/)?runs/?\s*(&&|;)[^\n|;&]*\b(cat|less|more|head|tail)\b[^\n|;&]*\.json\b'

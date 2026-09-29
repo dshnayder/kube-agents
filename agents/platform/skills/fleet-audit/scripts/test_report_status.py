@@ -78,6 +78,15 @@ class TestProjection(ReportStatusTestCase):
         self.assertIsNone(latest["prs_opened"])
         self.assertEqual(stream["repos"][REPO]["runs"], ["20260801T093000.000000Z.json"])
 
+    def test_a_withheld_delta_is_carried_and_an_old_envelope_reads_null(self):
+        self.write_latest(delta_known=False)
+        latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]
+        self.assertIs(latest["delta_known"], False)
+        self.write_latest()
+        latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]
+        self.assertIn("delta_known", latest)
+        self.assertIsNone(latest["delta_known"])
+
     def test_a_malformed_envelope_counts_unknown_not_zero(self):
         self.write_latest(new_ids="x", document=[])
         latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]

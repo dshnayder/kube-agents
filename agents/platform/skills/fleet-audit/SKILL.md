@@ -48,7 +48,7 @@ fails if the two drift apart. Do not restate a title anywhere else.
 
 ## Running a stream on demand
 
-An audit request arrives in one of two distinct forms, distinguished by the request itself:
+An audit request arrives in one of three distinct forms, distinguished by the request itself:
 
 ### 1. Asked to run an audit stream per its SOP: Run the audit directly
 
@@ -246,8 +246,9 @@ run](#the-clean-run). On a stream that passes `--manifest-file` there is a fifth
 finding the collector still emits: `resolved_because` does not release it, and only the collector no
 longer emitting it or a `declared` entry does. Where the store has never held the ledger, `start`
 reads the issue's hidden block once instead. Empty when there is no open ledger, or the store's
-record of it is missing, unreadable or for another issue, or the store never held it and the issue
-has no readable block (`start` says so on stderr).
+record of it is missing, unreadable, for another issue, or lists ids that differ from the issue's
+hidden block, or the store never held it and the issue has no readable block (`start` says so on
+stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream

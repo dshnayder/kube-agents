@@ -375,6 +375,10 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "critical": latest.get("critical"),
         "new": latest.get("new"),
         "resolved": latest.get("resolved"),
+        # False when `finish` withheld the delta over a lost memory: `new`
+        # and `resolved` are then 0 because nothing was claimed, not because
+        # nothing changed.
+        "delta_known": latest.get("delta_known"),
         "current": latest.get("current"),
         "clusters": latest.get("clusters"),
         "skipped": latest.get("skipped"),

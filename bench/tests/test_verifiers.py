@@ -2712,3 +2712,53 @@ def test_the_past_run_safeguard_catches_every_gh_write_form(command):
 @pytest.mark.parametrize("command", _READS)
 def test_the_past_run_safeguard_lets_reads_through(command):
     assert not any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+_PAST_RUN_ENVELOPE_SAFEGUARD = "the-envelope-was-not-read-whole"
+_STORE = "/opt/data/fleet-audit-reports/fleet-wide-cost-analysis/acme/fleet"
+# Each prints a whole envelope: the findings document and the ledger body.
+_WHOLE_ENVELOPE_READS = [
+    f"cat {_STORE}/latest.json",
+    f"head -n 40 {_STORE}/runs/20260929T010000Z.json",
+    f"cd /tmp && tail {_STORE}/latest.json",
+    # Behind a wrapper, which is why the pattern has no start anchor.
+    f"timeout 30 cat {_STORE}/latest.json",
+    f"sudo cat {_STORE}/latest.json",
+    # The file named before the command that prints it.
+    f"find {_STORE} -name latest.json -exec cat {{}} \\;",
+    f"find {_STORE}/runs -name '*.json' -exec /bin/cat {{}} +",
+    f"ls {_STORE}/runs/*.json | xargs cat",
+    f"find {_STORE} -name latest.json | xargs -0 head -c 4000",
+    f"cd {_STORE}/runs && cat 2026*.json",
+    "cd runs; less *.json",
+]
+# What the recorded greens ran, and projections of one key.
+_ENVELOPE_PROJECTIONS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "python3 scripts/report_query.py runs fleet-wide-cost-analysis --repo acme/fleet",
+    f"jq .status {_STORE}/latest.json",
+    f"ls {_STORE}/runs",
+    f"cd {_STORE}/runs && ls",
+]
+
+
+def _past_run_envelope_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [
+        e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_ENVELOPE_SAFEGUARD
+    ]
+    assert len(entries) == 1, f"{_PAST_RUN_ENVELOPE_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _WHOLE_ENVELOPE_READS)
+def test_the_envelope_safeguard_catches_every_whole_read(command):
+    assert any(re.search(p, command) for p in _past_run_envelope_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _ENVELOPE_PROJECTIONS)
+def test_the_envelope_safeguard_lets_projections_through(command):
+    assert not any(
+        re.search(p, command) for p in _past_run_envelope_forbidden()
+    ), command

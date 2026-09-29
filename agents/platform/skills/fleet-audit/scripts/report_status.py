@@ -68,6 +68,9 @@ LATEST_KEYS = (
     "prs_opened",
     "prs_closed",
     "silent_ok",
+    # False when `finish` withheld the delta over a lost memory, so a reader
+    # does not print `new`/`resolved` of zero as though nothing changed.
+    "delta_known",
     "id_scheme",
 )
 

@@ -1810,6 +1810,7 @@ def report_envelope(
     rendered_ids: list[str],
     ledger_document: dict | None = None,
     ledger_held_open: bool = False,
+    delta_known: bool = True,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -1830,6 +1831,10 @@ def report_envelope(
     `ledger_held_open` says the run left the issue open without rewriting it,
     so the issue still lists findings this run's document does not: a reader
     counting this run's findings must not report the ledger as clear.
+    `delta_known` is False when the previous run's memory was lost over an
+    open ledger: `new_ids` and `resolved_ids` are then empty because the delta
+    was withheld, not because nothing changed, and a reader must say so
+    rather than print a zero.
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
 
@@ -1856,6 +1861,7 @@ def report_envelope(
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
         "ledger_held_open": ledger_held_open,
+        "delta_known": delta_known,
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
@@ -2005,7 +2011,9 @@ def invalidate_report_memory(audit_id: str, repo: str) -> None:
         log(f"WARNING: could not set the stored report for {audit_id} aside ({exc}).")
 
 
-def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict | None:
+def seed_memory_from_ledger(
+    audit_id: str, issue_number: int, repo: str, listed_body: str | None = None
+) -> dict | None:
     """The previous run's memory read once off the open ledger, or None.
 
     For a stream and repository the store has never held — the first run after
@@ -2020,20 +2028,26 @@ def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict
     `latest.json` stays a lost memory, because two memories with a precedence
     rule is how a divergence becomes undetectable. A body with no readable
     block, or one that cannot be fetched, seeds nothing.
+
+    `listed_body` is the body `find_existing_issue`'s listing already carried.
+    Where it arrived it is the seed, so the seed has no failure point of its
+    own; `gh issue view` is only the fallback for a listing that brought none.
     """
-    res = gh(
-        ["issue", "view", str(issue_number), "-R", repo, "--json", "body"], check=False
-    )
-    if res.returncode != 0:
-        log(
-            f"WARNING: no report store for {audit_id} in {repo} and issue #{issue_number} "
-            f"could not be read to seed one; {MEMORY_UNKNOWABLE}"
+    body = listed_body
+    if not isinstance(body, str):
+        res = gh(
+            ["issue", "view", str(issue_number), "-R", repo, "--json", "body"], check=False
         )
-        return None
-    try:
-        body = json.loads(res.stdout or "{}").get("body")
-    except (json.JSONDecodeError, AttributeError):
-        body = None
+        if res.returncode != 0:
+            log(
+                f"WARNING: no report store for {audit_id} in {repo} and issue #{issue_number} "
+                f"could not be read to seed one; {MEMORY_UNKNOWABLE}"
+            )
+            return None
+        try:
+            body = json.loads(res.stdout or "{}").get("body")
+        except (json.JSONDecodeError, AttributeError):
+            body = None
     if not isinstance(body, str) or not DELTA_RE.search(normalise_newlines(body)):
         log(
             f"No report store for {audit_id} in {repo} and issue #{issue_number} carries no "
@@ -2110,7 +2124,7 @@ def previous_run_memory(
     except ValueError:
         never_stored = False
     if never_stored:
-        return seed_memory_from_ledger(audit_id, issue_number, repo)
+        return seed_memory_from_ledger(audit_id, issue_number, repo, live_body)
     memory = read_report_memory(audit_id, issue_number, repo)
     if memory is None or not memory_matches_ledger(audit_id, memory, issue_number, live_body):
         return None
@@ -11645,11 +11659,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
-    # `latest.json` is dropped just before each call that changes what the
-    # ledger says -- the findings rewrite, the clean close, the coverage issue
-    # a clean run opens -- and not here. A clean run that only comments leaves
-    # the stored memory exactly true, so a failure on that path (a transient
-    # `gh issue close`, a terminal timeout) must not cost the next run it.
+    # `latest.json` is dropped just before each call that rewrites what the
+    # ledger says -- the findings rewrite, the coverage issue a clean run
+    # opens -- and just after the clean close, not here. A close leaves the
+    # body untouched, so the stored memory stays exactly true until it lands,
+    # and a failure on that path (a transient `gh issue close`, a terminal
+    # timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
@@ -11859,7 +11874,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
-            invalidate_report_memory(audit_id, repo)
             gh(
                 [
                     "issue",
@@ -11871,6 +11885,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     "completed",
                 ]
             )
+            # Dropped only once the close has landed: the close leaves the body
+            # as it was, so until it succeeds the stored memory is still exactly
+            # the open ledger, and a failed close must not cost the next run it.
+            invalidate_report_memory(audit_id, repo)
             log(f"Audit {audit_id} is clean; closed issue #{existing_issue}.")
         elif gaps:
             # Zero findings, incomplete coverage, and no ledger to say so on.
@@ -12013,6 +12031,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 rendered_ids=stored_ids,
                 ledger_document=ledger_document,
                 ledger_held_open=body_untouched,
+                delta_known=delta_known,
             ),
             now,
         )
@@ -12412,6 +12431,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # The block as published, held ids included, so the stored set
             # is the one the next run's memory parses out of `ledger_body`.
             rendered_ids=parse_delta_block(ledger_body),
+            delta_known=delta_known,
         ),
         now,
     )
