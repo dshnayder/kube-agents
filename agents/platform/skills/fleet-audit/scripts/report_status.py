@@ -173,12 +173,22 @@ def in_flight_ids(scratch: str) -> list[str]:
         names = os.listdir(scratch)
     except FileNotFoundError:
         return []
-    return sorted(
+    ids = (
         name[len(INFLIGHT_PREFIX) : -len(INFLIGHT_SUFFIX)]
         for name in names
         if name.startswith(INFLIGHT_PREFIX)
         and name.endswith(INFLIGHT_SUFFIX)
         and len(name) > len(INFLIGHT_PREFIX) + len(INFLIGHT_SUFFIX)
+    )
+    # The id is joined onto the store root as a directory, and the scratch
+    # directory is shared with the worker: `inflight_...json` would name `..`
+    # and list the root's parent as that stream's repositories. One segment
+    # the store could have written, never `.` or `..`, as `store_path` holds
+    # the repository to.
+    return sorted(
+        audit_id
+        for audit_id in ids
+        if REPO_SEGMENT_RE.match(audit_id) and audit_id not in (os.curdir, os.pardir)
     )
 
 

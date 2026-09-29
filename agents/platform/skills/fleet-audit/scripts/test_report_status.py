@@ -217,6 +217,18 @@ class TestLiveness(ReportStatusTestCase):
         self.assertEqual(stream["started"]["age_s"], 30.0)
         self.assertEqual(stream["repos"], {})
 
+    def test_a_note_whose_name_is_not_a_stream_id_is_no_stream(self):
+        """The scratch directory is shared with the worker, and the id is joined
+        onto the store root: `inflight_...json` would name `..`, and the root's
+        parent would be listed as that stream's repositories."""
+        outside = self.root.parent / "acme" / "fleet"
+        outside.mkdir(parents=True, exist_ok=True)
+        for audit in ("..", ".", "a b"):
+            self.write_note(audit=audit, age_s=30.0)
+        self.write_note(audit="cost-audit", age_s=30.0)
+        self.assertEqual(report_status.in_flight_ids(str(self.scratch)), ["cost-audit"])
+        self.assertEqual(sorted(self.project()["streams"]), ["cost-audit"])
+
     def test_an_unparseable_note_counts_from_its_mtime(self):
         # A `start` that created the note and has not written it yet: a claim.
         path = self.write_note(text="")
