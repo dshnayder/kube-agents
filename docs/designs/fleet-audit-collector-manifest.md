@@ -240,9 +240,9 @@ stay protected, because the stale-close pass reads the still-flagged set whole, 
 nothing the lost body held is protected. The delta comment is skipped. A run with neither a memory
 nor a manifest answers no `/remediate` at all (no refusal, deferral or acknowledgement; the next run
 with a memory answers them, and the deferred marker is what `reply_to_deferrals` guards on, so
-nothing is lost by waiting). A clean run over a lost memory closes unless the collector still flags
-something the document does not carry; then it files the lost-memory coverage gap (§4), stays open
-and reports partial. Every published body also spells a `<!--` arriving in model- or fleet-authored
+nothing is lost by waiting). A clean run over a lost memory closes only with a manifest whose
+collector flags nothing the document does not carry; otherwise it files a lost-memory coverage gap
+(§4), stays open and reports partial. Every published body also spells a `<!--` arriving in model- or fleet-authored
 free text as `&lt;!--` (§3.3), so a run over a document whose text contains a comment opener renders
 that text differently from main; none of the five recorded transcripts carries an opener in free
 text. A marker minted under

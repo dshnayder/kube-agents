@@ -364,6 +364,9 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "clusters": latest.get("clusters"),
         "skipped": latest.get("skipped"),
         "partial": latest.get("partial"),
+        # True when the issue still lists the previous run's findings, so
+        # this run's zero `findings` and `critical` do not say it is clear.
+        "ledger_held_open": latest.get("ledger_held_open"),
         # A count, not the gap strings: every stream's worth of prose is the
         # unbounded shape this command exists to avoid. `show` names them.
         "gaps": len(gaps) if isinstance(gaps, list) else None,
@@ -412,6 +415,7 @@ def cmd_findings(args: argparse.Namespace) -> dict:
         "run": name,
         "finished_at": envelope.get("finished_at"),
         "status": envelope.get("status"),
+        "ledger_held_open": bool(envelope.get("ledger_held_open")),
         "filters": {
             "severity": args.severity,
             "cluster": args.cluster,

@@ -549,6 +549,9 @@ class TestDiff(StoreTestCase):
         payload = self.ok("diff", AUDIT, "--to", later)
         self.assertTrue(payload["to_held_open"])
         self.assertTrue(self.ok("show", AUDIT)["envelope"]["ledger_held_open"])
+        self.assertTrue(self.ok("findings", AUDIT)["ledger_held_open"])
+        rows = [row for row in self.ok("streams")["streams"] if row["audit_id"] == AUDIT]
+        self.assertTrue(rows[0]["ledger_held_open"])
 
     def test_the_oldest_entry_has_nothing_behind_it(self):
         payload = self.refused("diff", AUDIT, "--to", self.first)

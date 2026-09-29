@@ -1169,11 +1169,13 @@ report store's record of the open ledger is missing, unreadable, or written for 
 block instead) — the previous run's findings are unknowable, so the run announces nothing rather
 than declaring every live finding new, and logs `The previous run's findings are unknowable;
 skipping the delta comment` to stderr. It holds nothing it cannot name: the body is rewritten from
-this document, and a findings run leaves the next run a trusted record. A clean run closes unless it
-passed a manifest whose collector still flags something the document dropped; then the ledger stays
-open with a coverage gap saying the store had no record, `partial: true` and `silent_ok: false`.
-Without a manifest it answers no `/remediate` — it cannot tell a held id from a typo — and logs `No
-stored report and no manifest` to say so; report that as you would any other partial run.
+this document, and a findings run leaves the next run a trusted record. A clean run closes only when
+it passed a manifest and the collector flags nothing the document dropped. Otherwise the ledger
+stays open with a coverage gap saying the store had no record, `partial: true` and `silent_ok:
+false`, and it stays open run after run until a findings run rewrites the body or a human closes the
+issue. Without a manifest it also answers no `/remediate` — it cannot tell a held id from a typo —
+and logs `No stored report and no manifest` to say so; report that as you would any other partial
+run.
 
 ## Red lines
 

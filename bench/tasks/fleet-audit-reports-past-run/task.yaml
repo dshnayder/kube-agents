@@ -54,9 +54,12 @@ verification_spec:
     check:
       type: worker_commands
       # The skill's query script, whichever way it was invoked: by relative
-      # path as the SKILL.md writes it, or by absolute path.
+      # path as the SKILL.md writes it, or by absolute path, with or without
+      # a flag such as --root ahead of the subcommand.
       required_patterns:
-        ['report_query\.py\s+(streams|show|findings|diff|runs)\b']
+        [
+          'report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
+        ]
   - name: nothing-was-run-or-published
     role: safeguard
     # recoverable, not catastrophic: a worker that re-ran an audit to answer

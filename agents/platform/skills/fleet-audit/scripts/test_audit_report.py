@@ -3889,20 +3889,24 @@ class TestHeldClose(HarnessTestCase):
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["unaccounted"], [])
 
-    def test_a_lost_store_holds_nothing_and_closes_without_a_manifest(self):
-        # Same rule as the delta: nothing can be joined against a memory that
-        # is gone, so nothing is claimed either way. With no manifest there is
-        # no collector left to hold the ledger open, so the clean run closes.
+    def test_a_lost_store_without_a_manifest_holds_the_ledger_open(self):
+        # Nothing can be joined against a memory that is gone, and with no
+        # manifest there is no still-flagged set either: an empty document
+        # would close the ledger and its pull requests over findings nothing
+        # says were fixed. It stays open, partial, and says why.
         self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"--json body": 1}
         self.assertEqual(self.run_finish(naming_doc()), 0)
-        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
-        self.assertFalse(payload["partial"])
+        self.assertTrue(payload["partial"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
         self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
         self.assertEqual(payload["unaccounted"], [])
+
     def test_a_gap_takes_precedence_over_the_hold(self):
         # Over a gap the ledger stays open anyway and the comment says why; the
         # hold is not computed on top of it, so the JSON says one thing.
@@ -17237,6 +17241,31 @@ class TestReportStore(HarnessTestCase):
         stored = self.stored()
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
         self.assertIs(stored["ledger_held_open"], True)
+
+    def test_a_closed_ledger_is_not_remembered_for_its_issue(self):
+        """Reopened by hand, a closed ledger is not the empty one the close
+        left, so its next run must read a lost memory, not a trusted empty one."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertIsNone(self.stored()["issue_number"])
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+    def test_a_run_that_dies_before_its_write_leaves_no_trusted_memory(self):
+        """Killed between the issue edit and the store write, a run must not
+        leave the envelope of the run before it reading as current."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        self.assertTrue(list((self.store_dir() / "runs").glob("*.json")))
 
     def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)

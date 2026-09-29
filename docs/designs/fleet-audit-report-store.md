@@ -54,8 +54,10 @@ The write is best-effort: a store that cannot be written logs a warning and neve
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
 quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
-indistinguishable from a fresh one. Pruning runs in its own `try`: a failed prune has not damaged
-the memory the run just wrote.
+indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` as soon as it
+has read its memory, before it touches the issue: a run killed between editing the ledger and
+writing the store leaves no envelope rather than one describing the run before. Pruning runs in its
+own `try`: a failed prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
 ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
@@ -66,7 +68,9 @@ rides beside it as `ledger_document`, which only `finish` reads, for titles. `do
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
 handed the previous run's scope under this run's status; `ledger_held_open` tells that reader the
 issue still lists findings this run's zero does not. Where the previous memory is itself lost, the
-envelope names no issue, so the next run's trust check fails as a lost memory should.
+envelope names no issue, so the next run's trust check fails as a lost memory should. A run that
+closes the ledger names no issue either: reopened by hand, the issue is not the empty ledger that
+run left.
 
 ## 3. Where it lives
 
@@ -117,15 +121,17 @@ has no readable block — the memory is **lost**, unknowable rather than empty:
 - The body is rewritten. Freezing it until a run could read its memory would freeze it for good,
   since only a run that writes the body restores the store. Ids held on the lost body are no longer
   carried; with a manifest their pull requests stay protected by the still-flagged set.
-- A clean run closes, unless the collector still flags something the document does not carry. Then
-  it files the lost-memory coverage gap, stays open, and reports partial.
+- A clean run closes only when it passed a manifest and the collector flags nothing the document
+  does not carry. Otherwise it files a lost-memory coverage gap, stays open, and reports partial:
+  with no manifest, nothing says the findings the ledger carries were fixed, and an empty document
+  would close them and their pull requests.
 - A run with neither a memory nor a manifest answers no `/remediate`; the next run with a memory
   answers them.
 
 A lost memory therefore never puts a wrong count in a public issue. The delta annotation costs one
 cycle when that run writes the body, which a findings run or a close does. A clean run held open
-writes nothing to it, so the memory stays lost, and each such run files the gap again, until one
-rewrites the body or closes the ledger. The held rows cost more: a findings run rewrites the body
+writes nothing to it, so the memory stays lost, and each such run files the gap again, until a findings
+run rewrites the body or a human closes the ledger. The held rows cost more: a findings run rewrites the body
 without them, so the next run's memory has no marker id to hold and they are not rendered again.
 While the collector flags them they stay on each run's JSON line as `unpublished_candidates`, and
 their pull requests stay open; what is lost for good is their row on the ledger. A seeded run keeps

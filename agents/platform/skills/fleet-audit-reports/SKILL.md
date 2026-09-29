@@ -29,8 +29,10 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 - `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
-  run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `ledger_document` is
-  that previous document, kept for `fleet-audit`; do not answer from it.
+  run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and
+  `findings` all carry it. Held open over a lost memory, the envelope's `issue_number` is null and
+  `current` is empty: the store does not know what the issue lists, so read the issue.
+  `ledger_document` is that previous document, kept for `fleet-audit`; do not answer from it.
 - `current_ids` is the **rendered** id set, exactly what the body's hidden block published. Derive
   the full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
@@ -85,10 +87,11 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py show compliance-aud
 python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
 ```
 
-`show` gives `status`, `findings`, `critical`, `partial`, `ledger_held_open`, the delta counts and
-`issue_url`; name the criticals from `findings`. When `ledger_held_open` is true, this run found
-nothing new but the issue still carries `current` findings — say both, and point at the issue. Always hand back the issue URL — the store is where you read, the ledger
-is where a human acts.
+`show` gives, under `envelope`, `status`, `findings`, `critical`, `partial`, `ledger_held_open`, the
+delta counts and `issue_url`; name the criticals from `findings`. When `ledger_held_open` is true,
+this run found nothing but the issue still carries the previous run's findings — say both, and point
+at the issue. Always hand back the issue URL — the store is where you read, the ledger is where a
+human acts.
 
 **"What changed since the last run?"**
 
@@ -98,9 +101,11 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-aud
 
 Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. When
 `from_partial` or `to_partial` is true, that run could not see the whole fleet: a finding under
-`resolved` may be one it did not look at, so say "not seen", never "fixed". When `to_held_open`
-is true, the audit itself refused to resolve them; they are still on the issue. For a wider span, list
-the ring first and name two stamps, older as `--from` — a reversed pair is refused:
+`resolved` may be one it did not look at, so say "not seen", never "fixed". When `to_held_open` is
+true, the audit itself refused to resolve them; they are still on the issue. When `from_held_open`
+is true, the earlier run found nothing while the issue still listed older findings, so `added` may
+be findings the ledger already carried — say "found again", not "new". For a wider span, list the
+ring first and name two stamps, older as `--from` — a reversed pair is refused:
 
 ```bash
 python3 ./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit

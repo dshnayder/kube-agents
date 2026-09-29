@@ -907,6 +907,11 @@ LOST_MEMORY_GAP = (
     "carries are unknown, and the collector still flags something this run did "
     "not report; the ledger stays open over it"
 )
+LOST_MEMORY_UNGUARDED_GAP = (
+    "the report store holds no record of the open ledger and this run passed no "
+    "collector manifest, so nothing shows whether the findings it carries were "
+    "fixed; the ledger stays open over them"
+)
 # The width of a coverage hold rendered on a line of its own — the waiver's
 # reason in the Scope section and the delta comment. Wide enough for the
 # sentence an operator typed; `_cell`'s table width left a third of one.
@@ -1952,6 +1957,23 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         log(f"WARNING: stored report for {audit_id} has no readable ledger body.")
         return None
     return envelope
+
+
+def invalidate_report_memory(audit_id: str, repo: str) -> None:
+    """Drop `latest.json` before this run changes the ledger it describes.
+
+    From here until `write_report` the stored memory is about to be wrong: a
+    run killed after it edits the issue — the terminal's timeout is enough —
+    would leave a trusted envelope describing the run before, and the next
+    delta would be computed against it. Gone, it is a lost memory, which holds
+    the ledger open rather than miscounting. The ring is left alone.
+    """
+    try:
+        (reports_dir_for(audit_id, repo) / "latest.json").unlink()
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log(f"WARNING: could not set the stored report for {audit_id} aside ({exc}).")
 
 
 def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict | None:
@@ -11400,6 +11422,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # than empty — see `memory_lost` below. No open ledger is the one case that
     # genuinely is empty: the run is first, and everything present is new.
     memory = previous_run_memory(audit_id, existing_issue, repo)
+    invalidate_report_memory(audit_id, repo)
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
@@ -11498,10 +11521,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # open over that and says why, until the collector stops flagging it or the
     # document accounts for it. Only the clean branch closes anything, so the
     # findings branch needs no gap for this; its delta is withheld already.
+    # With no manifest there is no still-flagged set to hold on either, and an
+    # empty document would close the ledger and every pull request it carries
+    # over findings nothing says were fixed. It stays open until a findings run
+    # rewrites the body, or a human closes it.
     if memory_lost and not findings and (still_flagged - held_exclude):
         gaps.append(LOST_MEMORY_GAP)
         collector_gaps.append(LOST_MEMORY_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_GAP}")
+    elif memory_lost and not findings and manifest is None:
+        gaps.append(LOST_MEMORY_UNGUARDED_GAP)
+        collector_gaps.append(LOST_MEMORY_UNGUARDED_GAP)
+        log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -11872,7 +11903,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             if isinstance(carried, dict):
                 ledger_document = carried
         else:
-            stored_issue = existing_issue or opened_issue
+            # Either the ledger was just closed or none was open. A closed
+            # ledger names no issue in the store: reopened by hand, it is not
+            # the empty ledger this run left, and trusting that memory would
+            # announce every finding new and let an empty document close it
+            # again past the unaccounted guard.
+            stored_issue = opened_issue
             stored_body, stored_ids = opened_body, []
         write_report(
             audit_id,
