@@ -1949,6 +1949,35 @@ class ProjectDiscoveryTest(unittest.TestCase):
         self.assertEqual(manifest["clusters"], [])
         self.assertTrue(manifest["error"].startswith("nothing collected"))
 
+    @staticmethod
+    def compute_off_run(**fleet_kwargs):
+        """No cluster anywhere, and every project's Compute Engine API off."""
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                project = argv[argv.index("--project") + 1]
+                return run_of(1, "", f"ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project {project}")
+            return fleet_run({}, **fleet_kwargs)(argv, **kwargs)
+        return run
+
+    def test_a_failed_project_listing_is_named_when_nothing_is_collected(self):
+        """Without `--project`, the discovery entry is a real failure: a
+        `projects list` that failed took the rest of the fleet with it, and the
+        run error names it rather than saying nothing recorded an error."""
+        inner = self.compute_off_run()
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "ERROR: PERMISSION_DENIED")
+            return inner(argv, **kwargs)
+
+        error = self.collect(run)["error"]
+        self.assertIn(f"First: {fs.UNENUMERATED_PROJECTS_TARGET}: `gcloud projects list` rc=1", error)
+
+    def test_a_scoped_project_that_yields_nothing_says_why_not_what_was_skipped(self):
+        error = self.collect(self.compute_off_run(), project="acme")["error"]
+        self.assertNotIn(fs.UNENUMERATED_PROJECTS_TARGET, error)
+        self.assertIn(f"First: {fs.NO_TARGET_REASON}", error)
+
     def test_a_project_override_is_recorded_as_unenumerated(self):
         manifest = self.collect(fleet_run({"acme": ["c1"]}), project="acme")
         entry = next(c for c in manifest["clusters"] if c["name"] == fs.UNENUMERATED_PROJECTS_TARGET)

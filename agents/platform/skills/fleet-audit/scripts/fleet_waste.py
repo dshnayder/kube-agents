@@ -175,6 +175,11 @@ NOTHING_COLLECTED_ERROR = (
     "its cluster listing, went unread past the deadline, or has neither the Compute Engine nor "
     "the Artifact Registry API on. First: {first}"
 )
+# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
+# way a project yields nothing without recording why.
+NO_TARGET_REASON = (
+    "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
+)
 
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
@@ -502,6 +507,9 @@ CREATE_NODE_POOL_OPERATION = "CREATE_NODE_POOL"
 OPERATION_FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 # Decimal places a resize target keeps before it is ceiled to a whole unit.
 RESIZE_CEIL_DIGITS = 6
+# Relative slack when comparing a per-replica quotient against a request or
+# floor; see `_clearly_exceeds`.
+PER_REPLICA_RELATIVE_TOLERANCE = 1e-9
 
 SYSTEM_NAMESPACES = frozenset(
     {
@@ -2711,22 +2719,27 @@ def _resize_shrinks_request(
         return False
     request_per_replica = request_total / replicas
     target = _resize_target(peak_total, replicas, floor=floor, unit=unit)
-    # A relative tolerance, because the request is a per-replica quotient of a
-    # sum: three pods of `50m` total 0.15000000000000002, and a third of that
-    # is a hair over 0.05. An exact `>` would call that hair a reclaimable
-    # delta and report every three-replica controller sitting on the floor --
-    # the exact shape this gate exists to drop.
-    return request_per_replica - target > max(request_per_replica, target) * 1e-9
+    return _clearly_exceeds(request_per_replica, target)
+
+
+def _clearly_exceeds(larger: float, smaller: float) -> bool:
+    """`larger > smaller` by more than a relative hair. A relative tolerance,
+    because a request is compared as a per-replica quotient of a sum: three
+    pods of `50m` total 0.15000000000000002, and a third of that is a hair over
+    0.05. An exact `>` would call that hair a reclaimable delta and report
+    every three-replica controller sitting on the floor -- the exact shape
+    `_resize_shrinks_request` exists to drop."""
+    return larger - smaller > max(larger, smaller) * PER_REPLICA_RELATIVE_TOLERANCE
 
 
 def _below_resize_floor(request_total: float, replicas: int, *, floor: float) -> bool:
     """Whether the per-replica request sits under §3.1's resize floor, with
-    `_resize_shrinks_request`'s tolerance so a three-way split of `50m` is on
-    the floor rather than a hair beside it."""
+    the tolerance `_resize_shrinks_request` uses, so a three-way split of
+    `50m` is on the floor rather than a hair beside it."""
     if replicas <= 0:
         return False
     request_per_replica = request_total / replicas
-    return floor - request_per_replica > max(request_per_replica, floor) * 1e-9
+    return _clearly_exceeds(floor, request_per_replica)
 
 
 def _is_guaranteed(entry: dict) -> bool:
@@ -5599,8 +5612,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # retry can still bring it into scope.
         # The `--project` note is an error only in form: it says what this run
         # did not look at, never why the project it did look at yielded nothing.
+        # Without `--project` the same entry is a failed or filtered
+        # `projects list`, a real failure, so it stays eligible.
         first = next(
-            (e for e in entries if e.get("error") and e.get("name") != UNENUMERATED_PROJECTS_TARGET), None
+            (e for e in entries if e.get("error") and not (project and e.get("name") == UNENUMERATED_PROJECTS_TARGET)),
+            None,
         )
         return {
             "version": MANIFEST_VERSION,
@@ -5608,7 +5624,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             "audit": "fleet-wide-cost-analysis",
             "started_at": started_at,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "error": NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else "no project yielded any target"),
+            "error": NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else NO_TARGET_REASON),
             "clusters": [],
         }
 

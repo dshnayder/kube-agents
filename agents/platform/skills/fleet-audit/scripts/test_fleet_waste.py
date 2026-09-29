@@ -2824,6 +2824,20 @@ class UnderrequestTest(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "major")
         self.assertIn("190% of request", hits[0]["excerpt"])
 
+    def test_an_unread_peak_sizes_the_raise_from_the_mean(self):
+        """A memory series missing from the peak read is unmeasured, not zero.
+        Read as zero, the raise was sized at the 64Mi floor -- "Raise the
+        memory request to 64Mi" under a 512Mi request the workload already
+        exceeds. The mean stands in, since a peak is never below its mean."""
+        pod = self.pod()
+        means = {("kubeagents-system", "litellm-1"): 973.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, None)}
+        hits = self.check([pod], means, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("peak not read", hits[0]["excerpt"])
+        self.assertNotIn("64Mi", hits[0]["excerpt"])
+        self.assertIn("1265Mi", hits[0]["excerpt"])  # ceil(973 x 1.3)
+
     def test_a_container_with_no_memory_request_makes_the_mean_unattributable(self):
         pod = self.pod()
         pod["spec"]["containers"].append({"resources": {}})
@@ -3402,6 +3416,13 @@ class UnsizedWorkloadTest(unittest.TestCase):
         complained about."""
         self.assertEqual(self.check([self.pod()], {("argocd", "other-pod"): (0.5, 500.0)}), [])
         self.assertEqual(self.check([self.pod()], {}), [])
+
+    def test_a_controller_measured_on_one_dimension_is_not_reported(self):
+        """A pod with a CPU series and no memory series is unmeasured on
+        memory: sized from a zero, the recommendation would request the 64Mi
+        floor for a workload nobody measured."""
+        self.assertEqual(self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.5, None)}), [])
+        self.assertEqual(self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (None, 500.0)}), [])
 
     def test_a_measured_but_idle_controller_still_gets_a_floor(self):
         """A near-silent sidecar measured at almost nothing must not be handed
@@ -5244,6 +5265,21 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertEqual(manifest["clusters"], [])
         self.assertIn("nothing collected", manifest["error"])
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
+        self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
+
+    def test_a_failed_project_listing_is_named_when_nothing_is_collected(self):
+        """Without `--project`, the discovery entry is a real failure: a
+        `projects list` that failed took the rest of the fleet with it, and the
+        run error names it rather than saying nothing recorded an error."""
+        inner = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "ERROR: PERMISSION_DENIED")
+            return inner(argv, **kwargs)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        self.assertIn(f"First: {fw.UNENUMERATED_PROJECTS_TARGET}: `gcloud projects list` rc=1", manifest["error"])
 
     def test_compute_off_declares_its_checks_inapplicable_and_still_reads_the_registry(self):
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: None)

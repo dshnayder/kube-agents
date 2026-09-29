@@ -213,11 +213,16 @@ NOTHING_COLLECTED_ERROR = (
     "its cluster listing, went unread past the deadline, or has the Compute Engine API off "
     "and no cluster. First: {first}"
 )
+# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
+# way a project yields nothing without recording why.
+NO_TARGET_REASON = (
+    "no project in scope recorded an error, so each holds no cluster and has the Compute Engine API off"
+)
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
-# `collect.py` carry, copied rather than imported: this collector imports only
-# the leaf parsers it shares with them, so a change to either sibling's
-# exclusions cannot move this stream's.
+# `collect.py` carry, copied rather than imported: this collector imports
+# nothing from either sibling, so it runs standalone and a change to either
+# sibling's exclusions cannot move this stream's.
 SYSTEM_NAMESPACES = frozenset(
     {
         "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
@@ -2018,10 +2023,13 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         # rather than a manifest nothing can be built from.
         # The `--project` note is an error only in form: it says what this run
         # did not look at, never why the project it did look at yielded nothing.
+        # Without `--project` the same entry is a failed or filtered
+        # `projects list`, a real failure, so it stays eligible.
         first = next(
-            (e for e in entries if e.get("error") and e.get("name") != UNENUMERATED_PROJECTS_TARGET), None
+            (e for e in entries if e.get("error") and not (project and e.get("name") == UNENUMERATED_PROJECTS_TARGET)),
+            None,
         )
-        return failed(NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else "no project yielded any target"))
+        return failed(NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else NO_TARGET_REASON))
 
     return {
         "version": MANIFEST_VERSION,
