@@ -22,11 +22,13 @@ import (
 	stderrors "errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -5771,20 +5773,40 @@ func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy
 	}
 }
 
-// An entry over 2048 characters is exactly what cannot be read, and a
-// ConfigMap value holds far more than a condition message may: a message over
-// the CRD's 32768 fails the whole status write, every pass.
-func TestMinterHeldMessageStaysUnderTheConditionCap(t *testing.T) {
-	long := "https://github.com/test-org/" + strings.Repeat("c", 40000)
-	msg := minterHeldMessage("held-gitops-state", []string{long, long, long, long})
-	if len(msg) > 32768 {
-		t.Fatalf("len(message) = %d, over the CRD's 32768", len(msg))
+// A credential in a hand-written entry stays out of the operator's log, from
+// an entry it cannot read and from one it reads but skips for its organisation.
+func TestMinterBareReposLogsNoEntryValue(t *testing.T) {
+	const secret = "ghp_notarealtoken"
+	var logged strings.Builder
+	logger := funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{Verbosity: 1})
+	repos := `[{"type":"github","url":"https://x:` + secret + `@github.com:test-org/held"},` +
+		`{"type":"github","url":"https://x:` + secret + `@github.com/other-org/app"},` +
+		`{"type":"gitlab","url":"https://x:` + secret + `@gitlab.com/g/p"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
 	}
-	if !strings.Contains(msg, "https://github.com/test-org/ccc") || !strings.Contains(msg, "and 1 more") {
-		t.Errorf("message = %.200q..., expected each entry's start and the count of the rest", msg)
+	if !slices.Equal(bare, []string{"repo-1"}) || !slices.Equal(unreadable, []string{"managed_repos[0]"}) {
+		t.Errorf("minterBareRepos() = (%v, %v), expected ([repo-1], [managed_repos[0]])", bare, unreadable)
 	}
-	if short := minterHeldMessage("held-gitops-state", []string{"ssh://git@github.com:o/r"}); !strings.Contains(short, "(ssh://git@github.com:o/r)") {
-		t.Errorf("message = %q, expected a short entry verbatim", short)
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("log quotes an entry's credential:\n%s", logged.String())
+	}
+}
+
+// The unreadable entries are named by list and index, so the message is
+// bounded whatever the ConfigMap holds; past minterHeldEntriesShown it counts
+// the rest.
+func TestMinterHeldMessageNamesEntriesByPosition(t *testing.T) {
+	msg := minterHeldMessage("held-gitops-state", []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "context_repos[2]"})
+	for _, want := range []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "and 1 more"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, expected it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "context_repos[2]") {
+		t.Errorf("message = %q names more than %d entries", msg, minterHeldEntriesShown)
 	}
 }
 
@@ -5805,11 +5827,15 @@ func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
 		},
 	}
-	const unreadable = "ssh://git@github.com:test-org/repo-y"
+	// A hand-written clone URL with a credential, in a spelling this release
+	// refuses. The blank entry ahead of it is dropped, and must not shift the
+	// index the message names it by.
+	const secret = "ghp_notarealtoken"
+	const unreadable = "https://x:" + secret + "@github.com:test-org/repo-y"
 	state := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "held-gitops-state", Namespace: "test-ns"},
 		Data: map[string]string{
-			"managed_repos": `[{"type":"github","url":"` + unreadable + `"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
+			"managed_repos": `[{"type":"github","url":""},{"type":"github","url":"` + unreadable + `"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
 		},
 	}
 	minterCM := &corev1.ConfigMap{
@@ -5848,8 +5874,11 @@ func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonMinterPruningHeld {
 		t.Fatalf("Degraded = %v, expected True/%s", degraded, conditionReasonMinterPruningHeld)
 	}
-	if !strings.Contains(degraded.Message, unreadable) {
-		t.Errorf("Degraded message %q does not name the held entry", degraded.Message)
+	if !strings.Contains(degraded.Message, "managed_repos[1]") {
+		t.Errorf("Degraded message %q does not name the held entry by its position", degraded.Message)
+	}
+	if strings.Contains(degraded.Message, secret) {
+		t.Errorf("Degraded message %q quotes the entry's credential", degraded.Message)
 	}
 	if ready := meta.FindStatusCondition(got.Status.Conditions, "Ready"); ready == nil || ready.Reason == conditionReasonMinterPruningHeld {
 		t.Errorf("Ready = %v; the hold is reported on Degraded only", ready)
@@ -6260,6 +6289,9 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// git and this parser read the host after the last `@`, the agent after
 		// the first, so it reads this one as host `b@github.com` and skips it.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "a@b@github.com:gke-labs/kube-agents"},
+		// The agent refuses a value over 256 characters before it parses it, so
+		// a long credential in the userinfo makes an entry it skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {

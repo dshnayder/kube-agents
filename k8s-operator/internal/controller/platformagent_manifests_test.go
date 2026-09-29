@@ -6880,6 +6880,25 @@ func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
 			},
 		},
 		{
+			// The agent reads the first managed_repos entry as its GitOps
+			// repository, so an accepted managed one must not take the place of
+			// a refused gitops one. Context repositories hold no such place.
+			name: "a refused gitops repository seeds no managed one in its place",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "in fra", Role: "gitops"},
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+			}},
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			name: "managed repositories are seeded where no gitops one is declared",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+		},
+		{
 			// Before this change the operator wrote
 			// {"type":"github","url":"https://github.com/group/project"} here: the
 			// host was discarded, the two remaining slashes passed the shape check,

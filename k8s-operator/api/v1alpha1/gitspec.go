@@ -367,9 +367,11 @@ func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
 		return false
 	}
 	_, rejected := ri.check()
+	// Only a write repository names the organisation, so only an accepted one
+	// can stand in for a refused declaration of the same repository.
 	accepted := map[string]bool{}
 	for _, r := range ri.Repositories {
-		if !rejected[r] {
+		if !rejected[r] && r.Role != RepositoryRoleContext {
 			if ref, err := r.Resolve(); err == nil {
 				accepted[strings.ToLower(ref.URL())] = true
 			}
@@ -384,8 +386,8 @@ func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
 	})
 }
 
-// restatesAccepted reports that a refused repository names, by itself, one
-// that validation accepted: a second declaration of it, or a full URL of it
+// restatesAccepted reports that a refused repository names, by itself, a write
+// repository that validation accepted: a second declaration of it, or a full URL of it
 // beside a namespace override the grammar refused and the URL never used. Its
 // refusal cannot move the organisation, which the accepted one already names.
 // It is read without the namespace, so a bare name the override would have

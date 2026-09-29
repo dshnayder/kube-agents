@@ -1522,23 +1522,17 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 	// how the discriminator reaches the agent — written down rather than
 	// inferred from the URL's text. Only entries Problems accepts are seeded:
 	// with the webhook off, nothing else stops a refused one reaching the
-	// agent and the minter.
+	// agent and the minter. The agent reads the first managed_repos entry as
+	// its GitOps repository, so while a declared gitops repository is refused
+	// no managed one is seeded either: it would take that place.
 	if agent.Spec.Integration != nil {
 		resolved, err := agent.Spec.Integration.ResolveGit()
 		if err != nil {
 			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
 		} else {
-			lists := []struct {
-				key   string
-				repos []*agentv1alpha1.ResolvedRepository
-			}{
-				{gitopsStateManagedReposKey, append(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps),
-					resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)...)},
-				{gitopsStateContextReposKey, resolved.Accepted(agentv1alpha1.RepositoryRoleContext)},
-			}
-			for _, list := range lists {
+			seedEntries := func(repos []*agentv1alpha1.ResolvedRepository) []agentv1alpha1.ManagedRepoEntry {
 				var entries []agentv1alpha1.ManagedRepoEntry
-				for _, repo := range list.repos {
+				for _, repo := range repos {
 					entry, err := repo.ManagedRepoEntry()
 					if err != nil {
 						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
@@ -1547,11 +1541,23 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 					}
 					entries = append(entries, entry)
 				}
+				return entries
+			}
+			managed := seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps))
+			if len(managed) == 0 && resolved.GitOps() != nil {
+				manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
+			} else {
+				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
+			}
+			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
+				gitopsStateManagedReposKey: managed,
+				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
+			} {
 				if len(entries) == 0 {
 					continue
 				}
 				if jsonBytes, err := json.Marshal(entries); err == nil {
-					data[list.key] = string(jsonBytes)
+					data[key] = string(jsonBytes)
 				}
 			}
 		}

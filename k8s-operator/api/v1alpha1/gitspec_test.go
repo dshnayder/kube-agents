@@ -734,6 +734,43 @@ func TestPrimaryNamespace(t *testing.T) {
 	}
 }
 
+// TestScopeRefusedIgnoresAContextRestatement covers the refused write
+// repository whose accepted twin is a context one. PrimaryNamespace reads
+// write repositories only, so it is empty either way; ScopeRefused is what
+// stops the minter sync from running with that empty organisation, which
+// accepts every one.
+func TestScopeRefusedIgnoresAContextRestatement(t *testing.T) {
+	cases := []struct {
+		name  string
+		repos []RepositorySpec
+		want  bool
+	}{
+		{name: "a duplicate of a context repository", repos: []RepositorySpec{
+			repo("github", "acme/infra", RepositoryRoleContext),
+			repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+		}, want: true},
+		{name: "a full URL beside a refused override, twinned by a context repository", repos: []RepositorySpec{
+			repo("github", "acme/infra", RepositoryRoleContext),
+			{Forge: "github", Repository: "https://github.com/acme/infra", Namespace: "bad_ns", Role: RepositoryRoleGitOps},
+		}, want: true},
+		{name: "a duplicate of a write repository", repos: []RepositorySpec{
+			repo("github", "acme/infra", RepositoryRoleManaged),
+			repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+		}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := (&IntegrationSpec{Forges: []ForgeSpec{{Name: "github"}}, Repositories: tc.repos}).ResolveGit()
+			if err != nil {
+				t.Fatalf("ResolveGit() = %v", err)
+			}
+			if got := resolved.ScopeRefused(GitProviderGitHub); got != tc.want {
+				t.Errorf("ScopeRefused() = %v, expected %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCredentialsRefOnGitHubIsAWarningNotAnError(t *testing.T) {
 	spec := &IntegrationSpec{Forges: []ForgeSpec{{
 		Name: "github", Namespace: "gke-labs",

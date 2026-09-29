@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -245,9 +246,11 @@ const (
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
 	conditionReasonMinterPruningHeld = "MinterPruningHeld"
+	// agentRepoRefMaxLength is repo_ref.py's MAX_REPO_LENGTH: the agent
+	// refuses a managed_repos value longer than this before parsing it.
+	agentRepoRefMaxLength = 256
 	// minterHeldEntriesShown caps how many held entries the condition names.
 	minterHeldEntriesShown     = 3
-	minterHeldEntryBudget      = hostPathDroppedEntryBudget / minterHeldEntriesShown
 	gitopsStateConfigMapSuffix = "-gitops-state"
 	managedReposConfigMapKey   = "managed_repos"
 
@@ -1102,26 +1105,35 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 }
 
 func parseManagedRepoEntries(raw string) ([]agentv1alpha1.ManagedRepoEntry, error) {
+	entries, _, err := parseManagedRepoEntriesAt(raw)
+	return entries, err
+}
+
+// parseManagedRepoEntriesAt is parseManagedRepoEntries with each entry's index
+// in the JSON array, which a blank entry it drops would otherwise shift.
+func parseManagedRepoEntriesAt(raw string) ([]agentv1alpha1.ManagedRepoEntry, []int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if !strings.HasPrefix(raw, "[") {
-		return nil, fmt.Errorf("managed_repos JSON must be an array starting with '['")
+		return nil, nil, fmt.Errorf("managed_repos JSON must be an array starting with '['")
 	}
 	var entries []agentv1alpha1.ManagedRepoEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal managed_repos JSON: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal managed_repos JSON: %w", err)
 	}
 	var res []agentv1alpha1.ManagedRepoEntry
-	for _, e := range entries {
+	var positions []int
+	for i, e := range entries {
 		u := strings.TrimSpace(e.URL)
 		t := strings.TrimSpace(e.Type)
 		if u != "" && t != "" {
 			res = append(res, agentv1alpha1.ManagedRepoEntry{Type: t, URL: u})
+			positions = append(positions, i)
 		}
 	}
-	return res, nil
+	return res, positions, nil
 }
 
 func parseManagedRepos(raw string) ([]string, error) {
@@ -1315,6 +1327,12 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if strings.Count(existing.URL, "@") > 1 {
 		return false
 	}
+	// The agent refuses a value over its bound before it reads the syntax;
+	// this parser's bound is MaxGitRepoURLLength, so userinfo can push an
+	// entry past the agent's and still resolve here.
+	if utf8.RuneCountInString(strings.TrimSpace(existing.URL)) > agentRepoRefMaxLength {
+		return false
+	}
 	provider, err := agentv1alpha1.LookupGitProvider(seeded.Type)
 	if err != nil {
 		return false
@@ -1446,30 +1464,34 @@ func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
 // because an empty result would read as "no repositories" and prune every
 // policy the operator tracks. An entry that does not resolve is returned in
 // unreadable, so the caller can tell a repository that left the list from one
-// it could not read.
+// it could not read. It is named by list and index, as "managed_repos[2]",
+// never by value: a hand-written clone URL can carry a credential, and the
+// names reach the operator's log and the CR's status. The parser's errors
+// quote the value too, so they are not logged either.
 func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) (bare, unreadable []string, err error) {
 	reposStr = strings.TrimSpace(reposStr)
 	if reposStr == "" {
 		return nil, nil, nil
 	}
-	entries, err := parseManagedRepoEntries(reposStr)
+	entries, positions, err := parseManagedRepoEntriesAt(reposStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
 	}
 	seen := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
+	for i, entry := range entries {
 		// Another forge's entry is not the minter's: it never had a policy, and
 		// the agent skips it by type too. Read as a GitHub URL it would be
 		// unreadable, and hold every tracked policy for as long as it is listed.
 		if entry.Type != agentv1alpha1.GitProviderGitHub {
-			logger.V(1).Info("skipping a non-GitHub repository entry in minter policy sync", "list", listName, "type", entry.Type, "repo", entry.URL)
+			logger.V(1).Info("skipping a non-GitHub repository entry in minter policy sync", "list", listName, "index", positions[i], "type", entry.Type)
 			continue
 		}
 		fullRepo := entry.URL
 		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
 		if err != nil {
-			logger.Info("skipping a repository entry the minter policy sync cannot read", "list", listName, "repo", fullRepo, "error", err.Error())
-			unreadable = append(unreadable, fullRepo)
+			entryName := fmt.Sprintf("%s[%d]", listName, positions[i])
+			logger.Info("skipping a repository entry the minter policy sync cannot read", "entry", entryName)
+			unreadable = append(unreadable, entryName)
 			continue
 		}
 		parts := strings.SplitN(slug, "/", 2)
@@ -1479,7 +1501,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		repoOrg, bareRepo := parts[0], parts[1]
 		if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
 			logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
-				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+				"list", listName, "repo", slug, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
 			continue
 		}
 		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
@@ -1488,7 +1510,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 			// from, and a read-only rendering there strips the write scope from
 			// every managed repository.
 			logger.Info("skipping repository whose minter policy key would be the base template",
-				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+				"list", listName, "repo", slug, "key", minterBaseTemplateKey)
 			continue
 		}
 		if _, exists := seen[bareRepo]; exists {
@@ -1554,20 +1576,12 @@ func (r *PlatformAgentReconciler) minterHeldEntries(ctx context.Context, agent *
 	return slices.Concat(managed, contextHeld)
 }
 
-// minterHeldMessage names at most minterHeldEntriesShown held entries, each
-// cut to its share of hostPathDroppedEntryBudget. An entry is a URL an
-// administrator wrote into the ConfigMap, of any length -- one over 2048
-// characters is exactly what lands here -- and the status write that carries
-// the message is the whole status write.
+// minterHeldMessage names at most minterHeldEntriesShown held entries, by the
+// list-and-index names minterBareRepos gives them: the values are
+// administrator-written URLs that can carry a credential, and the Degraded
+// message is readable by anyone who can read the PlatformAgent.
 func minterHeldMessage(cmName string, held []string) string {
-	entries := make([]string, 0, minterHeldEntriesShown)
-	for _, entry := range held[:min(len(held), minterHeldEntriesShown)] {
-		if len(entry) > minterHeldEntryBudget {
-			entry = truncateToValidUTF8(entry, minterHeldEntryBudget-len(hostPathDroppedEntryEllipsis)) + hostPathDroppedEntryEllipsis
-		}
-		entries = append(entries, entry)
-	}
-	shown := strings.Join(entries, hostPathDroppedEntrySeparator)
+	shown := strings.Join(held[:min(len(held), minterHeldEntriesShown)], hostPathDroppedEntrySeparator)
 	if extra := len(held) - minterHeldEntriesShown; extra > 0 {
 		shown += fmt.Sprintf(" and %d more", extra)
 	}
