@@ -11,18 +11,26 @@ owns both ends of that lifecycle.
 
 ## The store
 
-`/opt/data/fleet-audit/reports/<audit-id>/`, one directory per stream:
+`/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
+repository — a stream publishes one ledger per managed repository:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
   run-over-run history that exists anywhere: the ledger issue rewrites itself in place.
 
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
-`partial`, `coverage_gaps`, `prs_opened`, `prs_closed`, `silent_ok`, `new_ids`, `resolved_ids`,
-`current_ids`, `id_scheme`, `ledger_body`, and `document`.
+`partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
+`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
+`new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`, `document`, and sometimes
+`ledger_document`.
 
-- `document` is the whole validated findings document — un-clipped, so it holds findings the issue
-  body had no room to print.
+- `document` is this run's whole validated findings document — un-clipped, so it holds findings the
+  issue body had no room to print.
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. A `CLEAN` or `HELD` run that left the issue
+  open (partial, or holding it over findings it did not account for) did not rewrite the body, so
+  the issue still shows the previous run's findings, and `current` counts those rather than this
+  run's zero. `ledger_document` is that previous document, kept for `fleet-audit`; do not answer
+  from it.
 - `current_ids` is the **rendered** id set, exactly what the body's hidden block published. Derive
   the full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
@@ -41,19 +49,22 @@ Answering "how many criticals are open?" that way spends tens of thousands of to
 `python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
 object per call.
 
-| Subcommand                          | Answers                                                   |
-| ----------------------------------- | --------------------------------------------------------- |
-| `streams`                           | one row per stream: last run, status, counts, liveness    |
-| `show <stream>`                     | one run's envelope **without** `document`                 |
-| `findings <stream>`                 | finding id, severity, title, cluster, check — filterable  |
-| `finding <stream> <id>`             | one finding in full; the only call that returns prose     |
-| `checks <stream>`                   | the command behind each check that ran, plus exclusions   |
-| `diff <stream> [--from S] [--to S]` | ids and titles added and resolved between two runs        |
-| `runs <stream>`                     | the stamps the ring holds, so a `diff` can name real ones |
+| Subcommand                          | Answers                                                               |
+| ----------------------------------- | --------------------------------------------------------------------- |
+| `streams`                           | one row per stream and repository: last run, status, counts, liveness |
+| `show <stream>`                     | one run's envelope **without** `document`                             |
+| `findings <stream>`                 | finding id, severity, title, cluster, check — filterable              |
+| `finding <stream> <id>`             | one finding in full; the only call that returns prose                 |
+| `checks <stream>`                   | the command behind each check that ran, plus exclusions               |
+| `diff <stream> [--from S] [--to S]` | ids and titles added and resolved between two runs                    |
+| `runs <stream>`                     | the stamps the ring holds, so a `diff` can name real ones             |
 
 - Exit 0 answered the question. Exit 2 could not, and stdout still holds one JSON object whose
   `error` says why — absent store, absent stream, absent stamp, a file that would not parse. Every
   answer carries an `error` key, null on success.
+- Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
+  published to one repository; when it has published to several, the answer is exit 2 with the
+  `repos` to choose from — ask which, or run once per repository, never pick one silently.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run.
 - `--severity`, `--cluster` and `--check` on `findings`, and `--cluster` and `--check` on `checks`,
   are exact matches, case-insensitive.
@@ -83,8 +94,10 @@ is where a human acts.
 python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
 ```
 
-Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. For a wider
-span, list the ring first and name two stamps:
+Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. When
+`from_partial` or `to_partial` is true, that run could not see the whole fleet: a finding under
+`resolved` may be one it did not look at, so say "not seen", never "fixed". For a wider span, list
+the ring first and name two stamps, older as `--from` — a reversed pair is refused:
 
 ```bash
 python3 ./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit

@@ -33,6 +33,7 @@ import report_query  # noqa: E402
 AUDIT = "compliance-audit"
 OTHER = "obtainability-audit"
 PROSE = "PROSE-MARKER"
+REPO = "acme/fleet"
 
 
 @contextlib.contextmanager
@@ -135,16 +136,19 @@ class StoreTestCase(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def stream_dir(self, audit_id):
-        path = Path(self.root) / audit_id
+    def stream_dir(self, audit_id, repo=REPO):
+        """The store one stream keeps for one repository."""
+        path = Path(self.root) / audit_id / repo
         (path / "runs").mkdir(parents=True, exist_ok=True)
         return path
 
-    def write_run(self, audit_id, stamp, findings, *, latest=True, **overrides):
+    def write_run(self, audit_id, stamp, findings, *, latest=True, repo=REPO, **overrides):
         """One ring entry, and (by default) the `latest.json` copy of it."""
-        directory = self.stream_dir(audit_id)
+        directory = self.stream_dir(audit_id, repo)
         text = json.dumps(
-            envelope(audit_id, f"{stamp}+00:00", findings, **overrides), indent=2, sort_keys=True
+            envelope(audit_id, f"{stamp}+00:00", findings, repo=repo, **overrides),
+            indent=2,
+            sort_keys=True,
         )
         (directory / "runs" / f"{stamp}.json").write_text(text, encoding="utf-8")
         if latest:
@@ -220,7 +224,7 @@ class TestArgumentsStayInsideTheStore(StoreTestCase):
         self.addCleanup(self.outside.unlink, missing_ok=True)
 
     def test_a_run_that_walks_out_of_the_ring_is_refused(self):
-        escape = os.path.relpath(self.outside, Path(self.root) / AUDIT / "runs")[: -len(".json")]
+        escape = os.path.relpath(self.outside, Path(self.root) / AUDIT / REPO / "runs")[: -len(".json")]
         payload = self.refused("show", AUDIT, "--run", escape)
         self.assertIn("not a name inside the report store", payload["error"])
 
@@ -303,7 +307,7 @@ class TestStreams(StoreTestCase):
 
     def test_an_unparseable_envelope_is_an_error_row_and_a_nonzero_exit(self):
         self.stream_dir(AUDIT)
-        (Path(self.root) / AUDIT / "latest.json").write_text("{not json", encoding="utf-8")
+        (Path(self.root) / AUDIT / REPO / "latest.json").write_text("{not json", encoding="utf-8")
         code, payload = self.query("streams")
         self.assertEqual(code, 2)
         self.assertIn(AUDIT, payload["error"])
@@ -314,7 +318,7 @@ class TestStreams(StoreTestCase):
     def test_one_broken_stream_does_not_hide_the_others(self):
         self.write_run(OTHER, "20260826T070500.000000Z", [finding("q")])
         self.stream_dir(AUDIT)
-        (Path(self.root) / AUDIT / "latest.json").write_text("[]", encoding="utf-8")
+        (Path(self.root) / AUDIT / REPO / "latest.json").write_text("[]", encoding="utf-8")
         rows = {row["audit_id"]: row for row in self.query("streams")[1]["streams"]}
         self.assertEqual(rows[OTHER]["findings"], 1)
         self.assertEqual(rows[AUDIT]["liveness"], "error")
@@ -391,7 +395,7 @@ class TestUnknownIsNotClean(StoreTestCase):
         """`write_report` unlinks `latest.json` when its write fails, so the
         ring can hold entries while the newest record is gone."""
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
-        os.unlink(Path(self.root) / AUDIT / "latest.json")
+        os.unlink(Path(self.root) / AUDIT / REPO / "latest.json")
         payload = self.refused("findings", AUDIT)
         self.assertIn("unknown, not clean", payload["error"])
         self.assertEqual(payload["runs"], ["20260826T063100.000000Z.json"])
@@ -521,10 +525,22 @@ class TestDiff(StoreTestCase):
         self.assertEqual(payload["added_total"], 1)
         self.assertEqual(payload["resolved_total"], 1)
 
+    def test_reversed_stamps_are_refused_rather_than_swapped(self):
+        payload = self.refused("diff", AUDIT, "--from", self.third, "--to", self.first)
+        self.assertIn("is not older than", payload["error"])
+
     def test_to_alone_diffs_against_the_run_before_it(self):
         payload = self.ok("diff", AUDIT, "--to", self.second)
         self.assertEqual(payload["from"], self.first)
         self.assertEqual([row["id"] for row in payload["resolved"]], ["a"])
+
+    def test_a_partial_run_is_flagged_so_unseen_does_not_read_as_fixed(self):
+        payload = self.ok("diff", AUDIT)
+        self.assertFalse(payload["from_partial"])
+        self.assertFalse(payload["to_partial"])
+        later = self.write_run(AUDIT, "20260904T060000.000000Z", [], partial=True)
+        payload = self.ok("diff", AUDIT, "--to", later)
+        self.assertTrue(payload["to_partial"])
 
     def test_the_oldest_entry_has_nothing_behind_it(self):
         payload = self.refused("diff", AUDIT, "--to", self.first)
@@ -562,6 +578,47 @@ class TestDiff(StoreTestCase):
         self.assertTrue(payload["truncated"])
 
 
+class TestRepositories(StoreTestCase):
+    """A stream an SOP finishes once per managed repository keeps one store
+    per repository, and no answer mixes two."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_run(AUDIT, "20260825T063100.000000Z", [finding("a")])
+        self.write_run(
+            AUDIT, "20260825T064100.000000Z", [finding("z")], repo="acme/other", issue_number=7
+        )
+
+    def test_streams_carries_a_row_per_repository(self):
+        rows = self.ok("streams")["streams"]
+        self.assertEqual(
+            [(row["audit_id"], row["repo"], row["issue_number"]) for row in rows],
+            [(AUDIT, REPO, 128), (AUDIT, "acme/other", 7)],
+        )
+
+    def test_a_per_run_question_names_one_or_is_refused(self):
+        payload = self.refused("findings", AUDIT)
+        self.assertIn("name one with --repo", payload["error"])
+        self.assertEqual(payload["repos"], [REPO, "acme/other"])
+        chosen = self.ok("findings", AUDIT, "--repo", "acme/other")
+        self.assertEqual(chosen["repo"], "acme/other")
+        self.assertEqual([row["id"] for row in chosen["findings"]], ["z"])
+
+    def test_diff_reads_one_repositorys_ring(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("b")])
+        payload = self.ok("diff", AUDIT, "--repo", REPO)
+        self.assertEqual([row["id"] for row in payload["added"]], ["b"])
+        self.assertEqual([row["id"] for row in payload["resolved"]], ["a"])
+
+    def test_an_unknown_or_malformed_repository_is_refused(self):
+        self.assertEqual(
+            self.refused("show", AUDIT, "--repo", "acme/none")["repos"], [REPO, "acme/other"]
+        )
+        self.assertIn(
+            "is not owner/name", self.refused("show", AUDIT, "--repo", "../acme")["error"]
+        )
+
+
 class TestRuns(StoreTestCase):
     def test_it_lists_stamps_without_reading_a_single_envelope(self):
         first = self.write_run(AUDIT, "20260825T063100.000000Z", [finding("a")], latest=False)
@@ -569,7 +626,7 @@ class TestRuns(StoreTestCase):
         # A ring entry nothing can parse. `runs` still answers, because a stamp
         # listing that reads fourteen documents is the cost this command exists
         # to avoid.
-        broken = Path(self.root) / AUDIT / "runs" / "20260827T063100.000000Z.json"
+        broken = Path(self.root) / AUDIT / REPO / "runs" / "20260827T063100.000000Z.json"
         broken.write_text("{not json", encoding="utf-8")
         payload = self.ok("runs", AUDIT)
         self.assertEqual(payload["runs"], [first, second, broken.name])
@@ -579,7 +636,7 @@ class TestRuns(StoreTestCase):
 
     def test_a_temp_file_mid_write_is_not_a_run(self):
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
-        (Path(self.root) / AUDIT / "runs" / "tmpabc123.tmp").write_text("{", encoding="utf-8")
+        (Path(self.root) / AUDIT / REPO / "runs" / "tmpabc123.tmp").write_text("{", encoding="utf-8")
         self.assertEqual(self.ok("runs", AUDIT)["count"], 1)
 
     def test_an_absent_stream_is_refused(self):

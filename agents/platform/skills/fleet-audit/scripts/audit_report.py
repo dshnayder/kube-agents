@@ -391,6 +391,10 @@ REPORT_HISTORY = 14
 # The ring's filename: a UTC stamp that sorts lexically in time order, to the
 # microsecond so two runs finishing in one second do not replace each other.
 REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+# One path segment of the `owner/name` a store directory is keyed on. The
+# GitHub charset, and never `.` or `..`, so a repository can only ever name a
+# directory under its stream's.
+REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
@@ -1715,8 +1719,11 @@ def release_in_flight(audit_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # The report store — what `finish` published, kept where it ran.
 #
-# `reports/<audit-id>/runs/<stamp>.json` is a ring of the newest
-# REPORT_HISTORY envelopes and `latest.json` a copy of the newest. Two readers:
+# `reports/<audit-id>/<owner>/<name>/runs/<stamp>.json` is a ring of the newest
+# REPORT_HISTORY envelopes and `latest.json` a copy of the newest, one store
+# per repository a stream publishes to: an SOP that walks `managed_repos`
+# finishes the stream once per repository, and a store shared between them
+# would hand each run the other repository's memory. Two readers:
 # the chat path (the fleet-audit-reports skill and `report_status.py`), which
 # answers "what did the last run find" from keys rather than from a rendered
 # issue, and the next `finish`, whose memory of the previous run this is. The
@@ -1726,14 +1733,22 @@ def release_in_flight(audit_id: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def reports_dir_for(audit_id: str) -> Path:
-    """The store directory for one stream.
+def reports_dir_for(audit_id: str, repo: str) -> Path:
+    """The store directory for one stream's ledger in one repository.
 
-    Re-read at call time, with the import-time value as the fallback, which is
-    what the readers do: a write side that saw a different root from its
-    readers would put the report where nobody looks, with no error anywhere.
+    The root is re-read at call time, with the import-time value as the
+    fallback, which is what the readers do: a write side that saw a different
+    root from its readers would put the report where nobody looks, with no
+    error anywhere. Raises ValueError for a `repo` that is not `owner/name`.
     """
-    return Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR) / audit_id
+    segments = str(repo).split("/")
+    if len(segments) != 2 or not all(
+        REPORT_REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir)
+        for part in segments
+    ):
+        raise ValueError(f"repository {repo!r} is not owner/name")
+    root = Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR)
+    return root / audit_id / segments[0] / segments[1]
 
 
 def _redact_document(value: object) -> object:
@@ -1759,6 +1774,7 @@ def report_envelope(
     new_ids: list[str],
     resolved_ids: list[str],
     rendered_ids: list[str],
+    ledger_document: dict | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -1770,16 +1786,18 @@ def report_envelope(
     instead of trusting a body that is not the one on GitHub.
 
     `current_ids` is the rendered set, exactly what the body's hidden block
-    lists; the full set is derivable from `document`. `document` is the
-    validated document the ledger rendered, whole rather than clipped to the
-    body's budget, with the body's redaction backstop applied to every string.
+    lists. `document` is this run's validated document, whole rather than
+    clipped to the body's budget, with the body's redaction backstop applied
+    to every string. Where the body was carried forward, `ledger_document` is
+    the document that body rendered: `document`
+    answers "what did this run find", `ledger_document` is `finish`'s memory
+    of the ledger, and a reader of one must never be handed the other.
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
 
-    `repo` is here because the store is keyed by stream alone, and an SOP that
-    walks `managed_repos` in sequence finishes one stream once per repository:
-    issue numbers are per repository, so `acme/a#38` and `acme/b#38` would
-    otherwise pass the issue check against each other's memory.
+    `repo` names the store directory the envelope is written under, and is
+    checked again on the read: issue numbers are per repository, so a store
+    moved or copied between repositories must not pass the issue check.
     """
     return {
         "audit_id": audit_id,
@@ -1805,6 +1823,11 @@ def report_envelope(
         "id_scheme": ID_SCHEME,
         "ledger_body": ledger_body,
         "document": _redact_document(document),
+        **(
+            {"ledger_document": _redact_document(ledger_document)}
+            if ledger_document is not None
+            else {}
+        ),
     }
 
 
@@ -1834,7 +1857,11 @@ def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
     Called on the exit-0 publish path only; a dry run, a rejected document and
     `remediate` return before reaching it.
     """
-    directory = reports_dir_for(audit_id)
+    try:
+        directory = reports_dir_for(audit_id, str(envelope.get("repo")))
+    except ValueError as exc:
+        log(f"WARNING: report store write for {audit_id} skipped: {exc}")
+        return
     runs = directory / "runs"
     try:
         runs.mkdir(parents=True, exist_ok=True)
@@ -1884,12 +1911,16 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     """
     if issue_number is None:
         return None
-    path = reports_dir_for(audit_id) / "latest.json"
+    try:
+        path = reports_dir_for(audit_id, repo) / "latest.json"
+    except ValueError as exc:
+        log(f"WARNING: no report store for {audit_id}: {exc}")
+        return None
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         log(
-            f"No stored report for {audit_id}, but issue #{issue_number} is open; "
+            f"No stored report for {audit_id} in {repo}, but issue #{issue_number} is open; "
             "the previous run's findings are unknowable this run."
         )
         return None
@@ -1922,9 +1953,13 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     """{finding id: title} for every finding the stored document carried.
 
     Wider than the body's headings: a finding the body budget cut is still one
-    the delta comment or a stale-close comment may have to name.
+    the delta comment or a stale-close comment may have to name. The document
+    the ledger renders, which is the run's own unless the body was carried.
     """
-    document = (envelope or {}).get("document")
+    envelope = envelope or {}
+    document = envelope.get("ledger_document")
+    if not isinstance(document, dict):
+        document = envelope.get("document")
     findings = document.get("findings") if isinstance(document, dict) else None
     if not isinstance(findings, list):
         return {}
@@ -3737,10 +3772,11 @@ def collector_held_entries(
     heading is what a body under budget pressure drops first, and a hold keyed
     on headings forgot the finding the moment its row was squeezed out — a run
     with 400 findings and ten held closed the ledger on the next clean pass
-    with ten pull requests still open. A ledger this run could not read is not
-    this function's case: `finish` then leaves the body as it was and holds
-    nothing, rather than deriving a set from the manifest alone (which would
-    turn every candidate the model has been rejecting into a hold).
+    with ten pull requests still open. A lost memory is not this function's
+    case: there is no marker to intersect, so it holds nothing, rather than
+    deriving a set from the manifest alone (which would turn every candidate
+    the model has been rejecting into a hold); `finish` files the lost-memory
+    gap over the still-flagged set instead.
 
     `preview_from_candidates` is the dry run's: it fetches no ledger, so the
     preview is the still-flagged set less `exclude`, whole, with the caveat
@@ -7037,9 +7073,9 @@ def _render_collector_held(
 ) -> list[str]:
     """The previous findings this run carries forward because the collector still flags them.
 
-    The ledger body is the harness's only memory between runs: `previous_ids`
-    is read back out of the hidden block and a finding's location out of its
-    `####` heading. A body rewritten from a document that dropped a finding
+    The ledger body is the harness's memory between runs, kept in the report
+    store: `previous_ids` is read out of its hidden block and a finding's
+    location out of its `####` heading. A body rewritten from a document that dropped a finding
     forgets it, so a hold that only kept the id out of `resolved` lasted one
     run — the next run's previous body no longer named it, and a clean run
     closed the ledger over it with its pull request still open. These rows are
@@ -11385,7 +11421,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     candidate_only = (still_flagged - held_exclude) - held_ids
     # On a clean run a lost memory also costs the two checks that refuse the
     # close — the previous findings this run left unexplained, and the ones the
-    # collector still flags — since both are joined against the previous body.
+    # collector still flags — since both are joined against the stored body.
     # The first is given up for the one run it takes to restore the memory.
     # The second is not: a close over a candidate the collector still emits
     # might be a close over a finding the lost body carried, so the ledger stays
@@ -11752,16 +11788,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # instead; with no memory of it, the envelope names no issue, so the
         # next run's trust check fails as a lost memory should.
         body_untouched = bool(existing_issue) and bool(gaps or unaccounted)
-        # `document` carries forward on the same condition: it is documented as
-        # the document the ledger rendered, and an untouched body rendered the
-        # previous run's.
-        stored_document = data
+        # `document` stays this run's: it is what a reader asking "what did the
+        # last run check, which clusters did it skip" is answered from. The
+        # document the untouched body renders rides alongside as
+        # `ledger_document`, for the next run's titles.
+        ledger_document = None
         if body_untouched:
             stored_issue = existing_issue if memory else None
             stored_body, stored_ids = previous_body, previous_ids
-            carried_document = (memory or {}).get("document")
-            if isinstance(carried_document, dict):
-                stored_document = carried_document
+            carried = (memory or {}).get("ledger_document")
+            if not isinstance(carried, dict):
+                carried = (memory or {}).get("document")
+            if isinstance(carried, dict):
+                ledger_document = carried
         else:
             stored_issue = existing_issue or opened_issue
             stored_body, stored_ids = opened_body, []
@@ -11770,7 +11809,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             report_envelope(
                 audit_id,
                 payload,
-                stored_document,
+                data,
                 now,
                 repo=repo,
                 issue_number=stored_issue,
@@ -11778,6 +11817,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 new_ids=[],
                 resolved_ids=[] if (gaps or unaccounted) else previous_ids,
                 rendered_ids=stored_ids,
+                ledger_document=ledger_document,
             ),
             now,
         )

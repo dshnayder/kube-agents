@@ -726,12 +726,17 @@ class HarnessTestCase(BaseTestCase):
         audit_report.set_workspace(self.workspace)
         self._audit_in_flight = None
 
+    def store_dir(self, audit=AUDIT, repo="acme/fleet"):
+        """The store directory `finish` keeps for `audit` on `repo`."""
+        return self.reports_dir / audit / repo
+
     def seed_report(self, body, issue=42, repo="acme/fleet", audit=None):
         """Leave the report store a previous run would have, rendering `body` on `issue`."""
-        directory = self.reports_dir / (audit or self._audit_in_flight or AUDIT)
+        audit = audit or self._audit_in_flight or AUDIT
+        directory = self.store_dir(audit, repo)
         directory.mkdir(parents=True, exist_ok=True)
         envelope = {
-            "audit_id": directory.name,
+            "audit_id": audit,
             "repo": repo,
             "issue_number": issue,
             "ledger_body": body,
@@ -761,7 +766,7 @@ class HarnessTestCase(BaseTestCase):
         elif listed and "--json body" in self.harness.replies:
             body = json.loads(self.harness.replies["--json body"]).get("body") or ""
             self.seed_report(body, issue=int(listed[0]["number"]))
-        elif listed and not (self.reports_dir / audit / "latest.json").exists():
+        elif listed and not (self.store_dir(audit) / "latest.json").exists():
             self.seed_report("", issue=int(listed[0]["number"]))
         return super().run_main(argv)
 
@@ -15326,7 +15331,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn("] HELD:", self.err)
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
         self.assertFalse([b for b in self.harness.bodies_for("issue", "comment") if "audit delta" in b])
-        stored = json.loads((self.reports_dir / AUDIT / "latest.json").read_text())
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
         self.assertEqual(stored["ledger_body"], body_n1)
 
         # Run N+2 reads the store run N+1 wrote: trusted, and b resolves.
@@ -15422,7 +15427,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         edits = self.harness.bodies_for("issue", "edit")
         self.assertEqual(len(edits), 2)
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
-        stored = json.loads((self.reports_dir / AUDIT / "latest.json").read_text())
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
         self.assertEqual(stored["ledger_body"], edits[-1])
         self.assertEqual(self.harness.gh_calls("pr", "close"), [])
         posted = self.harness.bodies_for("issue", "comment")
@@ -17087,7 +17092,7 @@ class TestReportStore(HarnessTestCase):
         return envelope
 
     def stored(self):
-        return json.loads((self.reports_dir / AUDIT / "latest.json").read_text())
+        return json.loads((self.store_dir() / "latest.json").read_text())
 
     def test_a_written_report_is_read_back_for_the_same_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(), NOW)
@@ -17096,7 +17101,7 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(memory["current_ids"], ["a", "b"])
         self.assertEqual(memory["new_ids"], ["a", "b"])
         self.assertEqual(memory["id_scheme"], audit_report.ID_SCHEME)
-        runs = list((self.reports_dir / AUDIT / "runs").glob("*.json"))
+        runs = list((self.store_dir() / "runs").glob("*.json"))
         self.assertEqual([p.name for p in runs], ["20260801T093000.000000Z.json"])
 
     def test_a_report_for_another_ledger_is_not_trusted(self):
@@ -17105,8 +17110,40 @@ class TestReportStore(HarnessTestCase):
             with self.subTest(issue=issue, repo=repo):
                 self.assertIsNone(audit_report.read_report_memory(AUDIT, issue, repo))
 
+    def test_each_repository_keeps_its_own_memory(self):
+        """An SOP walking `managed_repos` finishes one stream once per
+        repository; each run must find its own ledger's memory, not the one
+        the other repository's run wrote a minute before."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        audit_report.write_report(
+            AUDIT,
+            self.envelope(repo="acme/other", issue_number=12, ledger_body="other body"),
+            NOW.replace(minute=31),
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 12, "acme/other")["ledger_body"],
+            "other body",
+        )
+        for repo in ("acme/fleet", "acme/other"):
+            with self.subTest(repo=repo):
+                runs = list(self.store_dir(repo=repo).joinpath("runs").glob("*.json"))
+                self.assertEqual(len(runs), 1)
+
+    def test_a_repository_that_is_not_owner_name_is_never_a_path(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for repo in ("../../etc", "acme", "acme/fleet/x", "acme/..", ""):
+                with self.subTest(repo=repo):
+                    audit_report.write_report(AUDIT, self.envelope(repo=repo), NOW)
+                    self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, repo))
+        self.assertFalse(self.reports_dir.exists())
+        self.assertIn("is not owner/name", err.getvalue())
+
     def test_a_malformed_report_is_not_trusted_and_fails_nothing(self):
-        directory = self.reports_dir / AUDIT
+        directory = self.store_dir()
         directory.mkdir(parents=True)
         for text in ("not json", "[]", json.dumps({"issue_number": 42, "repo": "acme/fleet"})):
             with self.subTest(text=text):
@@ -17116,7 +17153,7 @@ class TestReportStore(HarnessTestCase):
     def test_the_ring_keeps_the_newest_runs(self):
         for minute in range(audit_report.REPORT_HISTORY + 3):
             audit_report.write_report(AUDIT, self.envelope(), NOW.replace(minute=minute))
-        runs = sorted(p.name for p in (self.reports_dir / AUDIT / "runs").glob("*.json"))
+        runs = sorted(p.name for p in (self.store_dir() / "runs").glob("*.json"))
         self.assertEqual(len(runs), audit_report.REPORT_HISTORY)
         self.assertTrue(runs[0].startswith("20260801T090300"), runs[0])
 
@@ -17126,7 +17163,7 @@ class TestReportStore(HarnessTestCase):
         with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
                 contextlib.redirect_stderr(err):
             audit_report.write_report(AUDIT, self.envelope(), NOW)
-        self.assertFalse((self.reports_dir / AUDIT / "latest.json").exists())
+        self.assertFalse((self.store_dir() / "latest.json").exists())
         self.assertIn("report store write", err.getvalue())
 
     def test_the_document_is_redacted(self):
@@ -17161,6 +17198,23 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["ledger_body"], previous)
         self.assertEqual(stored["issue_number"], 42)
         self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(previous)))
+        # `document` is this run's; the one the carried body renders rides
+        # beside it for the next run's titles, and no reader is handed both.
+        self.assertEqual(stored["document"]["findings"], [])
+        self.assertEqual(stored["document"]["scope"]["skipped"][0]["cluster"], "dr-west")
+        self.assertIn("ledger_document", stored)
+        self.assertNotIn("ledger_document", audit_report.report_envelope(
+            AUDIT, {"status": "UPDATED"}, make_doc(), NOW, repo="acme/fleet", issue_number=42,
+            ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[]))
+
+    def test_titles_come_from_the_document_the_ledger_renders(self):
+        own = {"findings": [{"id": "own", "title": "This run"}]}
+        carried = {"findings": [{"id": "held", "title": "Still on the issue"}]}
+        self.assertEqual(audit_report.report_finding_titles({"document": own}), {"own": "This run"})
+        self.assertEqual(
+            audit_report.report_finding_titles({"document": own, "ledger_document": carried}),
+            {"held": "Still on the issue"},
+        )
 
     def test_a_clean_run_held_open_over_a_lost_store_breaks_the_trust_chain(self):
         # The body it would carry is not known, so it stores no issue number:

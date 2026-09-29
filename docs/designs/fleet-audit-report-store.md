@@ -28,22 +28,27 @@ Both are the same missing thing: the run's structured output, kept where it was 
 
 `finish` keeps what it publishes. On the exit-0 path only — clean and findings branches alike, never
 on `--dry-run`, never after a rejection, never from `remediate` — it writes one envelope under
-`<root>/<audit-id>/`:
+`<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to:
 
 - `runs/<finished-at, UTC, filename-safe>.json` — the envelope. The ring prunes to the newest 14 at
   write time: two weeks of a daily stream.
 - `latest.json` — a byte-identical copy of the newest envelope. A copy rather than a symlink, so the
   store asks nothing of the mount.
 
+The repository is part of the path because every SOP walks its `managed_repos` and runs `finish`
+once per entry: one stream publishes one ledger per repository, and a directory per stream would
+hold whichever repository finished last, so each run would find the other's memory and read it as
+lost. `repo` must be exactly `owner/name` with no `.` or `..` segment before it becomes a path; a
+run whose repository fails that stores nothing.
+
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 the run's outcome (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`, the PR URL
 lists, `silent_ok`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `repo`, `ledger_body` — the body this run left on the
-issue — and `document`, the validated findings document the ledger rendered, whole rather than
-clipped to the body's budget. The body's redaction backstop is applied to every string on the way
-in, so the envelope never holds a credential shape the public issue blanked. `current_ids` is the
-**rendered** set, exactly what the body's hidden block lists; the full set is derivable from
-`document`.
+issue — and `document`, this run's validated findings document, whole rather than clipped to the
+body's budget. The body's redaction backstop is applied to every string on the way in, so the
+envelope never holds a credential shape the public issue blanked. `current_ids` is the **rendered**
+set, exactly what the body's hidden block lists.
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
@@ -54,11 +59,13 @@ the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
 ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
-body still renders the previous run's findings. That path stores the previous body, ids and document
-forward instead of its own empty set; recording `[]` would hand the next run a trusted memory of an
-empty ledger, and every finding the body carries would be announced as new. Where the previous
-memory is itself lost, the envelope names no issue, so the next run's trust check fails as a lost
-memory should.
+body still renders the previous run's findings. That path stores the previous body and ids forward
+instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
+ledger, and every finding the body carries would be announced as new. The document that body renders
+rides beside it as `ledger_document`, which only `finish` reads, for titles. `document` stays this
+run's, because it answers what this run checked and skipped, and a reader asking that must not be
+handed the previous run's scope under this run's status. Where the previous memory is itself lost,
+the envelope names no issue, so the next run's trust check fails as a lost memory should.
 
 ## 3. Where it lives
 
@@ -76,22 +83,21 @@ probes the agent pods for both containers and reads the sandbox first.
 
 ## 4. `finish`'s own memory
 
-The previous run's memory is `latest.json`, trusted when its `issue_number` is the open ledger
-`find_existing_issue` just returned and its `repo` is this run's. The repository is part of the
-check because the store is keyed by stream alone, and an SOP that walks several managed repositories
-finishes one stream once per repository: `acme/a#38` and `acme/b#38` would otherwise pass against
-each other's memory.
+The previous run's memory is the `latest.json` in this run's repository directory, trusted when its
+`issue_number` is the open ledger `find_existing_issue` just returned and its `repo` is this run's.
+The path already selects the repository; the envelope's own `repo` is checked as well, so a file
+moved or copied between directories is not trusted for a ledger it was not written for.
 
 The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
 stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did
 when the body came from GitHub, so a scheme bump costs what it always cost.
 
 `finish` parses the previous ids and titles out of the stored `ledger_body` with the same readers it
-used on the fetched body, so every join — delta, held set, carried held rows, the clean-close hold —
-is unchanged. Titles are also read from the stored `document`, which names findings the body budget
-cut. The issue body is no longer fetched for this at all; there is no fallback to it, because two
-memories with a precedence rule is how a divergence becomes undetectable, and the one failure a
-fallback would save costs a single cycle.
+used on a fetched body, so every join — delta, held set, carried held rows, the clean-close hold —
+is unchanged. Titles are also read from the stored document the body renders (`ledger_document`
+where the body was carried, `document` otherwise), which names findings the body budget cut. The
+issue body is no longer fetched for this at all; there is no fallback to it, because two memories
+with a precedence rule is how a divergence becomes undetectable.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
 the store is absent, unreadable, or written for another issue, the memory is **lost** — unknowable,
@@ -107,8 +113,12 @@ not empty:
 - A run with neither a memory nor a manifest answers no `/remediate`; the next run with a memory
   answers them.
 
-A wiped volume therefore never puts a wrong count in a public issue. It costs one cycle of delta
-annotation, restored by the write that same run makes.
+A wiped volume therefore never puts a wrong count in a public issue. The delta annotation costs one
+cycle, restored by the write that same run makes. The held rows cost more: a findings run rewrites
+the body without them, so the next run's memory has no marker id to hold and they are not rendered
+again. While the collector flags them they stay on each run's JSON line as `unpublished_candidates`,
+and their pull requests stay open; what is lost for good is their row on the ledger. The first run after an upgrade that introduces the store is such a run on
+every stream with an open ledger.
 
 The hidden block stays in every ledger body. It was never only `finish`'s round-trip state: the
 bench verifiers grade audit evals by parsing ids out of the published body, and it is the one way a
@@ -120,8 +130,8 @@ work from the live pull request list, which humans change between runs.
 
 Whether a run is in flight comes from the lease `start` takes — the in-flight note
 `/opt/data/scratch/inflight_<audit-id>.json` — not from a file in the store. `report_status.py`
-reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, pinned by a test) and reports each stream
-as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
+reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, copied into `report_status.py` and
+pinned equal by a test) and reports each stream, across all its repositories, as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
 `error` (a store file that would not parse). A note that exists but cannot be parsed is a `start`
 that has claimed the lease and not yet written it, and counts from its mtime. A first run in flight
 is `running` before its store directory exists.
@@ -131,7 +141,9 @@ is `running` before its store directory exists.
 **The agent.** The Planning Agent has no file tools; a question about an audit is delegated to the
 platform specialist, which runs in the same shell `finish` does. The `fleet-audit-reports` skill
 answers from the store through `report_query.py`, whose subcommands (`streams`, `show`, `findings`,
-`finding`, `checks`, `diff`, `runs`) each return one small JSON object. Every answer is bounded and
+`finding`, `checks`, `diff`, `runs`) each return one small JSON object. `streams` returns a row per
+stream and repository; the others take `--repo`, which may be omitted when the stream has published
+to exactly one. Every answer is bounded and
 the full document is opt-in: `show` omits `document` so the cheap call stays cheap, and `finding`
 returns one finding's prose. `checks` reaches `scope.clusters[].checks_run[]`, which a finding-heavy
 ledger drops from its body with a notice pointing at the stored report. The reader is its own skill
@@ -140,7 +152,8 @@ question about a past run should not pull the publish procedure into context.
 
 **The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and
-renders one row per stream. `report_status.py` therefore imports nothing outside the standard
+renders one row per stream and repository, labelled with the repository only when a stream has more
+than one. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
 

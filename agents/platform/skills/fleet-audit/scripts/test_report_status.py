@@ -17,6 +17,7 @@ import audit_report  # noqa: E402
 import report_status  # noqa: E402
 
 AUDIT = "compliance-audit"
+REPO = "acme/fleet"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 
 
@@ -28,10 +29,10 @@ class ReportStatusTestCase(unittest.TestCase):
         self.scratch = Path(tmp.name) / "scratch"
         self.scratch.mkdir()
 
-    def write_latest(self, audit=AUDIT, **overrides):
+    def write_latest(self, audit=AUDIT, repo=REPO, **overrides):
         envelope = {
             "audit_id": audit,
-            "repo": "acme/fleet",
+            "repo": repo,
             "finished_at": NOW.isoformat(),
             "status": "UPDATED",
             "issue_number": 42,
@@ -45,11 +46,11 @@ class ReportStatusTestCase(unittest.TestCase):
             },
         }
         envelope.update(overrides)
-        directory = self.root / audit / "runs"
+        directory = self.root / audit / repo / "runs"
         directory.mkdir(parents=True, exist_ok=True)
         text = json.dumps(envelope)
         (directory / "20260801T093000.000000Z.json").write_text(text)
-        (self.root / audit / "latest.json").write_text(text)
+        (self.root / audit / repo / "latest.json").write_text(text)
 
     def write_note(self, audit=AUDIT, age_s=60.0, text=None):
         path = self.scratch / f"inflight_{audit}.json"
@@ -66,7 +67,7 @@ class TestProjection(ReportStatusTestCase):
         self.write_latest(chat="kept")
         stream = self.project()["streams"][AUDIT]
         self.assertEqual(stream["liveness"], "completed")
-        latest = stream["latest"]
+        latest = stream["repos"][REPO]["latest"]
         self.assertEqual((latest["new"], latest["resolved"], latest["current"]), (1, 0, 2))
         self.assertEqual((latest["findings"], latest["critical"]), (2, 1))
         self.assertEqual((latest["clusters"], latest["skipped"]), (3, 1))
@@ -75,22 +76,22 @@ class TestProjection(ReportStatusTestCase):
         for key in ("document", "ledger_body", "new_ids", "current_ids"):
             self.assertNotIn(key, latest)
         self.assertIsNone(latest["prs_opened"])
-        self.assertEqual(stream["runs"], ["20260801T093000.000000Z.json"])
+        self.assertEqual(stream["repos"][REPO]["runs"], ["20260801T093000.000000Z.json"])
 
     def test_a_malformed_envelope_counts_unknown_not_zero(self):
         self.write_latest(new_ids="x", document=[])
-        latest = self.project()["streams"][AUDIT]["latest"]
+        latest = self.project()["streams"][AUDIT]["repos"][REPO]["latest"]
         self.assertIsNone(latest["new"])
         self.assertIsNone(latest["findings"])
         self.assertIsNone(latest["critical"])
 
     def test_a_corrupt_stream_costs_only_itself(self):
         self.write_latest()
-        (self.root / "drift-audit").mkdir(parents=True)
-        (self.root / "drift-audit" / "latest.json").write_text("[]")
+        (self.root / "drift-audit" / REPO).mkdir(parents=True)
+        (self.root / "drift-audit" / REPO / "latest.json").write_text("[]")
         streams = self.project()["streams"]
         self.assertEqual(streams["drift-audit"]["liveness"], "error")
-        self.assertIn("latest.json: not a JSON object", streams["drift-audit"]["error"])
+        self.assertIn(f"{REPO}: latest.json: not a JSON object", streams["drift-audit"]["error"])
         self.assertEqual(streams[AUDIT]["liveness"], "completed")
 
     def test_no_store_is_said_rather_than_read_as_an_empty_fleet(self):
@@ -100,8 +101,27 @@ class TestProjection(ReportStatusTestCase):
 
     def test_the_temp_file_of_a_write_in_progress_is_not_a_run(self):
         self.write_latest()
-        (self.root / AUDIT / "runs" / "tmpabc.tmp").write_text("{")
-        self.assertEqual(len(self.project()["streams"][AUDIT]["runs"]), 1)
+        (self.root / AUDIT / REPO / "runs" / "tmpabc.tmp").write_text("{")
+        self.assertEqual(len(self.project()["streams"][AUDIT]["repos"][REPO]["runs"]), 1)
+
+    def test_each_repository_is_its_own_entry(self):
+        self.write_latest()
+        self.write_latest(repo="acme/other", status="CLEAN", new_ids=[])
+        repos = self.project()["streams"][AUDIT]["repos"]
+        self.assertEqual(sorted(repos), [REPO, "acme/other"])
+        self.assertEqual(repos["acme/other"]["latest"]["status"], "CLEAN")
+        self.assertEqual(repos[REPO]["latest"]["status"], "UPDATED")
+
+    def test_a_directory_that_cannot_be_a_repository_is_not_one(self):
+        self.write_latest()
+        (self.root / AUDIT / "stray").mkdir()
+        (self.root / AUDIT / "acme" / "bad name").mkdir()
+        self.assertEqual(list(self.project()["streams"][AUDIT]["repos"]), [REPO])
+
+    def test_a_repository_argument_cannot_leave_the_store(self):
+        for repo in ("../x", "acme/..", "a/b/c", ""):
+            with self.subTest(repo=repo), self.assertRaises(ValueError):
+                report_status.store_path(str(self.root), AUDIT, repo)
 
 
 class TestLiveness(ReportStatusTestCase):
@@ -145,7 +165,7 @@ class TestLiveness(ReportStatusTestCase):
         stream = self.project()["streams"]["cost-audit"]
         self.assertEqual(stream["liveness"], "running")
         self.assertEqual(stream["started"]["age_s"], 30.0)
-        self.assertIsNone(stream["latest"])
+        self.assertEqual(stream["repos"], {})
 
     def test_an_unparseable_note_counts_from_its_mtime(self):
         # A `start` that created the note and has not written it yet: a claim.

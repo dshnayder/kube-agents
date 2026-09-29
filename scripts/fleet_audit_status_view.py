@@ -123,12 +123,13 @@ EXEC_TIMEOUT = 120
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b\x90\x9d]")
 
-#: Every outcome the audit skill writes. Anything else is styled as a warning
-#: rather than as a success -- an outcome this view has never heard of is
-#: exactly the one a reader should look at, and green would hide it.
+#: Every outcome `finish` stores. Anything else is styled as a warning rather
+#: than as a success -- an outcome this view has never heard of is exactly the
+#: one a reader should look at, and green would hide it. HELD is a clean run
+#: the ledger stayed open over, which is a reason to look, not a success.
 STATUS_STYLE = {
     "CLEAN": "green",
-    "REMEDIATED": "green",
+    "HELD": "yellow",
     "OPENED": "cyan",
     "UPDATED": "cyan",
     "running…": "yellow",
@@ -672,7 +673,7 @@ def row_for(
 
     enabled = "yes" if job.get("enabled") else ("no" if job else "?")
     row = [
-        (audit_id, "bold" if flags else None),
+        (scrub(audit_id), "bold" if flags else None),
         (enabled, {"yes": "green", "no": "dim"}.get(enabled, "yellow")),
         (job.get("expr", "?"), "dim"),
         (when_cell(at, utc), None),
@@ -680,11 +681,13 @@ def row_for(
         (status, status_style),
         (findings_text, findings_style),
         (delta_text, delta_style),
-        (pr_text, "dim" if pr_text in ("0", "—") else None, pr_url),
+        # Link targets are store text too, so they cross `scrub()` like
+        # every other cell: an escape in a URL is an escape in the terminal.
+        (pr_text, "dim" if pr_text in ("0", "—") else None, scrub(pr_url)),
         (
             issue_ref(latest.get("issue_url")),
             "dim" if not latest.get("issue_url") else "cyan",
-            str(latest.get("issue_url") or ""),
+            scrub(latest.get("issue_url")),
         ),
         (
             " ".join(flags),
@@ -722,6 +725,33 @@ GAP_COLUMNS = [
 UNBOUNDED = 10_000
 
 
+def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
+    """(label, audit id, row source) for every stream and repository.
+
+    The store keeps a stream once per repository it publishes to, so a stream
+    an SOP finishes across several managed repositories is several rows, each
+    labelled with its repository; one repository, or none yet, is one row
+    under the bare id. The row source is the stream's lease and liveness with
+    that repository's `latest`, which is the shape `row_for` reads.
+    """
+    out = []
+    for audit_id in sorted(set(roster) | set(streams)):
+        stream = streams.get(audit_id) or {}
+        repos = stream.get("repos") or {}
+        if not repos:
+            out.append((audit_id, audit_id, {**stream, "latest": None}))
+            continue
+        for repo, entry in sorted(repos.items()):
+            label = audit_id if len(repos) == 1 else f"{audit_id} {repo}"
+            source = {
+                **stream,
+                "latest": (entry or {}).get("latest"),
+                "error": (entry or {}).get("error"),
+            }
+            out.append((label, audit_id, source))
+    return out
+
+
 def render(
     projection: dict,
     roster: dict,
@@ -744,15 +774,13 @@ def render(
     box = box or BOX_UNICODE
     streams = projection.get("streams") or {}
     root_exists = bool(projection.get("root_exists"))
-    ids = sorted(set(roster) | set(streams))
 
     built = []
-    for audit_id in ids:
-        stream = streams.get(audit_id) or {}
+    for label, audit_id, stream in stream_rows(streams, roster):
         row, flags, latest = row_for(
-            audit_id, stream, roster.get(audit_id) or {}, now, root_exists, utc
+            label, stream, roster.get(audit_id) or {}, now, root_exists, utc
         )
-        built.append({"id": audit_id, "row": row, "flags": flags, "latest": latest})
+        built.append({"id": label, "row": row, "flags": flags, "latest": latest})
 
     shown = [
         entry for entry in built

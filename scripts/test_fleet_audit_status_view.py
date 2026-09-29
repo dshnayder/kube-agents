@@ -74,11 +74,15 @@ def latest(**overrides):
     return base
 
 
-def stream(liveness="completed", last=None, started=None, error=None, runs=()):
+def stream(liveness="completed", last=None, started=None, error=None, runs=(), repo="acme/fleet"):
+    """One stream as `report_status.project` shapes it: the lease, and the one
+    repository's store when it has a run or a read error to carry."""
+    repos = {}
+    if last is not None or runs or error:
+        repos[repo] = {"latest": last, "runs": list(runs), "error": error}
     return {
         "started": started,
-        "latest": last,
-        "runs": list(runs),
+        "repos": repos,
         "liveness": liveness,
         "error": error,
     }
@@ -227,7 +231,10 @@ class TestFlags(unittest.TestCase):
     JOB = {"enabled": True, "expr": "20 6 * * *"}
 
     def flags(self, stream_doc, job=None, root_exists=True):
-        return view.flags_for(stream_doc, job or self.JOB, NOW, root_exists)
+        # Through `stream_rows`, as `render` does: a row reads one
+        # repository's `latest`, not the projection's per-stream shape.
+        (_, _, source), = view.stream_rows({"cost-audit": stream_doc}, {})
+        return view.flags_for(source, job or self.JOB, NOW, root_exists)
 
     def test_a_recent_run_carries_no_flag(self):
         recent = latest(finished_at=(NOW - timedelta(hours=2)).isoformat())
@@ -295,6 +302,33 @@ class TestRender(unittest.TestCase):
         self.assertIn("57 (2 c)", out)
         self.assertIn("+3 / −1", out)
         self.assertIn("#12", out)
+
+    def test_a_stream_on_two_repositories_is_two_labelled_rows(self):
+        doc = stream(last=latest())
+        doc["repos"]["acme/other"] = {
+            "latest": latest(status="CLEAN", issue_url="https://github.com/acme/other/issues/7"),
+            "runs": [],
+            "error": None,
+        }
+        out = self.render({"compliance-audit": doc})
+        self.assertIn("compliance-audit acme/fleet", out)
+        self.assertIn("compliance-audit acme/other", out)
+        self.assertIn("#7", out)
+        self.assertIn("#12", out)
+
+    def test_a_held_run_is_a_known_status(self):
+        out = self.render({"compliance-audit": stream(last=latest(status="HELD"))})
+        self.assertIn("HELD", out)
+        self.assertNotIn("HELD ?", out)
+
+    def test_link_targets_are_scrubbed(self):
+        hostile = "https://github.com/acme/fleet/issues/12\x1b]52;c;cHduZWQ=\x07"
+        out = self.render(
+            {"compliance-audit": stream(last=latest(issue_url=hostile, prs_opened=[hostile]))},
+            palette=view.Palette(True),
+        )
+        self.assertNotIn("\x1b]52", out)
+        self.assertNotIn("\x07", out)
 
     def test_the_prs_column_counts_the_url_list(self):
         urls = ["https://x/pull/1", "https://x/pull/2"]

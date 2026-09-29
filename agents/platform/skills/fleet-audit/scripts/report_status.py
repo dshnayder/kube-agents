@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """report_status.py — the read side of the fleet-audit report store.
 
-Projects `reports/<audit-id>/{latest.json, runs/}` and the in-flight notes
-`start` leaves in the scratch directory into one small JSON document: each
-stream's liveness, the last run's outcome without its findings document, and
-the run ring's filenames. Design of record: docs/designs/fleet-audit-report-store.md.
+Projects `reports/<audit-id>/<owner>/<name>/{latest.json, runs/}` and the
+in-flight notes `start` leaves in the scratch directory into one small JSON
+document: each stream's liveness and, per repository it publishes to, the last
+run's outcome without its findings document and the run ring's filenames. Design of record: docs/designs/fleet-audit-report-store.md.
 
 Two consumers, each pinning one property of this file:
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -45,6 +46,10 @@ INFLIGHT_TTL_S = 2 * 60 * 60
 # audit_report.inflight_path_for's spelling: `<scratch>/inflight_<audit>.json`.
 INFLIGHT_PREFIX = "inflight_"
 INFLIGHT_SUFFIX = ".json"
+
+# audit_report.REPORT_REPO_SEGMENT_RE, duplicated for the same reason: one
+# segment of the `owner/name` a store directory is keyed on, never `.`/`..`.
+REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
 # Always present on a projected `latest`, null when the envelope lacks them, so
 # a reader never has to tell an absent key from a null one. Everything else the
@@ -72,7 +77,7 @@ LATEST_KEYS = (
 # `new`/`resolved`/`current`, and the reader that wants the ids themselves
 # reads the envelope through `load_latest` instead.
 _NEVER_PROJECTED = frozenset(
-    {"document", "ledger_body", "new_ids", "resolved_ids", "current_ids"}
+    {"document", "ledger_document", "ledger_body", "new_ids", "resolved_ids", "current_ids"}
 )
 
 
@@ -103,6 +108,43 @@ def stream_ids(root: str) -> list[str]:
             return sorted(entry.name for entry in entries if entry.is_dir())
     except FileNotFoundError:
         return []
+
+
+def _subdirs(path: str) -> list[str]:
+    with os.scandir(path) as entries:
+        return sorted(entry.name for entry in entries if entry.is_dir())
+
+
+def repo_ids(root: str, audit_id: str) -> list[str]:
+    """Every `owner/name` the stream has a store for, sorted; [] when none.
+
+    A stream is kept once per repository it publishes to, because an SOP
+    walking `managed_repos` finishes it once per repository and each run's
+    memory is its own ledger's. OSError other than absence propagates, as in
+    `stream_ids`.
+    """
+    try:
+        owners = _subdirs(os.path.join(root, audit_id))
+    except FileNotFoundError:
+        return []
+    return [
+        f"{owner}/{name}"
+        for owner in owners
+        if REPO_SEGMENT_RE.match(owner)
+        for name in _subdirs(os.path.join(root, audit_id, owner))
+        if REPO_SEGMENT_RE.match(name)
+    ]
+
+
+def store_path(root: str, audit_id: str, repo: str) -> str:
+    """The directory one stream keeps for one repository. ValueError for a
+    `repo` that is not `owner/name`, so an argument can never walk out of it."""
+    segments = str(repo).split("/")
+    if len(segments) != 2 or not all(
+        REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in segments
+    ):
+        raise ValueError(f"repository {repo!r} is not owner/name")
+    return os.path.join(root, audit_id, *segments)
 
 
 def in_flight_ids(scratch: str) -> list[str]:
@@ -165,20 +207,20 @@ def in_flight_since(scratch: str, audit_id: str) -> float | None:
         return None
 
 
-def load_latest(root: str, audit_id: str) -> dict | None:
+def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
     """The raw, whole `latest.json`, `document` included.
 
     The projection strips `document`; report_query.py needs it, so this helper
     is the one that does not.
     """
-    return _read_object(os.path.join(root, audit_id, "latest.json"))
+    return _read_object(os.path.join(store_path(root, audit_id, repo), "latest.json"))
 
 
-def list_runs(root: str, audit_id: str) -> list[str]:
+def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
     """Filenames in `runs/`, sorted ascending — which is time order, because
     the stamp is UTC. [] when the ring does not exist yet."""
     try:
-        names = os.listdir(os.path.join(root, audit_id, "runs"))
+        names = os.listdir(os.path.join(store_path(root, audit_id, repo), "runs"))
     except FileNotFoundError:
         return []
     # The atomic write replaces from a `.tmp` file in the same directory, so a
@@ -186,9 +228,9 @@ def list_runs(root: str, audit_id: str) -> list[str]:
     return sorted(name for name in names if name.endswith(".json"))
 
 
-def load_run(root: str, audit_id: str, name: str) -> dict | None:
+def load_run(root: str, audit_id: str, repo: str, name: str) -> dict | None:
     """One ring entry, whole. None when that stamp is not in the ring."""
-    return _read_object(os.path.join(root, audit_id, "runs", name))
+    return _read_object(os.path.join(store_path(root, audit_id, repo), "runs", name))
 
 
 def liveness(
@@ -250,25 +292,46 @@ def project(
 
 
 def _project_stream(root: str, scratch: str, audit_id: str, now_epoch: float) -> dict:
+    """The stream's lease, and one entry per repository it has a store for.
+
+    Liveness is the stream's, because the lease is: one `start` holds the
+    stream across every repository. `error` names the first repository that
+    could not be read, and the entry for it carries its own.
+    """
+    started = in_flight_since(scratch, audit_id)
+    error: str | None = None
+    repos: dict[str, dict] = {}
+    try:
+        ids = repo_ids(root, audit_id)
+    except OSError as exc:
+        ids, error = [], _failure(f"{audit_id}/", exc)
+    any_latest = None
+    for repo in ids:
+        entry = _project_repo(root, audit_id, repo)
+        repos[repo] = entry
+        error = error or (f"{repo}: {entry['error']}" if entry["error"] else None)
+        any_latest = any_latest or entry["latest"]
+    return {
+        "started": _project_started(started, now_epoch),
+        "repos": repos,
+        "liveness": liveness(started, any_latest, now_epoch, error=error),
+        "error": error,
+    }
+
+
+def _project_repo(root: str, audit_id: str, repo: str) -> dict:
     latest: dict | None = None
     runs: list[str] = []
     error: str | None = None
-    started = in_flight_since(scratch, audit_id)
     try:
-        latest = load_latest(root, audit_id)
+        latest = load_latest(root, audit_id, repo)
     except (OSError, ValueError) as exc:
         error = _failure("latest.json", exc)
     try:
-        runs = list_runs(root, audit_id)
+        runs = list_runs(root, audit_id, repo)
     except OSError as exc:
         error = error or _failure("runs/", exc)
-    return {
-        "started": _project_started(started, now_epoch),
-        "latest": _project_latest(latest),
-        "runs": runs,
-        "liveness": liveness(started, latest, now_epoch, error=error),
-        "error": error,
-    }
+    return {"latest": _project_latest(latest), "runs": runs, "error": error}
 
 
 def _project_started(started: float | None, now_epoch: float) -> dict | None:

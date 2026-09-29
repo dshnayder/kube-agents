@@ -137,7 +137,8 @@ own `deliver` setting; repeating them here sends the same content twice.
 
 A question about a run that already happened — what a stream last found, what changed since
 yesterday, which findings the ledger omitted for space, whether a stream is stuck — is not a request
-to run anything. Every `finish` that exits 0 keeps its report on the volume, and
+to run anything. Every `finish` that publishes (exits 0, not `--dry-run`) keeps its report on the
+volume, best-effort, and
 [`fleet-audit-reports`](../fleet-audit-reports/SKILL.md) answers from it without a `start`, a lease
 or a GitHub call. Do not re-run a stream to answer a question its last report already answers.
 
@@ -871,7 +872,8 @@ Corollaries:
 ## What the ledger says about each finding
 
 Every finding renders in exactly one state, computed fresh each run from whether it still reproduces
-and what pull request sits on its branch. Nothing is stored between runs.
+and what pull request sits on its branch. The state itself is never stored; the report store keeps
+the previous run's ids and titles, which is how a finding is known to be new or resolved.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
@@ -1084,8 +1086,9 @@ it can cost is bounded.
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the
 findings left, and is dropped whole rather than half if it does not fit: a partial evidence table
-reads as a short one, and "this run ran three checks" is a worse lie than saying nothing. You do not
-write this section; you supply the commands and the harness publishes them.
+reads as a short one, and "this run ran three checks" is a worse lie than saying nothing. A dropped
+table leaves a notice pointing at the run's stored report, where `fleet-audit-reports` reads every
+command back. You do not write this section; you supply the commands and the harness publishes them.
 
 ## The clean run
 
