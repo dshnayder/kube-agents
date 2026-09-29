@@ -75,6 +75,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -176,6 +177,22 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# When the collector stops starting project reads, in seconds from its own
+# start; `fleet_waste.py` carries the same bound for the same 600 s terminal
+# call, and its comment has the reasoning. A project not reached by then
+# becomes a `gate-failed` `project/<p>` target. It does not bound the
+# cluster reads, which every fleet collector in this directory leaves open.
+PROJECT_READ_DEADLINE_S = 420
+PROJECT_DEADLINE_ERROR = (
+    "not read: the collector stops starting project reads {budget} s after it starts, so the "
+    "run can end inside its terminal timeout with a manifest, and this project's turn came "
+    "after that. Rerun with `--project {project}` to read it on its own."
+)
+NOTHING_COLLECTED_ERROR = (
+    "nothing collected: none of the {count} project(s) in scope yielded a target -- each failed "
+    "its cluster listing, went unread past the deadline, or has the Compute Engine API off "
+    "and no cluster. First: {first}"
+)
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
 # `collect.py` carry; each collector runs standalone, so it is copied, not
@@ -392,6 +409,10 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     return projects, None
 
 
+def _api_disabled(result: Run) -> bool:
+    return result.rc != 0 and any(marker in result.stderr for marker in API_DISABLED_MARKERS)
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
@@ -400,7 +421,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         ]
     )
     if result.rc != 0:
-        if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
+        if _api_disabled(result):
             log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
             return [], []
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
@@ -1689,9 +1710,15 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     return entry
 
 
-def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict:
+def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict | None:
     res_argv = ["gcloud", "compute", "reservations", "list", "--project", project, "--format", "json"]
     reservations, res_result = run_and_gate(res_argv, run=run)
+    if not cluster_regions and reservations is None and _api_disabled(res_result):
+        # No Compute Engine and no cluster: no reservation or regional quota
+        # can exist here, so there is no target. A row reporting the failed
+        # read would make every such project a coverage gap.
+        log(f"{project}: Compute Engine API is not enabled; no project-scoped check applies")
+        return None
 
     quota_records: dict[str, dict] = {}
     quota_candidates: list[dict] = []
@@ -1763,7 +1790,11 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
     return entry
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS) -> dict:
+def _before(deadline: float) -> bool:
+    return time.monotonic() < deadline
+
+
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     def failed(error: str) -> dict:
@@ -1788,35 +1819,60 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # One `clusters list` per project, in the pool: discovery names every
     # project the credential sees, which on an organisation-wide one is
     # hundreds, and one at a time that is minutes before a cluster is read.
-    enumerated: dict[str, tuple[list[dict], list[dict]] | str] = {}
+    deadline = time.monotonic() + project_budget_s
+    deadline_error = lambda p: PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)
 
     def enumerate_or_error(p: str) -> tuple[list[dict], list[dict]] | str:
+        if not _before(deadline):
+            return deadline_error(p)
         try:
             return enumerate_clusters(p, run=run)
         except RuntimeError as exc:
             log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
             return str(exc)[:ERROR_EXCERPT_CHARS]
 
+    enumerated: dict[str, tuple[list[dict], list[dict]] | str] = {}
     with ThreadPoolExecutor(max_workers=max(1, min(len(projects), max_workers))) as pool:
-        futures = {pool.submit(enumerate_or_error, p): p for p in projects}
+        # Started in a fresh order each run, so a deadline that cuts the list
+        # short leaves a different tail unread each week rather than the same
+        # projects forever.
+        futures = {pool.submit(enumerate_or_error, p): p for p in random.sample(projects, len(projects))}
         for future in as_completed(futures):
             enumerated[futures[future]] = future.result()
     enumeration_failed = {p: r for p, r in enumerated.items() if isinstance(r, str)}
     if len(enumeration_failed) == len(projects):
         # Nothing was read anywhere, which is the same run a single failed
-        # project used to be.
-        return failed("; ".join(f"{p}: {enumeration_failed[p]}" for p in projects))
+        # project used to be. One project quoted, the rest counted: a
+        # credential that expired across two hundred projects would
+        # otherwise produce an error nobody can read as a one-line summary.
+        first = projects[0]
+        return failed(f"{len(projects)} project(s) could not be listed; first, {first}: {enumeration_failed[first]}")
 
+    readable = [p for p in projects if p not in enumeration_failed]
     clusters: list[dict] = []
     not_running: list[dict] = []
-    for p in projects:
-        if p not in enumeration_failed:
-            clusters.extend(enumerated[p][0])
-            not_running.extend(enumerated[p][1])
+    for p in readable:
+        clusters.extend(enumerated[p][0])
+        not_running.extend(enumerated[p][1])
+
+    # A quota or a reservation belongs to a project rather than to a cluster,
+    # and a project with no cluster can still hold a reservation nobody uses
+    # (§3.10), so every readable project gets its project-scoped reads. They
+    # need nothing the cluster reads produce, so they share the cluster pool
+    # and are submitted first, while the deadline still admits them.
+    def project_or_skip(p: str) -> tuple[dict | None] | None:
+        if not _before(deadline):
+            return None
+        regions = {region_of(c["location"]) for c in enumerated[p][0] if c.get("location")}
+        return (collect_project(p, regions, run=run),)
 
     cluster_entries = [None] * len(clusters)
+    project_reads: dict[str, tuple[dict | None] | None] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        project_futures = {pool.submit(project_or_skip, p): p for p in random.sample(readable, len(readable))}
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
+        for future in as_completed(project_futures):
+            project_reads[project_futures[future]] = future.result()
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -1824,19 +1880,13 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             except Exception as exc:  # noqa: BLE001 — see crashed_entry
                 cluster_entries[index] = crashed_entry(clusters[index], exc)
 
-    # A quota or a reservation is capacity for a project's clusters, so the
-    # project-scoped reads cover the projects holding one. A project with
-    # none has no workload to stock out, and reading it anyway would be two
-    # gcloud calls per cluster-free project for checks with nothing to judge.
-    holding = [p for p in projects if p not in enumeration_failed and (enumerated[p][0] or enumerated[p][1])]
-    project_entries: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=max(1, min(len(holding), max_workers))) as pool:
-        futures = {
-            pool.submit(collect_project, p, {region_of(c["location"]) for c in enumerated[p][0] if c.get("location")}, run=run): p
-            for p in holding
-        }
-        for future in as_completed(futures):
-            project_entries[futures[future]] = future.result()
+    project_entries: list[dict] = []
+    for p in readable:
+        read = project_reads.get(p)
+        if read is None:
+            enumeration_failed[p] = deadline_error(p)
+        elif read[0]:
+            project_entries.append(read[0])
 
     failed_entries = [
         {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": "gate-failed", "error": enumeration_failed[p]}
@@ -1849,17 +1899,23 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         else []
     )
 
+    read_clusters = [e for e in cluster_entries if e]
+    entries = read_clusters + project_entries + failed_entries + not_running + discovery_entries
+    if not read_clusters and not project_entries:
+        # Every target left is one §2 sends straight to `scope.skipped` -- an
+        # unlisted or unreached project, a cluster not running -- and `finish`
+        # rejects an empty `scope.clusters`, so this is the top-level `error`
+        # rather than a manifest nothing can be built from.
+        first = next((e for e in entries if e.get("error")), None)
+        return failed(NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else "no project yielded any target"))
+
     return {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
         "audit": "stockout-prevention",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [e for e in cluster_entries if e]
-        + [project_entries[p] for p in holding]
-        + failed_entries
-        + not_running
-        + discovery_entries,
+        "clusters": entries,
     }
 
 

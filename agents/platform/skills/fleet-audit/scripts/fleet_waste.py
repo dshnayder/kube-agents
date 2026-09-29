@@ -19,9 +19,11 @@ same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 reads the active project plus every listed project, whether or not it holds a
 cluster -- a project whose last cluster was deleted is where its disks and
 addresses are left behind -- rather than auditing only the active gcloud
-project; `--project` overrides discovery for a scoped run. The per-project
-reads run in the same worker pool as the clusters, and stop being started
-`PROJECT_READ_DEADLINE_S` in, so the run ends inside its terminal timeout. Project-scoped facts (live PV handles, Service
+project; `--project` overrides discovery for a scoped run. Each project's
+cluster listing runs in a pool before the clusters are read, and its disk,
+address, load-balancer and registry reads share the cluster pool; neither is
+started after `PROJECT_READ_DEADLINE_S`, so the run aims to end inside its
+terminal timeout with a manifest. Project-scoped facts (live PV handles, Service
 names, referenced addresses) are unioned only across the clusters in the
 same project before that project's disk/address/LB checks run — a project
 never sees another project's cluster state.
@@ -54,6 +56,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -130,13 +133,20 @@ REGISTRY_DISABLED_REASON = (
 # would get there. A project not reached by this point becomes a
 # `gate-failed` `project/<p>` target, which the document carries into
 # `scope.skipped`, and the run reports partial rather than nothing. The
-# margin covers the reads already in flight -- up to `DEFAULT_TIMEOUT_S`
-# each -- and the cluster pool, which this does not bound.
+# margin is for the project reads already in flight, which take seconds on a
+# healthy API; it is not a guarantee, because one project's reads run in
+# sequence under `DEFAULT_TIMEOUT_S` each, and the cluster reads, which this
+# does not bound, finish on their own time as they did before it.
 PROJECT_READ_DEADLINE_S = 420
 PROJECT_DEADLINE_ERROR = (
     "not read: the collector stops starting project reads {budget} s after it starts, so the "
-    "run ends inside its terminal timeout with a manifest, and this project's turn came "
+    "run can end inside its terminal timeout with a manifest, and this project's turn came "
     "after that. Rerun with `--project {project}` to read it on its own."
+)
+NOTHING_COLLECTED_ERROR = (
+    "nothing collected: none of the {count} project(s) in scope yielded a target -- each failed "
+    "its cluster listing, went unread past the deadline, or has neither the Compute Engine nor "
+    "the Artifact Registry API on. First: {first}"
 )
 
 # Where a GitOps clone keeps the manifests applied to one cluster:
@@ -4811,7 +4821,9 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # All five refused with the disabled-API answer: the project has no
     # Compute Engine, so it holds nothing these checks look for. Any other
     # mix is a read that failed, and gates as one below.
-    compute_disabled = len(failed) == len(compute_reads) and all(_api_disabled(result) for _, _, result in compute_reads)
+    # A project with a known cluster has Compute Engine, whatever the error
+    # says: the refusal is then someone else's, such as a quota project's.
+    compute_disabled = not known_clusters and len(failed) == len(compute_reads) and all(_api_disabled(result) for _, _, result in compute_reads)
     if failed and not compute_disabled:
         return {
             "name": f"project/{project}",
@@ -4981,12 +4993,39 @@ def _read_project(p: str, *, run: RunFn, session: SessionFn, now: datetime) -> t
     # in `collect_project_compute` still sees it and still fails the target.
     # Here it means only that the traffic sentence goes unwritten, which is
     # the silence `_idle_traffic_clause` prefers to a fabricated zero.
-    traffic = fetch_lb_traffic(p, rules, session=session, now=now) if isinstance(rules, list) else None
+    # Only a running cluster's idle workload reads the traffic, so a project
+    # without one skips the three Monitoring calls.
+    traffic = fetch_lb_traffic(p, rules, session=session, now=now) if running and isinstance(rules, list) else None
     return running, not_running, None, forwarding_rules, traffic
 
 
+def _before(deadline: float) -> bool:
+    return time.monotonic() < deadline
+
+
+def _prefetch_compute(p: str, *, run: RunFn, now: datetime, known_clusters: set[str] | None, forwarding_rules: tuple[object | None, Run] | None) -> dict[tuple[str, ...], Run]:
+    """Every read `collect_project_compute` makes for `p`, keyed by argv.
+
+    None of those reads depends on what the clusters hold -- only the judging
+    does -- so they run in the cluster pool rather than after it, and the time
+    the clusters take no longer eats into the project reads' deadline. The
+    reads are recorded by running the function itself against empty facts:
+    which reads it makes depends only on their own answers, so replaying the
+    record with the real facts takes the same path without a second call."""
+    recorded: dict[tuple[str, ...], Run] = {}
+
+    def recording(argv: list[str], **kwargs) -> Run:
+        result = run(argv, **kwargs)
+        recorded[tuple(argv)] = result
+        return result
+
+    empty_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
+    collect_project_compute(p, False, empty_facts, run=recording, now=now, known_clusters=known_clusters, forwarding_rules=forwarding_rules)
+    return recorded
+
+
 def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline: float) -> dict[str, object]:
-    """`work(p)` for every project, `max_workers` at a time, in project order.
+    """`work(p)` for every project, `max_workers` at a time.
 
     A project whose turn comes after `deadline` (a `time.monotonic()` value)
     is not started, and maps to `None`; see `PROJECT_READ_DEADLINE_S`. The
@@ -4994,13 +5033,16 @@ def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline:
     so a credential listing N projects paid N rounds of gcloud calls before
     the first cluster was read."""
     def guarded(p: str):
-        return work(p) if time.monotonic() < deadline else None
+        return work(p) if _before(deadline) else None
 
     results: dict[str, object] = {}
     if not projects:
         return results
     with ThreadPoolExecutor(max_workers=max(1, min(len(projects), max_workers))) as pool:
-        futures = {pool.submit(guarded, p): p for p in projects}
+        # Started in a fresh order each run, so a deadline that cuts the list
+        # short leaves a different tail unread each week rather than the same
+        # projects forever.
+        futures = {pool.submit(guarded, p): p for p in random.sample(projects, len(projects))}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return results
@@ -5081,9 +5123,21 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
 
+    readable = [p for p in projects if p not in enumeration_failed]
+
+    def prefetch_or_skip(p: str) -> dict[tuple[str, ...], Run] | None:
+        if not _before(deadline):
+            return None
+        return _prefetch_compute(p, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
+
     results: list[tuple[dict, dict]] = [None] * len(clusters)
-    with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
+    prefetched: dict[str, dict[tuple[str, ...], Run] | None] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(clusters) + len(readable), max_workers))) as pool:
+        # Submitted first, so they start while the deadline still admits them.
+        prefetch_futures = {pool.submit(prefetch_or_skip, p): p for p in random.sample(readable, len(readable))}
         futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations, releases=releases, lb_traffic=lb_traffic.get(c["project"])): i for i, c in enumerate(clusters)}
+        for future in as_completed(prefetch_futures):
+            prefetched[prefetch_futures[future]] = future.result()
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -5119,7 +5173,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     def gate_failed_project(p: str, error: str) -> dict:
         return {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": "gate-failed", "error": error}
 
-    def compute_for(p: str) -> dict | None:
+    def compute_for(p: str, recorded: dict[tuple[str, ...], Run]) -> dict | None:
         group = by_project.get(p, [])
         # A project with no clusters is fully read: no Service anywhere can
         # still claim its forwarding rules, which is §3.6's orphan at its
@@ -5133,24 +5187,29 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        return collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
+        # A read missing from the record goes to the live API rather than
+        # failing; the replay is expected to find every one.
+        def replay(argv: list[str], **kwargs) -> Run:
+            return recorded.get(tuple(argv)) or run(argv, **kwargs)
 
-    readable = [p for p in projects if p not in enumeration_failed]
-    # `_pooled_by_project` maps both "not started" and "nothing applies" to
-    # `None`, so the started ones say so explicitly.
-    computed = _pooled_by_project(readable, lambda p: (compute_for(p),), max_workers=max_workers, deadline=deadline)
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
+
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []
+    read_projects = 0
     for p in projects:
         cluster_entries.extend(entry for entry, _ in by_project.get(p, []))
         if p in enumeration_failed:
             project_entries.append(gate_failed_project(p, enumeration_failed[p]))
             continue
-        started = computed.get(p)
-        if started is None:
+        recorded = prefetched.get(p)
+        if recorded is None:
             project_entries.append(gate_failed_project(p, PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)))
-        elif started[0]:
-            project_entries.append(started[0])
+            continue
+        entry = compute_for(p, recorded)
+        if entry:
+            project_entries.append(entry)
+            read_projects += 1
 
     # One rung up from a failed `clusters list`: a `projects list` that failed,
     # or a `--project` that skipped it, took the other projects' names with it.
@@ -5166,13 +5225,32 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             }
         )
 
+    entries = cluster_entries + project_entries + unaudited + discovery_entries
+    if not cluster_entries and not read_projects:
+        # Every target left is one §2 sends straight to `scope.skipped` -- an
+        # unlisted or unreached project, a cluster not running -- and `finish`
+        # rejects an empty `scope.clusters`, so this is the top-level `error`
+        # rather than a manifest nothing can be built from. A target the
+        # collector read and gate-failed is not in that set: §2's manual
+        # retry can still bring it into scope.
+        first = next((e for e in entries if e.get("error")), None)
+        return {
+            "version": MANIFEST_VERSION,
+            "checks_revision": CHECKS_REVISION,
+            "audit": "fleet-wide-cost-analysis",
+            "started_at": started_at,
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else "no project yielded any target"),
+            "clusters": [],
+        }
+
     return {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
         "audit": "fleet-wide-cost-analysis",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": cluster_entries + project_entries + unaudited + discovery_entries,
+        "clusters": entries,
     }
 
 

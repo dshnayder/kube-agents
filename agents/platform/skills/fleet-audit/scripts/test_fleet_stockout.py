@@ -1844,9 +1844,41 @@ class ProjectDiscoveryTest(unittest.TestCase):
             {"acme/us-central1/c1", "beta/us-central1/c2", "project/acme", "project/beta"},
         )
 
-    def test_a_project_holding_no_cluster_gets_no_project_reads(self):
+    def test_a_project_holding_no_cluster_is_still_read_for_its_reservations(self):
+        # §3.10's idle reservation needs no cluster beside it, and a shared
+        # reservation often lives in a project that holds none.
         manifest = self.collect(fleet_run({"acme": ["c1"]}))
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(set(by_name), {"acme/us-central1/c1", "project/acme", "project/beta"})
+        self.assertEqual([c["check"] for c in by_name["project/beta"]["commands"]], ["reservation-mismatch-risk"])
+
+    def test_the_active_project_is_read_when_the_listing_omits_it(self):
+        manifest = self.collect(fleet_run({"acme": ["c1"], "beta": ["c2"]}, projects="beta\n"))
+        self.assertIn("acme/us-central1/c1", {c["name"] for c in manifest["clusters"]})
+        self.assertNotIn("error", manifest)
+
+    def test_a_cluster_free_project_without_compute_engine_leaves_no_target(self):
+        inner = fleet_run({"acme": ["c1"]})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"] and "beta" in argv:
+                return run_of(1, "", "ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project beta")
+            return inner(argv, **kwargs)
+
+        manifest = self.collect(run)
         self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme"})
+
+    def test_a_fleet_that_yields_no_target_is_an_error_not_an_empty_manifest(self):
+        # `finish` rejects an empty `scope.clusters`, so an empty manifest
+        # without an error left the agent nothing to publish and no rule.
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(1, "", "ERROR: SERVICE_DISABLED: Compute Engine API has not been used")
+            return fleet_run({})(argv, **kwargs)
+
+        manifest = self.collect(run)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertTrue(manifest["error"].startswith("nothing collected"))
 
     def test_a_project_override_is_recorded_as_unenumerated(self):
         manifest = self.collect(fleet_run({"acme": ["c1"]}), project="acme")
@@ -1890,7 +1922,9 @@ class ProjectDiscoveryTest(unittest.TestCase):
             return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
 
         manifest = self.collect(fleet_run({}, cluster_list=cluster_list))
-        self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme"})
+        self.assertNotIn("error", manifest)
+        self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme", "project/beta"})
+        self.assertEqual(next(c for c in manifest["clusters"] if c["name"] == "project/beta")["outcome"], "collected")
 
     def test_projects_are_enumerated_in_the_pool(self):
         # Both listings have to be in flight at once to pass the barrier; one
@@ -1902,8 +1936,54 @@ class ProjectDiscoveryTest(unittest.TestCase):
             return run_of(0, "[]")
 
         manifest = fs.collect_fleet(None, run=fleet_run({}, cluster_list=cluster_list), max_workers=2)
-        self.assertEqual(manifest["clusters"], [])
         self.assertNotIn("error", manifest)
+        self.assertEqual({c["name"] for c in manifest["clusters"]}, {"project/acme", "project/beta"})
+
+    def test_project_reads_share_the_cluster_pool(self):
+        # The reservation read and the cluster's node-pool read have to be in
+        # flight together to pass the barrier.
+        barrier = threading.Barrier(2, timeout=5)
+        inner = fleet_run({"acme": ["c1"]}, projects="acme\n")
+
+        def run(argv, **kwargs):
+            if argv[:3] in (["gcloud", "compute", "reservations"], ["gcloud", "container", "node-pools"]):
+                barrier.wait()
+            return inner(argv, **kwargs)
+
+        manifest = self.collect_with(run, max_workers=2)
+        self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"collected"})
+
+    def collect_with(self, run, **kwargs):
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                return fs.collect_fleet(None, run=run, **kwargs)
+
+    def test_a_run_past_the_deadline_names_every_project_it_did_not_start(self):
+        manifest = self.collect_with(fleet_run({"acme": ["c1"]}), project_budget_s=0)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("2 project(s) could not be listed", manifest["error"])
+        self.assertIn("not read:", manifest["error"])
+
+    def test_a_deadline_between_listing_and_project_reads_fails_only_those_reads(self):
+        # Two listings admitted, then the clock has run out.
+        admitted = iter([True, True])
+        with patch.object(fs, "_before", lambda deadline: next(admitted, False)):
+            manifest = self.collect_with(fleet_run({"acme": ["c1"]}))
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "collected")
+        for name in ("project/acme", "project/beta"):
+            self.assertEqual(by_name[name]["outcome"], "gate-failed")
+            self.assertTrue(by_name[name]["error"].startswith("not read:"))
+
+    def test_an_error_across_many_projects_quotes_one_and_counts_the_rest(self):
+        projects = "".join(f"p{i}\n" for i in range(200))
+
+        def cluster_list(project):
+            return run_of(1, "", "ERROR: Reauthentication failed. " + "x" * 250)
+
+        manifest = self.collect_with(fleet_run({}, projects=projects, active="p0", cluster_list=cluster_list))
+        self.assertIn("200 project(s)", manifest["error"])
+        self.assertLess(len(manifest["error"]), 2 * fs.ERROR_EXCERPT_CHARS)
 
 
 class CollectProjectTest(unittest.TestCase):

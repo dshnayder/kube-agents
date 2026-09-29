@@ -4812,7 +4812,9 @@ class DisabledApiProjectTest(unittest.TestCase):
     def test_one_compute_read_refused_for_another_reason_still_gates(self):
         # Only all five answering "disabled" says the project has no Compute
         # Engine; one denied read among them is a read that failed.
-        def compute(project, calls=[]):
+        calls = []
+
+        def compute(project):
             calls.append(project)
             return run_of(1, "", "PERMISSION_DENIED" if len(calls) == 1 else self.COMPUTE_OFF)
 
@@ -4843,9 +4845,10 @@ class ProjectReadScaleTest(unittest.TestCase):
         manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, max_workers=2)
         self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"collected"})
 
-    def test_projects_past_the_deadline_are_recorded_not_read(self):
+    def test_a_run_past_the_deadline_reads_nothing_and_says_so(self):
         # A run killed at its terminal timeout leaves no manifest; one that
-        # stops starting projects leaves a partial one naming what it skipped.
+        # stops starting projects leaves one naming what it skipped -- here
+        # everything, which is the top-level error.
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
@@ -4854,37 +4857,74 @@ class ProjectReadScaleTest(unittest.TestCase):
             raise AssertionError(f"read a project after the deadline: {argv}")
 
         manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=0)
-        entries = {c["name"]: c for c in manifest["clusters"]}
-        self.assertEqual(set(entries), {"project/acme", "project/beta"})
-        self.assertEqual({e["outcome"] for e in entries.values()}, {"gate-failed"})
-        self.assertIn("--project beta", entries["project/beta"]["error"])
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("2 project(s)", manifest["error"])
+        self.assertIn("not read:", manifest["error"])
 
-    def test_a_deadline_reached_between_phases_fails_only_the_project_reads_left(self):
-        # Clusters read before the deadline stay collected; the project-scoped
-        # reads that had not started are what the run reports as unread.
-        # Collector start, then the one cluster-phase read; every later look
-        # at the clock is past the 10 s budget.
-        ticks = [0.0, 1.0]
-
-        def clock():
-            return ticks.pop(0) if ticks else 100.0
+    def test_a_deadline_reached_after_listing_fails_only_the_project_reads(self):
+        # The listing is admitted and the clock then runs out: the cluster is
+        # still read, and the project's own reads are what the run reports as
+        # unread -- without one of them being made.
+        compute_reads = []
 
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
             if argv[:2] == ["gcloud", "projects"] and "list" in argv:
                 return run_of(0, "acme\n")
-            if argv[:3] == ["gcloud", "container", "clusters"]:
-                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
             if argv[:3] == ["gcloud", "compute", "forwarding-rules"]:
                 return run_of(0, "[]")
-            raise AssertionError(f"read a project after the deadline: {argv}")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                compute_reads.append(argv)
+            return run_of(0, "")
 
-        with patch.object(fw.time, "monotonic", clock):
-            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=10)
-        (entry,) = manifest["clusters"]
-        self.assertEqual((entry["name"], entry["outcome"]), ("project/acme", "gate-failed"))
-        self.assertIn("not read", entry["error"])
+        admitted = iter([True])
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "_before", lambda deadline: next(admitted, False)):
+            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("acme/us-central1/c1", by_name)
+        self.assertEqual(by_name["project/acme"]["outcome"], "gate-failed")
+        self.assertTrue(by_name["project/acme"]["error"].startswith("not read:"))
+        self.assertEqual(compute_reads, [])
+
+    def test_project_reads_share_the_cluster_pool(self):
+        # The disk read and the cluster's credential fetch have to be in
+        # flight together to pass the barrier.
+        barrier = threading.Barrier(2, timeout=5)
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
+            if argv[:3] == ["gcloud", "compute", "disks"] or "get-credentials" in argv:
+                barrier.wait()
+            return run_of(0, "[]") if argv[0] == "gcloud" else run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, max_workers=2)
+        self.assertIn("acme/us-central1/c1", {c["name"] for c in manifest["clusters"]})
+        self.assertEqual(next(c for c in manifest["clusters"] if c["name"] == "project/acme")["outcome"], "collected")
+
+    def test_the_replay_makes_no_second_read(self):
+        # Recording the project's reads in the pool and judging them after
+        # it must not double the gcloud calls a project costs.
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(tuple(argv))
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\n")
+            return run_of(0, "[]")
+
+        fw.collect_fleet(None, run=run, session=None, now=NOW)
+        self.assertEqual(len(seen), len(set(seen)))
 
 
 class MultiProjectCollectFleetTest(unittest.TestCase):
@@ -5063,9 +5103,9 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
             return run_of(0, "")
 
         manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
-        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
-        self.assertEqual(project["outcome"], "gate-failed")
-        self.assertIn("parseable JSON", project["error"])
+        # The only project, so nothing is left to audit and the run says so.
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("project/acme: cluster enumeration returned no parseable JSON", manifest["error"])
 
     def test_a_cluster_that_is_not_running_is_recorded_as_an_unreachable_target(self):
         def run(argv, **kwargs):
@@ -5195,9 +5235,8 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
-        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
-        self.assertEqual(project["outcome"], "gate-failed")
-        self.assertNotIn("orphan-lb", {c["check"] for c in project.get("commands", [])})
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("PERMISSION_DENIED", manifest["error"])
 
 
 class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
