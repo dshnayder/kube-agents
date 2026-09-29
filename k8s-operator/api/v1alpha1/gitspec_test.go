@@ -38,6 +38,14 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		{input: "https://github.com:443/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "ssh://git@github.com:22/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "https://github.com:/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		// Userinfo ends at the last `@`, a token included, and a run of
+		// separators around the path is trimmed; git clones all of these.
+		{input: "https://x-access-token:ghp_abc@github.com/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		{input: "https://a@b@github.com/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		{input: "https://github.com//gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		{input: "git@github.com:/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		{input: "https://evil.example#@github.com/gke-labs/kube-agents", err: true},
+		{input: "https://evil.example?x=@github.com/gke-labs/kube-agents", err: true},
 		// After `://` git splits off only a port; anything else stays in the
 		// host, so none of these is a remote git can clone.
 		{input: "ssh://git@github.com:gke-labs/kube-agents.git", err: true},
@@ -104,6 +112,12 @@ func TestGitHubResolveRefusesAnotherForgesHost(t *testing.T) {
 		"ssh://git@bitbucket.org/team/repo.git",
 		"https://github.com.evil.example/gke-labs/kube-agents",
 		"https://evil.example/github.com/gke-labs/kube-agents",
+		// A `#` or `?` ends the authority, so the host is evil.example and
+		// the `@` after it is no userinfo separator.
+		"https://evil.example#@github.com/gke-labs/kube-agents",
+		"https://evil.example?x=@github.com/gke-labs/kube-agents",
+		"ssh://git@evil.example#@github.com/gke-labs/kube-agents",
+		"evil.example#@github.com/gke-labs/kube-agents",
 	} {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.Resolve("", repo, ""); err == nil {

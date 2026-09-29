@@ -241,8 +241,14 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
-	gitopsStateConfigMapSuffix         = "-gitops-state"
-	managedReposConfigMapKey           = "managed_repos"
+	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
+	// sync cannot read holds every tracked policy, so a repository removed
+	// from the lists keeps its write policy until the entry is fixed.
+	conditionReasonMinterPruningHeld = "MinterPruningHeld"
+	// minterHeldEntriesShown caps how many held entries the condition names.
+	minterHeldEntriesShown     = 3
+	gitopsStateConfigMapSuffix = "-gitops-state"
+	managedReposConfigMapKey   = "managed_repos"
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
@@ -1489,6 +1495,68 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 	return bare, unreadable, nil
 }
 
+// minterPrimaryOrg is the organisation the minter policies are scoped to, or,
+// in skip, why the sync must leave them as they were.
+func minterPrimaryOrg(agent *agentv1alpha1.PlatformAgent) (primaryOrg, skip string) {
+	if agent.Spec.Integration == nil {
+		return "", ""
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		// Both spellings set. Nothing can say which forge the organisation
+		// is read from, and an empty primaryOrg would accept every
+		// organisation, so leave the policies as they were. The reconcile
+		// status already reports the declaration.
+		return "", "git integration does not resolve: " + err.Error()
+	}
+	// An empty primaryOrg accepts every organisation, and a primary
+	// organisation chosen from what validation left standing can be
+	// another forge's or another repository's. Where validation refused
+	// something the organisation is read from, syncing would widen or
+	// move the policies rather than leave them as they were. Skip the
+	// sync until the declaration is fixed; the reconcile status already
+	// reports it.
+	if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+		return "", "validation refuses something the github organisation is read from"
+	}
+	return resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub), ""
+}
+
+// minterHeldEntries returns the GitHub repository entries that stop
+// syncGithubTokenMinterConfigMap from pruning, for the Degraded condition: a
+// revocation that silently does not happen is what a condition reports. It is
+// nil where the sync would not run, or would have nothing to prune: no minter
+// ConfigMap, no base template, or no policy the operator tracks.
+func (r *PlatformAgentReconciler) minterHeldEntries(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) []string {
+	minterCM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, minterCM); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(minterCM.Data[minterBaseTemplateKey]) == "" ||
+		len(parseManagedKeysAnnotation(minterCM.Annotations[AnnotationManagedMinterKeys])) == 0 {
+		return nil
+	}
+	primaryOrg, skip := minterPrimaryOrg(agent)
+	if skip != "" {
+		return nil
+	}
+	_, managed, errManaged := minterBareRepos(logr.Discard(), managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	_, contextHeld, errContext := minterBareRepos(logr.Discard(), contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if errManaged != nil || errContext != nil {
+		return nil
+	}
+	return slices.Concat(managed, contextHeld)
+}
+
+// minterHeldMessage names at most minterHeldEntriesShown held entries.
+func minterHeldMessage(cmName string, held []string) string {
+	shown := strings.Join(held[:min(len(held), minterHeldEntriesShown)], ", ")
+	if extra := len(held) - minterHeldEntriesShown; extra > 0 {
+		shown += fmt.Sprintf(" and %d more", extra)
+	}
+	return fmt.Sprintf("GitHub repository entries in ConfigMap %s cannot be read (%s); no minter policy is pruned, so a repository removed from the lists keeps its write policy, until they are corrected or removed", cmName, shown)
+}
+
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
 // to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
 // entry exists in github-token-minter-config ConfigMap, and that every same-organization
@@ -1545,29 +1613,10 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		return nil
 	}
 
-	primaryOrg := ""
-	if agent.Spec.Integration != nil {
-		resolved, err := agent.Spec.Integration.ResolveGit()
-		if err != nil {
-			// Both spellings set. Nothing can say which forge the organisation
-			// is read from, and an empty primaryOrg would accept every
-			// organisation, so leave the policies as they were. The reconcile
-			// status already reports the declaration.
-			logger.Info("skipping minter policy sync: git integration does not resolve", "error", err.Error())
-			return nil
-		}
-		// An empty primaryOrg accepts every organisation, and a primary
-		// organisation chosen from what validation left standing can be
-		// another forge's or another repository's. Where validation refused
-		// something the organisation is read from, syncing would widen or
-		// move the policies rather than leave them as they were. Skip the
-		// sync until the declaration is fixed; the reconcile status already
-		// reports it.
-		if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
-			logger.Info("skipping minter policy sync: validation refuses something the github organisation is read from")
-			return nil
-		}
-		primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+	primaryOrg, skip := minterPrimaryOrg(agent)
+	if skip != "" {
+		logger.Info("skipping minter policy sync: " + skip)
+		return nil
 	}
 
 	// Both lists are parsed before anything is computed from either: an
@@ -3157,6 +3206,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	managedReposErr := error(nil)
+	var minterHeld []string
 	if gitRepoErr == nil {
 		cmName := agent.Name + gitopsStateConfigMapSuffix
 		cm := &corev1.ConfigMap{}
@@ -3166,11 +3216,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 					managedReposErr = err
 				}
 			}
+			if managedReposErr == nil {
+				minterHeld = r.minterHeldEntries(ctx, agent, cm.Data[gitopsStateManagedReposKey], cm.Data[gitopsStateContextReposKey])
+			}
 		}
 	}
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
+	// The Degraded message is the Ready one unless a branch says otherwise.
+	degradedMsg := ""
 	if gitRepoErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
@@ -3191,6 +3246,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonCorruptManagedRepos
 		condMsg = fmt.Sprintf("Corrupt %s in ConfigMap %s%s (%s); GitOps disabled", managedReposConfigMapKey, agent.Name, gitopsStateConfigMapSuffix, managedReposErr.Error())
 		degradedStatus = metav1.ConditionTrue
+	} else if len(minterHeld) > 0 {
+		// Degraded only: the agent runs and every readable repository still
+		// gets its policy, so Ready and the phase keep what the workload says.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonMinterPruningHeld
+		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	}
+	if degradedMsg == "" {
+		degradedMsg = condMsg
 	}
 
 	// Cluster event ingestion, reported only while it is switched off. A
@@ -3243,7 +3307,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	rbacDegradedPreserved := degradedStatus == metav1.ConditionFalse && existingDegradedCond != nil &&
 		existingDegradedCond.Reason == reasonRBACIncomplete
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
-		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == condMsg)
+		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == degradedMsg)
 
 	// From the spec alone, so it is resolved here rather than passed in like the
 	// telemetry and policy results, which take a discovery to produce.
@@ -3318,7 +3382,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Type:               "Degraded",
 			Status:             metav1.ConditionTrue,
 			Reason:             degradedReason,
-			Message:            condMsg,
+			Message:            degradedMsg,
 			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		}

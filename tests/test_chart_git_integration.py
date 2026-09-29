@@ -287,6 +287,9 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "git@github.com:gke-labs/.git",
             ".git",
             "a" * 2049,
+            "gke-labs//infra",
+            "https://evil.example#@github.com/gke-labs/infra",
+            "https://evil.example?x=@github.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo[:80]):
                 integration = _integration(
@@ -325,6 +328,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "/gke-labs/infra",
             "/gke-labs/infra/",
             "HTTPS://GitHub.com/gke-labs/infra",
+            "https://x-access-token:ghp_abc@github.com/gke-labs/infra",
+            "https://a@b@github.com/gke-labs/infra",
+            "https://github.com//gke-labs/infra",
+            "//gke-labs/infra",
+            "gke-labs/infra//",
+            "git@github.com:/gke-labs/infra",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

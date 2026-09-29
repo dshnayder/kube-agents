@@ -60,6 +60,10 @@ const (
 	gitSuffix = ".git"
 	// userInfoSeparator ends the `git@` part of a remote.
 	userInfoSeparator = "@"
+	// authorityTerminators end a URL's authority for git, curl and Python's
+	// urlsplit, so an `@` after one is not the end of userinfo:
+	// `https://evil.com#@github.com/o/r` is a clone of evil.com.
+	authorityTerminators = "#?"
 	// authoritySeparator divides host from port in a URL, and host from path in
 	// the scp remote form, which carries no scheme.
 	authoritySeparator = ":"
@@ -171,7 +175,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 		// it since before provider dispatch. The user is dropped as it is for
 		// a URL.
 		if first, rest, found := strings.Cut(path, pathSeparator); found && rest != "" {
-			if at := strings.LastIndex(first, userInfoSeparator); at != -1 {
+			if at := strings.LastIndex(first, userInfoSeparator); at != -1 && !strings.ContainsAny(first, authorityTerminators) {
 				first = first[at+1:]
 			}
 			if schemelessHosts[strings.ToLower(first)] {
@@ -200,10 +204,18 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 // scp form legal after `://`. Reading the slot as the start of the path would
 // rewrite a URL git cannot clone into a repository nobody wrote, so it is
 // refused, under every scheme.
+//
+// A `#` or `?` ends the authority before the first `/` does, so one in the
+// authority slot is refused rather than read past: dropping everything up to
+// the last `@` would turn `https://evil.com#@github.com/o/r`, a clone of
+// evil.com, into github.com's `o/r`. repo_ref.py refuses it too.
 func splitAuthority(rest string) (string, string, error) {
 	authority, path, _ := strings.Cut(rest, pathSeparator)
 	if path != "" {
 		path = pathSeparator + path
+	}
+	if strings.ContainsAny(authority, authorityTerminators) {
+		return "", "", fmt.Errorf("URL authority %q carries a %q or %q, which ends the authority for git before the host", authority, "#", "?")
 	}
 	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
 		authority = authority[idx+1:]
