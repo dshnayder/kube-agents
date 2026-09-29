@@ -44,9 +44,12 @@ this directory. `streams` and `runs` report it as `liveness`: `never` (no run st
 
 ## Query it; do not read it
 
-**Never open `latest.json` with a file tool.** It embeds `document` and `ledger_body`, which pass
+**Never open a store file** — not `latest.json`, not a ring entry, not with a file tool and not
+with `cat`, `head`, `grep` or `jq` in the shell. Each embeds `document` and `ledger_body`, which pass
 60,000 characters each on a finding-heavy stream — times every stream, times fourteen runs.
 Answering "how many criticals are open?" that way spends tens of thousands of tokens on an integer.
+When `report_query.py` says a stream has no record, that is the answer: do not search the directory
+for a file it did not find.
 
 `python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
 object per call.
