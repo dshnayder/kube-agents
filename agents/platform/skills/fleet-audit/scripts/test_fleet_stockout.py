@@ -1851,6 +1851,28 @@ class ProjectDiscoveryTest(unittest.TestCase):
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertEqual(set(by_name), {"acme/us-central1/c1", "project/acme", "project/beta"})
         self.assertEqual([c["check"] for c in by_name["project/beta"]["commands"]], ["reservation-mismatch-risk"])
+        self.assertEqual([c["check"] for c in by_name["project/beta"]["checks_not_applicable"]], ["quota-exhaustion-risk"])
+
+    def test_a_cluster_free_project_is_not_a_coverage_gap(self):
+        # Its quota check has no region to read; undeclared, `coverage_gaps`
+        # counted it as a check that did not run and pinned the run partial.
+        import audit_report
+
+        manifest = self.collect(fleet_run({"acme": ["c1"]}))
+        data = {
+            "audit": "stockout-prevention",
+            "scope": {
+                "clusters": [
+                    {
+                        "name": e["name"],
+                        "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]],
+                        "checks_not_applicable": e.get("checks_not_applicable", []),
+                    }
+                    for e in manifest["clusters"]
+                ]
+            },
+        }
+        self.assertEqual([g for g in audit_report.coverage_gaps(data) if "project/beta" in g], [])
 
     def test_the_active_project_is_read_when_the_listing_omits_it(self):
         manifest = self.collect(fleet_run({"acme": ["c1"], "beta": ["c2"]}, projects="beta\n"))

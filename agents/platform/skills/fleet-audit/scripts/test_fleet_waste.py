@@ -5094,7 +5094,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertNotIn("unattached-disk", {c["check"] for c in project["commands"]})
         self.assertIn("unattached-disk was not evaluated", project["limitations"])
 
-    def test_unparseable_cluster_list_fails_that_project_not_the_run(self):
+    def test_an_unparseable_cluster_list_on_the_only_project_is_a_run_error(self):
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 return run_of(0, "WARNING: something printed to stdout")
@@ -5224,7 +5224,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
             {"unattached-disk", "idle-address", "registry-no-cleanup"},
         )
 
-    def test_an_unlistable_project_also_closes_the_gate(self):
+    def test_an_unlistable_only_project_is_a_run_error(self):
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 return run_of(1, "", "PERMISSION_DENIED")

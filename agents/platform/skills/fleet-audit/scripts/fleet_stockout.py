@@ -188,6 +188,10 @@ PROJECT_DEADLINE_ERROR = (
     "run can end inside its terminal timeout with a manifest, and this project's turn came "
     "after that. Rerun with `--project {project}` to read it on its own."
 )
+NO_CLUSTER_QUOTA_REASON = (
+    "project {project!r} holds no cluster, so there is no region whose quota a cluster "
+    "could exhaust"
+)
 NOTHING_COLLECTED_ERROR = (
     "nothing collected: none of the {count} project(s) in scope yielded a target -- each failed "
     "its cluster listing, went unread past the deadline, or has the Compute Engine API off "
@@ -1781,6 +1785,13 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
         "commands": commands,
         "candidates": candidates,
     }
+    if not cluster_regions:
+        # The quota reads are per cluster region, so with no cluster there
+        # is none to make. Declared, because a check that neither ran nor
+        # was declared counts as a coverage gap and pins every run partial.
+        entry["checks_not_applicable"] = [
+            {"check": "quota-exhaustion-risk", "reason": NO_CLUSTER_QUOTA_REASON.format(project=project)}
+        ]
     if unevaluated:
         entry["checks_unevaluated"] = [
             {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())
@@ -1796,6 +1807,9 @@ def _before(deadline: float) -> bool:
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
+    # `projects list` spends the same terminal timeout the reads do.
+    deadline = time.monotonic() + project_budget_s
 
     def failed(error: str) -> dict:
         # The manifest contract's top-level `error`: a run that enumerated
@@ -1819,7 +1833,6 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # One `clusters list` per project, in the pool: discovery names every
     # project the credential sees, which on an organisation-wide one is
     # hundreds, and one at a time that is minutes before a cluster is read.
-    deadline = time.monotonic() + project_budget_s
     deadline_error = lambda p: PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)
 
     def enumerate_or_error(p: str) -> tuple[list[dict], list[dict]] | str:
@@ -1846,7 +1859,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         # credential that expired across two hundred projects would
         # otherwise produce an error nobody can read as a one-line summary.
         first = projects[0]
-        return failed(f"{len(projects)} project(s) could not be listed; first, {first}: {enumeration_failed[first]}")
+        return failed(f"{len(projects)} project(s) could not be listed or were not reached; first, {first}: {enumeration_failed[first]}")
 
     readable = [p for p in projects if p not in enumeration_failed]
     clusters: list[dict] = []

@@ -5069,8 +5069,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     except NoProjectInScope as exc:
         # No active project and a `projects list` that answered with nothing:
         # the credential sees no project, which is not an empty fleet. Projects
-        # that were listed but hold no cluster are an empty fleet, and do not
-        # land here. The manifest contract's top-level `error`, as
+        # that were listed but hold no cluster do not land here: their project
+        # reads still run, and only a run that reads nothing at all ends in
+        # `NOTHING_COLLECTED_ERROR` below. The manifest contract's top-level `error`, as
         # `fleet_stockout.py` sets when its enumeration fails, and `main` exits
         # non-zero on it.
         return {
