@@ -627,7 +627,12 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 					ri.repositoryPath(ri.Repositories[first], "").String()))
 			continue
 		}
-		seen[key] = r.Index
+		// An entry refused for its role is still checked for everything else,
+		// but it claims no URL: a later entry naming the same repository in a
+		// role that is accepted is not its duplicate.
+		if !rejected[r] {
+			seen[key] = r.Index
+		}
 	}
 	return problems, rejected
 }

@@ -1562,6 +1562,10 @@ func agentURLSpelling(value string) (string, bool) {
 		rest = rest[:cut]
 	}
 	authority, path, _ := strings.Cut(rest, "/")
+	// urlsplit refuses a bracket without its pair anywhere in the netloc.
+	if strings.Contains(authority, "[") != strings.Contains(authority, "]") {
+		return "", false
+	}
 	if at := strings.LastIndex(authority, "@"); at != -1 {
 		authority = authority[at+1:]
 	}

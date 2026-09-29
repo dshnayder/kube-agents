@@ -153,6 +153,23 @@ func TestGitHubResolveRefusesAnEmptyOrColonUser(t *testing.T) {
 	}
 }
 
+// urlsplit refuses a bracket without its pair anywhere in the authority, so
+// repo_ref.py reads none of these; neither does the provider.
+func TestGitHubParseRepoRefRefusesAnUnpairedBracket(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, repo := range []string{
+		"https://[x@github.com/gke-labs/kube-agents",
+		"https://a]b@github.com/gke-labs/kube-agents",
+		"ssh://git@github.com]/gke-labs/kube-agents",
+	} {
+		t.Run(repo, func(t *testing.T) {
+			if ref, err := provider.ParseRepoRef(repo); err == nil {
+				t.Errorf("ParseRepoRef(%q) = %+v, expected a refusal", repo, ref)
+			}
+		})
+	}
+}
+
 // A value that names a host and one segment is a URL missing its repository,
 // not a bare name: qualifying it would turn an organisation URL pasted as
 // https://github.com/gke-labs into gke-labs/gke-labs.
@@ -631,6 +648,13 @@ func TestProblemsNameTheFieldAtFault(t *testing.T) {
 		{name: "two gitops", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
 			repo("github", "infra", RepositoryRoleGitOps),
 			repo("github", "infra2", RepositoryRoleGitOps),
+		}}, want: []string{"repositories[1].role"}},
+		// The second gitops entry is what to fix; the managed one naming the
+		// same repository is not a duplicate of an entry that was refused.
+		{name: "a refused gitops repository claims no URL", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
+			repo("github", "infra", RepositoryRoleGitOps),
+			repo("github", "apps", RepositoryRoleGitOps),
+			repo("github", "apps", RepositoryRoleManaged),
 		}}, want: []string{"repositories[1].role"}},
 		{name: "one repository in two roles", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
 			repo("github", "infra", RepositoryRoleManaged),

@@ -249,6 +249,13 @@ func splitAuthority(rest string) (string, string, error) {
 	if strings.ContainsAny(authority, authorityTerminators) {
 		return "", "", fmt.Errorf("URL authority %q carries a %q or %q, which ends the authority for git before the host", authority, "#", "?")
 	}
+	// A bracket without its pair anywhere in the authority, the userinfo
+	// included, is an invalid IPv6 URL to urlsplit, so repo_ref.py refuses
+	// `https://[x@github.com/o/r`; reading its host would count an entry the
+	// agent skips.
+	if strings.Contains(authority, ipv6Open) != strings.Contains(authority, ipv6Close) {
+		return "", "", fmt.Errorf("unpaired bracket in URL authority %q", authority)
+	}
 	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
 		authority = authority[idx+1:]
 	}
