@@ -244,10 +244,12 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	bare := ref.Host == ""
 	// `github.com/` is a host and nothing else, refused as empty in its other
 	// spellings (`https://github.com/`). Its trailing separator is what says
-	// so: without one, `github.com` is a repository name GitHub allows.
-	if bare && !strings.Contains(ref.Path, pathSeparator) && p.schemelessHosts()[lowerASCII(ref.Path)] &&
-		strings.Contains(strings.TrimSpace(repository), pathSeparator) {
-		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, ref.Path)
+	// so: without one, `github.com` is a repository name GitHub allows, and
+	// `/github.com` and `github.com.git/` spell that name as `/infra` and
+	// `infra.git/` spell `infra`.
+	if raw := strings.TrimSpace(repository); bare && strings.HasSuffix(raw, pathSeparator) &&
+		p.schemelessHosts()[lowerASCII(strings.Trim(raw, pathSeparator))] {
+		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, strings.Trim(raw, pathSeparator))
 	}
 	// A dotted first segment the namespace grammar refuses is a host, most
 	// often another forge's (`gitlab.com/group/project`). Said here, the

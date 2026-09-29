@@ -284,13 +284,17 @@ func TestResolveNamesAForeignHostInABarePath(t *testing.T) {
 // GitHub allows, and stays one.
 func TestResolveRefusesAHostWithNoRepository(t *testing.T) {
 	provider, _ := LookupGitProvider(GitProviderGitHub)
-	for _, input := range []string{"github.com/", "www.github.com/", "SSH.GitHub.com//", "https://github.com/", "github.com:"} {
+	for _, input := range []string{"github.com/", "www.github.com/", "SSH.GitHub.com//", "/github.com/", "https://github.com/", "github.com:"} {
 		if ref, err := provider.Resolve("", input, "acme"); err == nil {
 			t.Errorf("Resolve(%q, acme) = %q, expected a refusal", input, ref.URL())
 		}
 	}
-	if ref, err := provider.Resolve("", "github.com", "acme"); err != nil || ref.URL() != "https://github.com/acme/github.com" {
-		t.Errorf("Resolve(\"github.com\", acme) = (%q, %v), expected the bare name qualified", ref.URL(), err)
+	// Only a trailing separator says "host": these spell the name `github.com`
+	// the way `/infra` and `infra.git/` spell `infra`.
+	for _, input := range []string{"github.com", "/github.com", "github.com.git/"} {
+		if ref, err := provider.Resolve("", input, "acme"); err != nil || ref.URL() != "https://github.com/acme/github.com" {
+			t.Errorf("Resolve(%q, acme) = (%q, %v), expected the bare name qualified", input, ref.URL(), err)
+		}
 	}
 }
 

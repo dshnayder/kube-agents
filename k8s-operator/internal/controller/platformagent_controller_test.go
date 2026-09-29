@@ -6296,6 +6296,10 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// git and this parser read the host after the last `@`, the agent after
 		// the first, so it reads this one as host `b@github.com` and skips it.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "a@b@github.com:gke-labs/kube-agents"},
+		// The provider drops the user before lifting a schemeless host; the
+		// agent lifts only a bare `github.com/`, so it skips this one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "git@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "x-access-token@github.com//gke-labs/kube-agents"},
 		// The agent refuses a value over 256 characters before it parses it, so
 		// a long credential in the userinfo makes an entry it skips.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},

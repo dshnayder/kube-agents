@@ -673,7 +673,9 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- if and $name (not (hasSuffix "/" $name)) -}}
 {{- $trimmed = trimAll "/" $name -}}
 {{- end -}}
-{{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
+{{- /* A GitHub host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
+{{- $hostOnly := and (hasSuffix "/" $repository) (has (lower (trimAll "/" $repository)) (list "github.com" "www.github.com" "ssh.github.com")) -}}
+{{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $hostOnly) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}
 {{- end -}}

@@ -666,11 +666,12 @@ Earlier operator versions passed arbitrary `https://` and `http://` URLs through
 :::
 
 :::caution[Upgrade note: repository spellings no longer rescued]
-Earlier operator versions also rewrote three malformed GitHub spellings into a working repository. Each is now refused, with the same `Degraded` condition and admission behaviour as above:
+Earlier operator versions also rewrote four malformed GitHub spellings into a working repository. Each is now refused, with the same `Degraded` condition and admission behaviour as above:
 
 - A single path segment after a host, with the owner taken from `org`: `github.gitRepo: github.com/infra` (or `https://github.com/infra`, `git@github.com:infra`) and `github.org: gke-labs` used to mean `gke-labs/infra`. A URL with one segment names an account, not a repository, so only a bare name is qualified by the namespace. Write `infra` or `gke-labs/infra`.
 - A colon in place of the first slash of a URL with a scheme: `https://github.com:owner/repo`, `ssh://git@github.com:owner/repo`. After `://`, what follows the colon can only be a port, and git itself reads `github.com:owner` as the host. Write `https://github.com/owner/repo`, `ssh://git@github.com/owner/repo`, or `git@github.com:owner/repo`.
 - An owner containing `_` or `.`, which no GitHub account can have.
+- A schemeless remote with a `:` in its userinfo: `user:token@github.com:owner/repo`, `a:b@github.com/owner/repo`. Earlier versions cut everything up to the first `@`; git reads what comes before the first `:` as the host, so this names the host `user`. Put a credential in the credential helper, not the value, and write `git@github.com:owner/repo` or `https://github.com/owner/repo`.
   :::
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.

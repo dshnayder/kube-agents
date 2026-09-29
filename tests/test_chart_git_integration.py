@@ -257,6 +257,15 @@ class ChartGitIntegrationTest(unittest.TestCase):
         )
         self.assertNotIn("github", integration)
         self.assertEqual(integration["repositories"][0]["repository"], "git@github.com:infra")
+        # So does a GitHub host followed only by `/`: it names no repository.
+        for repo in ("github.com/", "www.github.com/", "GitHub.com//"):
+            with self.subTest(repo=repo):
+                integration = _integration(
+                    *_forge(0, name="github"),
+                    *_repo(0, forge="github", repository=repo, role="gitops"),
+                )
+                self.assertNotIn("github", integration)
+                self.assertEqual(integration["repositories"][0]["repository"], repo)
 
     def test_a_declaration_the_alias_would_misname_renders_as_the_lists(self):
         """A repository the operator would refuse for GitHub -- another host, a
@@ -303,7 +312,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "ssh.github.com/",
             "github.com//",
             "GitHub.com/",
-            "github.com.git/",
+            # The operator refuses whitespace and control characters anywhere
+            # in the value, userinfo included.
+            "https://a b@github.com/gke-labs/infra",
+            "a b@github.com:gke-labs/infra",
+            "https://a\tb@github.com/gke-labs/infra",
+            "https://a\u00a0b@github.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo[:80]):
                 integration = _integration(
@@ -351,6 +365,9 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "github.com//gke-labs/infra",
             "git@github.com//gke-labs/infra",
             "github.com",
+            "/github.com",
+            "github.com.git/",
+            "https://user:p%40ss@github.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

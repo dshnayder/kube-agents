@@ -1337,8 +1337,15 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if err != nil {
 		return false
 	}
-	// The provider lifts every spelling of its host out of a schemeless path;
-	// the agent lifts only the canonical one, so any other host is skipped.
+	// The provider lifts every spelling of its host out of a schemeless path,
+	// dropping a `user@` before it; the agent lifts only the canonical one,
+	// and only bare, so `git@github.com/o/r` (an scp remote with its colon
+	// mistyped) is one it skips, like any other host.
+	if url := strings.TrimLeft(strings.TrimSpace(existing.URL), "/"); !strings.Contains(url, "://") {
+		if first, _, _ := strings.Cut(url, "/"); strings.Contains(first, "@") && !strings.Contains(first, ":") {
+			return false
+		}
+	}
 	parsed, err := provider.ParseRepoRef(existing.URL)
 	if err != nil {
 		return false
