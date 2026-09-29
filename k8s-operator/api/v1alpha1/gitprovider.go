@@ -162,7 +162,7 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 // ValidateHost reports whether a declared host is one this provider serves.
 // An empty host is the provider's default and is always allowed.
 func (p *GitProvider) ValidateHost(host string) error {
-	trimmed := strings.ToLower(strings.TrimSpace(host))
+	trimmed := lowerASCII(strings.TrimSpace(host))
 	if trimmed == "" {
 		return nil
 	}
@@ -242,6 +242,13 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// host and one segment, such as an organisation URL, is a URL missing its
 	// repository, and the depth check below refuses it as that.
 	bare := ref.Host == ""
+	// `github.com/` is a host and nothing else, refused as empty in its other
+	// spellings (`https://github.com/`). Its trailing separator is what says
+	// so: without one, `github.com` is a repository name GitHub allows.
+	if bare && !strings.Contains(ref.Path, pathSeparator) && p.schemelessHosts()[lowerASCII(ref.Path)] &&
+		strings.Contains(strings.TrimSpace(repository), pathSeparator) {
+		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, ref.Path)
+	}
 	// A dotted first segment the namespace grammar refuses is a host, most
 	// often another forge's (`gitlab.com/group/project`). Said here, the
 	// refusal names it; left to the depth check, it would send the

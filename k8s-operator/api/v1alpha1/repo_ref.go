@@ -88,6 +88,19 @@ const (
 // cannot be driven into polynomial backtracking.
 var repoSegmentRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
+// lowerASCII lowers A-Z and nothing else. A host is compared ASCII-only:
+// Unicode case mapping folds some non-ASCII runes onto ASCII letters (U+0130
+// to `i`, U+212A to `k`), which would read `gİthub.com`, a different host on
+// the wire, as github.com. repo_ref.py's str.lower() folds neither.
+func lowerASCII(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
+}
+
 // allowedRepoSchemes is the set a repository URL may carry. `file://` and the
 // rest are refused rather than ignored, because a scheme this list does not
 // name is a value the administrator did not mean as a repository.
@@ -162,7 +175,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 
 	var host, path string
 	if idx := strings.Index(text, schemeSeparator); idx != -1 {
-		scheme := strings.ToLower(text[:idx])
+		scheme := lowerASCII(text[:idx])
 		if !allowedRepoSchemes[scheme] {
 			return RepoRef{}, fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
 		}
@@ -190,7 +203,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 			if at := strings.LastIndex(first, userInfoSeparator); at != -1 && !strings.ContainsAny(first, authorityTerminators) {
 				first = first[at+1:]
 			}
-			if schemelessHosts[strings.ToLower(first)] {
+			if schemelessHosts[lowerASCII(first)] {
 				host, path = first, rest
 			}
 		}
@@ -204,7 +217,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 			return RepoRef{}, fmt.Errorf("invalid repository path segment %q", segment)
 		}
 	}
-	return RepoRef{Host: strings.ToLower(host), Path: path}, nil
+	return RepoRef{Host: lowerASCII(host), Path: path}, nil
 }
 
 // splitAuthority separates host from path in everything after a URL's scheme.

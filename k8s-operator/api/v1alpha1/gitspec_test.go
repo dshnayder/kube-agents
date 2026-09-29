@@ -278,6 +278,43 @@ func TestResolveNamesAForeignHostInABarePath(t *testing.T) {
 	}
 }
 
+// A host with a trailing separator and nothing after it names no repository,
+// as `https://github.com/` does; qualified by a namespace it would become a
+// repository called `github.com`. Without the separator the value is a name
+// GitHub allows, and stays one.
+func TestResolveRefusesAHostWithNoRepository(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, input := range []string{"github.com/", "www.github.com/", "SSH.GitHub.com//", "https://github.com/", "github.com:"} {
+		if ref, err := provider.Resolve("", input, "acme"); err == nil {
+			t.Errorf("Resolve(%q, acme) = %q, expected a refusal", input, ref.URL())
+		}
+	}
+	if ref, err := provider.Resolve("", "github.com", "acme"); err != nil || ref.URL() != "https://github.com/acme/github.com" {
+		t.Errorf("Resolve(\"github.com\", acme) = (%q, %v), expected the bare name qualified", ref.URL(), err)
+	}
+}
+
+// Hosts compare ASCII-only. Unicode case mapping lowers U+0130 to `i` and
+// U+212A to `k`, so a host git sends to another server would otherwise read
+// as github.com (or bitbucket.org).
+func TestAHostIsNotCaseFoldedOutsideASCII(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, input := range []string{"https://gİthub.com/acme/infra", "git@gİthub.com:acme/infra", "gİthub.com/acme/infra"} {
+		if ref, err := provider.Resolve("", input, ""); err == nil {
+			t.Errorf("Resolve(%q) = %q, expected a refusal", input, ref.URL())
+		}
+		if ref, err := ParseRepoRef(input); err == nil && ref.Host == "github.com" {
+			t.Errorf("ParseRepoRef(%q).Host = github.com", input)
+		}
+	}
+	if err := provider.ValidateHost("gİthub.com"); err == nil {
+		t.Error("ValidateHost accepted gİthub.com as a github host")
+	}
+	if ref, err := ParseRepoRef("https://GitHub.COM/acme/infra"); err != nil || ref.Host != "github.com" {
+		t.Errorf("ParseRepoRef lost ASCII case folding: (%+v, %v)", ref, err)
+	}
+}
+
 // TestResolveValidatesEveryPathSegment covers the segments a declared namespace
 // contributes. The repository value is checked as it is parsed; the namespace is
 // prepended afterwards, so without this loop `namespace: ..` reached the state

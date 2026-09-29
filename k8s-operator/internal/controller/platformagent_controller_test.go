@@ -6292,6 +6292,9 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// The agent refuses a value over 256 characters before it parses it, so
 		// a long credential in the userinfo makes an entry it skips.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},
+		// U+0130 lowers to `i` under Unicode case mapping, but it is another
+		// host on the wire, and the agent's str.lower() does not fold it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://gİthub.com/gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {
