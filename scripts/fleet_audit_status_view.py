@@ -29,7 +29,8 @@ Four flags the raw rows cannot be trusted without:
     schedule parsing, so it fires within two hours on every cron shape and on
     kanban-dispatched runs that have no schedule at all.
   - NEVER: roster-enabled, the store was readable, and the stream has neither
-    file — it has genuinely never run.
+    a lease nor a stored run — it has genuinely never run. A ring whose
+    `latest.json` a failed run deleted still has its newest entry.
   - STALE: now is past the next expected fire plus slack. A silent stream is
     rendered loudly — this is the whole reason the surface exists.
 

@@ -15317,6 +15317,13 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         body_n = self.harness.bodies_for("issue", "edit")[0]
         self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        # The store holds the block as published, held id included, so a
+        # reader's `current` counts what the issue lists.
+        stored_n = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(
+            stored_n["current_ids"], sorted(set(audit_report.parse_delta_block(body_n)))
+        )
+        self.assertIn(a_id, stored_n["current_ids"])
 
         # Run N+1: the store is gone; the collector now also flags c.
         with_c = _full_manifest(
@@ -15351,8 +15358,10 @@ class TestFinishManifestFlag(HarnessTestCase):
 
     def test_a_clean_run_over_a_lost_store_does_not_close_over_a_flagged_candidate(self):
         """A candidate the collector still flags may be a finding the lost body
-        carried, so the ledger stays open over it; once the collector stops
-        flagging, the close goes ahead."""
+        carried, so the ledger stays open over it. Once the collector stops
+        flagging it stays open still: the lost body may carry findings from
+        checks no collector covers, and closing would retire their pull
+        requests on an empty document's word."""
         self.replay_lost_store()
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
@@ -15363,7 +15372,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
-        # The collector stops flagging: nothing holds the ledger open.
+        # The collector stops flagging: the other lost-memory gap holds it.
         self.replay_lost_store()
         rc = self.run_finish(
             make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
@@ -15371,7 +15380,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
-        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(payload["prs_closed"], [])
 
     def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
         """A marker under another identity scheme is not a lost memory: the
@@ -17178,6 +17189,30 @@ class TestReportStore(HarnessTestCase):
             ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
         )
         self.assertNotIn(token, json.dumps(envelope))
+
+    def test_a_finding_id_is_not_redacted_in_the_document(self):
+        """The body's block and `current_ids` publish ids raw; a redacted id in
+        the document would name a finding no other key does."""
+        fid = (
+            "image-not-pinned.prod-us.batch."
+            "deployment-task-runner-controller-manager-with-long-name"
+        )
+        finding = make_finding(fid="a")
+        finding["id"] = fid
+        envelope = audit_report.report_envelope(
+            AUDIT, {}, make_doc(findings=[finding]), NOW, repo="acme/fleet",
+            issue_number=42, ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
+        )
+        self.assertNotEqual(audit_report.redact_secrets(fid), fid)
+        self.assertEqual(envelope["document"]["findings"][0]["id"], fid)
+
+    def test_repository_casing_names_one_store(self):
+        """GitHub's names are not case-sensitive, so `--repo Acme/Fleet` and a
+        ConfigMap's `acme/fleet` are one ledger with one memory."""
+        audit_report.write_report(AUDIT, self.envelope(repo="Acme/Fleet"), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
+        self.assertEqual(memory["ledger_body"], "body")
 
     def test_a_findings_run_stores_the_body_it_wrote(self):
         self.harness.replies = {"issue list": self.issue_list()}

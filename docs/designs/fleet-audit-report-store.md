@@ -39,16 +39,21 @@ The repository is part of the path because every SOP walks its `managed_repos` a
 once per entry: one stream publishes one ledger per repository, and a directory per stream would
 hold whichever repository finished last, so each run would find the other's memory and read it as
 lost. `repo` must be exactly `owner/name` with no `.` or `..` segment before it becomes a path; a
-run whose repository fails that stores nothing.
+run whose repository fails that stores nothing. The path is lower-cased, because GitHub's names are
+not case-sensitive: an on-demand `--repo Acme/GitOps` and a ConfigMap's `acme/gitops` are one
+ledger, and two directories for it would each trust a memory the other had moved past.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
-the run's outcome (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`, `declared`,
-`unaccounted`, the PR URL lists, `silent_ok`, `ledger_held_open`), the collector keys the JSON line
-carried, the delta as id lists (`new_ids`, `resolved_ids`, `current_ids`, `id_scheme`), `repo`,
-`ledger_body` — the body this run left on the issue — and `document`, this run's validated findings
-document, whole rather than clipped to the body's budget. The body's redaction backstop is applied
-to every string on the way in, so the envelope never holds a credential shape the public issue
-blanked. `current_ids` is the **rendered** set, exactly what the body's hidden block lists.
+`audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
+`partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
+`ledger_held_open`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
+`resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
+and `document`, this run's validated findings document, whole rather than clipped to the body's
+budget. The body's redaction backstop is applied to every string on the way in, so the envelope
+never holds a credential shape the public issue blanked — except a finding's `id`, which the hidden
+block publishes raw, and which a long object name can make look like a token. `current_ids` is
+exactly what the body's hidden block lists: the findings the body rendered plus the collector-held
+ids.
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
@@ -56,8 +61,10 @@ describes an older run and nothing in it says so — the next run would trust it
 quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
 indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` as soon as it
 has read its memory, before it touches the issue: a run killed between editing the ledger and
-writing the store leaves no envelope rather than one describing the run before. Pruning runs in its
-own `try`: a failed prune has not damaged the memory the run just wrote.
+writing the store leaves no envelope rather than one describing the run before. The ring is left
+alone, and the readers answer from its newest entry with `latest_missing: true`: the stream did run,
+and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a failed
+prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
 ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
@@ -104,8 +111,10 @@ where the body was carried, `document` otherwise), which names findings the body
 issue body is not a fallback for a store that exists, because two memories with a precedence rule
 is how a divergence becomes undetectable.
 
-It is read once, where the store has never held this ledger: no directory for the stream and
-repository at all, as on the first run after an upgrade that introduces the store or after the
+`start` joins against the same memory for the `carried` list it hands the model, seed included.
+
+The issue body is read once, where the store has never held this ledger: no directory for the stream
+and repository at all, as on the first run after an upgrade that introduces the store or after the
 volume is replaced. That run would otherwise have no previous ids, so the guard that refuses to
 close over findings the document does not account for would have nothing to check, and an empty
 document would close the ledger and its pull requests. The body's hidden block is the id set the
@@ -113,25 +122,28 @@ last run published, so it stands in for the store this once; the run writes the 
 later run reads that.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
-its store is missing, unreadable, or written for another issue — or there is no store and the body
-has no readable block — the memory is **lost**, unknowable rather than empty:
+its `latest.json` is missing, unreadable, or written for another issue — or there is no store and
+the body has no readable block or cannot be fetched — the memory is **lost**, unknowable rather than
+empty:
 
 - The run publishes with no delta claim: `new: 0`, `resolved: 0`, the delta comment skipped, and a
   log line saying the previous run's findings are unknowable.
 - The body is rewritten. Freezing it until a run could read its memory would freeze it for good,
   since only a run that writes the body restores the store. Ids held on the lost body are no longer
   carried; with a manifest their pull requests stay protected by the still-flagged set.
-- A clean run closes only when it passed a manifest and the collector flags nothing the document
-  does not carry. Otherwise it files a lost-memory coverage gap, stays open, and reports partial:
-  with no manifest, nothing says the findings the ledger carries were fixed, and an empty document
-  would close them and their pull requests.
+- A clean run never closes. It files a lost-memory coverage gap, stays open, and reports partial:
+  the collector's gap while it still flags something the document does not carry, and otherwise the
+  gap saying nothing shows whether the ledger's findings were fixed. A manifest covers only the
+  collector's checks, and without one there is nothing, while an empty document would close the
+  ledger and the pull requests of findings no collector looks at.
 - A run with neither a memory nor a manifest answers no `/remediate`; the next run with a memory
   answers them.
 
 A lost memory therefore never puts a wrong count in a public issue. The delta annotation costs one
-cycle when that run writes the body, which a findings run or a close does. A clean run held open
-writes nothing to it, so the memory stays lost, and each such run files the gap again, until a findings
-run rewrites the body or a human closes the ledger. The held rows cost more: a findings run rewrites the body
+cycle when that run writes the body, which a findings run does. A clean run held open writes nothing
+to it, so the memory stays lost, and each such run files the gap again, until a findings run
+rewrites the body or a human who has checked the findings closes the ledger; the gap names both
+ways out. The held rows cost more: a findings run rewrites the body
 without them, so the next run's memory has no marker id to hold and they are not rendered again.
 While the collector flags them they stay on each run's JSON line as `unpublished_candidates`, and
 their pull requests stay open; what is lost for good is their row on the ledger. A seeded run keeps
@@ -149,10 +161,11 @@ Whether a run is in flight comes from the lease `start` takes — the in-flight 
 `/opt/data/scratch/inflight_<audit-id>.json` — not from a file in the store. `report_status.py`
 reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, copied into `report_status.py` as
 `INFLIGHT_TTL_S` and pinned equal by a test) and reports each stream, across all its repositories,
-as `never`, `completed`, `running`, `died` (a lease older than the TTL that never finished), or
-`error` (a store file that would not parse). A note that exists but cannot be parsed is a `start`
-that has claimed the lease and not yet written it, and counts from its mtime. A first run in flight
-is `running` before its store directory exists.
+as `never` (no lease and no stored run), `completed`, `running`, `died` (a lease older than the TTL
+that never finished), or `error` (a store file that would not parse). A ring whose `latest.json` was
+deleted is `completed`, projected from its newest entry with `latest_missing`. A note that exists
+but cannot be parsed is a `start` that has claimed the lease and not yet written it, and counts from
+its mtime. A first run in flight is `running` before its store directory exists.
 
 ## 6. Readers
 

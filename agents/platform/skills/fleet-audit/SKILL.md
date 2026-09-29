@@ -245,8 +245,10 @@ check there and your `checks_run` does not claim you did. A run whose
 `checks_run` says the check ran and whose document neither reports nor explains the finding is
 **held** — see [The clean run](#the-clean-run). On a stream that passes `--manifest-file` there is
 a fifth ending for a finding the collector still emits: `resolved_because` does not release it, and
-only the collector no longer emitting it or a `declared` entry does. Empty when there is no open ledger or the
-report store holds no record of it (`start` says so on stderr).
+only the collector no longer emitting it or a `declared` entry does. Where the store has never held
+the ledger, `start` reads the issue's hidden block once instead. Empty when there is no open ledger,
+or the store's record of it is missing, unreadable or for another issue (`start` says so on
+stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
@@ -425,14 +427,14 @@ nothing to re-run until that run's `finish`.
 
 ### Partial coverage
 
-`partial` is `true` exactly when the run could not speak for the whole fleet. Four of the six
-sources are in the document: any entry in `scope.skipped`, any cluster carrying a `limitations`
+`partial` is `true` exactly when the run could not speak for the whole fleet. Four sources are in
+the document: any entry in `scope.skipped`, any cluster carrying a `limitations`
 note, any cluster whose `checks_run` is short of the checks that _apply_ to it, or — on a stream
 with a declared-intent step — posture checks that ran without a complete search record
-([`declared_intent_searched`](#declared_intent_searched)). The other two belong to the run rather
-than to the document, so a document that reads as complete can still produce them: a collector
-manifest waived with `--no-collector-manifest`, whose reason becomes the gap, and a clean run over
-an open ledger the report store has no record of while the collector still flags something (see
+([`declared_intent_searched`](#declared_intent_searched)). The rest belong to the run rather than
+to the document, so a document that reads as complete can still produce them: a collector manifest
+waived with `--no-collector-manifest`, whose reason becomes the gap, and a clean run over an open
+ledger the report store has no record of, on any stream, with or without a manifest (see
 [The clean run](#the-clean-run)). `coverage_gaps` says which, and why — so
 `partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
 
@@ -1166,14 +1168,16 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
 report store's record of the open ledger is missing, unreadable, or written for a different issue
 (where the store has never held the ledger at all, `finish` seeds it once from the issue's hidden
-block instead) — the previous run's findings are unknowable, so the run announces nothing rather
-than declaring every live finding new, and logs `The previous run's findings are unknowable;
-skipping the delta comment` to stderr. It holds nothing it cannot name: the body is rewritten from
-this document, and a findings run leaves the next run a trusted record. A clean run closes only when
-it passed a manifest and the collector flags nothing the document dropped. Otherwise the ledger
-stays open with a coverage gap saying the store had no record, `partial: true` and `silent_ok:
-false`, and it stays open run after run until a findings run rewrites the body or a human closes the
-issue. Without a manifest it also answers no `/remediate` — it cannot tell a held id from a typo —
+block instead, and a block that is absent or cannot be fetched is the same loss) — the previous
+run's findings are unknowable, so the run announces nothing rather than declaring every live finding
+new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
+that fails after reading the record has already deleted it, so that a record older than the issue is
+never trusted, and the run after it is one of these. It holds nothing it cannot name: the body is
+rewritten from this document, and a findings run leaves the next run a trusted record. A clean run
+never closes: the ledger stays open with a coverage gap saying the store had no record, `partial:
+true` and `silent_ok: false`, and it stays open run after run until a findings run rewrites the body
+or a human who has checked the findings closes the issue — the gap says so, and so should your
+report. Without a manifest it also answers no `/remediate` — it cannot tell a held id from a typo —
 and logs `No stored report and no manifest` to say so; report that as you would any other partial
 run.
 

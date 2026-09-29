@@ -33,14 +33,14 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   `findings` all carry it. Held open over a lost memory, the envelope's `issue_number` is null and
   `current` is empty: the store does not know what the issue lists, so read the issue.
   `ledger_document` is that previous document, kept for `fleet-audit`; do not answer from it.
-- `current_ids` is the **rendered** id set, exactly what the body's hidden block published. Derive
-  the full set from `document`.
+- `current_ids` is exactly what the body's hidden block published: the findings the body rendered
+  plus the ids the collector held. Derive this run's full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
   run, not something to answer from. No subcommand returns it.
 
 Whether a run is in flight comes from the lease `fleet-audit`'s `start` takes, not from a file in
-this directory. `streams` and `runs` report it as `liveness`: `never`, `completed`, `running`,
-`died` (started over two hours ago and never finished), or `error`.
+this directory. `streams` and `runs` report it as `liveness`: `never` (no run stored), `completed`,
+`running`, `died` (started over two hours ago and never finished), or `error`.
 
 ## Query it; do not read it
 
@@ -68,7 +68,10 @@ object per call.
 - Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
-- `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run.
+- `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run:
+  `latest.json`, or the newest ring entry when a later run deleted it and failed. `streams`, `show`,
+  `findings`, `finding` and `checks` then carry `latest_missing: true` — say the answer is from that
+  run and the issue may be newer.
 - `--severity`, `--cluster` and `--check` on `findings`, and `--cluster` and `--check` on `checks`,
   are exact matches, case-insensitive.
 - `findings`, `checks` and `diff` cap at 100 rows, raisable with `--limit`. `findings` and `checks`
@@ -144,9 +147,10 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
   that run, or a `/remediate` posted since, is not in it until the next run rewrites the store. When
   the question is about the issue, read the issue.
 - **Not written for every invocation.** Only a `finish` that exits 0 writes — never `--dry-run`,
-  never a run that exited 2, never `remediate`. The write is best-effort, and a failed write deletes
-  `latest.json` rather than leave a superseded envelope reading as current. **A missing `latest.json`
-  means unknown, not clean** — say the store has no record, and read the ledger issue.
+  never a run that exited 2, never `remediate`. The write is best-effort, and a `finish` that fails
+  after reading its memory deletes `latest.json` rather than leave a superseded envelope reading as
+  current; the ring stays, and answers come from it flagged `latest_missing`. **No stored run means
+  unknown, not clean** — say the store has no record, and read the ledger issue.
 
 ## Red lines
 

@@ -516,6 +516,9 @@ def test_audit_report_github_api_lifecycle_mocked(
     original_run_cmd = audit_report.run_cmd
     original_refresh = audit_report.refresh_credentials
     original_resolve = audit_report.resolve_repo
+    # The report store's root is read from the environment at call time, and
+    # left alone it is the agent's volume on whatever host runs this.
+    original_reports_dir = os.environ.get("FLEET_AUDIT_REPORTS_DIR")
 
     calls: list[list[str]] = []
 
@@ -550,6 +553,7 @@ def test_audit_report_github_api_lifecycle_mocked(
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
         audit_report.SCRATCH_DIR = str(tmp_path)
+        os.environ["FLEET_AUDIT_REPORTS_DIR"] = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
         audit_report.refresh_credentials = lambda *args, **kwargs: None
@@ -632,4 +636,8 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.repo_root = original_repo_root
         audit_report.GITOPS_WORKSPACE = original_workspace
         audit_report.SCRATCH_DIR = original_scratch
+        if original_reports_dir is None:
+            os.environ.pop("FLEET_AUDIT_REPORTS_DIR", None)
+        else:
+            os.environ["FLEET_AUDIT_REPORTS_DIR"] = original_reports_dir
         audit_report.set_workspace(None)

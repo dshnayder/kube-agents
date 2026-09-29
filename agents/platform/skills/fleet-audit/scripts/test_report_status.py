@@ -160,6 +160,17 @@ class TestLiveness(ReportStatusTestCase):
                 stream = self.project()["streams"][AUDIT]
                 self.assertEqual(stream["liveness"], expected)
 
+    def test_a_ring_without_latest_is_the_last_run_not_never(self):
+        """A `finish` that failed after reading its memory leaves the ring and
+        no `latest.json`; the stream ran, and its newest entry is flagged."""
+        self.write_latest()
+        (self.root / AUDIT / REPO / "latest.json").unlink()
+        stream = self.project()["streams"][AUDIT]
+        self.assertEqual(stream["liveness"], "completed")
+        entry = stream["repos"][REPO]
+        self.assertTrue(entry["latest_missing"])
+        self.assertEqual(entry["latest"]["finished_at"], NOW.isoformat())
+
     def test_a_first_run_in_flight_is_running_before_the_store_exists(self):
         self.write_note(audit="cost-audit", age_s=30.0)
         stream = self.project()["streams"]["cost-audit"]

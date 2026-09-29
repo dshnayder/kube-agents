@@ -198,7 +198,8 @@ a dropped candidate cannot be refused the way a dropped cluster is.
 
 The ledger body is the persistence: `previous_ids` is parsed out of the hidden marker of the body
 the previous run published — the copy the report store kept
-([report store design](fleet-audit-report-store.md)), not the issue fetched back from GitHub — and
+([report store design](fleet-audit-report-store.md)), not the issue fetched back from GitHub, except
+once where the store has never held the ledger — and
 the body is rewritten from the document on every findings run. A
 hold that only kept an id out of `resolved` therefore lasted one run — the next previous body no
 longer named the finding, and a clean run closed the ledger over it with its pull request open. So
@@ -229,10 +230,11 @@ given the same `--manifest-file` refuses it as held rather than as unknown.
 
 Three bounds on the held set, all applied where it is computed, once per run, before the branches
 split. "The document carries it" means the document's own ids plus the postures `finish` withheld
-this run: a withheld posture is the model's finding taken out for want of a search, and withheld
-ids enter no delta block, so it is never held. When the report store holds no record of the open ledger — absent, unreadable, or written for
-another issue — the run has no held set to intersect with, and it does not derive one from the
-manifest, because that would turn every candidate the model has been rejecting into a permanent
+this run: a withheld posture is the model's finding taken out for want of a search, and withheld ids
+enter no delta block, so it is never held. When the report store holds no usable record of the open
+ledger — `latest.json` missing, unreadable, or written for another issue, or a never-held store with
+no block to seed from — the run has no held set to intersect with, and it does not derive one from
+the manifest, because that would turn every candidate the model has been rejecting into a permanent
 hold. It holds nothing and rewrites the body anyway: freezing the body until a run could read its
 memory would freeze it for good, because only a run that writes the body restores the store. The
 cost is that ids held on the lost body are no longer carried; with a manifest their pull requests
@@ -240,21 +242,23 @@ stay protected, because the stale-close pass reads the still-flagged set whole, 
 nothing the lost body held is protected. The delta comment is skipped. A run with neither a memory
 nor a manifest answers no `/remediate` at all (no refusal, deferral or acknowledgement; the next run
 with a memory answers them, and the deferred marker is what `reply_to_deferrals` guards on, so
-nothing is lost by waiting). A clean run over a lost memory closes only with a manifest whose
-collector flags nothing the document does not carry; otherwise it files a lost-memory coverage gap
-(§4), stays open and reports partial. Every published body also spells a `<!--` arriving in model- or fleet-authored
-free text as `&lt;!--` (§3.3), so a run over a document whose text contains a comment opener renders
-that text differently from main; none of the five recorded transcripts carries an opener in free
-text. A marker minted under
-another identity scheme is deliberately not this case: the stamp is refreshed only by the rewrite,
-so a scheme bump rewrites the body as it always has; the holds survive it by re-derivation from
-their rows (below), and only ids with no row are lost. And the set is capped at `MAX_HELD_IDS` in
-sorted id order — the ids are a monotone term in the marker that no SOP-side edit can shrink. An id
-past the cap leaves the marker for good: the ledger stops tracking it, it stays on each run's JSON
-line as an unpublished candidate while the collector flags it, its pull request stays open, and the
-dropped ids are logged once with a warning and stated at the end of the section under every tier;
-the ids kept are charged to the budget ahead of the findings, so the body cannot raise over them.
-The fourth tier, when not even the note fits, is no section at all and the ids in the marker alone.
+nothing is lost by waiting). A clean run over a lost memory never closes: it files a lost-memory
+coverage gap, stays open and reports partial — the collector's gap while it still flags something
+the document does not carry, and otherwise the gap saying nothing shows whether the ledger's
+findings were fixed, since a collector covers only its own checks ([report store design
+§4](fleet-audit-report-store.md)). Every published body also spells a `<!--` arriving in model- or
+fleet-authored free text as `&lt;!--` (§3.3), so a run over a document whose text contains a comment
+opener renders that text differently from main; none of the five recorded transcripts carries an
+opener in free text. A marker minted under another identity scheme is deliberately not this case:
+the stamp is refreshed only by the rewrite, so a scheme bump rewrites the body as it always has; the
+holds survive it by re-derivation from their rows (below), and only ids with no row are lost. And
+the set is capped at `MAX_HELD_IDS` in sorted id order — the ids are a monotone term in the marker
+that no SOP-side edit can shrink. An id past the cap leaves the marker for good: the ledger stops
+tracking it, it stays on each run's JSON line as an unpublished candidate while the collector flags
+it, its pull request stays open, and the dropped ids are logged once with a warning and stated at
+the end of the section under every tier; the ids kept are charged to the budget ahead of the
+findings, so the body cannot raise over them. The fourth tier, when not even the note fits, is no
+section at all and the ids in the marker alone.
 
 `--dry-run` previews the hold from the manifest's candidates alone. A clean preview says the run
 would be `HELD` if the ledger's marker carries any of the still-flagged candidates and `CLEAN`
@@ -396,10 +400,10 @@ The reason, passed through the same redactor as a skipped cluster's reason, is a
 nothing is announced resolved, no remediation pull request is retired, and the ledger is not closed,
 by the same rule any other gap applies. A document-authored gap shows in the Scope table's rows; the
 waiver has no row, so the ledger body lists it under a _Coverage_ heading in the Scope section and
-the delta comment, when one is posted, repeats it. The other hold the document cannot express — a
-clean run whose report store holds no record of the open ledger while the collector still flags
-something the document does not carry (§3.3) — arises only on a clean run, which comments rather
-than rewriting the body, so it is named in that comment instead. The waiver and `--manifest-file`
+the delta comment, when one is posted, repeats it. The other holds the document cannot express —
+the lost-memory gaps a clean run files when its report store holds no record of the open ledger
+(§3.3) — arise only on a clean run, which comments rather than rewriting the body, so they are named
+in that comment instead. The waiver and `--manifest-file`
 are mutually
 exclusive, a blank reason is a validation error, and `--dry-run` appends the same gap so the preview
 shows the hold the real run will apply.

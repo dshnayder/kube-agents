@@ -364,6 +364,21 @@ class TestShow(StoreTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue())["root"], self.root)
 
+    def test_a_missing_latest_answers_from_the_newest_ring_entry(self):
+        """A failed `finish` deletes `latest.json` and leaves the ring: the
+        store still holds a record, flagged as possibly behind the ledger."""
+        (Path(self.root) / AUDIT / REPO / "latest.json").unlink()
+        payload = self.ok("show", AUDIT)
+        self.assertEqual(payload["run"], self.newest)
+        self.assertTrue(payload["envelope"]["latest_missing"])
+        self.assertTrue(self.ok("findings", AUDIT)["latest_missing"])
+        self.assertTrue(self.ok("checks", AUDIT)["latest_missing"])
+        self.assertFalse(self.ok("findings", AUDIT, "--run", self.older)["latest_missing"])
+
+    def test_repository_casing_is_not_a_second_store(self):
+        payload = self.ok("show", AUDIT, "--repo", REPO.upper())
+        self.assertEqual(payload["repo"], REPO)
+
     def test_an_absent_stamp_names_the_ring(self):
         payload = self.refused("show", AUDIT, "--run", "20990101T000000.000000Z")
         self.assertIn("20990101T000000.000000Z.json", payload["error"])
@@ -382,7 +397,7 @@ class TestShow(StoreTestCase):
 
 
 class TestUnknownIsNotClean(StoreTestCase):
-    """A stream with no `latest.json` has no record, which is not a clean run."""
+    """A stream with no stored run has no record, which is not a clean run."""
 
     def test_a_missing_latest_is_unknown(self):
         self.stream_dir(AUDIT)
@@ -391,15 +406,19 @@ class TestUnknownIsNotClean(StoreTestCase):
         self.assertEqual(payload["liveness"], "never")
         self.assertEqual(payload["runs"], [])
 
-    def test_a_failed_write_leaves_the_ring_and_says_which_run_it_lost(self):
-        """`write_report` unlinks `latest.json` when its write fails, so the
-        ring can hold entries while the newest record is gone."""
+    def test_a_failed_write_leaves_the_ring_and_answers_flagged(self):
+        """`write_report` and `finish` unlink `latest.json` when a run fails,
+        so the ring can hold entries while the newest record is gone. The
+        newest entry is still a run the stream completed: answered from, and
+        flagged, never reported as a stream that never ran."""
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
         os.unlink(Path(self.root) / AUDIT / REPO / "latest.json")
-        payload = self.refused("findings", AUDIT)
-        self.assertIn("unknown, not clean", payload["error"])
-        self.assertEqual(payload["runs"], ["20260826T063100.000000Z.json"])
-        self.assertEqual(payload["liveness"], "never")
+        payload = self.ok("findings", AUDIT)
+        self.assertEqual(payload["run"], "20260826T063100.000000Z.json")
+        self.assertTrue(payload["latest_missing"])
+        row = self.ok("streams")["streams"][0]
+        self.assertEqual(row["liveness"], "completed")
+        self.assertTrue(row["latest_missing"])
 
 
 class TestFindings(StoreTestCase):

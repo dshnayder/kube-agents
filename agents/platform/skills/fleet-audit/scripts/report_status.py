@@ -138,8 +138,10 @@ def repo_ids(root: str, audit_id: str) -> list[str]:
 
 def store_path(root: str, audit_id: str, repo: str) -> str:
     """The directory one stream keeps for one repository. ValueError for a
-    `repo` that is not `owner/name`, so an argument can never walk out of it."""
-    segments = str(repo).split("/")
+    `repo` that is not `owner/name`, so an argument can never walk out of it.
+    Lower-cased as audit_report.reports_dir_for writes it: GitHub's names are
+    not case-sensitive, so neither is the store."""
+    segments = str(repo).lower().split("/")
     if len(segments) != 2 or not all(
         REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in segments
     ):
@@ -214,6 +216,23 @@ def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
     is the one that does not.
     """
     return _read_object(os.path.join(store_path(root, audit_id, repo), "latest.json"))
+
+
+def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
+    """The last run the store kept, whole, and whether it came off the ring.
+
+    `finish` deletes `latest.json` once it has read its memory and restores it
+    only on a completed write, so a run that failed in between leaves the ring
+    and no `latest.json`. The newest ring entry is then the last run the store
+    has, and the flag says a later run may have changed the ledger unrecorded.
+    """
+    latest = load_latest(root, audit_id, repo)
+    if latest is not None:
+        return latest, False
+    runs = list_runs(root, audit_id, repo)
+    if not runs:
+        return None, False
+    return load_run(root, audit_id, repo, runs[-1]), True
 
 
 def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
@@ -323,15 +342,23 @@ def _project_repo(root: str, audit_id: str, repo: str) -> dict:
     latest: dict | None = None
     runs: list[str] = []
     error: str | None = None
+    latest_missing = False
     try:
-        latest = load_latest(root, audit_id, repo)
+        latest, latest_missing = load_last(root, audit_id, repo)
     except (OSError, ValueError) as exc:
         error = _failure("latest.json", exc)
     try:
         runs = list_runs(root, audit_id, repo)
     except OSError as exc:
         error = error or _failure("runs/", exc)
-    return {"latest": _project_latest(latest), "runs": runs, "error": error}
+    return {
+        "latest": _project_latest(latest),
+        # True when `latest` is the newest ring entry because `latest.json` is
+        # gone: a run after it failed, and the ledger may be newer than this.
+        "latest_missing": latest_missing,
+        "runs": runs,
+        "error": error,
+    }
 
 
 def _project_started(started: float | None, now_epoch: float) -> dict | None:

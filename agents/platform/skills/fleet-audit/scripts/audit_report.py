@@ -899,18 +899,23 @@ MAX_HELD_DETAIL_ROWS = 50
 # sorted order so which ones survive the cap is deterministic, with the
 # overflow logged and stated in the body.
 MAX_HELD_IDS = 200
-# The coverage gap a clean run files when the report store holds no memory of
-# the open ledger and the collector still flags something the document does not
-# carry: the ledger may be holding that finding, so it is not closed over it.
+# The coverage gaps a clean run files when the report store holds no memory of
+# the open ledger. The first when the collector still flags something the
+# document does not carry: the ledger may be holding that finding. The second
+# otherwise: nothing says the findings the ledger carries were fixed, since a
+# collector covers only its own checks, and an empty document would close them
+# and their pull requests. It names the way out, because a clean fleet files it
+# on every run until one rewrites the body.
 LOST_MEMORY_GAP = (
     "the report store holds no record of the open ledger, so the findings it "
     "carries are unknown, and the collector still flags something this run did "
     "not report; the ledger stays open over it"
 )
 LOST_MEMORY_UNGUARDED_GAP = (
-    "the report store holds no record of the open ledger and this run passed no "
-    "collector manifest, so nothing shows whether the findings it carries were "
-    "fixed; the ledger stays open over them"
+    "the report store holds no record of the open ledger, so nothing shows "
+    "whether the findings it carries were fixed; the ledger stays open over them "
+    "until a run that reports findings rewrites it, or a human who has checked "
+    "them closes it"
 )
 # The width of a coverage hold rendered on a line of its own — the waiver's
 # reason in the Scope section and the delta comment. Wide enough for the
@@ -1746,7 +1751,10 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     root from its readers would put the report where nobody looks, with no
     error anywhere. Raises ValueError for a `repo` that is not `owner/name`.
     """
-    segments = str(repo).split("/")
+    # Lower-cased because GitHub's names are not case-sensitive: `--repo
+    # Acme/GitOps` and a ConfigMap's `acme/gitops` are one ledger, and two
+    # directories for it would each trust a memory the other has moved past.
+    segments = str(repo).lower().split("/")
     if len(segments) != 2 or not all(
         REPORT_REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir)
         for part in segments
@@ -1757,11 +1765,19 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
 
 
 def _redact_document(value: object) -> object:
-    """`value` with the body's redaction backstop applied to every string in it."""
+    """`value` with the body's redaction backstop applied to every string in it.
+
+    Except an `id`: the body's hidden block and `current_ids` publish ids raw,
+    and a long object name can hold a token shape, so a redacted id would name
+    a finding no other key does.
+    """
     if isinstance(value, str):
         return redact_secrets(value)
     if isinstance(value, dict):
-        return {key: _redact_document(item) for key, item in value.items()}
+        return {
+            key: item if key == "id" and isinstance(item, str) else _redact_document(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_redact_document(item) for item in value]
     return value
@@ -1791,8 +1807,8 @@ def report_envelope(
     when it cannot carry them, so the next run's trust check fails by design
     instead of trusting a body that is not the one on GitHub.
 
-    `current_ids` is the rendered set, exactly what the body's hidden block
-    lists. `document` is this run's validated document, whole rather than
+    `current_ids` is exactly what the body's hidden block lists: the rendered
+    findings plus the held ids. `document` is this run's validated document, whole rather than
     clipped to the body's budget, with the body's redaction backstop applied
     to every string. Where the body was carried forward, `ledger_document` is
     the document that body rendered: `document`
@@ -1942,7 +1958,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         return None
     stored_issue = envelope.get("issue_number")
     stored_repo = envelope.get("repo")
-    if stored_issue != issue_number or stored_repo != repo:
+    if stored_issue != issue_number or str(stored_repo).lower() != str(repo).lower():
         log(
             f"Stored report for {audit_id} was written for {stored_repo}#{stored_issue}, "
             f"not the open {repo}#{issue_number}; the previous run's findings are "
@@ -11515,21 +11531,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # On a clean run a lost memory also costs the two checks that refuse the
     # close — the previous findings this run left unexplained, and the ones the
     # collector still flags — since both are joined against the stored body.
-    # The first is given up for the one run it takes to restore the memory.
-    # The second is not: a close over a candidate the collector still emits
-    # might be a close over a finding the lost body carried, so the ledger stays
-    # open over that and says why, until the collector stops flagging it or the
-    # document accounts for it. Only the clean branch closes anything, so the
+    # So a clean run with a lost memory never closes. Where the collector still
+    # emits a candidate the document does not carry, the gap says so. Otherwise
+    # nothing says the findings the ledger carries were fixed: a manifest
+    # covers only the collector's checks, and without one there is nothing at
+    # all, while an empty document would close the ledger and every pull
+    # request it carries. It stays open until a findings run rewrites the body,
+    # or a human closes it. Only the clean branch closes anything, so the
     # findings branch needs no gap for this; its delta is withheld already.
-    # With no manifest there is no still-flagged set to hold on either, and an
-    # empty document would close the ledger and every pull request it carries
-    # over findings nothing says were fixed. It stays open until a findings run
-    # rewrites the body, or a human closes it.
     if memory_lost and not findings and (still_flagged - held_exclude):
         gaps.append(LOST_MEMORY_GAP)
         collector_gaps.append(LOST_MEMORY_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_GAP}")
-    elif memory_lost and not findings and manifest is None:
+    elif memory_lost and not findings:
         gaps.append(LOST_MEMORY_UNGUARDED_GAP)
         collector_gaps.append(LOST_MEMORY_UNGUARDED_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
@@ -12312,7 +12326,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             ledger_body=ledger_body,
             new_ids=new_ids if delta_known else [],
             resolved_ids=[] if (gaps or stale_scheme or not delta_known) else resolved_ids,
-            rendered_ids=rendered.rendered_ids,
+            # The block as published, held ids included, so the stored set
+            # is the one the next run's memory parses out of `ledger_body`.
+            rendered_ids=parse_delta_block(ledger_body),
         ),
         now,
     )

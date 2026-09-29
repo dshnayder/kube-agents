@@ -160,12 +160,12 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
             report_status.store_path(root, audit_id, repo)
         except ValueError as exc:
             raise QueryError(str(exc)) from exc
-        if repo not in repos:
+        if repo.lower() not in repos:
             raise QueryError(
                 f"no reports for {audit_id} in {repo}", repos=repos,
                 liveness=_liveness(root, audit_id),
             )
-        return repo
+        return repo.lower()
     if len(repos) == 1:
         return repos[0]
     if not repos:
@@ -197,7 +197,7 @@ def _liveness(root: str, audit_id: str) -> str:
             (
                 envelope
                 for repo in report_status.repo_ids(root, audit_id)
-                if (envelope := report_status.load_latest(root, audit_id, repo))
+                if (envelope := report_status.load_last(root, audit_id, repo)[0])
             ),
             None,
         )
@@ -225,7 +225,12 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
     name = _run_name(run)
     try:
         if name == "latest.json":
-            envelope = report_status.load_latest(root, audit_id, repo)
+            envelope, latest_missing = report_status.load_last(root, audit_id, repo)
+            if latest_missing:
+                # A run after the newest ring entry failed: answer from the
+                # entry, and say the ledger may have moved on since.
+                name = _ring(root, audit_id, repo)[-1]
+                envelope = {**envelope, "latest_missing": True} if envelope else None
         else:
             envelope = report_status.load_run(root, audit_id, repo, name)
     except (OSError, ValueError) as exc:
@@ -235,9 +240,9 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
     if envelope is None:
         if name == "latest.json":
             raise QueryError(
-                f"{audit_id} has no latest.json in {repo}: the store holds no "
-                "record of a run for it. That means unknown, not clean — say so "
-                "and read the ledger issue.",
+                f"{audit_id} has no run stored for {repo}: the store holds no "
+                "record of it. That means unknown, not clean — say so and read "
+                "the ledger issue.",
                 liveness=_liveness(root, audit_id),
                 runs=_ring(root, audit_id, repo),
             )
@@ -367,6 +372,9 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         # True when the issue still lists the previous run's findings, so
         # this run's zero `findings` and `critical` do not say it is clear.
         "ledger_held_open": latest.get("ledger_held_open"),
+        # True when the row is the newest ring entry because a later run
+        # failed before storing: the issue may be newer than this row.
+        "latest_missing": entry.get("latest_missing"),
         # A count, not the gap strings: every stream's worth of prose is the
         # unbounded shape this command exists to avoid. `show` names them.
         "gaps": len(gaps) if isinstance(gaps, list) else None,
@@ -416,6 +424,7 @@ def cmd_findings(args: argparse.Namespace) -> dict:
         "finished_at": envelope.get("finished_at"),
         "status": envelope.get("status"),
         "ledger_held_open": bool(envelope.get("ledger_held_open")),
+        "latest_missing": bool(envelope.get("latest_missing")),
         "filters": {
             "severity": args.severity,
             "cluster": args.cluster,
@@ -442,6 +451,7 @@ def cmd_finding(args: argparse.Namespace) -> dict:
                 "repo": repo,
                 "run": name,
                 "finished_at": envelope.get("finished_at"),
+                "latest_missing": bool(envelope.get("latest_missing")),
                 "finding": finding,
                 "error": None,
             }
@@ -507,6 +517,7 @@ def cmd_checks(args: argparse.Namespace) -> dict:
         "run": name,
         "finished_at": envelope.get("finished_at"),
         "status": envelope.get("status"),
+        "latest_missing": bool(envelope.get("latest_missing")),
         "filters": {"cluster": args.cluster, "check": args.check},
         "scope_entries": len(clusters),
         "total": len(ran),
@@ -529,7 +540,7 @@ def cmd_diff(args: argparse.Namespace) -> dict:
     Computed from each run's whole `document.findings`, not from the envelope's
     `new_ids`/`resolved_ids` — those are one run's delta against the run before
     it, which answers a different question than "what changed between Monday
-    and Friday", and `current_ids` is the rendered subset rather than the set.
+    and Friday", and `current_ids` is the body's hidden block rather than the document.
     """
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)
