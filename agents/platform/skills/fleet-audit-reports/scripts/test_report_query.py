@@ -327,6 +327,18 @@ class TestStreams(StoreTestCase):
         self.assertEqual(payload["streams"], [])
         self.assertIn("in-flight leases not readable", payload["error"])
 
+    def test_an_unlistable_lease_directory_blames_the_leases_not_the_stores(self):
+        # `project` stamps the lease failure on every stream, so an answer that
+        # listed those streams would call readable stores unreadable.
+        self.write_run(AUDIT, "2026-07-27T08:00:00", [])
+        denied = PermissionError(13, "Permission denied")
+        with patch.object(report_query.report_status, "in_flight_ids", side_effect=denied):
+            code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        self.assertIn("in-flight leases not readable", payload["error"])
+        self.assertNotIn("streams that could not be read", payload["error"])
+        self.assertIn("Permission denied", payload["lease_error"])
+
     def test_an_unparseable_envelope_is_an_error_row_and_a_nonzero_exit(self):
         self.stream_dir(AUDIT)
         (Path(self.root) / AUDIT / REPO / "latest.json").write_text("{not json", encoding="utf-8")

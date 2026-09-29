@@ -17337,6 +17337,20 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertIsNone(self.stored()["issue_number"])
 
+    def test_a_clean_run_that_only_comments_keeps_the_memory_when_killed(self):
+        # Held open over a gap, a clean run comments and leaves the body as the
+        # stored envelope describes it, so dying before the write must not turn
+        # the next run into a lost memory that can never close.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(gap)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
     def test_a_failed_lookup_before_the_ledger_changes_keeps_the_memory(self):
         # Nothing touched the ledger, so the stored envelope still describes it
         # exactly; deleting it would cost the next run its memory for nothing.

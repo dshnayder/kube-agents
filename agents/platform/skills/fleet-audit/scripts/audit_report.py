@@ -1579,7 +1579,7 @@ def _in_flight_since(path: Path) -> float | None:
     except (OSError, ValueError):
         note = None
     started = note.get("started_at") if isinstance(note, dict) else None
-    if isinstance(started, (int, float)):
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
         return float(started)
     try:
         return path.stat().st_mtime
@@ -11482,8 +11482,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # and not the held set; a run without one has only the held set, and
     # protects nothing the lost body held.
     #
-    # A run with no manifest cannot know the held set either way, so it answers
-    # no `/remediate` at all: read against the document alone, a held id is
+    # A run with neither a manifest nor a stored memory cannot know the held
+    # set, so it answers no `/remediate` at all (with the memory, the held set
+    # is the last body's, and it answers): read against the document alone, a held id is
     # "not a finding … may be a typo" under the permanent refused marker. The
     # next run with a memory answers them — `reply_to_deferrals` guards on the
     # deferred marker alone, so nothing is lost by waiting.
@@ -11576,12 +11577,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
-    # The last read that can abort the run is behind us and nothing has touched
-    # the ledger yet, so from here a killed run could leave `latest.json`
-    # describing a ledger it no longer matches. Deleted before that read, a
-    # failed pull-request lookup that changed nothing would cost the next run
-    # its memory.
-    invalidate_report_memory(audit_id, repo)
+    # `latest.json` is dropped just before each call that changes what the
+    # ledger says -- the findings rewrite, the clean close, the coverage issue
+    # a clean run opens -- and not here. A clean run that only comments leaves
+    # the stored memory exactly true, so a failure on that path (a transient
+    # `gh issue close`, a terminal timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
@@ -11791,6 +11791,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
+            invalidate_report_memory(audit_id, repo)
             gh(
                 [
                     "issue",
@@ -11816,6 +11817,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             rendered = render_issue_body(
                 data, generated_at=now, audit_id=audit_id, gaps=gaps
             )
+            invalidate_report_memory(audit_id, repo)
             res = gh(
                 [
                     "issue",
@@ -11950,6 +11952,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
+    invalidate_report_memory(audit_id, repo)
     # Every finding in the document reproduces by definition — the resolved ones
     # are the ids that are absent from it.
     pr_by_finding, pr_urls = reconcile_remediation_prs(

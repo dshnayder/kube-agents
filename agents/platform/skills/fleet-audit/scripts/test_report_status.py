@@ -223,6 +223,17 @@ class TestLiveness(ReportStatusTestCase):
         os.utime(path, (NOW.timestamp() - 10, NOW.timestamp() - 10))
         self.assertEqual(self.project()["streams"][AUDIT]["liveness"], "running")
 
+    def test_the_lease_and_this_reader_agree_on_a_non_numeric_started_at(self):
+        # `true` is an int to Python; were it 1.0 on one side and the mtime on
+        # the other, `start` would take over a stream the readers call running.
+        for value in (True, False, "soon", None):
+            with self.subTest(started_at=value):
+                path = self.write_note(text=json.dumps({"started_at": value}))
+                self.assertEqual(
+                    report_status.in_flight_since(str(self.scratch), AUDIT),
+                    audit_report._in_flight_since(Path(path)),
+                )
+
     def test_the_lock_file_is_not_a_stream(self):
         (self.scratch / f"inflight_{AUDIT}.json.lock").write_text("")
         (self.scratch / "inflight_.json").write_text("{}")

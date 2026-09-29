@@ -333,18 +333,21 @@ def cmd_streams(args: argparse.Namespace) -> dict:
             f"report store not readable at {projection['root']}: no stream can "
             "be answered from it. This is unknown, not clean."
         )
-    elif unreadable:
-        error = "streams that could not be read: " + ", ".join(unreadable)
+    # Before `unreadable`: `project` stamps the lease failure onto every
+    # stream's error, so naming those streams would blame stores that read fine.
     elif projection.get("lease_error"):
         error = (
             f"in-flight leases not readable ({projection['lease_error']}): a run "
             "in progress would not be listed. This is unknown, not clean."
         )
+    elif unreadable:
+        error = "streams that could not be read: " + ", ".join(unreadable)
     return {
         "root": projection["root"],
         "root_exists": projection["root_exists"],
         "generated_at": projection["generated_at"],
         "ttl_s": projection["ttl_s"],
+        "lease_error": projection.get("lease_error"),
         "streams": rows,
         "error": error,
     }

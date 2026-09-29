@@ -473,9 +473,16 @@ def load_roster(path: Path) -> tuple[dict[str, dict], str]:
     parses and holds no fleet-audit job returns no reason.
     """
     try:
-        jobs = json.loads(path.read_text(encoding="utf-8")).get("jobs") or []
+        doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return {}, _oneline(exc)
+    # A bare list of jobs or an object carrying them under `jobs`, as
+    # scripts/generate_docs.py's reader accepts; any other shape is unreadable.
+    jobs = doc.get("jobs") if isinstance(doc, dict) else doc
+    if jobs is None:
+        jobs = []
+    if not isinstance(jobs, list) or not all(isinstance(job, dict) for job in jobs):
+        return {}, "not a list of jobs, nor an object carrying one under `jobs`"
     out = {}
     for job in jobs:
         if "fleet-audit" in (job.get("skills") or []):
@@ -560,7 +567,9 @@ def count_cell(value: object) -> str:
     return str(value) if isinstance(value, int) else "—"
 
 
-def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list[str]:
+def flags_for(
+    stream: dict, job: dict, now: datetime, root_exists: bool, leases_read: bool = True
+) -> list[str]:
     """The five flags, in severity order.
 
     DIED reads off the projection's liveness alone, so a roster that has
@@ -568,7 +577,9 @@ def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list
     it gated on the schedule, `at is None` → `expected is None` → `stale is
     False` would render every failure as the same calm blank row. STALE is
     silence, so a stream whose lease is `running` is never STALE: it is late,
-    and the STATUS cell already says how long it has been going.
+    and the STATUS cell already says how long it has been going. NEVER also
+    needs the leases read: a first run in flight has a lease and no store
+    directory yet, so with the scratch directory unlisted "never" is unknown.
     """
     flags = []
     unreadable = not root_exists or bool(stream.get("error"))
@@ -580,7 +591,7 @@ def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list
     if stream.get("latest_missing"):
         flags.append("UNRECORDED")
     enabled = bool(job.get("enabled"))
-    if liveness == "never" and enabled and not unreadable:
+    if liveness == "never" and enabled and not unreadable and leases_read:
         flags.append("NEVER")
     if enabled and liveness != "running":
         at = parse_iso((stream.get("latest") or {}).get("finished_at"))
@@ -605,17 +616,27 @@ def exit_code(projection: dict) -> int:
 
 
 def unreadable_reason(projection: dict) -> str | None:
+    """Why the table cannot be trusted, with the error text itself.
+
+    The lease failure comes first: `project()` stamps it onto every stream's
+    `error`, so listing those streams would blame stores that read fine. The
+    per-stream text is printed here because the STATUS cell shows an error
+    only when the row has no completed status, and a stray directory beside a
+    clean run would otherwise surface as a bare NO STORE flag.
+    """
     if not projection.get("root_exists"):
         return f"store directory absent on the pod: {projection.get('root')}"
+    if projection.get("lease_error"):
+        return f"in-flight leases unreadable, so a run in progress may be missing: {projection['lease_error']}"
     bad = sorted(
-        audit_id
+        (audit_id, stream["error"])
         for audit_id, stream in (projection.get("streams") or {}).items()
         if (stream or {}).get("error")
     )
     if bad:
-        return f"unreadable stream files: {', '.join(bad)}"
-    if projection.get("lease_error"):
-        return f"in-flight leases unreadable, so a run in progress may be missing: {projection['lease_error']}"
+        return "unreadable stream files: " + "; ".join(
+            f"{audit_id} ({clip_gap(error)})" for audit_id, error in bad
+        )
     return None
 
 
@@ -689,10 +710,11 @@ def row_for(
     now: datetime,
     root_exists: bool,
     utc: bool,
+    leases_read: bool = True,
 ) -> tuple[list[tuple], list[str], dict]:
     """One table row, its flags, and the `latest` envelope behind it."""
     latest = stream.get("latest") or {}
-    flags = flags_for(stream, job, now, root_exists)
+    flags = flags_for(stream, job, now, root_exists, leases_read)
     status, status_style = status_cell(stream, latest)
 
     findings = latest.get("findings")
@@ -820,11 +842,12 @@ def render(
     box = box or BOX_UNICODE
     streams = projection.get("streams") or {}
     root_exists = bool(projection.get("root_exists"))
+    leases_read = not projection.get("lease_error")
 
     built = []
     for label, audit_id, stream in stream_rows(streams, roster):
         row, flags, latest = row_for(
-            label, stream, roster.get(audit_id) or {}, now, root_exists, utc
+            label, stream, roster.get(audit_id) or {}, now, root_exists, utc, leases_read
         )
         # Scrubbed once here, because the gaps table and the pull-request list
         # below print the label too, and a stream directory's name is not
@@ -862,13 +885,13 @@ def render(
         COLUMNS, [entry["row"] for entry in shown], palette,
         width if width else UNBOUNDED, box,
     )
-    shown_streams = len({e["audit_id"] for e in shown})
-    all_streams = len({e["audit_id"] for e in built})
+    # Rows, not streams: the note fires on hidden rows, and a stream on two
+    # repositories can lose one of them to --stream or --flagged.
     if len(shown) != len(built):
         out.append(
             palette(
-                "  %d of %d streams shown; drop --stream/--flagged for the rest"
-                % (shown_streams, all_streams),
+                "  %d of %d rows shown; drop --stream/--flagged for the rest"
+                % (len(shown), len(built)),
                 "dim",
             )
         )

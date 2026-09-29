@@ -60,9 +60,10 @@ exit code. A failed write deletes `latest.json` on its way out, because the file
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
 quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
 indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` just before
-it touches the issue, once the last lookup that can abort the run has returned: a run killed between
-editing the ledger and writing the store leaves no envelope rather than one describing the run
-before, and a lookup that fails earlier has changed nothing and leaves the memory in place. The ring
+each call that changes what the ledger says: the findings rewrite, the clean close, and the coverage
+issue a clean run opens. A run killed between that call and writing the store leaves no envelope
+rather than one describing the run before. A lookup that fails earlier, or a clean run held open that
+only comments, has changed nothing the envelope describes and leaves the memory in place. The ring
 is left alone, and the readers answer from its newest entry with `latest_missing: true`: the stream
 did run, and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a
 failed prune has not damaged the memory the run just wrote.

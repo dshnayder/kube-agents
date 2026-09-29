@@ -469,6 +469,39 @@ class TestRender(unittest.TestCase):
         self.assertIn("latest.json: not a JSON object", out)
         self.assertIn("NO STORE", out)
 
+    def test_a_stream_error_beside_a_completed_run_is_printed(self):
+        # STATUS shows the run's status, so the error text has to reach the
+        # footer or the operator sees a bare NO STORE with no reason.
+        doc = stream(last=latest(), error="Acme/Fleet: not lower-case, so no reader opens it")
+        out = self.render({"compliance-audit": doc})
+        self.assertIn("UPDATED", out)
+        self.assertIn("Acme/Fleet: not lower-case", out)
+
+    def test_an_unreadable_lease_directory_is_named_not_the_stores(self):
+        lease = "/opt/data/scratch/: Permission denied"
+        doc = stream(liveness="error", last=latest(), error=lease)
+        out = view.render(
+            projection({"compliance-audit": doc}, lease_error=lease),
+            self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
+        )
+        self.assertIn("in-flight leases unreadable", out)
+        self.assertNotIn("unreadable stream files", out)
+
+    def test_a_roster_stream_is_not_never_while_the_leases_are_unread(self):
+        # Its first run may be in flight with no store directory yet; the lease
+        # that would say so could not be listed.
+        out = view.render(
+            projection({}, lease_error="/opt/data/scratch/: Permission denied"),
+            self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
+        )
+        self.assertNotIn("NEVER", out)
+
+    def test_a_hidden_repository_row_is_counted_as_a_row(self):
+        doc = stream(last=latest())
+        doc["repos"]["acme/other"] = {"latest": latest(), "runs": [], "error": None}
+        out = self.render({"compliance-audit": doc}, patterns=("acme/other",))
+        self.assertIn("1 of 2 rows shown", out)
+
     def test_a_missing_store_says_so_below_the_table(self):
         out = self.render({}, root_exists=False)
         self.assertIn("store directory absent on the pod", out)
@@ -667,7 +700,7 @@ class TestDashboard(unittest.TestCase):
         out = self.render(self.two(), patterns=("cost",))
         self.assertIn("cost-audit", out)
         self.assertNotIn("compliance-audit", out)
-        self.assertIn("1 of 2 streams shown", out)
+        self.assertIn("1 of 2 rows shown", out)
 
     def test_flagged_keeps_only_the_rows_worth_looking_at(self):
         streams = self.two()
@@ -1149,6 +1182,23 @@ class TestRosterLoading(unittest.TestCase):
         self.assertEqual(roster, {})
         self.assertIn("/nonexistent", error)
 
+    def test_a_bare_list_roster_is_read(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            path.write_text(json.dumps([{"id": "cost-audit", "skills": ["fleet-audit"], "enabled": True}]), encoding="utf-8")
+            roster, error = view.load_roster(path)
+        self.assertEqual(error, "")
+        self.assertIn("cost-audit", roster)
+
+    def test_a_roster_of_another_shape_reports_why(self):
+        for text in ("42", '"jobs"', '{"jobs": {"a": 1}}', "[1, 2]"):
+            with self.subTest(text=text), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "jobs.json"
+                path.write_text(text, encoding="utf-8")
+                roster, error = view.load_roster(path)
+                self.assertEqual(roster, {})
+                self.assertTrue(error)
+
     def test_a_malformed_roster_reports_why(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "jobs.json"
@@ -1216,6 +1266,19 @@ class TestUnreadableRoster(unittest.TestCase):
         rc, out, _ = run_main(["--roster", "/nonexistent/jobs.json"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("store directory absent on the pod", out)
+
+
+class TestColourGate(unittest.TestCase):
+    class Tty:
+        def isatty(self):
+            return True
+
+    def test_an_empty_no_color_does_not_disable_colour(self):
+        # no-color.org: set and non-empty.
+        with mock.patch.dict("os.environ", {"NO_COLOR": "", "TERM": "xterm"}):
+            self.assertTrue(view.want_colour("auto", self.Tty()))
+        with mock.patch.dict("os.environ", {"NO_COLOR": "1", "TERM": "xterm"}):
+            self.assertFalse(view.want_colour("auto", self.Tty()))
 
 
 class TestFormatting(unittest.TestCase):
