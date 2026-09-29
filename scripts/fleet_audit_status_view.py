@@ -41,7 +41,9 @@ a death. `⚠` on STATUS marks a partial run; the default view counts its covera
 gaps below the table and `--gaps` spells them out, so the fact that a run read
 less than the fleet is never off-screen even when the text of it is.
 Unknown status values render as themselves with the warning marker,
-never as success. Model-influenced text is scrubbed of terminal control
+never as success. A run that held the ledger open shows the findings the
+ledger carried (`N held`), not its own zero, and it counts as needing
+attention, as a HELD run does. Model-influenced text is scrubbed of terminal control
 characters at exactly one boundary, `scrub()`.
 
 The presentation half -- the box table, the palette, OSC 8 links, the width
@@ -711,6 +713,37 @@ def status_cell(stream: dict, latest: dict) -> tuple[str, str]:
     return text, style
 
 
+def held_open(latest: dict) -> bool:
+    """The run left the ledger open without rewriting it: its own `findings`
+    count is not what the issue lists, so it must not read as a clear ledger."""
+    return bool(latest.get("ledger_held_open"))
+
+
+def ledger_count(latest: dict) -> int | None:
+    """The findings the ledger lists after this run: this run's own, or the
+    carried ones when it held the ledger open. Null where that is unknown --
+    a hold over a lost memory stores `current: 0` because the store does not
+    know what the issue lists."""
+    if held_open(latest):
+        carried = latest.get("current")
+        return carried if isinstance(carried, int) and carried else None
+    findings = latest.get("findings")
+    return findings if isinstance(findings, int) else None
+
+
+def needs_attention(entry: dict) -> bool:
+    """A flag, a partial run, a HELD outcome, or a ledger held open. HELD with
+    no coverage gap is `partial: false` and sets no flag, yet it is a run that
+    refused to close the ledger over findings it did not account for."""
+    latest = entry["latest"]
+    return bool(
+        entry["flags"]
+        or latest.get("partial")
+        or latest.get("status") == "HELD"
+        or held_open(latest)
+    )
+
+
 def row_for(
     audit_id: str,
     stream: dict,
@@ -727,7 +760,13 @@ def row_for(
 
     findings = latest.get("findings")
     crit = latest.get("critical")
-    if isinstance(findings, int):
+    if held_open(latest):
+        # The issue still lists the previous run's findings; this run's zero
+        # is not the ledger's. Their criticality is not in the projection.
+        carried = ledger_count(latest)
+        findings_text = f"{carried} held" if carried is not None else "held ?"
+        findings_style = "yellow"
+    elif isinstance(findings, int):
         findings_text = f"{findings} ({crit} c)" if crit else str(findings)
         findings_style = "crit" if crit else ("dim" if not findings else None)
     else:
@@ -867,7 +906,7 @@ def render(
     shown = [
         entry for entry in built
         if (not patterns or any(p.lower() in entry["id"].lower() for p in patterns))
-        and (not flagged_only or entry["flags"] or entry["latest"].get("partial"))
+        and (not flagged_only or needs_attention(entry))
     ]
 
     def key(entry: dict):
@@ -877,7 +916,8 @@ def render(
             return (0 if at else 1, -(at.timestamp() if at else 0), entry["id"])
         if sort == "findings":
             crit = latest.get("critical") if isinstance(latest.get("critical"), int) else 0
-            total = latest.get("findings") if isinstance(latest.get("findings"), int) else -1
+            count = ledger_count(latest)
+            total = count if count is not None else -1
             return (-crit, -total, entry["id"])
         if sort == "flags":
             return (0 if entry["flags"] else 1, entry["id"])
@@ -969,13 +1009,12 @@ def header_lines(
     # A stream publishing to two repositories is two rows and one stream, so
     # every count below is of distinct stream ids, not of rows.
     total = len({e["audit_id"] for e in built})
-    attention = [e for e in built if e["flags"] or e["latest"].get("partial")]
+    attention = [e for e in built if needs_attention(e)]
     attention_streams = len({e["audit_id"] for e in attention})
-    findings = sum(
-        e["latest"].get("findings") or 0
-        for e in built
-        if isinstance(e["latest"].get("findings"), int)
-    )
+    # What the ledgers list: a held-open row counts the findings it carried,
+    # not this run's zero.
+    findings = sum(ledger_count(e["latest"]) or 0 for e in built)
+    held = [e for e in built if held_open(e["latest"])]
     critical = sum(
         e["latest"].get("critical") or 0
         for e in built
@@ -1047,6 +1086,15 @@ def header_lines(
                     "across %d run stream%s · %d critical"
                     % (ran_streams, "" if ran_streams == 1 else "s", critical),
                     "crit" if critical else "dim",
+                )
+                + (
+                    palette(
+                        " · %d ledger%s held open, criticals not counted"
+                        % (len(held), "" if len(held) == 1 else "s"),
+                        "yellow",
+                    )
+                    if held
+                    else ""
                 ),
             ),
         )
@@ -1185,7 +1233,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flagged", action="store_true",
-        help="only streams carrying a flag or a partial run",
+        help="only streams needing attention: a flag, a partial run, a HELD run, or a ledger held open",
     )
     parser.add_argument(
         "--gaps", action="store_true",

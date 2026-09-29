@@ -190,15 +190,21 @@ def _ring(root: str, audit_id: str, repo: str) -> list[str]:
         ) from exc
 
 
-def _liveness(root: str, audit_id: str) -> str:
-    """The stream's liveness, as `streams` reports it: the same projection, so
-    `runs` and a refusal cannot disagree with it about a lease."""
+def _stream_state(root: str, audit_id: str) -> tuple[str, str | None]:
+    """The stream's liveness and stream-level error, as `streams` reports
+    them: the same projection, so `runs` and a refusal cannot disagree with
+    it about a lease, and an `error` liveness always comes with its reason."""
     try:
-        return report_status.project_stream(
+        stream = report_status.project_stream(
             root, report_status.scratch_root(), audit_id, time.time()
-        )["liveness"]
-    except (OSError, ValueError):
-        return "error"
+        )
+    except (OSError, ValueError, OverflowError) as exc:
+        return "error", f"the stream could not be projected: {_oneline(exc)}"
+    return stream["liveness"], stream.get("error")
+
+
+def _liveness(root: str, audit_id: str) -> str:
+    return _stream_state(root, audit_id)[0]
 
 
 def _run_name(run: str | None) -> str:
@@ -621,6 +627,11 @@ def cmd_runs(args: argparse.Namespace) -> dict:
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)
     ring = _ring(root, args.stream, repo)
+    # The stream's error rides along as it does on every `streams` row -- a
+    # sibling repository's corrupt store, a stray directory, an unreadable
+    # lease -- and a lease that makes liveness `running` does not clear it.
+    # The ring still lists; the error makes the exit 2, as it does there.
+    liveness, error = _stream_state(root, args.stream)
     return {
         "root": root,
         "audit_id": args.stream,
@@ -628,8 +639,8 @@ def cmd_runs(args: argparse.Namespace) -> dict:
         "count": len(ring),
         "runs": ring,
         "newest": ring[-1] if ring else None,
-        "liveness": _liveness(root, args.stream),
-        "error": None,
+        "liveness": liveness,
+        "error": error,
     }
 
 

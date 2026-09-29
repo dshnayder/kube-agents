@@ -200,12 +200,28 @@ def _read_object(path: str) -> dict | None:
     return value
 
 
+def _lease_epoch(value: object) -> float | None:
+    """`started_at` as an epoch a clock can be compared with and a date made
+    of, or None. A millisecond epoch, `1e400` (JSON's inf) or NaN is no
+    timestamp at all -- `datetime` refuses each -- so such a note is read as
+    one that does not parse, from its mtime, rather than taking every
+    stream's projection down with it."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        datetime.fromtimestamp(value, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return None
+    return float(value)
+
+
 def in_flight_since(scratch: str, audit_id: str) -> float | None:
     """When the run holding this stream started, or None when none holds it.
 
     audit_report._in_flight_since, restated: a note that exists but does not
-    parse — a `start` that created it a moment ago — counts from its mtime,
-    because an unreadable note is a claim, not an absence. A note that can
+    parse — a `start` that created it a moment ago, or a `started_at` that is
+    not a usable timestamp — counts from its mtime, because an unreadable note
+    is a claim, not an absence. A note that can
     be neither read nor stat'd raises OSError: the lease could not be looked
     at, which the caller reports rather than reading as "nothing in flight".
     """
@@ -216,9 +232,9 @@ def in_flight_since(scratch: str, audit_id: str) -> float | None:
         return None
     except (OSError, ValueError):
         note = None
-    started = note.get("started_at") if isinstance(note, dict) else None
-    if isinstance(started, (int, float)) and not isinstance(started, bool):
-        return float(started)
+    started = _lease_epoch(note.get("started_at") if isinstance(note, dict) else None)
+    if started is not None:
+        return started
     try:
         return os.stat(path).st_mtime
     except FileNotFoundError:

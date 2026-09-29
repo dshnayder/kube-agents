@@ -40,7 +40,9 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 
 Whether a run is in flight comes from the lease `fleet-audit`'s `start` takes, not from a file in
 this directory. `streams` and `runs` report it as `liveness`: `never` (no run stored), `completed`,
-`running`, `died` (started over two hours ago and never finished), or `error`.
+`running`, `died` (started over two hours ago and never finished), or `error`. A stream-level
+problem (a sibling repository's unreadable store, a bad lease note) comes back under `error` with
+exit 2 even when the listing is complete; report it, do not drop it.
 
 ## Query it; do not read it
 

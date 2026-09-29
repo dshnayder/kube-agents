@@ -72,11 +72,16 @@ verification_spec:
       # sandbox holds `gh` because `finish` uses it, so a worker could comment
       # on, edit or close the issue or a remediation pull request directly.
       # A collector run is a new audit sweep even where it writes nothing.
+      # `gh api` writes two ways, as the credential proxy's github.api-mutation
+      # rule reads them: a named write method (`-X POST`, `-XPOST`, clustered
+      # `-iX POST`, `--method=POST`), or a field or input, which makes gh
+      # default to POST unless the method is named GET.
       forbidden_patterns:
         - 'audit_report\.py\s+(start|finish|remediate)\b'
         - 'hermes\s+cron\s+run\b'
-        - '(^|&&|;|\|)\s*gh\s+(issue|pr)\s+(comment|close|edit|create|reopen|merge|lock|delete)\b'
-        - '(^|&&|;|\|)\s*gh\s+api\b[^\n|;&]*(-X|--method)\s*(POST|PATCH|PUT|DELETE)\b'
+        - '(^|&&|;|\|)\s*gh\s+(issue|pr)\s+(comment|close|edit|create|reopen|merge|lock|unlock|delete|review|ready|transfer|pin|unpin|develop|update-branch)\b'
+        - '(^|&&|;|\|)\s*gh\s+api\b[^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?(POST|PATCH|PUT|DELETE)\b'
+        - '(^|&&|;|\|)\s*gh\s+api\b(?![^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?GET\b)[^\n|;&]*\s(-[fF]|--field|--raw-field|--input)'
         - '\b(collect|fleet_[a-z_]+|patch_readiness)\.py\b'
   - name: the-envelope-was-not-read-whole
     role: safeguard

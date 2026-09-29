@@ -756,6 +756,46 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("SCOPE", out)
         self.assertNotIn("16/18", out)
 
+    def held_open_clean(self, current=21):
+        """The PR's live shape: a clean run that left the ledger open over the
+        previous run's findings without rewriting it."""
+        return latest(
+            audit_id="cost-audit", status="CLEAN", ledger_held_open=True,
+            findings=0, critical=0, current=current, prs_opened=[], new=0, resolved=0,
+        )
+
+    def test_a_held_open_ledger_shows_what_it_carries_not_this_run_s_zero(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(last=self.held_open_clean())
+        out = self.render(streams)
+        row = next(r for r in self.body_rows(out) if "cost-audit" in r)
+        self.assertIn("21 held", row)
+        # 57 on the compliance ledger plus the 21 the cost ledger still lists.
+        self.assertIn("78", out)
+        self.assertIn("1 ledger held open", out)
+        self.assertIn("1 need attention", out)
+        self.assertNotIn("all clear", out)
+
+    def test_a_hold_over_a_lost_memory_is_unknown_not_zero(self):
+        streams = {"cost-audit": stream(last=self.held_open_clean(current=0))}
+        row = next(r for r in self.body_rows(self.render(streams)) if "cost-audit" in r)
+        self.assertIn("held ?", row)
+
+    def test_a_held_run_with_no_gap_needs_attention(self):
+        """HELD is `partial: false` when there is no coverage gap, and sets no
+        flag, yet the run refused to close the ledger."""
+        streams = self.two()
+        streams["cost-audit"] = stream(
+            last=latest(audit_id="cost-audit", status="HELD", partial=False, prs_opened=[])
+        )
+        out = self.render(streams)
+        self.assertIn("1 need attention", out)
+        self.assertNotIn("all clear", out)
+        self.assertIn("1 of 2 streams clean", out)
+        flagged = self.render(streams, flagged_only=True)
+        self.assertIn("cost-audit", flagged)
+        self.assertNotIn("compliance-audit", "\n".join(self.body_rows(flagged)))
+
     def test_a_flagged_stream_is_counted_in_the_lead(self):
         streams = self.two()
         streams["cost-audit"] = stream(liveness="never")

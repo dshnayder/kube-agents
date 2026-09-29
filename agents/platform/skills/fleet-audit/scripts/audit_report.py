@@ -1581,8 +1581,14 @@ def _in_flight_since(path: Path) -> float | None:
     except (OSError, ValueError):
         note = None
     started = note.get("started_at") if isinstance(note, dict) else None
+    # Finite and in `datetime`'s range, as report_status reads it: an `inf`
+    # would otherwise hold the lease past every TTL.
     if isinstance(started, (int, float)) and not isinstance(started, bool):
-        return float(started)
+        try:
+            datetime.fromtimestamp(started, timezone.utc)
+            return float(started)
+        except (OverflowError, ValueError, OSError):
+            pass
     try:
         return path.stat().st_mtime
     except OSError:
@@ -11539,7 +11545,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # all, while an empty document would close the ledger and every pull
     # request it carries. It stays open until a findings run rewrites the body,
     # or a human closes it. Only the clean branch closes anything, so the
-    # findings branch needs no gap for this; its delta is withheld already.
+    # findings branch needs no gap for this: its delta is withheld already, and
+    # its `silent_ok` is false on a lost memory (see the payload).
     if memory_lost and not findings and (still_flagged - held_exclude):
         gaps.append(LOST_MEMORY_GAP)
         collector_gaps.append(LOST_MEMORY_GAP)
@@ -12287,8 +12294,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # run off-schedule is waiting for an answer, and gets one
         # regardless of what this says — see the dispatch rule in the
         # Platform Agent's AGENTS.md.
+        #
+        # A lost memory is never silent either. Its delta is withheld, so
+        # `new == 0` here means "not known", not "nothing new": the ids this
+        # run publishes become the next run's baseline, and any new among
+        # them would never be announced. It is not a coverage gap -- the
+        # audit looked -- so `partial` stays false and stale pull requests
+        # still close; only the verdict refuses to call it quiet.
         "silent_ok": not (
-            reported_new
+            not delta_known
+            or reported_new
             or reported_resolved
             or gaps
             or prs_opened

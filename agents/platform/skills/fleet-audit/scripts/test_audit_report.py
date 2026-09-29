@@ -3149,6 +3149,12 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
         self.assertIn("unknowable", self.err)
+        # `new: 0` is "not known" here, so the scheduled verdict must not be
+        # `[SILENT]`: the ids published now are the next run's baseline, and
+        # any new among them would never be announced. The audit still looked,
+        # so it is not a coverage gap.
+        self.assertFalse(result["silent_ok"])
+        self.assertFalse(result["partial"])
 
     def test_gcloud_only_run_still_publishes(self):
         self.harness.replies = {
@@ -4210,6 +4216,17 @@ class TestStart(HarnessTestCase):
         rc = self.run_finish(make_doc())
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
+
+    def test_a_started_at_outside_datetime_s_range_counts_from_the_mtime(self):
+        # Milliseconds, `inf`, NaN: none is a time `report_status` can read,
+        # and an `inf` taken at face value would hold the lease past every
+        # TTL. The note is still a claim, so its mtime dates it.
+        note = Path(tempfile.mkdtemp(prefix="inflight-")) / "note.json"
+        self.addCleanup(shutil.rmtree, note.parent, ignore_errors=True)
+        for started_at in (1759000000000, float("inf"), float("nan")):
+            with self.subTest(started_at=started_at):
+                note.write_text(json.dumps({"audit": AUDIT, "started_at": started_at}))
+                self.assertEqual(audit_report._in_flight_since(note), note.stat().st_mtime)
 
     def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
         # `write_text` opens O_TRUNC and then writes. A write that fails on

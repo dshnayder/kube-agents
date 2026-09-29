@@ -732,8 +732,13 @@ class TestRuns(StoreTestCase):
         self.stream_dir(AUDIT)
         (Path(self.root) / AUDIT / REPO / "latest.json").write_text("[]", encoding="utf-8")
         self.write_claim(AUDIT, age_s=report_query.report_status.INFLIGHT_TTL_S + 60)
-        self.assertEqual(self.query("streams")[1]["streams"][0]["liveness"], "died")
-        self.assertEqual(self.ok("runs", AUDIT)["liveness"], "died")
+        row = self.query("streams")[1]["streams"][0]
+        self.assertEqual(row["liveness"], "died")
+        # The store's error rides along beside the lease's verdict, as it does
+        # on the `streams` row, and exits 2 the same way.
+        payload = self.refused("runs", AUDIT)
+        self.assertEqual(payload["liveness"], "died")
+        self.assertIn(row["error"], payload["error"])
 
     def test_a_temp_file_mid_write_is_not_a_run(self):
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
@@ -742,6 +747,55 @@ class TestRuns(StoreTestCase):
 
     def test_an_absent_stream_is_refused(self):
         self.assertEqual(self.refused("runs", AUDIT)["streams"], [])
+
+    def test_a_corrupt_sibling_names_itself_as_streams_does(self):
+        # `liveness: error` with a null error is a verdict nobody can pass on;
+        # `runs` carries the stream's reason exactly as the `streams` row does.
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        (Path(self.root) / AUDIT / "acme/other").mkdir(parents=True)
+        (Path(self.root) / AUDIT / "acme/other" / "latest.json").write_text("{", encoding="utf-8")
+        payload = self.refused("runs", AUDIT, "--repo", REPO)
+        self.assertEqual(payload["liveness"], "error")
+        self.assertIn("acme/other", payload["error"])
+        self.assertEqual(payload["count"], 1)
+        row = self.query("streams")[1]["streams"][0]
+        self.assertEqual(row["error"], payload["error"])
+
+
+class TestUnusableLeaseTimestamps(StoreTestCase):
+    """A lease note's `started_at` is whatever the writer left. One out of
+    `datetime`'s range -- milliseconds instead of seconds, `inf`, NaN -- must
+    not crash the projection; the note is a claim, so its mtime dates it."""
+
+    BAD = {
+        "milliseconds": 1759000000000,
+        "infinity": float("inf"),
+        "nan": float("nan"),
+    }
+
+    def write_bad_claim(self, started_at):
+        self.stream_dir(AUDIT)
+        # `json.dumps` writes inf and NaN as the bare tokens `json.loads` reads back.
+        (Path(self.scratch) / f"inflight_{AUDIT}.json").write_text(
+            json.dumps({"audit": AUDIT, "started_at": started_at}), encoding="utf-8"
+        )
+
+    def test_every_reader_answers_and_reads_the_note_as_a_fresh_claim(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        for label, started_at in self.BAD.items():
+            with self.subTest(label):
+                self.write_bad_claim(started_at)
+                row = self.ok("streams")["streams"][0]
+                self.assertEqual(row["liveness"], "running")
+                self.assertEqual(self.ok("runs", AUDIT)["liveness"], "running")
+                self.assertEqual(self.ok("show", AUDIT)["run"], "latest.json")
+
+    def test_an_old_note_with_a_bad_timestamp_dies_on_its_mtime(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.write_bad_claim(float("inf"))
+        old = time.time() - report_query.report_status.INFLIGHT_TTL_S - 60
+        os.utime(Path(self.scratch) / f"inflight_{AUDIT}.json", (old, old))
+        self.assertEqual(self.ok("streams")["streams"][0]["liveness"], "died")
 
 
 class TestChecks(StoreTestCase):

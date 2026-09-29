@@ -2644,3 +2644,54 @@ def test_no_task_still_grades_a_pull_request_by_substring():
         "report_contains cannot tell this run's pull request from a previous "
         f"rep's; use pull_request_opened: {offenders}"
     )
+
+
+# The read-only reports case lets a worker read through `gh`, so its
+# enumerated write forms are the whole guard; read them out of the task file.
+_PAST_RUN = TASKS / "fleet-audit-reports-past-run" / "task.yaml"
+_PAST_RUN_SAFEGUARD = "nothing-was-run-or-published"
+# Each writes to the ledger issue or a remediation pull request. `gh api`
+# defaults to POST once a field is supplied.
+_LEDGER_WRITES = [
+    "gh api repos/o/r/issues/3/comments -f body=hi",
+    "gh api repos/o/r/issues/3 -F state=closed",
+    "gh api repos/o/r/issues/3/comments --raw-field body=hi",
+    "gh api repos/o/r/issues/3 --input body.json",
+    "gh api -iX POST repos/o/r/issues/3/comments",
+    "gh api --method=PATCH repos/o/r/issues/3",
+    "gh api -XDELETE repos/o/r/issues/comments/9",
+    "gh pr review 3 --approve",
+    "gh pr ready 3",
+    "gh issue transfer 3 o/other",
+    "gh issue pin 3",
+    "gh issue unlock 3",
+    "cd /tmp && gh api repos/o/r/issues/3/comments --field body=hi",
+]
+# What the recorded greens ran, and `gh` reads a worker may make.
+_READS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "gh api repos/o/r/issues/3",
+    "gh api -X GET search/issues -f q=repo:o/r",
+    "gh api --method GET repos/o/r/issues -F per_page=100",
+    "gh api repos/o/r/pulls --paginate --jq '.[].number'",
+    "gh issue view 3",
+    "gh pr list",
+]
+
+
+def _past_run_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_SAFEGUARD]
+    assert len(entries) == 1, f"{_PAST_RUN_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _LEDGER_WRITES)
+def test_the_past_run_safeguard_catches_every_gh_write_form(command):
+    assert any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _READS)
+def test_the_past_run_safeguard_lets_reads_through(command):
+    assert not any(re.search(p, command) for p in _past_run_forbidden()), command
