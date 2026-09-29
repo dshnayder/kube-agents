@@ -247,6 +247,24 @@ class FetchUsagePeaksTest(unittest.TestCase):
         self.assertEqual(result.rc, -1)
         self.assertIn("connection reset", result.stderr)
 
+    def test_a_non_json_200_is_unavailable_not_a_crash(self):
+        """A 200 whose body is not JSON raised out of `collect_cluster` and cost
+        the cluster every object-state check, not only the metrics."""
+
+        class HtmlResponse(FakeResponse):
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", "<html>", 0)
+
+        class HtmlSession(FakeSession):
+            def get(self, url, params=None, timeout=None):
+                return HtmlResponse(200, text="<html>")
+
+        peaks, ok, result = self.fetch(HtmlSession())
+        self.assertFalse(ok)
+        self.assertEqual(peaks, {})
+        self.assertEqual(result.rc, -1)
+        self.assertIn(fw.NON_JSON_BODY, result.stderr)
+
     def test_no_session_degrades_instead_of_raising(self):
         # `collect_fleet` passes None when ADC could not be resolved. Every
         # object-state check still has to run.
@@ -511,11 +529,30 @@ class FetchLbTrafficTest(unittest.TestCase):
         traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-udp", 5)]), rules=rules)
         self.assertIsNone(traffic["34.186.100.26"]["ingress_packets"])
 
-    def test_a_project_with_no_external_rule_reads_as_nothing_to_measure(self):
-        traffic, result = self.fetch(FakeLbSession(), rules=[])
+    def test_a_project_with_no_external_rule_sends_nothing_and_returns_none(self):
+        """No request is made, so there is no `Run` to record: one would reach
+        the manifest as an rc-0 Monitoring read that never happened."""
+        session = FakeLbSession()
+        self.assertIsNone(self.fetch(session, rules=[]))
+        self.assertEqual(session.calls, [])
+
+    def test_a_non_json_200_fails_the_read_rather_than_raising(self):
+        """`ApiSession.get` returns a bare `requests.Response`; a 200 carrying
+        an HTML page raised out of `_read_project` and cost the project every
+        cluster, for a read whose only consumer is one excerpt sentence."""
+
+        class HtmlResponse(FakeResponse):
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", "<html>", 0)
+
+        class HtmlSession(FakeLbSession):
+            def get(self, url, params=None, timeout=None):
+                return HtmlResponse(200, text="<html>")
+
+        traffic, result = self.fetch(HtmlSession())
         self.assertEqual(traffic, {})
-        self.assertEqual(result.rc, 0)
-        self.assertIn("no EXTERNAL forwarding rule", result.stderr)
+        self.assertEqual(result.rc, -1)
+        self.assertIn(fw.NON_JSON_BODY, result.stderr)
 
     def test_an_api_error_keeps_its_status_and_measures_nothing(self):
         traffic, result = self.fetch(FakeLbSession(status=403, text="caller lacks monitoring.timeSeries.list"))
@@ -3336,6 +3373,28 @@ class UnsizedWorkloadTest(unittest.TestCase):
         self.assertEqual(hits[0]["namespace"], "argocd")
         self.assertEqual(hits[0]["severity"], "minor")
 
+    def test_a_request_naming_no_cpu_or_memory_is_unsized(self):
+        """`collect.py`'s `no-requests` files these three shapes as request-less
+        and defers the number here. Partitioned on whether `requests` was an
+        empty dict, they read as sized, every sizing check dropped them for
+        having no CPU or memory to compare, and nothing produced the number."""
+        shapes = {
+            "gpu-only": {"nvidia.com/gpu": "1"},
+            "ephemeral-storage-only": {"ephemeral-storage": "1Gi"},
+            "zero-cpu": {"cpu": "0"},
+        }
+        for label, requests in shapes.items():
+            with self.subTest(shape=label):
+                pod = self.pod(containers=[{"name": "c", "resources": {"requests": requests}}])
+                peaks = {("argocd", "argocd-repo-server-1"): (0.175, 1625.0)}
+                self.assertEqual(len(self.check([pod], peaks)), 1)
+                self.assertEqual(fw._eligible_pods_by_owner({"pods": [pod]}, now=NOW), {})
+
+    def test_a_nonzero_memory_request_beside_a_gpu_is_sized(self):
+        pod = self.pod(containers=[{"name": "c", "resources": {"requests": {"nvidia.com/gpu": "1", "memory": "1Gi"}}}])
+        self.assertEqual(self.check([pod], {("argocd", "argocd-repo-server-1"): (0.175, 1625.0)}), [])
+        self.assertEqual(len(fw._eligible_pods_by_owner({"pods": [pod]}, now=NOW)), 1)
+
     def test_the_excerpt_carries_the_measured_peak_and_the_recommendation(self):
         """`adopt_collector_evidence` overwrites whatever the model wrote with
         this string, so the number remediation sizes off has to be in it."""
@@ -3491,6 +3550,23 @@ class UnattachedDiskTest(unittest.TestCase):
 
     def test_flags_unattached_over_30_days(self):
         self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
+
+    def test_same_named_disks_in_two_zones_derive_two_finding_ids(self):
+        """A disk name is unique per zone, and every disk finding is filed
+        under `project/<p>` with no namespace, so `object` is the only field
+        left to tell them apart. With the bare name both derived one id and
+        `finish` refused the document for the duplicate."""
+        import audit_report
+
+        east = self.disk(name="data-1")
+        west = dict(self.disk(name="data-1"), zone="https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b")
+        hits = fw.check_unattached_disk([east, west], set(), now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["Disk/us-central1-a:data-1", "Disk/us-central1-b:data-1"])
+        ids = {
+            audit_report.published_id({"check": "unattached-disk", "cluster": "project/p", "namespace": "", "object": h["object"]})
+            for h in hits
+        }
+        self.assertEqual(len(ids), 2)
 
     def test_a_live_owner_is_named_in_the_excerpt(self):
         """The finding stays on `project/<p>`, so the excerpt is where the
@@ -3892,14 +3968,20 @@ class RegistryNoCleanupTest(unittest.TestCase):
     def test_flags_a_large_old_repository_with_no_policy(self):
         hits = self.check(self.repo())
         self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0]["object"], "ArtifactRegistryRepository/images")
+        self.assertEqual(hits[0]["object"], "ArtifactRegistryRepository/us-east4:images")
         self.assertIn("no cleanup policy", hits[0]["excerpt"])
 
     def test_the_object_is_the_short_name_not_the_resource_path(self):
-        """`object` is half the finding's identity, and a resource path carries
-        the project and location -- move the repository and the ledger announces
-        the same leak as resolved and then as new."""
+        """`object` is half the finding's identity. The project is already the
+        finding's `cluster`, so the resource path would only repeat it; the
+        location stays, because a repository name is unique per location."""
         self.assertNotIn("projects/", self.check(self.repo())[0]["object"])
+
+    def test_same_named_repositories_in_two_locations_are_two_objects(self):
+        east = self.repo()
+        west = self.repo(name="projects/acme/locations/us-west1/repositories/images")
+        objects = {h["object"] for h in self.check(east, west)}
+        self.assertEqual(objects, {"ArtifactRegistryRepository/us-east4:images", "ArtifactRegistryRepository/us-west1:images"})
 
     def test_a_live_policy_is_not_flagged(self):
         self.assertEqual(self.check(self.repo(policies={"keep-recent": {}})), [])
@@ -3986,11 +4068,11 @@ class OrphanLbTest(unittest.TestCase):
 
     def test_flags_empty_target_pool(self):
         hits = fw.check_orphan_lb([], [{"name": "tp1", "instances": []}], [], set(), now=NOW)
-        self.assertEqual(hits[0]["object"], "TargetPool/tp1")
+        self.assertEqual(hits[0]["object"], "TargetPool/global:tp1")
 
     def test_flags_empty_backend_service(self):
         hits = fw.check_orphan_lb([], [], [{"name": "bs1", "backends": []}], set(), now=NOW)
-        self.assertEqual(hits[0]["object"], "BackendService/bs1")
+        self.assertEqual(hits[0]["object"], "BackendService/global:bs1")
 
     #: What the GKE service controller actually writes into a forwarding rule's
     #: description. Every test above uses the bare `key: value` form, which is
@@ -4103,8 +4185,8 @@ class AgeInExcerptTest(unittest.TestCase):
         old = {"name": "old", "address": "1.1.1.1", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-01-01T00:00:00Z", "region": "us-central1"}
         new = {"name": "new", "address": "2.2.2.2", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-07-01T00:00:00Z", "region": "us-central1"}
         by_name = {h["object"]: h["excerpt"] for h in fw.check_idle_address([old, new], set(), project="p", now=NOW)}
-        self.assertIn("(212d ago)", by_name["Address/old"])
-        self.assertIn("(31d ago)", by_name["Address/new"])
+        self.assertIn("(212d ago)", by_name["Address/us-central1:old"])
+        self.assertIn("(31d ago)", by_name["Address/us-central1:new"])
 
     def test_an_unreadable_timestamp_prints_no_age_rather_than_zero(self):
         """`_age_days` returns None for a timestamp it cannot parse, and "(0d
@@ -5505,6 +5587,36 @@ class ProjectReadScaleTest(unittest.TestCase):
         fw.collect_fleet(None, run=run, session=None, now=NOW)
         self.assertEqual(len(seen), len(set(seen)))
 
+    def test_a_project_with_every_api_off_by_number_is_described_once(self):
+        """The refusal branch is the one place a repeat argv is issued: the
+        Kubernetes Engine, Compute Engine and Artifact Registry refusals each
+        ask for the project's number. The fixture above answers `[]` and never
+        reaches it."""
+        seen = []
+        refusal = "ERROR: SERVICE_DISABLED: {api} API has not been used in project 123456789 before or it is disabled"
+
+        def run(argv, **kwargs):
+            seen.append(tuple(argv))
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(0, "123456789\n")
+            if argv[:2] == ["gcloud", "container"]:
+                return run_of(1, "", refusal.format(api="Kubernetes Engine"))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(1, "", refusal.format(api="Compute Engine"))
+            if argv[:2] == ["gcloud", "artifacts"]:
+                return run_of(1, "", refusal.format(api="Artifact Registry"))
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        # The refusals were read as the project's own: nothing to report.
+        self.assertIn("error", manifest)
+        describes = [a for a in seen if a[:3] == ("gcloud", "projects", "describe")]
+        self.assertEqual(len(describes), 1)
+
 
 class MultiProjectCollectFleetTest(unittest.TestCase):
     def test_discovers_and_audits_every_project_with_a_cluster(self):
@@ -6114,6 +6226,10 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
+            if "forwarding-rules" in argv:
+                # An external rule, so the traffic read is really sent and the
+                # label validated here describes a request that was made.
+                return run_of(0, json.dumps(FetchLbTrafficTest.RULES))
             if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]) or "node-pools" in argv:
                 return run_of(0, "[]")
             return run_of(0, "")
@@ -6129,6 +6245,32 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                     audit_report.validate_check_command(c["command"], entry["name"], c["check"])
                 checked.add(c["check"])
         self.assertIn("overrequest", checked)
+        self.assertIn("idle-workload-traffic", checked)
+
+    def test_a_project_with_no_external_rule_records_no_traffic_read(self):
+        """No request is sent for a project with nothing to measure, so no
+        cluster in it may carry an `idle-workload-traffic` command."""
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]) or "node-pools" in argv:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/c1")
+        slugs = {c["check"] for c in cluster_entry["commands"]}
+        self.assertIn("idle-workload", slugs)
+        self.assertNotIn("idle-workload-traffic", slugs)
 
     def test_a_project_with_no_clusters_evaluates_orphan_lb(self):
         """No cluster means no Service can still claim a forwarding rule, so the

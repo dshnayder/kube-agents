@@ -129,6 +129,9 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 # the consumer project's, and with a quota project set (`billing/quota_project`)
 # that is not the project being listed.
 REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The read `refusal_names_project` makes to turn a project id into the number
+# a refusal names. `collect_fleet` answers a repeat of it from the first answer.
+PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -175,13 +178,13 @@ NOTHING_COLLECTED_ERROR = (
     "its cluster listing, went unread past the deadline, or has neither the Compute Engine nor "
     "the Artifact Registry API on. First: {first}"
 )
-# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
-# way a project yields nothing without recording why.
 # The opening of the note a filtered `projects list` leaves: the listing
 # succeeded, so like the `--project` note it says what a run may have
 # missed, never why nothing was collected.
 FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
 
+# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
+# way a project yields nothing without recording why.
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
 )
@@ -311,6 +314,10 @@ NO_SESSION_MESSAGE = (
 MONITORING_TIMEOUT_S = 120
 MONITORING_TIMESERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
 MONITORING_PAGE_SIZE = "2000"
+#: The failure a 200 whose body is not a JSON object reports. `ApiSession.get`
+#: hands back a bare `requests.Response`, so a misbehaving intermediary's HTML
+#: page arrives as a 200 and would otherwise raise out of the read.
+NON_JSON_BODY = "HTTP 200 with a body that is not a JSON object"
 MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
 # `--oauth2-bearer`, not an `Authorization: Bearer` header: `finish` redacts
@@ -775,8 +782,32 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
         return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
-    described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
+    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
     return described.rc == 0 and numbers == {described.stdout.strip()}
+
+
+def _describing_once(run: RunFn) -> RunFn:
+    """`run`, answering a repeated `gcloud projects describe` from its first answer.
+
+    A project with the Kubernetes Engine, Compute Engine and Artifact Registry
+    APIs all off is asked for its number three times -- once per refusal --
+    and an organisation-wide credential lists many such projects inside one
+    project-read budget. The number does not change within a run, and the
+    cache lives only as long as the `collect_fleet` call that made it. Two
+    threads racing on one project can both ask; that costs a call, not a
+    wrong answer.
+    """
+    answers: dict[tuple[str, ...], Run] = {}
+
+    def wrapped(argv: list[str], **kwargs) -> Run:
+        if argv[: len(PROJECT_DESCRIBE_ARGV)] != PROJECT_DESCRIBE_ARGV:
+            return run(argv, **kwargs)
+        key = tuple(argv)
+        if key not in answers:
+            answers[key] = run(argv, **kwargs)
+        return answers[key]
+
+    return wrapped
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
@@ -967,6 +998,21 @@ def _lb_traffic_params(metric: str, *, start: datetime, now: datetime) -> dict:
     }
 
 
+def _json_body(response) -> dict | None:
+    """The response's JSON object, or None when the body is not one.
+
+    Raised inside the caller, the decode error escaped the read: under
+    `_read_project` it cost the project every cluster, under `collect_cluster`
+    every object-state check, for a metric the caller already treats as
+    optional.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
 def _read_pod_series(
     session: SessionFn,
     url: str,
@@ -1010,7 +1056,9 @@ def _read_pod_series(
             return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
         if response.status_code != 200:
             return {}, (response.status_code, f"{metric}: {response.text}")
-        body = response.json()
+        body = _json_body(response)
+        if body is None:
+            return {}, (-1, f"{metric}: {NON_JSON_BODY}")
         for series in body.get("timeSeries") or []:
             labels = (series.get("resource") or {}).get("labels") or {}
             pod_key = (labels.get("namespace_name", ""), labels.get("pod_name", ""))
@@ -1206,7 +1254,9 @@ def _read_lb_series(
             return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
         if response.status_code != 200:
             return {}, (response.status_code, f"{metric}: {response.text}")
-        body = response.json()
+        body = _json_body(response)
+        if body is None:
+            return {}, (-1, f"{metric}: {NON_JSON_BODY}")
         for series in body.get("timeSeries") or []:
             labels = (series.get("resource") or {}).get("labels") or {}
             rule = labels.get("forwarding_rule_name", "")
@@ -1233,7 +1283,7 @@ def fetch_lb_traffic(
     session: SessionFn,
     now: datetime,
     window_hours: int = USAGE_WINDOW_HOURS,
-) -> tuple[dict[str, dict], Run]:
+) -> tuple[dict[str, dict], Run] | None:
     """What each external forwarding rule in `project` metered, keyed by address.
 
     Keyed by IP and not by rule name because of what the join needs on the
@@ -1249,6 +1299,10 @@ def fetch_lb_traffic(
     the rule was not measured, and neither is a zero. `check_idle_workload`
     keeps all three apart, because reading any of them as "no traffic" is how
     the check came to assert a caller it had never looked for.
+
+    None when the project has no external rule, because then no request is
+    sent: a `Run` for it would reach the manifest as an rc-0 Monitoring read
+    that never happened, on every cluster of most projects in a fleet.
     """
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
@@ -1275,7 +1329,7 @@ def fetch_lb_traffic(
         and rule.get("name")
     }
     if not addresses:
-        return fail(0, f"this project has no {LB_EXTERNAL_SCHEME} forwarding rule to measure")
+        return None
 
     totals: dict[str, dict[str, float]] = {}
     for key, metric in metrics:
@@ -1327,7 +1381,8 @@ def _by_kind(dump: dict, kind: str) -> list[dict]:
 
 # The markers a reconciling controller stamps on an object it owns. Duplicated
 # from `collect.reconciler_of` for the reason `declaration_for` below is: these
-# collectors are standalone scripts and none of them imports another.
+# collectors are standalone scripts, and none imports a sibling collector at
+# module level.
 #
 # Helm 3 writes both halves of its pair on every object in a release, and the
 # release namespace is not the object's. Argo CD's tracking id is
@@ -1583,12 +1638,18 @@ ORPHAN_PV_RELEASED_DAYS = 7
 ORPHAN_PV_UNCLAIMED_DAYS = 30
 
 
-def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
-    pvc_uid = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")): p["metadata"].get("uid", "") for p in context["pvcs"]}
-    # Per namespace, as 3.3 keys it: a StatefulSet only ever claims in its own.
+def _statefulsets_by_namespace(context: dict) -> dict[str, set[str]]:
+    """StatefulSet names per namespace: a StatefulSet only claims in its own."""
     sts_by_ns: dict[str, set[str]] = {}
     for sts in context.get("statefulsets", []):
         sts_by_ns.setdefault(sts.get("metadata", {}).get("namespace", ""), set()).add(sts.get("metadata", {}).get("name", ""))
+    return sts_by_ns
+
+
+def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
+    pvc_uid = {(p["metadata"].get("namespace", ""), p["metadata"].get("name", "")): p["metadata"].get("uid", "") for p in context["pvcs"]}
+    # Per namespace, as 3.3 keys it.
+    sts_by_ns = _statefulsets_by_namespace(context)
     # A statically provisioned PV waiting on a claim that has not bound yet is
     # pre-staged, not abandoned. Only this cluster's claims can bind it.
     pending_classes = {
@@ -1680,9 +1741,7 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
             claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
             if claim:
                 referenced.add((ns, claim))
-    sts_by_ns: dict[str, set[str]] = {}
-    for sts in context.get("statefulsets", []):
-        sts_by_ns.setdefault(sts.get("metadata", {}).get("namespace", ""), set()).add(sts.get("metadata", {}).get("name", ""))
+    sts_by_ns = _statefulsets_by_namespace(context)
 
     hits = []
     for pvc in context["pvcs"]:
@@ -2419,6 +2478,24 @@ def _sizing_owner(meta: dict) -> tuple[str, str]:
     return key
 
 
+def _declares_cpu_or_memory(requests: list[dict]) -> bool:
+    """Whether any container's requests name a nonzero CPU or memory.
+
+    The partition between the sized checks and 3.12 turns on this, and it used
+    to turn on whether a `requests` dict was non-empty: a container requesting
+    only `nvidia.com/gpu`, only `ephemeral-storage`, or `cpu: "0"` read as
+    sized, every sizing check then dropped it for having no CPU or memory to
+    compare, and 3.12 never saw it. `collect.py`'s `no-requests` files exactly
+    those shapes as request-less and defers the number here.
+    """
+    for request in requests:
+        cpu = parse_cpu_cores(str(request.get("cpu") or ""))
+        mem = parse_mem_mib(str(request.get("memory") or ""))
+        if (cpu or 0) > 0 or (mem or 0) > 0:
+            return True
+    return False
+
+
 def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]:
     """Pods whose declared request is a sizing decision somebody here can change.
 
@@ -2456,7 +2533,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         containers = spec.get("containers") or []
         requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
         limits = [(c.get("resources") or {}).get("limits") or {} for c in containers]
-        if not any(requests):
+        if not _declares_cpu_or_memory(requests):
             continue  # obtainability-audit's `no-requests` owns this
         # Namespaced, because `(kind, name)` is not unique within a cluster: a
         # Deployment or StatefulSet owns pods under its bare name, so the same
@@ -3632,7 +3709,7 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
         if not containers:
             continue
         requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
-        if any(requests):
+        if _declares_cpu_or_memory(requests):
             continue  # sized: 3.1 and 3.11 own it
         kind, owner_name = _sizing_owner(meta)
         entry = by_owner.setdefault(
@@ -4866,7 +4943,7 @@ def check_unattached_disk(
         pvc_note = f", held the {pvc} PersistentVolumeClaim" if pvc else ""
         hits.append(
             {
-                "object": f"Disk/{disk.get('name', '')}",
+                "object": _located("Disk", disk),
                 "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk_type} ({_scope_flag(disk)}){pvc_note}{orphan_note}",
                 "severity": "major" if size_gb >= 500 or "ssd" in disk_type.lower() or "extreme" in disk_type.lower() else "minor",
             }
@@ -4887,6 +4964,20 @@ def _location_of(obj: dict) -> str:
         if value:
             return value.rsplit("/", 1)[-1]
     return "global"
+
+
+def _located(kind: str, obj: dict) -> str:
+    """`<kind>/<location>:<name>`, the `object` of a project-scoped compute finding.
+
+    A disk name is unique per zone and an address, rule, pool or backend name
+    per region (or once globally), not per project; the collector reads the
+    whole project in one list and files every candidate under `project/<p>`
+    with no namespace, so `object` is the only field left to tell two
+    same-named resources apart. With the bare name they derived one finding
+    id and `finish` refused the document. The spelling is stockout's
+    `Quota/<region>:<metric>`.
+    """
+    return f"{kind}/{_location_of(obj)}:{obj.get('name', '')}"
 
 
 def _scope_flag(obj: dict) -> str:
@@ -4951,7 +5042,7 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
             }
         ]
     for addr, age in idle:
-        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')}{_ago(age)} ({_scope_flag(addr)})", "severity": "minor"})
+        hits.append({"object": _located("Address", addr), "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')}{_ago(age)} ({_scope_flag(addr)})", "severity": "minor"})
     return hits
 
 
@@ -5025,7 +5116,8 @@ def check_registry_no_cleanup(repositories: list[dict], *, project: str, now: da
         if policies and not dry_run:
             continue
         # `name` is the full resource path; the location is what the remediation
-        # has to carry, and it is only available here.
+        # has to carry, and it is only available here. `object` carries it too:
+        # a repository name is unique per location, not per project (`_located`).
         parts = str(repo.get("name") or "").split("/")
         short = parts[-1] if parts else ""
         location = parts[3] if len(parts) > 4 else ""
@@ -5044,7 +5136,7 @@ def check_registry_no_cleanup(repositories: list[dict], *, project: str, now: da
         )
         hits.append(
             {
-                "object": f"ArtifactRegistryRepository/{short}",
+                "object": f"ArtifactRegistryRepository/{location}:{short}",
                 "excerpt": (
                     f"{repo.get('format', 'unknown')} repository in {location}: "
                     f"{size / BYTES_PER_GIB:.1f} GiB, {why}, created "
@@ -5080,13 +5172,13 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
         age = _age_days(rule.get("creationTimestamp", ""), now=now)
         if age is None or age < 7:
             continue
-        hits.append({"object": f"ForwardingRule/{rule.get('name', '')}", "excerpt": f"targets deleted Service {m.group(1)}, created {rule.get('creationTimestamp')}{_ago(age)} ({_scope_flag(rule)})", "severity": "major"})
+        hits.append({"object": _located("ForwardingRule", rule), "excerpt": f"targets deleted Service {m.group(1)}, created {rule.get('creationTimestamp')}{_ago(age)} ({_scope_flag(rule)})", "severity": "major"})
     for pool in target_pools:
         if not pool.get("instances"):
-            hits.append({"object": f"TargetPool/{pool.get('name', '')}", "excerpt": f"zero instances ({_scope_flag(pool)})", "severity": "major"})
+            hits.append({"object": _located("TargetPool", pool), "excerpt": f"zero instances ({_scope_flag(pool)})", "severity": "major"})
     for backend in backend_services:
         if not backend.get("backends"):
-            hits.append({"object": f"BackendService/{backend.get('name', '')}", "excerpt": f"zero backends ({_scope_flag(backend)})", "severity": "major"})
+            hits.append({"object": _located("BackendService", backend), "excerpt": f"zero backends ({_scope_flag(backend)})", "severity": "major"})
     return hits
 
 
@@ -5421,6 +5513,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     deadline = time.monotonic() + project_budget_s
+    run = _describing_once(run)
 
     if session is None:
         # One session for the fleet: its connection pool is thread-safe, and

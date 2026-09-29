@@ -346,9 +346,11 @@ id when it flags both: either keeps the ledger open over a finding the collector
 the counted residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
 naming their count. A bump that re-spells an object rather than a cluster name loses those rows the
 same way, because the re-derived id keeps the old object and matches nothing the collector emits:
-scheme 6 re-spells the stockout stream's quota (`Quota/<region>:<metric>`) and autoscaler
-(`ScaleUpError/<message-id>`) objects, which leave the ledger unheld on the bump run and are not in
-the warning's count. That residual is the cost of a
+scheme 6 re-spells the stockout stream's quota (`Quota/<region>:<metric>`), autoscaler
+(`ScaleUpError/<message-id>`) and reservation (`Reservation/<zone>:<name>`) objects, and the cost
+stream's project-scoped disks, addresses, forwarding rules, target pools, backend services and
+repositories (`Disk/<zone>:<name>` and the like, since each name is unique only per location), which
+leave the ledger unheld on the bump run and are not in the warning's count. That residual is the cost of a
 bump, which is rare and operator-initiated.
 
 ### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_marked_findings`

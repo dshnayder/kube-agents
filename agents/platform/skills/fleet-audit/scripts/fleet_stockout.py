@@ -980,8 +980,12 @@ def check_reservation(reservation: dict) -> dict | None:
         return None
     ratio = in_use / count
     if ratio <= RESERVATION_IDLE_RATIO and (count - in_use) >= RESERVATION_IDLE_MIN_INSTANCES:
+        # A reservation name is unique per zone, and every reservation is filed
+        # under `project/<p>`, so the zone is what keeps two same-named ones
+        # from deriving one finding id -- the `Quota/<region>:<metric>` shape.
+        zone = str(reservation.get("zone") or "").rsplit("/", 1)[-1] or "global"
         return {
-            "object": f"Reservation/{reservation.get('name', '')}",
+            "object": f"Reservation/{zone}:{reservation.get('name', '')}",
             "excerpt": f"inUseCount={in_use}/{count} ({ratio * 100:.0f}% used, {count - in_use} idle)",
             "severity": "major",
         }
@@ -1644,12 +1648,15 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         "--limit", str(AUTOSCALER_LOG_LIMIT), "--format", "json",
     ]
     entries, logging_result = run_and_gate(logging_argv, run=run)
-    if logging_result.rc == 0:
+    # `entries` is None for an empty result set as well as for unparseable
+    # output. gcloud prints nothing at all when nothing matched, so empty stdout
+    # at rc 0 is a clean window. Output that is there but does not parse is not:
+    # the sandbox's `gcloud` shim cuts stdout at the broker's cap, says so on
+    # stderr and keeps the child's exit code, and the busiest cluster's window
+    # is the one that reaches the cap.
+    logs_unreadable = logging_result.rc == 0 and bool(logging_result.stdout.strip()) and not isinstance(entries, list)
+    if logging_result.rc == 0 and not logs_unreadable:
         commands["autoscaler-out-of-resources"] = _record(shlex.join(logging_argv), logging_result)
-        # `entries` is None for an empty result set as well as for unparseable
-        # output, because gcloud prints nothing at all when nothing matched.
-        # rc == 0 already told us the read succeeded, so an empty window is a
-        # clean cluster rather than a gap.
         for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries)):
             candidates.append(_emit("autoscaler-out-of-resources", hit))
         if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
@@ -1662,9 +1669,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             )
     else:
         logging_failure = (
-            f"`gcloud logging read` failed (rc={logging_result.rc}) — "
-            f"{logging_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
-        )
+            f"`gcloud logging read` returned output that is not a JSON list (rc=0) — "
+            if logs_unreadable
+            else f"`gcloud logging read` failed (rc={logging_result.rc}) — "
+        ) + (logging_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
         unevaluated["autoscaler-out-of-resources"] = logging_failure
         limitations.append(f"autoscaler-out-of-resources could not be measured on this cluster: {logging_failure}")
 
@@ -1691,8 +1699,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             )
             continue
         commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)
-        # A list of one, on every response seen so far. Unwrapped here rather
-        # than in the helpers so they take the shape the API documents.
+        # The live read returned a bare object (the module docstring's shape);
+        # a list of one is unwrapped as well, here rather than in the helpers,
+        # so they take the shape the API documents.
         first = advice[0] if isinstance(advice, list) and advice else advice
         hit, limitation = check_spot_scarcity(machine_type, shapes[machine_type], region, first)
         if hit:

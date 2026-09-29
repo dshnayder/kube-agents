@@ -545,12 +545,17 @@ DELTA_RE = re.compile(
 # documents wrote.
 #
 # 6: `fleet_waste.py` and `fleet_stockout.py` make the same rename for the cost
-# and stockout streams, and the stockout collector also re-spells two objects:
+# and stockout streams, and the stockout collector also re-spells three objects:
 # a quota finding names its region (`Quota/<region>:<metric>`) and an
-# autoscaler finding its message id (`ScaleUpError/<message-id>`). The
-# qualified cluster names re-spell through the Scope table as before; the two
-# objects cannot, so those rows leave the ledger unheld on the first run, and
-# `resolved` is withheld for that run rather than reporting them fixed.
+# autoscaler finding its message id (`ScaleUpError/<message-id>`) and an
+# idle reservation its zone (`Reservation/<zone>:<name>`), and the
+# cost collector names a project-scoped resource's location
+# (`Disk/<zone>:<name>`, likewise for addresses, forwarding rules, target
+# pools, backend services and repositories), whose names are unique only per
+# location. The qualified cluster names re-spell through the Scope table as
+# before; these objects cannot, so those rows leave the ledger unheld on the
+# first run, and `resolved` is withheld for that run rather than reporting
+# them fixed.
 ID_SCHEME = 6
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
@@ -4925,7 +4930,7 @@ def previous_marker_ids(
     unannounced; held ids with no row — the note and empty tiers write none —
     are the residual, which the caller reports and which the bump loses. A
     row whose object the bump re-spelled (scheme 6's stockout `Quota/` and
-    `ScaleUpError/` rows) re-derives to an id nothing emits, and is lost
+    `ScaleUpError/` rows, and its location-qualified cost rows) re-derives to an id nothing emits, and is lost
     without being counted.
     `flagged` picks between a row's bare and qualified spellings
     (`_respelled_rows`), qualifying names past the Scope table from `clusters`.

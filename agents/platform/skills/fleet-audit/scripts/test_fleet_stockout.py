@@ -811,6 +811,15 @@ class ReservationTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit["severity"], "major")
 
+    def test_same_named_reservations_in_two_zones_are_two_objects(self):
+        """A reservation name is unique per zone, and both are filed under
+        `project/<p>`: with the bare name they derived one finding id."""
+        objects = {
+            fs.check_reservation({"name": "r1", "zone": f"https://www.googleapis.com/compute/v1/projects/p/zones/{zone}", "specificReservation": {"count": 10, "inUseCount": 2}})["object"]
+            for zone in ("us-central1-a", "us-central1-b")
+        }
+        self.assertEqual(objects, {"Reservation/us-central1-a:r1", "Reservation/us-central1-b:r1"})
+
     def test_does_not_flag_well_utilized_reservation(self):
         r = {"name": "r1", "specificReservation": {"count": 10, "inUseCount": 8}}
         self.assertIsNone(fs.check_reservation(r))
@@ -1166,6 +1175,7 @@ class CollectClusterTest(unittest.TestCase):
         log_entries=None,
         log_rc=0,
         log_stderr="denied",
+        log_stdout=None,
         advice=None,
         advice_rc=0,
         advice_stderr="denied",
@@ -1188,6 +1198,8 @@ class CollectClusterTest(unittest.TestCase):
             if argv[:3] == ["gcloud", "logging", "read"]:
                 if log_rc:
                     return run_of(log_rc, "", log_stderr)
+                if log_stdout is not None:
+                    return run_of(0, log_stdout, log_stderr)
                 # gcloud prints nothing at all when nothing matched, which is
                 # what the bare `run_of(0, "")` below stands in for elsewhere.
                 return run_of(0, json.dumps(log_entries) if log_entries else "")
@@ -1703,6 +1715,22 @@ class CollectClusterTest(unittest.TestCase):
     def test_a_failed_autoscaler_read_is_unevaluated(self):
         entry = self.run_with(dump_items=[], log_rc=1)
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_a_truncated_autoscaler_read_is_unevaluated_not_clean(self):
+        """The sandbox's `gcloud` shim cuts stdout at the broker's cap, says so
+        on stderr and exits with the child's code, 0. The cut JSON does not
+        parse; scoring that as an empty window published the busiest cluster
+        -- the one whose log reached the cap -- as free of stockouts."""
+        truncated = json.dumps([ERROR_MSG_ENTRY] * 3)[:-40]
+        entry = self.run_with(dump_items=[], log_stdout=truncated, log_stderr="credential proxy output truncated")
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertIn("credential proxy output truncated", entry["limitations"])
+
+    def test_an_empty_autoscaler_read_is_still_clean(self):
+        entry = self.run_with(dump_items=[], log_stdout="\n")
+        self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {e["check"] for e in entry.get("checks_unevaluated", [])})
 
     def test_the_autoscaler_read_is_pinned_to_the_location(self):
         self.run_with(dump_items=[])
