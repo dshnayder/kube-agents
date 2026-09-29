@@ -16,9 +16,12 @@ so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
 §1 scopes this to "every project the agent can see", so a bare invocation
-discovers the active project plus every listed project holding at least one
-cluster, rather than auditing only the active gcloud project; `--project`
-overrides discovery for a scoped run. Project-scoped facts (live PV handles, Service
+reads the active project plus every listed project, whether or not it holds a
+cluster -- a project whose last cluster was deleted is where its disks and
+addresses are left behind -- rather than auditing only the active gcloud
+project; `--project` overrides discovery for a scoped run. The per-project
+reads run in the same worker pool as the clusters, and stop being started
+`PROJECT_READ_DEADLINE_S` in, so the run ends inside its terminal timeout. Project-scoped facts (live PV handles, Service
 names, referenced addresses) are unioned only across the clusters in the
 same project before that project's disk/address/LB checks run — a project
 never sees another project's cluster state.
@@ -107,6 +110,34 @@ ERROR_EXCERPT_CHARS = 300
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# The same answer from the Compute Engine or Artifact Registry API: nothing
+# §3.4-§3.6 or §3.14 looks for can exist in that project, so the check has
+# nothing to run against there rather than a read that failed. An
+# organisation-wide credential sees many such projects now that discovery
+# keeps every listed one, and each would otherwise pin the run partial.
+COMPUTE_CHECKS = ("idle-address", "orphan-lb", "unattached-disk")
+COMPUTE_DISABLED_REASON = (
+    "the Compute Engine API is not enabled in project {project!r}, so no disk, address, "
+    "forwarding rule or backend service can exist there"
+)
+REGISTRY_DISABLED_REASON = (
+    "the Artifact Registry API is not enabled in project {project!r}, so no repository can exist there"
+)
+# When the collector stops starting project reads, in seconds from its own
+# start. §2 runs it as one foreground terminal call of 600 s, and a call that
+# overruns is killed with no manifest at all; every listed project costs a
+# handful of gcloud reads, so a credential that sees hundreds of projects
+# would get there. A project not reached by this point becomes a
+# `gate-failed` `project/<p>` target, which the document carries into
+# `scope.skipped`, and the run reports partial rather than nothing. The
+# margin covers the reads already in flight -- up to `DEFAULT_TIMEOUT_S`
+# each -- and the cluster pool, which this does not bound.
+PROJECT_READ_DEADLINE_S = 420
+PROJECT_DEADLINE_ERROR = (
+    "not read: the collector stops starting project reads {budget} s after it starts, so the "
+    "run ends inside its terminal timeout with a manifest, and this project's turn came "
+    "after that. Rerun with `--project {project}` to read it on its own."
+)
 
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
@@ -531,10 +562,17 @@ class NoProjectInScope(Exception):
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
     """§1's project scope: "every project the agent can see". A `--project`
     override skips discovery entirely, for a scoped or a test run; otherwise
-    this discovers the active project plus every other listed project with
-    at least one cluster. A listed project that holds none is dropped, which
-    `collect.py` and `patch_readiness.py` no longer do: they keep every
-    listed project.
+    this names the active project plus every other listed project, and lists
+    none of them -- `collect.py`'s `discover_fleet` takes the same scope.
+
+    A listed project holding no cluster stays in scope on purpose. §3.4-§3.6
+    and §3.14 look for disks, addresses, forwarding rules and repositories,
+    and a project whose last cluster was deleted is exactly where those are
+    left behind; dropped here, it left no `project/<p>` row, and `finish`
+    read a finding filed there on an earlier run as resolved. Probing each
+    candidate with `clusters list` to decide was also a serial read per
+    listed project before any worker started, which `collect_fleet` now does
+    once, in its pool.
 
     The second value is set when the scope is provably short of the fleet --
     `--project` skipped discovery, `gcloud projects list` failed, or it
@@ -572,21 +610,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     candidates = [p for p in listed if p != base]
     if not base and not candidates:
         raise NoProjectInScope(NO_PROJECT_IN_SCOPE_ERROR)
-    for candidate in candidates:
-        parsed, probe = run_and_gate(
-            ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
-        )
-        # `[]` and `None` are different answers and only the first one means the
-        # project owes this audit nothing. A project this probe could not read
-        # stays in scope so `collect_fleet` records the loss as a `gate-failed`
-        # target; dropped here it leaves no trace in the manifest at all, and a
-        # project nobody could enumerate then reads exactly like one holding no
-        # clusters. The one failure that is an answer is a disabled Kubernetes
-        # Engine API: that project cannot hold a cluster.
-        if parsed is None and any(marker in probe.stderr for marker in API_DISABLED_MARKERS):
-            continue
-        if parsed is None or parsed:
-            projects.append(candidate)
+    projects.extend(candidates)
     if base and base not in listed:
         # rc 0 and the active project absent from its own output: the listing
         # is filtered rather than complete, so the scope is provably short.
@@ -654,8 +678,8 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
     )
     if result.rc != 0:
-        # The active project or a `--project` override reaches here without
-        # the discovery probe, so the same disabled-API answer is read again.
+        # Discovery lists no project, so this is where a project whose
+        # Kubernetes Engine API is off first answers: with no cluster.
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
             log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
             return [], []
@@ -4726,6 +4750,11 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
     return hits
 
 
+def _api_disabled(result: Run) -> bool:
+    """Whether a failed gcloud read failed because its API is off in the project."""
+    return result.rc != 0 and any(marker in result.stderr for marker in API_DISABLED_MARKERS)
+
+
 def forwarding_rules_argv(project: str) -> list[str]:
     """§3.6's rule list, named once because two callers now need the same read.
 
@@ -4767,18 +4796,23 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # broken, and it is the reason nobody noticed: five reads gate as one, the
     # message fingers none of them, and the only way to learn which had been
     # failing all along was to run all five by hand against a live project.
+    compute_reads = (
+        (disks_argv, disks_parsed, disks_result),
+        (addr_argv, addr_parsed, addr_result),
+        (fwd_argv, fwd_parsed, fwd_result),
+        (tp_argv, tp_parsed, tp_result),
+        (bs_argv, bs_parsed, bs_result),
+    )
     failed = [
         f"{shlex.join(argv)} rc={result.rc}: {result.stderr.strip()[:200] or 'no stderr'}"
-        for argv, parsed, result in (
-            (disks_argv, disks_parsed, disks_result),
-            (addr_argv, addr_parsed, addr_result),
-            (fwd_argv, fwd_parsed, fwd_result),
-            (tp_argv, tp_parsed, tp_result),
-            (bs_argv, bs_parsed, bs_result),
-        )
+        for argv, parsed, result in compute_reads
         if parsed is None
     ]
-    if failed:
+    # All five refused with the disabled-API answer: the project has no
+    # Compute Engine, so it holds nothing these checks look for. Any other
+    # mix is a read that failed, and gates as one below.
+    compute_disabled = len(failed) == len(compute_reads) and all(_api_disabled(result) for _, _, result in compute_reads)
+    if failed and not compute_disabled:
         return {
             "name": f"project/{project}",
             "project": project,
@@ -4797,12 +4831,30 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # every location in one read, and the banner it prints goes to stderr.
     reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
     reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
+    registry_disabled = reg_parsed is None and _api_disabled(reg_result)
+    if compute_disabled and registry_disabled:
+        # Nothing any project-scoped check looks for can exist here, so there
+        # is no target to report: a row naming four inapplicable checks and
+        # no read would still need a `limitations` note in the document,
+        # which makes every such project a coverage gap.
+        log(f"{project}: Compute Engine and Artifact Registry APIs are not enabled; no project-scoped check applies")
+        return None
+
+    not_applicable: dict[str, str] = {}
+    if compute_disabled:
+        not_applicable.update({slug: COMPUTE_DISABLED_REASON.format(project=project) for slug in COMPUTE_CHECKS})
+        disks_parsed = addr_parsed = fwd_parsed = tp_parsed = bs_parsed = []
+    if registry_disabled:
+        not_applicable["registry-no-cleanup"] = REGISTRY_DISABLED_REASON.format(project=project)
 
     # §3.4: with none of the project's clusters read there is no PV handle to
     # clear any disk against, so the check is withheld rather than judged.
-    disks_judged = not (known_clusters and unread_clusters >= known_clusters)
+    disks_judged = not compute_disabled and not (known_clusters and unread_clusters >= known_clusters)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
+    # A project with the Compute Engine API off holds no cluster either, so
+    # there is no unread one to withhold `orphan-lb` over; it is inapplicable.
+    all_reachable = all_reachable and not compute_disabled
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
     if reg_parsed is not None:
@@ -4814,7 +4866,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         "location": "global",
         "outcome": "collected",
         "commands": ([{"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)}] if disks_judged else [])
-        + [{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}]
+        + ([{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}] if not compute_disabled else [])
         + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else [])
         # Recorded only when the read succeeded, which is what puts
         # `registry-no-cleanup` into §6's `coverage_gaps` when it did not. A
@@ -4823,7 +4875,9 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         + ([{"check": "registry-no-cleanup", **_record(shlex.join(reg_argv), reg_result)}] if reg_parsed is not None else []),
         "candidates": candidates,
     }
-    if not all_reachable:
+    if not_applicable:
+        entry["checks_not_applicable"] = [{"check": slug, "reason": reason} for slug, reason in sorted(not_applicable.items())]
+    if not all_reachable and not compute_disabled:
         # §6 already reports the missing check -- `orphan-lb` drops out of
         # `commands`, so the roster half of `coverage_gaps` names it whatever
         # this entry says in prose. What it cannot supply is why, and a gap
@@ -4843,14 +4897,14 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "See this project's cluster "
             "entries in this manifest for the reason each one failed."
         )
-    if not disks_judged:
+    if not disks_judged and not compute_disabled:
         disk_gap = (
             "unattached-disk was not evaluated for this project: none of its clusters "
             f"({', '.join(sorted(unread_clusters))}) could be read, so no disk can be "
             "cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
-    elif unread_clusters:
+    elif unread_clusters and not compute_disabled:
         disk_gap = (
             "unattached-disk skipped every disk that a PersistentVolumeClaim created "
             "and that could belong to a cluster this run did not read "
@@ -4859,11 +4913,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     unevaluated = {}
-    if not all_reachable:
+    if not all_reachable and not compute_disabled:
         unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
-    if not disks_judged:
+    if not disks_judged and not compute_disabled:
         unevaluated["unattached-disk"] = "none of this project's clusters could be read"
-    if reg_parsed is None:
+    if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
     if unevaluated:
         entry["checks_unevaluated"] = [{"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())]
@@ -4871,7 +4925,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # outright rather than appending, so a registry gap written first would be
     # overwritten on any project with an unreadable cluster -- which is most of
     # them on a fleet this size.
-    if reg_parsed is None:
+    if reg_parsed is None and not registry_disabled:
         # `run_and_gate` returns None three ways, and only one of them is a
         # non-zero exit. A gap that said "exited 0" over an empty or unparseable
         # answer would send a reader to look for an error gcloud never reported.
@@ -4894,9 +4948,68 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     return entry
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None) -> dict:
+def _read_project(p: str, *, run: RunFn, session: SessionFn, now: datetime) -> tuple[list[dict], list[dict], str | None, tuple[object | None, Run] | None, tuple[dict, Run] | None]:
+    """One project's reads that have to land before the cluster pool starts:
+    its clusters, its forwarding rules, and the traffic behind them. Returns
+    `(running, not_running, enumeration_error, forwarding_rules, lb_traffic)`.
+
+    The rule list is here for a reason of ordering rather than economy.
+    §3.13 asks what the load balancer in front of an idle workload metered,
+    and the only thing that maps a Service's external address to the
+    forwarding rule Cloud Monitoring reports under is this list -- so it has
+    to be in hand before the first cluster is collected.
+    `collect_project_compute` then reuses the same answer for §3.6 rather
+    than re-reading it."""
+    try:
+        running, not_running = enumerate_clusters(p, run=run)
+    except RuntimeError as exc:
+        # A log line is not a record. The manifest is the only account of
+        # what this run managed to read, and a project whose clusters could
+        # not be listed used to leave nothing in it -- its `project/<p>`
+        # compute entry still arrived as `collected`, so the document saw a
+        # project with two of three checks and zero clusters, which is
+        # exactly what a genuinely cluster-free project looks like. The
+        # project's own `project/<p>` entry carries the loss instead, as
+        # `gate-failed`: §3.4 and §3.6 both need the cluster list to tell
+        # an orphan from a disk or rule a cluster still owns, so the
+        # project checks cannot run honestly without it either.
+        log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
+        return [], [], str(exc)[:ERROR_EXCERPT_CHARS], None, None
+    forwarding_rules = run_and_gate(forwarding_rules_argv(p), run=run)
+    rules, _ = forwarding_rules
+    # A failed rule list is §3.6's problem to report -- the five-read gate
+    # in `collect_project_compute` still sees it and still fails the target.
+    # Here it means only that the traffic sentence goes unwritten, which is
+    # the silence `_idle_traffic_clause` prefers to a fabricated zero.
+    traffic = fetch_lb_traffic(p, rules, session=session, now=now) if isinstance(rules, list) else None
+    return running, not_running, None, forwarding_rules, traffic
+
+
+def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline: float) -> dict[str, object]:
+    """`work(p)` for every project, `max_workers` at a time, in project order.
+
+    A project whose turn comes after `deadline` (a `time.monotonic()` value)
+    is not started, and maps to `None`; see `PROJECT_READ_DEADLINE_S`. The
+    per-project reads used to run one project at a time outside any pool,
+    so a credential listing N projects paid N rounds of gcloud calls before
+    the first cluster was read."""
+    def guarded(p: str):
+        return work(p) if time.monotonic() < deadline else None
+
+    results: dict[str, object] = {}
+    if not projects:
+        return results
+    with ThreadPoolExecutor(max_workers=max(1, min(len(projects), max_workers))) as pool:
+        futures = {pool.submit(guarded, p): p for p in projects}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    deadline = time.monotonic() + project_budget_s
 
     if session is None:
         # One session for the fleet: its connection pool is thread-safe, and
@@ -4941,50 +5054,32 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # which clusters went unread is decided on the pair.
     known_pairs_by_project: dict[str, set[tuple[str, str | None]]] = {}
     enumeration_failed: dict[str, str] = {}
+    forwarding_rules: dict[str, tuple[object | None, Run]] = {}
+    lb_traffic: dict[str, tuple[dict, Run]] = {}
+    reads = _pooled_by_project(projects, lambda p: _read_project(p, run=run, session=session, now=now), max_workers=max_workers, deadline=deadline)
     for p in projects:
-        try:
-            running, not_running = enumerate_clusters(p, run=run)
-            clusters.extend(running)
-            unaudited.extend(not_running)
-            known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
-        except RuntimeError as exc:
+        read = reads.get(p)
+        if read is None:
             known_by_project[p] = None
-            # A log line is not a record. The manifest is the only account of
-            # what this run managed to read, and a project whose clusters could
-            # not be listed used to leave nothing in it -- its `project/<p>`
-            # compute entry still arrived as `collected`, so the document saw a
-            # project with two of three checks and zero clusters, which is
-            # exactly what a genuinely cluster-free project looks like. The
-            # project's own `project/<p>` entry carries the loss instead, as
-            # `gate-failed`: §3.4 and §3.6 both need the cluster list to tell
-            # an orphan from a disk or rule a cluster still owns, so the
-            # project checks cannot run honestly without it either.
-            log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
-            enumeration_failed[p] = str(exc)[:ERROR_EXCERPT_CHARS]
+            enumeration_failed[p] = PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)
+            continue
+        running, not_running, error, rules, traffic = read
+        if error is not None:
+            known_by_project[p] = None
+            enumeration_failed[p] = error
+            continue
+        clusters.extend(running)
+        unaudited.extend(not_running)
+        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
+        forwarding_rules[p] = rules
+        if traffic is not None:
+            lb_traffic[p] = traffic
 
     # Built once for the whole fleet, before the pool: every cluster's
     # candidates resolve against the same clone, and walking it per cluster
     # would read the same tree sixteen times to get the same answer.
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
-
-    # Also before the pool, and for a reason of ordering rather than economy.
-    # §3.13 asks what the load balancer in front of an idle workload metered,
-    # and the only thing that maps a Service's external address to the
-    # forwarding rule Cloud Monitoring reports under is this list -- so it has
-    # to be in hand before the first cluster is collected. `collect_project_compute`
-    # then reuses the same answer for §3.6 rather than re-reading it.
-    forwarding_rules: dict[str, tuple[object | None, Run]] = {}
-    lb_traffic: dict[str, tuple[dict, Run]] = {}
-    for p in projects:
-        forwarding_rules[p] = run_and_gate(forwarding_rules_argv(p), run=run)
-        rules, _ = forwarding_rules[p]
-        # A failed rule list is §3.6's problem to report -- the five-read gate
-        # in `collect_project_compute` still sees it and still fails the target.
-        # Here it means only that the traffic sentence goes unwritten, which is
-        # the silence `_idle_traffic_clause` prefers to a fabricated zero.
-        if isinstance(rules, list):
-            lb_traffic[p] = fetch_lb_traffic(p, rules, session=session, now=now)
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
@@ -5021,38 +5116,41 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     for entry in unaudited:
         skipped_by_project.setdefault(entry.get("project", ""), []).append(entry)
 
-    cluster_entries: list[dict] = []
-    project_entries: list[dict] = []
-    for p in projects:
+    def gate_failed_project(p: str, error: str) -> dict:
+        return {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": "gate-failed", "error": error}
+
+    def compute_for(p: str) -> dict | None:
         group = by_project.get(p, [])
-        group_entries = [entry for entry, _ in group]
-        cluster_entries.extend(group_entries)
         # A project with no clusters is fully read: no Service anywhere can
         # still claim its forwarding rules, which is §3.6's orphan at its
         # plainest. Requiring one cluster withheld the check there every week
         # and pinned the run `partial`.
         all_reachable = (
             not skipped_by_project.get(p)
-            and all(e["outcome"] == "collected" for e in group_entries)
+            and all(entry["outcome"] == "collected" for entry, _ in group)
         )
-        if p in enumeration_failed:
-            project_entries.append(
-                {
-                    "name": f"{PROJECT_TARGET_PREFIX}{p}",
-                    "project": p,
-                    "location": "global",
-                    "outcome": "gate-failed",
-                    "error": enumeration_failed[p],
-                }
-            )
-            continue
         fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
-        if project_entry:
-            project_entries.append(project_entry)
+        return collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
+
+    readable = [p for p in projects if p not in enumeration_failed]
+    # `_pooled_by_project` maps both "not started" and "nothing applies" to
+    # `None`, so the started ones say so explicitly.
+    computed = _pooled_by_project(readable, lambda p: (compute_for(p),), max_workers=max_workers, deadline=deadline)
+    cluster_entries: list[dict] = []
+    project_entries: list[dict] = []
+    for p in projects:
+        cluster_entries.extend(entry for entry, _ in by_project.get(p, []))
+        if p in enumeration_failed:
+            project_entries.append(gate_failed_project(p, enumeration_failed[p]))
+            continue
+        started = computed.get(p)
+        if started is None:
+            project_entries.append(gate_failed_project(p, PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)))
+        elif started[0]:
+            project_entries.append(started[0])
 
     # One rung up from a failed `clusters list`: a `projects list` that failed,
     # or a `--project` that skipped it, took the other projects' names with it.

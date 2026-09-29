@@ -4614,18 +4614,18 @@ class GetTargetProjectsTest(unittest.TestCase):
         # Discovery was skipped, so the run cannot vouch for the rest of the fleet.
         self.assertIn("acme-only", partial)
 
-    def test_discovers_every_project_with_a_cluster(self):
+    def test_discovers_every_listed_project_and_lists_none_of_them(self):
+        # A cluster-free project stays in scope: §3.4-§3.6 and §3.14 look for
+        # what its last cluster left behind. Listing each candidate's clusters
+        # here was also a serial read per project before any worker started.
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
             if argv[:2] == ["gcloud", "projects"] and "list" in argv:
                 return run_of(0, "acme\nother\nempty\n")
-            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
-                project = argv[argv.index("--project") + 1]
-                return run_of(0, json.dumps([{"name": "c1"}]) if project == "other" else "[]")
-            raise AssertionError(argv)
+            raise AssertionError(f"discovery read more than the project list: {argv}")
 
-        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other", "empty"], None))
 
     def test_a_credential_that_sees_no_project_is_an_error_not_an_empty_fleet(self):
         def run(argv, **kwargs):
@@ -4651,7 +4651,7 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertIn("permission denied", manifest["error"])
         self.assertEqual(manifest["clusters"], [])
 
-    def test_listed_projects_that_hold_no_cluster_are_an_empty_fleet_not_an_error(self):
+    def test_listed_projects_that_hold_no_cluster_are_read_not_an_error(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "")
@@ -4659,11 +4659,16 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "proj-a\nproj-b\n")
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return run_of(0, "[]")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
             raise AssertionError(argv)
 
         manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
         self.assertNotIn("error", manifest)
-        self.assertEqual(manifest["clusters"], [])
+        self.assertEqual(
+            {(c["name"], c["outcome"]) for c in manifest["clusters"]},
+            {("project/proj-a", "collected"), ("project/proj-b", "collected")},
+        )
 
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
@@ -4706,31 +4711,180 @@ class GetTargetProjectsTest(unittest.TestCase):
 
         self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "beta"], None))
 
-    def test_a_project_with_the_gke_api_disabled_is_dropped_not_failed(self):
-        # It cannot hold a cluster; kept, it is a `gate-failed` target on every
-        # run and pins the stream partial.
-        disabled = "ERROR: (gcloud.container.clusters.list) SERVICE_DISABLED: Kubernetes Engine API has not been used in project beta"
+    def test_a_project_with_every_api_disabled_leaves_no_target_and_no_gap(self):
+        # Kept as a target, a project that can hold nothing any check looks
+        # for is a row the document has to explain on every run, and an
+        # organisation-wide credential sees many of them.
+        disabled = "ERROR: SERVICE_DISABLED: {api} API has not been used in project beta"
 
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
             if argv[:2] == ["gcloud", "projects"] and "list" in argv:
                 return run_of(0, "acme\nbeta\ngamma\n")
+            project = argv[argv.index("--project") + 1] if "--project" in argv else ""
             if argv[:3] == ["gcloud", "container", "clusters"]:
-                project = argv[argv.index("--project") + 1]
                 if project == "beta":
-                    return run_of(1, "", disabled)
-                return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+                    return run_of(1, "", disabled.format(api="Kubernetes Engine"))
+                if project == "gamma":
+                    return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+                return run_of(0, "[]")
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                if project == "beta":
+                    return run_of(1, "", disabled.format(api="Compute Engine" if argv[1] == "compute" else "Artifact Registry"))
+                return run_of(0, "[]")
             raise AssertionError(argv)
 
-        # gamma's failure is not an answer, so it stays in scope to be recorded.
-        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "gamma"], None))
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
+        # gamma's failure is not an answer, so it is recorded rather than dropped.
+        self.assertEqual(outcomes, {"project/acme": "collected", "project/gamma": "gate-failed"})
+
+    def test_a_cluster_free_listed_project_is_audited_for_what_its_clusters_left(self):
+        # The project whose last cluster was deleted is where its disks become
+        # orphans; dropped from scope, it wrote no row and a finding filed
+        # there on an earlier run read as resolved.
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "disks"] and argv[argv.index("--project") + 1] == "beta":
+                disk = {"name": "left-behind", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "z"}
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        beta = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
+        self.assertEqual(beta["outcome"], "collected")
+        self.assertIn("unattached-disk", {c["check"] for c in beta["candidates"]})
 
     def test_the_active_project_with_the_gke_api_disabled_holds_no_cluster(self):
         def run(argv, **kwargs):
             return run_of(1, "", "accessNotConfigured: Kubernetes Engine API is disabled")
 
         self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
+
+
+def cluster_free_run(compute=None, registry=None, projects="acme\n"):
+    """A fleet of cluster-free projects whose compute and registry reads answer
+    `compute(project)` / `registry(project)`, or `[]` when those return None."""
+    def run(argv, **kwargs):
+        if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+            return run_of(0, projects.split()[0] + "\n")
+        if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+            return run_of(0, projects)
+        project = argv[argv.index("--project") + 1]
+        if argv[:3] == ["gcloud", "container", "clusters"]:
+            return run_of(0, "[]")
+        answer = (compute if argv[1] == "compute" else registry if argv[1] == "artifacts" else None)
+        if answer is None:
+            raise AssertionError(argv)
+        return answer(project) or run_of(0, "[]")
+    return run
+
+
+class DisabledApiProjectTest(unittest.TestCase):
+    COMPUTE_OFF = "ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project acme"
+    REGISTRY_OFF = "ERROR: accessNotConfigured: Artifact Registry API has not been used in project acme"
+
+    def test_compute_off_declares_its_checks_inapplicable_and_still_reads_the_registry(self):
+        run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: None)
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual([c["check"] for c in entry["commands"]], ["registry-no-cleanup"])
+        self.assertEqual({c["check"] for c in entry["checks_not_applicable"]}, set(fw.COMPUTE_CHECKS))
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_registry_off_is_inapplicable_not_a_coverage_gap(self):
+        run = cluster_free_run(compute=lambda p: None, registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        self.assertEqual([c["check"] for c in entry["checks_not_applicable"]], ["registry-no-cleanup"])
+        self.assertEqual({c["check"] for c in entry["commands"]}, {"unattached-disk", "idle-address", "orphan-lb"})
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_one_compute_read_refused_for_another_reason_still_gates(self):
+        # Only all five answering "disabled" says the project has no Compute
+        # Engine; one denied read among them is a read that failed.
+        def compute(project, calls=[]):
+            calls.append(project)
+            return run_of(1, "", "PERMISSION_DENIED" if len(calls) == 1 else self.COMPUTE_OFF)
+
+        run = cluster_free_run(compute=compute, registry=lambda p: None)
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(entry["outcome"], "gate-failed")
+
+
+class ProjectReadScaleTest(unittest.TestCase):
+    def test_project_reads_run_in_the_pool(self):
+        # Two projects' reads have to be in flight at once to pass the barrier,
+        # at both phases; one project at a time breaks it instead of hanging.
+        clusters_barrier = threading.Barrier(2, timeout=5)
+        disks_barrier = threading.Barrier(2, timeout=5)
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                clusters_barrier.wait()
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                disks_barrier.wait()
+            return run_of(0, "[]")
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, max_workers=2)
+        self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"collected"})
+
+    def test_projects_past_the_deadline_are_recorded_not_read(self):
+        # A run killed at its terminal timeout leaves no manifest; one that
+        # stops starting projects leaves a partial one naming what it skipped.
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            raise AssertionError(f"read a project after the deadline: {argv}")
+
+        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=0)
+        entries = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(set(entries), {"project/acme", "project/beta"})
+        self.assertEqual({e["outcome"] for e in entries.values()}, {"gate-failed"})
+        self.assertIn("--project beta", entries["project/beta"]["error"])
+
+    def test_a_deadline_reached_between_phases_fails_only_the_project_reads_left(self):
+        # Clusters read before the deadline stay collected; the project-scoped
+        # reads that had not started are what the run reports as unread.
+        # Collector start, then the one cluster-phase read; every later look
+        # at the clock is past the 10 s budget.
+        ticks = [0.0, 1.0]
+
+        def clock():
+            return ticks.pop(0) if ticks else 100.0
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "forwarding-rules"]:
+                return run_of(0, "[]")
+            raise AssertionError(f"read a project after the deadline: {argv}")
+
+        with patch.object(fw.time, "monotonic", clock):
+            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=10)
+        (entry,) = manifest["clusters"]
+        self.assertEqual((entry["name"], entry["outcome"]), ("project/acme", "gate-failed"))
+        self.assertIn("not read", entry["error"])
 
 
 class MultiProjectCollectFleetTest(unittest.TestCase):
@@ -4764,9 +4918,8 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         """A PV handle live in project acme's cluster must not suppress a
         genuinely unattached disk of the same name in project beta -- the
         cross-cluster fact union is scoped per project, not fleet-wide.
-        Beta gets its own (PV-less) cluster so project discovery includes
-        it at all; a listed project with zero clusters is dropped by
-        `get_target_projects`."""
+        Beta gets its own (PV-less) cluster, so the handle is the only thing
+        that could clear the disk."""
 
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:

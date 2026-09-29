@@ -161,6 +161,21 @@ STDERR_EXCERPT_CHARS = 200
 # lists one name twice. Project-scoped checks keep `project/<id>`.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
+# §1's scope is every project the credential can see. These four are copied
+# from `fleet_waste.py`, whose discovery this mirrors: a failed or narrowed
+# project listing is one `project/UNENUMERATED_PROJECTS` target, so the loss
+# is a row the document accounts for rather than a fleet that shrank to one
+# project, and a project whose Kubernetes Engine API is off holds no cluster.
+UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+NO_PROJECT_IN_SCOPE_ERROR = (
+    "no project in scope: there is no active gcloud project and `gcloud projects list` "
+    "returned none, so this credential sees nothing to audit"
+)
+SCOPED_RUN_NOTE = (
+    "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
+    "project in this fleet was named or read, and this run cannot speak for their clusters."
+)
+API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
 # `collect.py` carry; each collector runs standalone, so it is copied, not
@@ -328,6 +343,55 @@ def not_running_entry(c: dict, project: str) -> dict:
     }
 
 
+class NoProjectInScope(Exception):
+    """Discovery named no project at all, which is not a fleet of empty projects."""
+
+
+def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
+    """The active project plus every other listed project, or the one
+    `--project` names; a copy of `fleet_waste.get_target_projects`, which
+    carries the reasoning. The second value is set when the scope is provably
+    short of the fleet and becomes an `UNENUMERATED_PROJECTS_TARGET` entry.
+    Raises `NoProjectInScope` when the credential sees no project."""
+    if cli_project:
+        return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
+
+    result = run(["gcloud", "config", "get-value", "project"])
+    base = result.stdout.strip() if result.rc == 0 else ""
+    projects = [base] if base else []
+
+    list_result = run(["gcloud", "projects", "list", "--format", "value(projectId)"])
+    if list_result.rc != 0:
+        stderr = list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        if not base:
+            raise NoProjectInScope(
+                f"project discovery failed: `gcloud config get-value project` rc={result.rc} "
+                f"named no project and `gcloud projects list` rc={list_result.rc}: {stderr}"
+            )
+        partial = (
+            f"`gcloud projects list` rc={list_result.rc}: {stderr}. The scope fell back to "
+            f"the active project {base!r}; how many other projects the fleet holds is unknown."
+        )
+        log(f"WARNING: {partial}")
+        return projects, partial
+
+    listed = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip()]
+    candidates = [p for p in listed if p != base]
+    if not base and not candidates:
+        raise NoProjectInScope(NO_PROJECT_IN_SCOPE_ERROR)
+    projects.extend(candidates)
+    if base and base not in listed:
+        partial = (
+            f"`gcloud projects list` rc=0 did not name the active project {base!r}, "
+            f"so it is filtered rather than complete: it returned {len(listed)} "
+            "project(s) and this run reads clusters in one it did not return. How "
+            "many other projects the fleet holds is unknown."
+        )
+        log(f"WARNING: {partial}")
+        return projects, partial
+    return projects, None
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
@@ -336,6 +400,9 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         ]
     )
     if result.rc != 0:
+        if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
+            log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
+            return [], []
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     try:
         clusters = json.loads(result.stdout or "[]")
@@ -1698,14 +1765,8 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS) -> dict:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    resolved_project = project
-    if not resolved_project:
-        result = run(["gcloud", "config", "get-value", "project"])
-        resolved_project = result.stdout.strip() if result.rc == 0 else ""
 
-    try:
-        clusters, not_running = enumerate_clusters(resolved_project, run=run)
-    except RuntimeError as exc:
+    def failed(error: str) -> dict:
         # The manifest contract's top-level `error`: a run that enumerated
         # nothing says so rather than emitting an empty `clusters` array,
         # which reads as an empty fleet. `main` exits non-zero on it.
@@ -1715,9 +1776,44 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             "audit": "stockout-prevention",
             "started_at": started_at,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "error": str(exc),
+            "error": error,
             "clusters": [],
         }
+
+    try:
+        projects, partial_discovery = get_target_projects(project, run=run)
+    except NoProjectInScope as exc:
+        return failed(str(exc))
+
+    # One `clusters list` per project, in the pool: discovery names every
+    # project the credential sees, which on an organisation-wide one is
+    # hundreds, and one at a time that is minutes before a cluster is read.
+    enumerated: dict[str, tuple[list[dict], list[dict]] | str] = {}
+
+    def enumerate_or_error(p: str) -> tuple[list[dict], list[dict]] | str:
+        try:
+            return enumerate_clusters(p, run=run)
+        except RuntimeError as exc:
+            log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
+            return str(exc)[:ERROR_EXCERPT_CHARS]
+
+    with ThreadPoolExecutor(max_workers=max(1, min(len(projects), max_workers))) as pool:
+        futures = {pool.submit(enumerate_or_error, p): p for p in projects}
+        for future in as_completed(futures):
+            enumerated[futures[future]] = future.result()
+    enumeration_failed = {p: r for p, r in enumerated.items() if isinstance(r, str)}
+    if len(enumeration_failed) == len(projects):
+        # Nothing was read anywhere, which is the same run a single failed
+        # project used to be.
+        return failed("; ".join(f"{p}: {enumeration_failed[p]}" for p in projects))
+
+    clusters: list[dict] = []
+    not_running: list[dict] = []
+    for p in projects:
+        if p not in enumeration_failed:
+            clusters.extend(enumerated[p][0])
+            not_running.extend(enumerated[p][1])
+
     cluster_entries = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
@@ -1728,8 +1824,30 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             except Exception as exc:  # noqa: BLE001 — see crashed_entry
                 cluster_entries[index] = crashed_entry(clusters[index], exc)
 
-    regions = {region_of(c["location"]) for c in clusters if c.get("location")}
-    project_entry = collect_project(resolved_project, regions, run=run)
+    # A quota or a reservation is capacity for a project's clusters, so the
+    # project-scoped reads cover the projects holding one. A project with
+    # none has no workload to stock out, and reading it anyway would be two
+    # gcloud calls per cluster-free project for checks with nothing to judge.
+    holding = [p for p in projects if p not in enumeration_failed and (enumerated[p][0] or enumerated[p][1])]
+    project_entries: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(holding), max_workers))) as pool:
+        futures = {
+            pool.submit(collect_project, p, {region_of(c["location"]) for c in enumerated[p][0] if c.get("location")}, run=run): p
+            for p in holding
+        }
+        for future in as_completed(futures):
+            project_entries[futures[future]] = future.result()
+
+    failed_entries = [
+        {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": "gate-failed", "error": enumeration_failed[p]}
+        for p in projects
+        if p in enumeration_failed
+    ]
+    discovery_entries = (
+        [{"name": UNENUMERATED_PROJECTS_TARGET, "project": "", "location": "global", "outcome": "gate-failed", "error": partial_discovery[:ERROR_EXCERPT_CHARS]}]
+        if partial_discovery
+        else []
+    )
 
     return {
         "version": MANIFEST_VERSION,
@@ -1737,13 +1855,17 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         "audit": "stockout-prevention",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [e for e in cluster_entries if e] + [project_entry] + not_running,
+        "clusters": [e for e in cluster_entries if e]
+        + [project_entries[p] for p in holding]
+        + failed_entries
+        + not_running
+        + discovery_entries,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="project to audit; omit to use the active gcloud project")
+    parser.add_argument("--project", help="audit only this project; omit to discover every project the credential can see")
     args = parser.parse_args(argv)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))

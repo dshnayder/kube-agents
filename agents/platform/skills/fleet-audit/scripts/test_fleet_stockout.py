@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1802,6 +1803,109 @@ class EnumerationFailureTest(unittest.TestCase):
         self.assertIn("parseable JSON", manifest["error"])
 
 
+def fleet_run(clusters_by_project, *, projects="acme\nbeta\n", active="acme", cluster_list=None):
+    """Discovery lists `projects`; each project's `clusters list` answers from
+    `clusters_by_project`, or `cluster_list(project)` when given."""
+    def run(argv, **kwargs):
+        if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+            return run_of(0, active + "\n")
+        if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+            return run_of(0, projects)
+        if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+            project = argv[argv.index("--project") + 1]
+            if cluster_list:
+                return cluster_list(project)
+            return run_of(0, json.dumps([{"name": n, "location": "us-central1", "status": "RUNNING"} for n in clusters_by_project.get(project, [])]))
+        if "get-credentials" in argv:
+            return run_of(0)
+        if argv[:2] == ["kubectl", "get"]:
+            return run_of(0, json.dumps(dump_of()))
+        if argv[:3] == ["gcloud", "container", "node-pools"]:
+            return run_of(0, "[]")
+        if argv[:3] == ["gcloud", "compute", "reservations"]:
+            return run_of(0, "[]")
+        if argv[:3] == ["gcloud", "compute", "regions"]:
+            return run_of(0, json.dumps({"quotas": []}))
+        return run_of(0, "")
+    return run
+
+
+class ProjectDiscoveryTest(unittest.TestCase):
+    def collect(self, run, project=None):
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                return fs.collect_fleet(project, run=run)
+
+    def test_every_listed_project_is_read_not_only_the_active_one(self):
+        # One project's clusters, all `collected`, certified a whole fleet.
+        manifest = self.collect(fleet_run({"acme": ["c1"], "beta": ["c2"]}))
+        self.assertEqual(
+            {c["name"] for c in manifest["clusters"]},
+            {"acme/us-central1/c1", "beta/us-central1/c2", "project/acme", "project/beta"},
+        )
+
+    def test_a_project_holding_no_cluster_gets_no_project_reads(self):
+        manifest = self.collect(fleet_run({"acme": ["c1"]}))
+        self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme"})
+
+    def test_a_project_override_is_recorded_as_unenumerated(self):
+        manifest = self.collect(fleet_run({"acme": ["c1"]}), project="acme")
+        entry = next(c for c in manifest["clusters"] if c["name"] == fs.UNENUMERATED_PROJECTS_TARGET)
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("--project", entry["error"])
+
+    def test_a_failed_project_listing_is_recorded_as_unenumerated(self):
+        inner = fleet_run({"acme": ["c1"]})
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"]:
+                return run_of(1, "", "PERMISSION_DENIED: resourcemanager.projects.list")
+            return inner(argv, **kwargs)
+
+        manifest = self.collect(run)
+        entry = next(c for c in manifest["clusters"] if c["name"] == fs.UNENUMERATED_PROJECTS_TARGET)
+        self.assertIn("PERMISSION_DENIED", entry["error"])
+        self.assertIn("acme/us-central1/c1", {c["name"] for c in manifest["clusters"]})
+
+    def test_a_credential_that_sees_no_project_is_an_error(self):
+        manifest = self.collect(fleet_run({}, projects="", active=""))
+        self.assertEqual(manifest["error"], fs.NO_PROJECT_IN_SCOPE_ERROR)
+
+    def test_one_unlistable_project_is_a_gate_failed_target_not_a_run_error(self):
+        def cluster_list(project):
+            if project == "beta":
+                return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+            return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
+
+        manifest = self.collect(fleet_run({}, cluster_list=cluster_list))
+        self.assertNotIn("error", manifest)
+        beta = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
+        self.assertEqual(beta["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", beta["error"])
+
+    def test_a_project_with_the_gke_api_off_holds_no_cluster(self):
+        def cluster_list(project):
+            if project == "beta":
+                return run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project beta")
+            return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
+
+        manifest = self.collect(fleet_run({}, cluster_list=cluster_list))
+        self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme"})
+
+    def test_projects_are_enumerated_in_the_pool(self):
+        # Both listings have to be in flight at once to pass the barrier; one
+        # project at a time breaks it instead of hanging.
+        barrier = threading.Barrier(2, timeout=5)
+
+        def cluster_list(project):
+            barrier.wait()
+            return run_of(0, "[]")
+
+        manifest = fs.collect_fleet(None, run=fleet_run({}, cluster_list=cluster_list), max_workers=2)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertNotIn("error", manifest)
+
+
 class CollectProjectTest(unittest.TestCase):
     def test_reservation_and_quota_findings(self):
         def run(argv, **kwargs):
@@ -1944,8 +2048,10 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 "clusters": [
                     {"name": e["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]]}
                     for e in manifest["clusters"]
+                    if e["outcome"] == "collected"
                 ],
-                "skipped": [],
+                # `--project` skipped discovery, and the manifest says so.
+                "skipped": [{"cluster": fs.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}],
             },
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
@@ -1990,12 +2096,14 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         clusters = [
             {"name": e["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]]}
             for e in manifest["clusters"]
+            if e["outcome"] == "collected"
         ]
         for entry in clusters:
             if entry["name"] == "acme/us-central1/c1":
                 entry["checks_run"].append({"check": "autoscaler-out-of-resources", "command": "x"})
                 entry["limitations"] = "the Cloud Logging read failed"
-        data = {"audit": "stockout-prevention", "scope": {"clusters": clusters, "skipped": []}}
+        skipped = [{"cluster": fs.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}]
+        data = {"audit": "stockout-prevention", "scope": {"clusters": clusters, "skipped": skipped}}
         with self.assertRaisesRegex(audit_report.ValidationError, "as run or not applicable"):
             audit_report.cross_check_manifest(data, manifest)
 
