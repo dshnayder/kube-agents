@@ -215,14 +215,19 @@ NOTHING_COLLECTED_ERROR = (
 )
 # `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
 # way a project yields nothing without recording why.
+# The opening of the note a filtered `projects list` leaves: the listing
+# succeeded, so like the `--project` note it says what a run may have
+# missed, never why nothing was collected.
+FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
+
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has the Compute Engine API off"
 )
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
-# `collect.py` carry, copied rather than imported: this collector imports
-# nothing from either sibling, so it runs standalone and a change to either
-# sibling's exclusions cannot move this stream's.
+# `collect.py` carry, copied rather than imported: this collector borrows only
+# two leaf parsers from its siblings, imported inside the checks that use them,
+# so a change to either sibling's exclusions cannot move this stream's.
 SYSTEM_NAMESPACES = frozenset(
     {
         "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
@@ -494,7 +499,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     projects.extend(candidates)
     if base and base not in listed:
         partial = (
-            f"`gcloud projects list` rc=0 did not name the active project {base!r}, "
+            f"{FILTERED_LISTING_NOTE} {base!r}, "
             f"so it is filtered rather than complete: it returned {len(listed)} "
             "project(s) and this run reads clusters in one it did not return. How "
             "many other projects the fleet holds is unknown."
@@ -1886,6 +1891,15 @@ def _before(deadline: float) -> bool:
     return time.monotonic() < deadline
 
 
+def _only_a_scope_note(entry: dict, project: str | None) -> bool:
+    """Whether a target's error is the discovery entry's note on what a run
+    skipped -- a `--project` scope or a filtered listing -- rather than a
+    failure that explains why nothing was collected."""
+    if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
+        return False
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+
+
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
@@ -2021,12 +2035,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         # unlisted or unreached project, a cluster not running -- and `finish`
         # rejects an empty `scope.clusters`, so this is the top-level `error`
         # rather than a manifest nothing can be built from.
-        # The `--project` note is an error only in form: it says what this run
-        # did not look at, never why the project it did look at yielded nothing.
-        # Without `--project` the same entry is a failed or filtered
-        # `projects list`, a real failure, so it stays eligible.
+        # The `--project` note and a filtered listing's note are errors only in
+        # form: each says what this run did not look at, never why what it did
+        # look at yielded nothing. A `projects list` that failed is a real
+        # failure, so it stays eligible.
         first = next(
-            (e for e in entries if e.get("error") and not (project and e.get("name") == UNENUMERATED_PROJECTS_TARGET)),
+            (e for e in entries if e.get("error") and not _only_a_scope_note(e, project)),
             None,
         )
         return failed(NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else NO_TARGET_REASON))

@@ -1973,6 +1973,21 @@ class ProjectDiscoveryTest(unittest.TestCase):
         error = self.collect(run)["error"]
         self.assertIn(f"First: {fs.UNENUMERATED_PROJECTS_TARGET}: `gcloud projects list` rc=1", error)
 
+    def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
+        """A `projects list` that succeeded without naming the active project
+        was read in full; its note says what the run may have missed, so the
+        error gives the reason nothing was collected instead."""
+        inner = self.compute_off_run()
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "other\n")
+            return inner(argv, **kwargs)
+
+        error = self.collect(run)["error"]
+        self.assertNotIn(fs.UNENUMERATED_PROJECTS_TARGET, error)
+        self.assertIn(f"First: {fs.NO_TARGET_REASON}", error)
+
     def test_a_scoped_project_that_yields_nothing_says_why_not_what_was_skipped(self):
         error = self.collect(self.compute_off_run(), project="acme")["error"]
         self.assertNotIn(fs.UNENUMERATED_PROJECTS_TARGET, error)

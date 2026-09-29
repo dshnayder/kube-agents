@@ -5267,6 +5267,22 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
         self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
 
+    def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
+        """A `projects list` that succeeded without naming the active project
+        was read in full; its note says what the run may have missed, so the
+        error gives the reason nothing was collected instead."""
+        inner = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF.replace("acme", p)), registry=lambda p: run_of(1, "", self.REGISTRY_OFF.replace("acme", p)))
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "other\n")
+            return inner(argv, **kwargs)
+
+        manifest = fw.collect_fleet(run=run, session=None, now=NOW)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
+        self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
+
     def test_a_failed_project_listing_is_named_when_nothing_is_collected(self):
         """Without `--project`, the discovery entry is a real failure: a
         `projects list` that failed took the rest of the fleet with it, and the

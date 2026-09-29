@@ -177,6 +177,11 @@ NOTHING_COLLECTED_ERROR = (
 )
 # `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
 # way a project yields nothing without recording why.
+# The opening of the note a filtered `projects list` leaves: the listing
+# succeeded, so like the `--project` note it says what a run may have
+# missed, never why nothing was collected.
+FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
+
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
 )
@@ -688,7 +693,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
         # is filtered rather than complete, so the scope is provably short.
         # `collect.py`'s `discover_fleet` answers the same input the same way.
         partial = (
-            f"`gcloud projects list` rc=0 did not name the active project {base!r}, "
+            f"{FILTERED_LISTING_NOTE} {base!r}, "
             f"so it is filtered rather than complete: it returned {len(listed)} "
             "project(s) and this run reads clusters in one it did not return. How "
             "many other projects the fleet holds is unknown."
@@ -5403,6 +5408,15 @@ def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline:
     return results
 
 
+def _only_a_scope_note(entry: dict, project: str | None) -> bool:
+    """Whether a target's error is the discovery entry's note on what a run
+    skipped -- a `--project` scope or a filtered listing -- rather than a
+    failure that explains why nothing was collected."""
+    if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
+        return False
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+
+
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -5610,12 +5624,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # rather than a manifest nothing can be built from. A target the
         # collector read and gate-failed is not in that set: §2's manual
         # retry can still bring it into scope.
-        # The `--project` note is an error only in form: it says what this run
-        # did not look at, never why the project it did look at yielded nothing.
-        # Without `--project` the same entry is a failed or filtered
-        # `projects list`, a real failure, so it stays eligible.
+        # The `--project` note and a filtered listing's note are errors only in
+        # form: each says what this run did not look at, never why what it did
+        # look at yielded nothing. A `projects list` that failed is a real
+        # failure, so it stays eligible.
         first = next(
-            (e for e in entries if e.get("error") and not (project and e.get("name") == UNENUMERATED_PROJECTS_TARGET)),
+            (e for e in entries if e.get("error") and not _only_a_scope_note(e, project)),
             None,
         )
         return {
