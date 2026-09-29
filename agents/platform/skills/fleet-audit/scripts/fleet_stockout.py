@@ -460,7 +460,7 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     `fleet_waste.refusal_names_project`, which carries the reasoning."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        return re.search(rf"\bprojects?[ /]{re.escape(project)}\b", stderr) is not None
+        return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
     described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
     return described.rc == 0 and numbers == {described.stdout.strip()}
 

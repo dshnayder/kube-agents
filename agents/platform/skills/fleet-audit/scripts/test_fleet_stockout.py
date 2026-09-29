@@ -2271,6 +2271,11 @@ class ClustersListedMarkerTest(unittest.TestCase):
         entry = self.project_entry(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme"))
         self.assertEqual(entry[fs.CLUSTERS_LISTED_KEY], 0)
 
+    def test_a_refusal_naming_a_longer_project_id_does_not_mark_the_project(self):
+        # A hyphen ends a word, so `\b` after acme matched acme-prod's refusal and marked acme cluster-free.
+        manifest = self.manifest(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme-prod before"))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+
     def test_a_quota_project_s_refusal_does_not_mark_the_project(self):
         # The refusal names a project other than acme (fleet_run's describe answers no number),
         # so acme's clusters are unknown, not absent.

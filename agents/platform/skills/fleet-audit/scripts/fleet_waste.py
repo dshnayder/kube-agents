@@ -759,7 +759,7 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     for, is a failed read."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        return re.search(rf"\bprojects?[ /]{re.escape(project)}\b", stderr) is not None
+        return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
     described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
     return described.rc == 0 and numbers == {described.stdout.strip()}
 
@@ -1021,14 +1021,14 @@ def fetch_usage_peaks(
     session: SessionFn,
     now: datetime,
     window_hours: int = USAGE_WINDOW_HOURS,
-) -> tuple[dict[tuple[str, str], tuple[float, float]], bool, Run]:
+) -> tuple[dict[tuple[str, str], tuple[float | None, float | None]], bool, Run]:
     """§2's usage figures, read from Cloud Monitoring rather than sampled.
 
     Returns `(peaks, available, result)`. `peaks` maps `(namespace, pod)` to
     that pod's `(peak_cpu_cores, peak_mem_mib)` over the trailing
     `window_hours` -- deliberately the same key and the same two units the
     `kubectl top pods` parse produced, so `check_overrequest` reads it
-    unchanged.
+    unchanged. A dimension the pod has no series for is `None`.
 
     `available=False` is §2's metrics degradation and reaches the manifest as
     a limitation rather than a silent zero. It covers the empty answer as well
@@ -1070,8 +1070,14 @@ def fetch_usage_peaks(
             return fail(*err)
         peaks[key] = sink
 
+    # A pod with a series under one metric and none under the other is
+    # unmeasured on that dimension, not idle on it: `None`, which
+    # `_per_replica` keeps apart from zero. Read as `0.0`, the missing
+    # dimension cleared §3.1's 20% bar by the widest margin available and the
+    # finding proposed shrinking a request nothing had measured.
+    mem_mib = {pod_key: value / BYTES_PER_MIB for pod_key, value in peaks["mem"].items()}
     merged = {
-        pod_key: (peaks["cpu"].get(pod_key, 0.0), peaks["mem"].get(pod_key, 0.0) / BYTES_PER_MIB)
+        pod_key: (peaks["cpu"].get(pod_key), mem_mib.get(pod_key))
         for pod_key in set(peaks["cpu"]) | set(peaks["mem"])
     }
     if not merged:
@@ -1081,7 +1087,10 @@ def fetch_usage_peaks(
     # thing. There is no stdout here, so stand in the parsed answer, rounded
     # so a digest tracks a real change in usage rather than float noise.
     rendered = json.dumps(
-        sorted((ns, pod, round(cpu, 4), round(mem, 1)) for (ns, pod), (cpu, mem) in merged.items())
+        sorted(
+            (ns, pod, None if cpu is None else round(cpu, 4), None if mem is None else round(mem, 1))
+            for (ns, pod), (cpu, mem) in merged.items()
+        )
     )
     return merged, True, Run([label], 0, rendered, "", time.monotonic() - started)
 
@@ -2594,7 +2603,7 @@ def _observed_pod_keys(
     return live + sorted(extra), len(extra)
 
 
-def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = None) -> float:
+def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = None) -> float | None:
     """The worst single replica's figure, across every pod that occupied a slot.
 
     `max`, not the mean, and not the sum. Sum is what the join produced before
@@ -2611,14 +2620,32 @@ def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = 
     whole, which is `fetch_memory_means`' shape. CPU and memory are maximised
     independently, and may well come from different pods -- the same choice
     `_read_pod_series` already makes when folding a pod's containers together.
+
+    `None` when no key carried a figure -- for a tuple, on that dimension --
+    which is "unmeasured", never zero. Zero is the most idle a workload can
+    read, so an absent series read as zero clears every idle test there is.
     """
-    best = 0.0
+    best = None
     for key in keys:
         value = series.get(key)
+        if value is not None and index is not None:
+            value = value[index]
         if value is None:
             continue
-        best = max(best, value if index is None else value[index])
+        best = value if best is None else max(best, value)
     return best
+
+
+def _measured_peaks(
+    keys: list[tuple[str, str]], usage_peaks: dict, replicas: int
+) -> tuple[float, float] | None:
+    """The controller's `(peak_cpu, peak_mem)` totals, or `None` when either
+    dimension went unmeasured across every one of its pods."""
+    cpu = _per_replica(keys, usage_peaks, 0)
+    mem = _per_replica(keys, usage_peaks, 1)
+    if cpu is None or mem is None:
+        return None
+    return cpu * replicas, mem * replicas
 
 
 def _resize_target(
@@ -2812,19 +2839,21 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         guaranteed = _is_guaranteed(entry)
 
         keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
-        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
-        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # Same guard `check_underrequest` carries, and this is the direction in
         # which getting it wrong is worse. A controller none of whose pods
-        # reported reads as zero on both dimensions, which is not "idle" but
-        # "unmeasured" -- and zero is the most idle a workload can read, so it
-        # clears both ratio tests at once and the finding proposes shrinking
+        # reported would read as zero on both dimensions, which is not "idle"
+        # but "unmeasured" -- and zero is the most idle a workload can read, so
+        # it clears both ratio tests at once and the finding proposes shrinking
         # the request of a workload nobody observed. The `if not usage_peaks`
         # return above only catches a cluster that answered nothing at all;
         # one namespace missing from an otherwise-populated answer, or a
-        # metrics agent down on a single node, lands here instead.
-        if not any(key in usage_peaks for key in keys):
+        # metrics agent down on a single node, lands here instead. A controller
+        # measured on one dimension only is skipped whole: this check's verdict
+        # and its excerpt state both dimensions, and one of them is unknown.
+        peaks = _measured_peaks(keys, usage_peaks, replicas)
+        if peaks is None:
             continue
+        peak_cpu, peak_mem = peaks
         # The one case this check yields to §3.13. A `Guaranteed` controller
         # idle on every dimension gets a stand-down there rather than the
         # `manual` note here, because the note is all this check can offer it
@@ -3237,14 +3266,15 @@ def check_idle_workload(
         replicas = len(entry["pods"])
 
         keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
-        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
-        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # Same guard as §3.1, and it matters more here. Zero is the most idle a
-        # workload can read, and an unmeasured controller reads as zero on both
-        # dimensions -- so without this, a metrics agent down on one node
-        # produces a recommendation to delete whatever was running there.
-        if not any(key in usage_peaks for key in keys):
+        # workload can read, and an unmeasured controller would read as zero on
+        # both dimensions -- so without this, a metrics agent down on one node
+        # produces a recommendation to delete whatever was running there. Idle
+        # on every dimension needs every dimension measured.
+        peaks = _measured_peaks(keys, usage_peaks, replicas)
+        if peaks is None:
             continue
+        peak_cpu, peak_mem = peaks
 
         if not _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem):
             continue
@@ -3419,14 +3449,21 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # that lived a tenth of the window carries its mean while alive, not a
         # tenth of it -- `ALIGN_MEAN` averages the points that exist rather than
         # padding the gaps with zeroes.
-        mean_mem = _per_replica(keys, memory_means) * replicas
-        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
+        mean_per_replica = _per_replica(keys, memory_means)
         # A controller none of whose pods reported is not a controller using no
         # memory. Reading absent pods as zero would read it as comfortably
         # under its request, which is the same vacuum-as-evidence mistake
         # `fetch_usage_peaks` refuses at the cluster level.
-        if not any(key in memory_means for key in keys):
+        if mean_per_replica is None:
             continue
+        mean_mem = mean_per_replica * replicas
+        # The peak only sizes the new request and is printed beside the mean.
+        # Unread, the mean stands in for it -- a peak is never below the mean
+        # it contains -- rather than a zero that would size the raise at the
+        # 64Mi floor under a request already being exceeded.
+        peak_per_replica = _per_replica(keys, usage_peaks, 1)
+        peak_mem = mean_mem if peak_per_replica is None else peak_per_replica * replicas
+        peak_text = "peak not read" if peak_per_replica is None else f"peak {peak_mem / 1024.0:.2f} GiB"
 
         overage = mean_mem - mem_req_total
         if overage <= 0 or overage < UNDERREQUEST_FLOOR_MIB:
@@ -3467,7 +3504,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
             f"{mean_mem / 1024.0:.2f} GiB {measured_over} — "
             f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / 1024.0:.2f} GiB above it; "
-            f"peak {peak_mem / 1024.0:.2f} GiB. Sustained, not a burst."
+            f"{peak_text}. Sustained, not a burst."
         )
         # State the prescribed request rather than leaving it to be recomputed,
         # for the reason `_resize_target` records and §3.1 already acts on: the
@@ -3608,13 +3645,14 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # workload outgrows by tonight. On 2026-09-06 every Argo CD component
         # on the hub was sized off a 6h window for exactly that reason.
         keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
-        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
-        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # The whole finding is the measurement, so an unmeasured controller has
         # nothing to say. Reporting it anyway would recommend requesting zero,
-        # which is the state being complained about.
-        if not any(key in usage_peaks for key in keys):
+        # which is the state being complained about -- and so would a
+        # dimension no series was read for.
+        peaks = _measured_peaks(keys, usage_peaks, replicas)
+        if peaks is None:
             continue
+        peak_cpu, peak_mem = peaks
 
         _, measured_over = _measured_over(
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)

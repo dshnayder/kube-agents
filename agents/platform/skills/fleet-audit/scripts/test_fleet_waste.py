@@ -216,11 +216,13 @@ class FetchUsagePeaksTest(unittest.TestCase):
         peaks, _, _ = self.fetch(session)
         self.assertEqual(peaks[("default", "api-1")], (0.5, 512.0))
 
-    def test_a_pod_in_one_metric_only_still_appears(self):
+    def test_a_pod_in_one_metric_only_is_unmeasured_on_the_other(self):
+        # Present, so its CPU is judged; `None` on memory, because a missing
+        # series is no reading at all and zero would read as maximally idle.
         session = FakeSession(cpu=[series_of("default", "api-1", 0.3)], mem=[])
         peaks, ok, _ = self.fetch(session)
         self.assertTrue(ok)
-        self.assertEqual(peaks[("default", "api-1")], (0.3, 0.0))
+        self.assertEqual(peaks[("default", "api-1")], (0.3, None))
 
     def test_an_empty_answer_is_unavailable_rather_than_zero_usage(self):
         # The one failure mode that turns this check into a fleet-wide false
@@ -1693,6 +1695,14 @@ class OverrequestTest(unittest.TestCase):
         # and not the materiality floor or an eligibility exclusion.
         self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
 
+    def test_a_dimension_no_series_was_read_for_is_not_resized(self):
+        """CPU in use, memory never read. Reading the missing memory series as
+        zero published "Over-requested on memory only (0% of request); resize
+        to memory 64Mi" on the strength of a series nobody read."""
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (11.0, None)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
+
     def test_one_measured_pod_is_enough_to_judge_a_controller(self):
         """The guard drops the unmeasured, not the partially measured.
 
@@ -2476,6 +2486,10 @@ class IdleWorkloadTest(unittest.TestCase):
         # recommendation to delete whatever was running there.
         self.assertEqual(self.hits(peaks={(self.NS, "somebody-else"): (4.0, 8192.0)}), [])
         self.assertEqual(len(self.hits()), 1)
+
+    def test_a_controller_unmeasured_on_one_dimension_is_not_reported(self):
+        # Idle on every dimension needs every dimension read.
+        self.assertEqual(self.hits(peaks={(self.NS, self.POD): (0.0021, None)}), [])
 
     def test_no_usage_answer_at_all_reports_nothing(self):
         self.assertEqual(self.hits(peaks={}), [])
@@ -5152,6 +5166,13 @@ class GetTargetProjectsTest(unittest.TestCase):
         run, calls = self.refusing_run("acme")
         self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
         self.assertFalse([c for c in calls if c[:3] == ["gcloud", "projects", "describe"]])
+
+    def test_a_refusal_naming_a_longer_project_id_is_a_failed_list(self):
+        """A hyphen ends a word, so `\\b` after `acme` matched `acme-prod`'s
+        refusal and read it as acme's own, marking acme cluster-free."""
+        run, _ = self.refusing_run("acme-prod")
+        with self.assertRaises(RuntimeError):
+            fw.enumerate_clusters("acme", run=run)
 
     def test_a_quota_project_s_refusal_is_a_failed_list(self):
         """With `billing/quota_project` set to a project whose GKE API is off,
