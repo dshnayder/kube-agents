@@ -20,7 +20,7 @@ its seed state. A roster that cannot be read is named in that field and in the
 lead rather than swallowed: it disarms NEVER and STALE, so the empty flag list
 it produces is "not checked", not "clean", and the exit code is 1.
 
-Four flags the raw rows cannot be trusted without:
+Five flags the raw rows cannot be trusted without:
   - NO STORE: the store directory is absent, or this stream's files could not
     be read. "I could not look" is not "nothing is wrong", and the exit code
     says so too.
@@ -28,6 +28,8 @@ Four flags the raw rows cannot be trusted without:
     the lease's age against its own two-hour TTL alone. No roster and no
     schedule parsing, so it fires within two hours on every cron shape and on
     kanban-dispatched runs that have no schedule at all.
+  - UNRECORDED: `latest.json` is gone, so the row is the ring's newest entry
+    and a later run changed the ledger, or began to, without storing itself.
   - NEVER: roster-enabled, the store was readable, and the stream has neither
     a lease nor a stored run — it has genuinely never run. A ring whose
     `latest.json` a failed run deleted still has its newest entry.
@@ -69,6 +71,7 @@ try:
     from terminal_table import (  # noqa: E402
         BOX_ASCII,
         BOX_UNICODE,
+        SECONDS_PER_MINUTE,
         Column,
         Palette,
         ago,
@@ -138,7 +141,13 @@ STATUS_STYLE = {
 }
 KNOWN_STATUS = frozenset(STATUS_STYLE)
 
-FLAG_STYLE = {"NO STORE": "crit", "DIED": "crit", "NEVER": "yellow", "STALE": "yellow"}
+FLAG_STYLE = {
+    "NO STORE": "crit",
+    "DIED": "crit",
+    "UNRECORDED": "yellow",
+    "NEVER": "yellow",
+    "STALE": "yellow",
+}
 
 SORTS = ("stream", "last", "findings", "flags")
 # A collector writes coverage gaps at whatever length; one is clipped to this.
@@ -448,7 +457,7 @@ def load_roster(path: Path) -> tuple[dict[str, dict], str]:
     """The roster's fleet-audit jobs, and why the file could not be read.
 
     The reason is returned rather than swallowed because an unreadable roster
-    silently disarms two of the four flags: NEVER and STALE both gate on
+    silently disarms two of the five flags: NEVER and STALE both gate on
     `job.get("enabled")`, which is False for every stream when the roster came
     back empty, so a fleet that has been silent for a week renders as a table of
     calm blank rows under the word "all clear". Same principle the NO STORE flag
@@ -528,7 +537,11 @@ def duration(seconds: object) -> str:
     if not isinstance(seconds, (int, float)):
         return "?"
     seconds = int(seconds)
-    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+    return (
+        f"{seconds // SECONDS_PER_MINUTE}m{seconds % SECONDS_PER_MINUTE:02d}s"
+        if seconds >= SECONDS_PER_MINUTE
+        else f"{seconds}s"
+    )
 
 
 def count_cell(value: object) -> str:
@@ -541,7 +554,7 @@ def count_cell(value: object) -> str:
 
 
 def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list[str]:
-    """The four flags, in severity order.
+    """The five flags, in severity order.
 
     DIED reads off the projection's liveness alone, so a roster that has
     drifted from runtime cannot suppress the death of a running stream: were
@@ -557,6 +570,8 @@ def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list
     liveness = stream.get("liveness") or "never"
     if liveness == "died":
         flags.append("DIED")
+    if stream.get("latest_missing"):
+        flags.append("UNRECORDED")
     enabled = bool(job.get("enabled"))
     if liveness == "never" and enabled and not unreadable:
         flags.append("NEVER")
@@ -762,7 +777,10 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
             source = {
                 **stream,
                 "latest": (entry or {}).get("latest"),
-                "error": (entry or {}).get("error") or stream.get("stream_error"),
+                "error": (entry or {}).get("error")
+                or stream.get("stream_error")
+                or (stream.get("error") if stream.get("liveness") == "error" else None),
+                "latest_missing": bool((entry or {}).get("latest_missing")),
             }
             out.append((label, audit_id, source))
     return out

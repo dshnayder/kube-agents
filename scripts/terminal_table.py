@@ -226,7 +226,14 @@ def _cell_lines(text: str, width: int) -> List[Tuple[str, int]]:
             out.append(("", index))
             continue
         for line in (
-            textwrap.wrap(para, width=max(1, width), break_long_words=True, break_on_hyphens=False)
+            # `textwrap` counts characters and `width` is columns: widen it by
+            # the zero-width characters so a paragraph that fits is not split.
+            textwrap.wrap(
+                para,
+                width=max(1, width) + max(0, len(plain(para)) - display_width(para)),
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
             or [""]
         ):
             for piece in _to_width(line, max(1, width)):
@@ -278,7 +285,7 @@ def _minimum_width(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[A
     """The narrowest this table can be drawn without dropping a column."""
     natural = _natural_widths(columns, rows)
     return _overhead(len(columns)) + sum(
-        column.min_width if column.wrap else natural[index]
+        min(column.min_width, natural[index]) if column.wrap else natural[index]
         for index, column in enumerate(columns)
     )
 
@@ -323,17 +330,20 @@ def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
 
     fixed = sum(w for i, w in enumerate(natural) if i not in flex)
     room = available - fixed
-    floor = sum(columns[i].min_width for i in flex)
+    # A column whose content is narrower than its minimum needs only its
+    # content: padding it up would take the width from a column that wraps.
+    minimum = {i: min(columns[i].min_width, natural[i]) for i in flex}
+    floor = sum(minimum.values())
     if room < floor:
         # Nothing left to give. Honour the minimums and let the table run wide:
         # a table one column too wide is legible, a table with three-character
         # title cells is not.
-        return [columns[i].min_width if i in flex else natural[i] for i in range(len(columns))]
+        return [minimum[i] if i in flex else natural[i] for i in range(len(columns))]
 
     share = float(sum(natural[i] for i in flex)) or 1.0
     widths = list(natural)
     for i in flex:
-        widths[i] = max(columns[i].min_width, int(room * (natural[i] / share)))
+        widths[i] = max(minimum[i], int(room * (natural[i] / share)))
     # Integer division loses a column or two of the budget; hand the remainder
     # to the widest flexible column rather than leaving the table short.
     drift = room - sum(widths[i] for i in flex)
@@ -343,8 +353,8 @@ def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
     # the excess back from the columns above theirs, widest first. `room >=
     # floor` above guarantees there is enough slack to cover it.
     while drift < 0:
-        donor = max(flex, key=lambda i: widths[i] - columns[i].min_width)
-        give = min(-drift, widths[donor] - columns[donor].min_width)
+        donor = max(flex, key=lambda i: widths[i] - minimum[i])
+        give = min(-drift, widths[donor] - minimum[donor])
         widths[donor] -= give
         drift += give
     return widths

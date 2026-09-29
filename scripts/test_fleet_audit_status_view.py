@@ -254,6 +254,20 @@ class TestFlags(unittest.TestCase):
         doc.update(liveness="error", error="the in-flight note: denied", stream_error="the in-flight note: denied")
         self.assertEqual(self.flags(doc), ["NO STORE"])
 
+    def test_a_row_from_the_ring_is_flagged_unrecorded(self):
+        recent = latest(finished_at=(NOW - timedelta(hours=2)).isoformat())
+        doc = stream(last=recent)
+        doc["repos"]["acme/fleet"]["latest_missing"] = True
+        self.assertEqual(self.flags(doc), ["UNRECORDED"])
+
+    def test_a_sibling_repositorys_error_reaches_the_healthy_row(self):
+        recent = latest(finished_at=(NOW - timedelta(hours=2)).isoformat())
+        doc = stream(last=recent)
+        doc["repos"]["acme/other"] = {"latest": None, "runs": [], "error": "latest.json: bad"}
+        doc.update(liveness="error", error="acme/other: latest.json: bad", stream_error=None)
+        rows = view.stream_rows({"cost-audit": doc}, {})
+        self.assertTrue(all(source["error"] for _, _, source in rows))
+
     def test_died_needs_no_roster_and_no_schedule(self):
         doc = stream(liveness="died", started=started(age_s=9000))
         self.assertEqual(view.flags_for(doc, {}, NOW, True), ["DIED"])
@@ -484,6 +498,15 @@ class TestRender(unittest.TestCase):
         gaps = ["bad\x1b]8;;x\x07gap"]
         out = self.render(
             {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))},
+            show_gaps=True,
+        )
+        self.assertNotIn("\x1b", out)
+
+    def test_a_stream_label_is_scrubbed_in_the_gaps_table(self):
+        # The gaps table prints the label outside `row_for`, so the scrub at
+        # the row boundary is the only one it passes.
+        out = self.render(
+            {"bad\x1b]8;;x\x07audit": stream(last=latest(partial=True, coverage_gaps=["x: y"]))},
             show_gaps=True,
         )
         self.assertNotIn("\x1b", out)
@@ -1167,14 +1190,34 @@ class TestFormatting(unittest.TestCase):
         self.assertEqual(terminal_table.display_width("co\u00adop"), 5)
 
     def test_clamped_minimums_do_not_overspend_the_width(self):
-        # Two wrap columns, one clamped up to its minimum: the excess comes
-        # back from the other rather than running the table wide.
+        # Two wrap columns; A's proportional share (3) is below its content
+        # (5), so it is clamped up to the content, not to min_width, and the
+        # excess comes back from B rather than running the table wide.
         columns = [terminal_table.Column("A", wrap=True), terminal_table.Column("B", wrap=True)]
         rows = [[("x" * 5,), ("y" * 50,)]]
         total = 40 + terminal_table._overhead(2)
         widths = terminal_table._resolve_widths(columns, rows, total)
         self.assertEqual(sum(widths), 40)
-        self.assertEqual(widths[0], terminal_table.DEFAULT_MIN_WIDTH)
+        self.assertEqual(widths, [5, 35])
+
+    def test_a_short_wrap_column_is_counted_at_its_content_when_fitting(self):
+        # STATUS-like: min_width 11, content 5. The table fits at its natural
+        # widths, so no expendable column may be dropped.
+        columns = [
+            terminal_table.Column("S", wrap=True, min_width=11),
+            terminal_table.Column("AGE", expendable=1),
+        ]
+        rows = [[("CLEAN",), ("3h",)]]
+        natural_total = 5 + 3 + terminal_table._overhead(2)
+        kept, _, dropped = terminal_table._fit_columns(columns, rows, natural_total)
+        self.assertEqual(dropped, [])
+        self.assertEqual([c.title for c in kept], ["S", "AGE"])
+
+    def test_a_cell_that_fits_is_not_split_for_its_zero_width_characters(self):
+        text = "compliance\u200daudit"
+        width = terminal_table.display_width(text)
+        lines = terminal_table._cell_lines(text, width)
+        self.assertEqual([line for line, _ in lines], [text])
 
     def test_count_cell(self):
         self.assertEqual(view.count_cell(["a", "b"]), "2")

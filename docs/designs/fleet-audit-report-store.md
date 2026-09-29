@@ -188,7 +188,8 @@ question about a past run should not pull the publish procedure into context.
 **The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and
 renders one row per stream and repository, labelled with the repository only when a stream has more
-than one. `report_status.py` therefore imports nothing outside the standard
+than one. A row taken from the ring carries the `UNRECORDED` flag, and a stream-level error (the
+lease, a stray directory, a sibling repository) is shown on every row of that stream. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
 

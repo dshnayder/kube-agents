@@ -234,6 +234,15 @@ def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
     return _read_object(os.path.join(store_path(root, audit_id, repo), "latest.json"))
 
 
+class RingReadError(ValueError):
+    """The ring fallback failed; `name` is the path under the store that did,
+    so a reader names that file rather than the absent `latest.json`."""
+
+    def __init__(self, name: str, exc: Exception):
+        super().__init__(str(exc))
+        self.name = name
+
+
 def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
     """The last run the store kept, whole, and whether it came off the ring.
 
@@ -241,14 +250,21 @@ def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
     restores it only on a completed write, so a run that failed in between leaves the ring
     and no `latest.json`. The newest ring entry is then the last run the store
     has, and the flag says a later run may have changed the ledger unrecorded.
+    A failure reading the ring raises RingReadError naming the file.
     """
     latest = load_latest(root, audit_id, repo)
     if latest is not None:
         return latest, False
-    runs = list_runs(root, audit_id, repo)
+    try:
+        runs = list_runs(root, audit_id, repo)
+    except OSError as exc:
+        raise RingReadError("runs/", exc) from exc
     if not runs:
         return None, False
-    return load_run(root, audit_id, repo, runs[-1]), True
+    try:
+        return load_run(root, audit_id, repo, runs[-1]), True
+    except (OSError, ValueError) as exc:
+        raise RingReadError(f"runs/{runs[-1]}", exc) from exc
 
 
 def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
@@ -389,6 +405,9 @@ def _project_repo(root: str, audit_id: str, repo: str) -> dict:
     latest_missing = False
     try:
         latest, latest_missing = load_last(root, audit_id, repo)
+    except RingReadError as exc:
+        # `latest.json` is gone and the ring behind it is what failed.
+        error, latest_missing = _failure(exc.name, exc), True
     except (OSError, ValueError) as exc:
         error = _failure("latest.json", exc)
     try:

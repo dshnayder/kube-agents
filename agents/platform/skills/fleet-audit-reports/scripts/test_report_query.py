@@ -387,6 +387,13 @@ class TestShow(StoreTestCase):
         self.assertTrue(self.ok("checks", AUDIT)["latest_missing"])
         self.assertFalse(self.ok("findings", AUDIT, "--run", self.older)["latest_missing"])
 
+    def test_a_corrupt_ring_entry_behind_a_missing_latest_is_named(self):
+        (Path(self.root) / AUDIT / REPO / "latest.json").unlink()
+        (Path(self.root) / AUDIT / REPO / "runs" / self.newest).write_text("{", encoding="utf-8")
+        payload = self.refused("show", AUDIT)
+        self.assertIn(f"runs/{self.newest}", payload["error"])
+        self.assertIn("latest.json in acme/fleet is gone", payload["error"])
+
     def test_repository_casing_is_not_a_second_store(self):
         payload = self.ok("show", AUDIT, "--repo", REPO.upper())
         self.assertEqual(payload["repo"], REPO)
@@ -645,6 +652,16 @@ class TestRepositories(StoreTestCase):
         chosen = self.ok("findings", AUDIT, "--repo", "acme/other")
         self.assertEqual(chosen["repo"], "acme/other")
         self.assertEqual([row["id"] for row in chosen["findings"]], ["z"])
+
+    def test_a_corrupt_sibling_names_itself_on_the_healthy_row(self):
+        # Liveness is the stream's, so the healthy row reads `error` too, and
+        # must say why rather than carry a null error beside counts.
+        (Path(self.root) / AUDIT / "acme/other" / "latest.json").write_text("{", encoding="utf-8")
+        code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        rows = {row["repo"]: row for row in payload["streams"]}
+        self.assertEqual(rows[REPO]["liveness"], "error")
+        self.assertIn("acme/other", rows[REPO]["error"])
 
     def test_diff_reads_one_repositorys_ring(self):
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("b")])

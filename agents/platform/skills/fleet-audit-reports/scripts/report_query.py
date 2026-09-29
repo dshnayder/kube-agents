@@ -224,6 +224,11 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
                 envelope = {**envelope, "latest_missing": True} if envelope else None
         else:
             envelope = report_status.load_run(root, audit_id, repo, name)
+    except report_status.RingReadError as exc:
+        raise QueryError(
+            f"{audit_id}/latest.json in {repo} is gone and the ring behind it could not "
+            f"be read: {audit_id}/{exc.name}: {_oneline(exc)}"
+        ) from exc
     except (OSError, ValueError) as exc:
         raise QueryError(
             f"{audit_id}/{name} in {repo} could not be read: {_oneline(exc)}"
@@ -374,8 +379,11 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "runs": len(entry.get("runs") or []),
         "running_since": started.get("started_at"),
         "age_s": started.get("age_s"),
+        # Liveness is the stream's, so a row it calls `error` names why even
+        # when the failure was a sibling repository's.
         "error": entry.get("error")
-        or (stream.get("error") if repo is None else stream.get("stream_error")),
+        or (stream.get("error") if repo is None else stream.get("stream_error"))
+        or (stream.get("error") if stream.get("liveness") == "error" else None),
     }
 
 
