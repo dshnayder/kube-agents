@@ -1358,27 +1358,32 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{ref}; add `pull_requests: read` if that is 403 — this check could "
                 "not be evaluated"
             )
-        spent = None
+        # Every one this run opened and closed, not only the newest: a worker
+        # that opens and closes a second proposal on the name and then rebuilds
+        # on the first's revision carries the first's change, not the second's.
+        spent = []
         for earlier in listed:
             if not isinstance(earlier, dict) or earlier.get("number") == number:
                 continue
             created = _parse_github_time(earlier.get("created_at"))
             if created and (started - created).total_seconds() <= self.max_clock_skew_sec:
-                spent = earlier
-                break
-        if spent is not None:
+                spent.append(earlier)
+        if spent:
             # The name alone is not the reuse. A worker that clones the spent
             # branch and publishes on top of it also lands on the same name,
             # and its proposal carries the closed one's revisions -- the
             # rejected change, back under review. A branch cut fresh from the
             # base carries none of them.
-            carried = str((spent.get("head") or {}).get("sha") or "")
-            if not carried:
-                return None, (
-                    f"GitHub returned no head revision for #{spent.get('number')}, so "
-                    f"whether {slug} builds on it could not be read; this check "
-                    "could not be evaluated"
-                )
+            carried = {}
+            for closed in spent:
+                sha = str((closed.get("head") or {}).get("sha") or "")
+                if not sha:
+                    return None, (
+                        f"GitHub returned no head revision for #{closed.get('number')}, so "
+                        f"whether {slug} builds on it could not be read; this check "
+                        "could not be evaluated"
+                    )
+                carried[sha] = closed.get("number")
             # Oldest first, so on a long branch the closed revision sits on an
             # early page and a fresh cut's own commits fill the later ones; read
             # every page, up to the 250 commits this endpoint ever lists. The
@@ -1411,10 +1416,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "add `pull_requests: read` if that is 403 — this check could "
                         "not be evaluated"
                     )
-                if any(isinstance(c, dict) and c.get("sha") == carried for c in commits):
+                found = next(
+                    (c["sha"] for c in commits if isinstance(c, dict) and c.get("sha") in carried),
+                    None,
+                )
+                if found:
                     return (
-                        f"{slug}: it builds on {carried[:12]}, the last revision of the "
-                        f"closed pull request #{spent.get('number')}, so the spent branch "
+                        f"{slug}: it builds on {found[:12]}, the last revision of the "
+                        f"closed pull request #{carried[found]}, so the spent branch "
                         "was added to rather than cleared and the closed change is back "
                         "under review",
                         None,

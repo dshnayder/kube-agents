@@ -374,9 +374,13 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
 
 
 # Delete refusals that say nothing about the name: the call did not finish
-# (FORGE_CALL_FAILED, GIT_FAILED), or the branch moved since it was read
-# (BRANCH_MOVED). `prepare` run again reads the branch afresh.
-RETRY_THE_DELETE = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED"})
+# (FORGE_CALL_FAILED, GIT_FAILED), the branch moved since it was read
+# (BRANCH_MOVED), or a proposal was opened on it since `prepare` looked
+# (OPEN_PROPOSAL). `prepare` run again reads the branch afresh, and on an
+# open proposal it takes a copy of that branch and adds to it.
+RETRY_THE_DELETE = frozenset(
+    {"FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED", "OPEN_PROPOSAL"}
+)
 # The forge throttled or failed one of the delete's own reads. Transient, so
 # not a verdict on the name either, but retrying at once meets the same limit.
 WAIT_THEN_RETRY_THE_DELETE = frozenset({"FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"})

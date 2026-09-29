@@ -2323,6 +2323,24 @@ def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
     assert "added to rather than cleared" in res.reason
 
 
+def test_an_earlier_closed_proposal_riding_along_is_a_fail(token, github):
+    """Two proposals opened and closed on the name this run, newest first as
+    GitHub lists them. The new one leaves the second's revision out but builds
+    on the first's, which is the closed change back under review all the same."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    second = {"number": 6, "created_at": "2026-08-21T09:00:20Z", "state": "closed",
+              "head": {"sha": "d" * 40}}
+    first = {"number": 5, "created_at": "2026-08-21T09:00:10Z", "state": "closed",
+             "head": {"sha": "c" * 40}}
+    github.routes[_closed_from()] = (200, [second, first])
+    github.routes[_commits_of()] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "closed pull request #5" in res.reason
+
+
 def test_a_closed_revision_past_the_first_page_of_commits_is_a_fail(token, github):
     """A clone of the spent branch with a hundred commits added: the listing is
     oldest first, so the closed revision is on page 1 only when the branch is
@@ -2415,6 +2433,9 @@ def _route_patterns() -> list[str]:
         "/usr/bin/env gh pr close 5",
         "/usr/bin/timeout 60 gh pr close 5",
         "/usr/bin/env -i /usr/bin/git push origin :platform-agent/fix",
+        "setsid gh pr close 5",
+        "ionice -c3 gh pr close 5",
+        "stdbuf -oL /usr/bin/git push origin :platform-agent/fix",
         # A quoted value with a space in it, before the command or the subcommand.
         'git -c user.name="Platform Agent" push origin :platform-agent/fix',
         "git -c 'user.name=Platform Agent' push origin :platform-agent/fix",
@@ -2437,6 +2458,9 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         "git status && git log --oneline -3",
         "python3 credential_proxy_client.py kubectl get pods -n web",
         "credential-proxy-exec kubectl get pods -n web",
+        # Markdown in prose: a backtick is not a command position.
+        'python3 $S submit --branch platform-agent/fix --body "Closed the first with \\`gh pr close\\`, then reopened"',
+        "python3 $S submit --branch platform-agent/fix --title 'Publishing was refused (`git push` non-fast-forward)'",
         # The sanctioned local git, which has no route to a forge.
         "/opt/vcs/libexec/git -C /workspace/infra push origin platform-agent/fix",
         "cd /workspace/infra && /opt/vcs/libexec/git fetch origin",
@@ -2479,7 +2503,8 @@ def test_the_spent_branch_route_check_is_linear_on_a_long_wrapper_run():
     # each `env` as a value or a wrapper, and doubled in time every two.
     command = (
         "env -i " * 40 + "nice -n 1 " * 20 + "command -p " * 20
-        + "/usr/bin/env -i /usr/bin/env " * 20 + "true"
+        + "/usr/bin/env -i /usr/bin/env " * 20 + "setsid ionice -c3 stdbuf -oL " * 20
+        + "true"
     )
     began = time.monotonic()
     assert not any(re.search(p, command) for p in _route_patterns())

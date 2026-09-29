@@ -572,6 +572,24 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 self.assertIn(code, said)
                 self.assertNotIn("has not used", said)
 
+    def test_a_proposal_opened_before_the_delete_says_run_prepare_again(self):
+        # `prepare` read no open proposal, then one was opened on the name
+        # before the broker's own check. A second `prepare` joins it.
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        self.existing_proposal(branch)["state"] = "closed"
+        self.broker.delete_fails_with = vcs_client.VcsError(
+            "an open proposal", code="OPEN_PROPOSAL"
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        said = str(caught.exception)
+        self.assertIn("run prepare again", said)
+        self.assertNotIn("has not used", said)
+
     def test_a_branch_gone_before_the_delete_is_not_logged_as_deleted(self):
         # A sibling `prepare` on the same name deleted it between this run's
         # view and its delete; the broker answers `deleted: false`.

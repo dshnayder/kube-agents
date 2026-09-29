@@ -111,7 +111,8 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
    it has carried a full page of pull requests, too many to read. Treat those
    revisions as somebody's. Report the refusal, its code and the branch,
-   and stop. `BRANCH_MOVED` (something pushed to it just now), and
+   and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
+   request was opened on it just now; the next run adds to it), and
    `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
    not complete) all mean run `prepare` once more before reporting.
    `FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
