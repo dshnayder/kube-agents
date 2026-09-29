@@ -288,6 +288,14 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	return ref, nil
 }
 
+// ParseRepoRef reads a repository as Resolve does before it applies any of
+// this provider's rules: a schemeless first segment spelling one of its hosts
+// is lifted out, so `github.com//o/r` reads as host github.com and path
+// `o/r`, as it does to the agent. The package-level ParseRepoRef lifts none.
+func (p *GitProvider) ParseRepoRef(value string) (RepoRef, error) {
+	return parseRepoRef(value, p.schemelessHosts())
+}
+
 // schemelessHosts is DefaultHost plus every alternative spelling in Hosts.
 func (p *GitProvider) schemelessHosts() map[string]bool {
 	hosts := map[string]bool{p.DefaultHost: true}

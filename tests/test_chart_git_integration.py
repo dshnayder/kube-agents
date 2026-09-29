@@ -295,6 +295,15 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "git@github.com://gke-labs/infra",
             "github.com://gke-labs/infra",
             "git@github.com:///gke-labs/infra",
+            # A host and a separator name no repository; the operator refuses
+            # them as that. Without the separator, `github.com` is a name.
+            "github.com/",
+            "/github.com/",
+            "www.github.com/",
+            "ssh.github.com/",
+            "github.com//",
+            "GitHub.com/",
+            "github.com.git/",
         ):
             with self.subTest(repo=repo[:80]):
                 integration = _integration(
@@ -341,6 +350,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "git@github.com:/gke-labs/infra",
             "github.com//gke-labs/infra",
             "git@github.com//gke-labs/infra",
+            "github.com",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

@@ -1300,12 +1300,12 @@ func mergeRepoEntries(existing string, front, back []agentv1alpha1.ManagedRepoEn
 //
 // A string comparison is not enough across an upgrade. An entry written by
 // hand, or by an older operator, can spell the repository the operator now
-// seeds canonically as "https://github.com/o/r" with a ".git" suffix, as a
-// remote, or in another case; GitHub treats owner and name case-insensitively,
-// as the declaration-side check in ResolvedIntegration does. Comparing the
-// strings would append a second entry for the same repository: the agent
-// would sweep it twice, and the old spelling would stay, since removal is
-// administrator-driven by design.
+// seeds canonically as "https://github.com/o/r" with a ".git" suffix or as a
+// remote. Comparing the strings would append a second entry for the same
+// repository: the agent would sweep it twice, and the old spelling would
+// stay, since removal is administrator-driven by design. An entry in another
+// case is another spelling to the agent, which compares managed slugs exactly,
+// so it is seeded beside it, as a string comparison always did.
 //
 // Only an entry the agent reads counts as present, since treating one it
 // skips as the seeded repository would leave the agent with none. The agent
@@ -1337,20 +1337,13 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if err != nil {
 		return false
 	}
-	parsed, err := agentv1alpha1.ParseRepoRef(existing.URL)
+	// The provider lifts every spelling of its host out of a schemeless path;
+	// the agent lifts only the canonical one, so any other host is skipped.
+	parsed, err := provider.ParseRepoRef(existing.URL)
 	if err != nil {
 		return false
 	}
-	host := parsed.Host
-	if host == "" {
-		// ParseRepoRef lifts no schemeless host, and the provider lifts all of
-		// its spellings; the agent lifts only the canonical one.
-		first, _, _ := strings.Cut(parsed.Path, "/")
-		if first = strings.ToLower(first); provider.Hosts[first] {
-			host = first
-		}
-	}
-	if host != "" && host != provider.DefaultHost {
+	if parsed.Host != "" && parsed.Host != provider.DefaultHost {
 		return false
 	}
 	existingRef, err := provider.Resolve("", existing.URL, "")
@@ -1361,7 +1354,11 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if err != nil {
 		return false
 	}
-	return existingRef.Host == seededRef.Host && strings.EqualFold(existingRef.Path, seededRef.Path)
+	// The path compares exactly. GitHub folds case, but the agent's readers of
+	// managed_repos do not: the `--repo` allowlists and the token scope match
+	// the spelling, so an entry in another case is not the declared one to
+	// them, and counting it present would refuse `--repo` spelt as declared.
+	return existingRef.Host == seededRef.Host && existingRef.Path == seededRef.Path
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {

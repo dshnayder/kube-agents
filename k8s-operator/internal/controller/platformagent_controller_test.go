@@ -6254,12 +6254,15 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 	same := []string{
 		"https://github.com/gke-labs/kube-agents",
 		"https://github.com/gke-labs/kube-agents.git",
-		"https://github.com/GKE-Labs/Kube-Agents",
 		"git@github.com:gke-labs/kube-agents.git",
 		"ssh://git@github.com/gke-labs/kube-agents",
 		"http://github.com/gke-labs/kube-agents",
 		"gke-labs/kube-agents",
 		"github.com/gke-labs/kube-agents",
+		// The agent trims the separator run after a lifted host, so this is
+		// the seeded repository to it too.
+		"github.com//gke-labs/kube-agents",
+		"HTTPS://GitHub.com/gke-labs/kube-agents",
 	}
 	for _, url := range same {
 		t.Run(url, func(t *testing.T) {
@@ -6273,6 +6276,10 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 	different := []agentv1alpha1.ManagedRepoEntry{
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/gke-labs/other"},
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/other/kube-agents"},
+		// GitHub folds case, but the agent's `--repo` allowlists compare the
+		// spelling, so this entry does not stand in for the declared one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/GKE-Labs/Kube-Agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "GKE-Labs/kube-agents"},
 		// A different forge is a different repository however the paths line up,
 		// and an unresolvable spelling must not collapse into the seeded entry.
 		{Type: "gitlab", URL: "https://gitlab.com/gke-labs/kube-agents"},

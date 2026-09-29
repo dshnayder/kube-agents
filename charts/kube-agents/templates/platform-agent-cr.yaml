@@ -270,7 +270,8 @@ spec:
   operator trims, is allowed, except that an scp remote's colon takes at most
   one (`github.com://` reads to the operator as a scheme separator). Anything else -- another host, a deeper path,
   an owner GitHub would not accept, a name that is `.`, `..` or `.git` once
-  its `.git` suffix is dropped, or starts with `-`, a value over the CRD's
+  its `.git` suffix is dropped, or starts with `-`, a GitHub host with a
+  `/` and nothing else (`github.com/`; a bare `github.com` is a name), a value over the CRD's
   2048 characters -- would be refused by the
   operator against `github.gitRepo`, a key the values file never set, and a forge with neither a namespace nor a repository
   would fold into no key at all. Those render as the lists, so the refusal
@@ -292,7 +293,7 @@ spec:
   {{- $repo = (first .).repository | default "" }}
   {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
   {{- $github := `(?i:(https?|ssh|git)://([^/#?]*@)?((www|ssh)\.)?github\.com/+|([^/:#?]*@)?((www|ssh)\.)?github\.com(:/?|/+))` }}
-  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) }}
+  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) (not (and (contains "/" $repo) (has (lower (trimSuffix ".git" (trimAll "/" $repo))) (list "github.com" "www.github.com" "ssh.github.com")))) }}
   {{- end }}
   {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
   {{- end }}
