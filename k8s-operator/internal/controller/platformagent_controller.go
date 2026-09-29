@@ -247,6 +247,7 @@ const (
 	conditionReasonMinterPruningHeld = "MinterPruningHeld"
 	// minterHeldEntriesShown caps how many held entries the condition names.
 	minterHeldEntriesShown     = 3
+	minterHeldEntryBudget      = hostPathDroppedEntryBudget / minterHeldEntriesShown
 	gitopsStateConfigMapSuffix = "-gitops-state"
 	managedReposConfigMapKey   = "managed_repos"
 
@@ -1309,6 +1310,11 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if existing.URL == seeded.URL {
 		return true
 	}
+	// repo_ref.py reads a host after a remote's first `@` where git and this
+	// parser read it after the last, so the agent skips an entry with two.
+	if strings.Count(existing.URL, "@") > 1 {
+		return false
+	}
 	provider, err := agentv1alpha1.LookupGitProvider(seeded.Type)
 	if err != nil {
 		return false
@@ -1548,9 +1554,20 @@ func (r *PlatformAgentReconciler) minterHeldEntries(ctx context.Context, agent *
 	return slices.Concat(managed, contextHeld)
 }
 
-// minterHeldMessage names at most minterHeldEntriesShown held entries.
+// minterHeldMessage names at most minterHeldEntriesShown held entries, each
+// cut to its share of hostPathDroppedEntryBudget. An entry is a URL an
+// administrator wrote into the ConfigMap, of any length -- one over 2048
+// characters is exactly what lands here -- and the status write that carries
+// the message is the whole status write.
 func minterHeldMessage(cmName string, held []string) string {
-	shown := strings.Join(held[:min(len(held), minterHeldEntriesShown)], ", ")
+	entries := make([]string, 0, minterHeldEntriesShown)
+	for _, entry := range held[:min(len(held), minterHeldEntriesShown)] {
+		if len(entry) > minterHeldEntryBudget {
+			entry = truncateToValidUTF8(entry, minterHeldEntryBudget-len(hostPathDroppedEntryEllipsis)) + hostPathDroppedEntryEllipsis
+		}
+		entries = append(entries, entry)
+	}
+	shown := strings.Join(entries, hostPathDroppedEntrySeparator)
 	if extra := len(held) - minterHeldEntriesShown; extra > 0 {
 		shown += fmt.Sprintf(" and %d more", extra)
 	}

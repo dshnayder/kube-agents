@@ -290,6 +290,11 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs//infra",
             "https://evil.example#@github.com/gke-labs/infra",
             "https://evil.example?x=@github.com/gke-labs/infra",
+            # `://` after the host is a scheme separator to the operator, and
+            # `git@github.com` is no scheme.
+            "git@github.com://gke-labs/infra",
+            "github.com://gke-labs/infra",
+            "git@github.com:///gke-labs/infra",
         ):
             with self.subTest(repo=repo[:80]):
                 integration = _integration(
@@ -334,6 +339,8 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "//gke-labs/infra",
             "gke-labs/infra//",
             "git@github.com:/gke-labs/infra",
+            "github.com//gke-labs/infra",
+            "git@github.com//gke-labs/infra",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

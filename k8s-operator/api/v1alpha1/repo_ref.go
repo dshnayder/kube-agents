@@ -36,6 +36,14 @@ package v1alpha1
 // spelling into the state ConfigMap, and does not count one written there by
 // hand as the repository it seeds.
 //
+// They also read an scp remote's userinfo differently, as no install writes
+// it. Here, as git does, the host starts after the authority's last `@`, and
+// the authority ends at the first colon; `repo_ref.py` takes a user without an
+// `@` and lets it run past a colon. So `a@b@github.com:o/r` is GitHub here and
+// host `b@github.com` there, which the operator therefore does not count as
+// the repository it seeds; and `user:token@github.com:o/r` is refused here and
+// GitHub there, which leaves the agent reading the seeded entry beside it.
+//
 // A `RepoRef` carries a host, possibly empty, and an opaque path of any depth.
 // Depth is not checked here. "Exactly two segments" is a property of GitHub, so
 // it belongs to a `GitProvider` (see gitprovider.go), which is what lets a
@@ -174,7 +182,11 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 		// not scp syntax, since there is no colon — and the CRD has admitted
 		// it since before provider dispatch. The user is dropped as it is for
 		// a URL.
-		if first, rest, found := strings.Cut(path, pathSeparator); found && rest != "" {
+		// The rest is trimmed again because the path was trimmed as a whole:
+		// `github.com//o/r` would otherwise keep an empty first segment that
+		// `https://github.com//o/r` does not. repo_ref.py trims it too.
+		first, rest, found := strings.Cut(path, pathSeparator)
+		if rest = strings.Trim(rest, pathSeparator); found && rest != "" {
 			if at := strings.LastIndex(first, userInfoSeparator); at != -1 && !strings.ContainsAny(first, authorityTerminators) {
 				first = first[at+1:]
 			}

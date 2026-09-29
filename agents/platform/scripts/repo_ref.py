@@ -226,6 +226,9 @@ def parse(value: object) -> RepoRef:
     inferred = False
     if not host and PATH_SEPARATOR in path:
         first, _, rest = path.partition(PATH_SEPARATOR)
+        # Trimmed again, so `github.com//o/r` reads as `https://github.com//o/r`
+        # does rather than keeping an empty first segment. repo_ref.go agrees.
+        rest = rest.strip(PATH_SEPARATOR)
         if first.lower() in KNOWN_HOSTS and rest:
             host, path, inferred = first, rest, True
 

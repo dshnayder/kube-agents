@@ -235,6 +235,11 @@ func TestResolveLiftsEveryHostSpellingFromASchemelessPath(t *testing.T) {
 		"WWW.GitHub.com/gke-labs/kube-agents",
 		"ssh.github.com/gke-labs/kube-agents",
 		"git@github.com/gke-labs/kube-agents.git",
+		// A run of separators after the host is trimmed, as it is after a
+		// URL's host.
+		"github.com//gke-labs/kube-agents",
+		"git@github.com//gke-labs/kube-agents",
+		"www.github.com//gke-labs/kube-agents/",
 	} {
 		ref, err := provider.Resolve("", input, "")
 		if err != nil {
@@ -654,6 +659,31 @@ func TestPrimaryNamespace(t *testing.T) {
 				repo("github", "app", RepositoryRoleManaged),
 			}},
 			want: "gke-labs"},
+		// A second declaration of an accepted repository names the same
+		// organisation, so its refusal cannot move it.
+		{name: "a refused duplicate of an accepted repository does not count", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+				repo("github", "acme/infra", RepositoryRoleManaged),
+			}},
+			want: "acme"},
+		{name: "a full URL refused for an unused namespace override does not count", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+				{Forge: "github", Repository: "https://github.com/acme/infra", Namespace: "bad_ns", Role: RepositoryRoleManaged},
+			}},
+			want: "acme"},
+		// Read without its override, a bare name is not the accepted
+		// repository: the override was the organisation it meant.
+		{name: "a bare name refused for its namespace override still counts", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+				{Forge: "github", Repository: "infra", Namespace: "bad_ns", Role: RepositoryRoleManaged},
+			}},
+			want: ""},
 		{name: "a refused context repository does not count", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{{Name: "github"}},
 			Repositories: []RepositorySpec{

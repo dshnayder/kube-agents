@@ -267,7 +267,8 @@ spec:
   case, as the operator's do; a URL's userinfo, a token included, ends at its
   last `@` unless a `#` or `?` comes first (which ends the authority, so the
   host is not github.com); and a run of `/` around the path, which the
-  operator trims, is allowed. Anything else -- another host, a deeper path,
+  operator trims, is allowed, except that an scp remote's colon takes at most
+  one (`github.com://` reads to the operator as a scheme separator). Anything else -- another host, a deeper path,
   an owner GitHub would not accept, a name that is `.`, `..` or `.git` once
   its `.git` suffix is dropped, or starts with `-`, a value over the CRD's
   2048 characters -- would be refused by the
@@ -290,7 +291,7 @@ spec:
   {{- with $repos }}
   {{- $repo = (first .).repository | default "" }}
   {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
-  {{- $github := `(?i:(https?|ssh|git)://([^/#?]*@)?((www|ssh)\.)?github\.com/+|([^/:#?]*@)?((www|ssh)\.)?github\.com(:/*|/+))` }}
+  {{- $github := `(?i:(https?|ssh|git)://([^/#?]*@)?((www|ssh)\.)?github\.com/+|([^/:#?]*@)?((www|ssh)\.)?github\.com(:/?|/+))` }}
   {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) }}
   {{- end }}
   {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}

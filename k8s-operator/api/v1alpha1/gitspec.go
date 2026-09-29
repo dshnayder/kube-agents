@@ -367,12 +367,39 @@ func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
 		return false
 	}
 	_, rejected := ri.check()
+	accepted := map[string]bool{}
+	for _, r := range ri.Repositories {
+		if !rejected[r] {
+			if ref, err := r.Resolve(); err == nil {
+				accepted[strings.ToLower(ref.URL())] = true
+			}
+		}
+	}
 	// A repository naming no declared forge has no provider to exclude it by,
 	// so it counts against every provider: it may be this one's GitOps
 	// repository under a mistyped forge name.
 	return slices.ContainsFunc(ri.Repositories, func(r *ResolvedRepository) bool {
-		return rejected[r] && r.Role != RepositoryRoleContext && (r.Forge == nil || r.Forge.Provider == provider)
+		return rejected[r] && r.Role != RepositoryRoleContext && (r.Forge == nil || r.Forge.Provider == provider) &&
+			!r.restatesAccepted(accepted)
 	})
+}
+
+// restatesAccepted reports that a refused repository names, by itself, one
+// that validation accepted: a second declaration of it, or a full URL of it
+// beside a namespace override the grammar refused and the URL never used. Its
+// refusal cannot move the organisation, which the accepted one already names.
+// It is read without the namespace, so a bare name the override would have
+// qualified still counts: the override was the organisation it meant.
+func (r *ResolvedRepository) restatesAccepted(accepted map[string]bool) bool {
+	if r.Forge == nil || !r.Forge.valid() {
+		return false
+	}
+	provider, err := r.Forge.GitProvider()
+	if err != nil {
+		return false
+	}
+	ref, err := provider.Resolve(r.Forge.Host, r.Repository, "")
+	return err == nil && accepted[strings.ToLower(ref.URL())]
 }
 
 // minNamespacedPathDepth is the shortest path from which a namespace can be

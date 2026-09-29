@@ -5759,6 +5759,23 @@ func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy
 	}
 }
 
+// An entry over 2048 characters is exactly what cannot be read, and a
+// ConfigMap value holds far more than a condition message may: a message over
+// the CRD's 32768 fails the whole status write, every pass.
+func TestMinterHeldMessageStaysUnderTheConditionCap(t *testing.T) {
+	long := "https://github.com/test-org/" + strings.Repeat("c", 40000)
+	msg := minterHeldMessage("held-gitops-state", []string{long, long, long, long})
+	if len(msg) > 32768 {
+		t.Fatalf("len(message) = %d, over the CRD's 32768", len(msg))
+	}
+	if !strings.Contains(msg, "https://github.com/test-org/ccc") || !strings.Contains(msg, "and 1 more") {
+		t.Errorf("message = %.200q..., expected each entry's start and the count of the rest", msg)
+	}
+	if short := minterHeldMessage("held-gitops-state", []string{"ssh://git@github.com:o/r"}); !strings.Contains(short, "(ssh://git@github.com:o/r)") {
+		t.Errorf("message = %q, expected a short entry verbatim", short)
+	}
+}
+
 func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 	// The hold keeps repo-x's policy, which is right, but a revocation that
 	// silently does not happen has to be on the status: Degraded names the
@@ -6228,6 +6245,9 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// The agent matches the type exactly, so this entry is one it skips even
 		// though the URL is the seeded one byte for byte.
 		{Type: "GitHub", URL: "https://github.com/gke-labs/kube-agents"},
+		// git and this parser read the host after the last `@`, the agent after
+		// the first, so it reads this one as host `b@github.com` and skips it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "a@b@github.com:gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {
