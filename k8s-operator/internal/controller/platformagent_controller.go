@@ -1531,38 +1531,44 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 	return bare, unreadable, nil
 }
 
-// agentURLSpelling rewrites a URL the way the agent's urlsplit reads it, when
-// that differs from this release's parser: a query or fragment dropped, and a
-// port slot that is not a port dropped, since urlsplit's hostname ends at the
-// first colon and never validates what follows. The parser refuses all of
-// these, but the agent uses such an entry, so the minter must count it rather
-// than hold every policy for an entry that is not broken. Only those parts
-// change; the rewritten value is still the parser's to read or refuse, so
-// `https://github.com:owner/repo`, one segment once the slot is gone, stays
-// unreadable, as it is to the agent.
+// agentURLSchemeRegex is the scheme urlsplit recognises before `://`.
+var agentURLSchemeRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+
+// agentURLSpelling reads a URL as the agent does, and returns it as the
+// `https://host/path` that names the same repository, for the parser to read
+// or refuse. The agent takes any URL through urlsplit, whose scheme is not
+// allowlisted (`git+ssh://`, `file://github.com/...`), whose hostname is the
+// text after the last `@` and before the first colon, never validating a port,
+// and whose path ends at a query or fragment. This parser refuses all of
+// those, but the agent uses such an entry, so the minter must count it rather
+// than hold every policy for an entry that is not broken. What the agent
+// refuses stays refused: a value over its length bound, an empty host, and a
+// path that is one segment once the port slot is gone
+// (`https://github.com:owner/repo`).
 func agentURLSpelling(value string) (string, bool) {
-	scheme, rest, ok := strings.Cut(strings.TrimSpace(value), "://")
-	if !ok {
+	text := strings.TrimSpace(value)
+	if len(text) > agentRepoRefMaxLength {
 		return "", false
 	}
-	changed := false
+	scheme, rest, ok := strings.Cut(text, "://")
+	if !ok || !agentURLSchemeRegex.MatchString(scheme) {
+		return "", false
+	}
 	if cut := strings.IndexAny(rest, "?#"); cut != -1 {
-		rest, changed = rest[:cut], true
+		rest = rest[:cut]
 	}
 	authority, path, _ := strings.Cut(rest, "/")
-	userInfo := ""
 	if at := strings.LastIndex(authority, "@"); at != -1 {
-		userInfo, authority = authority[:at+1], authority[at+1:]
+		authority = authority[at+1:]
 	}
-	if host, port, found := strings.Cut(authority, ":"); found && !strings.HasPrefix(authority, "[") {
-		if _, err := strconv.ParseUint(port, 10, 16); err != nil || strings.Trim(port, "0123456789") != "" {
-			authority, changed = host, true
-		}
-	}
-	if !changed {
+	if strings.HasPrefix(authority, "[") {
 		return "", false
 	}
-	return scheme + "://" + userInfo + authority + "/" + path, true
+	host, _, _ := strings.Cut(authority, ":")
+	if host == "" {
+		return "", false
+	}
+	return "https://" + host + "/" + path, true
 }
 
 // minterPrimaryOrg is the organisation the minter policies are scoped to, or,
@@ -1631,7 +1637,7 @@ func minterHeldMessage(cmName string, held []string) string {
 }
 
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
-// to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
+// to the primary GitHub organization (minterPrimaryOrg, from the declaration), a corresponding <repo>.yaml
 // entry exists in github-token-minter-config ConfigMap, and that every same-organization
 // repository in context_repos has a <repo>.yaml carrying the read-only scope alone.
 // Repositories belonging to a different organization are skipped because the minter instance is
@@ -1649,8 +1655,9 @@ func minterHeldMessage(cmName string, held []string) string {
 // adopting pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active
 // repositories is unsupported: custom edits will be overwritten with policy rendered from
 // default.yaml on reconcile, and the key will be pruned when the repository is unregistered from
-// both lists. Keys for repositories present in neither list (and default.yaml itself) are never
-// claimed or pruned.
+// both lists — unless a GitHub entry in either list cannot be read, which holds all pruning
+// (Degraded/MinterPruningHeld) until it is fixed. Keys for repositories present in neither list
+// (and default.yaml itself) are never claimed or pruned.
 func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}

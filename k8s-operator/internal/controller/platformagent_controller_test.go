@@ -5866,8 +5866,8 @@ func TestMinterHeldMessageNamesEntriesByPosition(t *testing.T) {
 	}
 }
 
-// The agent reads a URL through urlsplit, which drops a query and a fragment
-// and does not range-check a port, so it uses these entries. The minter counts
+// The agent reads a URL through urlsplit, which drops a query and a fragment,
+// does not check a port and allowlists no scheme, so it uses these entries. The minter counts
 // them too, rather than holding every policy for an entry that works.
 func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	repos := `[{"type":"github","url":"https://github.com/test-org/repo-q?ref=main"},` +
@@ -5876,20 +5876,26 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 		// urlsplit's hostname ends at the first colon, whatever follows it.
 		`{"type":"github","url":"https://github.com:abc/test-org/repo-a"},` +
 		`{"type":"github","url":"https://github.com:owner/test-org/repo-o"},` +
+		// urlsplit allowlists no scheme.
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/repo-g"},` +
+		`{"type":"github","url":"file://github.com/test-org/repo-l"},` +
 		// One segment once the slot is gone, which the agent skips too.
 		`{"type":"github","url":"https://github.com:test-org/one"},` +
 		// Dropping the query leaves no repository, as it does for the agent.
 		`{"type":"github","url":"https://github.com?x=/test-org/gone"},` +
 		// A `#` ends the authority, so the host is evil.example either way.
-		`{"type":"github","url":"https://evil.example#@github.com/test-org/evil"}]`
+		`{"type":"github","url":"https://evil.example#@github.com/test-org/evil"},` +
+		// No host, and over the agent's length bound: the agent skips both.
+		`{"type":"github","url":"file:///github.com/test-org/nohost"},` +
+		`{"type":"github","url":"https://github.com/test-org/long?` + strings.Repeat("x", agentRepoRefMaxLength) + `"}]`
 	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
-	if want := []string{"repo-a", "repo-f", "repo-o", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
+	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-o", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
-	if want := []string{"managed_repos[5]", "managed_repos[6]", "managed_repos[7]"}; !slices.Equal(unreadable, want) {
+	if want := []string{"managed_repos[7]", "managed_repos[8]", "managed_repos[9]", "managed_repos[10]", "managed_repos[11]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
 	}
 }
