@@ -2666,6 +2666,17 @@ _LEDGER_WRITES = [
     "gh issue pin 3",
     "gh issue unlock 3",
     "cd /tmp && gh api repos/o/r/issues/3/comments --field body=hi",
+    # Behind a wrapper: the proxy's rule has no start anchor, and neither may this.
+    'timeout 120 gh issue comment 3 -b "done"',
+    "env GH_PAGER= gh pr close 8",
+    'bash -lc "gh issue close 3"',
+    "echo 8 | xargs gh pr close",
+    "timeout 60 gh api repos/o/r/issues/3/comments -f body=hi",
+    "env X=1 gh api -X PATCH repos/o/r/issues/3",
+    # The repository flag gh accepts between the command and its verb.
+    "gh issue -R acme/fleet close 3",
+    "gh pr --repo=acme/fleet comment 8 -b x",
+    "gh -R acme/fleet issue edit 3 --body x",
 ]
 # What the recorded greens ran, and `gh` reads a worker may make.
 _READS = [
@@ -2677,6 +2688,12 @@ _READS = [
     "gh api repos/o/r/pulls --paginate --jq '.[].number'",
     "gh issue view 3",
     "gh pr list",
+    "timeout 60 gh issue view 3 --comments",
+    "gh issue -R acme/fleet view 3",
+    "gh pr list --state closed",
+    'gh issue list --search "is:open close"',
+    "gh issue list --search close --repo acme/fleet",
+    'gh search issues "pr close" --repo acme/fleet',
 ]
 
 

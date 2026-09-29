@@ -76,12 +76,17 @@ verification_spec:
       # rule reads them: a named write method (`-X POST`, `-XPOST`, clustered
       # `-iX POST`, `--method=POST`), or a field or input, which makes gh
       # default to POST unless the method is named GET.
+      # No start anchor, as the proxy has none: `gh` may follow a wrapper
+      # (`timeout 120`, `env X=`, `bash -lc "`, `xargs`). Between `issue|pr`
+      # and the verb only the repository flag may sit, the one flag gh
+      # accepts there, so a read whose arguments mention a verb
+      # (`gh issue list --search close`) still reads.
       forbidden_patterns:
         - 'audit_report\.py\s+(start|finish|remediate)\b'
         - 'hermes\s+cron\s+run\b'
-        - '(^|&&|;|\|)\s*gh\s+(issue|pr)\s+(comment|close|edit|create|reopen|merge|lock|unlock|delete|review|ready|transfer|pin|unpin|develop|update-branch)\b'
-        - '(^|&&|;|\|)\s*gh\s+api\b[^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?(POST|PATCH|PUT|DELETE)\b'
-        - '(^|&&|;|\|)\s*gh\s+api\b(?![^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?GET\b)[^\n|;&]*\s(-[fF]|--field|--raw-field|--input)'
+        - '\bgh\s+((-R|--repo)(\s+|=)?[^\s|;&]+\s+)*(issue|pr)\s+((-R|--repo)(\s+|=)?[^\s|;&]+\s+)*(comment|close|edit|create|reopen|merge|lock|unlock|delete|review|ready|transfer|pin|unpin|develop|update-branch)\b'
+        - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b[^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?(POST|PATCH|PUT|DELETE)\b'
+        - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b(?![^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?GET\b)[^\n|;&]*\s(-[fF]|--field|--raw-field|--input)'
         - '\b(collect|fleet_[a-z_]+|patch_readiness)\.py\b'
   - name: the-envelope-was-not-read-whole
     role: safeguard
