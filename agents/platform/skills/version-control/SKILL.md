@@ -219,7 +219,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   view it again, and delete only if it is still spent.
   `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
   `GIT_FAILED` mean the delete did not complete, and it may have landed before
-  the failure: read the branch again, and retry once if it is still there. A forge without `proposal-list`
+  the failure: read the branch again, and retry once if it is still there.
+  `FORGE_RATE_LIMITED` and `FORGE_UNAVAILABLE` from the delete are the forge
+  turning it away for now: wait, then do the same. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
   `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**

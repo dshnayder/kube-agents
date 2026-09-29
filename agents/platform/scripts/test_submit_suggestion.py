@@ -550,6 +550,28 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 self.assertNotIn("has not used", said)
                 self.assertNotIn("Nothing was deleted", said)
 
+    def test_a_throttled_delete_says_wait_and_retry_not_rename(self):
+        # The delete lists proposals on the forge, and a listing can be
+        # throttled or 5xx'd; the transport keeps its own code for that, which
+        # says nothing about the name.
+        for code in ("FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"):
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-{code.lower()}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {len(code)}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.delete_fails_with = vcs_client.VcsError(
+                    "try later", code=code
+                )
+                with self.assertRaises(ValueError) as caught:
+                    self.prepare(branch)
+                said = str(caught.exception)
+                self.assertIn("wait a few minutes, then run prepare again", said)
+                self.assertIn(code, said)
+                self.assertNotIn("has not used", said)
+
     def test_a_branch_gone_before_the_delete_is_not_logged_as_deleted(self):
         # A sibling `prepare` on the same name deleted it between this run's
         # view and its delete; the broker answers `deleted: false`.

@@ -377,6 +377,9 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
 # (FORGE_CALL_FAILED, GIT_FAILED), or the branch moved since it was read
 # (BRANCH_MOVED). `prepare` run again reads the branch afresh.
 RETRY_THE_DELETE = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED"})
+# The forge throttled or failed one of the delete's own reads. Transient, so
+# not a verdict on the name either, but retrying at once meets the same limit.
+WAIT_THEN_RETRY_THE_DELETE = frozenset({"FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"})
 
 
 def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, base: str) -> None:
@@ -439,6 +442,13 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
                 f"{revision[:12]}, and deleting it did not complete "
                 f"({refused.code or 'error'}: {refused}). The name is still "
                 "usable: run prepare again, which reads the branch afresh."
+            ) from refused
+        if refused.code in WAIT_THEN_RETRY_THE_DELETE:
+            raise ValueError(
+                f"{spent_named}. The repository held the branch at "
+                f"{revision[:12]}, and the forge turned the delete away for now "
+                f"({refused.code}: {refused}). The name is still usable: wait a "
+                "few minutes, then run prepare again, which reads the branch afresh."
             ) from refused
         raise ValueError(
             f"{spent_named}. The repository still holds the branch at "

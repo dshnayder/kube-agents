@@ -2396,6 +2396,15 @@ def _route_patterns() -> list[str]:
         # The proxy client after a bare `--`, and run as a module.
         "python3 credential_proxy_client.py -- gh pr close 5",
         "cd /opt/defaults/scripts && python3 -m credential_proxy_client gh pr close 5",
+        # A quoted or escaped name runs the same binary; it only skips an alias.
+        '"gh" pr close 5',
+        "'gh' pr close 5",
+        "\\gh pr close 5",
+        '"/opt/credential-proxy/bin/gh" pr close 5',
+        '"/opt/credential-proxy/bin/git" push origin :platform-agent/fix',
+        "\\git push origin :platform-agent/fix",
+        "command gh pr close 5",
+        "command -p gh pr close 5",
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2424,6 +2433,10 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         # The sanctioned git with a doubled slash is still the sanctioned git.
         "//opt/vcs/libexec/git push origin platform-agent/fix",
         "/opt/vcs/libexec//git push origin platform-agent/fix",
+        '"/opt/vcs/libexec/git" push origin platform-agent/fix',
+        # Asking whether the binary exists runs nothing.
+        "command -v gh 2>/dev/null || echo missing",
+        "command -V gh && python3 /opt/vcs/vcs.py status",
     ],
 )
 def test_the_spent_branch_route_check_passes_the_verbs(command):
@@ -2447,7 +2460,7 @@ def test_the_spent_branch_route_check_is_linear_on_a_long_wrapper_run():
     # Wrappers with options, and nothing after them. An option's value may not
     # be a wrapper's name; before that rule `env -i env -i ...` could split
     # each `env` as a value or a wrapper, and doubled in time every two.
-    command = "env -i " * 40 + "nice -n 1 " * 20 + "true"
+    command = "env -i " * 40 + "nice -n 1 " * 20 + "command -p " * 20 + "true"
     began = time.monotonic()
     assert not any(re.search(p, command) for p in _route_patterns())
     assert time.monotonic() - began < 1.0
