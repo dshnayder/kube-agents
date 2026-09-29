@@ -13118,6 +13118,117 @@ class TestLoadManifest(BaseTestCase):
         )
 
 
+class TestClustersListedMarker(unittest.TestCase):
+    """`clusters_listed: 0` on a project entry: a fleet with no clusters is not
+    a run that lost them.
+
+    Without it, a cost or stockout run over cluster-free projects reported "no
+    cluster targets were audited" and stayed partial on every run, so it could
+    never close a ledger entry. The marker comes from the collector, is carried
+    verbatim onto `scope.clusters`, and lifts the cluster kind's gap only when
+    every project target carries it.
+    """
+
+    STREAMS = ("fleet-wide-cost-analysis", "stockout-prevention")
+    NETWORKING = "gcp-networking-fabric-audit"
+    KEY = audit_report.CLUSTERS_LISTED_KEY
+
+    def _project(self, audit_id, project, **extra):
+        entry = {
+            "name": f"project/{project}",
+            "location": "-",
+            "project": project,
+            "checks_run": list(audit_report.audit_target_checks(audit_id, f"project/{project}")),
+        }
+        entry.update(extra)
+        return entry
+
+    def _gaps(self, audit_id, clusters):
+        return audit_report.coverage_gaps(make_doc(findings=[], audit=audit_id, clusters=clusters))
+
+    def test_every_project_marked_empty_lifts_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [
+                    self._project(audit_id, "acme", **{self.KEY: 0}),
+                    self._project(audit_id, "beta", **{self.KEY: 0}),
+                ]
+                self.assertEqual(self._gaps(audit_id, clusters), [])
+
+    def test_one_unmarked_project_keeps_the_cluster_gap(self):
+        # beta's list failed or timed out: its clusters may exist unaudited.
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [self._project(audit_id, "acme", **{self.KEY: 0}), self._project(audit_id, "beta")]
+                gaps = self._gaps(audit_id, clusters)
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_no_marked_project_keeps_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                gaps = self._gaps(audit_id, [self._project(audit_id, "acme")])
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_the_marker_never_lifts_the_project_gap(self):
+        # A run of clusters alone still owes the project checks.
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme"}
+        gaps = audit_report._unenumerated_kind_gaps(self.STREAMS[0], [cluster])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no project targets were audited", gaps[0])
+
+    def test_a_stream_that_never_emits_it_is_unchanged(self):
+        """Networking is unpartitioned: the key changes nothing it reports."""
+        target = {"name": "project/acme", "location": "-", "project": "acme"}
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [dict(target, **{self.KEY: 0})]),
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [target]),
+        )
+
+    def test_validation_accepts_the_collectors_zero_on_a_project_entry(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.validate_findings(doc, audit_id)
+
+    def test_validation_rejects_anything_the_collector_would_not_write(self):
+        audit_id = self.STREAMS[0]
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme", self.KEY: 0}
+        cases = {
+            "a cluster entry": cluster,
+            "a non-zero count": self._project(audit_id, "acme", **{self.KEY: 3}),
+            "a bool": self._project(audit_id, "acme", **{self.KEY: False}),
+            "a string": self._project(audit_id, "acme", **{self.KEY: "0"}),
+        }
+        for label, entry in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(make_doc(findings=[], audit=audit_id, clusters=[entry]), audit_id)
+                self.assertIn(self.KEY, str(caught.exception))
+
+    def _manifest(self, audit_id, **extra):
+        entry = {
+            "name": "project/acme",
+            "outcome": "collected",
+            "commands": [{"check": c, "rc": 0} for c in audit_report.audit_target_checks(audit_id, "project/acme")],
+        }
+        entry.update(extra)
+        return {"clusters": [entry]}
+
+    def test_the_manifest_must_carry_the_marker_the_document_claims(self):
+        # A worker cannot hand-claim an empty fleet to turn a partial run clean.
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(doc, self._manifest(audit_id))
+        self.assertIn(self.KEY, str(caught.exception))
+
+    def test_a_marker_copied_from_the_manifest_passes(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.cross_check_manifest(doc, self._manifest(audit_id, **{self.KEY: 0}))
+
+
 class TestCrossCheckManifest(unittest.TestCase):
     """Manifest-scoped attestation: see `audit_report.cross_check_manifest`."""
 

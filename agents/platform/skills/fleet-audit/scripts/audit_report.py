@@ -908,6 +908,12 @@ TARGET_KIND_PROJECT = "project"
 TARGET_KIND_SUBNET = "subnet"
 PROJECT_TARGET_PREFIX = "project/"
 TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_SUBNET})
+# Set by the cost and stockout collectors on a `project/<id>` entry whose
+# `gcloud container clusters list` completed and came back empty -- never on a
+# failed or zone-incomplete one -- and carried verbatim onto that project's
+# `scope.clusters` entry. It is what tells a fleet with no clusters apart from
+# a run that lost them (`_unenumerated_kind_gaps`).
+CLUSTERS_LISTED_KEY = "clusters_listed"
 # The one manifest `outcome` under which the collector vouches for a cluster's
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —
 # except `out-of-scope`, the collector saying the target is not this audit's,
@@ -2280,6 +2286,16 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"scope.clusters[{i}].limitations",
                 allow_empty=False,
             )
+        if CLUSTERS_LISTED_KEY in cluster:
+            listed = cluster[CLUSTERS_LISTED_KEY]
+            if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
+                raise ValidationError(
+                    f"scope.clusters[{i}].{CLUSTERS_LISTED_KEY}: only a "
+                    f"`{PROJECT_TARGET_PREFIX}<id>` entry carries it, and only as "
+                    "the 0 the collector wrote for a project whose cluster list "
+                    f"completed empty; copy it from the manifest or leave it out. "
+                    f"{_sop_pointer(audit_id)}"
+                )
 
         # Which checks actually ran here, and the command each one ran. This is
         # the field that makes an empty `findings` list mean something: without
@@ -2963,14 +2979,27 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     An empty `scope.clusters` is left alone. That run has bigger problems and
     `validate_findings` already speaks to them; naming every kind here as well
     would bury the real error under a gap per kind.
+
+    So is the cluster kind when every project target carries
+    `CLUSTERS_LISTED_KEY`: each project's cluster list completed and came back
+    empty, so the cluster checks had nothing to run against rather than lost
+    what they should have read. One project without it -- or no project
+    target at all -- and the gap stands.
     """
     spec = AUDITS.get(audit_id)
     if not spec or not spec.scopes or not targets:
         return []
-    seen = {scoped_target_kind(spec, str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    kinds = [
+        (scoped_target_kind(spec, str(t.get("name", "")).strip()), t) for t in targets if isinstance(t, dict)
+    ]
+    seen = {kind for kind, _ in kinds}
+    projects = [t for kind, t in kinds if kind == TARGET_KIND_PROJECT]
+    listed_empty = bool(projects) and all(
+        t.get(CLUSTERS_LISTED_KEY) == 0 and not isinstance(t.get(CLUSTERS_LISTED_KEY), bool) for t in projects
+    )
     gaps = []
     for kind, checks in spec.scopes:
-        if kind in seen:
+        if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
             continue
         gaps.append(
             f"no {kind} targets were audited — {len(checks)} check(s) ran "
@@ -3240,6 +3269,16 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             continue
         name = str(cluster.get("name", ""))
         manifest_cluster = manifest_clusters.get(name)
+        # The marker takes the cluster kind out of the coverage count, so it
+        # has to be the collector's word, never the document's: a project
+        # the manifest does not mark empty cannot be claimed as one.
+        if CLUSTERS_LISTED_KEY in cluster and (manifest_cluster or {}).get(CLUSTERS_LISTED_KEY) != cluster[CLUSTERS_LISTED_KEY]:
+            raise ValidationError(
+                f"scope.clusters: {name!r} carries {CLUSTERS_LISTED_KEY}="
+                f"{cluster[CLUSTERS_LISTED_KEY]!r}, but the collector manifest for "
+                f"{audit_id} does not. Carry the marker only where the manifest "
+                "entry has it, verbatim."
+            )
         if not manifest_cluster:
             continue
         claimed = checks_ran(cluster)

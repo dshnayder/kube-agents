@@ -2198,6 +2198,46 @@ class ZoneTimeoutTest(unittest.TestCase):
         self.assertIn("did not respond", by_name["project/acme"]["error"])
 
 
+class ClustersListedMarkerTest(unittest.TestCase):
+    """`clusters_listed: 0` is what lets `finish` tell a fleet with no clusters
+    from a run that lost them, so only a completed, empty list may set it."""
+
+    def manifest(self, answer):
+        # beta completes empty in every run, so each one shows the marker set beside the entry under test.
+        run = fleet_run({}, cluster_list=lambda project: answer if project == "acme" else run_of(0, "[]"))
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                return fs.collect_fleet(None, run=run)
+
+    def project_entry(self, answer):
+        return next(c for c in self.manifest(answer)["clusters"] if c["name"] == "project/acme")
+
+    def test_a_completed_empty_list_marks_the_project(self):
+        entry = self.project_entry(run_of(0, "[]"))
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry[fs.CLUSTERS_LISTED_KEY], 0)
+
+    def test_the_gke_api_off_is_an_empty_list_and_marks_the_project(self):
+        entry = self.project_entry(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme"))
+        self.assertEqual(entry[fs.CLUSTERS_LISTED_KEY], 0)
+
+    def test_a_failed_list_does_not_mark_the_project(self):
+        manifest = self.manifest(run_of(1, "", "PERMISSION_DENIED: container.clusters.list"))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+
+    def test_an_empty_list_with_a_silent_zone_does_not_mark_the_project(self):
+        manifest = self.manifest(run_of(0, "[]", ZoneTimeoutTest.SILENT))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+
+    def test_a_project_holding_a_cluster_is_not_marked(self):
+        entry = self.project_entry(run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])))
+        self.assertNotIn(fs.CLUSTERS_LISTED_KEY, entry)
+
+    def test_a_project_whose_only_cluster_is_not_running_is_not_marked(self):
+        entry = self.project_entry(run_of(0, json.dumps([{"name": "c1", "location": "us-east1-b", "status": "DEGRADED"}])))
+        self.assertNotIn(fs.CLUSTERS_LISTED_KEY, entry)
+
+
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
     def test_the_renames_this_collector_makes_needed_an_id_scheme_bump(self):
         """Qualified cluster names and the region- and message-id-bearing

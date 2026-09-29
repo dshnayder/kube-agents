@@ -98,6 +98,11 @@ MAX_WORKERS = 8
 # `audit_report.py` reads both shapes, so keep them in step with it.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
+# On a `project/<id>` entry whose `clusters list` completed and came back
+# empty -- never a failed or zone-incomplete one. `audit_report.py` reads it
+# (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
+# lost them, so the cluster checks' kind gap does not pin the run partial.
+CLUSTERS_LISTED_KEY = "clusters_listed"
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 NO_PROJECT_IN_SCOPE_ERROR = (
     "no project in scope: there is no active gcloud project and `gcloud projects list` "
@@ -5321,6 +5326,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             project_entries.append(gate_failed_project(p, crashed_project_error(p, exc)))
             continue
         if entry:
+            if known_by_project.get(p) == set():
+                entry[CLUSTERS_LISTED_KEY] = 0
             project_entries.append(entry)
             read_projects += 1
 

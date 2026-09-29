@@ -162,6 +162,11 @@ STDERR_EXCERPT_CHARS = 200
 # lists one name twice. Project-scoped checks keep `project/<id>`.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
+# On a `project/<id>` entry whose `clusters list` completed and came back
+# empty -- never a failed or zone-incomplete one. `audit_report.py` reads it
+# (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
+# lost them, so the cluster checks' kind gap does not pin the run partial.
+CLUSTERS_LISTED_KEY = "clusters_listed"
 # §1's scope is every project the credential can see. These four are copied
 # from `fleet_waste.py`, whose discovery this mirrors: a failed or narrowed
 # project listing is one `project/UNENUMERATED_PROJECTS` target, so the loss
@@ -1962,6 +1967,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         elif isinstance(read, str):
             enumeration_failed[p] = read
         elif read[0]:
+            if not enumerated[p][0] and not enumerated[p][1]:
+                read[0][CLUSTERS_LISTED_KEY] = 0
             project_entries.append(read[0])
 
     failed_entries = [

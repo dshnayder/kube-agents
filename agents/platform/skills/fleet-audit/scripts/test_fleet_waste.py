@@ -4980,6 +4980,59 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertEqual(entry["outcome"], "gate-failed")
 
 
+class ClustersListedMarkerTest(unittest.TestCase):
+    """`clusters_listed: 0` is what lets `finish` tell a fleet with no clusters
+    from a run that lost them, so only a completed, empty list may set it."""
+    SILENT = ZoneTimeoutTest.SILENT
+
+    def manifest(self, cluster_list):
+        base = cluster_free_run(compute=lambda p: None, registry=lambda p: None, projects="acme\nbeta\n")
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                # beta completes empty in every run, so each one shows the marker set beside the entry under test.
+                return cluster_list() if "acme" in argv else run_of(0, "[]")
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return base(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                return fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+
+    def project_entry(self, cluster_list):
+        return next(c for c in self.manifest(cluster_list)["clusters"] if c["name"] == "project/acme")
+
+    def test_a_completed_empty_list_marks_the_project(self):
+        entry = self.project_entry(lambda: run_of(0, "[]"))
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry[fw.CLUSTERS_LISTED_KEY], 0)
+
+    def test_the_gke_api_off_is_an_empty_list_and_marks_the_project(self):
+        entry = self.project_entry(lambda: run_of(1, "", "accessNotConfigured: Kubernetes Engine API is disabled"))
+        self.assertEqual(entry[fw.CLUSTERS_LISTED_KEY], 0)
+
+    def test_a_failed_list_does_not_mark_the_project(self):
+        manifest = self.manifest(lambda: run_of(1, "", "PERMISSION_DENIED: container.clusters.list"))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fw.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+
+    def test_an_empty_list_with_a_silent_zone_does_not_mark_the_project(self):
+        manifest = self.manifest(lambda: run_of(0, "[]", self.SILENT))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fw.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+
+    def test_a_project_holding_a_cluster_is_not_marked(self):
+        entry = self.project_entry(lambda: run_of(0, ZoneTimeoutTest.CLUSTERS))
+        self.assertNotIn(fw.CLUSTERS_LISTED_KEY, entry)
+
+    def test_a_project_whose_only_cluster_is_not_running_is_not_marked(self):
+        entry = self.project_entry(lambda: run_of(0, json.dumps([{"name": "c1", "location": "us-central1-a", "status": "DEGRADED"}])))
+        self.assertNotIn(fw.CLUSTERS_LISTED_KEY, entry)
+
+
 class ProjectReadScaleTest(unittest.TestCase):
     def test_project_reads_run_in_the_pool(self):
         # Two projects' reads have to be in flight at once to pass the barrier,
