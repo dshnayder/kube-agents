@@ -1440,16 +1440,20 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 	if reposStr == "" {
 		return nil, nil, nil
 	}
-	repos, err := parseManagedRepos(reposStr)
+	entries, err := parseManagedRepoEntries(reposStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
 	}
-	seen := make(map[string]struct{}, len(repos))
-	for _, fullRepo := range repos {
-		fullRepo = strings.TrimSpace(fullRepo)
-		if fullRepo == "" {
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		// Another forge's entry is not the minter's: it never had a policy, and
+		// the agent skips it by type too. Read as a GitHub URL it would be
+		// unreadable, and hold every tracked policy for as long as it is listed.
+		if entry.Type != agentv1alpha1.GitProviderGitHub {
+			logger.V(1).Info("skipping a non-GitHub repository entry in minter policy sync", "list", listName, "type", entry.Type, "repo", entry.URL)
 			continue
 		}
+		fullRepo := entry.URL
 		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
 		if err != nil {
 			logger.Info("skipping a repository entry the minter policy sync cannot read", "list", listName, "repo", fullRepo, "error", err.Error())

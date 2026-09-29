@@ -321,6 +321,9 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "git@ssh.github.com:gke-labs/infra",
             "https://github.com/gke-labs/infra/",
             "infra/",
+            "/infra",
+            "/gke-labs/infra",
+            "/gke-labs/infra/",
             "HTTPS://GitHub.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo):

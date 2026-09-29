@@ -5759,6 +5759,58 @@ func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy
 	}
 }
 
+func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *testing.T) {
+	// A gitlab-typed entry is not an unreadable GitHub spelling: repo-x left
+	// managed_repos, so its tracked policy is pruned as it would be without
+	// the gitlab entry, and the entry gets no policy of its own.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"gitlab","url":"https://gitlab.com/test-org/project"}]`
+	contextRepos := `[{"type":"gitlab","url":"https://gitlab.com/test-org/docs"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, contextRepos); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if _, ok := got.Data["repo-x.yaml"]; ok {
+		t.Error("repo-x.yaml survived: a gitlab-typed entry held the pruning")
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added")
+	}
+	for _, key := range []string{"project.yaml", "docs.yaml"} {
+		if _, ok := got.Data[key]; ok {
+			t.Errorf("%s was rendered for a gitlab-typed entry", key)
+		}
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 	scheme := setupScheme()
 
