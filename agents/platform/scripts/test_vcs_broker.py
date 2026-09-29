@@ -1547,6 +1547,18 @@ class BranchVerbTest(unittest.TestCase):
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))
 
+    def test_delete_refuses_a_persons_branch_this_install_then_proposed_from(self):
+        # The carrier a caller can mint: a person proposed from the branch and
+        # closed it, then this install opened and closed its own proposal at
+        # the same tip. The tip is carried and the carrier is ours, but the
+        # branch was a person's first.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, author="a-maintainer")
+        self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
     def test_delete_takes_the_installs_own_proposal_whatever_the_bot_marking(self):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="kube-agents")

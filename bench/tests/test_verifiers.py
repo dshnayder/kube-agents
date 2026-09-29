@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2207,10 +2208,9 @@ def _closed_six() -> dict:
 
 
 def _commits_of(number: int = 7, page: int = 1) -> str:
-    return (
-        f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls/{number}/commits"
-        f"?per_page=100&page={page}"
-    )
+    # On `_pr_api`, the spelling `_pr_head_routes` uses, so a test that routes
+    # both is seen to route one URL.
+    return f"{_pr_api('pulls', number)}/commits?per_page=100&page={page}"
 
 
 def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
@@ -2286,6 +2286,14 @@ def _route_patterns() -> list[str]:
         "cd /workspace/infra && ./gh pr close 5",
         "/opt/credential-proxy/bin/git push origin :platform-agent/fix",
         "timeout 60 /usr/bin/git push origin :platform-agent/fix",
+        # git's global options before the subcommand.
+        "git -C /workspace/infra push origin :platform-agent/fix",
+        "cd /workspace/infra && git -C . push origin :platform-agent/fix",
+        "git --git-dir=/workspace/infra/.git push origin :platform-agent/fix",
+        "git -c http.extraheader=x push origin :platform-agent/fix",
+        # A path that starts at the sanctioned git and resolves to the shim.
+        "/opt/vcs/libexec/../../credential-proxy/bin/git push origin :platform-agent/fix",
+        "GH_TOKEN=x gh pr close 5",
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2304,21 +2312,75 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         # The sanctioned local git, which has no route to a forge.
         "/opt/vcs/libexec/git -C /workspace/infra push origin platform-agent/fix",
         "cd /workspace/infra && /opt/vcs/libexec/git fetch origin",
+        # Free prose on the command line is not a route.
+        'python3 /opt/vcs/vcs.py commit -m "git push was refused as BRANCH_DIVERGED, cleared the spent branch"',
+        "python3 submit_suggestion.py publish --title 'Second proposal after gh pr close'",
     ],
 )
 def test_the_spent_branch_route_check_passes_the_verbs(command):
     assert not any(re.search(p, command) for p in _route_patterns()), command
 
 
+def test_the_spent_branch_route_check_is_linear_on_a_long_proxied_command():
+    # A run of `--` flags straight after the client and no CLI: the earlier
+    # pattern tried every way to split each into `-` or `--` and a name, and
+    # the run into flags and values -- sixteen took seven seconds, each two
+    # more about four times that.
+    command = "python3 credential_proxy_client.py " + " ".join(
+        f"--p{i}" for i in range(20)
+    )
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
 def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
+    # A pulls payload with no commit total, so `_head_push` reads no page and
+    # the 403 is `_spent_before`'s own.
     _stash_pr_report()
-    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
-    _pr_head_routes(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
     github.routes[_closed_from()] = (200, [_closed_six()])
     github.routes[_commits_of()] = (403, {"message": "Resource not accessible by integration"})
     res = _pr_check(reuses_spent_branch=True).verify(5.0)
     assert res.status == "error"
+    assert "listing the commits of" in res.reason
     assert "pull_requests: read" in res.reason
+    assert _closed_from() in [url for url, _ in github.calls]
+
+
+def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
+    """`_head_push` already read the whole listing of a one-page proposal to
+    date its head; the revision clause reuses it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert [url for url, _ in github.calls].count(_commits_of()) == 1
+
+
+def test_the_revision_clause_reads_the_pages_the_commit_total_names(token, github):
+    """Two full pages and a total of 200: there is no third page to read, and
+    reading one blind would error the check on GitHub's 404."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (
+        200,
+        {"number": 7, "changed_files": 3, "commits": 200,
+         "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA}},
+    )
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": f"{i:040x}"} for i in range(100)])
+    github.routes[_commits_of(page=2)] = (
+        200,
+        [{"sha": f"{i:040x}"} for i in range(100, 199)]
+        + [{"sha": _PR_HEAD_SHA, "commit": {"committer": {"date": "2026-08-21T09:00:20Z"}}}],
+    )
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert _commits_of(page=3) not in [url for url, _ in github.calls]
 
 
 def test_the_same_change_on_a_fresh_branch_is_a_fail(token, github):

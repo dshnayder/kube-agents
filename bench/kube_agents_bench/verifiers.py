@@ -1327,18 +1327,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
         owner: str,
         repo: str,
         number: int,
-        head: dict,
+        pull: dict,
+        listing: list | None,
         token: str,
         budget: float,
         started: datetime,
     ) -> tuple[str | None, str | None]:
         """``(rejection, unevaluable)`` for :attr:`reuses_spent_branch`; both None passes.
 
-        ``head`` is the pulls payload's, as :meth:`_head_push` read it: the
+        ``pull`` is the pulls payload and ``listing`` the whole commit listing
+        when it fit on the one page, both as :meth:`_head_push` read them: the
         issues endpoint's answer carries no head ref, and reading
-        ``/pulls/{n}`` a second time would spend the budget on the same page.
+        ``/pulls/{n}`` or that page a second time would spend the budget on
+        the same answer.
         """
         slug = f"{owner}/{repo}#{number}"
+        head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
         ref = str(head.get("ref") or "")
         if not ref:
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
@@ -1377,14 +1381,30 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 )
             # Oldest first, so on a long branch the closed revision sits on an
             # early page and a fresh cut's own commits fill the later ones; read
-            # every page, up to the 250 commits this endpoint ever lists.
-            for page in range(1, _PR_COMMITS_MAX_PAGES + 1):
-                status_code, commits = _http_get_json(
-                    f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
-                    f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
-                    token,
-                    budget,
+            # every page, up to the 250 commits this endpoint ever lists. The
+            # payload's total says how many that is; without one, read until a
+            # short page.
+            total = pull.get("commits")
+            known = isinstance(total, int) and total >= 1
+            pages = (
+                min(
+                    _PR_COMMITS_MAX_PAGES,
+                    (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE,
                 )
+                if known
+                else _PR_COMMITS_MAX_PAGES
+            )
+            for page in range(1, pages + 1):
+                if page == 1 and listing is not None:
+                    commits = listing
+                    status_code = 200
+                else:
+                    status_code, commits = _http_get_json(
+                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                        f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+                        token,
+                        budget,
+                    )
                 if status_code != 200 or not isinstance(commits, list):
                     return None, (
                         f"GitHub answered {status_code} listing the commits of {slug}; "
@@ -1399,7 +1419,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "under review",
                         None,
                     )
-                if len(commits) < _PR_COMMITS_PAGE_SIZE:
+                if not known and len(commits) < _PR_COMMITS_PAGE_SIZE:
                     break
             return None, None
         return (
@@ -1466,11 +1486,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         resolved: dict,
         token: str,
         budget: float,
-    ) -> tuple[int | None, datetime | None, dict, str | None]:
-        """``(changed files, head commit date, head, unevaluable reason)``.
+    ) -> tuple[int | None, datetime | None, dict, list | None, str | None]:
+        """``(changed files, head commit date, pull, listing, unevaluable reason)``.
 
-        ``head`` is the pulls payload's ``head`` object, for
-        :meth:`_spent_before`; empty when the payload was not read.
+        ``pull`` is the pulls payload and ``listing`` the commit listing when
+        the one page read held all of it (``None`` otherwise), for
+        :meth:`_spent_before`; ``pull`` is empty when the payload was not read.
 
         Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
         file count and the commit total, and is skipped when ``_resolve``
@@ -1497,6 +1518,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     None,
                     None,
                     {},
+                    None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
                     f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
                     "an installation token expires an hour after it is minted — so "
@@ -1507,6 +1529,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     None,
                     None,
                     {},
+                    None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
                     f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
@@ -1517,6 +1540,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     None,
                     None,
                     {},
+                    None,
                     f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
                     "on the pulls endpoint; this check could not be evaluated",
                 )
@@ -1526,7 +1550,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
         head_sha = head.get("sha") or ""
         if not isinstance(total, int) or total < 1:
-            return changed, None, head, None
+            return changed, None, payload, None, None
         page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
         status, commits = _http_get_json(
             f"{base}/pulls/{number}/commits"
@@ -1535,12 +1559,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
             budget,
         )
         if status == 404:
-            return changed, None, head, None
+            return changed, None, payload, None, None
         if status == 401:
             return (
                 None,
                 None,
                 {},
+                None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
                 f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
                 "an installation token expires an hour after it is minted — so "
@@ -1551,6 +1576,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 None,
                 None,
                 {},
+                None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
                 f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
@@ -1561,15 +1587,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 None,
                 None,
                 {},
+                None,
                 f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
                 "on the commits page; this check could not be evaluated",
             )
+        listing = commits if page == 1 else None
         for entry in reversed(commits):
             if not isinstance(entry, dict) or entry.get("sha") != head_sha:
                 continue
             committer = (entry.get("commit") or {}).get("committer") or {}
-            return changed, _parse_github_time(committer.get("date")), head, None
-        return changed, None, head, None
+            return changed, _parse_github_time(committer.get("date")), payload, listing, None
+        return changed, None, payload, listing, None
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1684,7 +1712,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # only wrote to a pull request. `updated_at` moves on a comment and
             # on a label. The head commit moves on neither.
             try:
-                changed, pushed, head, unevaluable = self._head_push(
+                changed, pushed, pull, listing, unevaluable = self._head_push(
                     owner, repo, number, payload, token, budget
                 )
             except OSError as exc:
@@ -1708,7 +1736,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if self.reuses_spent_branch:
                 try:
                     rejection, unevaluable = self._spent_before(
-                        owner, repo, number, head, token, budget, started
+                        owner, repo, number, pull, listing, token, budget, started
                     )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")

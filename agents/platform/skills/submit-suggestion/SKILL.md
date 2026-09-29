@@ -130,7 +130,7 @@ If the broker refuses the delete, `prepare` refuses the name and names the
 code. `NOT_SPENT` means the branch moved on after its proposal closed;
 `BRANCH_MOVED` means something pushed to it a moment ago — run `prepare` once
 more, which reads it again; if a person or a sibling card on the same name added
-to it, that second run refuses it as `NOT_SPENT`. `BRANCH_NOT_OURS` means the closed proposal was
+to it, that second run refuses it as `NOT_SPENT`. `BRANCH_NOT_OURS` means a proposal from it was
 not this install's, or the name is not under `platform-agent/`. Those revisions
 are somebody's; do not delete them another way. Choose a different name where
 the derived one is only a default, or report the refusal and stop where the name

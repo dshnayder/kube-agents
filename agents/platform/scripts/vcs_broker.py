@@ -765,7 +765,9 @@ class VcsBroker:
         convention, not a lock -- anyone who can push can push under it -- so
         the proposal that carried the tip must also be this install's: opened
         by the credential's own login, from this repository rather than a fork.
-        A credential that cannot name itself leaves the prefix and the
+        So must every other proposal the branch's history lists: a branch a
+        person ever proposed from is theirs too, whatever this install later
+        opened on it. A credential that cannot name itself leaves the prefix and the
         same-repository rule as the bar, the same weaker bar `advance` settles for and for the reason
         `_viewer` gives; one whose lookup failed is refused, since that
         silence is an outage rather than an answer.
@@ -783,6 +785,14 @@ class VcsBroker:
         proposal carried, and deleting it would lose them. On the shipped forge
         the revision the proposal carried stays reachable from the proposal
         itself, so what this removes is a name, not work.
+
+        These gates hold against a mistake, not against their own caller: the
+        same caller can open a proposal from a branch with `proposal-create`
+        and close it, which makes the tip carried and the carrier this
+        install's -- the bar `advance` states for itself. What that caller
+        still cannot do is lose work: the revision it made carried stays
+        reachable from the proposal it opened, and a branch a person proposed
+        from is refused above whatever this install opened on it since.
 
         `revision` is the tip the caller last read, from `branch-view`, and the
         delete is conditional on it: a sibling that published to the same name
@@ -863,7 +873,7 @@ class VcsBroker:
                     status=409,
                     code="NOT_SPENT",
                 )
-            self._refuse_a_carrier_not_ours(bound, branch, carriers)
+            self._refuse_a_carrier_not_ours(bound, branch, carriers, proposals)
             # Conditional on the tip just compared, so a publish that lands
             # between the read and this push is refused by the remote rather
             # than silently undone.
@@ -936,13 +946,19 @@ class VcsBroker:
         return ""
 
     def _refuse_a_carrier_not_ours(
-        self, bound: Binding, branch: str, carriers: list[dict[str, Any]]
+        self,
+        bound: Binding,
+        branch: str,
+        carriers: list[dict[str, Any]],
+        history: list[dict[str, Any]],
     ) -> None:
         """Refuse to delete a branch whose spent proposal this install did not open.
 
         `carriers` are the proposals from `branch` that carried its tip. One of
         them has to be from this repository and, when the credential can name
-        itself, by this install. See `branch_delete` for why each half.
+        itself, by this install. `history` is every proposal listed from it,
+        and when the credential can name itself none of those may be anybody
+        else's. See `branch_delete` for why each.
         """
         here = bound.repo.casefold()
         ours = [
@@ -976,6 +992,21 @@ class VcsBroker:
                 f"the proposal that carried {branch}'s tip is {named}'s, not this "
                 f"install's ({viewer}), so the branch is not this install's to "
                 "delete.",
+                status=409,
+                code="BRANCH_NOT_OURS",
+            )
+        others = [
+            item for item in history
+            if _login_key(str(item.get("author") or "")) != _login_key(viewer)
+        ]
+        if others:
+            first = others[0]
+            named = first.get("url") or "#%s" % (first.get("number"),)
+            raise WorkspaceError(
+                f"{branch} also carried {named}, "
+                f"{first.get('author') or 'an unnamed author'}'s rather than this "
+                f"install's ({viewer}), so the branch is not only this install's "
+                "and is not deleted.",
                 status=409,
                 code="BRANCH_NOT_OURS",
             )

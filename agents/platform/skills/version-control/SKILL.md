@@ -212,7 +212,8 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
   the closed proposal is not this install's), `OPEN_PROPOSAL`, `NOT_SPENT` (it
   holds revisions no proposal carried); each of those is somebody's work — pick
-  another name or report it. `BRANCH_MOVED` means it moved since you read it:
+  another name or report it. Never open and close a proposal on a branch to make
+  it deletable: the delete reads that proposal as proof the branch is yours. `BRANCH_MOVED` means it moved since you read it:
   view it again, and delete only if it is still spent.
   `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
   `GIT_FAILED` mean the delete did not complete, and it may have landed before

@@ -877,9 +877,14 @@ only because GitHub freezes that revision when the proposal closes rather than
 following the branch; a forge whose closed proposals keep tracking their branch
 cannot serve `branch-delete` until it reports the revision at close. The prefix is a convention anyone who can push
 can use, so the proposal that carried the tip must also be this install's —
-opened from this repository by the credential's own login — or the delete is
-`BRANCH_NOT_OURS` too; a credential that cannot name itself leaves the prefix and
-the same-repository rule as the bar, as it does for `advance`. `revision` is the tip the
+opened from this repository by the credential's own login — and no proposal
+from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too; a
+credential that cannot name itself leaves the prefix and the same-repository
+rule as the bar, as it does for `advance`. That bar holds against a mistake,
+not against the caller itself, which can open and close a proposal on a branch
+with `proposal-create` to make its tip carried. It still cannot lose work that
+way: the revision stays reachable from the proposal it opened, and a branch a
+person proposed from stays refused. `revision` is the tip the
 caller read, and the push is conditional on it: a sibling that published to the
 name in between wins, and the delete is refused `BRANCH_MOVED`. A branch already
 gone is answered `deleted: false`, not refused — the caller wanted it gone.
