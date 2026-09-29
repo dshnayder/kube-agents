@@ -28,6 +28,20 @@ import textwrap
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# The narrowest a wrapping column shrinks unless its spec says otherwise.
+DEFAULT_MIN_WIDTH = 12
+# The least content width a table is ever fitted to, however narrow the
+# terminal: below it every wrapping column is one or two characters wide.
+MIN_CONTENT_WIDTH = 10
+# Unicode categories a terminal draws in no column: nonspacing and enclosing
+# marks, and format characters such as the zero-width joiner and space.
+ZERO_WIDTH_CATEGORIES = ("Mn", "Me", "Cf")
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+HOURS_PER_DAY = 24
+
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\]8;[^\x1b]*\x1b\\")
 
@@ -101,10 +115,14 @@ def display_width(text: str) -> int:
     and draws two columns, and a combining accent counts one and draws none. A
     single one of either shifted every border below its row -- and the test
     that exists to catch that measured with `len(plain(...))` too, so it agreed
-    with the renderer and reported the table aligned.
+    with the renderer and reported the table aligned. Zero-width is decided by
+    category, not by combining class: the zero-width joiner, a variation
+    selector and many vowel signs have combining class 0 and still draw nothing.
     """
     return sum(
-        0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        0
+        if unicodedata.combining(ch) or unicodedata.category(ch) in ZERO_WIDTH_CATEGORIES
+        else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
         for ch in plain(text)
     )
 
@@ -133,7 +151,7 @@ def hyperlink(text: str, url: str, palette: Palette, link_id: str = "") -> str:
     `link_id` is OSC 8's `id=` parameter, which exists to say that two
     separately-emitted runs are one hyperlink. Anything that wraps across table
     rows needs it: without it a terminal treats each row as its own link and
-    highlights only the line under the pointer, and with it the whole location
+    highlights only the line under the pointer, and with it the whole text
     lights up as one.
     """
     if not palette.enabled or not url or not _LINKABLE_URL.match(url):
@@ -169,7 +187,7 @@ class Column:
         title: str,
         align: str = "l",
         wrap: bool = False,
-        min_width: int = 12,
+        min_width: int = DEFAULT_MIN_WIDTH,
         expendable: int = 0,
     ) -> None:
         self.title = title
@@ -191,8 +209,8 @@ def _cell_lines(text: str, width: int) -> List[Tuple[str, int]]:
     """Wrap one cell to `width`, as `(line, source paragraph index)` pairs.
 
     Deliberate newlines are preserved, and the paragraph index rides along so a
-    cell that stacks several facts -- a finding's title, its location, its gate
-    verdict -- can colour each one differently even after wrapping has turned
+    cell that stacks several facts -- a title over a location, say -- can
+    colour each one differently even after wrapping has turned
     them into an indeterminate number of lines.
 
     `break_long_words` is on because the cells most likely to overflow are file
@@ -266,13 +284,12 @@ def _fit_columns(
 ) -> Tuple[List[Column], List[List[Sequence[Any]]], List[str]]:
     """Drop expendable columns until the table fits, worst-value first.
 
-    An eighty-column terminal cannot hold the findings table: nine columns of
-    borders alone are twenty-eight characters, and the columns that carry the
-    finding itself want another eighty. Left to run wide the terminal hard-wraps
-    every row and the result is less readable than the JSON this replaces. So
-    the least load-bearing columns come out first, and the caller is told which
-    -- a table that silently drops a column is a table that lies about what the
-    ledger holds.
+    An eighty-column terminal cannot hold every wide table: each column costs
+    three characters of border before its content, and a table left to run
+    wide is hard-wrapped by the terminal into something less readable than the
+    JSON it renders. So the least load-bearing columns come out first, and the
+    caller is told which -- a table that silently drops a column is a table
+    that lies about what its source holds.
     """
     kept = list(columns)
     trimmed = [list(row) for row in rows]
@@ -293,7 +310,7 @@ def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
     natural = _natural_widths(columns, rows)
 
     overhead = _overhead(len(columns))
-    available = max(total - overhead, 10)
+    available = max(total - overhead, MIN_CONTENT_WIDTH)
     if sum(natural) <= available:
         return natural
 
@@ -319,6 +336,14 @@ def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
     drift = room - sum(widths[i] for i in flex)
     if drift > 0:
         widths[max(flex, key=lambda i: widths[i])] += drift
+    # Clamping a narrow column up to its minimum overspends the budget; take
+    # the excess back from the columns above theirs, widest first. `room >=
+    # floor` above guarantees there is enough slack to cover it.
+    while drift < 0:
+        donor = max(flex, key=lambda i: widths[i] - columns[i].min_width)
+        give = min(-drift, widths[donor] - columns[donor].min_width)
+        widths[donor] -= give
+        drift += give
     return widths
 
 def render_table(
@@ -342,10 +367,9 @@ def render_table(
     form to reach, so a whole-cell URL on it would never render at all.
 
     `separator` puts a `blank` line or a `rule` between rows, for a table whose
-    rows are several lines tall: the row number is on the first of them and
-    every other line of the cell is blank in the narrow columns, so without one
-    there is nothing to say where one record stops and the next starts. A table
-    of one-line rows wants `none`, which is the default.
+    rows are several lines tall: a short cell leaves the lines under it blank,
+    so without one there is nothing to say where one record stops and the next
+    starts. A table of one-line rows wants `none`, which is the default.
     """
     columns, rows, dropped = _fit_columns(columns, rows, width)
     widths = _resolve_widths(columns, rows, width)
@@ -355,7 +379,7 @@ def render_table(
 
     vertical = palette(box["v"], "dim")
 
-    # Distinguishes one wrapped link from another, so that two locations in the
+    # Distinguishes one wrapped link from another, so that two links in the
     # same table are never fused into one hyperlink by a shared `id=`.
     link_seq = [0]
 
@@ -395,10 +419,8 @@ def render_table(
                     url = per_line_url[para]
                     # A per-paragraph link is drawn even when its paragraph
                     # wraps, joined across the rows by `id=`. Dropping it
-                    # instead cost the location column every link it had at any
-                    # normal terminal width: a path with a line number needs
-                    # around 120 columns of FINDING to fit on one line, so an
-                    # 80-column terminal rendered no file links at all.
+                    # instead would lose every link too long for its column,
+                    # which at an 80-column terminal is most of them.
                     linkable = True
                     if spans[i][para] > 1:
                         link_id = "%d.%d.%d" % (row_seq, i, para)
@@ -435,14 +457,14 @@ def render_table(
 
 def humanise_delta(seconds: float) -> str:
     seconds = abs(int(seconds))
-    if seconds < 60:
+    if seconds < SECONDS_PER_MINUTE:
         return "%ds" % seconds
-    if seconds < 3600:
-        return "%dm" % (seconds // 60)
-    if seconds < 86400:
-        hours, minutes = divmod(seconds // 60, 60)
+    if seconds < SECONDS_PER_HOUR:
+        return "%dm" % (seconds // SECONDS_PER_MINUTE)
+    if seconds < SECONDS_PER_DAY:
+        hours, minutes = divmod(seconds // SECONDS_PER_MINUTE, MINUTES_PER_HOUR)
         return "%dh%02dm" % (hours, minutes) if minutes else "%dh" % hours
-    days, hours = divmod(seconds // 3600, 24)
+    days, hours = divmod(seconds // SECONDS_PER_HOUR, HOURS_PER_DAY)
     return "%dd%dh" % (days, hours) if hours else "%dd" % days
 
 def ago(when: Optional[_dt.datetime], now: _dt.datetime) -> str:

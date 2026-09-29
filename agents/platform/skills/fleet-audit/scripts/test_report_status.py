@@ -103,6 +103,27 @@ class TestProjection(ReportStatusTestCase):
         self.assertEqual(stream["liveness"], "died")
         self.assertIn("acme/other: latest.json: not a JSON object", stream["error"])
 
+    def test_a_mixed_case_directory_is_named_rather_than_listed_as_never_run(self):
+        # The writer lower-cases every path and store_path opens nothing else,
+        # so a directory spelled otherwise would list as a repository with no
+        # runs and no error.
+        self.write_latest()
+        self.write_latest(repo="Zeta/Fleet")
+        stream = self.project()["streams"][AUDIT]
+        self.assertEqual(sorted(stream["repos"]), [REPO])
+        self.assertIn("Zeta/Fleet: not lower-case", stream["error"])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_an_unreadable_scratch_is_an_error_not_nothing_in_flight(self):
+        self.write_latest()
+        self.write_note(age_s=60)
+        self.scratch.chmod(0)
+        self.addCleanup(self.scratch.chmod, 0o700)
+        stream = self.project()["streams"][AUDIT]
+        self.assertIsNone(stream["started"])
+        self.assertEqual(stream["liveness"], "error")
+        self.assertIn(str(self.scratch), stream["error"])
+
     def test_no_store_is_said_rather_than_read_as_an_empty_fleet(self):
         document = self.project()
         self.assertFalse(document["root_exists"])

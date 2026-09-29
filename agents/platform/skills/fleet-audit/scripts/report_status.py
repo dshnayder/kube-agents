@@ -115,14 +115,8 @@ def _subdirs(path: str) -> list[str]:
         return sorted(entry.name for entry in entries if entry.is_dir())
 
 
-def repo_ids(root: str, audit_id: str) -> list[str]:
-    """Every `owner/name` the stream has a store for, sorted; [] when none.
-
-    A stream is kept once per repository it publishes to, because an SOP
-    walking `managed_repos` finishes it once per repository and each run's
-    memory is its own ledger's. OSError other than absence propagates, as in
-    `stream_ids`.
-    """
+def _repo_dirs(root: str, audit_id: str) -> list[str]:
+    """Every `owner/name` directory under the stream, spelled as on disk."""
     try:
         owners = _subdirs(os.path.join(root, audit_id))
     except FileNotFoundError:
@@ -134,6 +128,24 @@ def repo_ids(root: str, audit_id: str) -> list[str]:
         for name in _subdirs(os.path.join(root, audit_id, owner))
         if REPO_SEGMENT_RE.match(name)
     ]
+
+
+def repo_ids(root: str, audit_id: str) -> list[str]:
+    """Every `owner/name` the stream has a store for, sorted; [] when none.
+
+    A stream is kept once per repository it publishes to, because an SOP
+    walking `managed_repos` finishes it once per repository and each run's
+    memory is its own ledger's. Only lower-case directories count: the writer
+    spells every one so and `store_path` opens nothing else, so a mixed-case
+    one would list as a repository that never ran. `stray_repo_dirs` names
+    those. OSError other than absence propagates, as in `stream_ids`.
+    """
+    return [repo for repo in _repo_dirs(root, audit_id) if repo == repo.lower()]
+
+
+def stray_repo_dirs(root: str, audit_id: str) -> list[str]:
+    """The stream's repository directories no reader opens: not lower-case."""
+    return [repo for repo in _repo_dirs(root, audit_id) if repo != repo.lower()]
 
 
 def store_path(root: str, audit_id: str, repo: str) -> str:
@@ -153,11 +165,13 @@ def in_flight_ids(scratch: str) -> list[str]:
     """Every stream with an in-flight note, sorted; [] when there is none.
 
     A stream's first run has a note before it has a store directory, and a
-    running first run must not read as "never ran".
+    running first run must not read as "never ran". OSError other than
+    absence propagates: a scratch directory that cannot be listed is a lease
+    nobody could read, not a fleet with nothing in flight.
     """
     try:
         names = os.listdir(scratch)
-    except OSError:
+    except FileNotFoundError:
         return []
     return sorted(
         name[len(INFLIGHT_PREFIX) : -len(INFLIGHT_SUFFIX)]
@@ -191,7 +205,9 @@ def in_flight_since(scratch: str, audit_id: str) -> float | None:
 
     audit_report._in_flight_since, restated: a note that exists but does not
     parse — a `start` that created it a moment ago — counts from its mtime,
-    because an unreadable note is a claim, not an absence.
+    because an unreadable note is a claim, not an absence. A note that can
+    be neither read nor stat'd raises OSError: the lease could not be looked
+    at, which the caller reports rather than reading as "nothing in flight".
     """
     path = os.path.join(scratch, f"{INFLIGHT_PREFIX}{audit_id}{INFLIGHT_SUFFIX}")
     try:
@@ -205,7 +221,7 @@ def in_flight_since(scratch: str, audit_id: str) -> float | None:
         return float(started)
     try:
         return os.stat(path).st_mtime
-    except OSError:
+    except FileNotFoundError:
         return None
 
 
@@ -302,32 +318,49 @@ def project(
         # not read, not a fleet with no streams — and `root_exists` is the key
         # its exit code hangs on.
         ids, root_exists = [], False
-    ids = sorted(set(ids) | set(in_flight_ids(scratch)))
+    lease_error: str | None = None
+    try:
+        in_flight = in_flight_ids(scratch)
+    except OSError as exc:
+        in_flight, lease_error = [], _failure(f"{scratch}/", exc)
+    ids = sorted(set(ids) | set(in_flight))
     return {
         "root": root,
         "root_exists": root_exists,
         "generated_at": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat(),
         "ttl_s": INFLIGHT_TTL_S,
         "streams": {
-            audit_id: _project_stream(root, scratch, audit_id, now_epoch) for audit_id in ids
+            audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
+            for audit_id in ids
         },
     }
 
 
-def _project_stream(root: str, scratch: str, audit_id: str, now_epoch: float) -> dict:
+def project_stream(
+    root: str, scratch: str, audit_id: str, now_epoch: float, lease_error: str | None = None
+) -> dict:
     """The stream's lease, and one entry per repository it has a store for.
 
     Liveness is the stream's, because the lease is: one `start` holds the
-    stream across every repository. `error` names the first repository that
-    could not be read, and the entry for it carries its own.
+    stream across every repository. `error` names the lease when it could not
+    be read, else the first repository that could not be, and the entry for
+    that repository carries its own. `lease_error` is the scratch directory's
+    listing failure, which `project` found once for every stream.
     """
-    started = in_flight_since(scratch, audit_id)
-    error: str | None = None
+    error = lease_error
+    try:
+        started = in_flight_since(scratch, audit_id)
+    except OSError as exc:
+        started, error = None, _failure("the in-flight note", exc)
     repos: dict[str, dict] = {}
     try:
         ids = repo_ids(root, audit_id)
+        strays = stray_repo_dirs(root, audit_id)
     except OSError as exc:
-        ids, error = [], _failure(f"{audit_id}/", exc)
+        ids, strays = [], []
+        error = error or _failure(f"{audit_id}/", exc)
+    if strays:
+        error = error or f"{', '.join(strays)}: not lower-case, so no reader opens it"
     any_latest = None
     for repo in ids:
         entry = _project_repo(root, audit_id, repo)

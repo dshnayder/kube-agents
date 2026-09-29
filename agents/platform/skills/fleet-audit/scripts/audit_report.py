@@ -917,6 +917,9 @@ LOST_MEMORY_UNGUARDED_GAP = (
     "until a run that reports findings rewrites it, or a human who has checked "
     "them closes it"
 )
+# Every log line for a lost memory ends with this, whatever lost it: the
+# fleet-audit SKILL tells the agent to look for it on stderr.
+MEMORY_UNKNOWABLE = "the previous run's findings are unknowable this run."
 # The width of a coverage hold rendered on a line of its own — the waiver's
 # reason in the Scope section and the delta comment. Wide enough for the
 # sentence an operator typed; `_cell`'s table width left a third of one.
@@ -1940,29 +1943,28 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     try:
         path = reports_dir_for(audit_id, repo) / "latest.json"
     except ValueError as exc:
-        log(f"WARNING: no report store for {audit_id}: {exc}")
+        log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         log(
             f"No stored report for {audit_id} in {repo}, but issue #{issue_number} is open; "
-            "the previous run's findings are unknowable this run."
+            f"{MEMORY_UNKNOWABLE}"
         )
         return None
     except (OSError, ValueError) as exc:
-        log(f"WARNING: stored report for {audit_id} is unreadable ({exc}).")
+        log(f"WARNING: stored report for {audit_id} is unreadable ({exc}); {MEMORY_UNKNOWABLE}")
         return None
     if not isinstance(envelope, dict):
-        log(f"WARNING: stored report for {audit_id} is not an object.")
+        log(f"WARNING: stored report for {audit_id} is not an object; {MEMORY_UNKNOWABLE}")
         return None
     stored_issue = envelope.get("issue_number")
     stored_repo = envelope.get("repo")
     if stored_issue != issue_number or str(stored_repo).lower() != str(repo).lower():
         log(
             f"Stored report for {audit_id} was written for {stored_repo}#{stored_issue}, "
-            f"not the open {repo}#{issue_number}; the previous run's findings are "
-            "unknowable this run."
+            f"not the open {repo}#{issue_number}; {MEMORY_UNKNOWABLE}"
         )
         return None
     # Parsed is not well-formed: every reader below walks these keys outside a
@@ -1970,7 +1972,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     if not isinstance(envelope.get("ledger_body"), str) or not isinstance(
         envelope.get("current_ids"), list
     ):
-        log(f"WARNING: stored report for {audit_id} has no readable ledger body.")
+        log(f"WARNING: stored report for {audit_id} has no readable ledger body; {MEMORY_UNKNOWABLE}")
         return None
     return envelope
 
@@ -11437,7 +11439,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # than empty — see `memory_lost` below. No open ledger is the one case that
     # genuinely is empty: the run is first, and everything present is new.
     memory = previous_run_memory(audit_id, existing_issue, repo)
-    invalidate_report_memory(audit_id, repo)
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
@@ -11577,6 +11578,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
+    # The last read that can abort the run is behind us and nothing has touched
+    # the ledger yet, so from here a killed run could leave `latest.json`
+    # describing a ledger it no longer matches. Deleted before that read, a
+    # failed pull-request lookup that changed nothing would cost the next run
+    # its memory.
+    invalidate_report_memory(audit_id, repo)
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:

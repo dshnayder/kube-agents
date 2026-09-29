@@ -191,21 +191,12 @@ def _ring(root: str, audit_id: str, repo: str) -> list[str]:
 
 
 def _liveness(root: str, audit_id: str) -> str:
-    """The stream's lease state; the lease spans every repository."""
+    """The stream's liveness, as `streams` reports it: the same projection, so
+    `runs` and a refusal cannot disagree with it about a lease."""
     try:
-        latest = next(
-            (
-                envelope
-                for repo in report_status.repo_ids(root, audit_id)
-                if (envelope := report_status.load_last(root, audit_id, repo)[0])
-            ),
-            None,
-        )
-        return report_status.liveness(
-            report_status.in_flight_since(report_status.scratch_root(), audit_id),
-            latest,
-            time.time(),
-        )
+        return report_status.project_stream(
+            root, report_status.scratch_root(), audit_id, time.time()
+        )["liveness"]
     except (OSError, ValueError):
         return "error"
 

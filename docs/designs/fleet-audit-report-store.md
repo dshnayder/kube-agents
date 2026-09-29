@@ -59,12 +59,13 @@ The write is best-effort: a store that cannot be written logs a warning and neve
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
 quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
-indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` as soon as it
-has read its memory, before it touches the issue: a run killed between editing the ledger and
-writing the store leaves no envelope rather than one describing the run before. The ring is left
-alone, and the readers answer from its newest entry with `latest_missing: true`: the stream did run,
-and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a failed
-prune has not damaged the memory the run just wrote.
+indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` just before
+it touches the issue, once the last lookup that can abort the run has returned: a run killed between
+editing the ledger and writing the store leaves no envelope rather than one describing the run
+before, and a lookup that fails earlier has changed nothing and leaves the memory in place. The ring
+is left alone, and the readers answer from its newest entry with `latest_missing: true`: the stream
+did run, and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a
+failed prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
 ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
@@ -162,10 +163,13 @@ Whether a run is in flight comes from the lease `start` takes — the in-flight 
 reads it with the lease's own TTL (`INFLIGHT_TTL_SECONDS`, copied into `report_status.py` as
 `INFLIGHT_TTL_S` and pinned equal by a test) and reports each stream, across all its repositories,
 as `never` (no lease and no stored run), `completed`, `running`, `died` (a lease older than the TTL
-that never finished), or `error` (a store file that would not parse). A ring whose `latest.json` was
-deleted is `completed`, projected from its newest entry with `latest_missing`. A note that exists
-but cannot be parsed is a `start` that has claimed the lease and not yet written it, and counts from
-its mtime. A first run in flight is `running` before its store directory exists.
+that never finished), or `error` (a store file that would not parse, a scratch directory or note
+that could not be read, or a repository directory spelled in a case no reader opens). The lease is
+read first, so an unreadable store file does not hide a run that holds, or died on, the stream; the
+error rides beside it. A ring whose `latest.json` was deleted is `completed`, projected from its
+newest entry with `latest_missing`. A note that exists but cannot be parsed is a `start` that has
+claimed the lease and not yet written it, and counts from its mtime. A first run in flight is
+`running` before its store directory exists.
 
 ## 6. Readers
 

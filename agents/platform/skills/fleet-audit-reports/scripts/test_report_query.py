@@ -664,6 +664,15 @@ class TestRuns(StoreTestCase):
         self.assertEqual(payload["newest"], broken.name)
         self.assertEqual(payload["liveness"], "completed")
 
+    def test_a_dead_lease_is_not_hidden_by_an_unreadable_envelope(self):
+        # `streams` reads the lease before a store error; `runs` must answer
+        # the same, or the two subcommands disagree about one stream.
+        self.stream_dir(AUDIT)
+        (Path(self.root) / AUDIT / REPO / "latest.json").write_text("[]", encoding="utf-8")
+        self.write_claim(AUDIT, age_s=report_query.report_status.INFLIGHT_TTL_S + 60)
+        self.assertEqual(self.query("streams")[1]["streams"][0]["liveness"], "died")
+        self.assertEqual(self.ok("runs", AUDIT)["liveness"], "died")
+
     def test_a_temp_file_mid_write_is_not_a_run(self):
         self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
         (Path(self.root) / AUDIT / REPO / "runs" / "tmpabc123.tmp").write_text("{", encoding="utf-8")
@@ -911,6 +920,25 @@ class TestTheWriterIsWhatIsRead(StoreTestCase):
         row = self.ok("streams")["streams"][0]
         self.assertEqual(row["status"], "OPENED")
         self.assertEqual(row["liveness"], "completed")
+        # A second run that fixed a1 gives `runs` and `diff` a ring to read.
+        later = datetime(2026, 8, 2, 9, 30, tzinfo=timezone.utc)
+        second = self.audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED", "partial": False, "coverage_gaps": []},
+            scope_document(AUDIT, findings[1:], []),
+            later,
+            repo=REPO,
+            issue_number=7,
+            ledger_body="body",
+            new_ids=[],
+            resolved_ids=["a1"],
+            rendered_ids=["b2"],
+        )
+        self.audit_report.write_report(AUDIT, second, later)
+        self.assertEqual(self.ok("runs", AUDIT)["count"], 2)
+        diff = self.ok("diff", AUDIT)
+        self.assertEqual([row["id"] for row in diff["resolved"]], ["a1"])
+        self.assertEqual(diff["added_total"], 0)
 
 
 if __name__ == "__main__":

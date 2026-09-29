@@ -270,6 +270,12 @@ class TestFlags(unittest.TestCase):
         old = latest(finished_at=(NOW - timedelta(days=3)).isoformat())
         self.assertEqual(self.flags(stream(last=old)), ["STALE"])
 
+    def test_a_stream_still_running_is_late_not_stale(self):
+        # The lease says it is not silent; the STATUS cell carries its age.
+        old = latest(finished_at=(NOW - timedelta(days=3)).isoformat())
+        doc = stream(liveness="running", last=old, started=started(age_s=3900))
+        self.assertEqual(self.flags(doc), [])
+
     def test_a_disabled_stream_abstains_from_stale_and_never(self):
         old = latest(finished_at=(NOW - timedelta(days=30)).isoformat())
         self.assertEqual(self.flags(stream(last=old), {"enabled": False}), [])
@@ -333,7 +339,10 @@ class TestRender(unittest.TestCase):
     def test_the_prs_column_counts_the_url_list(self):
         urls = ["https://x/pull/1", "https://x/pull/2"]
         out = self.render({"compliance-audit": stream(last=latest(prs_opened=urls))})
-        self.assertRegex(out, r"\s2\s")
+        row = next(line for line in out.splitlines() if "compliance-audit" in line and "│" in line)
+        cells = [cell.strip() for cell in view.plain(row).strip("│").split("│")]
+        titles = [column.title for column in view.COLUMNS]
+        self.assertEqual(cells[titles.index("PRS")], "2")
 
     def test_the_header_names_the_store_and_the_source(self):
         out = self.render({})
@@ -560,21 +569,31 @@ class TestDashboard(unittest.TestCase):
         Cell text arrives from a model-written finding title and from GitHub
         pull-request titles, where an emoji is ordinary. Each one drew two
         columns and counted as one character, so the row ran past its own
-        border; a combining accent did the reverse. The wide cases also have to
-        survive *wrapping*, because `textwrap` counts characters too and hands
-        back a line that fits by its measure and overflows by the terminal's.
+        border; a combining accent did the reverse.
         """
         for label, name in (
             ("emoji", "\U0001f680 compliance-audit"),
             ("cjk", "コンプライアンス監査"),
             ("combining", "compliance-áudit"),
-            ("wide and long enough to wrap", "コンプライアンス" * 12),
+            ("zero-width joiner", "compliance\u200daudit"),
         ):
             with self.subTest(cell=label):
                 streams = {name: stream(last=latest(audit_id=name))}
                 out = self.render(streams, roster={name: {"enabled": True, "expr": "20 6 * * *"}})
                 widths = self.border_widths(out)
                 self.assertEqual(len(widths), 1, "%s: %s" % (label, sorted(widths)))
+
+    def test_a_wide_cell_that_wraps_still_aligns(self):
+        # `textwrap` counts characters too, so a wrapped line of wide text fits
+        # by its measure and overflows by the terminal's. GAP is a wrapping
+        # column; STREAM is not, so a long stream name never reaches the wrap.
+        gap = "dr-west: " + "コンプライアンス" * 12
+        streams = {"compliance-audit": stream(last=latest(coverage_gaps=[gap]))}
+        out = self.render(streams, show_gaps=True, width=100)
+        gap_lines = out[out.index("COVERAGE GAPS"):]
+        self.assertGreater(sum("コ" in line for line in gap_lines.splitlines()), 1, "never wrapped")
+        widths = self.border_widths(gap_lines)
+        self.assertEqual(len(widths), 1, sorted(widths))
 
     def test_colour_is_off_unless_asked_for(self):
         self.assertNotIn("\x1b[", self.render(self.two()))
@@ -813,6 +832,24 @@ class TestProjectionRead(unittest.TestCase):
         run_main(["--roster", NO_ROSTER, "--container", "other"], fake)
         cmd = fake.exec_call["cmd"]
         self.assertEqual(cmd[cmd.index("-c") + 1], "other")
+
+    def test_a_container_alone_picks_the_pod_that_has_it(self):
+        # The sandbox pod sorts first and has only `shell`; asking for the
+        # gateway's container must read the gateway, not fail on the sandbox.
+        class Both(FakeKubectl):
+            def __call__(self, cmd, **kwargs):
+                if "get" in cmd:
+                    self.calls.append({"cmd": list(cmd), "input": None, "timeout": None})
+                    listing = "agent-gateway platform-agent fluent-bit\nagent-shell-0 shell\n"
+                    return CompletedProcess(cmd, 0, listing, "")
+                return super().__call__(cmd, **kwargs)
+
+        fake = Both()
+        rc, _, _ = run_main(["--roster", NO_ROSTER, "--container", "platform-agent"], fake)
+        self.assertEqual(rc, 0)
+        cmd = fake.exec_call["cmd"]
+        self.assertIn("agent-gateway", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "platform-agent")
 
     def test_discovery_filters_by_label_and_running_phase(self):
         fake = FakeKubectl()
@@ -1114,6 +1151,21 @@ class TestFormatting(unittest.TestCase):
     def test_issue_ref(self):
         self.assertEqual(view.issue_ref("https://github.com/a/b/issues/12"), "#12")
         self.assertEqual(view.issue_ref(None), "—")
+
+    def test_zero_width_is_by_category_not_combining_class(self):
+        # U+200D, U+200B and U+FE0F have combining class 0 and draw nothing.
+        self.assertEqual(terminal_table.display_width("a\u200db\u200bc\ufe0f"), 3)
+        self.assertEqual(terminal_table.display_width("e\u0301"), 1)
+
+    def test_clamped_minimums_do_not_overspend_the_width(self):
+        # Two wrap columns, one clamped up to its minimum: the excess comes
+        # back from the other rather than running the table wide.
+        columns = [terminal_table.Column("A", wrap=True), terminal_table.Column("B", wrap=True)]
+        rows = [[("x" * 5,), ("y" * 50,)]]
+        total = 40 + terminal_table._overhead(2)
+        widths = terminal_table._resolve_widths(columns, rows, total)
+        self.assertEqual(sum(widths), 40)
+        self.assertEqual(widths[0], terminal_table.DEFAULT_MIN_WIDTH)
 
     def test_count_cell(self):
         self.assertEqual(view.count_cell(["a", "b"]), "2")

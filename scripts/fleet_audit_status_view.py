@@ -159,6 +159,8 @@ FIELD_LABEL_WIDTH = 9
 MIN_TERMINAL_WIDTH = 80
 MAX_TERMINAL_WIDTH = 220
 FALLBACK_TERMINAL_SIZE = (160, 40)
+# Cells in the header's health bar: the share of streams needing no attention.
+HEALTH_BAR_CELLS = 18
 
 
 class ProjectionError(RuntimeError):
@@ -544,7 +546,9 @@ def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list
     DIED reads off the projection's liveness alone, so a roster that has
     drifted from runtime cannot suppress the death of a running stream: were
     it gated on the schedule, `at is None` → `expected is None` → `stale is
-    False` would render every failure as the same calm blank row.
+    False` would render every failure as the same calm blank row. STALE is
+    silence, so a stream whose lease is `running` is never STALE: it is late,
+    and the STATUS cell already says how long it has been going.
     """
     flags = []
     unreadable = not root_exists or bool(stream.get("error"))
@@ -556,7 +560,7 @@ def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list
     enabled = bool(job.get("enabled"))
     if liveness == "never" and enabled and not unreadable:
         flags.append("NEVER")
-    if enabled:
+    if enabled and liveness != "running":
         at = parse_iso((stream.get("latest") or {}).get("finished_at"))
         expected = next_fire(job.get("expr", ""), at) if at else None
         if expected is not None and now > expected + STALE_SLACK:
@@ -792,7 +796,10 @@ def render(
         row, flags, latest = row_for(
             label, stream, roster.get(audit_id) or {}, now, root_exists, utc
         )
-        built.append({"id": label, "row": row, "flags": flags, "latest": latest})
+        # Scrubbed once here, because the gaps table and the pull-request list
+        # below print the label too, and a stream directory's name is not
+        # validated the way a repository segment is.
+        built.append({"id": scrub(label), "row": row, "flags": flags, "latest": latest})
 
     shown = [
         entry for entry in built
@@ -1011,9 +1018,8 @@ def header_lines(
         )
     if total:
         clean = total - len(attention)
-        cells = 18
-        filled = int(round(cells * clean / float(total)))
-        bar = "█" * filled + "░" * (cells - filled)
+        filled = int(round(HEALTH_BAR_CELLS * clean / float(total)))
+        bar = "█" * filled + "░" * (HEALTH_BAR_CELLS - filled)
         lines.append(
             field(
                 "health",
@@ -1040,7 +1046,11 @@ def load_projection(args: argparse.Namespace) -> tuple[dict, str, str]:
     pod, container, context = args.pod, args.container, args.context
     if not pod:
         targets, context = resolve_target(args.namespace, args.context)
-        pod, found = targets[0]
+        # `--container` alone names the pod too: the first one that has it,
+        # since the sandbox pod sorts first and has no `platform-agent`.
+        pod, found = next(
+            ((name, c) for name, c in targets if c == container), targets[0]
+        )
         container = container or found
         # Only rivals for the same container compete: the gateway beside a
         # sandbox is the fallback, not a second choice worth a note.

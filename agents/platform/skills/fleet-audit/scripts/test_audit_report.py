@@ -17337,6 +17337,16 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertIsNone(self.stored()["issue_number"])
 
+    def test_a_failed_lookup_before_the_ledger_changes_keeps_the_memory(self):
+        # Nothing touched the ledger, so the stored envelope still describes it
+        # exactly; deleting it would cost the next run its memory for nothing.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"pr list": 1}
+        self.assertNotEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertEqual(self.stored()["issue_number"], 42)
+
     def test_a_dry_run_writes_no_report(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(), ["--dry-run"]), 0, self.err)

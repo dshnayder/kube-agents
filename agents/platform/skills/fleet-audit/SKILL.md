@@ -1170,15 +1170,16 @@ report store's record of the open ledger is missing, unreadable, or written for 
 block instead, and a block that is absent or cannot be fetched is the same loss) — the previous
 run's findings are unknowable, so the run announces nothing rather than declaring every live finding
 new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
-that fails after reading the record has already deleted it, so that a record older than the issue is
-never trusted, and the run after it is one of these. It holds nothing it cannot name: the body is
-rewritten from this document, and a findings run leaves the next run a trusted record. A clean run
-never closes: the ledger stays open with a coverage gap saying the store had no record, `partial:
-true` and `silent_ok: false`, and it stays open run after run until a findings run rewrites the body
-or a human who has checked the findings closes the issue — the gap says so, and so should your
-report. Without a manifest it also answers no `/remediate` — it cannot tell a held id from a typo —
-and logs `No stored report and no manifest` to say so; report that as you would any other partial
-run.
+that fails once it has started changing the ledger has already deleted the record, so that a record
+older than the issue is never trusted, and the run after it is one of these. It holds nothing it
+cannot name: the body is rewritten from this document, and a findings run leaves the next run a
+trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
+had no record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
+findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
+your report: the gap names both ways out only when the collector flags nothing, and otherwise names
+what it still flags. Without a manifest it also answers no `/remediate` — it cannot tell a held id
+from a typo — and logs `No stored report and no manifest` to say so; report that as you would any
+other partial run.
 
 ## Red lines
 
