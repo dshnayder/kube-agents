@@ -45,6 +45,7 @@ _MINTER = (
 )
 
 _CR_TEMPLATE = "templates/platform-agent-cr.yaml"
+_MINTER_TEMPLATE = "templates/github-minter.yaml"
 
 _P = "platformAgent.integration."
 
@@ -55,7 +56,6 @@ def _forge(i: int, **fields: str) -> tuple:
 
 def _repo(i: int, **fields: str) -> tuple:
     return tuple(f"{_P}repositories[{i}].{k}={v}" for k, v in fields.items())
-_MINTER_TEMPLATE = "templates/github-minter.yaml"
 
 
 def _render(template: str, *sets: str) -> subprocess.CompletedProcess:
@@ -155,6 +155,28 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertEqual(
             integration["forges"][0]["credentialsRef"], {"name": "token"}
         )
+        # Whole lists, so a host or a namespace the render drops is caught: a
+        # lost override would qualify infra under gke-labs, another repository.
+        integration = _integration(*cases["two forges"])
+        self.assertEqual(
+            integration["forges"],
+            [
+                {"name": "github", "provider": "github", "namespace": "gke-labs"},
+                {"name": "github-ssh", "provider": "github", "host": "ssh.github.com"},
+            ],
+        )
+        integration = _integration(*cases["namespace override"])
+        self.assertEqual(
+            integration["forges"],
+            [{"name": "github", "provider": "github", "namespace": "gke-labs"}],
+        )
+        self.assertEqual(
+            integration["repositories"],
+            [
+                {"forge": "github", "repository": "infra", "role": "gitops",
+                 "namespace": "other-org"},
+            ],
+        )
 
     def test_a_host_github_does_not_serve_fails_rather_than_dropping(self):
         """The alias has no host field. Dropping a foreign host would seed
@@ -215,15 +237,27 @@ class ChartGitIntegrationTest(unittest.TestCase):
                     *_forge(0, name="github"),
                     *_repo(0, forge="github", role="gitops", **repo),
                 )
+        # An scp remote with one path segment names a host, not a bare name: a
+        # namespace would not fix it, so it reaches the operator as the lists
+        # and is refused there, on depth, against the entry written.
+        integration = _integration(
+            *_forge(0, name="github"),
+            *_repo(0, forge="github", repository="git@github.com:infra", role="gitops"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(integration["repositories"][0]["repository"], "git@github.com:infra")
 
     def test_a_declaration_the_alias_would_misname_renders_as_the_lists(self):
-        """A URL, a remote, a deeper path, an owner GitHub would not accept, or
-        a name that is a traversal or a flag, folded into `github.gitRepo`,
-        would be refused against that key; a forge with no namespace and no
-        repository would fold into nothing. Each renders as the lists."""
+        """A repository the operator would refuse for GitHub -- another host, a
+        URL or remote missing its owner, a deeper path, an owner GitHub would
+        not accept, or a name that is a traversal or a flag -- folded into
+        `github.gitRepo` would be refused against that key; a forge with no
+        namespace and no repository would fold into nothing. Each renders as
+        the lists."""
         for repo in (
             "https://gitlab.com/group/project",
-            "git@github.com:gke-labs/infra",
+            "https://github.com/infra",
+            "https://github.com.evil.example/gke-labs/infra",
             "gke-labs/infra/extra",
             "-org/infra",
             "org-/infra",
@@ -244,9 +278,17 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertEqual(integration["forges"][0]["name"], "github")
 
     def test_a_name_github_accepts_still_folds(self):
-        """The tightened fold must not unfold names the operator accepts, a
-        leading dot and an empty credentialsRef name included."""
-        for repo in ("gke-labs/.github", "gke-labs/my_repo.v2", "infra"):
+        """The tightened fold must not unfold what the operator accepts: a
+        leading dot, a github.com URL or remote, and an empty credentialsRef
+        name included."""
+        for repo in (
+            "gke-labs/.github",
+            "gke-labs/my_repo.v2",
+            "infra",
+            "https://github.com/gke-labs/infra",
+            "https://www.github.com/gke-labs/infra.git",
+            "git@github.com:gke-labs/infra",
+        ):
             with self.subTest(repo=repo):
                 integration = _integration(
                     *_forge(0, name="github", namespace="gke-labs"),

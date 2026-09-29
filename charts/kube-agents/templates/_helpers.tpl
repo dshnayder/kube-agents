@@ -647,7 +647,7 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- if eq $repository "None" -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is \"None\", the deprecated github.gitRepo's \"no repository\" value; omit the entry instead" $i) -}}
 {{- end -}}
-{{- if and (not (contains "/" $repository)) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
+{{- if and (not (contains "/" $repository)) (not (contains ":" $repository)) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}
 {{- end -}}

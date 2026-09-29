@@ -466,9 +466,13 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. The alias is still what `install.sh` and the
-  `full-install` Terraform composition write. A declaration the alias can
-  carry renders as `github`, whichever key set it, because `helm upgrade`
-  does not update CRDs; anything else renders as the lists, and on a live
+  `full-install` Terraform composition write. One GitHub forge with no
+  `credentialsRef` and at most one repository, the gitops one, with no
+  namespace of its own, renders as `github`, whichever key set it, because
+  `helm upgrade` does not update CRDs — provided the forge declares a
+  namespace or the repository, and the repository is one the operator would
+  accept for GitHub (`name`, `owner/name`, or a github.com URL or remote
+  naming `owner/name`). Anything else renders as the lists, and on a live
   install the render fails unless the installed CRD has them — apply
   `charts/kube-agents/crds/` first. Enabling `githubMinter` when forges are
   declared and none is GitHub fails the render, since minty issues GitHub App

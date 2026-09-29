@@ -1197,11 +1197,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			continue
 		}
 		// A GitOps repository the list lacks goes first rather than last. The
-		// entries carry no role, and the agent falls back to the first
-		// managed entry when it needs the GitOps repository and nothing else
-		// names it, so appending would leave whichever repository was first
-		// before -- the previous GitOps repository, typically -- answering
-		// for it. An entry already in the list is never moved.
+		// entries carry no role, and the agent's token refresh mints for the
+		// first managed entry when no repository is named, so appending would
+		// leave whichever repository was first before -- the previous GitOps
+		// repository, typically -- the one the token is scoped to. An entry
+		// already in the list is never moved.
 		var front, missing []agentv1alpha1.ManagedRepoEntry
 		for _, se := range specEntries {
 			present := false
@@ -1279,21 +1279,24 @@ func mergeRepoEntries(existing string, front, back []agentv1alpha1.ManagedRepoEn
 
 // sameManagedRepo reports whether two managed_repos URLs name one repository.
 //
-// A string comparison is not enough across an upgrade. The operator used to
-// write an http(s) repository into this ConfigMap verbatim, so an install
-// configured with "https://www.github.com/o/r", an uppercase host, or a URL
-// carrying userinfo has that spelling on disk while the operator now seeds the
-// canonical "https://github.com/o/r". Comparing the strings would append a
-// second entry for the same repository: the agent would sweep it twice, and the
-// old spelling — credentials and all — would stay, since removal is
+// A string comparison is not enough across an upgrade. An entry written by
+// hand, or by an older operator, can spell the repository the operator now
+// seeds canonically as "https://github.com/o/r" with a ".git" suffix, as a
+// remote, or in another case; GitHub treats owner and name case-insensitively,
+// as the declaration-side check in ResolvedIntegration does. Comparing the
+// strings would append a second entry for the same repository: the agent
+// would sweep it twice, and the old spelling would stay, since removal is
 // administrator-driven by design.
 //
-// Canonicalisation goes through the provider both entries name, so alternative
-// spellings of one host ("www.github.com") fold together. Entries of different
-// types, an unregistered type, and values the provider cannot resolve all fall
-// back to the string comparison rather than being treated as equal: this
-// ConfigMap is administrator-writable, so a value the operator does not
-// understand is one it must leave alone.
+// Only an entry on the provider's canonical host, or naming none, counts as
+// present. The agent reads a GitHub entry only on github.com or as the bare
+// owner/name shorthand, so an entry spelled
+// "https://www.github.com/o/r" is one it skips: treating it as the seeded
+// repository would leave the agent with none. Entries of different types, an
+// unregistered type, and values the provider cannot resolve all fall back to
+// the string comparison rather than being treated as equal: this ConfigMap is
+// administrator-writable, so a value the operator does not understand is one
+// it must leave alone.
 func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if existing.URL == seeded.URL {
 		return true
@@ -1305,6 +1308,9 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if err != nil {
 		return false
 	}
+	if parsed, err := agentv1alpha1.ParseRepoRef(existing.URL); err != nil || (parsed.Host != "" && parsed.Host != provider.DefaultHost) {
+		return false
+	}
 	existingRef, err := provider.Resolve("", existing.URL, "")
 	if err != nil {
 		return false
@@ -1313,7 +1319,7 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 	if err != nil {
 		return false
 	}
-	return existingRef == seededRef
+	return existingRef.Host == seededRef.Host && strings.EqualFold(existingRef.Path, seededRef.Path)
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1528,17 +1534,18 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		// Admission and the reconcile-status check both report it; the minter
 		// policy sync is not the place to surface it a third time.
 		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
-			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
-			// An empty primaryOrg accepts every organisation. That is right only
-			// where the declaration has nothing to scope to; where it declares a
-			// github forge or a repository the agent writes to on one and
-			// validation refused all of it, syncing would widen the policies
-			// rather than leave them as they were. Skip the sync until the
-			// declaration is fixed; the reconcile status already reports it.
-			if primaryOrg == "" && minterScopeRefused(resolved) {
-				logger.Info("skipping minter policy sync: validation refuses everything the github organisation would be read from")
+			// An empty primaryOrg accepts every organisation, and a primary
+			// organisation chosen from what validation left standing can be
+			// another forge's or another repository's. Where validation refused
+			// something the organisation is read from, syncing would widen or
+			// move the policies rather than leave them as they were. Skip the
+			// sync until the declaration is fixed; the reconcile status already
+			// reports it.
+			if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+				logger.Info("skipping minter policy sync: validation refuses something the github organisation is read from")
 				return nil
 			}
+			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
 		}
 	}
 
@@ -3464,25 +3471,6 @@ func hostPathDroppedEntryList(entries []string) string {
 		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
 	}
 	return b.String()
-}
-
-// minterScopeRefused reports that a declaration whose primary organisation is
-// empty had one to give: it declares a github forge, and either none of them
-// is valid or a repository the agent writes to is declared on one. Either way
-// validation refused what the organisation would have been read from.
-func minterScopeRefused(resolved *agentv1alpha1.ResolvedIntegration) bool {
-	if resolved == nil {
-		return false
-	}
-	onGitHub := func(f *agentv1alpha1.ResolvedForge) bool {
-		return f != nil && f.Provider == agentv1alpha1.GitProviderGitHub
-	}
-	if resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil {
-		return slices.ContainsFunc(resolved.Forges, onGitHub)
-	}
-	return slices.ContainsFunc(resolved.Repositories, func(r *agentv1alpha1.ResolvedRepository) bool {
-		return r.Role != agentv1alpha1.RepositoryRoleContext && onGitHub(r.Forge)
-	})
 }
 
 // gitProblemList lists ValidateGit's problems under the same budget as the

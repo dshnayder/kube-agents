@@ -28,6 +28,7 @@ package v1alpha1
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -304,8 +305,13 @@ func (ri *ResolvedIntegration) PrimaryForge(provider string) *ResolvedForge {
 // It is empty when none of that is available, which an empty minter primary
 // organisation reads as "accept every organisation". That is legitimate only
 // where there is nothing on the forge to scope: an install may declare no
-// repository at all.
+// repository at all. It is empty too while ScopeRefused(provider) holds, so a
+// refusal leaves the namespace unset rather than moving it to whatever forge
+// or repository validation happened to leave standing.
 func (ri *ResolvedIntegration) PrimaryNamespace(provider string) string {
+	if ri.ScopeRefused(provider) {
+		return ""
+	}
 	forge := ri.PrimaryForge(provider)
 	if forge == nil {
 		return ""
@@ -328,6 +334,42 @@ func (ri *ResolvedIntegration) PrimaryNamespace(provider string) string {
 		}
 	}
 	return ""
+}
+
+// ScopeRefused reports that validation refused something the choice of
+// PrimaryNamespace(provider) depends on: a forge of that provider, or a
+// repository the agent writes to on one. The one declaration a refusal cannot
+// move is every forge of the provider valid and naming the same namespace.
+//
+// The minter prunes every policy outside its primary organisation, and the
+// webhook is off by default. Were the choice made from what validation left
+// standing, a typo in the GitOps forge's namespace, or in the GitOps
+// repository, would move the organisation to another forge's or another
+// repository's and revoke the tokens of the repositories that were working.
+func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
+	if ri == nil {
+		return false
+	}
+	fixed, declared := true, ""
+	for _, f := range ri.Forges {
+		if f.Provider != provider {
+			continue
+		}
+		if !f.valid() {
+			return true
+		}
+		if f.Namespace == "" || (declared != "" && f.Namespace != declared) {
+			fixed = false
+		}
+		declared = f.Namespace
+	}
+	if fixed {
+		return false
+	}
+	_, rejected := ri.check()
+	return slices.ContainsFunc(ri.Repositories, func(r *ResolvedRepository) bool {
+		return rejected[r] && r.Role != RepositoryRoleContext && r.Forge != nil && r.Forge.Provider == provider
+	})
 }
 
 // minNamespacedPathDepth is the shortest path from which a namespace can be

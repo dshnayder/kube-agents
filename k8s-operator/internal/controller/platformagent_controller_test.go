@@ -5122,7 +5122,47 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Errorf("a refused write repository must leave the policies as they were, got %v", updatedCM.Data)
 	}
 
-	// 7. An integration block with no forge declaration at all -- chat only --
+	// 7. A refusal must not move the organisation to what validation left
+	// standing either: another forge's namespace, or a managed repository's
+	// organisation. Either would scope the sync to other-org and prune the
+	// policy of test-org's repository, which was working.
+	for name, integration := range map[string]agentv1alpha1.IntegrationSpec{
+		"a typo in the gitops forge's namespace": {
+			Forges: []agentv1alpha1.ForgeSpec{
+				{Name: "ours", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org_"},
+				{Name: "upstream", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "other-org"},
+			},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "ours", Repository: "repo-1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "upstream", Repository: "other-repo", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+		},
+		"a typo in the gitops repository": {
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "test-org/repo 1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "other-org/other-repo", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+	} {
+		agentMoved := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent-moved", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: integration},
+			},
+		}
+		if err := r.syncGithubTokenMinterConfigMap(ctx, agentMoved, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+			t.Fatalf("%s: syncGithubTokenMinterConfigMap failed: %v", name, err)
+		}
+		if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+			t.Fatalf("%s: failed to get updated ConfigMap: %v", name, err)
+		}
+		if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+			t.Errorf("%s must leave the policies as they were, got %v", name, updatedCM.Data)
+		}
+	}
+
+	// 8. An integration block with no forge declaration at all -- chat only --
 	// resolves to nil, and the sync must still run.
 	agentChatOnly := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-chat-only", Namespace: "test-ns"},
@@ -5956,10 +5996,11 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 	same := []string{
 		"https://github.com/gke-labs/kube-agents",
 		"https://github.com/gke-labs/kube-agents.git",
-		"https://www.github.com/gke-labs/kube-agents",
+		"https://github.com/GKE-Labs/Kube-Agents",
 		"git@github.com:gke-labs/kube-agents.git",
 		"ssh://git@github.com/gke-labs/kube-agents",
 		"http://github.com/gke-labs/kube-agents",
+		"gke-labs/kube-agents",
 	}
 	for _, url := range same {
 		t.Run(url, func(t *testing.T) {
@@ -5977,6 +6018,10 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// and an unresolvable spelling must not collapse into the seeded entry.
 		{Type: "gitlab", URL: "https://gitlab.com/gke-labs/kube-agents"},
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "not a url at all"},
+		// The agent reads a GitHub entry only on github.com, so another spelling
+		// of the host is not the seeded repository: it is one the agent skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh://git@ssh.github.com/gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {

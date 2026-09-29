@@ -955,8 +955,8 @@ platformAgent:
     #     repository: my-org/app
     #     role: managed           # read-write, like the gitops repository
     #   - forge: github
-    #     repository: my-org/runbooks
-    #     namespace: ""           # overrides the forge's namespace
+    #     repository: runbooks
+    #     namespace: other-org    # qualifies a bare name, overriding the forge's namespace
     #     role: context           # read-only reference material
     repositories: []
     # Deprecated: use `forges` and `repositories` above. Kept so existing values files keep working.

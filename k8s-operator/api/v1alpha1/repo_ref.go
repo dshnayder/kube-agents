@@ -43,6 +43,7 @@ package v1alpha1
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -216,6 +217,12 @@ func splitAuthority(rest, scheme string) (string, string, error) {
 	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
 		authority = authority[idx+1:]
 	}
+	// `https:///o/r` stated an authority, an empty one. Reading it as a value
+	// that stated none would hand it to the install's default forge, the
+	// silent fallback this parser exists to remove; repo_ref.py refuses it too.
+	if authority == "" {
+		return "", "", fmt.Errorf("URL %q names no host", rest)
+	}
 
 	if strings.HasPrefix(authority, ipv6Open) {
 		end := strings.Index(authority, ipv6Close)
@@ -229,17 +236,24 @@ func splitAuthority(rest, scheme string) (string, string, error) {
 	if !found {
 		return host, path, nil
 	}
-	// Digits after the colon are a port, unless reading them as one leaves a
-	// single path segment on a scheme that also writes the scp form: then
-	// `ssh://git@github.com:12345678/app` names the numeric owner 12345678,
-	// not port 12345678 and a bare name the namespace would requalify.
-	if repoPortRegex.MatchString(port) && (port == "" || !scpCapableSchemes[scheme] || strings.Count(strings.Trim(path, pathSeparator), pathSeparator) > 0) {
+	// Digits after the colon are a port, as git reads them, unless they are
+	// more than a port can be on a scheme that also writes the scp form: then
+	// `ssh://git@github.com:12345678/app` names the numeric owner 12345678.
+	// `ssh://git@github.com:22/infra` is port 22 and a path missing its owner,
+	// which the provider's depth check refuses, not owner 22.
+	if repoPortRegex.MatchString(port) && (port == "" || !scpCapableSchemes[scheme] || isPortNumber(port)) {
 		return host, path, nil
 	}
 	if !scpCapableSchemes[scheme] {
 		return "", "", fmt.Errorf("invalid port %q in %q", port, authority)
 	}
 	return host, port + path, nil
+}
+
+// isPortNumber reports whether a run of digits fits in a TCP port.
+func isPortNumber(digits string) bool {
+	_, err := strconv.ParseUint(digits, 10, 16)
+	return err == nil
 }
 
 // splitSCPRemote recognises the schemeless `[user@]host:path` remote form. A

@@ -42,7 +42,15 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		// A numeric owner in the scp-with-scheme form: read as a port it would
 		// leave a bare name for the namespace to requalify into another repository.
 		{input: "ssh://git@github.com:12345678/kube-agents", host: "github.com", path: "12345678/kube-agents"},
+		{input: "ssh://git@github.com:65536/kube-agents", host: "github.com", path: "65536/kube-agents"},
 		{input: "ssh://git@github.com:22/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		// Digits a port can hold are one, as git reads them, even where that
+		// leaves the path missing its owner: the provider refuses it on depth.
+		{input: "ssh://git@github.com:22/infra", host: "github.com", path: "infra"},
+		{input: "ssh://git@github.com:65535/infra", host: "github.com", path: "infra"},
+		// An empty authority stated a host, and an empty one is none.
+		{input: "https:///gke-labs/kube-agents", err: true},
+		{input: "ssh://git@/gke-labs/kube-agents", err: true},
 		// The whole point: another forge's host survives parsing as that host,
 		// rather than being discarded so the remaining slashes can be counted.
 		{input: "git@gitlab.com:group/subgroup/project.git", host: "gitlab.com", path: "group/subgroup/project"},
@@ -112,6 +120,9 @@ func TestGitHubResolveDoesNotQualifyAHostedSingleSegment(t *testing.T) {
 		"github.com/infra",
 		"git@github.com:infra",
 		"ssh://github.com/infra",
+		"ssh://git@github.com:22/infra",
+		"https:///infra",
+		"https:///gke-labs/infra",
 	} {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
@@ -243,7 +254,7 @@ func TestNonNumericPortIsAnScpPathOnlyUnderGitAndSsh(t *testing.T) {
 // validation dispatches rather than applying GitHub's rules under another name:
 // its namespace grammar admits dots and underscores that GitHub's rejects, and
 // its paths nest, which GitHub's do not. Registering it for real waits on the
-// agent-side provider that would have to honour it (§9 step 5).
+// agent-side provider that would have to honour it.
 var nestedProvider = &GitProvider{
 	Name:               "nested",
 	DefaultHost:        "nested.example",
@@ -315,6 +326,37 @@ func ghForge(name, namespace string) ForgeSpec {
 
 func repo(forge, repository, role string) RepositorySpec {
 	return RepositorySpec{Forge: forge, Repository: repository, Role: role}
+}
+
+// A repository's own namespace qualifies its bare name ahead of the forge's.
+// The rows that set one elsewhere are refused before it is ever consulted.
+func TestARepositoryNamespaceOverridesTheForges(t *testing.T) {
+	override := repo("github", "runbooks", RepositoryRoleContext)
+	override.Namespace = "other-org"
+	spec := &IntegrationSpec{
+		Forges:       []ForgeSpec{ghForge("github", "gke-labs")},
+		Repositories: []RepositorySpec{repo("github", "infra", RepositoryRoleGitOps), override},
+	}
+	resolved, err := spec.ResolveGit()
+	if err != nil {
+		t.Fatalf("ResolveGit() = %v", err)
+	}
+	for role, want := range map[string]string{
+		RepositoryRoleGitOps:  "https://github.com/gke-labs/infra",
+		RepositoryRoleContext: "https://github.com/other-org/runbooks",
+	} {
+		accepted := resolved.Accepted(role)
+		if len(accepted) != 1 {
+			t.Fatalf("Accepted(%s) = %d repositories, expected 1", role, len(accepted))
+		}
+		entry, err := accepted[0].ManagedRepoEntry()
+		if err != nil {
+			t.Fatalf("ManagedRepoEntry(%s) = %v", role, err)
+		}
+		if entry.URL != want {
+			t.Errorf("%s repository seeds %q, expected %q", role, entry.URL, want)
+		}
+	}
 }
 
 func TestResolveGitFoldsTheDeprecatedAlias(t *testing.T) {
@@ -523,20 +565,37 @@ func TestPrimaryNamespace(t *testing.T) {
 			Forges:       []ForgeSpec{{Name: "github"}},
 			Repositories: []RepositorySpec{repo("github", "kubernetes/kubernetes", RepositoryRoleContext)}},
 			want: ""},
-		{name: "not inferred from a gitops repository validation refuses", spec: &IntegrationSpec{
+		// A refusal leaves the namespace unset rather than moving it to what
+		// validation left standing: the minter would prune the policies of the
+		// repositories that were working.
+		{name: "a refused gitops repository does not move it to a managed repository's", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{{Name: "github"}},
 			Repositories: []RepositorySpec{
-				repo("github", "https://x y@github.com/acme/app", RepositoryRoleGitOps),
-				repo("github", "gke-labs/infra", RepositoryRoleManaged),
+				repo("github", "my-org/in fra", RepositoryRoleGitOps),
+				repo("github", "other-org/tool", RepositoryRoleManaged),
 			}},
-			want: "gke-labs"},
-		{name: "a refused gitops repository does not pin the forge", spec: &IntegrationSpec{
+			want: ""},
+		{name: "a refused gitops repository does not move it to another forge's", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{{Name: "a"}, ghForge("b", "acme")},
 			Repositories: []RepositorySpec{
 				repo("a", "https://x y@github.com/acme/app", RepositoryRoleGitOps),
 				repo("b", "acme/lib", RepositoryRoleManaged),
 			}},
-			want: "acme"},
+			want: ""},
+		{name: "a refused gitops repository cannot move a namespace every forge declares", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{ghForge("github", "gke-labs")},
+			Repositories: []RepositorySpec{
+				repo("github", "in fra", RepositoryRoleGitOps),
+				repo("github", "app", RepositoryRoleManaged),
+			}},
+			want: "gke-labs"},
+		{name: "a refused context repository does not count", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "gke-labs/infra", RepositoryRoleGitOps),
+				repo("github", "kubernetes/in fra", RepositoryRoleContext),
+			}},
+			want: "gke-labs"},
 		{name: "a forge with a namespace wins over one without", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{{Name: "a"}, ghForge("b", "acme")}},
 			want: "acme"},
@@ -554,13 +613,13 @@ func TestPrimaryNamespace(t *testing.T) {
 			Forges:       []ForgeSpec{ghForge("github", "platform_team")},
 			Repositories: []RepositorySpec{repo("github", "https://github.com/gke-labs/infra", RepositoryRoleGitOps)}},
 			want: ""},
-		{name: "an invalid gitops forge falls through to the next valid one", spec: &IntegrationSpec{
-			Forges: []ForgeSpec{ghForge("bad", "my.org"), ghForge("good", "gke-labs")},
+		{name: "an invalid gitops forge does not move it to the next valid one", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{ghForge("ours", "gke-labs_"), ghForge("upstream", "kubernetes")},
 			Repositories: []RepositorySpec{
-				repo("bad", "infra", RepositoryRoleGitOps),
-				repo("good", "app", RepositoryRoleManaged),
+				repo("ours", "infra", RepositoryRoleGitOps),
+				repo("upstream", "kubernetes", RepositoryRoleContext),
 			}},
-			want: "gke-labs"},
+			want: ""},
 		{name: "alias inferred", spec: &IntegrationSpec{GitHub: &GitHubSpec{
 			GitRepo: "git@github.com:gke-labs/kube-agents.git"}}, want: "gke-labs"},
 		{name: "unresolvable", spec: &IntegrationSpec{GitHub: &GitHubSpec{
