@@ -39,6 +39,10 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		// "port" goes back onto the front of the path rather than being rejected.
 		{input: "ssh://git@github.com:gke-labs/kube-agents.git", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "https://github.com:443/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		// A numeric owner in the scp-with-scheme form: read as a port it would
+		// leave a bare name for the namespace to requalify into another repository.
+		{input: "ssh://git@github.com:12345678/kube-agents", host: "github.com", path: "12345678/kube-agents"},
+		{input: "ssh://git@github.com:22/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
 		// The whole point: another forge's host survives parsing as that host,
 		// rather than being discarded so the remaining slashes can be counted.
 		{input: "git@gitlab.com:group/subgroup/project.git", host: "gitlab.com", path: "group/subgroup/project"},
@@ -92,6 +96,25 @@ func TestGitHubResolveRefusesAnotherForgesHost(t *testing.T) {
 	} {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.Resolve("", repo, ""); err == nil {
+				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref)
+			}
+		})
+	}
+}
+
+// A value that names a host and one segment is a URL missing its repository,
+// not a bare name: qualifying it would turn an organisation URL pasted as
+// https://github.com/gke-labs into gke-labs/gke-labs.
+func TestGitHubResolveDoesNotQualifyAHostedSingleSegment(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, repo := range []string{
+		"https://github.com/gke-labs",
+		"github.com/infra",
+		"git@github.com:infra",
+		"ssh://github.com/infra",
+	} {
+		t.Run(repo, func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
 				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref)
 			}
 		})
@@ -489,10 +512,24 @@ func TestPrimaryNamespace(t *testing.T) {
 			Forges:       []ForgeSpec{{Name: "github"}},
 			Repositories: []RepositorySpec{repo("github", "https://github.com/gke-labs/kube-agents.git", RepositoryRoleGitOps)}},
 			want: "gke-labs"},
-		{name: "not inferred from a managed repository", spec: &IntegrationSpec{
+		{name: "inferred from a managed repository when there is no gitops one", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "gke-labs/kube-agents", RepositoryRoleManaged),
+				repo("github", "other/lib", RepositoryRoleManaged),
+			}},
+			want: "gke-labs"},
+		{name: "not inferred from a context repository", spec: &IntegrationSpec{
 			Forges:       []ForgeSpec{{Name: "github"}},
-			Repositories: []RepositorySpec{repo("github", "gke-labs/kube-agents", RepositoryRoleManaged)}},
+			Repositories: []RepositorySpec{repo("github", "kubernetes/kubernetes", RepositoryRoleContext)}},
 			want: ""},
+		{name: "not inferred from a gitops repository validation refuses", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "github"}},
+			Repositories: []RepositorySpec{
+				repo("github", "https://x y@github.com/acme/app", RepositoryRoleGitOps),
+				repo("github", "gke-labs/infra", RepositoryRoleManaged),
+			}},
+			want: "gke-labs"},
 		{name: "the gitops forge wins over declaration order", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{ghForge("upstream", "kubernetes"), ghForge("ours", "gke-labs")},
 			Repositories: []RepositorySpec{

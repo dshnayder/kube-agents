@@ -229,7 +229,11 @@ func splitAuthority(rest, scheme string) (string, string, error) {
 	if !found {
 		return host, path, nil
 	}
-	if repoPortRegex.MatchString(port) {
+	// Digits after the colon are a port, unless reading them as one leaves a
+	// single path segment on a scheme that also writes the scp form: then
+	// `ssh://git@github.com:12345678/app` names the numeric owner 12345678,
+	// not port 12345678 and a bare name the namespace would requalify.
+	if repoPortRegex.MatchString(port) && (port == "" || !scpCapableSchemes[scheme] || strings.Count(strings.Trim(path, pathSeparator), pathSeparator) > 0) {
 		return host, path, nil
 	}
 	if !scpCapableSchemes[scheme] {

@@ -259,6 +259,13 @@ spec:
   nothing reports it. The alias carries everything such a declaration says
   except the host, and every host GitHub serves is the same forge, which
   kube-agents.forgeProviders has already checked.
+
+  Only a plain `name` or `owner/name` repository folds, and only a
+  declaration that says something: a URL, a remote or a deeper path would be
+  refused by the operator against `github.gitRepo`, a key the values file
+  never set, and a forge with neither a namespace nor a repository would fold
+  into no key at all. Those render as the lists, so the refusal names the
+  entry the administrator wrote.
   */}}
   {{- $asAlias := false }}
   {{- if eq (len $forges) 1 }}
@@ -269,7 +276,13 @@ spec:
   {{- $onlyGitOps = false }}
   {{- end }}
   {{- end }}
-  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not $f.credentialsRef) (le (len $repos) 1) $onlyGitOps }}
+  {{- $plain := true }}
+  {{- $repo := "" }}
+  {{- with $repos }}
+  {{- $repo = (first .).repository | default "" }}
+  {{- $plain = regexMatch "^([A-Za-z0-9-]+/)?[A-Za-z0-9._-]+$" $repo }}
+  {{- end }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not $f.credentialsRef) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
   {{- end }}
   {{- $aliasOrg := "" }}
   {{- $aliasRepo := "" }}

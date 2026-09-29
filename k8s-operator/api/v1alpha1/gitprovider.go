@@ -241,9 +241,13 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 		return RepoRef{}, fmt.Errorf("repository %q names host %q, which is not a %s host",
 			repository, ref.Host, p.Name)
 	}
+	// Only a bare name is qualified by the namespace. A value that names a
+	// host and one segment, such as an organisation URL, is a URL missing its
+	// repository, and the depth check below refuses it as that.
+	bare := ref.Host == ""
 	ref.Host = canonical
 
-	if !strings.Contains(ref.Path, pathSeparator) {
+	if bare && !strings.Contains(ref.Path, pathSeparator) {
 		trimmed := strings.TrimSpace(namespace)
 		if trimmed == "" {
 			return RepoRef{}, fmt.Errorf("repository %q names no namespace and none was declared", repository)

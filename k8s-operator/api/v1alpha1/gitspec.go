@@ -280,9 +280,16 @@ func (ri *ResolvedIntegration) PrimaryForge(provider string) *ResolvedForge {
 }
 
 // PrimaryNamespace is the namespace of PrimaryForge(provider): as declared, or
-// else the one the GitOps repository implies when it is on that forge. It is
-// empty when neither is available, which is legitimate: an install may declare
-// no repository at all.
+// else the one the first accepted repository the agent writes to on that forge
+// implies, the GitOps repository before the managed ones. Only accepted
+// repositories count, so a value validation refuses never becomes GITHUB_ORG.
+// Context repositories do not count: reading another organisation's repository
+// is what they are for.
+//
+// It is empty when none of that is available, which an empty minter primary
+// organisation reads as "accept every organisation". That is legitimate only
+// where there is nothing on the forge to scope: an install may declare no
+// repository at all.
 func (ri *ResolvedIntegration) PrimaryNamespace(provider string) string {
 	forge := ri.PrimaryForge(provider)
 	if forge == nil {
@@ -291,19 +298,21 @@ func (ri *ResolvedIntegration) PrimaryNamespace(provider string) string {
 	if forge.Namespace != "" {
 		return forge.Namespace
 	}
-	gitops := ri.GitOps()
-	if gitops == nil || gitops.Forge != forge {
-		return ""
+	for _, role := range []string{RepositoryRoleGitOps, RepositoryRoleManaged} {
+		for _, r := range ri.Accepted(role) {
+			if r.Forge != forge {
+				continue
+			}
+			ref, err := r.Resolve()
+			if err != nil {
+				continue
+			}
+			if segments := ref.Segments(); len(segments) >= minNamespacedPathDepth {
+				return strings.Join(segments[:len(segments)-1], pathSeparator)
+			}
+		}
 	}
-	ref, err := gitops.Resolve()
-	if err != nil {
-		return ""
-	}
-	segments := ref.Segments()
-	if len(segments) < minNamespacedPathDepth {
-		return ""
-	}
-	return strings.Join(segments[:len(segments)-1], pathSeparator)
+	return ""
 }
 
 // minNamespacedPathDepth is the shortest path from which a namespace can be

@@ -5097,6 +5097,18 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
 		t.Errorf("an invalid forge namespace must leave the policies as they were, got %v", updatedCM.Data)
 	}
+
+	// 6. An integration block with no forge declaration at all -- chat only --
+	// resolves to nil, and the sync must still run.
+	agentChatOnly := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-chat-only", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{Slack: &agentv1alpha1.SlackSpec{}},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentChatOnly, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a chat-only integration failed: %v", err)
+	}
 }
 
 // Each refused repository adds a problem that can quote up to 2048 characters,

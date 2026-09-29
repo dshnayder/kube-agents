@@ -1490,7 +1490,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 			// every organisation, which would widen the policies rather than
 			// leave them as they were. Skip the sync until the declaration is
 			// fixed; the reconcile status already reports it.
-			if resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil && slices.ContainsFunc(resolved.Forges, func(f *agentv1alpha1.ResolvedForge) bool {
+			if resolved != nil && resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil && slices.ContainsFunc(resolved.Forges, func(f *agentv1alpha1.ResolvedForge) bool {
 				return f.Provider == agentv1alpha1.GitProviderGitHub
 			}) {
 				logger.Info("skipping minter policy sync: every declared github forge is invalid")

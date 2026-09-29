@@ -216,6 +216,26 @@ class ChartGitIntegrationTest(unittest.TestCase):
                     *_repo(0, forge="github", role="gitops", **repo),
                 )
 
+    def test_a_declaration_the_alias_would_misname_renders_as_the_lists(self):
+        """A URL, a remote or a deeper path folded into `github.gitRepo` would
+        be refused against that key; a forge with no namespace and no
+        repository would fold into nothing. Each renders as the lists."""
+        for repo in (
+            "https://gitlab.com/group/project",
+            "git@github.com:gke-labs/infra",
+            "gke-labs/infra/extra",
+        ):
+            with self.subTest(repo=repo):
+                integration = _integration(
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository=repo, role="gitops"),
+                )
+                self.assertNotIn("github", integration)
+                self.assertEqual(integration["repositories"][0]["repository"], repo)
+        integration = _integration(*_forge(0, name="github", host="ssh.github.com"))
+        self.assertNotIn("github", integration)
+        self.assertEqual(integration["forges"][0]["name"], "github")
+
     def test_declaring_both_spellings_fails_the_render(self):
         result = _render(
             _CR_TEMPLATE,
