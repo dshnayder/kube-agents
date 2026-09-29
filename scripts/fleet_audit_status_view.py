@@ -488,6 +488,8 @@ def load_roster(path: Path) -> tuple[dict[str, dict], str]:
         return {}, _oneline(exc)
     # A bare list of jobs or an object carrying them under `jobs`, as
     # scripts/generate_docs.py's reader accepts; any other shape is unreadable.
+    if isinstance(doc, dict) and "jobs" not in doc:
+        return {}, "an object without a `jobs` key"
     jobs = doc.get("jobs") if isinstance(doc, dict) else doc
     if jobs is None:
         jobs = []
@@ -721,12 +723,18 @@ def held_open(latest: dict) -> bool:
 
 def ledger_count(latest: dict) -> int | None:
     """The findings the ledger lists after this run: this run's own, or the
-    carried ones when it held the ledger open. Null where that is unknown --
-    a hold over a lost memory stores `current: 0` because the store does not
-    know what the issue lists."""
+    carried ones when it held the ledger open. Null where that is unknown.
+
+    A hold over a lost memory is the unknown case, and `finish` marks it by
+    storing no `issue_number`: it does not know what the issue lists, so its
+    `current: 0` is not a count. A hold over a trusted memory names the issue,
+    and there a zero is real -- a coverage issue opened by a clean run over a
+    gap lists no finding, and the next clean run over a gap holds it."""
     if held_open(latest):
         carried = latest.get("current")
-        return carried if isinstance(carried, int) and carried else None
+        if latest.get("issue_number") is None or not isinstance(carried, int):
+            return None
+        return carried
     findings = latest.get("findings")
     return findings if isinstance(findings, int) else None
 

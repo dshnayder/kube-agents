@@ -756,11 +756,11 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("SCOPE", out)
         self.assertNotIn("16/18", out)
 
-    def held_open_clean(self, current=21):
+    def held_open_clean(self, current=21, issue_number=12):
         """The PR's live shape: a clean run that left the ledger open over the
         previous run's findings without rewriting it."""
         return latest(
-            audit_id="cost-audit", status="CLEAN", ledger_held_open=True,
+            audit_id="cost-audit", status="CLEAN", ledger_held_open=True, issue_number=issue_number,
             findings=0, critical=0, current=current, prs_opened=[], new=0, resolved=0,
         )
 
@@ -777,9 +777,18 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("all clear", out)
 
     def test_a_hold_over_a_lost_memory_is_unknown_not_zero(self):
-        streams = {"cost-audit": stream(last=self.held_open_clean(current=0))}
+        """`finish` stores no issue for a hold whose memory was lost."""
+        streams = {"cost-audit": stream(last=self.held_open_clean(current=0, issue_number=None))}
         row = next(r for r in self.body_rows(self.render(streams)) if "cost-audit" in r)
         self.assertIn("held ?", row)
+
+    def test_a_trusted_hold_of_an_empty_ledger_is_zero_not_unknown(self):
+        """A coverage issue lists no finding; held open over a trusted memory
+        of it, the store knows that zero."""
+        streams = {"cost-audit": stream(last=self.held_open_clean(current=0))}
+        row = next(r for r in self.body_rows(self.render(streams)) if "cost-audit" in r)
+        self.assertIn("0 held", row)
+        self.assertNotIn("held ?", row)
 
     def test_a_held_run_with_no_gap_needs_attention(self):
         """HELD is `partial: false` when there is no coverage gap, and sets no
@@ -875,7 +884,8 @@ class TestContextDiscovery(unittest.TestCase):
         rc, _, err = run_main(["--roster", NO_ROSTER, "--context", "hub-a"], fake)
         self.assertEqual(rc, 2)
         self.assertIn("--context hub-b", err)
-        self.assertNotIn("more than one context", err)
+        self.assertIn("on another context:", err)
+        self.assertNotIn("other contexts", err)
 
     def test_no_context_anywhere_says_so_rather_than_offering_nothing(self):
         fake = FakeKubectl(pods=(), contexts=("hub-a",), current="managed")
@@ -1239,7 +1249,7 @@ class TestRosterLoading(unittest.TestCase):
         self.assertIn("cost-audit", roster)
 
     def test_a_roster_of_another_shape_reports_why(self):
-        for text in ("42", '"jobs"', '{"jobs": {"a": 1}}', "[1, 2]"):
+        for text in ("42", '"jobs"', '{"jobs": {"a": 1}}', "[1, 2]", "{}", '{"job": []}'):
             with self.subTest(text=text), TemporaryDirectory() as tmp:
                 path = Path(tmp) / "jobs.json"
                 path.write_text(text, encoding="utf-8")
