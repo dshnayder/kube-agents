@@ -2223,6 +2223,8 @@ def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
     res = _pr_check(reuses_spent_branch=True).verify(5.0)
     assert res.status == "pass", res.reason
     assert "closed pull request had used" in res.reason
+    # The head ref comes from the pulls payload `_head_push` already read.
+    assert [url for url, _ in github.calls].count(_pr_api("pulls")) == 1
 
 
 def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
@@ -2279,6 +2281,11 @@ def _route_patterns() -> list[str]:
         "python3 credential_proxy_client.py gh pr close 5",
         'python3 credential_proxy_client.py --endpoint "$CREDENTIAL_PROXY_URL" gh pr close 5',
         "python3 credential_proxy_client.py --endpoint=http://127.0.0.1:8080 git push origin :b",
+        "/opt/credential-proxy/bin/gh pr close 5",
+        "/usr/bin/gh pr close 5",
+        "cd /workspace/infra && ./gh pr close 5",
+        "/opt/credential-proxy/bin/git push origin :platform-agent/fix",
+        "timeout 60 /usr/bin/git push origin :platform-agent/fix",
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2294,6 +2301,9 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         "git -C /workspace/infra commit -am 'scale web'",
         "git status && git log --oneline -3",
         "python3 credential_proxy_client.py kubectl get pods -n web",
+        # The sanctioned local git, which has no route to a forge.
+        "/opt/vcs/libexec/git -C /workspace/infra push origin platform-agent/fix",
+        "cd /workspace/infra && /opt/vcs/libexec/git fetch origin",
     ],
 )
 def test_the_spent_branch_route_check_passes_the_verbs(command):
