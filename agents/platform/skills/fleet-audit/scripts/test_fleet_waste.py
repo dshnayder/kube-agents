@@ -2129,6 +2129,14 @@ class OverrequestResizeIsANoOpTest(unittest.TestCase):
         self.assertIn("cpu is already at the 50m/64Mi sizing floor", excerpt)
         self.assertNotIn("in use", excerpt)
 
+    def test_a_dimension_below_the_floor_is_not_described_as_on_it(self):
+        # Idle and not reclaimable also covers a 10m request, and "at the
+        # 50m/64Mi floor" would tell the reviewer it declares 50m.
+        pod = self.pod(cpu_req="10m", mem_req="8Gi")
+        excerpt = self.hits([pod], {("default", "api-1"): (0.001, 100.0)})[0]["excerpt"]
+        self.assertIn("cpu is already below the 50m/64Mi sizing floor", excerpt)
+        self.assertNotIn("at the 50m/64Mi", excerpt)
+
     def test_a_dimension_genuinely_in_use_still_says_so(self):
         # The control for the branch above: memory at 86% of its request is
         # excluded for the original reason, and the original wording holds.
@@ -2303,6 +2311,11 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("requests 0.050 vCPU / 64 MiB", hits[0]["excerpt"])
         self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
         self.assertIn("no resize can reclaim", hits[0]["excerpt"])
+
+    def test_a_sub_floor_controller_is_not_described_as_on_the_floor(self):
+        hits = self.hits({(self.NS, self.POD): (0.001, 3.0)}, pods=[self.pod(cpu_req="10m", mem_req="32Mi")])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("already at or below the 50m/64Mi floor", hits[0]["excerpt"])
 
     def test_the_partition_with_overrequest_is_exact(self):
         """Neither check may stay silent on a controller, nor both speak.

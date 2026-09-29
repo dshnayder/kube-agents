@@ -2717,6 +2717,16 @@ def _resize_shrinks_request(
     return request_per_replica - target > max(request_per_replica, target) * 1e-9
 
 
+def _below_resize_floor(request_total: float, replicas: int, *, floor: float) -> bool:
+    """Whether the per-replica request sits under §3.1's resize floor, with
+    `_resize_shrinks_request`'s tolerance so a three-way split of `50m` is on
+    the floor rather than a hair beside it."""
+    if replicas <= 0:
+        return False
+    request_per_replica = request_total / replicas
+    return floor - request_per_replica > max(request_per_replica, floor) * 1e-9
+
+
 def _is_guaranteed(entry: dict) -> bool:
     """Whether this controller's pods are `Guaranteed` QoS: requests == limits.
 
@@ -2974,6 +2984,14 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 why = "the namespace LimitRange default, which is fixed in the LimitRange rather than resized here"
             elif not other_req_total:
                 why = "not requested, so there is nothing to resize"
+            elif other_unused and _below_resize_floor(
+                other_req_total,
+                replicas,
+                floor=OVERREQUEST_RESIZE_FLOOR_VCPU if other == "cpu" else OVERREQUEST_RESIZE_FLOOR_MIB,
+            ):
+                # Idle and not reclaimable covers a request under the floor as
+                # well as one on it, and "at the floor" is false of the first.
+                why = "already below the 50m/64Mi sizing floor, where a resize would raise it rather than reduce it"
             elif other_unused:
                 why = "already at the 50m/64Mi sizing floor and cannot be reduced further"
             else:
@@ -3313,11 +3331,11 @@ def check_idle_workload(
             else "The request is under the 100m / 128Mi a resize is worth "
             "proposing for, so no resize is offered"
             if cpu_shrinks or mem_shrinks
-            else "Every dimension is already at the 50m/64Mi floor or is the "
+            else "Every dimension is already at or below the 50m/64Mi floor or is the "
             "namespace LimitRange default, which is fixed in the LimitRange "
             "rather than here, so no resize of this workload can reclaim any of it"
             if defaulted
-            else "Every dimension is already at the 50m/64Mi floor, so no "
+            else "Every dimension is already at or below the 50m/64Mi floor, so no "
             "resize can reclaim any of it"
         )
         excerpt = (
