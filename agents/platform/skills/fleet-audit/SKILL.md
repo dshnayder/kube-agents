@@ -247,8 +247,8 @@ finding the collector still emits: `resolved_because` does not release it, and o
 longer emitting it or a `declared` entry does. Where the store has never held the ledger, `start`
 reads the issue's hidden block once instead. Empty when there is no open ledger, or the store's
 record of it is missing, unreadable, for another issue, or lists ids that differ from the issue's
-hidden block, or the store never held it and the issue has no readable block (`start` says so on
-stderr).
+hidden block, or the issue listing returned no body to check it against, or the store never held it
+and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream

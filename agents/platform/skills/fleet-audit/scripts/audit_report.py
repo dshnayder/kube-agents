@@ -1995,13 +1995,15 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
 
 
 def invalidate_report_memory(audit_id: str, repo: str) -> None:
-    """Drop `latest.json` before this run changes the ledger it describes.
+    """Drop `latest.json` around a change to the ledger it describes.
 
-    From here until `write_report` the stored memory is about to be wrong: a
-    run killed after it edits the issue — the terminal's timeout is enough —
-    would leave a trusted envelope describing the run before, and the next
-    delta would be computed against it. Gone, it is a lost memory, which holds
-    the ledger open rather than miscounting. The ring is left alone.
+    Callers that rewrite the body call it just before: from there until
+    `write_report` the stored memory is about to be wrong, and a run killed
+    after it edits the issue — the terminal's timeout is enough — would leave
+    a trusted envelope describing the run before. Gone, it is a lost memory,
+    which holds the ledger open rather than miscounting. The clean close calls
+    it just after, because a close leaves the body as it was. The ring is left
+    alone.
     """
     try:
         (reports_dir_for(audit_id, repo) / "latest.json").unlink()

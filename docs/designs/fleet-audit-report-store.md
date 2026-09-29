@@ -66,9 +66,11 @@ rewrites the ledger: the findings rewrite and the coverage issue a clean run ope
 between that call and writing the store leaves no envelope rather than one describing the run before.
 The clean close is the exception, and `finish` deletes the file just after it: a close leaves the
 body as it was, so until it lands the stored memory is still exactly the open ledger, and a close
-that fails leaves the memory in place. A run killed between the close and the delete leaves a record
-naming an issue that is now closed, which no later run trusts, since the trust check needs that issue
-to be the open ledger. A lookup that fails earlier, or a clean run held open that only comments, has
+that fails leaves the memory in place. A run killed between the close and the delete, or a close that
+lands on GitHub but reports failure, leaves a record naming an issue that is now closed. A later run
+does not trust it while that issue stays closed, since the trust check needs it to be the open
+ledger; a reader quoting it shows the last findings run as latest until the next run rewrites it.
+Deleting first would trade that for a lost memory on every close that genuinely fails. A lookup that fails earlier, or a clean run held open that only comments, has
 changed nothing the envelope describes and leaves the memory in place. The ring
 is left alone, and the readers answer from its newest entry with `latest_missing: true`: the stream
 did run, and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a
