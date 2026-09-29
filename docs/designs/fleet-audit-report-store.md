@@ -58,8 +58,9 @@ ids.
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
-quote it as current. An absent store is unknowable, and every reader handles that; a stale one is
-indistinguishable from a fresh one. For the same reason `finish` deletes `latest.json` just before
+quote it as current. An absent store is unknowable, and every reader handles that; a stale one
+passes the issue and repository checks, and only the comparison against the live block in §4 tells
+it from a fresh one. For the same reason `finish` deletes `latest.json` just before
 each call that changes what the ledger says: the findings rewrite, the clean close, and the coverage
 issue a clean run opens. A run killed between that call and writing the store leaves no envelope
 rather than one describing the run before. A lookup that fails earlier, or a clean run held open that
@@ -102,6 +103,18 @@ The previous run's memory is the `latest.json` in this run's repository director
 The path already selects the repository; the envelope's own `repo` is checked as well, so a file
 moved or copied between directories is not trusted for a ledger it was not written for.
 
+Those two say the record is about this ledger, not that it is the latest word on it. Anything that
+rewrites the ledger without writing this store leaves a record that passes both: a `finish` from an
+image that predates the store, during a revert or a mixed rollout, or the other pod's copy after the
+shell sandbox is toggled (§3). Joined against it, the delta would re-announce what that window added
+and resolved, and a clean run could close over findings only the window reported. So the record is
+also checked against the ledger itself: `find_existing_issue` lists the open issue with its body, and
+the record is trusted only when that body's hidden block names the same ids as the stored
+`ledger_body`'s. The block rather than the whole body, because it is what every join reads and it
+survives the newline and prose edits GitHub or a person can make around it. The listed body is a
+check on the store, never a memory in its place: a mismatch, or a listing that returned no body, is
+a lost memory, and the store is not re-seeded from the issue.
+
 The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
 stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did
 when the body came from GitHub, so a scheme bump costs what it always cost.
@@ -124,7 +137,8 @@ last run published, so it stands in for the store this once; the run writes the 
 later run reads that.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
-its `latest.json` is missing, unreadable, or written for another issue — or there is no store and
+its `latest.json` is missing, unreadable, written for another issue, or lists ids the ledger's
+block no longer does — or there is no store and
 the body has no readable block or cannot be fetched — the memory is **lost**, unknowable rather than
 empty:
 
@@ -205,7 +219,8 @@ not grow two parsers of the same files.
   telemetry into the user's repository, a commit per stream per day, and a network read is what the
   store exists to remove.
 - **Keeping the ledger read-back as a fallback.** Rejected in §4; the one read left seeds a store
-  that has never existed and is never consulted beside one.
+  that has never existed and is never consulted beside one. The body `find_existing_issue` lists
+  only vouches for a store, by its id block, and never replaces one.
 - **Removing the hidden block from bodies.** Breaks the bench verifiers and every external consumer
   of the published interface; only its read-back was worth retiring.
 - **Giving the Planning Agent file tools** to skip a delegation hop. It would turn the one profile

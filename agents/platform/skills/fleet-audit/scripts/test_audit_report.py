@@ -452,6 +452,9 @@ class Recorder:
         # branch to describe a repository that is not on `main`, or to None to
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
+        # (audit, repo, issue number) -> the body a `gh issue list` entry that
+        # names none should carry. None leaves listings exactly as replied.
+        self.listed_body = None
 
     def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
         self.calls.append(list(cmd))
@@ -474,8 +477,33 @@ class Recorder:
         self._simulate_clone(cmd)
         for key, payload in self.replies.items():
             if key in joined:
-                return CompletedProcess(cmd, 0, payload, "")
+                return CompletedProcess(cmd, 0, self._with_listed_bodies(cmd, payload), "")
         return CompletedProcess(cmd, 0, "", "")
+
+    def _with_listed_bodies(self, cmd, payload):
+        """Give each issue a ledger listing names the body the store last wrote.
+
+        `finish` checks its stored memory against the body `gh issue list`
+        returns (`memory_matches_ledger`). A test that describes a listing
+        without bodies is describing a ledger nobody rewrote behind the store's
+        back, so each entry without one gets the body the store holds for it.
+        A test about a rewritten ledger names the body itself.
+        """
+        if cmd[:3] != ["gh", "issue", "list"] or self.listed_body is None:
+            return payload
+        try:
+            issues = json.loads(payload)
+        except (TypeError, ValueError):
+            return payload
+        if not isinstance(issues, list):
+            return payload
+        label = cmd[cmd.index("--label") + 1] if "--label" in cmd else ""
+        repo = cmd[cmd.index("-R") + 1] if "-R" in cmd else ""
+        audit = label.split(":", 1)[1] if label.startswith("audit:") else ""
+        for issue in issues:
+            if isinstance(issue, dict) and "body" not in issue:
+                issue["body"] = self.listed_body(audit, repo, issue.get("number"))
+        return json.dumps(issues)
 
     @staticmethod
     def _simulate_clone(cmd):
@@ -725,6 +753,19 @@ class HarnessTestCase(BaseTestCase):
         # default branch the harness was never consulted about.
         audit_report.set_workspace(self.workspace)
         self._audit_in_flight = None
+        self.harness.listed_body = self.stored_ledger_body
+
+    def stored_ledger_body(self, audit, repo, number):
+        """The ledger body the store last wrote for `number`, or "" without one."""
+        try:
+            envelope = json.loads(
+                (self.store_dir(audit, repo) / "latest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(envelope, dict) or envelope.get("issue_number") != number:
+            return ""
+        return str(envelope.get("ledger_body") or "")
 
     def store_dir(self, audit=AUDIT, repo="acme/fleet"):
         """The store directory `finish` keeps for `audit` on `repo`."""
@@ -11738,19 +11779,25 @@ class TestFindExistingIssue(HarnessTestCase):
         self.harness.replies = {
             "issue list": json.dumps(
                 [
-                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7"},
-                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42"},
+                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7", "body": "seven"},
+                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": "forty-two"},
                 ]
             )
         }
-        number, url = self.find()
+        number, url, body = self.find()
         self.assertEqual(number, 42)
         self.assertTrue(url.endswith("/42"))
+        self.assertEqual(body, "forty-two")
         self.assertIn("7", self.err)
+
+    def test_a_listing_without_a_body_names_none(self):
+        self.harness.listed_body = None
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.find()[2], None)
 
     def test_no_ledger_is_not_an_error(self):
         self.harness.replies = {"issue list": "[]"}
-        self.assertEqual(self.find(), (None, None))
+        self.assertEqual(self.find(), (None, None, None))
 
     def test_an_outage_raises_rather_than_reporting_no_ledger(self):
         self.harness.failures = {"issue list": 1}
@@ -14873,6 +14920,7 @@ class TestFinishManifestFlag(HarnessTestCase):
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": body}),
@@ -15307,6 +15355,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         """A fresh recorder over an open ledger the report store has no record
         of — a replaced volume, or a first run after the store landed."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"--json body": 1}
         self.patch_attr("run_cmd", self.harness)
@@ -15315,6 +15364,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         """A fresh recorder over the open ledger, reading the store the
         previous run wrote."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": self.issue_list()}
         self.patch_attr("run_cmd", self.harness)
 
@@ -15488,6 +15538,7 @@ class TestFinishManifestFlag(HarnessTestCase):
                 if declared:
                     manifest["audit"] = declared
                 self.harness = Recorder()
+                self.harness.listed_body = self.stored_ledger_body
                 self.harness.replies = {"issue list": "[]"}
                 self.patch_attr("run_cmd", self.harness)
                 rc = self.run_finish(
@@ -15516,6 +15567,7 @@ class TestFinishManifestFlag(HarnessTestCase):
              "checks_run": [ran(c, "alpha-cluster") for c in audit_report.audit_checks(AUDIT)]}
         )
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": "[]"}
         self.patch_attr("run_cmd", self.harness)
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
@@ -17343,10 +17395,71 @@ class TestReportStore(HarnessTestCase):
         )
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
 
+    def rewrite_ledger_behind_the_store(self):
+        """Run N publishes a; then something that never touches the store — a
+        `finish` from an older image — rewrites the ledger to list a and w.
+        Returns (run N's body, the rewritten body)."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        body_n = self.stored()["ledger_body"]
+        rewritten = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": json.dumps(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": rewritten}]
+            )
+        }
+        return body_n, rewritten
+
+    def test_a_ledger_rewritten_behind_the_store_is_a_lost_memory(self):
+        """The record still names the open issue and repository, so trusted on
+        those alone it would announce w — which the window already published —
+        as new. The ledger's block no longer matches the record's, so the
+        memory is lost and the run claims no delta."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertFalse(payload["silent_ok"])
+        self.assertIn("no longer matches issue #42", self.err)
+        self.assertFalse([b for b in self.harness.bodies_for("issue", "comment") if "audit delta" in b])
+
+    def test_a_clean_run_does_not_close_over_what_the_window_reported(self):
+        """The stale record lists only a, which the clean document accounts for;
+        w, which only the window reported, would go unchecked and the ledger
+        would close. A lost memory holds it open instead."""
+        body_n, _ = self.rewrite_ledger_behind_the_store()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n)
+        self.assertEqual(self.run_finish_unseeded(clean), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertNotEqual(self.stdout_json()["status"], "CLOSED")
+
+    def test_a_ledger_whose_block_is_unchanged_keeps_its_memory(self):
+        """Prose around the block is not what the delta reads: a hand edit to
+        the body, or GitHub's newline handling, must not lose the memory."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        edited = "A human note.\r\n\r\n" + self.stored()["ledger_body"].replace("\n", "\r\n")
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", edited)
+        self.assertIsNotNone(memory)
+
+    def test_a_listing_that_brought_no_body_cannot_vouch_for_the_store(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
+        self.assertIn("did not come back", err.getvalue())
+
     def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)
         self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "x"})}
-        self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet"))
+        self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", "x"))
         self.assertEqual(self.body_reads(), [])
 
     def test_a_body_without_a_block_seeds_nothing(self):
@@ -17354,7 +17467,7 @@ class TestReportStore(HarnessTestCase):
         self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "hand-written"})}
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet"))
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
         self.assertEqual(len(self.body_reads()), 1)
         self.assertIn("unknowable", err.getvalue())
 

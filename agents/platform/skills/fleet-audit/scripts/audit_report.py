@@ -1933,7 +1933,8 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     open issue `find_existing_issue` returned and its `repo` is this run's. A
     store written for another issue is a memory of another conversation, and
     joining against it would call every id on one side new and every id on the
-    other resolved.
+    other resolved. That it is still the latest word on this ledger is the
+    caller's check: `previous_run_memory` holds it against the live id block.
 
     The identity scheme is not a trust condition. The stored body carries its
     own `audit-id-scheme` stamp, and the readers that join against it
@@ -2051,9 +2052,55 @@ def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict
     }
 
 
-def previous_run_memory(audit_id: str, issue_number: int | None, repo: str) -> dict | None:
+def memory_matches_ledger(
+    audit_id: str, memory: dict, issue_number: int, live_body: str | None
+) -> bool:
+    """Whether the ledger still carries the id block the stored memory published.
+
+    `read_report_memory` trusts a record on its issue number and repository,
+    which says the record is about this ledger but not that it is the latest
+    word on it. Something that rewrites the ledger without touching the store —
+    a `finish` from an image that predates it, during a revert or a mixed
+    rollout, or the other pod's copy after the shell sandbox is toggled — leaves
+    a record that passes both. Joined against it, the delta re-announces what
+    that window added and resolved, and a clean run can close over findings
+    only the window reported.
+
+    The comparison is the finding-id block, not the whole body: the block is
+    what the delta and the unaccounted guard read, and it survives the newline
+    and whitespace changes GitHub or a hand edit can make to the prose around
+    it. The body is the one `gh issue list` returned alongside the issue's
+    number, so it costs no read of its own, and it is a check on the store,
+    never a memory in its place. A body that did not arrive cannot vouch for
+    the record, so it fails the check.
+    """
+    if not isinstance(live_body, str):
+        log(
+            f"WARNING: issue #{issue_number}'s body did not come back with it, so the "
+            f"stored report for {audit_id} cannot be checked against it; {MEMORY_UNKNOWABLE}"
+        )
+        return False
+    stored = set(parse_delta_block(str(memory.get("ledger_body") or "")))
+    if set(parse_delta_block(live_body)) == stored:
+        return True
+    log(
+        f"Stored report for {audit_id} no longer matches issue #{issue_number}: the ledger's "
+        f"finding-id block was rewritten since the store last wrote it; {MEMORY_UNKNOWABLE}"
+    )
+    return False
+
+
+def previous_run_memory(
+    audit_id: str, issue_number: int | None, repo: str, live_body: str | None
+) -> dict | None:
     """The memory `start` and `finish` join against: the store, or — where the
-    store has no directory for this ledger at all — one seed off the ledger."""
+    store has no directory for this ledger at all — one seed off the ledger.
+
+    `live_body` is the open ledger's body as `find_existing_issue` listed it;
+    a stored record whose id block it does not carry is a lost memory (see
+    `memory_matches_ledger`), not a reason to re-seed: a store that exists is
+    never replaced by the issue.
+    """
     if issue_number is None:
         return None
     try:
@@ -2062,7 +2109,10 @@ def previous_run_memory(audit_id: str, issue_number: int | None, repo: str) -> d
         never_stored = False
     if never_stored:
         return seed_memory_from_ledger(audit_id, issue_number, repo)
-    return read_report_memory(audit_id, issue_number, repo)
+    memory = read_report_memory(audit_id, issue_number, repo)
+    if memory is None or not memory_matches_ledger(audit_id, memory, issue_number, live_body):
+        return None
+    return memory
 
 
 def report_finding_titles(envelope: dict | None) -> dict[str, str]:
@@ -8774,8 +8824,14 @@ class GitHubLookupError(RuntimeError):
     """A GitHub lookup failed in a way that must not be read as 'nothing found'."""
 
 
-def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | None]:
-    """The audit's single open ledger issue, if any. Highest number wins.
+def find_existing_issue(
+    repo: str, audit_id: str
+) -> tuple[int | None, str | None, str | None]:
+    """The audit's single open ledger issue, if any: (number, url, body).
+
+    Highest number wins. The body rides along in the same listing so the report
+    store's memory can be checked against it (`memory_matches_ledger`); it is
+    None when the listing carried none.
 
     Raises rather than reporting "none" when the lookup itself fails. The old
     code returned (None, None) on a non-zero exit, which made a `gh` outage
@@ -8801,7 +8857,7 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
             "--state",
             "open",
             "--json",
-            "number,url",
+            "number,url,body",
             "--limit",
             "20",
         ],
@@ -8819,7 +8875,7 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
             f"gh issue list returned output that is not JSON: {exc}"
         ) from exc
     if not isinstance(issues, list) or not issues:
-        return None, None
+        return None, None, None
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -8830,7 +8886,8 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
             "Close the duplicates by hand — this harness will not close an issue "
             "it cannot prove it opened."
         )
-    return int(chosen["number"]), chosen.get("url")
+    body = chosen.get("body")
+    return int(chosen["number"]), chosen.get("url"), body if isinstance(body, str) else None
 
 
 def fetch_issue_url(repo: str, number: int) -> str | None:
@@ -10351,7 +10408,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
 
     # No branch is created or reset here. The report branch is gone: the ledger
     # is an issue, and each remediation pull request branches off main on demand.
-    existing_issue, _ = find_existing_issue(repo, audit_id)
+    existing_issue, _, existing_body = find_existing_issue(repo, audit_id)
 
     pending: list[str] = []
     carried: list[dict[str, str]] = []
@@ -10361,7 +10418,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
         # join against. A lost memory prints an empty list and says so on
         # stderr (read_report_memory logs it); `finish` then holds nothing, by
         # the same rule the delta applies.
-        memory = previous_run_memory(audit_id, existing_issue, repo)
+        memory = previous_run_memory(audit_id, existing_issue, repo, existing_body)
         carried = [
             {"id": fid, "check": fid.split(".", 1)[0], **where}
             for fid, where in sorted(
@@ -11149,7 +11206,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
     issue_number = args.issue
     if issue_number is None:
-        issue_number, _ = find_existing_issue(repo, audit_id)
+        issue_number, _, _ = find_existing_issue(repo, audit_id)
 
     pr_by_finding, _ = reconcile_remediation_prs(
         audit_id, findings, list_remediation_prs(repo, audit_id)
@@ -11436,7 +11493,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"({len(group['objects'])} object(s)){claimed}. {', '.join(group['objects'])}"
         )
 
-    existing_issue, existing_url = find_existing_issue(repo, audit_id)
+    existing_issue, existing_url, existing_body = find_existing_issue(repo, audit_id)
     # The previous run's memory is the body it published, as the report store
     # kept it, not the issue body fetched back from GitHub: the store is the
     # harness's own record of what it wrote, and a public body is one anyone
@@ -11444,7 +11501,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # is absent or was written for another ledger, which is unknowable rather
     # than empty — see `memory_lost` below. No open ledger is the one case that
     # genuinely is empty: the run is first, and everything present is new.
-    memory = previous_run_memory(audit_id, existing_issue, repo)
+    memory = previous_run_memory(audit_id, existing_issue, repo, existing_body)
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
