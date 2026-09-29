@@ -318,6 +318,11 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "a b@github.com:gke-labs/infra",
             "https://a\tb@github.com/gke-labs/infra",
             "https://a\u00a0b@github.com/gke-labs/infra",
+            # A schemeless user must be non-empty and carry no colon; git reads
+            # these as local paths, and the operator refuses them.
+            "@github.com:gke-labs/infra",
+            "@github.com/gke-labs/infra",
+            ":x@github.com/gke-labs/infra",
         ):
             with self.subTest(repo=repo[:80]):
                 integration = _integration(

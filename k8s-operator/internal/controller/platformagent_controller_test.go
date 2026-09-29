@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -5810,6 +5811,87 @@ func TestMinterHeldMessageNamesEntriesByPosition(t *testing.T) {
 	}
 }
 
+// The agent reads a URL through urlsplit, which drops a query and a fragment
+// and does not range-check a port, so it uses these entries. The minter counts
+// them too, rather than holding every policy for an entry that works.
+func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
+	repos := `[{"type":"github","url":"https://github.com/test-org/repo-q?ref=main"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-f#main"},` +
+		`{"type":"github","url":"https://x@github.com:99999/test-org/repo-p?a#b"},` +
+		// Dropping the query leaves no repository, as it does for the agent.
+		`{"type":"github","url":"https://github.com?x=/test-org/gone"},` +
+		// A `#` ends the authority, so the host is evil.example either way.
+		`{"type":"github","url":"https://evil.example#@github.com/test-org/evil"}]`
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if want := []string{"repo-f", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
+		t.Errorf("bare = %v, expected %v", bare, want)
+	}
+	if want := []string{"managed_repos[3]", "managed_repos[4]"}; !slices.Equal(unreadable, want) {
+		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue drives the
+// reconcile wiring TestARefusedGitHubScopeKeepsTheLiveGitHubOrg cannot: the
+// held organisation reaches the applied gateway, and the warning names the
+// refused field without writing its token to the log.
+func TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue(t *testing.T) {
+	scheme := setupScheme()
+	const secret = "ghp_notarealtoken"
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "https://x:" + secret + "@github.com:gke-labs/infra"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, live, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	for range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile() = %v", err)
+		}
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(live), dep); err != nil {
+		t.Fatalf("get gateway: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+		t.Errorf("applied GITHUB_ORG = %q, expected the held gke-labs", got)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("reconcile log quotes the refused value's credential:\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "integration.github.gitRepo") {
+		t.Errorf("reconcile log does not name the refused field:\n%s", logged.String())
+	}
+}
+
 func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 	// The hold keeps repo-x's policy, which is right, but a revocation that
 	// silently does not happen has to be on the status: Degraded names the
@@ -6300,6 +6382,11 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// agent lifts only a bare `github.com/`, so it skips this one.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "git@github.com/gke-labs/kube-agents"},
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "x-access-token@github.com//gke-labs/kube-agents"},
+		// An empty user, or a colon ahead of the `@`, is no user the agent
+		// reads: it takes `@github.com` or `:x@github.com` as the host.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "@github.com:gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":x@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":@github.com/gke-labs/kube-agents"},
 		// The agent refuses a value over 256 characters before it parses it, so
 		// a long credential in the userinfo makes an entry it skips.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},

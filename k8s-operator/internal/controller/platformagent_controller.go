@@ -433,12 +433,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// corrected. Warn loudly so an administrator discovers un-updatable CRs
 	// immediately upon operator upgrade. Both spellings go through ValidateGit,
 	// the same call admission makes, so the warning cannot pass a declaration
-	// the webhook refuses.
+	// the webhook refuses. It names the refused fields, not their values: a
+	// clone URL can carry a token, and this is logged on every reconcile.
 	if instance.Spec.Integration != nil {
 		if err := instance.Spec.Integration.ValidateGit(); err != nil {
 			log.Info("WARNING: spec.integration.forges/repositories (or the deprecated spec.integration.github) is invalid; "+
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
-				"name", instance.Name, "namespace", instance.Namespace, "error", err.Error())
+				"name", instance.Name, "namespace", instance.Namespace, "fields", gitProblemFields(&instance.Spec.Integration.IntegrationSpec))
 		}
 	}
 
@@ -1492,6 +1493,9 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		}
 		fullRepo := entry.URL
 		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if agentSpelling, ok := agentURLSpelling(fullRepo); err != nil && ok {
+			slug, err = agentv1alpha1.CleanRepoSlugWithOrg(agentSpelling, primaryOrg)
+		}
 		if err != nil {
 			entryName := fmt.Sprintf("%s[%d]", listName, positions[i])
 			logger.Info("skipping a repository entry the minter policy sync cannot read", "entry", entryName)
@@ -1525,6 +1529,37 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 	}
 	sort.Strings(bare)
 	return bare, unreadable, nil
+}
+
+// agentURLSpelling rewrites a URL the way the agent's urlsplit reads it, when
+// that differs from this release's parser: a query or fragment dropped, and a
+// numeric port out of range dropped. The parser refuses all three, but the
+// agent uses such an entry, so the minter must count it rather than hold every
+// policy for an entry that is not broken. Only those three parts change; the
+// rewritten value is still the parser's to read or refuse.
+func agentURLSpelling(value string) (string, bool) {
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(value), "://")
+	if !ok {
+		return "", false
+	}
+	changed := false
+	if cut := strings.IndexAny(rest, "?#"); cut != -1 {
+		rest, changed = rest[:cut], true
+	}
+	authority, path, _ := strings.Cut(rest, "/")
+	userInfo := ""
+	if at := strings.LastIndex(authority, "@"); at != -1 {
+		userInfo, authority = authority[:at+1], authority[at+1:]
+	}
+	if host, port, found := strings.Cut(authority, ":"); found && port != "" && strings.Trim(port, "0123456789") == "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			authority, changed = host, true
+		}
+	}
+	if !changed {
+		return "", false
+	}
+	return scheme + "://" + userInfo + authority + "/" + path, true
 }
 
 // minterPrimaryOrg is the organisation the minter policies are scoped to, or,
@@ -3669,6 +3704,21 @@ func gitProblemList(err error) string {
 		entries = append(entries, p.Error())
 	}
 	return hostPathDroppedEntryList(entries)
+}
+
+// gitProblemFields names the fields ValidateGit refuses, within the status
+// message budget, and never their values. A declaration the operator cannot
+// resolve at all is named by that error, which quotes nothing.
+func gitProblemFields(in *agentv1alpha1.IntegrationSpec) string {
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		return err.Error()
+	}
+	var fields []string
+	for _, p := range resolved.Problems() {
+		fields = append(fields, "integration."+p.Path.String())
+	}
+	return hostPathDroppedEntryList(fields)
 }
 
 // truncateToValidUTF8 cuts s to at most max bytes, dropping any rune the cut

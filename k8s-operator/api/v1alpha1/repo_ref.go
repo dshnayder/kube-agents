@@ -43,6 +43,8 @@ package v1alpha1
 // host `b@github.com` there, which the operator therefore does not count as
 // the repository it seeds; and `user:token@github.com:o/r` is refused here and
 // GitHub there, which leaves the agent reading the seeded entry beside it.
+// An empty user is refused here — `@github.com:o/r`, and `@github.com/o/r` on a
+// slash path — since `repo_ref.py` reads neither as GitHub.
 //
 // A `RepoRef` carries a host, possibly empty, and an opaque path of any depth.
 // Depth is not checked here. "Exactly two segments" is a property of GitHub, so
@@ -200,7 +202,11 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 		// `https://github.com//o/r` does not. repo_ref.py trims it too.
 		first, rest, found := strings.Cut(path, pathSeparator)
 		if rest = strings.Trim(rest, pathSeparator); found && rest != "" {
-			if at := strings.LastIndex(first, userInfoSeparator); at != -1 && !strings.ContainsAny(first, authorityTerminators) {
+			// An empty user, or a colon ahead of the `@`, is no userinfo prefix
+			// git would read either: `@github.com/o/r` and `:x@github.com/o/r`
+			// are local paths to git and hostless to repo_ref.py, so neither
+			// is lifted.
+			if at := strings.LastIndex(first, userInfoSeparator); at > 0 && !strings.ContainsAny(first, authorityTerminators+authoritySeparator) {
 				first = first[at+1:]
 			}
 			if schemelessHosts[lowerASCII(first)] {
@@ -285,7 +291,11 @@ func splitSCPRemote(text string) (string, string, bool) {
 		return "", "", false
 	}
 	authority, path := text[:colon], text[colon+1:]
-	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
+	if idx := strings.LastIndex(authority, userInfoSeparator); idx == 0 {
+		// `@github.com:o/r` names no user. repo_ref.py's user needs a
+		// character, so it reads host `@github.com`; this is not a remote.
+		return "", "", false
+	} else if idx != -1 {
 		authority = authority[idx+1:]
 	}
 	if authority == "" || path == "" {

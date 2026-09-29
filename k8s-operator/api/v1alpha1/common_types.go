@@ -1874,8 +1874,9 @@ func CleanRepoSlug(rawURL string) (string, error) {
 // `gitlab.com/project` — is refused rather than read as owner `gitlab.com`. See
 // repo_ref.go's header.
 //
-// Deprecated: GitHub-bound, and kept for the deprecated
-// `spec.integration.github` alias. Use ResolvedRepository.Resolve.
+// Deprecated: GitHub-bound, and kept for the minter policy sync, which reads
+// the state ConfigMap's GitHub entries with no declaration to dispatch on. Use
+// ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)
 	if err != nil {

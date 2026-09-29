@@ -66,8 +66,10 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		// rather than being discarded so the remaining slashes can be counted.
 		{input: "git@gitlab.com:group/subgroup/project.git", host: "gitlab.com", path: "group/subgroup/project"},
 		{input: "https://gitlab.example/a/b/c", host: "gitlab.example", path: "a/b/c"},
-		// A hostless value stays hostless. `my.org` is a legal GitHub owner, and
-		// reading it as a host would turn a valid slug into a one-segment path.
+		// A hostless value stays hostless. `my.org` is a legal owner on some
+		// forge, and reading it as a host would turn a slug into a one-segment
+		// path; GitHub's owner grammar is the provider's to apply, not the
+		// parser's.
 		{input: "my.org/repo", host: "", path: "my.org/repo"},
 		{input: "github.com/gke-labs/kube-agents", host: "", path: "github.com/gke-labs/kube-agents"},
 		{input: "file:///etc/passwd", err: true},
@@ -122,6 +124,30 @@ func TestGitHubResolveRefusesAnotherForgesHost(t *testing.T) {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.Resolve("", repo, ""); err == nil {
 				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref)
+			}
+		})
+	}
+}
+
+// An empty user, or one with a colon ahead of the `@`, is no userinfo git would
+// read on a schemeless value: each is a local path to git, and repo_ref.py
+// reads none of them as GitHub. Lifting the host would rewrite a value git
+// cannot clone into a working repository.
+func TestGitHubResolveRefusesAnEmptyOrColonUser(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, repo := range []string{
+		"@github.com:gke-labs/kube-agents",
+		"@github.com/gke-labs/kube-agents",
+		":x@github.com/gke-labs/kube-agents",
+		":@github.com/gke-labs/kube-agents",
+		"a:@github.com/gke-labs/kube-agents",
+	} {
+		t.Run(repo, func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, ""); err == nil {
+				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref)
+			}
+			if ref, err := provider.ParseRepoRef(repo); err == nil && ref.Host != "" {
+				t.Errorf("ParseRepoRef(%q) = %+v, expected no host", repo, ref)
 			}
 		})
 	}
@@ -224,7 +250,8 @@ func TestResolveCanonicalisesADeclaredHost(t *testing.T) {
 // shapes the parser before provider dispatch admitted: it stripped both
 // `github.com/` and `www.github.com/`, and dropped a `user@` prefix. A CR
 // written any of these ways must keep resolving after an operator upgrade —
-// refusing it marks the agent Degraded and drops GITHUB_ORG from the pod.
+// refusing it marks the agent Degraded and leaves GITHUB_ORG held at whatever
+// the running gateway carries, never following the declaration.
 // Another forge's host is still not lifted, so it is read as a namespace and
 // refused by GitHub's owner grammar.
 func TestResolveLiftsEveryHostSpellingFromASchemelessPath(t *testing.T) {
