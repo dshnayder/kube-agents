@@ -210,9 +210,10 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   proposal was closed or squash-merged is a spent branch in the way:
   `remote-branch view` reads its revision and `remote-branch delete` clears it.
   That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
-  the closed proposal is not this install's), `OPEN_PROPOSAL`, `NOT_SPENT` (it
-  holds revisions no proposal carried); each of those is somebody's work — pick
-  another name or report it. `DELETE_REFUSED` means the remote itself refuses
+  the closed proposal is not this install's, or it has carried a full page of
+  proposals, too many to read), `OPEN_PROPOSAL`, `NOT_SPENT` (it holds revisions
+  no proposal carried); treat each as somebody's work — pick another name or
+  report it. `DELETE_REFUSED` means the remote itself refuses
   the delete (a branch rule, a hook, or a credential without the right); it
   answers every attempt alike, so pick another name or report it too. Never open and close a proposal on a branch to make
   it deletable: the delete reads that proposal as proof the branch is yours. `BRANCH_MOVED` means it moved since you read it:

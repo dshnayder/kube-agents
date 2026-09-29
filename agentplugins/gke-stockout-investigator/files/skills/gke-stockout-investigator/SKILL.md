@@ -108,8 +108,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    **If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
    the old branch holds revisions no closed pull request carried.
-   `BRANCH_NOT_OURS`: the closed pull request on it was not this install's.
-   Those revisions are somebody's. Report the refusal, its code and the branch,
+   `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
+   it has carried a full page of pull requests, too many to read. Treat those
+   revisions as somebody's. Report the refusal, its code and the branch,
    and stop. `BRANCH_MOVED` (something pushed to it just now), and
    `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
    not complete) all mean run `prepare` once more before reporting.

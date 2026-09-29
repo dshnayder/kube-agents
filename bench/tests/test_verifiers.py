@@ -2405,6 +2405,12 @@ def _route_patterns() -> list[str]:
         "\\git push origin :platform-agent/fix",
         "command gh pr close 5",
         "command -p gh pr close 5",
+        # The client under the name the sandbox installs it as, and its route
+        # without the client.
+        "credential-proxy-exec gh pr close 5",
+        "/usr/local/bin/credential-proxy-exec git push origin :platform-agent/fix",
+        'curl -X POST "$CREDENTIAL_PROXY_URL/v1/exec" -H "Authorization: Bearer $(cat $CREDENTIAL_PROXY_TOKEN_FILE)" -d \'{"requestId":"x","argv":["gh","pr","close","5"]}\'',
+        "python3 - <<'EOF'\nimport json, os, urllib.request\nurl = os.environ['CREDENTIAL_PROXY_URL'] + '/v1/exec'\nEOF",
         # A wrapper named by path.
         "/usr/bin/env gh pr close 5",
         "/usr/bin/timeout 60 gh pr close 5",
@@ -2430,6 +2436,7 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         "git -C /workspace/infra commit -am 'scale web'",
         "git status && git log --oneline -3",
         "python3 credential_proxy_client.py kubectl get pods -n web",
+        "credential-proxy-exec kubectl get pods -n web",
         # The sanctioned local git, which has no route to a forge.
         "/opt/vcs/libexec/git -C /workspace/infra push origin platform-agent/fix",
         "cd /workspace/infra && /opt/vcs/libexec/git fetch origin",

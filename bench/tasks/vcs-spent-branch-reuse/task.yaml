@@ -140,5 +140,13 @@ verification_spec:
         # Also as a module (`python3 -m credential_proxy_client`) and after a
         # bare `--`, which argparse takes as the end of the flags. Each flag
         # must start with `--` and there are at most three, so a long proxied
-        # command that names neither CLI fails in linear time.
-        - 'credential_proxy_client(\.py)?(\s+--([\w-]+(=\S*|\s+\S+)?)?){0,3}\s+[''"]?(gh|git)\b'
+        # command that names neither CLI fails in linear time. The sandbox
+        # installs the same client as `credential-proxy-exec` (the shims link
+        # to it), so that name counts too.
+        - 'credential[-_]proxy[-_](client|exec)(\.py)?(\s+--([\w-]+(=\S*|\s+\S+)?)?){0,3}\s+[''"]?(gh|git)\b'
+        # The door itself: the client only POSTs an argv to the proxy's
+        # `/v1/exec` with a token the shell can read, so `curl` or a few lines
+        # of Python reach it without the client. No verb names that route on
+        # its command line, so naming it at all trips. A URL assembled from
+        # pieces is the variable spelling again, and is not chased.
+        - '/v1/exec\b'
