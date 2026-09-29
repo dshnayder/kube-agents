@@ -118,6 +118,11 @@ ERROR_EXCERPT_CHARS = 300
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# The project an API refusal names, which gcloud gives by number ("has not been
+# used in project 123456789", "consumer: projects/123456789"). The refusal is
+# the consumer project's, and with a quota project set (`billing/quota_project`)
+# that is not the project being listed.
+REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -148,6 +153,12 @@ REGISTRY_DISABLED_REASON = (
 # sequence under `DEFAULT_TIMEOUT_S` each, and the cluster reads, which this
 # does not bound, finish on their own time as they did before it.
 PROJECT_READ_DEADLINE_S = 420
+# `gcloud projects list`'s own timeout. Under `DEFAULT_TIMEOUT_S` a credential
+# that sees hundreds of projects was killed mid-listing, and the run fell back
+# to the active project alone -- the case `PROJECT_READ_DEADLINE_S` is sized
+# for, made unreachable. The listing runs before any project read and counts
+# against that deadline, so this leaves project reads time to start.
+PROJECTS_LIST_TIMEOUT_S = 240
 PROJECT_DEADLINE_ERROR = (
     "not read: the collector stops starting project reads {budget} s after it starts, so the "
     "run can end inside its terminal timeout with a manifest, and this project's turn came "
@@ -631,7 +642,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     base = result.stdout.strip() if result.rc == 0 else ""
     projects = [base] if base else []
 
-    _, list_result = run_and_gate(["gcloud", "projects", "list", "--format", "value(projectId)"], run=run)
+    list_result = run(["gcloud", "projects", "list", "--format", "value(projectId)"], timeout=PROJECTS_LIST_TIMEOUT_S)
     if list_result.rc != 0:
         stderr = list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
         if not base:
@@ -729,23 +740,49 @@ class IncompleteEnumeration(RuntimeError):
         self.not_running = not_running
 
 
+def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
+    """Whether an API-disabled refusal is `project`'s own. Only then is it the
+    answer "no cluster can exist here": a refusal from a quota project with the
+    API off names that project instead, and read as this one's it marked every
+    project cluster-free, so `finish` closed an audit that read no cluster. A
+    refusal naming no project, or one this project's number cannot be read
+    for, is a failed read."""
+    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
+    if not numbers:
+        return re.search(rf"\bprojects?[ /]{re.escape(project)}\b", stderr) is not None
+    described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
+    return described.rc == 0 and numbers == {described.stdout.strip()}
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
-        ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
+        ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled,createTime)"]
     )
     if result.rc != 0:
         # Discovery lists no project, so this is where a project whose
         # Kubernetes Engine API is off first answers: with no cluster.
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
-            log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
-            return [], []
+            if refusal_names_project(project, result.stderr, run=run):
+                log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
+                return [], []
+            raise RuntimeError(
+                f"cluster enumeration refused (rc={result.rc}) by a Kubernetes Engine API that is off in a "
+                f"project other than {project!r}, such as a quota project, so this project's clusters are "
+                f"unknown: {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
+            )
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
     try:
         clusters = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"cluster enumeration returned no parseable JSON: {exc}") from exc
     running = [
-        {"name": c["name"], "location": c.get("location"), "project": project, "autopilot": bool((c.get("autopilot") or {}).get("enabled"))}
+        {
+            "name": c["name"],
+            "location": c.get("location"),
+            "project": project,
+            "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
+            "create_time": c.get("createTime") or "",
+        }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
     ]
@@ -975,7 +1012,7 @@ def fetch_usage_peaks(
     )
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
-        return {}, False, Run([label], rc, "", message[:300], time.monotonic() - started)
+        return {}, False, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
 
     if session is None:
         return fail(-1, NO_SESSION_MESSAGE)
@@ -1040,7 +1077,7 @@ def fetch_memory_means(
     )
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
-        return {}, False, Run([label], rc, "", message[:300], time.monotonic() - started)
+        return {}, False, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
 
     if session is None:
         return fail(-1, NO_SESSION_MESSAGE)
@@ -1167,7 +1204,7 @@ def fetch_lb_traffic(
     )
 
     def fail(rc: int, message: str) -> tuple[dict, Run]:
-        return {}, Run([label], rc, "", message[:300], time.monotonic() - started)
+        return {}, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
 
     if session is None:
         return fail(-1, NO_SESSION_MESSAGE)
@@ -1693,7 +1730,7 @@ def node_pool_creation_ages(operations: object, cluster: str, *, now: datetime) 
 
     A pool with no entry was created before the operations the API still
     lists, or with the cluster itself (whose first pool arrives in
-    `CREATE_CLUSTER`), so it is older than any operation here. The latest
+    `CREATE_CLUSTER`); `check_idle_nodepool` dates it from the cluster. The latest
     creation wins: a pool deleted and recreated under one name is as old as its
     newest incarnation.
     """
@@ -1718,12 +1755,16 @@ def check_idle_nodepool(
     *,
     now: datetime,
     pool_ages: dict[str, float] | None = None,
+    cluster_age: float | None = None,
     limitations: list[str] | None = None,
 ) -> list[dict]:
     """§3.7. `pool_ages` is `node_pool_creation_ages`' answer, or `None` when
     the operations read failed; only then does the oldest node stand in for the
     pool's age, and a pool that stand-in exempts is named in `limitations`,
-    because a node upgrade recreates every node and resets it."""
+    because a node upgrade recreates every node and resets it. A pool with no
+    creation operation came with the cluster or before the operations the API
+    keeps, so it is `cluster_age` days old, and older than the threshold when
+    that is unknown."""
     nodes_by_pool: dict[str, list[dict]] = {}
     for node in context["nodes"]:
         pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
@@ -1754,7 +1795,8 @@ def check_idle_nodepool(
         # upgrade recreates every node, so a months-old pool read as a week old
         # after each auto-upgrade and went unflagged for that run.
         if pool_ages is not None:
-            if pool_ages.get(pool_name, IDLE_NODEPOOL_MIN_AGE_DAYS) < IDLE_NODEPOOL_MIN_AGE_DAYS:
+            default_age = IDLE_NODEPOOL_MIN_AGE_DAYS if cluster_age is None else cluster_age
+            if pool_ages.get(pool_name, default_age) < IDLE_NODEPOOL_MIN_AGE_DAYS:
                 continue
         else:
             # Fallback only. Measured off the *oldest* node rather than
@@ -1982,9 +2024,13 @@ def _selector_matches(pdb: tuple[str, dict], ns: str, labels: dict) -> bool:
 
 
 def _pdb_selectors(context: dict) -> list[tuple[str, dict]]:
+    """Each PDB's namespace and selector. A PDB with no selector selects no
+    pod in `policy/v1`, the opposite of an empty `{}` one, so it is left out
+    rather than read as `{}` and made to cover the whole namespace."""
     return [
-        ((pdb.get("metadata") or {}).get("namespace", ""), (pdb.get("spec") or {}).get("selector") or {})
+        ((pdb.get("metadata") or {}).get("namespace", ""), selector)
         for pdb in (context.get("pdbs") or [])
+        if (selector := (pdb.get("spec") or {}).get("selector")) is not None
     ]
 
 
@@ -3545,7 +3591,8 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # the figure is never below twice the peak. Floored at the smallest
         # values worth writing into a manifest so a near-silent sidecar is not
         # handed a `1m`/`1Mi` request that no scheduler decision can turn on.
-        raw_cpu, raw_mem_mib = peak_cpu / replicas * 2, peak_mem / replicas * 2
+        raw_cpu = peak_cpu / replicas * OVERREQUEST_PEAK_MULTIPLIER
+        raw_mem_mib = peak_mem / replicas * OVERREQUEST_PEAK_MULTIPLIER
         want_cpu = _resize_target(peak_cpu, replicas, floor=UNSIZED_FLOOR_VCPU, unit=0.001)
         want_mem_mib = _resize_target(peak_mem, replicas, floor=UNSIZED_FLOOR_MIB, unit=1.0)
         # Autopilot bills on requests and injects its own defaults where a
@@ -4139,7 +4186,7 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
         "location": cluster.get("location", "?"),
         "autopilot": bool(cluster.get("autopilot")),
         "outcome": "gate-failed",
-        "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+        "error": f"collector raised {type(exc).__name__}: {exc}"[:ERROR_EXCERPT_CHARS],
     }
 
 
@@ -4188,7 +4235,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
     dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange"
 
@@ -4196,7 +4243,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
+        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
     if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
         # Read as empty, it would be a cluster with no Services or volumes --
         # which 3.4 and 3.6 then take as proof a project's disks and rules are
@@ -4325,7 +4372,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             operations, _ops_result = run_and_gate(ops_argv, run=run)
             pool_ages = None if operations is None else node_pool_creation_ages(operations, name, now=now)
             idle_pool_hits = check_idle_nodepool(
-                context, node_pools, now=now, pool_ages=pool_ages, limitations=limitations
+                context, node_pools, now=now, pool_ages=pool_ages,
+                cluster_age=_age_days(cluster.get("create_time") or "", now=now), limitations=limitations,
             )
             candidates += [emit("idle-nodepool", h) for h in idle_pool_hits]
             candidates += [emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]

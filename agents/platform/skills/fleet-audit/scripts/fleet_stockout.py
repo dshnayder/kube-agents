@@ -182,6 +182,9 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# The project an API refusal names; `fleet_waste.REFUSED_PROJECT_NUMBER_RE`
+# carries the reasoning.
+REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -193,6 +196,9 @@ ZONE_TIMEOUT_MARKER = "did not respond"
 # becomes a `gate-failed` `project/<p>` target. It does not bound the
 # cluster reads, which every fleet collector in this directory leaves open.
 PROJECT_READ_DEADLINE_S = 420
+# `gcloud projects list`'s own timeout; `fleet_waste.py` carries the same one
+# and its reasoning.
+PROJECTS_LIST_TIMEOUT_S = 240
 PROJECT_DEADLINE_ERROR = (
     "not read: the collector stops starting project reads {budget} s after it starts, so the "
     "run can end inside its terminal timeout with a manifest, and this project's turn came "
@@ -398,7 +404,7 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     base = result.stdout.strip() if result.rc == 0 else ""
     projects = [base] if base else []
 
-    list_result = run(["gcloud", "projects", "list", "--format", "value(projectId)"])
+    list_result = run(["gcloud", "projects", "list", "--format", "value(projectId)"], timeout=PROJECTS_LIST_TIMEOUT_S)
     if list_result.rc != 0:
         stderr = list_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
         if not base:
@@ -449,6 +455,16 @@ class IncompleteEnumeration(RuntimeError):
         self.not_running = not_running
 
 
+def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
+    """Whether an API-disabled refusal is `project`'s own; a copy of
+    `fleet_waste.refusal_names_project`, which carries the reasoning."""
+    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
+    if not numbers:
+        return re.search(rf"\bprojects?[ /]{re.escape(project)}\b", stderr) is not None
+    described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
+    return described.rc == 0 and numbers == {described.stdout.strip()}
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
@@ -458,8 +474,14 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     )
     if result.rc != 0:
         if _api_disabled(result):
-            log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
-            return [], []
+            if refusal_names_project(project, result.stderr, run=run):
+                log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
+                return [], []
+            raise RuntimeError(
+                f"cluster enumeration refused (rc={result.rc}) by a Kubernetes Engine API that is off in a "
+                f"project other than {project!r}, such as a quota project, so this project's clusters are "
+                f"unknown: {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
+            )
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     try:
         clusters = json.loads(result.stdout or "[]")
@@ -1705,7 +1727,16 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             "no ComputeClass names a Spot machine type and the node pools could "
             "not be read, so whether a Spot node pool exists is unknown"
         )
-    elif not shapes and not unqueryable:
+    elif not shapes and unqueryable:
+        # Spot is requested, by family only, so the check applies and was not
+        # measured. Filed like the branch above, because the limitation alone
+        # left the slug in no bucket `finish` checks, and a document declaring
+        # it not applicable published complete.
+        unevaluated["spot-scarcity-risk"] = (
+            f"every Spot request on this cluster names a machine family but no "
+            f"machine type, which `capacity-history` cannot query: {', '.join(unqueryable)}"
+        )
+    elif not shapes:
         # No command to record, so §6 would otherwise read the missing record as
         # a check nobody ran. Declared not-applicable for the same reason the
         # Autopilot branch above declares one: it is a fact already in hand.

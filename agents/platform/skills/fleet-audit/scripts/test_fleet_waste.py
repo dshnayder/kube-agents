@@ -844,6 +844,18 @@ class IdleNodepoolTest(unittest.TestCase):
         hits = fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={})
         self.assertEqual([h["object"] for h in hits], ["NodePool/pool"])
 
+    def test_a_young_cluster_s_first_pool_is_dated_from_the_cluster(self):
+        """A cluster's first pool arrives in `CREATE_CLUSTER`, so it has no
+        `CREATE_NODE_POOL` operation; on a three-day-old cluster it is three days
+        old, not older than the threshold."""
+        context, pools = self.upgraded_pool_context()
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={}, cluster_age=3.0), [])
+
+    def test_an_old_cluster_s_first_pool_is_judged(self):
+        context, pools = self.upgraded_pool_context()
+        hits = fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={}, cluster_age=200.0)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/pool"])
+
     def test_a_pool_created_under_a_week_ago_is_skipped_on_its_operation(self):
         context, pools = self.upgraded_pool_context()
         self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={"pool": 2.0}), [])
@@ -984,6 +996,16 @@ class IdleNodepoolTest(unittest.TestCase):
         pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
         excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
         self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_a_pdb_with_no_selector_covers_no_pod(self):
+        """In `policy/v1` an omitted selector selects nothing and `{}` selects
+        everything; read as `{}`, a selector-less PDB hid every blocker."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons, "pdbs": [{"metadata": {"namespace": "kube-system"}, "spec": {}}]}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Draining will not happen on its own: 2 pod(s)", excerpt)
+        self.assertEqual(fw._pdb_selectors({"pdbs": [{"metadata": {"namespace": "a"}, "spec": {"selector": {}}}]}), [("a", {})])
 
     def test_a_pdb_in_another_namespace_covers_nothing_here(self):
         pdb = ("default", {"matchLabels": {"k8s-app": "kube-dns"}})
@@ -4567,7 +4589,7 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
     POOLS = [{"name": "idle", "config": {"machineType": "e2-standard-4"}},
              {"name": "busy", "config": {"machineType": "e2-standard-4"}}]
 
-    def collect(self, operations):
+    def collect(self, operations, cluster=None):
         calls = []
         node = obj("Node", "node-1", **{
             "metadata.labels": {"cloud.google.com/gke-nodepool": "idle"},
@@ -4589,7 +4611,7 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+                entry, _ = fw.collect_cluster(cluster or self.CLUSTER, run=run, session=usage_session(), now=NOW)
         return entry, calls
 
     def test_the_read_is_filtered_to_this_cluster_s_pool_creations(self):
@@ -4602,6 +4624,21 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
         entry, _ = self.collect([])
         self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"] if c["check"] == "idle-nodepool"})
         self.assertNotIn("limitations", entry)
+
+    def test_a_young_cluster_s_pools_are_dated_from_its_create_time(self):
+        young = {**self.CLUSTER, "create_time": (NOW - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")}
+        entry, _ = self.collect([], cluster=young)
+        self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
+
+    def test_the_cluster_list_carries_each_cluster_s_create_time(self):
+        listing = [{"name": "c1", "location": "us-central1", "status": "RUNNING", "createTime": "2026-09-26T00:00:00+00:00"}]
+
+        def run(argv, **kwargs):
+            self.assertIn("createTime", argv[-1])
+            return run_of(0, json.dumps(listing))
+
+        running, _ = fw.enumerate_clusters("acme", run=run)
+        self.assertEqual(running[0]["create_time"], "2026-09-26T00:00:00+00:00")
 
 
 class SoleNodePoolNotApplicableTest(unittest.TestCase):
@@ -4885,6 +4922,20 @@ class GetTargetProjectsTest(unittest.TestCase):
 
         self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other", "empty"], None))
 
+    def test_the_listing_runs_under_its_own_timeout_not_the_default(self):
+        """Under the 60 s default, a credential that sees hundreds of projects
+        was killed mid-listing and the run read the active project alone."""
+        timeouts = {}
+
+        def run(argv, **kwargs):
+            timeouts[argv[1]] = kwargs.get("timeout")
+            return run_of(0, "acme\n")
+
+        fw.get_target_projects(None, run=run)
+        self.assertEqual(timeouts["projects"], fw.PROJECTS_LIST_TIMEOUT_S)
+        self.assertGreater(fw.PROJECTS_LIST_TIMEOUT_S, fw.DEFAULT_TIMEOUT_S)
+        self.assertLess(fw.PROJECTS_LIST_TIMEOUT_S, fw.PROJECT_READ_DEADLINE_S)
+
     def test_a_credential_that_sees_no_project_is_an_error_not_an_empty_fleet(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
@@ -5021,11 +5072,54 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertEqual(beta["outcome"], "collected")
         self.assertIn("unattached-disk", {c["check"] for c in beta["candidates"]})
 
+    GKE_OFF = (
+        "ERROR: (gcloud.container.clusters.list) ResponseError: code=403, message=Kubernetes Engine API "
+        "has not been used in project {number} before or it is disabled. Reason: SERVICE_DISABLED"
+    )
+
+    def refusing_run(self, named: str, own: str = "123456789"):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(0, own + "\n")
+            return run_of(1, "", self.GKE_OFF.format(number=named))
+
+        return run, calls
+
     def test_the_active_project_with_the_gke_api_disabled_holds_no_cluster(self):
+        run, _ = self.refusing_run("123456789")
+        self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
+
+    def test_a_refusal_naming_the_project_by_id_needs_no_describe(self):
+        run, calls = self.refusing_run("acme")
+        self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
+        self.assertFalse([c for c in calls if c[:3] == ["gcloud", "projects", "describe"]])
+
+    def test_a_quota_project_s_refusal_is_a_failed_list(self):
+        """With `billing/quota_project` set to a project whose GKE API is off,
+        every listing is refused in that project's name. Read as this project's
+        answer, every project was marked cluster-free and nothing was read."""
+        run, _ = self.refusing_run("987654321")
+        with self.assertRaisesRegex(RuntimeError, "quota project"):
+            fw.enumerate_clusters("acme", run=run)
+
+    def test_a_refusal_naming_no_project_is_a_failed_list(self):
         def run(argv, **kwargs):
             return run_of(1, "", "accessNotConfigured: Kubernetes Engine API is disabled")
 
-        self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
+        with self.assertRaises(RuntimeError):
+            fw.enumerate_clusters("acme", run=run)
+
+    def test_a_refusal_whose_project_number_cannot_be_read_is_a_failed_list(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(1, "", "PERMISSION_DENIED")
+            return run_of(1, "", self.GKE_OFF.format(number="123456789"))
+
+        with self.assertRaises(RuntimeError):
+            fw.enumerate_clusters("acme", run=run)
 
 
 def cluster_free_run(compute=None, registry=None, projects="acme\n"):
@@ -5090,6 +5184,8 @@ class ClustersListedMarkerTest(unittest.TestCase):
         base = cluster_free_run(compute=lambda p: None, registry=lambda p: None, projects="acme\nbeta\n")
 
         def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(0, "123456789\n" if "acme" in argv else "222222222\n")
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 # beta completes empty in every run, so each one shows the marker set beside the entry under test.
                 return cluster_list() if "acme" in argv else run_of(0, "[]")
@@ -5114,8 +5210,14 @@ class ClustersListedMarkerTest(unittest.TestCase):
         self.assertEqual(entry[fw.CLUSTERS_LISTED_KEY], 0)
 
     def test_the_gke_api_off_is_an_empty_list_and_marks_the_project(self):
-        entry = self.project_entry(lambda: run_of(1, "", "accessNotConfigured: Kubernetes Engine API is disabled"))
+        entry = self.project_entry(lambda: run_of(1, "", GetTargetProjectsTest.GKE_OFF.format(number="123456789")))
         self.assertEqual(entry[fw.CLUSTERS_LISTED_KEY], 0)
+
+    def test_a_quota_project_s_refusal_does_not_mark_the_project(self):
+        manifest = self.manifest(lambda: run_of(1, "", GetTargetProjectsTest.GKE_OFF.format(number="987654321")))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fw.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+        acme = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(acme["outcome"], "gate-failed")
 
     def test_a_failed_list_does_not_mark_the_project(self):
         manifest = self.manifest(lambda: run_of(1, "", "PERMISSION_DENIED: container.clusters.list"))

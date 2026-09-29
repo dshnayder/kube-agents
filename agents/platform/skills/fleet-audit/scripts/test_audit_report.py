@@ -14279,8 +14279,9 @@ class TestTriageMarkedFindings(BaseTestCase):
 class TestScopedCoverage(unittest.TestCase):
     """Coverage is measured against what a target owes, not the whole roster.
 
-    No shipped roster declares `scopes` yet, so these run against a copy of
-    the stockout and networking specs partitioned the way their SOPs read: the
+    The shipped cost and stockout rosters declare `scopes`, but these run
+    against a fixed copy of the stockout and networking specs, partitioned the
+    way their SOPs read, so a roster edit does not move them: the
     project entry owes the quota and reservation checks, every cluster owes
     the rest plus the reservation check's cluster form, and a networking
     subnet owes IP exhaustion alone. Rated against the whole roster, a project

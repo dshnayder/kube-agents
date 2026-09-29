@@ -968,8 +968,8 @@ class SpotScarcityTest(unittest.TestCase):
     SHAPE = {"owners": ["ComputeClass/cc1"], "families": {"ComputeClass/cc1": 1}}
 
     def test_the_live_us_east4_response_is_not_a_finding(self):
-        """26 daily intervals averaging 8.4%, which is what a healthy Spot
-        shape looks like. If this ever flags, the ceiling moved."""
+        """Eight daily intervals averaging 6.6%, the shape of a healthy Spot
+        response. If this ever flags, the ceiling moved."""
         hit, limitation = fs.check_spot_scarcity(
             "n2-standard-8", self.SHAPE, "us-east4", capacity_history([0.05, 0.06, 0.04, 0.05, 0.07, 0.09, 0.1, 0.07])
         )
@@ -1692,6 +1692,14 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
         self.assertIn("name no machine type", entry["limitations"])
 
+    def test_a_family_only_spot_class_beside_read_pools_is_unevaluated(self):
+        # Pools read, none Spot, and the only Spot request names no machine
+        # type: the check could not run, so it cannot be left out of every list.
+        cc = compute_class("cc1", [{"machineFamily": "n2", "spot": True}])
+        entry = self.run_with(dump_items=[cc])
+        self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
+        self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
+
     def test_a_failed_autoscaler_read_is_unevaluated(self):
         entry = self.run_with(dump_items=[], log_rc=1)
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
@@ -1902,6 +1910,9 @@ class ProjectDiscoveryTest(unittest.TestCase):
         manifest = self.collect(fleet_run({"acme": ["c1"], "beta": ["c2"]}, projects="beta\n"))
         self.assertIn("acme/us-central1/c1", {c["name"] for c in manifest["clusters"]})
         self.assertNotIn("error", manifest)
+        # A listing that omits the active project is filtered, so the run is partial.
+        entry = next(c for c in manifest["clusters"] if c["name"] == fs.UNENUMERATED_PROJECTS_TARGET)
+        self.assertIn("did not name the active project 'acme'", entry["error"])
 
     def test_a_cluster_free_project_without_compute_engine_leaves_no_target(self):
         inner = fleet_run({"acme": ["c1"]})
@@ -1971,6 +1982,34 @@ class ProjectDiscoveryTest(unittest.TestCase):
         self.assertNotIn("error", manifest)
         self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme", "project/beta"})
         self.assertEqual(next(c for c in manifest["clusters"] if c["name"] == "project/beta")["outcome"], "collected")
+
+    def test_a_project_numbered_refusal_matching_the_project_holds_no_cluster(self):
+        # gcloud names the consumer project by number; the collector resolves the listed project's.
+        base = fleet_run({}, cluster_list=lambda project: run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project 123456789"))
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(0, "123456789\n" if argv[3] == "acme" else "222222222\n")
+            return base(argv, **kwargs)
+
+        by_name = {c["name"]: c for c in self.collect(run)["clusters"]}
+        self.assertEqual(by_name["project/acme"]["outcome"], "collected")
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("quota project", by_name["project/beta"]["error"])
+
+    def test_the_listing_runs_under_its_own_timeout_not_the_default(self):
+        timeouts = []
+        base = fleet_run({})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                timeouts.append(kwargs.get("timeout"))
+            return base(argv, **kwargs)
+
+        self.collect(run)
+        self.assertEqual(timeouts, [fs.PROJECTS_LIST_TIMEOUT_S])
+        self.assertGreater(fs.PROJECTS_LIST_TIMEOUT_S, fs.DEFAULT_TIMEOUT_S)
+        self.assertLess(fs.PROJECTS_LIST_TIMEOUT_S, fs.PROJECT_READ_DEADLINE_S)
 
     def test_projects_are_enumerated_in_the_pool(self):
         # Both listings have to be in flight at once to pass the barrier; one
@@ -2220,6 +2259,14 @@ class ClustersListedMarkerTest(unittest.TestCase):
         entry = self.project_entry(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme"))
         self.assertEqual(entry[fs.CLUSTERS_LISTED_KEY], 0)
 
+    def test_a_quota_project_s_refusal_does_not_mark_the_project(self):
+        # The refusal names a project other than acme (fleet_run's describe answers no number),
+        # so acme's clusters are unknown, not absent.
+        manifest = self.manifest(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project 987654321"))
+        self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
+        acme = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(acme["outcome"], "gate-failed")
+
     def test_a_failed_list_does_not_mark_the_project(self):
         manifest = self.manifest(run_of(1, "", "PERMISSION_DENIED: container.clusters.list"))
         self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
@@ -2276,7 +2323,12 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "audit": "stockout-prevention",
             "scope": {
                 "clusters": [
-                    {"name": e["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]]}
+                    {
+                        "name": e["name"],
+                        "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]],
+                        # The family-only Spot class leaves spot-scarcity-risk unevaluated, which the report owes a sentence.
+                        **({"limitations": e["limitations"]} if e.get("checks_unevaluated") else {}),
+                    }
                     for e in manifest["clusters"]
                     if e["outcome"] == "collected"
                 ],
