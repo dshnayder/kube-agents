@@ -36,6 +36,8 @@ MIN_CONTENT_WIDTH = 10
 # Unicode categories a terminal draws in no column: nonspacing and enclosing
 # marks, and format characters such as the zero-width joiner and space.
 ZERO_WIDTH_CATEGORIES = ("Mn", "Me", "Cf")
+# The one format character terminals draw anyway: the soft hyphen, as a hyphen.
+SOFT_HYPHEN = "\u00ad"
 SECONDS_PER_MINUTE = 60
 MINUTES_PER_HOUR = 60
 SECONDS_PER_HOUR = 3600
@@ -121,7 +123,8 @@ def display_width(text: str) -> int:
     """
     return sum(
         0
-        if unicodedata.combining(ch) or unicodedata.category(ch) in ZERO_WIDTH_CATEGORIES
+        if ch != SOFT_HYPHEN
+        and (unicodedata.combining(ch) or unicodedata.category(ch) in ZERO_WIDTH_CATEGORIES)
         else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
         for ch in plain(text)
     )

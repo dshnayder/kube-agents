@@ -274,6 +274,18 @@ class TestStreams(StoreTestCase):
         self.assertTrue(row["partial"])
         self.assertEqual(row["gaps"], 2)
 
+    def test_a_stray_directory_reaches_the_rows_that_read_fine(self):
+        # The stray belongs to no repository, so without the stream's error on
+        # the row the answer would say "error" liveness with a null error.
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")], repo="Zeta/Fleet")
+        code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        (row,) = payload["streams"]
+        self.assertEqual(row["repo"], REPO)
+        self.assertIn("Zeta/Fleet: not lower-case", row["error"])
+        self.assertIn(AUDIT, payload["error"])
+
     def test_running_and_never_are_told_apart(self):
         self.write_claim(AUDIT, age_s=60)
         self.stream_dir(OTHER)

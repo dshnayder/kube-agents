@@ -1176,8 +1176,8 @@ cannot name: the body is rewritten from this document, and a findings run leaves
 trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
 had no record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
 findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
-your report: the gap names both ways out only when the collector flags nothing, and otherwise names
-what it still flags. Without a manifest it also answers no `/remediate` — it cannot tell a held id
+your report: the gap names both ways out only when the collector flags nothing, and otherwise says
+the collector still flags something this run did not report. Without a manifest it also answers no `/remediate` — it cannot tell a held id
 from a typo — and logs `No stored report and no manifest` to say so; report that as you would any
 other partial run.
 

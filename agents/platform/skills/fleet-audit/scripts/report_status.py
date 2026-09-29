@@ -237,8 +237,8 @@ def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
 def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
     """The last run the store kept, whole, and whether it came off the ring.
 
-    `finish` deletes `latest.json` once it has read its memory and restores it
-    only on a completed write, so a run that failed in between leaves the ring
+    `finish` deletes `latest.json` just before it changes the ledger and
+    restores it only on a completed write, so a run that failed in between leaves the ring
     and no `latest.json`. The newest ring entry is then the last run the store
     has, and the flag says a later run may have changed the ledger unrecorded.
     """
@@ -344,8 +344,11 @@ def project_stream(
     Liveness is the stream's, because the lease is: one `start` holds the
     stream across every repository. `error` names the lease when it could not
     be read, else the first repository that could not be, and the entry for
-    that repository carries its own. `lease_error` is the scratch directory's
-    listing failure, which `project` found once for every stream.
+    that repository carries its own. `stream_error` is the part no repository
+    entry carries -- the lease, the stream's directory, a stray repository
+    directory -- so a reader shows it on every row. `lease_error` is the
+    scratch directory's listing failure, which `project` found once for every
+    stream.
     """
     error = lease_error
     try:
@@ -361,6 +364,9 @@ def project_stream(
         error = error or _failure(f"{audit_id}/", exc)
     if strays:
         error = error or f"{', '.join(strays)}: not lower-case, so no reader opens it"
+    # Everything above belongs to the stream, not to any one repository, so no
+    # repository entry carries it; readers fall back to it on every row.
+    stream_error = error
     any_latest = None
     for repo in ids:
         entry = _project_repo(root, audit_id, repo)
@@ -372,6 +378,7 @@ def project_stream(
         "repos": repos,
         "liveness": liveness(started, any_latest, now_epoch, error=error),
         "error": error,
+        "stream_error": stream_error,
     }
 
 

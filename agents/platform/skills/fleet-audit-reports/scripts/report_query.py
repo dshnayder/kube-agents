@@ -374,7 +374,8 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "runs": len(entry.get("runs") or []),
         "running_since": started.get("started_at"),
         "age_s": started.get("age_s"),
-        "error": entry.get("error") or (stream.get("error") if repo is None else None),
+        "error": entry.get("error")
+        or (stream.get("error") if repo is None else stream.get("stream_error")),
     }
 
 

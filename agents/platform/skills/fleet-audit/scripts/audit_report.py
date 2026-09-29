@@ -2016,8 +2016,7 @@ def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict
     if res.returncode != 0:
         log(
             f"WARNING: no report store for {audit_id} in {repo} and issue #{issue_number} "
-            "could not be read to seed one; the previous run's findings are unknowable "
-            "this run."
+            f"could not be read to seed one; {MEMORY_UNKNOWABLE}"
         )
         return None
     try:
@@ -2027,8 +2026,7 @@ def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict
     if not isinstance(body, str) or not DELTA_RE.search(normalise_newlines(body)):
         log(
             f"No report store for {audit_id} in {repo} and issue #{issue_number} carries no "
-            "finding-id block to seed one from; the previous run's findings are unknowable "
-            "this run."
+            f"finding-id block to seed one from; {MEMORY_UNKNOWABLE}"
         )
         return None
     log(

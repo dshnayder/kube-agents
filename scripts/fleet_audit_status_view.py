@@ -762,7 +762,7 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
             source = {
                 **stream,
                 "latest": (entry or {}).get("latest"),
-                "error": (entry or {}).get("error"),
+                "error": (entry or {}).get("error") or stream.get("stream_error"),
             }
             out.append((label, audit_id, source))
     return out

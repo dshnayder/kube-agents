@@ -247,6 +247,13 @@ class TestFlags(unittest.TestCase):
         doc = stream(liveness="error", error="latest.json: not a JSON object")
         self.assertEqual(self.flags(doc), ["NO STORE"])
 
+    def test_a_stream_level_error_reaches_a_row_whose_repository_read_fine(self):
+        # An unreadable lease or a stray directory belongs to no repository,
+        # so the row must take it from the stream rather than read clean.
+        doc = stream(last=latest(finished_at=(NOW - timedelta(hours=2)).isoformat()))
+        doc.update(liveness="error", error="the in-flight note: denied", stream_error="the in-flight note: denied")
+        self.assertEqual(self.flags(doc), ["NO STORE"])
+
     def test_died_needs_no_roster_and_no_schedule(self):
         doc = stream(liveness="died", started=started(age_s=9000))
         self.assertEqual(view.flags_for(doc, {}, NOW, True), ["DIED"])
@@ -1156,6 +1163,8 @@ class TestFormatting(unittest.TestCase):
         # U+200D, U+200B and U+FE0F have combining class 0 and draw nothing.
         self.assertEqual(terminal_table.display_width("a\u200db\u200bc\ufe0f"), 3)
         self.assertEqual(terminal_table.display_width("e\u0301"), 1)
+        # The soft hyphen is Cf too, but terminals draw it as a hyphen.
+        self.assertEqual(terminal_table.display_width("co\u00adop"), 5)
 
     def test_clamped_minimums_do_not_overspend_the_width(self):
         # Two wrap columns, one clamped up to its minimum: the excess comes
