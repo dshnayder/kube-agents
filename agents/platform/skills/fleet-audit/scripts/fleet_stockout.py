@@ -1796,7 +1796,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
 def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict | None:
     res_argv = ["gcloud", "compute", "reservations", "list", "--project", project, "--format", "json"]
     reservations, res_result = run_and_gate(res_argv, run=run)
-    if not cluster_regions and reservations is None and _api_disabled(res_result):
+    if not cluster_regions and reservations is None and _api_disabled(res_result) and refusal_names_project(project, res_result.stderr, run=run):
         # No Compute Engine and no cluster: no reservation or regional quota
         # can exist here, so there is no target. A row reporting the failed
         # read would make every such project a coverage gap.

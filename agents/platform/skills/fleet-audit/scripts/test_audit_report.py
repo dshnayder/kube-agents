@@ -14637,6 +14637,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertFalse(self.harness.matching("issue", "create"))
         self.assertFalse(self.harness.matching("issue", "edit"))
 
+    def test_the_clusters_listed_marker_needs_a_manifest(self):
+        # Hand-written, the marker would lift the no-cluster gap on the worker's word alone.
+        audit_id = "fleet-wide-cost-analysis"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            audit_report.CLUSTERS_LISTED_KEY: 0,
+        }
+        doc = make_doc(findings=[], audit=audit_id, clusters=[project])
+        for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
+            with self.subTest(case=label):
+                self.harness.replies = {"issue list": "[]"}
+                rc = self.run_finish(doc, ["--dry-run", *extra], audit=audit_id)
+                self.assertEqual(rc, 2)
+                self.assertIn("only the collector manifest can back", self.err)
+
     def test_a_missing_manifest_file_is_rejected(self):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
         self.assertEqual(rc, 2)

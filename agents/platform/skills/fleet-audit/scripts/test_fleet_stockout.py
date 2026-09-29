@@ -1925,12 +1925,24 @@ class ProjectDiscoveryTest(unittest.TestCase):
         manifest = self.collect(run)
         self.assertEqual({c["name"] for c in manifest["clusters"]}, {"acme/us-central1/c1", "project/acme"})
 
+    def test_a_quota_project_s_compute_refusal_is_a_failed_read_not_an_absent_project(self):
+        inner = fleet_run({"acme": ["c1"]})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"] and "beta" in argv:
+                return run_of(1, "", "ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project quota-proj")
+            return inner(argv, **kwargs)
+
+        beta = next(c for c in self.collect(run)["clusters"] if c["name"] == "project/beta")
+        self.assertIn("reservation-mismatch-risk", {e["check"] for e in beta.get("checks_unevaluated", [])})
+
     def test_a_fleet_that_yields_no_target_is_an_error_not_an_empty_manifest(self):
         # `finish` rejects an empty `scope.clusters`, so an empty manifest
         # without an error left the agent nothing to publish and no rule.
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "compute", "reservations"]:
-                return run_of(1, "", "ERROR: SERVICE_DISABLED: Compute Engine API has not been used")
+                project = argv[argv.index("--project") + 1]
+                return run_of(1, "", f"ERROR: SERVICE_DISABLED: Compute Engine API has not been used in project {project}")
             return fleet_run({})(argv, **kwargs)
 
         manifest = self.collect(run)

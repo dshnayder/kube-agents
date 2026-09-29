@@ -11028,6 +11028,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"{fid}: impact taken from the collector, which knows which arm "
                 "of the check fired."
             )
+    # The marker lifts a coverage gap only as the collector's word, which only
+    # `cross_check_manifest` can hold the document to; without a manifest it
+    # would be the worker's own claim that the fleet holds no clusters.
+    unbacked = [
+        str(c.get("name"))
+        for c in (data.get("scope") or {}).get("clusters") or []
+        if isinstance(c, dict) and CLUSTERS_LISTED_KEY in c
+    ]
+    if manifest is None and unbacked:
+        raise ValidationError(
+            f"scope.clusters: {', '.join(unbacked)} carries {CLUSTERS_LISTED_KEY}, "
+            "which only the collector manifest can back; pass --manifest-file, or "
+            f"leave {CLUSTERS_LISTED_KEY} out and take the coverage gap."
+        )
     waiver_given = getattr(args, "no_collector_manifest", None)
     waiver = str(waiver_given or "").strip()
     if waiver_given is not None and not waiver:

@@ -8,8 +8,12 @@ document against; the checks it runs are defined in
 governance/fleet_wide_cost_analysis_sop.md.
 
 This stream's own collector: its targets are both GKE clusters (the fourteen
-`kubectl` object kinds in `collect_cluster`'s `dump_kinds`, plus a Cloud
-Monitoring usage read) and GCP projects
+`kubectl` object kinds in `collect_cluster`'s `dump_kinds`, a Cloud
+Monitoring usage read, `gcloud container node-pools list`, and §3.7's
+`gcloud container operations list` for `CREATE_NODE_POOL`, which dates each
+pool; a pool with no such operation is dated from the cluster's `createTime`,
+and only a failed operations read falls back to node age, with a limitation)
+and GCP projects
 (`gcloud compute disks/addresses/forwarding-rules/target-pools/backend-services`
 and `gcloud artifacts repositories list`),
 so its manifest mixes cluster-named entries with `project/<id>` entries the
@@ -294,6 +298,12 @@ NO_SESSION_MESSAGE = (
 )
 MONITORING_TIMEOUT_S = 120
 MONITORING_TIMESERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+MONITORING_PAGE_SIZE = "2000"
+MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
+# `--oauth2-bearer`, not an `Authorization: Bearer` header: `finish` redacts
+# whatever follows `Bearer`, which cut the published command in half.
+MONITORING_CURL_PREFIX = 'curl -sG --oauth2-bearer "$(gcloud auth print-access-token)"'
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # Pod phases that do not count as a running replica of their controller.
@@ -890,22 +900,56 @@ def _cluster_filter(cluster: str, location: str | None) -> str:
     return f'{clause} AND resource.labels.location="{location}"' if location else clause
 
 
-def _monitoring_command(project: str, metrics: tuple[str, ...], selector: str, note: str) -> str:
+def _monitoring_command(project: str, requests: list[dict]) -> str:
     """The manifest's stand-in for the argv of a Cloud Monitoring read.
 
     The read is an HTTPS GET with no argv of its own, and `finish` accepts a
     `checks_run` command only if it names an inspection binary, so the label
-    is the `curl` that issues the same request outside the sandbox: the
-    endpoint, the metric filter and the cluster or grouping it selects. The
-    alignment and interval parameters are summarised in the trailing comment
-    rather than spelled out, since they are what `note` names.
+    is the `curl` that issues the same requests outside the sandbox, one per
+    metric, each with every parameter the collector sent but the page size.
+    A list value repeats its key, as `requests` encodes it.
     """
-    kinds = f'"{metrics[0]}"' if len(metrics) == 1 else "one_of(" + ",".join(f'"{m}"' for m in metrics) + ")"
-    query = f"filter=metric.type={kinds}" + (f" AND {selector}" if selector else "")
-    return (
-        f'curl -sG -H "Authorization: Bearer $(gcloud auth print-access-token)" '
-        f"{MONITORING_TIMESERIES_URL.format(project=project)} --data-urlencode {shlex.quote(query)} # {note}"
-    )
+    url = MONITORING_TIMESERIES_URL.format(project=project)
+    curls = []
+    for params in requests:
+        args = [
+            f"--data-urlencode {shlex.quote(f'{key}={item}')}"
+            for key, value in params.items()
+            for item in (value if isinstance(value, list) else [value])
+        ]
+        curls.append(" ".join([MONITORING_CURL_PREFIX, url, *args]))
+    return " && ".join(curls)
+
+
+def _pod_series_params(
+    metric: str, cluster: str, location: str | None, *, start: datetime, now: datetime,
+    primary: str, secondary: str, window_hours: int,
+) -> dict:
+    """The query `_read_pod_series` sends, less paging; its label renders the same dict."""
+    return {
+        "filter": f'metric.type="{metric}" AND {_cluster_filter(cluster, location)}' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
+        "interval.startTime": start.strftime(MONITORING_TIME_FORMAT),
+        "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
+        "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
+        "aggregation.perSeriesAligner": primary,
+        "aggregation.crossSeriesReducer": "REDUCE_SUM",
+        "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
+        "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
+        "secondaryAggregation.perSeriesAligner": secondary,
+    }
+
+
+def _lb_traffic_params(metric: str, *, start: datetime, now: datetime) -> dict:
+    """The query `_read_lb_series` sends, less paging; its label renders the same dict."""
+    return {
+        "filter": f'metric.type="{metric}"',
+        "interval.startTime": start.strftime(MONITORING_TIME_FORMAT),
+        "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
+        "aggregation.alignmentPeriod": f"{LB_TRAFFIC_ALIGNMENT_S}s",
+        "aggregation.perSeriesAligner": "ALIGN_SUM",
+        "aggregation.crossSeriesReducer": "REDUCE_SUM",
+        "aggregation.groupByFields": [LB_RULE_LABEL],
+    }
 
 
 def _read_pod_series(
@@ -937,16 +981,11 @@ def _read_pod_series(
     page_token = None
     while True:
         params = {
-            "filter": f'metric.type="{metric}" AND {_cluster_filter(cluster, location)}' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
-            "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
-            "aggregation.perSeriesAligner": primary,
-            "aggregation.crossSeriesReducer": "REDUCE_SUM",
-            "aggregation.groupByFields": ["resource.labels.namespace_name", "resource.labels.pod_name"],
-            "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
-            "secondaryAggregation.perSeriesAligner": secondary,
-            "pageSize": "2000",
+            **_pod_series_params(
+                metric, cluster, location, start=start, now=now,
+                primary=primary, secondary=secondary, window_hours=window_hours,
+            ),
+            "pageSize": MONITORING_PAGE_SIZE,
         }
         if page_token:
             params["pageToken"] = page_token
@@ -1006,10 +1045,14 @@ def fetch_usage_peaks(
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
     url = MONITORING_TIMESERIES_URL.format(project=project)
-    label = _monitoring_command(
-        project, (CPU_METRIC, MEM_METRIC), _cluster_filter(cluster, location),
-        f"peak per pod, window={window_hours}h",
-    )
+    reads = ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem"))
+    label = _monitoring_command(project, [
+        _pod_series_params(
+            metric, cluster, location, start=start, now=now,
+            primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
+        )
+        for metric, aligner, _ in reads
+    ])
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
         return {}, False, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
@@ -1018,7 +1061,7 @@ def fetch_usage_peaks(
         return fail(-1, NO_SESSION_MESSAGE)
 
     peaks: dict[str, dict[tuple[str, str], float]] = {"cpu": {}, "mem": {}}
-    for metric, aligner, key in ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem")):
+    for metric, aligner, key in reads:
         sink, err = _read_pod_series(
             session, url, metric=metric, cluster=cluster, location=location, start=start, now=now,
             primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
@@ -1071,10 +1114,12 @@ def fetch_memory_means(
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
     url = MONITORING_TIMESERIES_URL.format(project=project)
-    label = _monitoring_command(
-        project, (MEM_METRIC,), _cluster_filter(cluster, location) + MEM_NON_EVICTABLE_FILTER,
-        f"ALIGN_MEAN per pod, window={window_hours}h",
-    )
+    label = _monitoring_command(project, [
+        _pod_series_params(
+            MEM_METRIC, cluster, location, start=start, now=now,
+            primary="ALIGN_MAX", secondary="ALIGN_MEAN", window_hours=window_hours,
+        )
+    ])
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
         return {}, False, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
@@ -1128,16 +1173,7 @@ def _read_lb_series(
     sink: dict[str, float] = {}
     page_token = None
     while True:
-        params = {
-            "filter": f'metric.type="{metric}"',
-            "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "aggregation.alignmentPeriod": f"{LB_TRAFFIC_ALIGNMENT_S}s",
-            "aggregation.perSeriesAligner": "ALIGN_SUM",
-            "aggregation.crossSeriesReducer": "REDUCE_SUM",
-            "aggregation.groupByFields": [LB_RULE_LABEL],
-            "pageSize": "2000",
-        }
+        params = {**_lb_traffic_params(metric, start=start, now=now), "pageSize": MONITORING_PAGE_SIZE}
         if page_token:
             params["pageToken"] = page_token
         try:
@@ -1198,10 +1234,7 @@ def fetch_lb_traffic(
         ("egress_packets", LB_EGRESS_PACKETS_METRIC),
         ("egress_bytes", LB_EGRESS_BYTES_METRIC),
     )
-    label = _monitoring_command(
-        project, tuple(metric for _, metric in metrics), "",
-        f"group_by={LB_RULE_LABEL}, window={window_hours}h",
-    )
+    label = _monitoring_command(project, [_lb_traffic_params(metric, start=start, now=now) for _, metric in metrics])
 
     def fail(rc: int, message: str) -> tuple[dict, Run]:
         return {}, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
@@ -3240,7 +3273,7 @@ def check_idle_workload(
             entry["oldest_h"], replaced=replaced, controller_h=age_days * 24
         )
         # Why no resize is on the table, which is the reader's first question
-        # and now has two answers. Naming the wrong one would send them to
+        # and has three answers. Naming the wrong one would send them to
         # check a floor the manifest is nowhere near.
         no_resize = (
             "Requests and limits are equal, so any resize would lower the "
@@ -3690,7 +3723,7 @@ IMPACT = {
     # substance; it was certainly unmeasured, and an audit that guesses right is
     # still an audit a reader cannot check. What this check measures is CPU and
     # memory, so that is all it now asserts.
-    "idle-workload": "Nothing has used this controller's CPU or memory for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the two no-resize reasons applies.",
+    "idle-workload": "Nothing has used this controller's CPU or memory for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
@@ -5036,7 +5069,13 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # mix is a read that failed, and gates as one below.
     # A project with a known cluster has Compute Engine, whatever the error
     # says: the refusal is then someone else's, such as a quota project's.
-    compute_disabled = not known_clusters and len(failed) == len(compute_reads) and all(_api_disabled(result) for _, _, result in compute_reads)
+    # Without a cluster to say so, the refusal has to name this project.
+    compute_disabled = (
+        not known_clusters
+        and len(failed) == len(compute_reads)
+        and all(_api_disabled(result) for _, _, result in compute_reads)
+        and refusal_names_project(project, disks_result.stderr, run=run)
+    )
     if failed and not compute_disabled:
         return {
             "name": f"project/{project}",
@@ -5056,7 +5095,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # every location in one read, and the banner it prints goes to stderr.
     reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
     reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
-    registry_disabled = reg_parsed is None and _api_disabled(reg_result)
+    registry_disabled = reg_parsed is None and _api_disabled(reg_result) and refusal_names_project(project, reg_result.stderr, run=run)
     if compute_disabled and registry_disabled:
         # Nothing any project-scoped check looks for can exist here, so there
         # is no target to report: a row naming four inapplicable checks and

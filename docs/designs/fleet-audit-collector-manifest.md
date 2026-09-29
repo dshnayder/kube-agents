@@ -96,7 +96,7 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                              |
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                            |
-| `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                        |
+| `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                   |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
@@ -155,7 +155,8 @@ before any `gh` call:
   a check the collector never reached still takes the model's judgement.
 - A target carries `clusters_listed` and its manifest entry does not carry the same value. The
   marker takes the cluster kind out of the coverage count (§5), so a hand-written one would turn a
-  run that lost its clusters clean.
+  run that lost its clusters clean. `validate_findings` accepts it only on a `project/<id>` entry and
+  only as the literal `0` (a bool is rejected), and `finish` rejects it without `--manifest-file`.
 - A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
   target's `checks_unevaluated`, or the manifest lists any there and the target carries no
   `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
@@ -423,7 +424,8 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
-`clusters list` completed empty, never on a failed, zone-incomplete or unreached one, and the SOPs
+`clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
+API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs
 carry it onto `scope.clusters`. The `cluster` kind's gap is lifted only when every `project/<id>`
 target carries it; §3.1 holds each copy to the manifest.
 

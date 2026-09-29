@@ -2,6 +2,7 @@
 """Tests for fleet_waste.py, the fleet-wide-cost-analysis collector."""
 
 import json
+import shlex
 import subprocess
 import os
 import sys
@@ -126,6 +127,59 @@ def usage_session(*pods, **kwargs):
 
 
 NO_USAGE = dict(cpu=[], mem=[])
+
+
+def requests_in_label(label):
+    """The query each `curl` in a Monitoring label sends, in `session.get`'s shape."""
+    requests = []
+    for curl in label.split(" && "):
+        words = shlex.split(curl)
+        params = {}
+        for flag, value in zip(words, words[1:]):
+            if flag == "--data-urlencode":
+                key, _, item = value.partition("=")
+                if key not in params:
+                    params[key] = item
+                else:
+                    params[key] = [*(params[key] if isinstance(params[key], list) else [params[key]]), item]
+        requests.append(params)
+    return requests
+
+
+def sent_without_paging(calls):
+    """What the fake session saw, with list values as a label spells them and no page size."""
+    return [{k: (v if not isinstance(v, list) or len(v) > 1 else v[0]) for k, v in call.items() if k != "pageSize"} for call in calls]
+
+
+class MonitoringLabelTest(unittest.TestCase):
+    """The label is published as the command that backs the check, so it has to
+    be the requests the collector sent and has to survive `finish`'s redaction."""
+
+    def test_each_label_is_the_requests_the_collector_sent(self):
+        peaks = FakeSession(cpu=[series_of("d", "p", 0.1)], mem=[series_of("d", "p", MIB)])
+        _, _, peaks_run = fw.fetch_usage_peaks("acme", "prod-usc1", session=peaks, now=NOW)
+        means = FakeSession(mem=[series_of("d", "p", MIB)])
+        _, _, means_run = fw.fetch_memory_means("acme", "prod-usc1", session=means, now=NOW)
+        lb = FakeLbSession(ingress=[lb_series("rule-a", 1)])
+        _, lb_run = fw.fetch_lb_traffic("acme", FetchLbTrafficTest.RULES, session=lb, now=NOW)
+        for label, session in ((peaks_run.argv[0], peaks), (means_run.argv[0], means), (lb_run.argv[0], lb)):
+            with self.subTest(label=label[:80]):
+                self.assertEqual(requests_in_label(label), sent_without_paging(session.calls))
+
+    def test_the_label_survives_redaction_and_passes_finish_s_command_check(self):
+        import audit_report
+
+        # The longest names GCP allows: a 30-character project, a 40-character cluster, the longest zone.
+        project, cluster, zone = "p" * 30, "c" * 40, "northamerica-northeast1-a"
+        labels = [
+            fw.fetch_usage_peaks(project, cluster, location=zone, session=FakeSession(), now=NOW)[2].argv[0],
+            fw.fetch_memory_means(project, cluster, location=zone, session=FakeSession(), now=NOW)[2].argv[0],
+            fw.fetch_lb_traffic(project, FetchLbTrafficTest.RULES, session=FakeLbSession(), now=NOW)[1].argv[0],
+        ]
+        for label in labels:
+            with self.subTest(label=label[:80]):
+                self.assertEqual(audit_report.publishable_text(label), label)
+                audit_report.validate_check_command(label, "scope.clusters[0]", "overrequest")
 
 
 class FetchUsagePeaksTest(unittest.TestCase):
@@ -332,7 +386,7 @@ class FetchMemoryMeansTest(unittest.TestCase):
         3.1's, which is otherwise the same metric over the same window."""
         _, _, result = self.fetch(FakeSession(mem=[series_of("d", "p", MIB)]))
         self.assertIn("ALIGN_MEAN", result.argv[0])
-        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", result.argv[0])
+        self.assertIn(f"secondaryAggregation.alignmentPeriod={fw.USAGE_WINDOW_HOURS * 3600}s", result.argv[0])
 
 
 def lb_series(rule, *values, resource="loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule"):
@@ -521,7 +575,9 @@ class FetchLbTrafficTest(unittest.TestCase):
         self.assertIn("projects/acme/timeSeries", label)
         self.assertIn(fw.LB_RULE_LABEL, label)
         self.assertIn(fw.LB_INGRESS_PACKETS_METRIC, label)
-        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", label)
+        start = NOW - timedelta(hours=fw.USAGE_WINDOW_HOURS)
+        self.assertIn(f"interval.startTime={start.strftime(fw.MONITORING_TIME_FORMAT)}", label)
+        self.assertIn(f"interval.endTime={NOW.strftime(fw.MONITORING_TIME_FORMAT)}", label)
 
     def test_the_digest_survives_an_unmeasured_rule(self):
         # The rendered stand-in holds `None` in three columns for `rule-b`. A
@@ -5160,6 +5216,19 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertEqual({c["check"] for c in entry["commands"]}, {"unattached-disk", "idle-address", "orphan-lb"})
         self.assertNotIn("checks_unevaluated", entry)
         self.assertNotIn("limitations", entry)
+
+    def test_a_quota_project_s_compute_refusal_gates_and_declares_nothing_inapplicable(self):
+        # A project with no cluster has nothing else to say the refusal is someone else's.
+        run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF.replace("acme", "quota-proj")), registry=lambda p: None)
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertNotIn("checks_not_applicable", entry)
+
+    def test_a_quota_project_s_registry_refusal_is_unevaluated_not_inapplicable(self):
+        run = cluster_free_run(compute=lambda p: None, registry=lambda p: run_of(1, "", self.REGISTRY_OFF.replace("acme", "quota-proj")))
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        self.assertNotIn("registry-no-cleanup", {c["check"] for c in entry.get("checks_not_applicable", [])})
+        self.assertIn("registry-no-cleanup", {c["check"] for c in entry.get("checks_unevaluated", [])})
 
     def test_one_compute_read_refused_for_another_reason_still_gates(self):
         # Only all five answering "disabled" says the project has no Compute
