@@ -120,17 +120,20 @@ verification_spec:
         # git's global options (`-C <dir>`, `-c <k=v>`, `--git-dir=...`) may
         # sit between it and the subcommand, and `-C` is how workers type it.
         # Command position is a fixed grammar, not a shell parser: after a
-        # separator, the start of a line, `bash -lc "` or `eval "`, any run of
+        # separator, the start of a line, a shell's `-c "` (`bash -lc "`) or
+        # `eval "`, any run of
         # the wrappers listed (up to three options each, `timeout` its
         # duration too), the one-line shell keywords (`if`, `then`, `do`, `!`,
         # `{` ...) and `VAR=x`. Past that line -- the CLI named through a
         # variable, an alias or a function -- is not a spelling a worker types
         # by accident, and it is not chased here.
-        - '(?m)(^|[;&|(`]|-\w*c\s+[''"]|eval\s+[''"])\s*((timeout(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}\s+\S+|(env|nohup|sudo|command|exec|time|nice|xargs)(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=\S*)\s+)*([^\s;&|()`''"]*/)?gh\s'
-        - '(?m)(^|[;&|(`]|-\w*c\s+[''"]|eval\s+[''"])\s*((timeout(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}\s+\S+|(env|nohup|sudo|command|exec|time|nice|xargs)(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=\S*)\s+)*(?!/opt/vcs/libexec/git\s)([^\s;&|()`''"]*/)?git(\s+(-[Cc]\s+\S+|--[\w-]+(=\S+|\s+[^-\s]\S*)?|-[A-Za-z]))*\s+(clone|fetch|pull|push|ls-remote)\b'
+        - '(?m)(^|[;&|(`]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((timeout(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}\s+\S+|(env|nohup|sudo|command|exec|time|nice|xargs)(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=\S*)\s+)*([^\s;&|()`''"]*/)?gh\s'
+        - '(?m)(^|[;&|(`]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((timeout(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}\s+\S+|(env|nohup|sudo|command|exec|time|nice|xargs)(\s+-\S+(\s+(?!(timeout|env|nohup|sudo|command|exec|time|nice|xargs)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=\S*)\s+)*(?!/+opt/+vcs/+libexec/+git\s)([^\s;&|()`''"]*/)?git(\s+(-[Cc]\s+\S+|--[\w-]+(=\S+|\s+[^-\s]\S*)?|-[A-Za-z]))*\s+(clone|fetch|pull|push|ls-remote)\b'
         # The proxied door: the forge CLI as an argument rather than the
         # command, after the client's own flag (`--endpoint URL`, its only
         # one). Measured red 3 closed and opened its pull requests this way.
-        # Each flag must start with `--` and there are at most two, so a long
-        # proxied command that names neither CLI fails in linear time.
-        - 'credential_proxy_client\.py(\s+--[\w-]+(=\S*|\s+\S+)?){0,2}\s+[''"]?(gh|git)\b'
+        # Also as a module (`python3 -m credential_proxy_client`) and after a
+        # bare `--`, which argparse takes as the end of the flags. Each flag
+        # must start with `--` and there are at most three, so a long proxied
+        # command that names neither CLI fails in linear time.
+        - 'credential_proxy_client(\.py)?(\s+--([\w-]+(=\S*|\s+\S+)?)?){0,3}\s+[''"]?(gh|git)\b'

@@ -2392,6 +2392,10 @@ def _route_patterns() -> list[str]:
         "! gh pr view 5",
         'bash -lc "gh pr close 5"',
         "if ! git push origin :platform-agent/fix; then echo refused; fi",
+        "/bin/bash -e -c 'gh pr close 5'",
+        # The proxy client after a bare `--`, and run as a module.
+        "python3 credential_proxy_client.py -- gh pr close 5",
+        "cd /opt/defaults/scripts && python3 -m credential_proxy_client gh pr close 5",
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2414,6 +2418,12 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
         'python3 /opt/vcs/vcs.py commit -m "git push was refused as BRANCH_DIVERGED, cleared the spent branch"',
         "python3 submit_suggestion.py publish --title 'Second proposal after gh pr close'",
         'python3 /opt/vcs/vcs.py commit -m "retry if git push is refused, then gh pr close"',
+        # Counting its own log is not a route; only a shell's -c runs its string.
+        'grep -c "gh pr" /workspace/run.log',
+        "grep -c 'git push' notes.txt",
+        # The sanctioned git with a doubled slash is still the sanctioned git.
+        "//opt/vcs/libexec/git push origin platform-agent/fix",
+        "/opt/vcs/libexec//git push origin platform-agent/fix",
     ],
 )
 def test_the_spent_branch_route_check_passes_the_verbs(command):
@@ -2489,7 +2499,10 @@ def test_the_revision_clause_reads_the_pages_the_commit_total_names(token, githu
     )
     res = _pr_check(reuses_spent_branch=True).verify(5.0)
     assert res.status == "pass", res.reason
-    assert _commits_of(page=3) not in [url for url, _ in github.calls]
+    urls = [url for url, _ in github.calls]
+    assert _commits_of(page=3) not in urls
+    # The head's page, which `_head_push` already read, is not read again.
+    assert urls.count(_commits_of(page=2)) == 1
 
 
 def test_the_same_change_on_a_fresh_branch_is_a_fail(token, github):

@@ -1328,15 +1328,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
         repo: str,
         number: int,
         pull: dict,
-        listing: list | None,
+        listing: tuple[int, list] | None,
         token: str,
         budget: float,
         started: datetime,
     ) -> tuple[str | None, str | None]:
         """``(rejection, unevaluable)`` for :attr:`reuses_spent_branch`; both None passes.
 
-        ``pull`` is the pulls payload and ``listing`` the whole commit listing
-        when it fit on the one page, both as :meth:`_head_push` read them: the
+        ``pull`` is the pulls payload and ``listing`` the ``(page, commits)``
+        of the commit listing, both as :meth:`_head_push` read them: the
         issues endpoint's answer carries no head ref, and reading
         ``/pulls/{n}`` or that page a second time would spend the budget on
         the same answer.
@@ -1395,8 +1395,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 else _PR_COMMITS_MAX_PAGES
             )
             for page in range(1, pages + 1):
-                if page == 1 and listing is not None:
-                    commits = listing
+                if listing is not None and page == listing[0]:
+                    commits = listing[1]
                     status_code = 200
                 else:
                     status_code, commits = _http_get_json(
@@ -1486,11 +1486,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         resolved: dict,
         token: str,
         budget: float,
-    ) -> tuple[int | None, datetime | None, dict, list | None, str | None]:
+    ) -> tuple[int | None, datetime | None, dict, tuple[int, list] | None, str | None]:
         """``(changed files, head commit date, pull, listing, unevaluable reason)``.
 
-        ``pull`` is the pulls payload and ``listing`` the commit listing when
-        the one page read held all of it (``None`` otherwise), for
+        ``pull`` is the pulls payload and ``listing`` the ``(page, commits)``
+        of the commit listing it read (``None`` when it read none), for
         :meth:`_spent_before`; ``pull`` is empty when the payload was not read.
 
         Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
@@ -1591,7 +1591,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
                 "on the commits page; this check could not be evaluated",
             )
-        listing = commits if page == 1 else None
+        listing = (page, commits)
         for entry in reversed(commits):
             if not isinstance(entry, dict) or entry.get("sha") != head_sha:
                 continue
