@@ -16,10 +16,9 @@ so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
 §1 scopes this to "every project the agent can see", so a bare invocation
-discovers every project with at least one cluster the same way
-`patch_readiness.py`'s `get_target_projects` does for its sibling stream,
-rather than auditing only the active gcloud project; `--project` overrides
-discovery for a scoped run. Project-scoped facts (live PV handles, Service
+discovers the active project plus every listed project holding at least one
+cluster, rather than auditing only the active gcloud project; `--project`
+overrides discovery for a scoped run. Project-scoped facts (live PV handles, Service
 names, referenced addresses) are unioned only across the clusters in the
 same project before that project's disk/address/LB checks run — a project
 never sees another project's cluster state.
@@ -103,6 +102,11 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 ERROR_EXCERPT_CHARS = 300
+# gcloud's words for a project whose Kubernetes Engine API is off. Such a
+# project cannot hold a cluster, so its `clusters list` failure is an answer
+# rather than a read that failed; otherwise every non-GKE project a credential
+# can see is a permanent `gate-failed` target. Copied from `collect.py`.
+API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
 
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
@@ -527,12 +531,14 @@ class NoProjectInScope(Exception):
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
     """§1's project scope: "every project the agent can see". A `--project`
     override skips discovery entirely, for a scoped or a test run; otherwise
-    this discovers the active project plus every other project with at
-    least one cluster, the same way `patch_readiness.py`'s
-    `get_target_projects` does for its own sibling stream.
+    this discovers the active project plus every other listed project with
+    at least one cluster. A listed project that holds none is dropped, which
+    `collect.py` and `patch_readiness.py` no longer do: they keep every
+    listed project.
 
     The second value is set when the scope is provably short of the fleet --
-    `--project` skipped discovery, or `gcloud projects list` failed -- and
+    `--project` skipped discovery, `gcloud projects list` failed, or it
+    answered without naming the active project -- and
     `collect_fleet` turns it into an `UNENUMERATED_PROJECTS_TARGET` entry, so
     the loss is a row the document has to account for rather than a fleet that
     silently shrank to one project.
@@ -562,11 +568,12 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
         log(f"WARNING: {partial}")
         return projects, partial
 
-    candidates = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip() and p.strip() != base]
+    listed = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip()]
+    candidates = [p for p in listed if p != base]
     if not base and not candidates:
         raise NoProjectInScope(NO_PROJECT_IN_SCOPE_ERROR)
     for candidate in candidates:
-        parsed, _ = run_and_gate(
+        parsed, probe = run_and_gate(
             ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
         )
         # `[]` and `None` are different answers and only the first one means the
@@ -574,9 +581,24 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
         # stays in scope so `collect_fleet` records the loss as a `gate-failed`
         # target; dropped here it leaves no trace in the manifest at all, and a
         # project nobody could enumerate then reads exactly like one holding no
-        # clusters. `patch_readiness.py` carries the same guard.
+        # clusters. The one failure that is an answer is a disabled Kubernetes
+        # Engine API: that project cannot hold a cluster.
+        if parsed is None and any(marker in probe.stderr for marker in API_DISABLED_MARKERS):
+            continue
         if parsed is None or parsed:
             projects.append(candidate)
+    if base and base not in listed:
+        # rc 0 and the active project absent from its own output: the listing
+        # is filtered rather than complete, so the scope is provably short.
+        # `collect.py`'s `discover_fleet` answers the same input the same way.
+        partial = (
+            f"`gcloud projects list` rc=0 did not name the active project {base!r}, "
+            f"so it is filtered rather than complete: it returned {len(listed)} "
+            "project(s) and this run reads clusters in one it did not return. How "
+            "many other projects the fleet holds is unknown."
+        )
+        log(f"WARNING: {partial}")
+        return projects, partial
     return projects, None
 
 
@@ -632,6 +654,11 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
     )
     if result.rc != 0:
+        # The active project or a `--project` override reaches here without
+        # the discovery probe, so the same disabled-API answer is read again.
+        if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
+            log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
+            return [], []
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
     try:
         clusters = json.loads(result.stdout or "[]")
@@ -1542,7 +1569,13 @@ CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
 # a TPU node pool carries its topology, not an `accelerators` list, and §3.7 is
 # explicit that "an idle accelerator pool with a non-zero floor is the single
 # largest reclaimable item this audit can find".
-ACCELERATOR_MACHINE_RE = re.compile(r"^[a-z0-9]+-(?:high|ultra|mega)(?:gpu|tpu)-\d+[a-z]?$")
+#
+# TPU v6e (`ct6e-standard-4t`) and TPU7x (`tpu7x-standard-4t`) name their
+# chips under `standard` instead, with a `t` suffix no vCPU-counted type
+# carries, so the second alternative admits exactly that shape.
+ACCELERATOR_MACHINE_RE = re.compile(
+    r"^[a-z0-9]+-(?:(?:high|ultra|mega)(?:gpu|tpu)-\d+[a-z]?|standard-\d+t)$"
+)
 
 
 def _machine_type_vcpus(machine_type: str) -> int | None:
@@ -1751,26 +1784,27 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
 
 
 SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
-# What the cluster autoscaler itself accepts. It reads the annotation with Go's
-# `strconv.ParseBool`, so `"False"`, `"FALSE"` and `"0"` pin a pod exactly as
-# `"false"` does. An exact-string comparison against `"false"` reads all three
-# as "annotation absent" and takes the permissive branch, so a node the
-# autoscaler will never drain went unreported -- and on the other side,
-# `!= "true"` read `"True"` as unset and reported a node whose owner had
-# explicitly cleared it. Both directions are wrong against the same parse.
-_EVICT_TRUE = frozenset({"1", "t", "true"})
-_EVICT_FALSE = frozenset({"0", "f", "false"})
+# What the cluster autoscaler itself compares against: the exact strings
+# `"true"` and `"false"`, untrimmed and case-sensitive. §3.8 states the rule
+# in those literals, and `gke-cluster-autoscaler`'s
+# `find-scale-down-blockers.sh` selects on `== "false"` / `!= "true"`. Folding
+# case or accepting `strconv.ParseBool`'s other spellings inverts the
+# autoscaler both ways: a pod annotated `"False"` was published as pinning a
+# node the autoscaler drains, and a local-storage pod annotated `"True"` had
+# its pin dropped although the autoscaler still honours it.
+SAFE_TO_EVICT_TRUE = "true"
+SAFE_TO_EVICT_FALSE = "false"
 
 
 def _safe_to_evict(annotations: dict) -> bool | None:
     """The `safe-to-evict` annotation as set-true, set-false, or unset.
 
-    Unset covers a value the autoscaler cannot parse either, which it ignores.
+    Unset covers every other value, which the autoscaler ignores.
     """
-    raw = (annotations.get(SAFE_TO_EVICT_ANNOTATION) or "").strip().lower()
-    if raw in _EVICT_TRUE:
+    raw = annotations.get(SAFE_TO_EVICT_ANNOTATION)
+    if raw == SAFE_TO_EVICT_TRUE:
         return True
-    if raw in _EVICT_FALSE:
+    if raw == SAFE_TO_EVICT_FALSE:
         return False
     return None
 
@@ -1850,8 +1884,6 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
     if not flagged_nodes:
         return []
 
-    pdb_selectors = _pdb_selectors(context)
-
     # One finding per node, carrying its worst blocker: a node pinned for good
     # by one pod is `critical` whichever pod the listing happens to put first.
     by_node: dict[str, dict] = {}
@@ -1873,10 +1905,13 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         evictable = _safe_to_evict(annotations)
         has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
 
-        blocked_by_pdb = any(_selector_matches(sel, ns, (pod.get("metadata", {}).get("labels") or {})) for sel in pdb_selectors)
-        if blocked_by_pdb:
-            continue  # already reported by obtainability-audit's 3.3/3.4
-
+        # A PDB is not a reason this check reports -- obtainability-audit's
+        # 3.3/3.4 own it -- but it is not a reason to skip the pod either. A
+        # PDB-selected pod that is bare, carries local storage or is annotated
+        # `safe-to-evict: "false"` still pins the node after the PDB is fixed,
+        # and one empty-selector PDB covers every pod in its namespace. §3.8
+        # withholds the finding only where the PDB is the *only* blocker, and
+        # `unevictable` below never counts a PDB.
         bare_pod = not owners
         unevictable = evictable is False or ((bare_pod or has_local_storage) and evictable is not True)
         if not unevictable:
@@ -2646,9 +2681,14 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             # A third reason: the other dimension is the namespace LimitRange's
             # default, which gets no verdict here at all -- idle or not, it is
             # fixed in the LimitRange, and "in use" would be false of it.
+            # A fourth: no request declared at all, where "in use" would be
+            # a verdict about a dimension nothing was measured against.
             other, other_unused = ("memory", mem_unused) if over == "cpu" else ("cpu", cpu_unused)
+            other_req_total = mem_req_total if over == "cpu" else cpu_req_total
             if other in defaulted:
                 why = "the namespace LimitRange default, which is fixed in the LimitRange rather than resized here"
+            elif not other_req_total:
+                why = "not requested, so there is nothing to resize"
             elif other_unused:
                 why = "already at the 50m/64Mi sizing floor and cannot be reduced further"
             else:
@@ -2818,18 +2858,34 @@ def _idle_traffic_clause(
     ]
     if not entries:
         return ""
-    subject = (
-        "Its forwarding rule"
-        if len(entries) == 1
-        else f"The {len(entries)} forwarding rules in front of it"
-    )
     measured = [entry for entry in entries if entry.get("ingress_packets") is not None]
     if not measured:
+        subject = (
+            "Its forwarding rule"
+            if len(entries) == 1
+            else f"The {len(entries)} forwarding rules in front of it"
+        )
         return (
             f". {subject} carries no Cloud Monitoring traffic series over the "
             f"trailing {USAGE_WINDOW_HOURS}h, so what reached "
             f"{'it' if len(entries) == 1 else 'them'} is unmeasured rather than zero"
         )
+    # Some rules measured and some not: the figures below speak for the
+    # measured ones only, and the rest are named as unmeasured. Folding them
+    # into "the N rules metered ..." read an unmeasured rule as a quiet one,
+    # the zero `fetch_lb_traffic` refuses to write within one address.
+    unmeasured = len(entries) - len(measured)
+    if not unmeasured:
+        subject = "Its forwarding rule" if len(entries) == 1 else f"The {len(entries)} forwarding rules in front of it"
+    else:
+        subject = f"{len(measured)} of the {len(entries)} forwarding rules in front of it"
+    unmeasured_clause = (
+        f"; the other {unmeasured} carr{'ies' if unmeasured == 1 else 'y'} no Cloud "
+        f"Monitoring traffic series, so what reached "
+        f"{'it' if unmeasured == 1 else 'them'} is unmeasured rather than zero"
+        if unmeasured
+        else ""
+    )
     ingress = sum(entry["ingress_packets"] for entry in measured)
     egress_packets = sum(entry.get("egress_packets") or 0.0 for entry in measured)
     egress_bytes = sum(entry.get("egress_bytes") or 0.0 for entry in measured)
@@ -2838,13 +2894,16 @@ def _idle_traffic_clause(
         f"{'' if ingress == 1 else 's'} over {USAGE_WINDOW_HOURS}h"
     )
     if ingress < LB_TRAFFIC_MIN_PACKETS:
-        return (
+        floor = (
             f"{metered}, under the {LB_TRAFFIC_MIN_PACKETS:,}-packet floor this "
             f"check treats as the background an exposed address collects on its "
-            f"own -- nothing measurable reached it"
+            f"own"
         )
+        if unmeasured:
+            return floor + unmeasured_clause
+        return f"{floor} -- nothing measurable reached it"
     if not egress_packets:
-        return f"{metered} and answered none of them"
+        return f"{metered} and answered none of them{unmeasured_clause}"
     per_packet = egress_bytes / egress_packets
     answered = (
         f"{metered} and answered with {egress_bytes:,.0f} bytes across "
@@ -2855,10 +2914,10 @@ def _idle_traffic_clause(
             f"{answered} -- under the {LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET}-byte "
             f"mark a served response clears, so the rule was busy without ever "
             f"sending a payload, which is the shape of unsolicited connection "
-            f"attempts to a public address rather than of sessions"
+            f"attempts to a public address rather than of sessions{unmeasured_clause}"
         )
     return (
-        f"{answered}, which is enough payload that something is being served. "
+        f"{answered}, which is enough payload that something is being served{unmeasured_clause}. "
         f"Find out what before standing the controller down: this check "
         f"measured a forwarding rule, not a caller"
     )
@@ -3123,10 +3182,28 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # `major`, and there is deliberately no Autopilot bump -- this stream
         # already grades most of what it finds at the ceiling, and a severity
         # every finding shares stops ordering any of them.
-        near_limit = mem_lim_total > 0 and mean_mem >= 0.9 * mem_lim_total
+        #
+        # Every container must declare a memory limit for the sum to be a
+        # ceiling anything enforces. Admission and the OOM killer are per
+        # container, so a pod pairing a limited sidecar with an unlimited main
+        # container -- every default Istio injection -- has a `mem_lim_total`
+        # binding neither. Grading against it published `critical` off the
+        # sidecar's 1Gi while the unlimited container held the memory, and
+        # `critical` + `manifest` is what `finish` promotes unattended.
+        limited = all(
+            parse_mem_mib(str(lim.get("memory", "0")))
+            for pod in entry["pods"]
+            for lim in pod["limits"]
+        )
+        near_limit = limited and mem_lim_total > 0 and mean_mem >= 0.9 * mem_lim_total
         severity = "critical" if near_limit else "major"
 
-        ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit" if mem_lim_total > 0 else "no memory limit"
+        if limited and mem_lim_total > 0:
+            ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit"
+        elif mem_lim_total > 0:
+            ceiling = "a memory limit on only some containers"
+        else:
+            ceiling = "no memory limit"
         excerpt = (
             f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
             f"{mean_mem / 1024.0:.2f} GiB {measured_over} — "
@@ -3159,19 +3236,8 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # prescription, so the comparison a reader makes from the excerpt alone
         # says it fits. Divide by the replica count here rather than asking for
         # that division to be remembered.
-        #
-        # Every container must declare a memory limit for the sum to be a
-        # ceiling anything enforces. Admission is per container, so a pod
-        # pairing a limited sidecar with an unlimited main container has a
-        # `mem_lim_total` binding neither. No controller on the sixteen-cluster
-        # fleet is shaped that way on 2026-09-07; the guard is here so that one
-        # appearing does not produce a sentence about a limit that does not
-        # exist.
-        limited = all(
-            parse_mem_mib(str(lim.get("memory", "0")))
-            for pod in entry["pods"]
-            for lim in pod["limits"]
-        )
+        # `limited` above keeps a partial limit out of this sentence too: it
+        # would describe a limit that does not exist.
         if limited and new_request > mem_lim_total / replicas:
             excerpt += (
                 f" That exceeds the {mem_lim_total / replicas:.0f}Mi memory limit declared"
@@ -3961,17 +4027,6 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             reconcilers=context["reconcilers"], releases=release_index,
         )
 
-    node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-    # Gated, unlike the bare `run` this used to be. An unreadable node-pool
-    # list -- denied, throttled, a bad `--location` -- parsed to `[]`, and a
-    # cluster with no node pools has no idle ones, so 3.7 and 3.8 recorded
-    # their command and reported nothing found. The evidence line carried the
-    # non-zero rc, but nothing downstream reads it: the ledger said the pools
-    # were checked and were fine.
-    node_pools, pools_result = run_and_gate(node_pools_argv, run=run)
-    pools_readable = node_pools is not None
-    node_pools = node_pools or []
-    pools_record = _record(shlex.join(node_pools_argv), pools_result)
     limitations: list[str] = []
     not_applicable: list[dict] = []
     # A check whose read failed: neither run nor inapplicable. `finish` rejects
@@ -4015,6 +4070,20 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # fact the collector already holds, so the disposition belongs here where it
     # is the same on every run.
     if not cluster.get("autopilot"):
+        # Read here rather than for every cluster: nothing on the Autopilot
+        # branch consumes it, and there the call is a round trip whose answer
+        # is discarded.
+        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+        # Gated, unlike the bare `run` this used to be. An unreadable node-pool
+        # list -- denied, throttled, a bad `--location` -- parsed to `[]`, and a
+        # cluster with no node pools has no idle ones, so 3.7 and 3.8 recorded
+        # their command and reported nothing found. The evidence line carried the
+        # non-zero rc, but nothing downstream reads it: the ledger said the pools
+        # were checked and were fine.
+        node_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        pools_readable = node_pools is not None
+        node_pools = node_pools or []
+        pools_record = _record(shlex.join(node_pools_argv), pools_result)
         if not pools_readable:
             for slug in ("idle-nodepool", "scaledown-blocked"):
                 unevaluated[slug] = f"`gcloud container node-pools list` failed (rc={pools_result.rc})"
@@ -4193,7 +4262,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # attached -- a reader saw the check named and had nothing to tell them
         # whether it was denied, throttled, or never attempted.
         for slug in ("overrequest", "unsized-workload", "idle-workload"):
-            unevaluated[slug] = f"the Cloud Monitoring usage read failed: {_metrics_gap_phrase(usage_result, 'usage')}"
+            unevaluated[slug] = _metrics_gap_phrase(usage_result, "usage")
         limitations.append(
             f"overrequest, unsized-workload and idle-workload could not be "
             f"measured on this cluster: {_metrics_gap_phrase(usage_result, 'usage')}"
@@ -4222,11 +4291,11 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             }
         )
     else:
-        unevaluated["underrequest"] = f"the Cloud Monitoring mean-memory read failed: {_metrics_gap_phrase(means_result, 'mean-memory')}"
-        limitations.append(
-            f"underrequest could not be measured on this cluster: "
-            f"{_metrics_gap_phrase(means_result, 'mean-memory')}"
-        )
+        # Where the peak read failed the mean read was never issued and
+        # `means_result` is the usage read's `Run`, so name that read.
+        means_gap = _metrics_gap_phrase(means_result, "mean-memory" if metrics_ok else "usage")
+        unevaluated["underrequest"] = means_gap
+        limitations.append(f"underrequest could not be measured on this cluster: {means_gap}")
 
     entry = {
         "name": target, "project": project, "location": location, **mode, "outcome": "collected",

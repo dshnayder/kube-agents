@@ -782,9 +782,11 @@ class IdleNodepoolTest(unittest.TestCase):
         largest reclaimable item this audit can find."""
         nodes = [self.node("n1", "tpu-pool")]
         context = {"nodes": nodes, "pods": []}
-        pools = [self.pool("tpu-pool", machine_type="ct5lp-hightpu-4t"), self.pool("other")]
-        hits = fw.check_idle_nodepool(context, pools, now=NOW)
-        self.assertEqual(hits[0]["severity"], "major")
+        for machine_type in ("ct5lp-hightpu-4t", "ct6e-standard-4t", "tpu7x-standard-4t"):
+            with self.subTest(machine_type=machine_type):
+                pools = [self.pool("tpu-pool", machine_type=machine_type), self.pool("other")]
+                hits = fw.check_idle_nodepool(context, pools, now=NOW)
+                self.assertEqual(hits[0]["severity"], "major")
 
     def test_one_busy_node_stops_the_pool_being_called_idle(self):
         """§3.7 flags when *every* node in the pool is under 15%, not when the
@@ -1038,12 +1040,13 @@ class IsBigMachineTest(unittest.TestCase):
         self.assertFalse(fw._is_big_machine("e2-standard-4"))
 
     def test_every_accelerator_family_is_big(self):
-        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "a3-highgpu-8g", "ct5lp-hightpu-4t"):
+        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "a3-highgpu-8g", "ct5lp-hightpu-4t", "ct6e-standard-1t", "ct6e-standard-4t", "tpu7x-standard-4t"):
             with self.subTest(machine_type=machine_type):
                 self.assertTrue(fw._is_big_machine(machine_type))
 
     def test_an_unparseable_type_is_not_assumed_big(self):
         self.assertFalse(fw._is_big_machine("e2-micro"))
+        self.assertFalse(fw._is_big_machine("e2-standard-4"))
         self.assertFalse(fw._is_big_machine(""))
 
 
@@ -1112,11 +1115,24 @@ class ScaledownBlockedTest(unittest.TestCase):
                 hits = fw.check_scaledown_blocked({"pods": pods, "pdbs": []}, [{"_node_names": {"n1"}}])
                 self.assertEqual([(h["severity"], "ci/debug" in h["excerpt"]) for h in hits], [("critical", True)])
 
-    def test_pdb_backed_pod_is_never_flagged_here(self):
-        pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": []})
+    def test_a_pdb_alone_is_not_flagged_here(self):
+        # obtainability-audit's 3.3/3.4 own the PDB; an owned pod with no
+        # other blocker is evictable as far as §3.8 is concerned.
+        pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}]})
         pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": {"matchLabels": {"app": "web"}}})
         context = {"pods": [pod], "pdbs": [pdb]}
         self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_a_pdb_does_not_hide_a_blocker_that_is_not_the_pdb(self):
+        """§3.8 withholds the finding only where the PDB is the only blocker.
+        A bare PDB-selected pod with local storage still pins the node for good
+        once the PDB is fixed, and an empty selector covers the namespace."""
+        pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": [], "spec.volumes": [{"emptyDir": {}}]})
+        for selector in ({"matchLabels": {"app": "web"}}, {}):
+            with self.subTest(selector=selector):
+                pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": selector})
+                [hit] = fw.check_scaledown_blocked({"pods": [pod], "pdbs": [pdb]}, [{"_node_names": {"n1"}}])
+                self.assertEqual(hit["severity"], "critical")
 
     def test_no_idle_pool_hits_means_nothing_to_check(self):
         self.assertEqual(fw.check_scaledown_blocked({"pods": [], "pdbs": []}, []), [])
@@ -1136,27 +1152,29 @@ class ScaledownBlockedTest(unittest.TestCase):
             },
         )
 
-    def test_every_spelling_the_autoscaler_accepts_pins_the_node(self):
-        """The autoscaler parses this annotation with `strconv.ParseBool`, so
-        `"False"`, `"FALSE"` and `"0"` pin a pod exactly as `"false"` does. An
-        exact match against `"false"` read all three as the annotation being
-        absent and let the node through unreported."""
-        for value in ("false", "False", "FALSE", "0", "f", " false "):
+    def test_only_the_exact_false_pins_the_node(self):
+        """The autoscaler compares the annotation against `"false"` exactly, so
+        any other spelling leaves the pod evictable and the node drainable.
+        Reporting `"False"` as a pin published a blocker the autoscaler
+        ignores."""
+        context = {"pods": [self.evict_pod("false")], "pdbs": []}
+        hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+        for value in ("False", "FALSE", "0", "f", " false "):
             with self.subTest(value=value):
                 context = {"pods": [self.evict_pod(value)], "pdbs": []}
-                hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
-                self.assertEqual(len(hits), 1, value)
-                self.assertEqual(hits[0]["severity"], "major")
+                self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
 
-    def test_a_capitalised_true_clears_the_local_storage_pin(self):
-        """The mirror-image error: `!= "true"` read `"True"` as unset, so a pod
-        whose owner had explicitly cleared the annotation was still reported."""
-        for value in ("true", "True", "TRUE", "1"):
+    def test_only_the_exact_true_clears_the_local_storage_pin(self):
+        """The mirror image: `"True"` is not `"true"` to the autoscaler, so a
+        local-storage pod annotated that way still pins its node."""
+        for value, expected in (("true", 0), ("True", 1), ("TRUE", 1), ("1", 1)):
             with self.subTest(value=value):
                 pod = self.evict_pod(value)
                 pod["spec"]["volumes"] = [{"emptyDir": {}}]
                 context = {"pods": [pod], "pdbs": []}
-                self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+                self.assertEqual(len(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])), expected)
 
     def test_an_unparseable_value_is_treated_as_unset(self):
         pod = self.evict_pod("maybe")
@@ -1164,9 +1182,9 @@ class ScaledownBlockedTest(unittest.TestCase):
         self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
 
     def test_the_excerpt_quotes_the_raw_annotation(self):
-        context = {"pods": [self.evict_pod("False")], "pdbs": []}
+        context = {"pods": [self.evict_pod("false")], "pdbs": []}
         hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
-        self.assertIn("safe-to-evict=False", hits[0]["excerpt"])
+        self.assertIn("safe-to-evict=false", hits[0]["excerpt"])
 
 
 class OwnerKeyTest(unittest.TestCase):
@@ -1607,6 +1625,17 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 400.0)}, now=NOW, autopilot=False)
         self.assertEqual(len(hits), 1)
         self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+
+    def test_a_memory_only_request_does_not_call_cpu_in_use(self):
+        # No CPU request and no LimitRange default: "in use" would be a verdict
+        # about a dimension the workload never declared.
+        pod = self.deployment_pod(mem_req="8Gi")
+        del pod["spec"]["containers"][0]["resources"]["requests"]["cpu"]
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 400.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+        self.assertIn("cpu is not requested", hits[0]["excerpt"])
+        self.assertNotIn("in use", hits[0]["excerpt"])
 
     def test_a_both_idle_finding_does_not_claim_one_dimension_is_in_use(self):
         pod = self.deployment_pod()
@@ -2470,6 +2499,21 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("unmeasured rather than zero", excerpt)
         self.assertNotIn("metered", excerpt)
 
+    def test_an_unmeasured_rule_beside_a_quiet_one_is_not_counted_as_quiet(self):
+        """Two Services in front of one controller, one rule with no series.
+
+        The 812 packets belong to the measured rule alone, and "nothing
+        measurable reached it" would claim the unmeasured one carried nothing.
+        """
+        other = "35.245.254.69"
+        traffic = {**self.traffic(ingress=812, egress_packets=400, egress_bytes=25000), **self.traffic(ip=other, rule="b-rule")}
+        hits = self.hits(services=[self.svc(ip=self.IP), self.svc("second", ip=other)], lb_traffic=traffic)
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("1 of the 2 forwarding rules in front of it metered 812 inbound packets", excerpt)
+        self.assertIn("the other 1 carries no Cloud Monitoring traffic series", excerpt)
+        self.assertIn("unmeasured rather than zero", excerpt)
+        self.assertNotIn("nothing measurable reached it", excerpt)
+
     def test_no_traffic_read_at_all_writes_no_clause(self):
         # `lb_traffic=None` is a run with no Monitoring session, or the
         # collector invoked by hand. Silence, not a zero and not a caveat.
@@ -2744,18 +2788,29 @@ class UnderrequestTest(unittest.TestCase):
     def test_a_partially_limited_pod_gets_no_limit_clause(self):
         """Admission is per container; the summed limit binds neither.
 
-        A pod pairing a limited sidecar with an unlimited main container has a
-        `mem_lim_total` that is a real number and enforces nothing. No
-        controller on the fleet is shaped this way on 2026-09-07 -- this pins
-        the guard against the first one that is.
+        The main container declares a 2Gi limit and the sidecar declares none,
+        so `mem_lim_total` is a real number that enforces nothing. The 1900 MiB
+        mean is past 90% of that 2Gi and its 1.3x prescription is past 2Gi, so
+        this reaches both guards: without them it would publish `critical`,
+        print a 2.0 GiB ceiling, and tell the reader to raise the limit.
         """
         pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
         pod["spec"]["containers"].append(
             {"name": "sidecar", "resources": {"requests": {"memory": "0"}}}
         )
-        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
-        self.assertIn("Raise the memory request to", excerpt)
-        self.assertNotIn("raise the limit", excerpt)
+        [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1900.0})
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("a memory limit on only some containers", hit["excerpt"])
+        self.assertNotIn("GiB limit", hit["excerpt"])
+        self.assertIn("Raise the memory request to", hit["excerpt"])
+        self.assertNotIn("raise the limit", hit["excerpt"])
+
+    def test_a_fully_limited_pod_near_its_limit_is_critical(self):
+        # The control for the test above: the same numbers with no sidecar.
+        [hit] = self.check([self.pod(mem_req="512Mi", mem_lim="2Gi")], {("kubeagents-system", "litellm-1"): 1900.0})
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("2.0 GiB limit", hit["excerpt"])
+        self.assertIn("raise the limit", hit["excerpt"])
 
     def test_the_per_replica_suffix_tracks_the_replica_count(self):
         # `check_overrequest`'s rule: on a single-replica controller the
@@ -4206,6 +4261,17 @@ class CollectClusterTest(unittest.TestCase):
             ["idle-workload", "overrequest", "underrequest", "unsized-workload"],
         )
 
+    def test_an_unevaluated_reason_names_the_read_once_and_only_the_read_issued(self):
+        # The phrase already opens "the Cloud Monitoring usage read ...", and
+        # with the peak read down the mean read was never made.
+        entry = self._metrics_down(obj("Node", "node-1"), session=FakeSession(raises=ConnectionError("connection reset")))
+        for item in entry["checks_unevaluated"]:
+            with self.subTest(check=item["check"]):
+                self.assertEqual(item["reason"].count("Cloud Monitoring"), 1, item["reason"])
+                self.assertIn("usage read failed", item["reason"])
+                self.assertNotIn("mean-memory", item["reason"])
+        self.assertNotIn("mean-memory", entry["limitations"])
+
     def test_an_empty_answer_is_not_described_as_a_failure(self):
         """rc 0 is a 200 that carried no series — the cluster is not shipping
         system metrics. Reporting that as `failed (rc=0)` asked the reader to
@@ -4268,6 +4334,23 @@ class CollectClusterTest(unittest.TestCase):
         the cluster does not owe."""
         entry, _ = self._unreadable_pools({**self.CLUSTER, "autopilot": True})
         self.assertNotIn("limitations", entry)
+
+    def test_autopilot_never_lists_node_pools(self):
+        # Nothing on the Autopilot branch reads the answer.
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                fw.collect_cluster({**self.CLUSTER, "autopilot": True}, run=run, session=usage_session(), now=NOW)
+        self.assertFalse([argv for argv in calls if argv[:3] == ["gcloud", "container", "node-pools"]])
 
     def test_a_readable_empty_pool_list_still_records_the_checks(self):
         """Zero pools is a measurement. It must not look like the failure above."""
@@ -4595,6 +4678,61 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertIn("permission denied", partial)
 
 
+    def test_a_listing_that_omits_the_active_project_is_partial(self):
+        # rc 0 without the active project: the listing is filtered, so the
+        # scope is provably short, as `collect.discover_fleet` reads it.
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "beta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "c2"}]))
+            raise AssertionError(argv)
+
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["acme", "beta"])
+        self.assertIn("did not name the active project 'acme'", partial)
+
+    def test_a_listing_that_names_the_active_project_is_complete(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "c2"}]))
+            raise AssertionError(argv)
+
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "beta"], None))
+
+    def test_a_project_with_the_gke_api_disabled_is_dropped_not_failed(self):
+        # It cannot hold a cluster; kept, it is a `gate-failed` target on every
+        # run and pins the stream partial.
+        disabled = "ERROR: (gcloud.container.clusters.list) SERVICE_DISABLED: Kubernetes Engine API has not been used in project beta"
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\ngamma\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                project = argv[argv.index("--project") + 1]
+                if project == "beta":
+                    return run_of(1, "", disabled)
+                return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+            raise AssertionError(argv)
+
+        # gamma's failure is not an answer, so it stays in scope to be recorded.
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "gamma"], None))
+
+    def test_the_active_project_with_the_gke_api_disabled_holds_no_cluster(self):
+        def run(argv, **kwargs):
+            return run_of(1, "", "accessNotConfigured: Kubernetes Engine API is disabled")
+
+        self.assertEqual(fw.enumerate_clusters("acme", run=run), ([], []))
+
+
 class MultiProjectCollectFleetTest(unittest.TestCase):
     def test_discovers_and_audits_every_project_with_a_cluster(self):
         def run(argv, **kwargs):
@@ -4627,8 +4765,8 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         genuinely unattached disk of the same name in project beta -- the
         cross-cluster fact union is scoped per project, not fleet-wide.
         Beta gets its own (PV-less) cluster so project discovery includes
-        it at all; a project with zero clusters is out of scope entirely,
-        matching `patch_readiness.py`'s sibling discovery rule."""
+        it at all; a listed project with zero clusters is dropped by
+        `get_target_projects`."""
 
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
@@ -5083,6 +5221,13 @@ class MonitoringReadsGoThroughTheRelayTest(unittest.TestCase):
     def test_the_broker_endpoint_selects_the_relay_session(self):
         import credential_proxy_client
 
+        # `ApiSession()` builds its default transport from `requests`, which
+        # the test requirements do not declare; the sibling test in
+        # `test_credential_proxy_client.py` skips on the same condition.
+        try:
+            import requests  # noqa: F401
+        except ImportError:  # pragma: no cover - environment without requests
+            self.skipTest("requests is not installed here; the sandbox image has it")
         with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker:8765"}):
             session = fw.default_monitoring_session()
         self.assertIsInstance(session, credential_proxy_client.ApiSession)
