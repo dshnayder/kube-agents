@@ -266,11 +266,15 @@ def liveness(
     older one does not (the next `start` takes it over). `died` is a run that
     started and never reached `finish`; nothing here can tell whether its
     session is still going, only that it no longer holds the stream.
+
+    The lease is read before `error`: it is the stream's, so one repository's
+    unreadable file must not hide a run holding, or dead on, every repository.
+    The error still rides beside it in the projection's `error` key.
     """
-    if error:
-        return "error"
     if started is not None:
         return "running" if now_epoch - started < ttl else "died"
+    if error:
+        return "error"
     if latest is not None:
         return "completed"
     return "never"

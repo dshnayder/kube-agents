@@ -94,6 +94,15 @@ class TestProjection(ReportStatusTestCase):
         self.assertIn(f"{REPO}: latest.json: not a JSON object", streams["drift-audit"]["error"])
         self.assertEqual(streams[AUDIT]["liveness"], "completed")
 
+    def test_an_unreadable_repository_does_not_hide_a_dead_run(self):
+        self.write_latest()
+        (self.root / AUDIT / "acme" / "other").mkdir(parents=True)
+        (self.root / AUDIT / "acme" / "other" / "latest.json").write_text("[]")
+        self.write_note(age_s=report_status.INFLIGHT_TTL_S + 60)
+        stream = self.project()["streams"][AUDIT]
+        self.assertEqual(stream["liveness"], "died")
+        self.assertIn("acme/other: latest.json: not a JSON object", stream["error"])
+
     def test_no_store_is_said_rather_than_read_as_an_empty_fleet(self):
         document = self.project()
         self.assertFalse(document["root_exists"])

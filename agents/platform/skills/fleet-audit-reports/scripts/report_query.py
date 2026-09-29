@@ -638,8 +638,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Bounded reads of the fleet-audit report store.",
         epilog="Exit 0 answered the question; exit 2 could not, and the JSON says why.",
     )
+    # No literal fallback: a third copy of the root is one more to drift, and
+    # without report_status every subcommand refuses anyway.
     default_root = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or getattr(
-        report_status, "REPORTS_DIR", "/opt/data/fleet-audit/reports"
+        report_status, "REPORTS_DIR", "unknown: the fleet-audit skill is not installed"
     )
     parser.add_argument("--root", help=f"store root to read (default: {default_root})")
     # Repeated on every subparser so `… findings compliance-audit --root X`

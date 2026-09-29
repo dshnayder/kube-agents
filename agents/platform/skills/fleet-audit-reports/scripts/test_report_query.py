@@ -848,5 +848,70 @@ class TestBoundedOutput(StoreTestCase):
         self.assertIn("error", self.refused("show", OTHER))
 
 
+
+class TestTheWriterIsWhatIsRead(StoreTestCase):
+    """The reader against envelopes the real writer made, not hand-built ones.
+
+    Every other test here builds its envelope by hand, so a key the writer
+    renames, or a severity it adds, would break the reader with every suite
+    still green.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import audit_report  # noqa: PLC0415 — on the path report_query put there
+
+        self.audit_report = audit_report
+        env = patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_the_severity_order_is_the_writers(self):
+        self.assertEqual(
+            sorted(report_query.SEVERITY_ORDER, key=report_query.SEVERITY_ORDER.get),
+            list(self.audit_report.SEVERITIES),
+        )
+
+    def test_a_written_run_answers_every_subcommand(self):
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        findings = [finding("a1", severity="minor"), finding("b2", severity="critical")]
+        document = scope_document(
+            AUDIT,
+            findings,
+            [{"name": "prod-us-east", "checks_run": [
+                {"check": "netpol-missing", "command": "kubectl get networkpolicy -A"}
+            ]}],
+        )
+        written = self.audit_report.report_envelope(
+            AUDIT,
+            {"status": "OPENED", "partial": False, "coverage_gaps": []},
+            document,
+            datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc),
+            repo=REPO,
+            issue_number=7,
+            ledger_body="body",
+            new_ids=["a1", "b2"],
+            resolved_ids=[],
+            rendered_ids=["a1", "b2"],
+        )
+        self.audit_report.write_report(
+            AUDIT, written, datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+        )
+        shown = self.ok("show", AUDIT)["envelope"]
+        self.assertEqual(shown["status"], "OPENED")
+        self.assertEqual(shown["issue_number"], 7)
+        self.assertEqual(shown["findings"], 2)
+        self.assertEqual(shown["critical"], 1)
+        self.assertEqual(
+            [row["id"] for row in self.ok("findings", AUDIT)["findings"]], ["b2", "a1"]
+        )
+        self.assertEqual(self.ok("finding", AUDIT, "b2")["finding"]["impact"], f"{PROSE} impact")
+        self.assertEqual(self.ok("checks", AUDIT)["matched"], 1)
+        row = self.ok("streams")["streams"][0]
+        self.assertEqual(row["status"], "OPENED")
+        self.assertEqual(row["liveness"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

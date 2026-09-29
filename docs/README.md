@@ -207,7 +207,7 @@ identifier appears, add its source here.
 | Which deliverables a Google Chat thread gets pasted inline, the size ceiling, and the per-message budget | `agents/platform/scripts/google_chat_relay_patch.py` |
 | Staging a sandbox-written artifact out for delivery: the per-file, per-card and total ceilings, the deadline, and the denied prefixes | `agents/platform/scripts/sandbox_artifact_patch.py` |
 | fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
-| fleet-audit report store: root, `FLEET_AUDIT_REPORTS_DIR`, ring size, stamp format, and the in-flight TTL | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (the readers' copies in `report_status.py` beside it) |
+| fleet-audit report store: root, `FLEET_AUDIT_REPORTS_DIR`, ring size, stamp format, and the in-flight TTL | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`report_status.py` beside it copies the root and the TTL) |
 | fleet-upgrade-verification record path, file name per target, record format version, readiness flags and exit codes, kubeconfig directory and file name, and the readiness cell strings | `agents/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py` and `upgrade_readiness.py` beside it |
 | Chat-delivery watch: the `ALERT chat_delivery_watch` log prefix and file, the ledger issue's label and marker, the streak state path, and the `CHAT_DELIVERY_*` environment variables | `agents/platform/scripts/chat_delivery_watch.py` |
 | Controller stall watch: the `STALL_WATCH_*` environment variables, the default kind list, the per-tick card ceiling and the ledger path | `agents/platform/scripts/stall_watch.py` |

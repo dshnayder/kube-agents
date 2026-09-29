@@ -141,6 +141,24 @@ KNOWN_STATUS = frozenset(STATUS_STYLE)
 FLAG_STYLE = {"NO STORE": "crit", "DIED": "crit", "NEVER": "yellow", "STALE": "yellow"}
 
 SORTS = ("stream", "last", "findings", "flags")
+# A collector writes coverage gaps at whatever length; one is clipped to this.
+GAP_WIDTH = 400
+#: `render_table` is given this when the caller asked for no width limit, which
+#: is the default for `render()` used as a library function and what `--width 0`
+#: means: draw every column at its natural width and drop nothing.
+UNBOUNDED = 10_000
+# How much of a projection that is not JSON goes into the error.
+BAD_OUTPUT_EXCERPT = 200
+# Days a cron day-of-week search walks: every weekday once, plus today's again.
+CRON_DOW_SCAN_DAYS = 8
+# A gap's `scope: text` prefix longer than this reads as prose, not a scope.
+SCOPE_PREFIX_MAX = 40
+# Label column width in the detail view.
+FIELD_LABEL_WIDTH = 9
+# The table's width when --width is not given: the terminal's, within bounds.
+MIN_TERMINAL_WIDTH = 80
+MAX_TERMINAL_WIDTH = 220
+FALLBACK_TERMINAL_SIZE = (160, 40)
 
 
 class ProjectionError(RuntimeError):
@@ -414,7 +432,7 @@ def as_projection(text: str, origin: str) -> dict:
     except ValueError:
         raise ProjectionError(
             f"the projection returned output that is not JSON, from {origin}: "
-            f"{_oneline(text)[:200] or '(no output)'}"
+            f"{_oneline(text)[:BAD_OUTPUT_EXCERPT] or '(no output)'}"
         ) from None
     if not isinstance(doc, dict) or not isinstance(doc.get("streams"), dict):
         raise ProjectionError(
@@ -472,7 +490,7 @@ def next_fire(expr: str, after: datetime) -> datetime | None:
         return None
     if candidate <= after:
         candidate += timedelta(days=1)
-    for _ in range(8):
+    for _ in range(CRON_DOW_SCAN_DAYS):
         # cron dow: 0=Sunday; Python: Monday=0 → cron = (weekday+1) % 7
         if dows is None or ((candidate.weekday() + 1) % 7) in dows:
             return candidate
@@ -571,8 +589,6 @@ def unreadable_reason(projection: dict) -> str | None:
     return f"unreadable stream files: {', '.join(bad)}" if bad else None
 
 
-GAP_WIDTH = 400
-
 
 def clip_gap(text: str, width: int = GAP_WIDTH) -> str:
     """A ceiling on one gap, because a collector writes these at whatever length.
@@ -597,7 +613,7 @@ def gap_parts(text: str) -> tuple[str, str]:
     """
     line = " ".join(str(text).split())
     scope, sep, rest = line.partition(": ")
-    if sep and rest and len(scope) <= 40 and " " not in scope.strip():
+    if sep and rest and len(scope) <= SCOPE_PREFIX_MAX and " " not in scope.strip():
         return scope, rest
     return "", line
 
@@ -719,11 +735,6 @@ GAP_COLUMNS = [
     Column("SCOPE", expendable=1),
     Column("GAP", wrap=True, min_width=28),
 ]
-
-#: `render_table` is given this when the caller asked for no width limit, which
-#: is the default for `render()` used as a library function and what `--width 0`
-#: means: draw every column at its natural width and drop nothing.
-UNBOUNDED = 10_000
 
 
 def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
@@ -933,7 +944,7 @@ def header_lines(
     lines = [lead, ""]
 
     def field(label: str, value: str) -> str:
-        return "  %s %s" % (palette(label.ljust(9), "dim"), value)
+        return "  %s %s" % (palette(label.ljust(FIELD_LABEL_WIDTH), "dim"), value)
 
     lines.append(field("store", scrub(projection.get("root"))))
     lines.append(field("source", scrub(source)))
@@ -1150,7 +1161,8 @@ def main(argv: list[str] | None = None) -> int:
     palette = Palette(want_colour(args.color))
     box = BOX_ASCII if args.ascii else BOX_UNICODE
     width = args.width if args.width else max(
-        80, min(shutil.get_terminal_size((160, 40)).columns, 220)
+        MIN_TERMINAL_WIDTH,
+        min(shutil.get_terminal_size(FALLBACK_TERMINAL_SIZE).columns, MAX_TERMINAL_WIDTH),
     )
 
     while True:

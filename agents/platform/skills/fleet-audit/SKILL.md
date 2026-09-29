@@ -236,19 +236,18 @@ still reproducing at `finish`, its pull request opens immediately instead of a w
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it
 is, and its title — read off the previous run's stored report, the body `finish` will compare your
-document against. **These
-are the findings you are answering for.** For each one, this run ends one of four ways: you report
-it again; you re-ran its check on that cluster, saw it gone, and say so under
-[`resolved_because`](#the-findings-document) with the same `check`, `cluster`, `namespace` and `object`;
-it is a posture now covered by a declaration and sits under `declared`; or you did not run that
-check there and your `checks_run` does not claim you did. A run whose
-`checks_run` says the check ran and whose document neither reports nor explains the finding is
-**held** — see [The clean run](#the-clean-run). On a stream that passes `--manifest-file` there is
-a fifth ending for a finding the collector still emits: `resolved_because` does not release it, and
-only the collector no longer emitting it or a `declared` entry does. Where the store has never held
-the ledger, `start` reads the issue's hidden block once instead. Empty when there is no open ledger,
-or the store's record of it is missing, unreadable or for another issue (`start` says so on
-stderr).
+document against. **These are the findings you are answering for.** For each one, this run ends one
+of four ways: you report it again; you re-ran its check on that cluster, saw it gone, and say so
+under [`resolved_because`](#the-findings-document) with the same `check`, `cluster`, `namespace` and
+`object`; it is a posture now covered by a declaration and sits under `declared`; or you did not run
+that check there and your `checks_run` does not claim you did. A run whose `checks_run` says the
+check ran and whose document neither reports nor explains the finding is **held** — see [The clean
+run](#the-clean-run). On a stream that passes `--manifest-file` there is a fifth ending for a
+finding the collector still emits: `resolved_because` does not release it, and only the collector no
+longer emitting it or a `declared` entry does. Where the store has never held the ledger, `start`
+reads the issue's hidden block once instead. Empty when there is no open ledger, or the store's
+record of it is missing, unreadable or for another issue, or the store never held it and the issue
+has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream

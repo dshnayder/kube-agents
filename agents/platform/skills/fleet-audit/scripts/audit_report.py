@@ -6909,11 +6909,10 @@ def _render_scope(
             out.append(f"| _…and {len(skipped) - MAX_SCOPE_ROWS} more_ |  |")
 
     # A gap the document itself cannot express has no row above to show it —
-    # a waived collector manifest, or a ledger body the run could not read and
-    # left as it was — so it is listed here, in the section a reader consults
-    # for what the run did not cover. Without this a findings run with a
-    # waiver published a Scope table reading as full coverage and the reason
-    # reached no page anyone opens.
+    # a waived collector manifest — so it is listed here, in the section a
+    # reader consults for what the run did not cover. Without this a findings
+    # run with a waiver published a Scope table reading as full coverage and
+    # the reason reached no page anyone opens.
     extra = list(extra_gaps or [])
     if extra:
         out += [

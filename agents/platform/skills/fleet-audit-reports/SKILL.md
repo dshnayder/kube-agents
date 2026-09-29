@@ -31,8 +31,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
   run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and
   `findings` all carry it. Held open over a lost memory, the envelope's `issue_number` is null and
-  `current` is empty: the store does not know what the issue lists, so read the issue.
-  `ledger_document` is that previous document, kept for `fleet-audit`; do not answer from it.
+  `current` is 0: the store does not know what the issue lists, so read the issue. `ledger_document`
+  is that previous document, kept for `fleet-audit`; do not answer from it.
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
@@ -62,8 +62,9 @@ object per call.
 | `runs <stream>`                     | the stamps the ring holds, so a `diff` can name real ones             |
 
 - Exit 0 answered the question. Exit 2 could not, and stdout still holds one JSON object whose
-  `error` says why — absent store, absent stream, absent stamp, a file that would not parse. Every
-  answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
+  `error` says why — absent store, absent stream, absent stamp, a file that would not parse.
+  Arguments that do not parse are the exception: argparse prints usage to stderr and stdout is
+  empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.
 - Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
@@ -75,10 +76,12 @@ object per call.
 - `--severity`, `--cluster` and `--check` on `findings`, and `--cluster` and `--check` on `checks`,
   are exact matches, case-insensitive.
 - `findings`, `checks` and `diff` cap at 100 rows, raisable with `--limit`. `findings` and `checks`
-  report `matched`, `returned` and `truncated`; `diff` caps `added` and `resolved` independently
-  and reports `added_total`, `resolved_total`, `unchanged` and `truncated` — quote `added_total`,
-  not the length of `added`. Findings sort severity-first, so a cap drops only the least severe;
-  `checks` keeps the document's order, so a capped answer lines up with the issue's table.
+  report `matched`, `returned` and `truncated`, and `checks` caps its exclusions separately under
+  `not_applicable_matched`, `not_applicable_returned` and `not_applicable_truncated`; `diff` caps
+  `added` and `resolved` independently and reports `added_total`, `resolved_total`, `unchanged` and
+  `truncated` — quote `added_total`, not the length of `added`. Findings sort severity-first, so a
+  cap drops only the least severe; `checks` keeps the document's order, so a capped answer lines up
+  with the issue's table.
 - `--root` overrides the store root. In the pod, leave it alone.
 
 ## The four questions this gets asked
@@ -134,7 +137,7 @@ python3 ./skills/fleet-audit-reports/scripts/report_query.py checks obtainabilit
 The ledger drops its least-severe findings, then its evidence table whole, to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
-it, plus every `checks_not_applicable` exclusion and its reason; filter by cluster or check — a
+it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a
 16-cluster stream carries upwards of 150.
 
 Fleet-wide, `streams` is the whole answer: one row per stream with its liveness, so "when did each
