@@ -2405,6 +2405,16 @@ def _route_patterns() -> list[str]:
         "\\git push origin :platform-agent/fix",
         "command gh pr close 5",
         "command -p gh pr close 5",
+        # A wrapper named by path.
+        "/usr/bin/env gh pr close 5",
+        "/usr/bin/timeout 60 gh pr close 5",
+        "/usr/bin/env -i /usr/bin/git push origin :platform-agent/fix",
+        # A quoted value with a space in it, before the command or the subcommand.
+        'git -c user.name="Platform Agent" push origin :platform-agent/fix',
+        "git -c 'user.name=Platform Agent' push origin :platform-agent/fix",
+        'GIT_COMMITTER_NAME="Platform Agent" git push origin :platform-agent/fix',
+        'GH_PAGER="less -R" gh pr close 5',
+        'git --git-dir="/workspace/my infra/.git" push origin :platform-agent/fix',
     ],
 )
 def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
@@ -2414,7 +2424,7 @@ def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
 @pytest.mark.parametrize(
     "command",
     [
-        "python3 /opt/vcs/vcs.py remote-branch delete --branch platform-agent/fix --revision abc",
+        "python3 /opt/vcs/vcs.py remote-branch delete platform-agent/fix --revision abc",
         "python3 /opt/vcs/vcs.py clone gke-agentic/infra",
         "python3 submit_suggestion.py prepare --branch platform-agent/fix",
         "git -C /workspace/infra commit -am 'scale web'",
@@ -2460,7 +2470,19 @@ def test_the_spent_branch_route_check_is_linear_on_a_long_wrapper_run():
     # Wrappers with options, and nothing after them. An option's value may not
     # be a wrapper's name; before that rule `env -i env -i ...` could split
     # each `env` as a value or a wrapper, and doubled in time every two.
-    command = "env -i " * 40 + "nice -n 1 " * 20 + "command -p " * 20 + "true"
+    command = (
+        "env -i " * 40 + "nice -n 1 " * 20 + "command -p " * 20
+        + "/usr/bin/env -i /usr/bin/env " * 20 + "true"
+    )
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
+def test_the_spent_branch_route_check_is_linear_on_long_quoted_values():
+    # Quoted values and assignments, then no push: each value is one shell
+    # word, so there is one way to read it.
+    command = 'A="x y" ' * 40 + "git " + '-c k="a b" ' * 40 + "status"
     began = time.monotonic()
     assert not any(re.search(p, command) for p in _route_patterns())
     assert time.monotonic() - began < 1.0

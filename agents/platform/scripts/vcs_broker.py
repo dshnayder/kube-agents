@@ -73,6 +73,7 @@ from providers import (
     CliTransport,
     Forge,
     ForgeUnsupported,
+    MAX_PAGE_SIZE,
     Registry,
     Transport,
     validate_branch,
@@ -112,10 +113,10 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 # the one that carried the tip, and every other, since a branch any of them
 # shows a person proposed from is not this install's to delete. A history the
 # forge answers as truncated is therefore refused rather than judged on its
-# first page. A spent agent branch carries one or two; ten is a branch
-# somebody has been reusing, and one page is as far as this reads before it
-# says so.
-PROPOSAL_HISTORY_ON_A_BRANCH = 10
+# first page. A spent agent branch carries one or two, but a flow with a fixed
+# name -- one per workload, reused on every alert -- adds one per round, so the
+# page is the largest a forge serves in one call, and it is still one call.
+PROPOSAL_HISTORY_ON_A_BRANCH = MAX_PAGE_SIZE
 
 # What git prints when the remote answered the delete and said no: a hook or
 # branch rule (`[remote rejected] <ref> (<reason>)`), or a credential without
@@ -1023,9 +1024,10 @@ class VcsBroker:
             )
         if not complete:
             raise WorkspaceError(
-                f"{branch} carried more than {len(history)} proposals, more than "
-                "one page, so whether every one of them was this install's "
-                "cannot be established and the branch is not deleted.",
+                f"{branch} carried at least {len(history)} proposals, a full "
+                "page, so whether every one of them was this install's cannot be "
+                "established and the branch is not deleted. This is the length "
+                "of its history, not a proposal found to be somebody else's.",
                 status=409,
                 code="BRANCH_NOT_OURS",
             )

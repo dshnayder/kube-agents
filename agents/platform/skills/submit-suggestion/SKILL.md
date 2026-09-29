@@ -142,8 +142,8 @@ failure), and running `prepare` once more, which reads the branch afresh, is
 the move; a second failure is reported, not retried. `FORGE_RATE_LIMITED` or
 `FORGE_UNAVAILABLE` from the delete is the forge turning it away for now: wait
 a few minutes, then run `prepare` once more. A proxy older than the
-sandbox cannot read the branch at all; `prepare` then refuses the name without
-a code and says so — use another name, or report it where the name is fixed.
+sandbox cannot read the branch at all; `prepare` then refuses the name with
+`BROKER_ROUTE_UNSUPPORTED` and says so — use another name, or report it where the name is fixed.
 
 ### Step 2: Make the Changes
 

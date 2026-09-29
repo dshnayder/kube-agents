@@ -1593,6 +1593,27 @@ class BranchVerbTest(unittest.TestCase):
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))
 
+    def test_delete_takes_a_fixed_name_that_has_carried_ten_of_its_own(self):
+        # One name per workload, reused on every alert: ten rounds of this
+        # install's own remediations are a history, not a stranger's branch.
+        tip = self.push_branch(self.SPENT)
+        for _ in range(10):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.delete(self.SPENT, tip)
+        self.assertFalse(self.exists(self.SPENT))
+
+    def test_a_full_page_of_history_is_refused_for_its_length_not_an_owner(self):
+        tip = self.push_branch(self.SPENT)
+        for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.delete(self.SPENT, tip)
+        self.assertEqual(caught.exception.fields.get("code"), "BRANCH_NOT_OURS")
+        self.assertIn("at least", str(caught.exception))
+        self.assertIn("not a proposal found to be somebody else's", str(caught.exception))
+
     def test_delete_takes_the_installs_own_proposal_whatever_the_bot_marking(self):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="kube-agents")

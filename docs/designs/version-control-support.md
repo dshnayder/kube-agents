@@ -879,8 +879,8 @@ cannot serve `branch-delete` until it reports the revision at close. The prefix 
 can use, so the proposal that carried the tip must also be this install's —
 opened from this repository by the credential's own login — and no proposal
 from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too — a
-history longer than the one page the broker reads included, since that page
-cannot show it; a
+history that fills the one page the broker reads (the largest one call
+returns) included, since that page cannot show the rest; a
 credential that cannot name itself leaves the prefix and the same-repository
 rule as the bar, as it does for `advance`. That bar holds against a mistake,
 not against the caller itself, which can open and close a proposal on a branch

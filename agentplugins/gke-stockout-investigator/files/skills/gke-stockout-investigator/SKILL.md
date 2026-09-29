@@ -113,6 +113,8 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    and stop. `BRANCH_MOVED` (something pushed to it just now), and
    `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
    not complete) all mean run `prepare` once more before reporting.
+   `FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
+   away for now) means wait a few minutes, then run `prepare` once more.
    Any other refusal: report it and stop. The helper's own message may suggest
    another name; for this skill the name is fixed.
 
