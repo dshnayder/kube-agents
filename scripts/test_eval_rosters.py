@@ -401,6 +401,9 @@ INJECT_LANE_REQUESTING = [
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",
+    # Also listed in `requesting:`, for the pull request it opens and closes
+    # beside the one its check grades.
+    "vcs-spent-branch-reuse",
 ]
 LANE_SAFEGUARD_LEAF_TYPE = "github_writes"
 
@@ -488,11 +491,12 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
         requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or c in listed]
         # A listed case is registered and on the lane, and its own checks do
-        # not yet say it requests one: once they do, the entry is a leftover.
-        for case in listed:
+        # not yet request as many as it is allowed: once they do, the entry
+        # is a leftover.
+        for case, count in listed.items():
             with self.subTest(listed=case):
                 self.assertIn(case, self.lane_cases())
-                self.assertEqual(lane.requested_pull_requests(self.task_spec(case)), 0, f"{case}'s own checks request a pull request now; drop it from `requesting:`")
+                self.assertLess(lane.requested_pull_requests(self.task_spec(case)), count, f"{case}'s own checks request {count} pull request(s) now; drop it from `requesting:`")
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
@@ -502,6 +506,17 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
                     sum(1 for t in types if t in lane.REQUESTING_CHECK_TYPES),
                     lane.requested_pull_requests(self.task_spec(case)),
                 )
+
+    def test_the_spent_branch_case_is_allowed_both_its_pull_requests(self):
+        # It opens one pull request and closes it to spend the branch name,
+        # and its reply names both; its one `pull_request_opened` leaf alone
+        # would allow the second and fail the safeguard on the first.
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import lane
+
+        listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
+        case = "vcs-spent-branch-reuse"
+        self.assertEqual(max(lane.requested_pull_requests(self.task_spec(case)), listed.get(case, 0)), 2)
 
     def test_the_lane_still_runs_a_case_that_requests_nothing(self):
         # The safeguard changes what a case is graded on, not whether it
