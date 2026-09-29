@@ -830,6 +830,47 @@ class IdleNodepoolTest(unittest.TestCase):
         pools = [self.pool("pool"), self.pool("other")]
         self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
 
+    def upgraded_pool_context(self):
+        """A pool whose every node a surge upgrade recreated two days ago."""
+        n = self.node("n1", "pool")
+        n["metadata"]["creationTimestamp"] = (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {"nodes": [n], "pods": []}, [self.pool("pool"), self.pool("other")]
+
+    def test_a_months_old_pool_is_flagged_after_a_node_upgrade(self):
+        """Node age is not pool age. Every auto-upgrade recreates the nodes, so
+        read off the nodes a months-old idle pool went unflagged for a week
+        after each one."""
+        context, pools = self.upgraded_pool_context()
+        hits = fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={})
+        self.assertEqual([h["object"] for h in hits], ["NodePool/pool"])
+
+    def test_a_pool_created_under_a_week_ago_is_skipped_on_its_operation(self):
+        context, pools = self.upgraded_pool_context()
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW, pool_ages={"pool": 2.0}), [])
+
+    def test_a_failed_operations_read_falls_back_to_node_age_and_says_so(self):
+        context, pools = self.upgraded_pool_context()
+        limitations: list[str] = []
+        hits = fw.check_idle_nodepool(context, pools, now=NOW, pool_ages=None, limitations=limitations)
+        self.assertEqual(hits, [])
+        self.assertEqual(len(limitations), 1)
+        self.assertIn("pool", limitations[0])
+        self.assertIn("operations read failed", limitations[0])
+
+    def test_creation_ages_take_the_newest_create_of_this_cluster_s_pools(self):
+        def op(pool, days, cluster="c1", kind="CREATE_NODE_POOL"):
+            start = (NOW - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+            return {
+                "operationType": kind,
+                "targetLink": f"https://container.googleapis.com/v1/projects/p/locations/l/clusters/{cluster}/nodePools/{pool}",
+                "startTime": start,
+            }
+
+        ops = [op("pool", 90), op("pool", 3), op("other", 1, cluster="c2"), op("gone", 1, kind="DELETE_NODE_POOL")]
+        ages = fw.node_pool_creation_ages(ops, "c1", now=NOW)
+        self.assertEqual(set(ages), {"pool"})
+        self.assertAlmostEqual(ages["pool"], 3.0, places=3)
+
     def test_system_addons_alone_do_not_make_a_pool_look_busy(self):
         """§3.7 puts the 15% bar "below the point where DaemonSet and system
         overhead (typically 10-25% of a small node) dominates". Measured, GKE's
@@ -1287,11 +1328,14 @@ class TerminalPodsTest(unittest.TestCase):
         return obj("Pod", name, ns=ns, **{"status.phase": phase, "metadata.creationTimestamp": created})
 
     def test_flags_a_namespace_with_50_or_more(self):
-        pods = [self.terminal_pod(name=f"p{i}") for i in range(50)]
-        context = {"pods": pods, "jobs": [], "cronjobs": []}
-        hits = fw.check_terminal_pods(context, now=NOW)
+        # Two days old: past the one-day grace, short of the seven-day arm, so
+        # only the count can flag it.
+        created = (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pods = [self.terminal_pod(name=f"p{i}", created=created) for i in range(50)]
+        hits = fw.check_terminal_pods({"pods": pods, "jobs": [], "cronjobs": []}, now=NOW)
         self.assertEqual(len(hits), 1)
         self.assertIn("50 terminal pods", hits[0]["excerpt"])
+        self.assertEqual(fw.check_terminal_pods({"pods": pods[:49], "jobs": [], "cronjobs": []}, now=NOW), [])
 
     def test_flags_a_single_old_pod(self):
         pods = [self.terminal_pod(created="2026-01-01T00:00:00Z")]
@@ -1697,8 +1741,9 @@ class OverrequestTest(unittest.TestCase):
 
     def test_an_idle_dimension_under_the_floor_is_not_rescued_by_one_in_use(self):
         # 64 GiB is far over the memory floor, but memory is the dimension in
-        # use. Only the idle dimension may satisfy the floor, and 50m does not.
-        pod = self.deployment_pod(cpu_req="50m", mem_req="64Gi")
+        # use. Only the idle dimension may satisfy the floor, and 80m -- above
+        # the 50m resize floor, so it is idle and shrinkable -- does not.
+        pod = self.deployment_pod(cpu_req="80m", mem_req="64Gi")
         peaks = {("default", "api-1"): (0.001, 60 * 1024.0)}
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
@@ -2189,6 +2234,17 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertEqual(fw.check_overrequest(floor_bound, self.IDLE, now=NOW, autopilot=False), [])
         self.assertEqual(fw.check_idle_workload(shrinkable, big_peak, now=NOW), [])
         self.assertEqual(len(fw.check_overrequest(shrinkable, big_peak, now=NOW, autopilot=False)), 1)
+
+    def test_the_partition_holds_between_the_resize_and_materiality_floors(self):
+        """50m/100Mi is above §3.1's 64Mi resize floor and under its 128Mi
+        materiality floor, so §3.1 drops it; this check deferred to §3.1 on the
+        resize floor alone, and a month-idle controller got neither finding."""
+        between = self.context(pods=[self.pod(mem_req="100Mi")])
+        peak = {(self.NS, self.POD): (0.002, 6.0)}
+        self.assertEqual(fw.check_overrequest(between, peak, now=NOW, autopilot=False), [])
+        hits = fw.check_idle_workload(between, peak, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("under the 100m / 128Mi", hits[0]["excerpt"])
 
     def test_a_limitrange_defaulted_dimension_does_not_break_the_partition(self):
         """CPU filled in by the LimitRange, memory on the floor, both idle.
@@ -2733,12 +2789,11 @@ class UnderrequestTest(unittest.TestCase):
         self.assertIn("no memory limit", hits[0]["excerpt"])
 
     def test_a_controller_monitoring_never_measured_is_skipped(self):
-        """A pod absent from the means is unmeasured, not idle. Summing a
-        missing key as 0.0 and comparing it to the request would be harmless
-        here -- but a *partially* measured controller must not have its
-        measured replicas judged against every replica's request."""
+        """A pod absent from the means is unmeasured, not idle. The means are
+        non-empty -- another namespace was measured -- so this reaches the
+        per-controller guard rather than the empty-means early return."""
         pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
-        self.assertEqual(self.check(pods, {}), [])
+        self.assertEqual(self.check(pods, {("elsewhere", "other-1"): 300.0}), [])
 
     def test_no_means_at_all_flags_nothing(self):
         # `fetch_memory_means` returns `{}` for a cluster it could not read.
@@ -3171,7 +3226,9 @@ class UnsizedWorkloadTest(unittest.TestCase):
         self.assertIn("declares no CPU or memory request", excerpt)
         self.assertIn("peak observed 7.1m vCPU / 67Mi", excerpt)
         self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
-        self.assertIn("14m / 133Mi per replica", excerpt)
+        # Ceiled, not rounded: 2 x 7.1m is 14.2m and 2 x 66.6Mi is 133.2Mi,
+        # and §3.1 never sizes below twice the peak.
+        self.assertIn("15m / 134Mi per replica", excerpt)
         self.assertNotIn("floor", excerpt)
 
     def test_a_short_window_says_why_it_disagrees_with_the_command(self):
@@ -4503,6 +4560,50 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
 
 
+class NodePoolAgeFromOperationsTest(unittest.TestCase):
+    """§3.7's age exclusion reads the pool's `CREATE_NODE_POOL` operation."""
+
+    CLUSTER = {"name": "two-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    POOLS = [{"name": "idle", "config": {"machineType": "e2-standard-4"}},
+             {"name": "busy", "config": {"machineType": "e2-standard-4"}}]
+
+    def collect(self, operations):
+        calls = []
+        node = obj("Node", "node-1", **{
+            "metadata.labels": {"cloud.google.com/gke-nodepool": "idle"},
+            "status.allocatable": {"cpu": "4", "memory": "8Gi"},
+            "metadata.creationTimestamp": (NOW - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(node)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(self.POOLS))
+            if argv[:3] == ["gcloud", "container", "operations"]:
+                return run_of(0, json.dumps(operations))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        return entry, calls
+
+    def test_the_read_is_filtered_to_this_cluster_s_pool_creations(self):
+        _, calls = self.collect([])
+        ops = [a for a in calls if a[:3] == ["gcloud", "container", "operations"]]
+        self.assertEqual(len(ops), 1)
+        self.assertIn("operationType=CREATE_NODE_POOL AND targetLink~/clusters/two-usc1/nodePools/", ops[0])
+
+    def test_a_pool_with_no_recent_creation_is_judged_despite_new_nodes(self):
+        entry, _ = self.collect([])
+        self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"] if c["check"] == "idle-nodepool"})
+        self.assertNotIn("limitations", entry)
+
+
 class SoleNodePoolNotApplicableTest(unittest.TestCase):
     """Autopilot's disposition reached from the other direction.
 
@@ -5699,6 +5800,38 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             },
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
+
+    def test_every_collected_command_passes_finish_s_command_check(self):
+        """§2 says to copy `commands` verbatim into `checks_run`, and `finish`
+        validates each one before it opens the manifest. A label it refuses --
+        the Monitoring reads carry no argv -- would fail every run that read
+        metrics, so each command the collector publishes must pass it."""
+        import audit_report
+
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]) or "node-pools" in argv:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        checked = set()
+        for entry in manifest["clusters"]:
+            for c in entry.get("commands", []):
+                with self.subTest(target=entry["name"], check=c["check"]):
+                    audit_report.validate_check_command(c["command"], entry["name"], c["check"])
+                checked.add(c["check"])
+        self.assertIn("overrequest", checked)
 
     def test_a_project_with_no_clusters_evaluates_orphan_lb(self):
         """No cluster means no Service can still claim a forwarding rule, so the

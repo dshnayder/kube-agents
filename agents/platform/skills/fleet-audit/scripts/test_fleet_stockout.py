@@ -757,11 +757,11 @@ class SingleZoneNodepoolTest(unittest.TestCase):
                 for has_nap in (True, False):
                     self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=has_nap, current_node_count=27))
 
-    def test_a_string_node_count_does_not_take_down_the_manifest(self):
+    def test_a_string_node_count_is_read_as_a_number(self):
         """`maxNodeCount` is an int32 so proto3 JSON will not stringify it, but
-        `"10" * 3` is `"101010"` and the `TypeError` escapes `collect_fleet`
-        into a shell redirect that has already truncated the manifest. The
-        module has `_gce_int` for exactly this and was not using it here."""
+        `"10" * 3` is `"101010"`, and a `TypeError` further on would fail the
+        whole cluster's entry. The module has `_gce_int` for exactly this and
+        was not using it here."""
         self.assertEqual(
             fs._pool_ceiling({"enabled": True, "maxNodeCount": "10"}, ["a", "b", "c"]),
             (30, "maxNodeCount 10/zone x 3 zones"),
@@ -829,10 +829,9 @@ class ReservationTest(unittest.TestCase):
 
         `gcloud compute reservations list --format json` serialises int64 as a
         JSON string, so the live shape is `{"count": "10", "inUseCount": "2"}`.
-        Dividing those raises `TypeError`, which nothing in this module catches
-        -- and the SOP invokes the collector as `... > manifest_<audit>.json`,
-        so the shell has already truncated the file. One reservation would cost
-        the whole stream its manifest.
+        Dividing those raises `TypeError`, which `collect_fleet` turns into a
+        `gate-failed` project entry: one reservation would cost its project
+        every check.
         """
         r = {"name": "r1", "specificReservation": {"count": "10", "inUseCount": "2"}}
         hit = fs.check_reservation(r)
@@ -2286,6 +2285,11 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             },
         }
         audit_report.cross_check_manifest(data, manifest)  # must not raise
+        # `finish` also checks each command names an inspection binary, before
+        # it opens the manifest; a copied command has to pass that too.
+        for target in data["scope"]["clusters"]:
+            for entry in target["checks_run"]:
+                audit_report.validate_check_command(entry["command"], target["name"], entry["check"])
 
     def test_a_check_whose_read_failed_is_rejected_as_run(self):
         import audit_report

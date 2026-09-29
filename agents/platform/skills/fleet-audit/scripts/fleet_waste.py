@@ -282,6 +282,7 @@ NO_SESSION_MESSAGE = (
     "was available at startup"
 )
 MONITORING_TIMEOUT_S = 120
+MONITORING_TIMESERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # Pod phases that do not count as a running replica of their controller.
@@ -470,6 +471,14 @@ UNDERREQUEST_LIMIT_MULTIPLIER = 2
 # have been a manifest edit that changes nothing observable.
 UNSIZED_FLOOR_VCPU = 0.01
 UNSIZED_FLOOR_MIB = 32.0
+# §3.7's "pools created < 7 days ago" exclusion.
+IDLE_NODEPOOL_MIN_AGE_DAYS = 7
+# The GKE operation type whose start time is a node pool's creation time.
+CREATE_NODE_POOL_OPERATION = "CREATE_NODE_POOL"
+# GKE operation timestamps carry nanoseconds; `fromisoformat` takes six digits.
+OPERATION_FRACTION_RE = re.compile(r"(\.\d{6})\d+")
+# Decimal places a resize target keeps before it is ceiled to a whole unit.
+RESIZE_CEIL_DIGITS = 6
 
 SYSTEM_NAMESPACES = frozenset(
     {
@@ -844,6 +853,24 @@ def _cluster_filter(cluster: str, location: str | None) -> str:
     return f'{clause} AND resource.labels.location="{location}"' if location else clause
 
 
+def _monitoring_command(project: str, metrics: tuple[str, ...], selector: str, note: str) -> str:
+    """The manifest's stand-in for the argv of a Cloud Monitoring read.
+
+    The read is an HTTPS GET with no argv of its own, and `finish` accepts a
+    `checks_run` command only if it names an inspection binary, so the label
+    is the `curl` that issues the same request outside the sandbox: the
+    endpoint, the metric filter and the cluster or grouping it selects. The
+    alignment and interval parameters are summarised in the trailing comment
+    rather than spelled out, since they are what `note` names.
+    """
+    kinds = f'"{metrics[0]}"' if len(metrics) == 1 else "one_of(" + ",".join(f'"{m}"' for m in metrics) + ")"
+    query = f"filter=metric.type={kinds}" + (f" AND {selector}" if selector else "")
+    return (
+        f'curl -sG -H "Authorization: Bearer $(gcloud auth print-access-token)" '
+        f"{MONITORING_TIMESERIES_URL.format(project=project)} --data-urlencode {shlex.quote(query)} # {note}"
+    )
+
+
 def _read_pod_series(
     session: SessionFn,
     url: str,
@@ -941,14 +968,10 @@ def fetch_usage_peaks(
     """
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-    # Recorded in the manifest in place of an argv. Not runnable as-is, but it
-    # names the project, the cluster, both metrics and the window, which is
-    # what a reader checking the evidence behind a finding needs.
-    label = (
-        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-        f" filter={_cluster_filter(cluster, location)}"
-        f" metrics={CPU_METRIC},{MEM_METRIC} window={window_hours}h"
+    url = MONITORING_TIMESERIES_URL.format(project=project)
+    label = _monitoring_command(
+        project, (CPU_METRIC, MEM_METRIC), _cluster_filter(cluster, location),
+        f"peak per pod, window={window_hours}h",
     )
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
@@ -1010,11 +1033,10 @@ def fetch_memory_means(
     """
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-    label = (
-        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-        f" filter={_cluster_filter(cluster, location)}"
-        f" metric={MEM_METRIC} aligner=ALIGN_MEAN window={window_hours}h"
+    url = MONITORING_TIMESERIES_URL.format(project=project)
+    label = _monitoring_command(
+        project, (MEM_METRIC,), _cluster_filter(cluster, location) + MEM_NON_EVICTABLE_FILTER,
+        f"ALIGN_MEAN per pod, window={window_hours}h",
     )
 
     def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
@@ -1133,20 +1155,15 @@ def fetch_lb_traffic(
     """
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+    url = MONITORING_TIMESERIES_URL.format(project=project)
     metrics = (
         ("ingress_packets", LB_INGRESS_PACKETS_METRIC),
         ("egress_packets", LB_EGRESS_PACKETS_METRIC),
         ("egress_bytes", LB_EGRESS_BYTES_METRIC),
     )
-    # Recorded in the manifest in place of an argv, the way `fetch_usage_peaks`
-    # records its own: not runnable as-is, but it names the project, the three
-    # metrics, the grouping and the window, which is what a reader checking a
-    # traffic figure in an excerpt needs in order to re-read it.
-    label = (
-        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-        f" group_by={LB_RULE_LABEL}"
-        f" metrics={','.join(metric for _, metric in metrics)} window={window_hours}h"
+    label = _monitoring_command(
+        project, tuple(metric for _, metric in metrics), "",
+        f"group_by={LB_RULE_LABEL}, window={window_hours}h",
     )
 
     def fail(rc: int, message: str) -> tuple[dict, Run]:
@@ -1670,7 +1687,43 @@ def _is_big_machine(machine_type: str) -> bool:
     return (_machine_type_vcpus(machine_type) or 0) >= 8
 
 
-def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime) -> list[dict]:
+def node_pool_creation_ages(operations: object, cluster: str, *, now: datetime) -> dict[str, float]:
+    """Days since each node pool of `cluster` was last created, from
+    `gcloud container operations list` filtered to `CREATE_NODE_POOL`.
+
+    A pool with no entry was created before the operations the API still
+    lists, or with the cluster itself (whose first pool arrives in
+    `CREATE_CLUSTER`), so it is older than any operation here. The latest
+    creation wins: a pool deleted and recreated under one name is as old as its
+    newest incarnation.
+    """
+    ages: dict[str, float] = {}
+    marker = f"/clusters/{cluster}/nodePools/"
+    for op in operations if isinstance(operations, list) else []:
+        if not isinstance(op, dict) or op.get("operationType") != CREATE_NODE_POOL_OPERATION:
+            continue
+        link = str(op.get("targetLink") or "")
+        if marker not in link:
+            continue
+        pool = link.rsplit(marker, 1)[1].split("/", 1)[0]
+        age = _age_days(OPERATION_FRACTION_RE.sub(r"\1", str(op.get("startTime") or "")), now=now)
+        if pool and age is not None:
+            ages[pool] = min(age, ages.get(pool, age))
+    return ages
+
+
+def check_idle_nodepool(
+    context: dict,
+    node_pools: list[dict],
+    *,
+    now: datetime,
+    pool_ages: dict[str, float] | None = None,
+    limitations: list[str] | None = None,
+) -> list[dict]:
+    """§3.7. `pool_ages` is `node_pool_creation_ages`' answer, or `None` when
+    the operations read failed; only then does the oldest node stand in for the
+    pool's age, and a pool that stand-in exempts is named in `limitations`,
+    because a node upgrade recreates every node and resets it."""
     nodes_by_pool: dict[str, list[dict]] = {}
     for node in context["nodes"]:
         pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
@@ -1696,21 +1749,33 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
         nodes = nodes_by_pool.get(pool_name, [])
         if not nodes or len(node_pools) <= 1:
             continue
-        # §3.7's "pools created < 7 days ago" exclusion, measured off the
-        # *oldest* node rather than whichever one the dump listed first. The
-        # dump comes back name-sorted, so `nodes[0]` is the alphabetically
-        # first node, and a pool that has run for months exempts itself the
-        # moment an autoscaler adds a node whose name happens to sort early.
-        # The oldest node is the closest lower bound on the pool's own age that
-        # the object dump carries.
-        ages = [
-            age
-            for node in nodes
-            if (age := _age_days((node.get("metadata", {}) or {}).get("creationTimestamp", ""), now=now))
-            is not None
-        ]
-        if ages and max(ages) < 7:
-            continue
+        # §3.7's "pools created < 7 days ago" exclusion, off the pool's own
+        # `CREATE_NODE_POOL` operation. Node age is not the pool's: a surge
+        # upgrade recreates every node, so a months-old pool read as a week old
+        # after each auto-upgrade and went unflagged for that run.
+        if pool_ages is not None:
+            if pool_ages.get(pool_name, IDLE_NODEPOOL_MIN_AGE_DAYS) < IDLE_NODEPOOL_MIN_AGE_DAYS:
+                continue
+        else:
+            # Fallback only. Measured off the *oldest* node rather than
+            # whichever one the dump listed first: the dump comes back
+            # name-sorted, and a pool that has run for months would exempt
+            # itself the moment an autoscaler added a node whose name sorts
+            # early.
+            ages = [
+                age
+                for node in nodes
+                if (age := _age_days((node.get("metadata", {}) or {}).get("creationTimestamp", ""), now=now))
+                is not None
+            ]
+            if ages and max(ages) < IDLE_NODEPOOL_MIN_AGE_DAYS:
+                if limitations is not None:
+                    limitations.append(
+                        f"idle-nodepool skipped pool {pool_name} as under {IDLE_NODEPOOL_MIN_AGE_DAYS} days old "
+                        f"on its oldest node's age, because the node-pool operations read failed; a node "
+                        f"upgrade resets that age, so the pool may be older"
+                    )
+                continue
         if any(node.get("spec", {}).get("unschedulable") for node in nodes):
             continue
 
@@ -2499,7 +2564,9 @@ def _resize_target(
     division are the same in both directions, and stating them twice is how
     the two halves of one edit drift apart.
     """
-    return max(floor, math.ceil(peak_total / replicas * multiplier / unit) * unit)
+    # Rounded before the ceil: `0.27 / 3 * 2 / 0.001` is 180.00000000000003,
+    # and ceiling float noise asks for a millicore the peak never needed.
+    return max(floor, math.ceil(round(peak_total / replicas * multiplier / unit, RESIZE_CEIL_DIGITS)) * unit)
 
 
 def _resize_shrinks_request(
@@ -3059,7 +3126,8 @@ def check_idle_workload(
     The partition with §3.1 is exact and load-bearing, and it turns on whether
     §3.1 *will* propose a resize rather than on whether one is arithmetically
     available. Usually those are the same thing and this fires only where
-    `_resize_shrinks_request` is false on every declared dimension. The
+    `_resize_shrinks_request` is false on every declared dimension, or true
+    only on one whose request is under §3.1's materiality floor. The
     exception is a `Guaranteed` controller, where §3.1 declines the resize it
     could compute, because on such a pod the request is also the limit;
     `_stands_down_instead_of_resizing` carries that argument and §3.1 skips
@@ -3105,21 +3173,20 @@ def check_idle_workload(
         # §3.1 refuses to shrink it, which is what `Guaranteed` means here, or
         # the shrinkable dimension is the namespace LimitRange's default, which
         # §3.1 gives no verdict.
+        # A shrinkable dimension under §3.1's materiality floor is dropped
+        # there, so it stays here: deferring on the resize floor alone lost a
+        # 50m/100Mi controller idle for a month to both checks.
         guaranteed = _is_guaranteed(entry)
         defaulted = _namespace_defaulted_dimensions(entry, lr_defaults.get(entry["ns"], {}))
+        cpu_shrinks = "cpu" not in defaulted and _resize_shrinks_request(
+            cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+        )
+        mem_shrinks = "memory" not in defaulted and _resize_shrinks_request(
+            mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+        )
         if not guaranteed and (
-            (
-                "cpu" not in defaulted
-                and _resize_shrinks_request(
-                    cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
-                )
-            )
-            or (
-                "memory" not in defaulted
-                and _resize_shrinks_request(
-                    mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
-                )
-            )
+            (cpu_shrinks and cpu_req >= OVERREQUEST_FLOOR_VCPU)
+            or (mem_shrinks and mem_req / 1024.0 >= OVERREQUEST_FLOOR_GIB)
         ):
             continue
 
@@ -3134,6 +3201,9 @@ def check_idle_workload(
             "enforcement ceiling with them -- a sizing observation is not a "
             "safe limit, which is why no resize is offered"
             if guaranteed
+            else "The request is under the 100m / 128Mi a resize is worth "
+            "proposing for, so no resize is offered"
+            if cpu_shrinks or mem_shrinks
             else "Every dimension is already at the 50m/64Mi floor or is the "
             "namespace LimitRange default, which is fixed in the LimitRange "
             "rather than here, so no resize of this workload can reclaim any of it"
@@ -3471,12 +3541,13 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
         )
         # §3.1's 2x, per replica, because the manifest declares one replica's
-        # request. Floored at the smallest values worth writing into a manifest
-        # so a near-silent sidecar is not handed a `1m`/`1Mi` request that no
-        # scheduler decision can turn on.
+        # request, ceiled to a whole millicore / MiB by the helper §3.1 uses so
+        # the figure is never below twice the peak. Floored at the smallest
+        # values worth writing into a manifest so a near-silent sidecar is not
+        # handed a `1m`/`1Mi` request that no scheduler decision can turn on.
         raw_cpu, raw_mem_mib = peak_cpu / replicas * 2, peak_mem / replicas * 2
-        want_cpu = max(raw_cpu, UNSIZED_FLOOR_VCPU)
-        want_mem_mib = max(raw_mem_mib, UNSIZED_FLOOR_MIB)
+        want_cpu = _resize_target(peak_cpu, replicas, floor=UNSIZED_FLOOR_VCPU, unit=0.001)
+        want_mem_mib = _resize_target(peak_mem, replicas, floor=UNSIZED_FLOOR_MIB, unit=1.0)
         # Autopilot bills on requests and injects its own defaults where a
         # manifest declares none, so an unsized workload there is not merely
         # unbooked -- it is being charged for a number nobody chose. Same
@@ -4246,7 +4317,16 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         else:
             commands["idle-nodepool"] = pools_record
             commands["scaledown-blocked"] = dump_record
-            idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
+            ops_argv = [
+                "gcloud", "container", "operations", "list", "--location", location, "--project", project,
+                "--filter", f"operationType={CREATE_NODE_POOL_OPERATION} AND targetLink~/clusters/{name}/nodePools/",
+                "--format", "json",
+            ]
+            operations, _ops_result = run_and_gate(ops_argv, run=run)
+            pool_ages = None if operations is None else node_pool_creation_ages(operations, name, now=now)
+            idle_pool_hits = check_idle_nodepool(
+                context, node_pools, now=now, pool_ages=pool_ages, limitations=limitations
+            )
             candidates += [emit("idle-nodepool", h) for h in idle_pool_hits]
             candidates += [emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
     else:

@@ -506,10 +506,9 @@ def _gce_int(value: object, default: int | None = None) -> int | None:
     `{"count": "100", "inUseCount": "3"}` is what `gcloud compute reservations
     list --format json` returns -- the Google API int64-to-string convention,
     reproduced verbatim by gcloud's `resource_projector`. Dividing two of them
-    raises `TypeError`, and nothing in this module catches one, so the
-    traceback escapes `collect_fleet`; every SOP invokes this collector as
-    `... > manifest_<audit>.json`, so the shell has already truncated the file
-    and the whole stream loses its manifest rather than one finding.
+    raises `TypeError`, and `collect_fleet`'s per-target guard turns that into
+    a `gate-failed` entry, so one string-typed reservation would cost its whole
+    project every check rather than one finding.
 
     `default` is for a field the API omits when it is zero -- proto3 JSON drops
     default values, so an unused reservation carries no `inUseCount` at all,

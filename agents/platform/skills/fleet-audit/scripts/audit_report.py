@@ -237,8 +237,9 @@ AUDITS: dict[str, AuditSpec] = {
             "terminal-pods",
             "idle-namespace",
             # Reads as the odd one out, and is: `underrequest` is §3.1's other
-            # half and belongs beside it. It sits last because this tuple is
-            # the SOP's heading order, and inserting a §3.2 would renumber
+            # half and belongs beside it. It sits at §3.11, after the
+            # original ten, because this tuple is the SOP's heading order, and
+            # inserting a §3.2 would renumber
             # nine sections that the SOP's prose refers to by
             # number — churn no check can verify afterwards. §3.1 and §3.11
             # cross-reference each other instead.
