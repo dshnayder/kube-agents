@@ -1007,7 +1007,12 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
 
 	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
-		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+		t.Fatalf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	// The problem list names only the org, so the message has to say that
+	// the repository on that forge is withheld too.
+	if !strings.Contains(degradedCond.Message, "nor is the repository on a refused forge") {
+		t.Errorf("Degraded message does not say the repository on the refused forge is withheld: %q", degradedCond.Message)
 	}
 }
 
@@ -5876,6 +5881,11 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 		// urlsplit's hostname ends at the first colon, whatever follows it.
 		`{"type":"github","url":"https://github.com:abc/test-org/repo-a"},` +
 		`{"type":"github","url":"https://github.com:owner/test-org/repo-o"},` +
+		// urlsplit deletes tabs and line breaks before it splits.
+		`{"type":"github","url":"https://github.com/test-org/repo-t\t?x"},` +
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/re\npo-n"},` +
+		// The agent's bound counts code points, not bytes.
+		`{"type":"github","url":"git+ssh://` + strings.Repeat("é", 200) + `@github.com/test-org/repo-u"},` +
 		// urlsplit allowlists no scheme.
 		`{"type":"github","url":"git+ssh://git@github.com/test-org/repo-g"},` +
 		`{"type":"github","url":"file://github.com/test-org/repo-l"},` +
@@ -5892,10 +5902,10 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
-	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-o", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
+	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-n", "repo-o", "repo-p", "repo-q", "repo-t", "repo-u"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
-	if want := []string{"managed_repos[7]", "managed_repos[8]", "managed_repos[9]", "managed_repos[10]", "managed_repos[11]"}; !slices.Equal(unreadable, want) {
+	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
 	}
 }

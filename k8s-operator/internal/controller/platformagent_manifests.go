@@ -1554,7 +1554,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 			}
 			managed := seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps))
 			if len(managed) == 0 && resolved.GitOps() != nil {
-				manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
+				if gitopsRefusalWithholdsManaged(resolved) {
+					manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
+				}
 			} else {
 				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
 			}

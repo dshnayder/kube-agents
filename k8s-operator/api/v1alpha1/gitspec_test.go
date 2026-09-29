@@ -825,6 +825,16 @@ func TestScopeRefusedIgnoresAContextRestatement(t *testing.T) {
 			repo("github", "acme/infra", RepositoryRoleManaged),
 			repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
 		}, want: false},
+		// Refused only as a second declaration, after its override qualified
+		// it to the accepted URL, so it cannot move the organisation.
+		{name: "a bare name its override qualifies to a write repository", repos: []RepositorySpec{
+			repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+			{Forge: "github", Repository: "infra", Namespace: "acme", Role: RepositoryRoleManaged},
+		}, want: false},
+		{name: "a bare name beside a refused override", repos: []RepositorySpec{
+			repo("github", "https://github.com/acme/infra", RepositoryRoleGitOps),
+			{Forge: "github", Repository: "infra", Namespace: "bad_ns", Role: RepositoryRoleManaged},
+		}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1539,17 +1539,21 @@ var agentURLSchemeRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
 // or refuse. The agent takes any URL through urlsplit, whose scheme is not
 // allowlisted (`git+ssh://`, `file://github.com/...`), whose hostname is the
 // text after the last `@` and before the first colon, never validating a port,
-// and whose path ends at a query or fragment. This parser refuses all of
+// and whose path ends at a query or fragment; tabs and line breaks anywhere in
+// the value are deleted before any of that. This parser refuses all of
 // those, but the agent uses such an entry, so the minter must count it rather
 // than hold every policy for an entry that is not broken. What the agent
 // refuses stays refused: a value over its length bound, an empty host, and a
 // path that is one segment once the port slot is gone
 // (`https://github.com:owner/repo`).
 func agentURLSpelling(value string) (string, bool) {
+	// The bound is checked as the agent does, in code points and before
+	// urlsplit deletes every tab, carriage return and newline in the value.
 	text := strings.TrimSpace(value)
-	if len(text) > agentRepoRefMaxLength {
+	if utf8.RuneCountInString(text) > agentRepoRefMaxLength {
 		return "", false
 	}
+	text = strings.NewReplacer("\t", "", "\r", "", "\n", "").Replace(text)
 	scheme, rest, ok := strings.Cut(text, "://")
 	if !ok || !agentURLSchemeRegex.MatchString(scheme) {
 		return "", false
@@ -3316,12 +3320,20 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condReason = conditionReasonInvalidGitRepoURL
 		degradedReason = conditionReasonInvalidGitRepoURL
 		// Not "GitOps disabled": with the lists, every entry validation
-		// accepts is still seeded, the gitops repository included — except
-		// the managed ones while the gitops repository is refused, which the
-		// message then says, since the problem list names none of them.
+		// accepts is still seeded, the gitops repository included. Two kinds
+		// of withheld entry are not in the problem list, so the message names
+		// them: the repositories on a refused forge, and the managed ones
+		// while the gitops repository is refused.
 		withheld := ""
-		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil && gitopsRefusalWithholdsManaged(resolved) {
-			withheld = ", and no managed repository is seeded while the gitops repository is refused, since the agent reads the first managed_repos entry as its GitOps repository"
+		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
+			if n := len(resolved.OnRefusedForge()); n == 1 {
+				withheld += ", nor is the repository on a refused forge"
+			} else if n > 1 {
+				withheld += fmt.Sprintf(", nor are the %d repositories on a refused forge", n)
+			}
+			if gitopsRefusalWithholdsManaged(resolved) {
+				withheld += ", and no managed repository is seeded while the gitops repository is refused, since the agent reads the first managed_repos entry as its GitOps repository"
+			}
 		}
 		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
 		degradedStatus = metav1.ConditionTrue

@@ -603,7 +603,7 @@ the failure names the values key: the two spellings are exclusive, forge names
 are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
 namespace a GitHub organisation or user name, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
-namespace if it is a bare name. The namespace checks matter beyond the error
+namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
 refusal would name `github.org` or `github.gitRepo`, keys the values file never
 set.
@@ -657,7 +657,14 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- $providers = append $providers $provider -}}
 {{- $_ := set $namespaces $f.name $namespace -}}
 {{- end -}}
+{{- $gitops := dict -}}
 {{- range $i, $r := $repos -}}
+{{- if eq ($r.role | default "") "gitops" -}}
+{{- if hasKey $gitops "index" -}}
+{{- fail (printf "platformAgent.integration.repositories[%d].role is gitops, but repositories[%d] already is; at most one repository may have role gitops" $i (get $gitops "index")) -}}
+{{- end -}}
+{{- $_ := set $gitops "index" $i -}}
+{{- end -}}
 {{- if not (has $r.forge $names) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].forge is %q, which is not a name in platformAgent.integration.forges" $i ($r.forge | default "")) -}}
 {{- end -}}

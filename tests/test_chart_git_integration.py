@@ -190,6 +190,19 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].host", result.stderr)
 
+    def test_a_second_gitops_repository_fails_naming_it(self):
+        """The CRD refuses a second gitops repository with a message naming no
+        values key, and under `helm upgrade` only after the render; the chart
+        refuses it first, as it does every other CRD refusal on the lists."""
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="github", namespace="acme"),
+            *_repo(0, forge="github", repository="infra", role="gitops"),
+            *_repo(1, forge="github", repository="apps", role="gitops"),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}repositories[1].role is gitops, but repositories[0] already is", result.stderr)
+
     def test_a_unicode_look_alike_github_host_fails_rather_than_folding(self):
         """Sprig's `lower` is Unicode, so `İ` (U+0130) lowers to `i`. The
         operator folds ASCII only and refuses `gİthub.com`, so the chart must

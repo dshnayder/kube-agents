@@ -160,8 +160,9 @@ func (r RepoRef) URL() string {
 //
 // A schemeless slash-path is hostless, because inferring a host from it would
 // read `my.org/repo` — a namespace containing a dot, which some forges allow —
-// as a host and a one-segment path. `GitProvider.Resolve` lifts a first segment
-// that spells one of its own hosts; nothing else does.
+// as a host and a one-segment path. `GitProvider.Resolve` and
+// `GitProvider.ParseRepoRef` lift a first segment that spells one of the
+// provider's own hosts; nothing else does.
 func ParseRepoRef(value string) (RepoRef, error) {
 	return parseRepoRef(value, nil)
 }

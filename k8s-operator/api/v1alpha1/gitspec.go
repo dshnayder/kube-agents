@@ -390,8 +390,10 @@ func (ri *ResolvedIntegration) ScopeRefused(provider string) bool {
 // repository that validation accepted: a second declaration of it, or a full URL of it
 // beside a namespace override the grammar refused and the URL never used. Its
 // refusal cannot move the organisation, which the accepted one already names.
-// It is read without the namespace, so a bare name the override would have
-// qualified still counts: the override was the organisation it meant.
+// It is read without the namespace, which a full URL never uses, and then with
+// its effective namespace, so a bare name that qualified to the accepted URL
+// and was refused only as a second declaration counts too. A bare name beside
+// a refused override does not: the grammar refuses the override again.
 func (r *ResolvedRepository) restatesAccepted(accepted map[string]bool) bool {
 	if r.Forge == nil || !r.Forge.valid() {
 		return false
@@ -400,8 +402,28 @@ func (r *ResolvedRepository) restatesAccepted(accepted map[string]bool) bool {
 	if err != nil {
 		return false
 	}
-	ref, err := provider.Resolve(r.Forge.Host, r.Repository, "")
-	return err == nil && accepted[strings.ToLower(ref.URL())]
+	for _, namespace := range []string{"", r.EffectiveNamespace()} {
+		if ref, err := provider.Resolve(r.Forge.Host, r.Repository, namespace); err == nil && accepted[strings.ToLower(ref.URL())] {
+			return true
+		}
+	}
+	return false
+}
+
+// OnRefusedForge returns the repositories withheld because their forge's own
+// fields are refused. Problems reports the forge, not them, so a caller that
+// explains what is not seeded has to count them itself.
+func (ri *ResolvedIntegration) OnRefusedForge() []*ResolvedRepository {
+	if ri == nil {
+		return nil
+	}
+	var withheld []*ResolvedRepository
+	for _, r := range ri.Repositories {
+		if r.Forge != nil && !r.Forge.valid() {
+			withheld = append(withheld, r)
+		}
+	}
+	return withheld
 }
 
 // minNamespacedPathDepth is the shortest path from which a namespace can be
