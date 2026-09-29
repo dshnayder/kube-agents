@@ -4776,6 +4776,14 @@ def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, 
     return frozenset(name for name, _ in known - collected)
 
 
+def _unread_labels(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> list[str]:
+    """The unread clusters as a reader should see them: a name another of the
+    project's clusters shares carries its location, so a limitation never
+    names a cluster that was read as one that was not."""
+    shared = {name for name, _ in known if sum(1 for other, _ in known if other == name) > 1}
+    return sorted(f"{name} in {location}" if name in shared else name for name, location in known - collected)
+
+
 def check_unattached_disk(
     disks: list[dict],
     live_pv_handles: set[str],
@@ -5080,7 +5088,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset()) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -5169,7 +5177,15 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
 
     # §3.4: with none of the project's clusters read there is no PV handle to
     # clear any disk against, so the check is withheld rather than judged.
-    disks_judged = not compute_disabled and not (known_clusters and unread_clusters >= known_clusters)
+    # Counted on (name, location) where the caller has it: `unread_clusters`
+    # is reduced to names, and two `c1`s with one read would otherwise read
+    # as none read and withhold the disks no PVC created as well.
+    if clusters_read is None:
+        none_read = bool(known_clusters) and unread_clusters >= known_clusters
+    else:
+        none_read = bool(known_clusters) and clusters_read == 0
+    disks_judged = not compute_disabled and not none_read
+    unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     # A project with the Compute Engine API off holds no cluster either, so
@@ -5220,7 +5236,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     if not disks_judged and not compute_disabled:
         disk_gap = (
             "unattached-disk was not evaluated for this project: none of its clusters "
-            f"({', '.join(sorted(unread_clusters))}) could be read, so no disk can be "
+            f"({unread_named}) could be read, so no disk can be "
             "cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
@@ -5228,7 +5244,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         disk_gap = (
             "unattached-disk skipped every disk that a PersistentVolumeClaim created "
             "and that could belong to a cluster this run did not read "
-            f"({', '.join(sorted(unread_clusters))}): those clusters' PersistentVolumes "
+            f"({unread_named}): those clusters' PersistentVolumes "
             "are unknown, so a detached disk one of them still binds would read as abandoned."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
@@ -5526,7 +5542,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         def replay(argv: list[str], **kwargs) -> Run:
             return recorded.get(tuple(argv)) or run(argv, **kwargs)
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs_by_project.get(p, set()), collected_by_project.get(p, set())))
+        known_pairs = known_pairs_by_project.get(p, set())
+        collected = collected_by_project.get(p, set())
+
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []

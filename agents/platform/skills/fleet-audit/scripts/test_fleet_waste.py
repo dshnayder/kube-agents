@@ -5590,6 +5590,35 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertIn("unattached-disk skipped", project["limitations"])
         self.assertIn("sick", project["limitations"])
 
+    def test_one_of_two_same_named_clusters_read_still_judges_unlabelled_disks(self):
+        """`c1` in two locations, one read. The names alone say every `c1` went
+        unread, which withheld the whole check and said none of the project's
+        clusters could be read."""
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps([
+                    {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}},
+                    {"name": "c1", "location": "us-east4", "status": "RUNNING", "autopilot": {"enabled": False}},
+                ]))
+            if "get-credentials" in argv:
+                return run_of(1, "", "unreachable") if "us-east4" in argv else run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                return run_of(0, json.dumps([{"name": "boot", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "us-east4-a"}]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertIn("unattached-disk", {c["check"] for c in project["candidates"]})
+        self.assertNotIn("unattached-disk", {c["check"] for c in project.get("checks_unevaluated", [])})
+        self.assertIn("(c1 in us-east4)", project["limitations"])
+        self.assertNotIn("none of its clusters", project["limitations"])
+
     def test_a_project_with_no_readable_cluster_withholds_unattached_disk(self):
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
