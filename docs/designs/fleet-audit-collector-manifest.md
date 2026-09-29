@@ -232,8 +232,9 @@ Three bounds on the held set, all applied where it is computed, once per run, be
 split. "The document carries it" means the document's own ids plus the postures `finish` withheld
 this run: a withheld posture is the model's finding taken out for want of a search, and withheld ids
 enter no delta block, so it is never held. When the report store holds no usable record of the open
-ledger — `latest.json` missing, unreadable, or written for another issue, or a never-held store with
-no block to seed from — the run has no held set to intersect with, and it does not derive one from
+ledger — `latest.json` missing, unreadable, written for another issue, or out of step with the
+ledger's hidden block, or a never-held store with no block to seed from; the full list is
+[report-store design §4](fleet-audit-report-store.md#4-finishs-own-memory) — the run has no held set to intersect with, and it does not derive one from
 the manifest, because that would turn every candidate the model has been rejecting into a permanent
 hold. It holds nothing and rewrites the body anyway: freezing the body until a run could read its
 memory would freeze it for good, because only a run that writes the body restores the store. The
@@ -401,7 +402,7 @@ nothing is announced resolved, no remediation pull request is retired, and the l
 by the same rule any other gap applies. A document-authored gap shows in the Scope table's rows; the
 waiver has no row, so the ledger body lists it under a _Coverage_ heading in the Scope section and
 the delta comment, when one is posted, repeats it. The other holds the document cannot express —
-the lost-memory gaps a clean run files when its report store holds no record of the open ledger
+the lost-memory gaps a clean run files when its report store holds no trusted record of the open ledger
 (§3.3) — arise only on a clean run, which comments rather than rewriting the body, so they are named
 in that comment instead. The waiver and `--manifest-file`
 are mutually

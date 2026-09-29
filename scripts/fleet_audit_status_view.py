@@ -486,8 +486,10 @@ def load_roster(path: Path) -> tuple[dict[str, dict], str]:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return {}, _oneline(exc)
-    # A bare list of jobs or an object carrying them under `jobs`, as
-    # scripts/generate_docs.py's reader accepts; any other shape is unreadable.
+    # A bare list of jobs or an object carrying them under `jobs`; any other
+    # shape is unreadable. Stricter than scripts/generate_docs.py's reader,
+    # which passes an object without `jobs` through: here it would read as an
+    # empty roster and silently disarm NEVER and STALE.
     if isinstance(doc, dict) and "jobs" not in doc:
         return {}, "an object without a `jobs` key"
     jobs = doc.get("jobs") if isinstance(doc, dict) else doc

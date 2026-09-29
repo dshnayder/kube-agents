@@ -844,7 +844,7 @@ three apply to it, so a partly-checked cluster that also carries a limitation re
 with two reasons rather than as two separate gaps. The denominator is the stream's roster minus that
 cluster's `checks_not_applicable`, which is what keeps a check the cluster's shape forbids from
 reading as a check nobody ran. `finish` appends the gaps no document field expresses: a waived
-collector manifest, and on a clean run whose report store holds no record of the open ledger, one
+collector manifest, and on a clean run whose report store holds no trusted record of the open ledger, one
 of two lost-memory gaps — the collector still flags something the document does not carry, or
 nothing shows whether the findings the ledger carries were fixed
 ([collector design §3.3, §4](fleet-audit-collector-manifest.md),

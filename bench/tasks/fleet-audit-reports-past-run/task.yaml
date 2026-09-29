@@ -80,7 +80,10 @@ verification_spec:
       # (`timeout 120`, `env X=`, `bash -lc "`, `xargs`). Between `issue|pr`
       # and the verb only the repository flag may sit, the one flag gh
       # accepts there, so a read whose arguments mention a verb
-      # (`gh issue list --search close`) still reads.
+      # (`gh issue list --search close`) still reads. The cost: a command
+      # that only quotes a write (`grep 'gh issue comment' SKILL.md`, an
+      # `echo` of one) also matches. That is accepted as the price of
+      # catching a write behind a wrapper.
       forbidden_patterns:
         - 'audit_report\.py\s+(start|finish|remediate)\b'
         - 'hermes\s+cron\s+run\b'

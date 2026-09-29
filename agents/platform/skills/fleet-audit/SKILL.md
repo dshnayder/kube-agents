@@ -433,7 +433,7 @@ with a declared-intent step — posture checks that ran without a complete searc
 ([`declared_intent_searched`](#declared_intent_searched)). The rest belong to the run rather than
 to the document, so a document that reads as complete can still produce them: a collector manifest
 waived with `--no-collector-manifest`, whose reason becomes the gap, and a clean run over an open
-ledger the report store has no record of, on any stream, with or without a manifest (see
+ledger the report store has no trusted record of, on any stream, with or without a manifest (see
 [The clean run](#the-clean-run)). `coverage_gaps` says which, and why — so
 `partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
 
@@ -968,8 +968,8 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   never carried is named only on
   the run's JSON line as an unpublished candidate. Either way there is no finding to open a pull
   request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
-  would be false there. A run whose report store has no record of the open ledger and that passed no manifest cannot
-  know which ids are held, so it answers no `/remediate` at all; the next run with a record answers
+  would be false there. A run whose report store has no trusted record of the open ledger and that passed no manifest cannot
+  know which ids are held, so it answers no `/remediate` at all; the next run with a trusted record answers
   them. One reply says the request is on hold and why, under its own
   `audit-deferred` marker, which nothing reads as an answer: the same comment is acted on, and
   acknowledged, by the first run that records the search and still sees the posture, or whose
@@ -1165,8 +1165,9 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
-report store's record of the open ledger is missing, unreadable, or written for a different issue
-(where the store has never held the ledger at all, `finish` seeds it once from the issue's hidden
+report store's record of the open ledger is missing, unreadable, written for a different issue, or
+lists a different id set from the ledger's hidden block (or the issue listing returned no body to
+check it against) (where the store has never held the ledger at all, `finish` seeds it once from the issue's hidden
 block instead, and a block that is absent or cannot be fetched is the same loss) — the previous
 run's findings are unknowable, so the run announces nothing rather than declaring every live finding
 new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
@@ -1174,11 +1175,11 @@ that fails once it has started changing the ledger has already deleted the recor
 older than the issue is never trusted, and the run after it is one of these. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
 trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
-had no record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
+had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
 findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
 your report: the gap names both ways out only when the collector flags nothing, and otherwise says
 the collector still flags something this run did not report. Without a manifest it also answers no `/remediate` — it cannot tell a held id
-from a typo — and logs `No stored report and no manifest` to say so; report that as you would any
+from a typo — and logs `No trusted stored report and no manifest` to say so; report that as you would any
 other partial run.
 
 ## Red lines

@@ -909,12 +909,14 @@ MAX_HELD_IDS = 200
 # and their pull requests. It names the way out, because a clean fleet files it
 # on every run until one rewrites the body.
 LOST_MEMORY_GAP = (
-    "the report store holds no record of the open ledger, so the findings it "
+    "the report store holds no trusted record of the open ledger (none, or one "
+    "that no longer matches the ledger's findings), so the findings it "
     "carries are unknown, and the collector still flags something this run did "
     "not report; the ledger stays open over it"
 )
 LOST_MEMORY_UNGUARDED_GAP = (
-    "the report store holds no record of the open ledger, so nothing shows "
+    "the report store holds no trusted record of the open ledger (none, or one "
+    "that no longer matches the ledger's findings), so nothing shows "
     "whether the findings it carries were fixed; the ledger stays open over them "
     "until a run that reports findings rewrites it, or a human who has checked "
     "them closes it"
@@ -11556,7 +11558,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     answers_remediate = not (memory_lost and manifest is None)
     if existing_issue and not answers_remediate:
         log(
-            "No stored report and no manifest: the held set is unknown, so no "
+            "No trusted stored report and no manifest: the held set is unknown, so no "
             "/remediate is answered this run."
         )
     held_entries: list[dict] = []

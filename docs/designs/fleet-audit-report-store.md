@@ -20,7 +20,8 @@ the harness held in structured form seconds before it published. The findings do
 only until the next run overwrote it in scratch, and the ledger rewrites itself in place, so
 run-over-run comparison had no source at all. And `finish` re-fetched the previous ledger body every
 run to parse its own hidden `<!-- audit-findings: … -->` block back out: a public issue body, which
-anyone with write access can edit between runs, was the harness's database.
+anyone with write access can edit between runs, was the harness's database. It is still read on
+every run, but only as a check that the store is current (§4), never as the memory itself.
 
 Both are the same missing thing: the run's structured output, kept where it was produced.
 
@@ -113,7 +114,10 @@ the record is trusted only when that body's hidden block names the same ids as t
 `ledger_body`'s. The block rather than the whole body, because it is what every join reads and it
 survives the newline and prose edits GitHub or a person can make around it. The listed body is a
 check on the store, never a memory in its place: a mismatch, or a listing that returned no body, is
-a lost memory, and the store is not re-seeded from the issue.
+a lost memory, and the store is not re-seeded from the issue. One consequence is deliberate: a
+public edit that changes the block's id set makes the memory lost. That fails safe — no delta claim,
+and a clean run holds the ledger open rather than closing it — and it lasts, because a held-open
+clean run stores `issue_number: null`, until a findings run rewrites the body.
 
 The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
 stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did
@@ -128,7 +132,8 @@ is how a divergence becomes undetectable.
 
 `start` joins against the same memory for the `carried` list it hands the model, seed included.
 
-The issue body is read once, where the store has never held this ledger: no directory for the stream
+The issue body is used as the memory once, where the store has never held this ledger (every run
+still reads it, but only for the check above): no directory for the stream
 and repository at all, as on the first run after an upgrade that introduces the store or after the
 volume is replaced. That run would otherwise have no previous ids, so the guard that refuses to
 close over findings the document does not account for would have nothing to check, and an empty
@@ -137,8 +142,8 @@ last run published, so it stands in for the store this once; the run writes the 
 later run reads that.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
-its `latest.json` is missing, unreadable, written for another issue, or lists ids the ledger's
-block no longer does — or there is no store and
+its `latest.json` is missing, unreadable, written for another issue, or names a different id set from the ledger's
+block, or the listing returned no body to check it against — or there is no store and
 the body has no readable block or cannot be fetched — the memory is **lost**, unknowable rather than
 empty:
 
