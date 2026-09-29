@@ -214,8 +214,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   holds revisions no proposal carried); each of those is somebody's work — pick
   another name or report it. `BRANCH_MOVED` means it moved since you read it:
   view it again, and delete only if it is still spent.
-  `PROTECTED_BRANCH` is never yours to clear; `FORGE_CALL_FAILED` deleted
-  nothing, so read the branch again and retry. A forge without `proposal-list`
+  `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
+  `GIT_FAILED` mean the delete did not complete, and it may have landed before
+  the failure: read the branch again, and retry only if it is still there. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
   `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**

@@ -110,9 +110,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    the old branch holds revisions no closed pull request carried.
    `BRANCH_NOT_OURS`: the closed pull request on it was not this install's.
    Those revisions are somebody's. Report the refusal, its code and the branch,
-   and stop. `BRANCH_MOVED` (something pushed to it just now) and
-   `FORGE_CALL_FAILED` (the forge did not answer; nothing was deleted) both mean
-   run `prepare` once more before reporting.
+   and stop. `BRANCH_MOVED` (something pushed to it just now), and
+   `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
+   not complete) all mean run `prepare` once more before reporting.
    Any other refusal: report it and stop. The helper's own message may suggest
    another name; for this skill the name is fixed.
 

@@ -134,8 +134,10 @@ to it, that second run refuses it as `NOT_SPENT`. `BRANCH_NOT_OURS` means the cl
 not this install's, or the name is not under `platform-agent/`. Those revisions
 are somebody's; do not delete them another way. Choose a different name where
 the derived one is only a default, or report the refusal and stop where the name
-is fixed. `FORGE_CALL_FAILED` is different: the forge did not answer, nothing
-was deleted, and running `prepare` again is the move. A proxy older than the
+is fixed. `FORGE_CALL_FAILED`, `GIT_FAILED`, or a delete refused with no code
+is different: the delete did not complete (it may have landed before the
+failure), and running `prepare` again, which reads the branch afresh, is the
+move. A proxy older than the
 sandbox cannot read the branch at all; `prepare` then refuses the name without
 a code and says so — use another name, or report it where the name is fixed.
 

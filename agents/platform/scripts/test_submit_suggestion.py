@@ -101,6 +101,8 @@ class FakeBroker:
         self.update_fails_with: Exception | None = None
         self.identity_fails_with: Exception | None = None
         self.delete_fails_with: Exception | None = None
+        # Runs as the delete arrives, to stand in for a sibling acting first.
+        self.before_delete = None
         self.view_fails_with: Exception | None = None
         # Who the credential authenticates as, which is what `proposal_create`
         # records as the author. Set it to somebody else and the proposals this
@@ -229,6 +231,8 @@ class FakeBroker:
         Kept whole because the caller's advice depends on which one it gets,
         and a fake that deletes anything would prove a route the broker refuses.
         """
+        if self.before_delete:
+            self.before_delete()
         if self.delete_fails_with:
             raise self.delete_fails_with
         branch, expected = payload["branch"], payload["revision"]
@@ -523,6 +527,48 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertIn("run prepare again", str(caught.exception))
         self.assertNotIn("has not used", str(caught.exception))
         self.assertNotEqual(self.broker._tip(branch), "")
+
+    def test_a_delete_that_did_not_finish_says_retry_not_rename(self):
+        # FORGE_CALL_FAILED can follow a push the remote took, so the helper
+        # must not claim nothing was deleted; the others say nothing about the
+        # name either, and a codeless error is a broker that was not reached.
+        for code in ("FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED", ""):
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-{code.lower() or 'unreached'}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {len(code) + 2}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.delete_fails_with = vcs_client.VcsError(
+                    "did not finish", code=code or None
+                )
+                with self.assertRaises(ValueError) as caught:
+                    self.prepare(branch)
+                said = str(caught.exception)
+                self.assertIn("run prepare again", said)
+                self.assertNotIn("has not used", said)
+                self.assertNotIn("Nothing was deleted", said)
+
+    def test_a_branch_gone_before_the_delete_is_not_logged_as_deleted(self):
+        # A sibling `prepare` on the same name deleted it between this run's
+        # view and its delete; the broker answers `deleted: false`.
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        self.existing_proposal(branch)["state"] = "closed"
+        self.broker.before_delete = lambda: git(
+            self.origin, "update-ref", "-d", f"refs/heads/{branch}"
+        )
+
+        prepared = self.prepare(branch)
+
+        self.assertEqual(prepared["branch"], branch)
+        said = "\n".join(self.logged)
+        self.assertNotIn("Deleted the spent branch", said)
+        self.assertIn("went from the repository while this run was deleting it", said)
 
     def test_a_broker_without_the_branch_verbs_refuses_the_name_by_code(self):
         branch = "platform-agent/scale-web"

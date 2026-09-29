@@ -493,6 +493,8 @@ _MAX_PR_CANDIDATES = 8
 # reports; GitHub caps the listing at 250, and a pull request longer than that
 # simply yields no head commit rather than the wrong one.
 _PR_COMMITS_PAGE_SIZE = 100
+# `/pulls/{n}/commits` lists at most 250 commits.
+_PR_COMMITS_MAX_PAGES = 3
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -1384,26 +1386,32 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"whether {slug} builds on it could not be read; this check "
                     "could not be evaluated"
                 )
-            status_code, commits = _http_get_json(
-                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
-                "?per_page=100",
-                token,
-                budget,
-            )
-            if status_code != 200 or not isinstance(commits, list):
-                return None, (
-                    f"GitHub answered {status_code} listing the commits of {slug}; add "
-                    "`pull_requests: read` if that is 403 — this check could not be "
-                    "evaluated"
+            # Oldest first, so on a long branch the closed revision sits on an
+            # early page and a fresh cut's own commits fill the later ones; read
+            # every page, up to the 250 commits this endpoint ever lists.
+            for page in range(1, _PR_COMMITS_MAX_PAGES + 1):
+                status_code, commits = _http_get_json(
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                    f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+                    token,
+                    budget,
                 )
-            if any(isinstance(c, dict) and c.get("sha") == carried for c in commits):
-                return (
-                    f"{slug}: it builds on {carried[:12]}, the last revision of the "
-                    f"closed pull request #{spent.get('number')}, so the spent branch "
-                    "was added to rather than cleared and the closed change is back "
-                    "under review",
-                    None,
-                )
+                if status_code != 200 or not isinstance(commits, list):
+                    return None, (
+                        f"GitHub answered {status_code} listing the commits of {slug}; "
+                        "add `pull_requests: read` if that is 403 — this check could "
+                        "not be evaluated"
+                    )
+                if any(isinstance(c, dict) and c.get("sha") == carried for c in commits):
+                    return (
+                        f"{slug}: it builds on {carried[:12]}, the last revision of the "
+                        f"closed pull request #{spent.get('number')}, so the spent branch "
+                        "was added to rather than cleared and the closed change is back "
+                        "under review",
+                        None,
+                    )
+                if len(commits) < _PR_COMMITS_PAGE_SIZE:
+                    break
             return None, None
         return (
             f"{slug}: its branch {ref} carries no pull request that this run opened "

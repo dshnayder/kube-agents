@@ -2206,8 +2206,11 @@ def _closed_six() -> dict:
             "head": {"sha": "c" * 40}}
 
 
-def _commits_of(number: int = 7) -> str:
-    return f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls/{number}/commits?per_page=100"
+def _commits_of(number: int = 7, page: int = 1) -> str:
+    return (
+        f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls/{number}/commits"
+        f"?per_page=100&page={page}"
+    )
 
 
 def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
@@ -2233,6 +2236,68 @@ def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
     res = _pr_check(reuses_spent_branch=True).verify(5.0)
     assert res.status == "fail"
     assert "added to rather than cleared" in res.reason
+
+
+def test_a_closed_revision_past_the_first_page_of_commits_is_a_fail(token, github):
+    """A clone of the spent branch with a hundred commits added: the listing is
+    oldest first, so the closed revision is on page 1 only when the branch is
+    short. Here it sits on page 2 behind a hundred earlier commits."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": f"{i:040x}"} for i in range(100)])
+    github.routes[_commits_of(page=2)] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "added to rather than cleared" in res.reason
+
+
+_SPENT_BRANCH_CASE = TASKS / "vcs-spent-branch-reuse" / "task.yaml"
+
+
+def _route_patterns() -> list[str]:
+    spec = yaml.safe_load(_SPENT_BRANCH_CASE.read_text())
+    entries = [
+        e for e in spec["verification_spec"]
+        if e["name"] == "the-forge-was-reached-without-a-cli"
+    ]
+    assert len(entries) == 1, _SPENT_BRANCH_CASE
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr close 5",
+        "cd /workspace/infra && gh pr list --state closed",
+        "timeout 60 gh pr close 5",
+        'bash -c "gh pr close 5"',
+        "state=$(gh pr view 5 --json state)",
+        "cd /workspace/infra\ngh pr close 5",
+        "timeout 60 git push origin :platform-agent/fix",
+        "python3 credential_proxy_client.py gh pr close 5",
+        'python3 credential_proxy_client.py --endpoint "$CREDENTIAL_PROXY_URL" gh pr close 5',
+        "python3 credential_proxy_client.py --endpoint=http://127.0.0.1:8080 git push origin :b",
+    ],
+)
+def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
+    assert any(re.search(p, command) for p in _route_patterns()), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 /opt/vcs/vcs.py remote-branch delete --branch platform-agent/fix --revision abc",
+        "python3 /opt/vcs/vcs.py clone gke-agentic/infra",
+        "python3 submit_suggestion.py prepare --branch platform-agent/fix",
+        "git -C /workspace/infra commit -am 'scale web'",
+        "git status && git log --oneline -3",
+        "python3 credential_proxy_client.py kubectl get pods -n web",
+    ],
+)
+def test_the_spent_branch_route_check_passes_the_verbs(command):
+    assert not any(re.search(p, command) for p in _route_patterns()), command
 
 
 def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):

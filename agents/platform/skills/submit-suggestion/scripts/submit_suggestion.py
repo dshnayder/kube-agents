@@ -373,6 +373,12 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
     return "" if contained.get("exitCode") == 0 else tip
 
 
+# Delete refusals that say nothing about the name: the call did not finish
+# (FORGE_CALL_FAILED, GIT_FAILED), or the branch moved since it was read
+# (BRANCH_MOVED). `prepare` run again reads the branch afresh.
+RETRY_THE_DELETE = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED"})
+
+
 def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, base: str) -> None:
     """Make a spent branch's name usable again, or refuse before the change is written.
 
@@ -418,18 +424,21 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
         return
     revision = str(held.get("revision") or "")
     try:
-        vcs_client.forge(
+        answer = vcs_client.forge(
             "branch-delete", {"branch": branch, "revision": revision}, repository=repo
         )
     except vcs_client.VcsError as refused:
-        if refused.code == "FORGE_CALL_FAILED":
-            # The forge did not answer; nothing was decided or deleted, and the
-            # same name is worth one more try before giving it up.
+        if refused.code in RETRY_THE_DELETE or not refused.code:
+            # Not a verdict on the name. The broker or the remote did not
+            # finish (a codeless error is a broker that could not be reached),
+            # or something pushed to the branch since it was read. The push may
+            # have landed before the failure, so this does not say nothing was
+            # deleted; a second `prepare` reads the branch afresh either way.
             raise ValueError(
-                f"{spent_named}. The repository still holds the branch at "
-                f"{revision[:12]}, and deleting it could not be completed "
-                f"(FORGE_CALL_FAILED: {refused}). Nothing was deleted; run "
-                "prepare again."
+                f"{spent_named}. The repository held the branch at "
+                f"{revision[:12]}, and deleting it did not complete "
+                f"({refused.code or 'error'}: {refused}). The name is still "
+                "usable: run prepare again, which reads the branch afresh."
             ) from refused
         raise ValueError(
             f"{spent_named}. The repository still holds the branch at "
@@ -439,6 +448,10 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
             f"{refused}). Submit this one under a branch name the repository has "
             "not used: the derived name is a default, not a requirement."
         ) from refused
+    if not (answer.get("branch") or {}).get("deleted"):
+        log(f"{spent_named}. The branch went from the repository while this run "
+            "was deleting it, so the name is free.")
+        return
     log(f"{spent_named}. Deleted the spent branch at {revision[:12]}; the name is free.")
 
 
