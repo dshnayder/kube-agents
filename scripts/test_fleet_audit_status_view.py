@@ -4,7 +4,7 @@ The contract under test is the read side of
 docs/designs/fleet-audit-report-store.md: the one-projection read
 (`kubectl exec -i … -- python3 -` with report_status.py on stdin), the
 `--json`/`--file` round trip that makes the view reproducible off-cluster, the
-four flags (NO STORE, DIED, NEVER, STALE), and the exit codes that keep "I
+five flags (NO STORE, DIED, UNRECORDED, NEVER, STALE), and the exit codes that keep "I
 could not look" from rendering as "nothing is wrong".
 
 The subprocess boundary is stubbed everywhere; no test reaches a cluster.
@@ -88,10 +88,11 @@ def stream(liveness="completed", last=None, started=None, error=None, runs=(), r
     }
 
 
-def projection(streams=None, root_exists=True):
+def projection(streams=None, root_exists=True, lease_error=None):
     return {
         "root": "/opt/data/fleet-audit/reports",
         "root_exists": root_exists,
+        "lease_error": lease_error,
         "generated_at": NOW.isoformat(),
         "ttl_s": 7200,
         "streams": streams or {},
@@ -167,6 +168,12 @@ def run_main(argv, fake=None):
 class TestScrub(unittest.TestCase):
     def test_control_characters_never_reach_the_terminal(self):
         self.assertEqual(view.scrub("a\x1b]8;;evil\x07b"), "a�]8;;evil�b")
+
+    def test_every_c1_control_is_scrubbed(self):
+        # NEL, IND and RI move the cursor; SOS, PM and APC swallow text up to
+        # the next ST, which every hyperlink ends with.
+        c1 = "".join(chr(code) for code in range(0x80, 0xA0))
+        self.assertEqual(view.scrub(c1), "\ufffd" * len(c1))
 
     def test_none_becomes_empty(self):
         self.assertEqual(view.scrub(None), "")
@@ -251,7 +258,7 @@ class TestFlags(unittest.TestCase):
         # An unreadable lease or a stray directory belongs to no repository,
         # so the row must take it from the stream rather than read clean.
         doc = stream(last=latest(finished_at=(NOW - timedelta(hours=2)).isoformat()))
-        doc.update(liveness="error", error="the in-flight note: denied", stream_error="the in-flight note: denied")
+        doc.update(liveness="error", error="the in-flight note: denied")
         self.assertEqual(self.flags(doc), ["NO STORE"])
 
     def test_a_row_from_the_ring_is_flagged_unrecorded(self):
@@ -264,7 +271,15 @@ class TestFlags(unittest.TestCase):
         recent = latest(finished_at=(NOW - timedelta(hours=2)).isoformat())
         doc = stream(last=recent)
         doc["repos"]["acme/other"] = {"latest": None, "runs": [], "error": "latest.json: bad"}
-        doc.update(liveness="error", error="acme/other: latest.json: bad", stream_error=None)
+        doc.update(liveness="error", error="acme/other: latest.json: bad")
+        rows = view.stream_rows({"cost-audit": doc}, {})
+        self.assertTrue(all(source["error"] for _, _, source in rows))
+
+    def test_a_sibling_repositorys_error_survives_a_held_lease(self):
+        recent = latest(finished_at=(NOW - timedelta(hours=2)).isoformat())
+        doc = stream(liveness="running", last=recent, started=started(age_s=300))
+        doc["repos"]["acme/other"] = {"latest": None, "runs": [], "error": "latest.json: bad"}
+        doc.update(error="acme/other: latest.json: bad")
         rows = view.stream_rows({"cost-audit": doc}, {})
         self.assertTrue(all(source["error"] for _, _, source in rows))
 
@@ -559,6 +574,17 @@ class TestDashboard(unittest.TestCase):
                 last=latest(audit_id="cost-audit", findings=3, critical=0, issue_number=8)
             ),
         }
+
+    def test_a_stream_on_two_repositories_counts_once_in_the_header(self):
+        streams = self.two()
+        streams["cost-audit"]["repos"]["acme/other"] = {
+            "latest": latest(audit_id="cost-audit", repo="acme/other"), "runs": [], "error": None,
+        }
+        out = self.render(streams)
+        self.assertEqual(len(self.body_rows(out)), 3)
+        self.assertIn("2 streams", out)
+        self.assertNotIn("3 streams", out)
+        self.assertIn("across 2 run streams", out)
 
     def test_the_table_is_drawn_with_box_borders(self):
         out = self.render(self.two())
@@ -1028,6 +1054,26 @@ class TestExitCodes(unittest.TestCase):
         doc = projection({"compliance-audit": stream(liveness="error", error="boom")})
         rc, _, _ = run_main(["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc)))
         self.assertEqual(rc, 1)
+
+    def test_an_unreadable_lease_directory_is_exit_1_even_with_no_stream(self):
+        doc = projection(lease_error="/opt/data/scratch/: Permission denied")
+        rc, out, _ = run_main(["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc)))
+        self.assertEqual(rc, 1)
+        self.assertIn("in-flight leases unreadable", out)
+
+    def test_a_kubectl_that_could_not_ask_does_not_probe_other_contexts(self):
+        # An expired token on the current context must not send the view to
+        # read whichever other context holds an agent pod.
+        fake = TestContextDiscovery.Probing(
+            pods=(), current="hub", contexts=("hub", "staging"),
+            get_rc=1, get_stderr="error: You must be logged in to the server (Unauthorized)",
+        )
+        fake.hubs = ("staging",)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("failed (kubectl exit 1)", err)
+        self.assertIn("Unauthorized", err)
+        self.assertEqual(fake.cmds("staging"), [])
 
     def test_a_readable_store_is_exit_0(self):
         doc = projection({"compliance-audit": stream(last=latest())})

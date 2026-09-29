@@ -78,7 +78,8 @@ verification_spec:
     check:
       type: worker_commands
       # The skill's first red line: latest.json embeds the whole findings
-      # document and the ledger body. A `jq` or `python3` projection of one
+      # document and the ledger body, and every runs/<stamp>.json ring entry
+      # is a byte-identical copy of one. A `jq` or `python3` projection of one
       # key is a different command and does not match.
       forbidden_patterns:
-        - '(^|&&|;|\|)\s*(cat|less|more|head|tail)\s+\S*latest\.json'
+        - '(^|&&|;|\|)\s*(cat|less|more|head|tail)\s+\S*(latest\.json|runs/[^\s/]+\.json)'

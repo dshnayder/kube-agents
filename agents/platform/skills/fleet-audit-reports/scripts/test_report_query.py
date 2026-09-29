@@ -317,6 +317,16 @@ class TestStreams(StoreTestCase):
         self.assertIn("unknown, not clean", payload["error"])
         self.assertEqual(payload["streams"], [])
 
+    def test_an_unlistable_lease_directory_over_an_empty_store_is_an_error(self):
+        # No stream directory means no row to carry the lease error, and a
+        # first run in flight is what the unlisted directory would have shown.
+        denied = PermissionError(13, "Permission denied")
+        with patch.object(report_query.report_status, "in_flight_ids", side_effect=denied):
+            code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["streams"], [])
+        self.assertIn("in-flight leases not readable", payload["error"])
+
     def test_an_unparseable_envelope_is_an_error_row_and_a_nonzero_exit(self):
         self.stream_dir(AUDIT)
         (Path(self.root) / AUDIT / REPO / "latest.json").write_text("{not json", encoding="utf-8")
@@ -661,6 +671,17 @@ class TestRepositories(StoreTestCase):
         self.assertEqual(code, 2)
         rows = {row["repo"]: row for row in payload["streams"]}
         self.assertEqual(rows[REPO]["liveness"], "error")
+        self.assertIn("acme/other", rows[REPO]["error"])
+
+    def test_a_corrupt_sibling_names_itself_while_the_stream_holds_a_lease(self):
+        # A lease makes liveness `running`, which must not clear the sibling's
+        # error from the healthy row.
+        (Path(self.root) / AUDIT / "acme/other" / "latest.json").write_text("{", encoding="utf-8")
+        self.write_claim(AUDIT, age_s=60)
+        code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        rows = {row["repo"]: row for row in payload["streams"]}
+        self.assertEqual(rows[REPO]["liveness"], "running")
         self.assertIn("acme/other", rows[REPO]["error"])
 
     def test_diff_reads_one_repositorys_ring(self):

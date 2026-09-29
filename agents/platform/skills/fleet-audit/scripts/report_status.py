@@ -345,6 +345,10 @@ def project(
         "root_exists": root_exists,
         "generated_at": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat(),
         "ttl_s": INFLIGHT_TTL_S,
+        # Also on every stream, but a store with no stream directory yet has no
+        # stream to carry it, and a first run in flight is exactly what the
+        # unlisted scratch directory would have shown.
+        "lease_error": lease_error,
         "streams": {
             audit_id: project_stream(root, scratch, audit_id, now_epoch, lease_error)
             for audit_id in ids
@@ -360,11 +364,9 @@ def project_stream(
     Liveness is the stream's, because the lease is: one `start` holds the
     stream across every repository. `error` names the lease when it could not
     be read, else the first repository that could not be, and the entry for
-    that repository carries its own. `stream_error` is the part no repository
-    entry carries -- the lease, the stream's directory, a stray repository
-    directory -- so a reader shows it on every row. `lease_error` is the
-    scratch directory's listing failure, which `project` found once for every
-    stream.
+    that repository carries its own, so a reader shows a repository entry's
+    error first and falls back to this one. `lease_error` is the scratch
+    directory's listing failure, which `project` found once for every stream.
     """
     error = lease_error
     try:
@@ -380,9 +382,6 @@ def project_stream(
         error = error or _failure(f"{audit_id}/", exc)
     if strays:
         error = error or f"{', '.join(strays)}: not lower-case, so no reader opens it"
-    # Everything above belongs to the stream, not to any one repository, so no
-    # repository entry carries it; readers fall back to it on every row.
-    stream_error = error
     any_latest = None
     for repo in ids:
         entry = _project_repo(root, audit_id, repo)
@@ -394,7 +393,6 @@ def project_stream(
         "repos": repos,
         "liveness": liveness(started, any_latest, now_epoch, error=error),
         "error": error,
-        "stream_error": stream_error,
     }
 
 

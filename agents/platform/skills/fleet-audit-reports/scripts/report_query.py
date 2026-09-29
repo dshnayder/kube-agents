@@ -335,6 +335,11 @@ def cmd_streams(args: argparse.Namespace) -> dict:
         )
     elif unreadable:
         error = "streams that could not be read: " + ", ".join(unreadable)
+    elif projection.get("lease_error"):
+        error = (
+            f"in-flight leases not readable ({projection['lease_error']}): a run "
+            "in progress would not be listed. This is unknown, not clean."
+        )
     return {
         "root": projection["root"],
         "root_exists": projection["root_exists"],
@@ -379,11 +384,10 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "runs": len(entry.get("runs") or []),
         "running_since": started.get("started_at"),
         "age_s": started.get("age_s"),
-        # Liveness is the stream's, so a row it calls `error` names why even
-        # when the failure was a sibling repository's.
-        "error": entry.get("error")
-        or (stream.get("error") if repo is None else stream.get("stream_error"))
-        or (stream.get("error") if stream.get("liveness") == "error" else None),
+        # A stream-level error -- the lease, a stray directory, a sibling
+        # repository -- goes on every row of the stream, whatever its liveness:
+        # a lease makes it `running` or `died` without clearing the error.
+        "error": entry.get("error") or stream.get("error"),
     }
 
 

@@ -125,7 +125,10 @@ CONTEXT_PROBE_TIMEOUT = 6
 DISCOVER_TIMEOUT = 20
 EXEC_TIMEOUT = 120
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b\x90\x9d]")
+# C0 except tab and newline, DEL, and all of C1: NEL, IND and RI move the
+# cursor, and SOS, PM and APC open a string the terminal swallows up to the
+# next ST, which every hyperlink this view prints ends with.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 #: Every outcome `finish` stores. Anything else is styled as a warning rather
 #: than as a success -- an outcome this view has never heard of is exactly the
@@ -153,8 +156,9 @@ SORTS = ("stream", "last", "findings", "flags")
 # A collector writes coverage gaps at whatever length; one is clipped to this.
 GAP_WIDTH = 400
 #: `render_table` is given this when the caller asked for no width limit, which
-#: is the default for `render()` used as a library function and what `--width 0`
-#: means: draw every column at its natural width and drop nothing.
+#: is the default for `render()` used as a library function (`width=0`): draw
+#: every column at its natural width and drop nothing. `--width 0` on the
+#: command line detects the terminal instead.
 UNBOUNDED = 10_000
 # How much of a projection that is not JSON goes into the error.
 BAD_OUTPUT_EXCERPT = 200
@@ -274,10 +278,13 @@ def discover_pod(namespace: str, context: str | None = None) -> list[tuple[str, 
         f"the agent pod lookup in {namespace} on {where}",
     )
     if res.returncode != 0:
+        # No `search_namespace`: a non-zero exit is an expired token, an
+        # unreachable server or a Forbidden -- "I could not ask", which must
+        # not send the view to read whichever other context answers.
         raise ProjectionError(
-            f"no agent pod found in namespace {namespace} on {where}: "
-            f"{_oneline(res.stderr) or 'kubectl get pods failed'}",
-            search_namespace=namespace,
+            f"the agent pod lookup in {namespace} on {where} failed "
+            f"(kubectl exit {res.returncode}): "
+            f"{_oneline(res.stderr) or 'no stderr'}"
         )
     targets = store_targets(res.stdout or "")
     if not targets:
@@ -591,7 +598,7 @@ def issue_ref(url: object) -> str:
 def exit_code(projection: dict) -> int:
     """1 when the store could not be read: "I could not look" is not a
     healthy fleet, and a caller scripting this view must be able to tell."""
-    if not projection.get("root_exists"):
+    if not projection.get("root_exists") or projection.get("lease_error"):
         return 1
     streams = projection.get("streams") or {}
     return 1 if any((s or {}).get("error") for s in streams.values()) else 0
@@ -605,7 +612,11 @@ def unreadable_reason(projection: dict) -> str | None:
         for audit_id, stream in (projection.get("streams") or {}).items()
         if (stream or {}).get("error")
     )
-    return f"unreadable stream files: {', '.join(bad)}" if bad else None
+    if bad:
+        return f"unreadable stream files: {', '.join(bad)}"
+    if projection.get("lease_error"):
+        return f"in-flight leases unreadable, so a run in progress may be missing: {projection['lease_error']}"
+    return None
 
 
 
@@ -777,9 +788,10 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
             source = {
                 **stream,
                 "latest": (entry or {}).get("latest"),
-                "error": (entry or {}).get("error")
-                or stream.get("stream_error")
-                or (stream.get("error") if stream.get("liveness") == "error" else None),
+                # A stream-level error goes on every row whatever the
+                # liveness: a lease makes it `running` or `died` without
+                # clearing a sibling repository's error.
+                "error": (entry or {}).get("error") or stream.get("error"),
                 "latest_missing": bool((entry or {}).get("latest_missing")),
             }
             out.append((label, audit_id, source))
@@ -817,7 +829,9 @@ def render(
         # Scrubbed once here, because the gaps table and the pull-request list
         # below print the label too, and a stream directory's name is not
         # validated the way a repository segment is.
-        built.append({"id": scrub(label), "row": row, "flags": flags, "latest": latest})
+        built.append(
+            {"id": scrub(label), "audit_id": audit_id, "row": row, "flags": flags, "latest": latest}
+        )
 
     shown = [
         entry for entry in built
@@ -848,11 +862,13 @@ def render(
         COLUMNS, [entry["row"] for entry in shown], palette,
         width if width else UNBOUNDED, box,
     )
+    shown_streams = len({e["audit_id"] for e in shown})
+    all_streams = len({e["audit_id"] for e in built})
     if len(shown) != len(built):
         out.append(
             palette(
                 "  %d of %d streams shown; drop --stream/--flagged for the rest"
-                % (len(shown), len(built)),
+                % (shown_streams, all_streams),
                 "dim",
             )
         )
@@ -919,8 +935,11 @@ def header_lines(
     utc: bool,
     roster_error: str = "",
 ) -> list[str]:
-    total = len(built)
+    # A stream publishing to two repositories is two rows and one stream, so
+    # every count below is of distinct stream ids, not of rows.
+    total = len({e["audit_id"] for e in built})
     attention = [e for e in built if e["flags"] or e["latest"].get("partial")]
+    attention_streams = len({e["audit_id"] for e in attention})
     findings = sum(
         e["latest"].get("findings") or 0
         for e in built
@@ -932,6 +951,7 @@ def header_lines(
         if isinstance(e["latest"].get("critical"), int)
     )
     ran = [e for e in built if e["latest"].get("finished_at")]
+    ran_streams = len({e["audit_id"] for e in ran})
     newest = max(
         (parse_iso(e["latest"].get("finished_at")) for e in ran),
         default=None,
@@ -952,7 +972,7 @@ def header_lines(
     # the caveat is appended in either case, and only "all clear" is withheld.
     verdicts = []
     if attention:
-        verdicts.append(palette("%d need attention" % len(attention), "yellow"))
+        verdicts.append(palette("%d need attention" % attention_streams, "yellow"))
     elif not roster_error:
         verdicts.append(palette("all clear", "green"))
     if roster_error:
@@ -994,7 +1014,7 @@ def header_lines(
                 palette(str(findings), "bold"),
                 palette(
                     "across %d run stream%s · %d critical"
-                    % (len(ran), "" if len(ran) == 1 else "s", critical),
+                    % (ran_streams, "" if ran_streams == 1 else "s", critical),
                     "crit" if critical else "dim",
                 ),
             ),
@@ -1035,7 +1055,7 @@ def header_lines(
             )
         )
     if total:
-        clean = total - len(attention)
+        clean = total - attention_streams
         filled = int(round(HEALTH_BAR_CELLS * clean / float(total)))
         bar = "█" * filled + "░" * (HEALTH_BAR_CELLS - filled)
         lines.append(

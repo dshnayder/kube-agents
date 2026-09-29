@@ -43,6 +43,7 @@ MINUTES_PER_HOUR = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
 HOURS_PER_DAY = 24
+_PR_URL = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)/?$")
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\]8;[^\x1b]*\x1b\\")
@@ -86,7 +87,8 @@ def want_colour(choice: str, stream=None) -> bool:
         return True
     if choice == "never":
         return False
-    if os.environ.get("NO_COLOR") is not None:
+    # no-color.org: set *and non-empty*, as the installer's shell gate reads it.
+    if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("TERM", "") == "dumb":
         return False
@@ -128,8 +130,6 @@ def display_width(text: str) -> int:
         else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
         for ch in plain(text)
     )
-
-_PR_URL = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)/?$")
 
 def pr_ref(url: str) -> str:
     """`owner/repo#123` for a GitHub pull-request URL, else the URL unchanged.
