@@ -645,7 +645,8 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- fail (printf "platformAgent.integration.forges[%d].provider is %q; must be one of %s" $i $provider (join ", " $registered)) -}}
 {{- end -}}
 {{- $host := $f.host | default "" -}}
-{{- if and (eq $provider "github") $host (not (has (lower $host) $githubHosts)) -}}
+{{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
+{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
@@ -674,7 +675,7 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- $trimmed = trimAll "/" $name -}}
 {{- end -}}
 {{- /* A GitHub host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
-{{- $hostOnly := and (hasSuffix "/" $repository) (has (lower (trimAll "/" $repository)) (list "github.com" "www.github.com" "ssh.github.com")) -}}
+{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) $githubHosts) -}}
 {{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $hostOnly) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}

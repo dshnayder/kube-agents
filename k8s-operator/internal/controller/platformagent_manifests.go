@@ -1512,6 +1512,14 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// gitopsRefusalWithholdsManaged reports whether a refused gitops repository is
+// keeping accepted managed ones out of managed_repos, as the seed below does.
+func gitopsRefusalWithholdsManaged(resolved *agentv1alpha1.ResolvedIntegration) bool {
+	return resolved != nil && resolved.GitOps() != nil &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps)) == 0 &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)) > 0
+}
+
 // buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
@@ -1535,8 +1543,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 				for _, repo := range repos {
 					entry, err := repo.ManagedRepoEntry()
 					if err != nil {
+						// By field, not value: a clone URL can carry a token.
 						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
-							"raw", repo.Repository, "forge", repo.ForgeName, "role", repo.Role, "error", err)
+							"index", repo.Index, "forge", repo.ForgeName, "role", repo.Role)
 						continue
 					}
 					entries = append(entries, entry)

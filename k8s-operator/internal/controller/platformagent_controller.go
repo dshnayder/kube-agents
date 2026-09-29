@@ -1533,10 +1533,13 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 
 // agentURLSpelling rewrites a URL the way the agent's urlsplit reads it, when
 // that differs from this release's parser: a query or fragment dropped, and a
-// numeric port out of range dropped. The parser refuses all three, but the
-// agent uses such an entry, so the minter must count it rather than hold every
-// policy for an entry that is not broken. Only those three parts change; the
-// rewritten value is still the parser's to read or refuse.
+// port slot that is not a port dropped, since urlsplit's hostname ends at the
+// first colon and never validates what follows. The parser refuses all of
+// these, but the agent uses such an entry, so the minter must count it rather
+// than hold every policy for an entry that is not broken. Only those parts
+// change; the rewritten value is still the parser's to read or refuse, so
+// `https://github.com:owner/repo`, one segment once the slot is gone, stays
+// unreadable, as it is to the agent.
 func agentURLSpelling(value string) (string, bool) {
 	scheme, rest, ok := strings.Cut(strings.TrimSpace(value), "://")
 	if !ok {
@@ -1551,8 +1554,8 @@ func agentURLSpelling(value string) (string, bool) {
 	if at := strings.LastIndex(authority, "@"); at != -1 {
 		userInfo, authority = authority[:at+1], authority[at+1:]
 	}
-	if host, port, found := strings.Cut(authority, ":"); found && port != "" && strings.Trim(port, "0123456789") == "" {
-		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+	if host, port, found := strings.Cut(authority, ":"); found && !strings.HasPrefix(authority, "[") {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil || strings.Trim(port, "0123456789") != "" {
 			authority, changed = host, true
 		}
 	}
@@ -3306,8 +3309,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condReason = conditionReasonInvalidGitRepoURL
 		degradedReason = conditionReasonInvalidGitRepoURL
 		// Not "GitOps disabled": with the lists, every entry validation
-		// accepts is still seeded, the gitops repository included.
-		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr))
+		// accepts is still seeded, the gitops repository included — except
+		// the managed ones while the gitops repository is refused, which the
+		// message then says, since the problem list names none of them.
+		withheld := ""
+		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil && gitopsRefusalWithholdsManaged(resolved) {
+			withheld = ", and no managed repository is seeded while the gitops repository is refused, since the agent reads the first managed_repos entry as its GitOps repository"
+		}
+		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"

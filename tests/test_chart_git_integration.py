@@ -190,6 +190,20 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].host", result.stderr)
 
+    def test_a_unicode_look_alike_github_host_fails_rather_than_folding(self):
+        """Sprig's `lower` is Unicode, so `İ` (U+0130) lowers to `i`. The
+        operator folds ASCII only and refuses `gİthub.com`, so the chart must
+        not pass it and then fold it away into the alias as github.com."""
+        for host in ("gİthub.com", "GİTHUB.COM", "www.gİthub.com"):
+            with self.subTest(host=host):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", host=host, namespace="acme"),
+                    *_repo(0, forge="github", repository="infra", role="gitops"),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].host", result.stderr)
+
     def test_a_namespace_github_refuses_fails_naming_the_forge(self):
         """A single-forge declaration renders as the alias, whose `org` carries
         GitHub's grammar in the CRD. Unchecked, the API server would refuse
@@ -271,7 +285,8 @@ class ChartGitIntegrationTest(unittest.TestCase):
         """A repository the operator would refuse for GitHub -- another host, a
         URL or remote missing its owner, a deeper path, an owner GitHub would
         not accept, or a name that is a traversal or a flag -- folded into
-        `github.gitRepo` would be refused against that key; a forge with no
+        `github.gitRepo` would be refused against that key (a port, which the
+        operator accepts, is not folded either); a forge with no
         namespace and no repository would fold into nothing. Each renders as
         the lists."""
         for repo in (
@@ -288,6 +303,8 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs/.git",
             "gke-labs/..git",
             "gke-labs/.git.git",
+            # The operator accepts a port; the fold does not carry one, so the
+            # lists render and the operator reads it as written.
             "https://github.com:443/gke-labs/infra",
             "ssh://git@github.com:gke-labs/infra",
             "file://github.com/gke-labs/infra",

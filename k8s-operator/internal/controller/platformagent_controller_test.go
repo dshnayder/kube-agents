@@ -1056,7 +1056,8 @@ func TestPlatformAgentReconciler_Reconcile_OneRefusedEntryKeepsItsNeighbours(t *
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidGitRepoURL {
 		t.Fatalf("expected Degraded True/InvalidGitRepoURL, got %v", degraded)
 	}
-	if strings.Contains(degraded.Message, "GitOps disabled") || !strings.Contains(degraded.Message, "refused entries are not seeded") {
+	if strings.Contains(degraded.Message, "GitOps disabled") || !strings.Contains(degraded.Message, "refused entries are not seeded") ||
+		strings.Contains(degraded.Message, "no managed repository") {
 		t.Errorf("Degraded message must say only the refused entries are left out, got %q", degraded.Message)
 	}
 
@@ -1069,6 +1070,60 @@ func TestPlatformAgentReconciler_Reconcile_OneRefusedEntryKeepsItsNeighbours(t *
 	}
 	if strings.Contains(cm.Data["context_repos"], "docs") {
 		t.Errorf("the refused context repository must not be seeded, context_repos = %q", cm.Data["context_repos"])
+	}
+}
+
+// A refused gitops repository keeps the accepted managed ones out of
+// managed_repos too, and the problem list names none of them, so the message
+// has to say it.
+func TestPlatformAgentReconciler_Reconcile_ARefusedGitOpsRepositorySaysManagedAreWithheld(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gitops-refused", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "gke-labs"}},
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "github", Repository: "in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+						{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Reason != conditionReasonInvalidGitRepoURL {
+		t.Fatalf("expected Degraded InvalidGitRepoURL, got %v", degraded)
+	}
+	if !strings.Contains(degraded.Message, "no managed repository is seeded while the gitops repository is refused") {
+		t.Errorf("Degraded message does not say the managed repositories are withheld: %q", degraded.Message)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gitops-state", Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("failed to get gitops-state ConfigMap: %v", err)
+	}
+	if strings.Contains(cm.Data["managed_repos"], "apps") {
+		t.Errorf("managed_repos = %q; the managed repository must be withheld", cm.Data["managed_repos"])
 	}
 }
 
@@ -5818,6 +5873,11 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	repos := `[{"type":"github","url":"https://github.com/test-org/repo-q?ref=main"},` +
 		`{"type":"github","url":"https://github.com/test-org/repo-f#main"},` +
 		`{"type":"github","url":"https://x@github.com:99999/test-org/repo-p?a#b"},` +
+		// urlsplit's hostname ends at the first colon, whatever follows it.
+		`{"type":"github","url":"https://github.com:abc/test-org/repo-a"},` +
+		`{"type":"github","url":"https://github.com:owner/test-org/repo-o"},` +
+		// One segment once the slot is gone, which the agent skips too.
+		`{"type":"github","url":"https://github.com:test-org/one"},` +
 		// Dropping the query leaves no repository, as it does for the agent.
 		`{"type":"github","url":"https://github.com?x=/test-org/gone"},` +
 		// A `#` ends the authority, so the host is evil.example either way.
@@ -5826,10 +5886,10 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
-	if want := []string{"repo-f", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
+	if want := []string{"repo-a", "repo-f", "repo-o", "repo-p", "repo-q"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
-	if want := []string{"managed_repos[3]", "managed_repos[4]"}; !slices.Equal(unreadable, want) {
+	if want := []string{"managed_repos[5]", "managed_repos[6]", "managed_repos[7]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
 	}
 }
@@ -6325,7 +6385,7 @@ func TestIsGKEAutopilot(t *testing.T) {
 
 // TestSameManagedRepoComparesIdentityNotSpelling covers the dedup that decides
 // whether the seeded GitOps repository is already in the state ConfigMap. A
-// string comparison made `https://www.github.com/gke-labs/kube-agents` and
+// string comparison made `https://github.com/gke-labs/kube-agents.git` and
 // `git@github.com:gke-labs/kube-agents.git` two entries for one repository, and
 // the agent then held two write locks on the same remote.
 func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
