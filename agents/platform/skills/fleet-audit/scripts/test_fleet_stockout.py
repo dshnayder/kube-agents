@@ -2081,6 +2081,25 @@ class ProjectDiscoveryTest(unittest.TestCase):
         self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
         self.assertIn("quota project", by_name["project/beta"]["error"])
 
+    def test_a_project_with_both_apis_off_is_described_once(self):
+        # Kubernetes Engine and Compute Engine both refuse, each naming the
+        # project by number; the second refusal is answered from the first describe.
+        refusal = "ERROR: SERVICE_DISABLED: {api} API has not been used in project 123456789"
+        base = fleet_run({}, cluster_list=lambda project: run_of(1, "", refusal.format(api="Kubernetes Engine")))
+        describes = []
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                describes.append(argv[3])
+                return run_of(0, "123456789\n" if argv[3] == "acme" else "222222222\n")
+            if argv[:4] == ["gcloud", "compute", "reservations", "list"]:
+                return run_of(1, "", refusal.format(api="Compute Engine"))
+            return base(argv, **kwargs)
+
+        manifest = self.collect(run)
+        self.assertEqual(describes.count("acme"), 1)
+        self.assertNotIn("project/acme", {c["name"] for c in manifest.get("clusters", [])})
+
     def test_the_listing_runs_under_its_own_timeout_not_the_default(self):
         timeouts = []
         base = fleet_run({})

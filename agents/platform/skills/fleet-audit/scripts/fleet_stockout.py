@@ -185,6 +185,9 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 # The project an API refusal names; `fleet_waste.REFUSED_PROJECT_NUMBER_RE`
 # carries the reasoning.
 REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The read `refusal_names_project` makes; `collect_fleet` answers a repeat of
+# it from the first answer.
+PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -226,7 +229,7 @@ NO_TARGET_REASON = (
 
 # §2's standard exclusions. S1's list is the one `fleet_waste.py` and
 # `collect.py` carry, copied rather than imported: this collector borrows only
-# two leaf parsers from its siblings, imported inside the checks that use them,
+# three leaf parsers from its siblings, imported inside the checks that use them,
 # so a change to either sibling's exclusions cannot move this stream's.
 SYSTEM_NAMESPACES = frozenset(
     {
@@ -534,8 +537,26 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
         return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
-    described = run(["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"])
+    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
     return described.rc == 0 and numbers == {described.stdout.strip()}
+
+
+def _describing_once(run: RunFn) -> RunFn:
+    """`run`, answering a repeated `gcloud projects describe` from its first
+    answer; a copy of `fleet_waste._describing_once`, which carries the
+    reasoning. Here a project with both Kubernetes Engine and Compute Engine
+    off is asked twice, once per refusal."""
+    answers: dict[tuple[str, ...], Run] = {}
+
+    def wrapped(argv: list[str], **kwargs) -> Run:
+        if argv[: len(PROJECT_DESCRIBE_ARGV)] != PROJECT_DESCRIBE_ARGV:
+            return run(argv, **kwargs)
+        key = tuple(argv)
+        if key not in answers:
+            answers[key] = run(argv, **kwargs)
+        return answers[key]
+
+    return wrapped
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
@@ -983,7 +1004,9 @@ def check_reservation(reservation: dict) -> dict | None:
         # A reservation name is unique per zone, and every reservation is filed
         # under `project/<p>`, so the zone is what keeps two same-named ones
         # from deriving one finding id -- the `Quota/<region>:<metric>` shape.
-        zone = str(reservation.get("zone") or "").rsplit("/", 1)[-1] or "global"
+        from fleet_waste import _location_of  # the cost stream's located objects use the same parser
+
+        zone = _location_of(reservation)
         return {
             "object": f"Reservation/{zone}:{reservation.get('name', '')}",
             "excerpt": f"inUseCount={in_use}/{count} ({ratio * 100:.0f}% used, {count - in_use} idle)",
@@ -1914,6 +1937,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
     # `projects list` spends the same terminal timeout the reads do.
     deadline = time.monotonic() + project_budget_s
+    run = _describing_once(run)
 
     def failed(error: str) -> dict:
         # The manifest contract's top-level `error`: a run that enumerated

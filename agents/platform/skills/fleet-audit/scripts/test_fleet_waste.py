@@ -536,6 +536,12 @@ class FetchLbTrafficTest(unittest.TestCase):
         self.assertIsNone(self.fetch(session, rules=[]))
         self.assertEqual(session.calls, [])
 
+    def test_no_external_rule_is_none_even_without_a_session(self):
+        """The no-rule answer comes before the session check: without it a
+        project with nothing to measure recorded an rc -1 traffic read on
+        every cluster whenever the session could not be built."""
+        self.assertIsNone(fw.fetch_lb_traffic("acme", [], session=None, now=NOW))
+
     def test_a_non_json_200_fails_the_read_rather_than_raising(self):
         """`ApiSession.get` returns a bare `requests.Response`; a 200 carrying
         an HTML page raised out of `_read_project` and cost the project every
@@ -3401,7 +3407,7 @@ class UnsizedWorkloadTest(unittest.TestCase):
         pod = self.pod()
         peaks = {("argocd", "argocd-repo-server-1"): (0.0071, 66.6)}
         excerpt = self.check([pod], peaks)[0]["excerpt"]
-        self.assertIn("declares no CPU or memory request", excerpt)
+        self.assertIn("declares no nonzero CPU or memory request", excerpt)
         self.assertIn("peak observed 7.1m vCPU / 67Mi", excerpt)
         self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
         # Ceiled, not rounded: 2 x 7.1m is 14.2m and 2 x 66.6Mi is 133.2Mi,
@@ -3550,6 +3556,18 @@ class UnattachedDiskTest(unittest.TestCase):
 
     def test_flags_unattached_over_30_days(self):
         self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
+
+    def test_a_pv_claims_only_the_disk_in_its_own_zone(self):
+        """A detached PV holding `us-central1-a/data-1` used to claim every
+        disk named `data-1`, so a truly orphaned one in `us-central1-b` was
+        never reported. A handle with no location still claims by name."""
+        pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/p/zones/us-central1-a/disks/data-1"}})
+        handles = fw._fleet_facts({"pvs": [pv], "services": []})["pv_handles"]
+        claimed = self.disk(name="data-1")
+        orphan = dict(self.disk(name="data-1"), zone="https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b")
+        hits = fw.check_unattached_disk([claimed, orphan], handles, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["Disk/us-central1-b:data-1"])
+        self.assertEqual(fw.check_unattached_disk([claimed, orphan], {"data-1"}, now=NOW), [])
 
     def test_same_named_disks_in_two_zones_derive_two_finding_ids(self):
         """A disk name is unique per zone, and every disk finding is filed
@@ -4710,9 +4728,11 @@ class CollectClusterTest(unittest.TestCase):
 
     def test_fleet_facts_carry_pv_handles_and_service_names(self):
         pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/p/disks/d1"}})
+        regional = obj("PersistentVolume", "pv2", **{"spec.csi": {"volumeHandle": "projects/p/regions/us-central1/disks/d2"}})
         svc = obj("Service", "web", ns="default")
-        entry, facts = self.run_with(dump_items=[pv, svc])
+        entry, facts = self.run_with(dump_items=[pv, regional, svc])
         self.assertIn("d1", facts["pv_handles"])
+        self.assertIn("us-central1/d2", facts["pv_handles"])
         self.assertIn("default/web", facts["service_names"])
 
 

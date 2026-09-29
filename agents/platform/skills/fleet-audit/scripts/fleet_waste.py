@@ -132,6 +132,9 @@ REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
 # The read `refusal_names_project` makes to turn a project id into the number
 # a refusal names. `collect_fleet` answers a repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
+# The zone or region and name in a PV's disk handle
+# (`projects/p/zones/us-central1-a/disks/data-1`, `.../regions/r/disks/n`).
+PV_DISK_HANDLE_RE = re.compile(r"(?:^|/)(?:zones|regions)/([^/]+)/disks/([^/]+)$")
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -1317,9 +1320,6 @@ def fetch_lb_traffic(
     def fail(rc: int, message: str) -> tuple[dict, Run]:
         return {}, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
 
-    if session is None:
-        return fail(-1, NO_SESSION_MESSAGE)
-
     addresses = {
         str(rule.get("name") or ""): str(rule.get("IPAddress") or "")
         for rule in (rules or [])
@@ -1330,6 +1330,8 @@ def fetch_lb_traffic(
     }
     if not addresses:
         return None
+    if session is None:
+        return fail(-1, NO_SESSION_MESSAGE)
 
     totals: dict[str, dict[str, float]] = {}
     for key, metric in metrics:
@@ -2485,8 +2487,10 @@ def _declares_cpu_or_memory(requests: list[dict]) -> bool:
     to turn on whether a `requests` dict was non-empty: a container requesting
     only `nvidia.com/gpu`, only `ephemeral-storage`, or `cpu: "0"` read as
     sized, every sizing check then dropped it for having no CPU or memory to
-    compare, and 3.12 never saw it. `collect.py`'s `no-requests` files exactly
-    those shapes as request-less and defers the number here.
+    compare, and 3.12 never saw it. A declared zero is unsized here but not
+    in `collect.py`'s `no-requests`, which asks only whether the key is
+    present, so 3.12 can fire on a pod that audit passes; its excerpt says "no
+    nonzero CPU or memory request" rather than that none was declared.
     """
     for request in requests:
         cpu = parse_cpu_cores(str(request.get("cpu") or ""))
@@ -3810,7 +3814,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # edit is written in, and the peak is directly twice-able by eye.
         peak_cpu_m, want_cpu_m = peak_cpu * 1000, want_cpu * 1000
         excerpt = (
-            f"declares no CPU or memory request on "
+            f"declares no nonzero CPU or memory request on "
             f"{'container' if len(entry['containers']) == 1 else 'containers'} "
             f"{', '.join(entry['containers'])}; peak observed {peak_cpu_m:.1f}m vCPU / "
             f"{peak_mem:.0f}Mi {measured_over}. "
@@ -3856,7 +3860,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
 
 IMPACT = {
     "overrequest": "This controller reserves far more than it uses, so the scheduler and autoscaler size the cluster for capacity nothing needs.",
-    "unsized-workload": "With no request declared, the scheduler books nothing for this controller: it lands on nodes that are already full, it is BestEffort so kubelet evicts it first under pressure, and the autoscaler cannot count it when sizing the cluster.",
+    "unsized-workload": "With no nonzero CPU or memory request, the scheduler books nothing for this controller: it lands on nodes that are already full, it is BestEffort so kubelet evicts it first under pressure, and the autoscaler cannot count it when sizing the cluster.",
     "underrequest": "Sustained memory use above the request means the scheduler has under-booked every node this controller lands on, and kubelet ranks Burstable pods for eviction by exactly this overage — so it is the first thing evicted when any workload on that node needs memory.",
     "orphan-pv": "The backing disk still exists and no claim can bind it -- capacity paid for and unusable.",
     "unconsumed-pvc": "Provisioned storage sits bound with nothing reading or writing it.",
@@ -4318,6 +4322,21 @@ def _emit(
     return candidate
 
 
+def _pv_disk_key(handle: str) -> str:
+    """`<location>/<name>` for a PV handle that names its disk's zone or region,
+    else the bare name.
+
+    A disk name is unique only per zone, so a PV holding `us-central1-a/data-1`
+    must not claim an orphaned `us-central1-b/data-1`. A handle with no
+    location (`pdName`, or a handle this does not parse) claims every disk of
+    that name, which errs towards not reporting. A disk name cannot contain
+    `/`, so the two spellings never collide."""
+    match = PV_DISK_HANDLE_RE.search(handle)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    return handle.rsplit("/", 1)[-1]
+
+
 def _fleet_facts(context: dict) -> dict:
     """What the project-scoped compute checks (3.4, 3.6) need to know about
     *this* cluster's live objects, so `collect_fleet` can union them across
@@ -4329,7 +4348,7 @@ def _fleet_facts(context: dict) -> dict:
         spec = pv.get("spec", {})
         handle = (spec.get("csi") or {}).get("volumeHandle") or (spec.get("gcePersistentDisk") or {}).get("pdName")
         if handle:
-            pv_handles.add(handle.rsplit("/", 1)[-1])
+            pv_handles.add(_pv_disk_key(handle))
     service_names = {
         f"{s.get('metadata', {}).get('namespace', '')}/{s.get('metadata', {}).get('name', '')}" for s in context["services"]
     }
@@ -4916,7 +4935,8 @@ def check_unattached_disk(
         dead_cluster = _dead_cluster_of(disk, known_clusters)
         if age < (DEAD_CLUSTER_AGE_DAYS if dead_cluster else UNATTACHED_AGE_DAYS):
             continue
-        if disk.get("name", "") in live_pv_handles:
+        name = disk.get("name", "")
+        if name in live_pv_handles or f"{_location_of(disk)}/{name}" in live_pv_handles:
             continue
         size_gb = disk.get("sizeGb")
         size_gb = float(size_gb) if size_gb else 0
