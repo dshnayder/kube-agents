@@ -264,7 +264,7 @@ spec:
   `owner/name`, or a github.com URL or remote naming `owner/name`, in the
   grammar the operator applies. Anything else -- another host, a deeper path,
   an owner GitHub would not accept, a name that is `.`, `..` or starts with
-  `-` -- would be refused by the operator against `github.gitRepo`, a key the
+  `-`, or one that is nothing once its `.git` suffix is dropped -- would be refused by the operator against `github.gitRepo`, a key the
   values file never set, and a forge with neither a namespace nor a repository
   would fold into no key at all. Those render as the lists, so the refusal
   names the entry the administrator wrote. A credentialsRef with an empty name
@@ -284,7 +284,7 @@ spec:
   {{- with $repos }}
   {{- $repo = (first .).repository | default "" }}
   {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
-  {{- $plain = and (regexMatch (printf `^((https?://(www\.)?github\.com/|git@github\.com:)%s|(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*$` $owner $owner) $repo) (not (has (base $repo) (list "." ".."))) }}
+  {{- $plain = and (regexMatch (printf `^((https?://(www\.)?github\.com/|git@github\.com:)%s|(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*$` $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".."))) }}
   {{- end }}
   {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
   {{- end }}

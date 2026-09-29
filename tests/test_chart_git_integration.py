@@ -265,6 +265,11 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs/-x",
             "gke-labs/..",
             "gke-labs/.",
+            "gke-labs/.git",
+            "gke-labs/..git",
+            "https://github.com/gke-labs/.git",
+            "git@github.com:gke-labs/.git",
+            ".git",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(

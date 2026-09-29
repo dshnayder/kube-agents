@@ -29,11 +29,12 @@ package v1alpha1
 // `docs/designs/version-control-support.md` §2 has the census.
 //
 // The two are counterparts, not a port: they agree on every shape an install
-// produces, and knowingly differ on one. `ssh://git@github.com:owner/repo` — an
-// scp path wearing a URL scheme — resolves here to `owner/repo` and in
-// `repo_ref.py` to `repo`, because the Python side reads the non-numeric port
-// slot as a port and drops it. Go's reading is git's; the Python side is the one
-// to correct.
+// produces, and knowingly differ on one. A schemeless `www.github.com/o/r` or
+// `ssh.github.com/o/r` is lifted here to a GitHub host, because the CRD has
+// admitted it, while `repo_ref.py` lifts only `github.com` and reads the rest
+// as a three-segment hostless path. The operator therefore never writes either
+// spelling into the state ConfigMap, and does not count one written there by
+// hand as the repository it seeds.
 //
 // A `RepoRef` carries a host, possibly empty, and an opaque path of any depth.
 // Depth is not checked here. "Exactly two segments" is a property of GitHub, so
@@ -60,7 +61,7 @@ const (
 	// userInfoSeparator ends the `git@` part of a remote.
 	userInfoSeparator = "@"
 	// authoritySeparator divides host from port in a URL, and host from path in
-	// the scp remote form — telling the two apart is what splitAuthority does.
+	// the scp remote form, which carries no scheme.
 	authoritySeparator = ":"
 	// flagPrefix, leading a path segment, makes a CLI read the repository as an
 	// option rather than an argument.
@@ -75,11 +76,6 @@ const (
 // cannot be driven into polynomial backtracking.
 var repoSegmentRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
-// repoPortRegex recognises a real port, which is how `https://github.com:443/o/r`
-// is told apart from `ssh://git@github.com:owner/repo` — a scp path wearing a
-// URL scheme, which git accepts and the CRD has always admitted.
-var repoPortRegex = regexp.MustCompile(`^[0-9]*$`)
-
 // allowedRepoSchemes is the set a repository URL may carry. `file://` and the
 // rest are refused rather than ignored, because a scheme this list does not
 // name is a value the administrator did not mean as a repository.
@@ -88,14 +84,6 @@ var allowedRepoSchemes = map[string]bool{
 	"https": true,
 	"git":   true,
 	"ssh":   true,
-}
-
-// scpCapableSchemes are the schemes under which `host:path` is a remote git
-// resolves rather than a malformed authority. http(s) is absent: a non-numeric
-// port there is a typo, not a second syntax.
-var scpCapableSchemes = map[string]bool{
-	"git": true,
-	"ssh": true,
 }
 
 // traversalSegments are filesystem instructions rather than names. The segment
@@ -165,7 +153,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 			return RepoRef{}, fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
 		}
 		var err error
-		if host, path, err = splitAuthority(text[idx+len(schemeSeparator):], scheme); err != nil {
+		if host, path, err = splitAuthority(text[idx+len(schemeSeparator):]); err != nil {
 			return RepoRef{}, err
 		}
 	} else if h, p, ok := splitSCPRemote(text); ok {
@@ -203,25 +191,20 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 
 // splitAuthority separates host from path in everything after a URL's scheme.
 //
-// The awkward case is a port slot that is not a port. `ssh://git@github.com:owner/repo`
-// is scp syntax carrying a scheme; git resolves it and the CRD has always
-// admitted it, so under an scp-capable scheme the non-numeric "port" is put
-// back on the front of the path rather than rejected. Under http(s) there is no
-// such form — `https://github.com:evil/owner` is a malformed URL and nothing
-// resolves it — so it is refused rather than silently read as a path segment.
-func splitAuthority(rest, scheme string) (string, string, error) {
+// The awkward case is a port slot that is not a port. Git splits a port off
+// the host only when what follows the colon is one, 0 to 65535; anything else
+// stays in the host, so `ssh://git@github.com:owner/repo` makes git connect to
+// a host called `github.com:owner` and ask it for `/repo`. No scheme makes the
+// scp form legal after `://`. Reading the slot as the start of the path would
+// rewrite a URL git cannot clone into a repository nobody wrote, so it is
+// refused, under every scheme.
+func splitAuthority(rest string) (string, string, error) {
 	authority, path, _ := strings.Cut(rest, pathSeparator)
 	if path != "" {
 		path = pathSeparator + path
 	}
 	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
 		authority = authority[idx+1:]
-	}
-	// `https:///o/r` stated an authority, an empty one. Reading it as a value
-	// that stated none would hand it to the install's default forge, the
-	// silent fallback this parser exists to remove; repo_ref.py refuses it too.
-	if authority == "" {
-		return "", "", fmt.Errorf("URL %q names no host", rest)
 	}
 
 	if strings.HasPrefix(authority, ipv6Open) {
@@ -233,21 +216,17 @@ func splitAuthority(rest, scheme string) (string, string, error) {
 	}
 
 	host, port, found := strings.Cut(authority, authoritySeparator)
-	if !found {
+	// `https:///o/r` and `https://:443/o/r` stated an authority with no host
+	// in it. Reading either as a value that stated none would hand it to the
+	// install's default forge, the silent fallback this parser exists to
+	// remove; repo_ref.py refuses both too.
+	if host == "" {
+		return "", "", fmt.Errorf("URL %q names no host", rest)
+	}
+	if !found || port == "" || isPortNumber(port) {
 		return host, path, nil
 	}
-	// Digits after the colon are a port, as git reads them, unless they are
-	// more than a port can be on a scheme that also writes the scp form: then
-	// `ssh://git@github.com:12345678/app` names the numeric owner 12345678.
-	// `ssh://git@github.com:22/infra` is port 22 and a path missing its owner,
-	// which the provider's depth check refuses, not owner 22.
-	if repoPortRegex.MatchString(port) && (port == "" || !scpCapableSchemes[scheme] || isPortNumber(port)) {
-		return host, path, nil
-	}
-	if !scpCapableSchemes[scheme] {
-		return "", "", fmt.Errorf("invalid port %q in %q", port, authority)
-	}
-	return host, port + path, nil
+	return "", "", fmt.Errorf("invalid port %q in %q", port, authority)
 }
 
 // isPortNumber reports whether a run of digits fits in a TCP port.

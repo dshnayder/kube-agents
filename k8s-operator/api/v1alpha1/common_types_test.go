@@ -94,7 +94,7 @@ func TestCleanRepoSlug(t *testing.T) {
 		{"http://github.com/gke-labs/kube-agents", "gke-labs/kube-agents", false},
 		{"git@github.com:gke-labs/kube-agents.git", "gke-labs/kube-agents", false},
 		{"ssh://git@github.com/gke-labs/kube-agents.git", "gke-labs/kube-agents", false},
-		{"ssh://git@github.com:gke-labs/kube-agents.git", "gke-labs/kube-agents", false},
+		{"ssh://git@github.com:gke-labs/kube-agents.git", "", true},
 		{"git://github.com/gke-labs/kube-agents.git", "gke-labs/kube-agents", false},
 		{"github.com/gke-labs/kube-agents", "gke-labs/kube-agents", false},
 		{"git@gitlab.com:gke-labs/kube-agents.git", "", true},

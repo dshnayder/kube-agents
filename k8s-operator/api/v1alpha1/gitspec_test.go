@@ -35,15 +35,15 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		{input: "https://github.com/gke-labs/kube-agents.git", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "git@github.com:gke-labs/kube-agents.git", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "ssh://git@github.com/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
-		// scp syntax wearing a URL scheme: git resolves it, so the non-numeric
-		// "port" goes back onto the front of the path rather than being rejected.
-		{input: "ssh://git@github.com:gke-labs/kube-agents.git", host: "github.com", path: "gke-labs/kube-agents"},
 		{input: "https://github.com:443/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
-		// A numeric owner in the scp-with-scheme form: read as a port it would
-		// leave a bare name for the namespace to requalify into another repository.
-		{input: "ssh://git@github.com:12345678/kube-agents", host: "github.com", path: "12345678/kube-agents"},
-		{input: "ssh://git@github.com:65536/kube-agents", host: "github.com", path: "65536/kube-agents"},
 		{input: "ssh://git@github.com:22/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		{input: "https://github.com:/gke-labs/kube-agents", host: "github.com", path: "gke-labs/kube-agents"},
+		// After `://` git splits off only a port; anything else stays in the
+		// host, so none of these is a remote git can clone.
+		{input: "ssh://git@github.com:gke-labs/kube-agents.git", err: true},
+		{input: "git://github.com:gke-labs/kube-agents", err: true},
+		{input: "ssh://git@github.com:12345678/kube-agents", err: true},
+		{input: "ssh://git@github.com:65536/kube-agents", err: true},
 		// Digits a port can hold are one, as git reads them, even where that
 		// leaves the path missing its owner: the provider refuses it on depth.
 		{input: "ssh://git@github.com:22/infra", host: "github.com", path: "infra"},
@@ -51,6 +51,9 @@ func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
 		// An empty authority stated a host, and an empty one is none.
 		{input: "https:///gke-labs/kube-agents", err: true},
 		{input: "ssh://git@/gke-labs/kube-agents", err: true},
+		{input: "https://:443/gke-labs/kube-agents", err: true},
+		{input: "https://:/gke-labs/kube-agents", err: true},
+		{input: "ssh://:gke-labs/kube-agents", err: true},
 		// The whole point: another forge's host survives parsing as that host,
 		// rather than being discarded so the remaining slashes can be counted.
 		{input: "git@gitlab.com:group/subgroup/project.git", host: "gitlab.com", path: "group/subgroup/project"},
@@ -123,6 +126,8 @@ func TestGitHubResolveDoesNotQualifyAHostedSingleSegment(t *testing.T) {
 		"ssh://git@github.com:22/infra",
 		"https:///infra",
 		"https:///gke-labs/infra",
+		"https://:443/infra",
+		"https://:443/gke-labs/infra",
 	} {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
@@ -230,23 +235,21 @@ func TestResolveValidatesEveryPathSegment(t *testing.T) {
 	}
 }
 
-// TestNonNumericPortIsAnScpPathOnlyUnderGitAndSsh separates the two readings of
-// `host:something`. Under ssh it is scp syntax and the value is a repository;
-// under https it is a port and a non-numeric one is a typo, so admitting it
-// would let `https://github.com:evil/owner` resolve to a repository nobody wrote.
-func TestNonNumericPortIsAnScpPathOnlyUnderGitAndSsh(t *testing.T) {
-	if _, err := ParseRepoRef("https://github.com:evil/owner"); err == nil {
-		t.Error("a non-numeric port under https was read as an scp path")
-	}
-	if _, err := ParseRepoRef("http://github.com:evil/owner"); err == nil {
-		t.Error("a non-numeric port under http was read as an scp path")
-	}
-	ref, err := ParseRepoRef("ssh://git@github.com:gke-labs/kube-agents.git")
-	if err != nil {
-		t.Fatalf("ParseRepoRef(ssh scp) = %v", err)
-	}
-	if ref.Host != "github.com" || ref.Path != "gke-labs/kube-agents" {
-		t.Errorf("ParseRepoRef(ssh scp) = {%q, %q}", ref.Host, ref.Path)
+// TestANonNumericPortIsRefusedUnderEveryScheme pins git's reading of
+// `host:something` after `://`: a port or nothing. Git keeps anything else in
+// the host, so `ssh://git@github.com:gke-labs/kube-agents` asks a host called
+// `github.com:gke-labs` for `/kube-agents`. Admitting it would rewrite a URL
+// git cannot clone into a repository nobody wrote.
+func TestANonNumericPortIsRefusedUnderEveryScheme(t *testing.T) {
+	for _, value := range []string{
+		"https://github.com:evil/owner",
+		"http://github.com:evil/owner",
+		"ssh://git@github.com:gke-labs/kube-agents.git",
+		"git://github.com:gke-labs/kube-agents.git",
+	} {
+		if ref, err := ParseRepoRef(value); err == nil {
+			t.Errorf("ParseRepoRef(%q) = {%q, %q}, expected a refusal", value, ref.Host, ref.Path)
+		}
 	}
 }
 

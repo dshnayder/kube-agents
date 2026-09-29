@@ -6001,6 +6001,7 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		"ssh://git@github.com/gke-labs/kube-agents",
 		"http://github.com/gke-labs/kube-agents",
 		"gke-labs/kube-agents",
+		"github.com/gke-labs/kube-agents",
 	}
 	for _, url := range same {
 		t.Run(url, func(t *testing.T) {
@@ -6022,6 +6023,11 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// of the host is not the seeded repository: it is one the agent skips.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://www.github.com/gke-labs/kube-agents"},
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh://git@ssh.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh.github.com/gke-labs/kube-agents"},
+		// The agent matches the type exactly, so this entry is one it skips even
+		// though the URL is the seeded one byte for byte.
+		{Type: "GitHub", URL: "https://github.com/gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {

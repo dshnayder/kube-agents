@@ -1288,27 +1288,39 @@ func mergeRepoEntries(existing string, front, back []agentv1alpha1.ManagedRepoEn
 // would sweep it twice, and the old spelling would stay, since removal is
 // administrator-driven by design.
 //
-// Only an entry on the provider's canonical host, or naming none, counts as
-// present. The agent reads a GitHub entry only on github.com or as the bare
-// owner/name shorthand, so an entry spelled
-// "https://www.github.com/o/r" is one it skips: treating it as the seeded
-// repository would leave the agent with none. Entries of different types, an
-// unregistered type, and values the provider cannot resolve all fall back to
-// the string comparison rather than being treated as equal: this ConfigMap is
-// administrator-writable, so a value the operator does not understand is one
-// it must leave alone.
+// Only an entry the agent reads counts as present, since treating one it
+// skips as the seeded repository would leave the agent with none. The agent
+// matches the type exactly, so "GitHub" is not "github", and it reads a GitHub
+// entry only on github.com or as the bare owner/name shorthand, so
+// "https://www.github.com/o/r" and a schemeless "www.github.com/o/r" are
+// skipped. An unregistered type, and values the provider cannot resolve, are
+// not treated as equal either: this ConfigMap is administrator-writable, so a
+// value the operator does not understand is one it must leave alone.
 func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
+	if existing.Type != seeded.Type {
+		return false
+	}
 	if existing.URL == seeded.URL {
 		return true
-	}
-	if !strings.EqualFold(existing.Type, seeded.Type) {
-		return false
 	}
 	provider, err := agentv1alpha1.LookupGitProvider(seeded.Type)
 	if err != nil {
 		return false
 	}
-	if parsed, err := agentv1alpha1.ParseRepoRef(existing.URL); err != nil || (parsed.Host != "" && parsed.Host != provider.DefaultHost) {
+	parsed, err := agentv1alpha1.ParseRepoRef(existing.URL)
+	if err != nil {
+		return false
+	}
+	host := parsed.Host
+	if host == "" {
+		// ParseRepoRef lifts no schemeless host, and the provider lifts all of
+		// its spellings; the agent lifts only the canonical one.
+		first, _, _ := strings.Cut(parsed.Path, "/")
+		if first = strings.ToLower(first); provider.Hosts[first] {
+			host = first
+		}
+	}
+	if host != "" && host != provider.DefaultHost {
 		return false
 	}
 	existingRef, err := provider.Resolve("", existing.URL, "")
