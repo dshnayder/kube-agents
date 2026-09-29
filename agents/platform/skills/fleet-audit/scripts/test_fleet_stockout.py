@@ -10,6 +10,7 @@ problem converting them was meant to solve."""
 import json
 import os
 import shlex
+import subprocess
 import sys
 import threading
 import unittest
@@ -751,7 +752,10 @@ class SingleZoneNodepoolTest(unittest.TestCase):
             with self.subTest(autoscaling=autoscaling, locations=locations):
                 self.assertEqual(fs._pool_ceiling(autoscaling, locations), (None, ""))
                 pool = {"name": "p1", "locations": locations, "autoscaling": autoscaling}
-                self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=27))
+                # Both NAP settings: without NAP the zone-locked arm is live,
+                # and it must read an empty span as unknown too.
+                for has_nap in (True, False):
+                    self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=has_nap, current_node_count=27))
 
     def test_a_string_node_count_does_not_take_down_the_manifest(self):
         """`maxNodeCount` is an int32 so proto3 JSON will not stringify it, but
@@ -1680,6 +1684,15 @@ class CollectClusterTest(unittest.TestCase):
         )
         self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
 
+    def test_a_failed_node_pool_read_beside_a_family_only_spot_class_is_unevaluated(self):
+        # The family-only request is a limitation, but it says nothing about
+        # the node pools, which were not read; the check landed in no list.
+        cc = compute_class("cc1", [{"machineFamily": "n2", "spot": True}])
+        entry = self.run_with(dump_items=[cc], pools_rc=1)
+        self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
+        self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertIn("name no machine type", entry["limitations"])
+
     def test_a_failed_autoscaler_read_is_unevaluated(self):
         entry = self.run_with(dump_items=[], log_rc=1)
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
@@ -1873,6 +1886,18 @@ class ProjectDiscoveryTest(unittest.TestCase):
             },
         }
         self.assertEqual([g for g in audit_report.coverage_gaps(data) if "project/beta" in g], [])
+
+    def test_a_project_whose_only_cluster_is_not_running_still_reads_its_quota(self):
+        # A DEGRADED cluster is unaudited but draws on its region's quota; the
+        # project does not hold "no cluster".
+        def cluster_list(project):
+            return run_of(0, json.dumps([{"name": "c1", "location": "us-east1-b", "status": "DEGRADED"}]))
+
+        manifest = self.collect(fleet_run({}, cluster_list=cluster_list, projects="acme\n"))
+        acme = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertEqual(acme.get("checks_not_applicable", []), [])
+        self.assertIn("quota-exhaustion-risk", [c["check"] for c in acme["commands"]])
+        self.assertIn("us-east1", " ".join(c["command"] for c in acme["commands"]))
 
     def test_the_active_project_is_read_when_the_listing_omits_it(self):
         manifest = self.collect(fleet_run({"acme": ["c1"], "beta": ["c2"]}, projects="beta\n"))
@@ -2107,6 +2132,70 @@ class CrashIsolationTest(unittest.TestCase):
         self.assertEqual(outcomes, {"acme/us-central1/c1": "collected", "acme/us-central1/boom": "gate-failed"})
         boom = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/boom")
         self.assertIn("TypeError", boom["error"])
+
+
+    def test_a_crashing_project_read_costs_that_project_and_no_other(self):
+        inner = fleet_run({"acme": ["c1"]})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"] and "beta" in argv:
+                raise TypeError("unsupported operand type(s) for -: 'str' and 'int'")
+            return inner(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet(None, run=run)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "collected")
+        self.assertEqual(by_name["project/acme"]["outcome"], "collected")
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("TypeError", by_name["project/beta"]["error"])
+
+    def test_a_crashing_cluster_list_costs_that_project_and_no_other(self):
+        def cluster_list(project):
+            # A cluster with no name: `enumerate_clusters` indexes it.
+            return run_of(0, '[{"status": "RUNNING"}]' if project == "beta" else json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]))
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet(None, run=fleet_run({}, cluster_list=cluster_list))
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "collected")
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("KeyError", by_name["project/beta"]["error"])
+
+
+class DefaultRunTest(unittest.TestCase):
+    def test_a_timed_out_childs_output_arrives_as_str(self):
+        exc = subprocess.TimeoutExpired(["gcloud"], 60, output=b"partial", stderr=b"SERVICE_DISABLED")
+        with patch.object(fs.subprocess, "run", side_effect=exc):
+            result = fs.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (124, "partial", "SERVICE_DISABLED"))
+
+
+class ZoneTimeoutTest(unittest.TestCase):
+    SILENT = "WARNING: The following zones did not respond: us-east1-b. List results may be incomplete."
+
+    def test_a_silent_zone_audits_the_listed_clusters_and_fails_the_project_target(self):
+        """A reservation a silent zone's cluster consumes would read as unused,
+        so the project's reads wait for a complete list."""
+        def cluster_list(project):
+            return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}]), self.SILENT)
+
+        inner = fleet_run({}, cluster_list=cluster_list, projects="acme\n")
+
+        def run(argv, **kwargs):
+            if argv[:3] in (["gcloud", "compute", "reservations"], ["gcloud", "compute", "regions"]):
+                raise AssertionError(f"a project read ran over an incomplete cluster list: {argv}")
+            return inner(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet(None, run=run)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "collected")
+        self.assertEqual(by_name["project/acme"]["outcome"], "gate-failed")
+        self.assertIn("did not respond", by_name["project/acme"]["error"])
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

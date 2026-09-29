@@ -113,6 +113,11 @@ ERROR_EXCERPT_CHARS = 300
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# gcloud's word for a zone that timed out during `clusters list`: the command
+# still exits 0, with the clusters the other zones returned and this line on
+# stderr, so the silent zone's clusters would read as nonexistent. See
+# `fleet_drift.ZONE_TIMEOUT_MARKER`.
+ZONE_TIMEOUT_MARKER = "did not respond"
 # The same answer from the Compute Engine or Artifact Registry API: nothing
 # §3.4-§3.6 or §3.14 looks for can exist in that project, so the check has
 # nothing to run against there rather than a read that failed. An
@@ -476,6 +481,11 @@ SSD_STORAGE_CLASS_MARKERS = ("ssd", "extreme", "premium")
 
 # §3.10: a namespace under an active GitOps sync is the controller's to delete.
 GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.io/")
+#: §3.10's "explicit ownership or retention annotation": an annotation whose
+#: key's name part (after any `prefix/`) holds one of these words once split
+#: on `-`, `_` and `.` -- `owner`, `team-owner`, `example.com/retain`,
+#: `retention-days`. Someone has said who keeps the namespace, or for how long.
+RETENTION_ANNOTATION_WORDS = ("owner", "retain", "retention")
 
 POD_TERMINAL_PHASES = ("Succeeded", "Failed")
 
@@ -503,6 +513,10 @@ RunFn = Callable[..., Run]
 SessionFn = Any
 
 
+def _text(output: str | bytes | None) -> str:
+    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
+
+
 def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
 
     t0 = time.monotonic()
@@ -510,7 +524,10 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
+        # notwithstanding, and every consumer of `Run` searches and slices it as
+        # str. `collect.py`'s `_text` does the same.
+        return Run(argv, 124, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -683,6 +700,21 @@ def not_running_entry(c: dict, project: str) -> dict:
     }
 
 
+class IncompleteEnumeration(RuntimeError):
+    """`clusters list` answered, but a zone did not respond.
+
+    Carries the clusters that did arrive, so they are still audited, while
+    the project's own target reports the enumeration as incomplete: its
+    checks compare against the project's whole cluster list, and a silent
+    zone's clusters are missing from it. A caller that catches only
+    `RuntimeError` still gets the conservative answer, the project unread."""
+
+    def __init__(self, message: str, running: list[dict], not_running: list[dict]):
+        super().__init__(message)
+        self.running = running
+        self.not_running = not_running
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
@@ -703,7 +735,13 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
     ]
-    return running, [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
+    if incomplete:
+        detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]
+        log(f"{project}: clusters list returned {len(clusters)} cluster(s) but is incomplete: {detail}")
+        raise IncompleteEnumeration(f"clusters list rc=0 but incomplete: {detail}", running, not_running)
+    return running, not_running
 
 
 # --------------------------------------------------------------------------- #
@@ -1635,11 +1673,16 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
 
     running_pods = [p for p in context["pods"] if (p.get("status") or {}).get("phase") == "Running"]
     pods_by_node: dict[str, list[dict]] = {}
+    # Every Running pod, DaemonSets included: what an absorbing node has
+    # already promised away. The 15% test excludes DaemonSets; the headroom
+    # a drain would find does not.
+    all_pods_by_node: dict[str, list[dict]] = {}
     for pod in running_pods:
-        if _pod_daemonset_owned(pod):
-            continue
         node_name = (pod.get("spec") or {}).get("nodeName", "")
-        if node_name:
+        if not node_name:
+            continue
+        all_pods_by_node.setdefault(node_name, []).append(pod)
+        if not _pod_daemonset_owned(pod):
             pods_by_node.setdefault(node_name, []).append(pod)
 
     hits = []
@@ -1753,7 +1796,7 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
             if other_name in pool_node_names:
                 continue
             other_cpu, other_mem = _allocatable(other)
-            used_cpu, used_mem = _sum_requests(pods_by_node.get(other_name, []))
+            used_cpu, used_mem = _sum_requests(all_pods_by_node.get(other_name, []))
             free_cpu += max(0.0, other_cpu - used_cpu)
             free_mem += max(0.0, other_mem - used_mem)
 
@@ -2058,6 +2101,12 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
+def _is_retention_key(key: str) -> bool:
+    """Whether an annotation key names an owner or a retention period."""
+    words = re.split(r"[-_.]", key.rsplit("/", 1)[-1].lower())
+    return any(word in RETENTION_ANNOTATION_WORDS for word in words)
+
+
 def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
     active_ns = {
         p.get("metadata", {}).get("namespace", "")
@@ -2070,6 +2119,7 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         cap = ((pvc.get("status") or {}).get("capacity") or {}).get("storage", "0")
         pvc_gib_by_ns[ns] = pvc_gib_by_ns.get(ns, 0) + _gib(cap)
     lb_ns = {s.get("metadata", {}).get("namespace", "") for s in context["services"] if (s.get("spec") or {}).get("type") == "LoadBalancer"}
+    cronjob_ns = {cj.get("metadata", {}).get("namespace", "") for cj in context.get("cronjobs") or []}
     # A ResourceQuota used to be a third way in here, and it is not billable.
     # Kubernetes reserves nothing for one: it is an admission gate on the sum of
     # the requests of the pods in its namespace, it holds no capacity, no
@@ -2095,6 +2145,13 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         # kustomize-controller stamps labels. Either one owns the lifecycle.
         markers = {**(ns_obj.get("metadata", {}).get("annotations") or {}), **(ns_obj.get("metadata", {}).get("labels") or {})}
         if any(k.startswith(GITOPS_SYNC_MARKER_PREFIXES) for k in markers):
+            continue
+        if any(_is_retention_key(k) for k in ns_obj.get("metadata", {}).get("annotations") or {}):
+            continue
+        # A CronJob's namespace is empty between fires by design, and a
+        # suspended one is waiting to be resumed; either way the pods it has
+        # not started yet are not evidence of abandonment.
+        if name in cronjob_ns:
             continue
         age = _age_days(ns_obj.get("metadata", {}).get("creationTimestamp", ""), now=now)
         if age is None or age < 30:
@@ -2300,6 +2357,16 @@ def _measured_over(
             f"over the trailing {window_h}h (Cloud Monitoring, across this "
             f"controller's live pods and the {pods}{short})"
         )
+    if replaced:
+        # A kind whose own age is not in the dump -- a bare ReplicaSet. The
+        # peak came partly from pods that are gone, so the live pods' age is
+        # not the bound either; say what the read asked and what is unknown.
+        pods = f"{replaced} pod{'s' if replaced != 1 else ''} it has replaced"
+        return USAGE_WINDOW_HOURS, (
+            f"over up to the trailing {USAGE_WINDOW_HOURS}h (Cloud Monitoring, "
+            f"across this controller's live pods and the {pods}; the "
+            f"controller's own age was not read, so its history may be shorter)"
+        )
     window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
     if window_h >= USAGE_WINDOW_HOURS:
         return window_h, f"over the trailing {window_h}h (Cloud Monitoring)"
@@ -2350,9 +2417,10 @@ def _observed_pod_keys(
     out at 1101 and 1164 MiB, while a pod they had replaced reached 1656 MiB,
     and `argocd-dex-server` read 0.3m of CPU against a predecessor's 3.6m.
 
-    Two guards keep a pattern from claiming someone else's pod. It must not be
-    a live pod some other controller owns -- `live_owners` is the cluster's own
-    answer and outranks any inference from a name. And a controller kind absent
+    Two guards keep a pattern from claiming a pod that is not replaced. It
+    must not be a live pod at all -- `live_owners` is the cluster's own answer
+    and outranks any inference from a name, and a live pod of this controller
+    that the sizing checks skipped is live, not replaced. And a controller kind absent
     from `REPLACED_POD_PATTERNS` is not widened at all, because a bare `Pod` and
     the kinds this does not model name their pods by rules this does not know.
     """
@@ -2369,7 +2437,10 @@ def _observed_pod_keys(
         if key not in seen
         and key[0] == ns
         and pattern.match(key[1])
-        and live_owners.get(key, (kind, name)) == (kind, name)
+        # A pod still in the dump is not replaced, whoever owns it: another
+        # controller's, or this one's that the sizing checks skipped (under an
+        # hour old, terminating, Pending).
+        and key not in live_owners
     ]
     return live + sorted(extra), len(extra)
 
@@ -3996,6 +4067,15 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
     }
 
 
+def crashed_project_error(project: str, exc: BaseException) -> str:
+    """`crashed_entry`'s account for a project read: the error its
+    `gate-failed` `project/<p>` target carries. A project read parses the same
+    live API answers a cluster read does, and without this one bad answer
+    there aborts the fleet the way `crashed_entry` exists to prevent."""
+    print(f"[fleet_waste] project {project}: collector raised {type(exc).__name__}: {exc}", file=sys.stderr)
+    return f"collector raised {type(exc).__name__}: {exc}"[:ERROR_EXCERPT_CHARS]
+
+
 def _metrics_gap_phrase(result: Run, read: str) -> str:
     """How a §2 metrics limitation should describe the read behind it.
 
@@ -4310,7 +4390,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # cluster with no nodes has nothing scheduled, so no pod can be sitting
         # above its request, and the empty Monitoring answer says only that
         # nothing ran. Same `rc == 0` guard, for the same reason, and it
-        # carries here even when the usage read is what failed: line 2070
+        # carries here even when the usage read is what failed: `collect_cluster`
         # hands `means_result` the very same `Run`, so its rc is the usage
         # read's rc and a failure there does not become a verdict here.
         not_applicable.append(
@@ -4974,6 +5054,11 @@ def _read_project(p: str, *, run: RunFn, session: SessionFn, now: datetime) -> t
     than re-reading it."""
     try:
         running, not_running = enumerate_clusters(p, run=run)
+    except IncompleteEnumeration as exc:
+        # The clusters that arrived are audited; the project's own target
+        # fails, because §3.4 and §3.6 would read a silent zone's cluster as
+        # gone and its disks and forwarding rules as orphans.
+        return exc.running, exc.not_running, str(exc), None, None
     except RuntimeError as exc:
         # A log line is not a record. The manifest is the only account of
         # what this run managed to read, and a project whose clusters could
@@ -5024,6 +5109,12 @@ def _prefetch_compute(p: str, *, run: RunFn, now: datetime, known_clusters: set[
     return recorded
 
 
+class ProjectCrash(NamedTuple):
+    """What a project read that raised maps to instead of its result."""
+
+    error: str
+
+
 def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline: float) -> dict[str, object]:
     """`work(p)` for every project, `max_workers` at a time.
 
@@ -5033,7 +5124,12 @@ def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline:
     so a credential listing N projects paid N rounds of gcloud calls before
     the first cluster was read."""
     def guarded(p: str):
-        return work(p) if _before(deadline) else None
+        if not _before(deadline):
+            return None
+        try:
+            return work(p)
+        except Exception as exc:  # noqa: BLE001 — see crashed_project_error
+            return ProjectCrash(crashed_project_error(p, exc))
 
     results: dict[str, object] = {}
     if not projects:
@@ -5106,13 +5202,19 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             known_by_project[p] = None
             enumeration_failed[p] = PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)
             continue
+        if isinstance(read, ProjectCrash):
+            known_by_project[p] = None
+            enumeration_failed[p] = read.error
+            continue
         running, not_running, error, rules, traffic = read
+        # Empty unless `clusters list` answered in part, in which case what it
+        # listed is still read even though the project's own target fails.
+        clusters.extend(running)
+        unaudited.extend(not_running)
         if error is not None:
             known_by_project[p] = None
             enumeration_failed[p] = error
             continue
-        clusters.extend(running)
-        unaudited.extend(not_running)
         known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
         forwarding_rules[p] = rules
         if traffic is not None:
@@ -5126,13 +5228,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 
     readable = [p for p in projects if p not in enumeration_failed]
 
-    def prefetch_or_skip(p: str) -> dict[tuple[str, ...], Run] | None:
+    def prefetch_or_skip(p: str) -> dict[tuple[str, ...], Run] | ProjectCrash | None:
         if not _before(deadline):
             return None
-        return _prefetch_compute(p, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
+        try:
+            return _prefetch_compute(p, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
+        except Exception as exc:  # noqa: BLE001 — see crashed_project_error
+            return ProjectCrash(crashed_project_error(p, exc))
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
-    prefetched: dict[str, dict[tuple[str, ...], Run] | None] = {}
+    prefetched: dict[str, dict[tuple[str, ...], Run] | ProjectCrash | None] = {}
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters) + len(readable), max_workers))) as pool:
         # Submitted first, so they start while the deadline still admits them.
         prefetch_futures = {pool.submit(prefetch_or_skip, p): p for p in random.sample(readable, len(readable))}
@@ -5207,7 +5312,14 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         if recorded is None:
             project_entries.append(gate_failed_project(p, PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)))
             continue
-        entry = compute_for(p, recorded)
+        if isinstance(recorded, ProjectCrash):
+            project_entries.append(gate_failed_project(p, recorded.error))
+            continue
+        try:
+            entry = compute_for(p, recorded)
+        except Exception as exc:  # noqa: BLE001 — see crashed_project_error
+            project_entries.append(gate_failed_project(p, crashed_project_error(p, exc)))
+            continue
         if entry:
             project_entries.append(entry)
             read_projects += 1

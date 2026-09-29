@@ -177,6 +177,11 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# gcloud's word for a zone that timed out during `clusters list`: the command
+# still exits 0, with the clusters the other zones returned and this line on
+# stderr, so the silent zone's clusters would read as nonexistent. See
+# `fleet_drift.ZONE_TIMEOUT_MARKER`.
+ZONE_TIMEOUT_MARKER = "did not respond"
 # When the collector stops starting project reads, in seconds from its own
 # start; `fleet_waste.py` carries the same bound for the same 600 s terminal
 # call, and its comment has the reasoning. A project not reached by then
@@ -281,13 +286,20 @@ class Run(NamedTuple):
 RunFn = Callable[..., Run]
 
 
+def _text(output: str | bytes | None) -> str:
+    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
+
+
 def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
     t0 = time.monotonic()
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
+        # notwithstanding, and every consumer of `Run` searches and slices it as
+        # str. `collect.py`'s `_text` does the same.
+        return Run(argv, 124, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -417,6 +429,21 @@ def _api_disabled(result: Run) -> bool:
     return result.rc != 0 and any(marker in result.stderr for marker in API_DISABLED_MARKERS)
 
 
+class IncompleteEnumeration(RuntimeError):
+    """`clusters list` answered, but a zone did not respond.
+
+    Carries the clusters that did arrive, so they are still audited, while
+    the project's own target reports the enumeration as incomplete: its
+    checks compare against the project's whole cluster list, and a silent
+    zone's clusters are missing from it. A caller that catches only
+    `RuntimeError` still gets the conservative answer, the project unread."""
+
+    def __init__(self, message: str, running: list[dict], not_running: list[dict]):
+        super().__init__(message)
+        self.running = running
+        self.not_running = not_running
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
@@ -447,7 +474,13 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
     ]
-    return running, [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
+    incomplete = [line.strip() for line in result.stderr.splitlines() if ZONE_TIMEOUT_MARKER in line]
+    if incomplete:
+        detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]
+        log(f"{project}: clusters list returned {len(clusters)} cluster(s) but is incomplete: {detail}")
+        raise IncompleteEnumeration(f"clusters list rc=0 but incomplete: {detail}", running, not_running)
+    return running, not_running
 
 
 def region_of(location: str) -> str:
@@ -854,7 +887,9 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     """
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
-    zone_locked = len(locations) <= 1 and autoscaling.get("enabled") and not has_nap
+    # Exactly one: an empty `locations` is an unknown zone span, as
+    # `_pool_ceiling` reads it, not a pool locked to a zone.
+    zone_locked = len(locations) == 1 and autoscaling.get("enabled") and not has_nap
     ceiling, basis = _pool_ceiling(autoscaling, locations)
     at_ceiling = bool(ceiling) and current_node_count >= NODEPOOL_CEILING_FRACTION * ceiling
     if not zone_locked and not at_ceiling:
@@ -1324,6 +1359,14 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
     }
 
 
+def crashed_project_error(project: str, exc: BaseException) -> str:
+    """`crashed_entry`'s account for a project read, as the error its
+    `gate-failed` `project/<p>` target carries: one bad answer there must not
+    abort the fleet either."""
+    print(f"[fleet_stockout] project {project}: collector raised {type(exc).__name__}: {exc}", file=sys.stderr)
+    return f"collector raised {type(exc).__name__}: {exc}"[:ERROR_EXCERPT_CHARS]
+
+
 def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     # `name` stays bare for the gcloud and logging reads; `target` is what the
@@ -1650,14 +1693,15 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"name no machine type, which `capacity-history` has no way to "
             f"query: {', '.join(unqueryable)}"
         )
-    elif not shapes and not autopilot and not pools_readable:
+    if not shapes and not autopilot and not pools_readable:
         # The node pools were not read, so "nothing here requests Spot" is
-        # not something this run knows.
+        # not something this run knows -- whether or not a ComputeClass also
+        # named a family-only Spot request, which says nothing about the pools.
         unevaluated["spot-scarcity-risk"] = (
             "no ComputeClass names a Spot machine type and the node pools could "
             "not be read, so whether a Spot node pool exists is unknown"
         )
-    elif not shapes:
+    elif not shapes and not unqueryable:
         # No command to record, so §6 would otherwise read the missing record as
         # a check nobody ran. Declared not-applicable for the same reason the
         # Autopilot branch above declares one: it is a fact already in hand.
@@ -1835,16 +1879,23 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # hundreds, and one at a time that is minutes before a cluster is read.
     deadline_error = lambda p: PROJECT_DEADLINE_ERROR.format(budget=int(project_budget_s), project=p)
 
-    def enumerate_or_error(p: str) -> tuple[list[dict], list[dict]] | str:
+    def enumerate_or_error(p: str) -> tuple[list[dict], list[dict], str | None] | str:
         if not _before(deadline):
             return deadline_error(p)
         try:
-            return enumerate_clusters(p, run=run)
+            return (*enumerate_clusters(p, run=run), None)
+        except IncompleteEnumeration as exc:
+            # The clusters that arrived are audited; the project's own reads
+            # are not, because a reservation a silent zone's cluster consumes
+            # would read as unused.
+            return exc.running, exc.not_running, str(exc)[:ERROR_EXCERPT_CHARS]
         except RuntimeError as exc:
             log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
             return str(exc)[:ERROR_EXCERPT_CHARS]
+        except Exception as exc:  # noqa: BLE001 — see crashed_project_error
+            return crashed_project_error(p, exc)
 
-    enumerated: dict[str, tuple[list[dict], list[dict]] | str] = {}
+    enumerated: dict[str, tuple[list[dict], list[dict], str | None] | str] = {}
     with ThreadPoolExecutor(max_workers=max(1, min(len(projects), max_workers))) as pool:
         # Started in a fresh order each run, so a deadline that cuts the list
         # short leaves a different tail unread each week rather than the same
@@ -1861,26 +1912,36 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         first = projects[0]
         return failed(f"{len(projects)} project(s) could not be listed or were not reached; first, {first}: {enumeration_failed[first]}")
 
-    readable = [p for p in projects if p not in enumeration_failed]
     clusters: list[dict] = []
     not_running: list[dict] = []
-    for p in readable:
+    for p in projects:
+        if p in enumeration_failed:
+            continue
         clusters.extend(enumerated[p][0])
         not_running.extend(enumerated[p][1])
+        if enumerated[p][2]:
+            enumeration_failed[p] = enumerated[p][2]
+    readable = [p for p in projects if p not in enumeration_failed]
 
     # A quota or a reservation belongs to a project rather than to a cluster,
     # and a project with no cluster can still hold a reservation nobody uses
     # (§3.10), so every readable project gets its project-scoped reads. They
     # need nothing the cluster reads produce, so they share the cluster pool
     # and are submitted first, while the deadline still admits them.
-    def project_or_skip(p: str) -> tuple[dict | None] | None:
+    def project_or_skip(p: str) -> tuple[dict | None] | str | None:
         if not _before(deadline):
             return None
-        regions = {region_of(c["location"]) for c in enumerated[p][0] if c.get("location")}
-        return (collect_project(p, regions, run=run),)
+        # Both halves: a DEGRADED or PROVISIONING cluster is not audited, but
+        # it still sits in a region whose quota it draws on, and a project
+        # whose only cluster is not running does not hold "no cluster".
+        regions = {region_of(c["location"]) for c in (*enumerated[p][0], *enumerated[p][1]) if c.get("location")}
+        try:
+            return (collect_project(p, regions, run=run),)
+        except Exception as exc:  # noqa: BLE001 — see crashed_project_error
+            return crashed_project_error(p, exc)
 
     cluster_entries = [None] * len(clusters)
-    project_reads: dict[str, tuple[dict | None] | None] = {}
+    project_reads: dict[str, tuple[dict | None] | str | None] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         project_futures = {pool.submit(project_or_skip, p): p for p in random.sample(readable, len(readable))}
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
@@ -1898,6 +1959,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         read = project_reads.get(p)
         if read is None:
             enumeration_failed[p] = deadline_error(p)
+        elif isinstance(read, str):
+            enumeration_failed[p] = read
         elif read[0]:
             project_entries.append(read[0])
 

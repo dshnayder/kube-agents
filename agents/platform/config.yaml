@@ -171,8 +171,9 @@ toolsets:
   - kanban
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrow: the cost audit runs ten checks against every cluster and the
-# drift audit twenty, plus enumeration, the SOP read, and the publish harness.
+# audits outgrow: the cost audit runs ten checks against every cluster and four
+# against every project, and the drift audit twenty, plus enumeration, the SOP
+# read, and the publish harness.
 # Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
 # a `timed_out` kanban event, though the run was actively heartbeating and no
 # clock ran out. 250 is roughly triple the observed near-miss.

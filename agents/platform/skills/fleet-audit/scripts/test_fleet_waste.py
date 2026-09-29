@@ -2,6 +2,7 @@
 """Tests for fleet_waste.py, the fleet-wide-cost-analysis collector."""
 
 import json
+import subprocess
 import os
 import sys
 import threading
@@ -890,6 +891,22 @@ class IdleNodepoolTest(unittest.TestCase):
                       hits[0]["excerpt"])
         self.assertIn("before taints, selectors and zonal spread", hits[0]["excerpt"])
 
+    def test_the_headroom_subtracts_daemonsets_already_on_the_absorbing_nodes(self):
+        """The logging and metrics agents on `n2` have booked their share of it
+        already; a drain will not find that room. DaemonSets leave the pool's
+        own 15% test, not the other nodes' arithmetic."""
+        node, addons = self.small_node_with_addons()
+        busy = self.node("n2", "other", cpu_alloc="4", mem_alloc="8Gi")
+        pods = addons + [
+            self.pod_on("n2", cpu_req="2", mem_req="4Gi", name="busy"),
+            self.pod_on("n2", cpu_req="500m", mem_req="1Gi", daemonset=True, name="fluentbit"),
+        ]
+        context = {"nodes": [node, busy], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertIn("other pools have 1.50 vCPU / 3.0 GiB unrequested to absorb it",
+                      hits[0]["excerpt"])
+
     def test_taints_are_surfaced_so_a_dedicated_pool_can_be_dismissed(self):
         """A pool tainted for add-ons is empty of workloads by design. That is
         a judgement for triage, not a suppression here -- §3.7 refuses to
@@ -1347,6 +1364,30 @@ class IdleNamespaceTest(unittest.TestCase):
         ns_doc = self.ns("demo")
         ns_doc["metadata"]["annotations"]["configsync.gke.io/sync-name"] = "x"
         context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_does_not_flag_a_namespace_annotated_with_an_owner_or_retention(self):
+        """§3.10: someone has said who keeps it, or for how long."""
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        for key in ("owner", "example.com/team-owner", "backup.example.com/retention-days", "retain"):
+            ns_doc = self.ns("demo")
+            ns_doc["metadata"]["annotations"][key] = "x"
+            context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
+            self.assertEqual(fw.check_idle_namespace(context, now=NOW), [], key)
+
+    def test_an_unrelated_annotation_does_not_suppress(self):
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        ns_doc = self.ns("demo")
+        ns_doc["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"] = "{}"
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
+        self.assertEqual(len(fw.check_idle_namespace(context, now=NOW)), 1)
+
+    def test_does_not_flag_a_namespace_a_cronjob_runs_in(self):
+        """§3.10: idle between fires by design, suspended or not."""
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        cj = obj("CronJob", "nightly", ns="demo", **{"spec.suspend": True})
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [],
+                   "namespaces": [self.ns("demo")], "cronjobs": [cj]}
         self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
 
     def test_does_not_flag_a_flux_labelled_namespace(self):
@@ -2826,8 +2867,9 @@ class UnderrequestTest(unittest.TestCase):
     def test_resize_target_defaults_to_the_overrequest_multiplier(self):
         """Adding the keyword must not have moved §3.1's number.
 
-        `_resize_target` is shared, and the three `check_overrequest` /
-        `check_unsized` call sites pass no multiplier.
+        `_resize_target` is shared, and its `check_overrequest` call sites --
+        two direct, and `_resize_shrinks_request`, which `check_idle_workload`
+        calls too -- pass no multiplier.
         """
         self.assertEqual(fw.UNDERREQUEST_PEAK_MULTIPLIER, 1.3)
         self.assertEqual(fw.UNDERREQUEST_LIMIT_MULTIPLIER, 2)
@@ -2996,6 +3038,30 @@ class ReplacedPodPeaksTest(unittest.TestCase):
         hits = self.over(ctx, peaks)
         self.assertEqual(len(hits), 1)
         self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_a_live_pod_of_this_controller_the_checks_skipped_is_not_replaced(self):
+        """A sibling started ten minutes ago is too young to size and still
+        live. It is not a replaced pod, so it neither counts toward `replaced`
+        nor widens the window claimed for the others."""
+        young = self.pod(name=self.GONE)
+        young["status"]["startTime"] = "2026-07-31T23:50:00Z"
+        ctx = self.context([self.pod(), young])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, self.GONE): (0.8, 3000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertNotIn("replaced", excerpt)
+        self.assertIn("oldest pod started", excerpt)
+
+    def test_a_bare_replicaset_with_replaced_pods_claims_no_age_bound(self):
+        """A ReplicaSet's own age is not in the dump. Its live pod is 9h old,
+        but the peak came partly from a replaced pod, so neither the 9h
+        oldest-pod clamp nor a controller age is a true bound."""
+        pod = self.pod(owner="web-rs")
+        ctx = {"pods": [pod]}
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-rs-22222"): (1.1, 4000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertNotIn("oldest pod started", excerpt)
+        self.assertIn("1 pod it has replaced", excerpt)
+        self.assertIn("was not read", excerpt)
 
     def test_a_hook_jobs_pods_are_not_this_deployments(self):
         """Job `web-migrate` leaves `web-migrate-x7k2p` behind. Two segments,
@@ -3315,7 +3381,7 @@ class UnattachedDiskTest(unittest.TestCase):
         age off `creationTimestamp` flagged a year-old boot disk that PD-CSI
         released this morning, which is the churn the threshold excludes."""
         disk = self.disk(created="2025-01-01T00:00:00Z")
-        disk["lastDetachTimestamp"] = "2026-08-27T00:00:00Z"
+        disk["lastDetachTimestamp"] = "2026-07-31T00:00:00Z"
         self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW), [])
 
     def test_the_excerpt_dates_the_detach_not_the_creation(self):
@@ -4602,6 +4668,97 @@ class CrashIsolationTest(unittest.TestCase):
         self.assertEqual(outcomes, {"acme/us-central1/c1": "collected", "acme/us-central1/boom": "gate-failed"})
         boom = next(c for c in manifest["clusters"] if c["name"] == "acme/us-central1/boom")
         self.assertIn("TypeError", boom["error"])
+
+
+    def test_a_crashing_project_read_costs_that_project_and_no_other(self):
+        """The project pools had no `crashed_entry`: a 200 whose body is not
+        JSON, or a disk with a non-numeric size, raised out of the pool and
+        left the SOP's redirect a zero-byte manifest."""
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "disks"] and argv[argv.index("--project") + 1] == "beta":
+                disk = {"name": "bad", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "ten", "type": "pd-standard", "zone": "z"}
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["project/acme"]["outcome"], "collected")
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("ValueError", by_name["project/beta"]["error"])
+
+    def test_a_crashing_cluster_list_costs_that_project_and_no_other(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                # A cluster with no name: `enumerate_clusters` indexes it.
+                return run_of(0, "[]" if argv[argv.index("--project") + 1] == "acme" else '[{"status": "RUNNING"}]')
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["project/acme"]["outcome"], "collected")
+        self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
+        self.assertIn("KeyError", by_name["project/beta"]["error"])
+
+
+class DefaultRunTest(unittest.TestCase):
+    def test_a_timed_out_childs_output_arrives_as_str(self):
+        """`TimeoutExpired` carries the child's output as bytes even under
+        `text=True`, and `enumerate_clusters` searches it with `in`."""
+        exc = subprocess.TimeoutExpired(["gcloud"], 60, output=b"partial", stderr=b"SERVICE_DISABLED")
+        with patch.object(fw.subprocess, "run", side_effect=exc):
+            result = fw.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (124, "partial", "SERVICE_DISABLED"))
+
+
+class ZoneTimeoutTest(unittest.TestCase):
+    CLUSTERS = json.dumps([{"name": "c1", "location": "us-central1-a", "status": "RUNNING"}])
+    SILENT = "WARNING: The following zones did not respond: us-east1-b. List results may be incomplete."
+
+    def test_a_silent_zone_is_an_incomplete_enumeration_carrying_what_arrived(self):
+        def run(argv, **kwargs):
+            return run_of(0, self.CLUSTERS, self.SILENT)
+
+        with self.assertRaises(fw.IncompleteEnumeration) as caught:
+            fw.enumerate_clusters("acme", run=run)
+        self.assertEqual([c["name"] for c in caught.exception.running], ["c1"])
+        self.assertIn("did not respond", str(caught.exception))
+
+    def test_a_silent_zone_audits_the_listed_clusters_and_fails_the_project_target(self):
+        """The project checks read the cluster list to tell an orphan from
+        something a cluster still owns, so a silent zone's cluster would make
+        its disks and forwarding rules read as orphans."""
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, self.CLUSTERS, self.SILENT)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                raise AssertionError(f"a project read ran over an incomplete cluster list: {argv}")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1-a/c1"]["outcome"], "collected")
+        self.assertEqual(by_name["project/acme"]["outcome"], "gate-failed")
+        self.assertIn("did not respond", by_name["project/acme"]["error"])
 
 
 class GetTargetProjectsTest(unittest.TestCase):
