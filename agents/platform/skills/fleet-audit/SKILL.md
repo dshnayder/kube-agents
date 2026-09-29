@@ -1164,16 +1164,16 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
-report store holds no record of the open ledger — the volume was replaced, or the stored report was
-written for a different issue — the previous run's findings are unknowable, so the run announces
-nothing rather than declaring every live finding new, and logs `The previous run's findings are
-unknowable; skipping the delta comment` to stderr. It holds nothing it cannot name: the body is
-rewritten from this document, and a findings run leaves the next run a trusted record. A clean run
-closes unless it passed a manifest whose collector still flags something the document dropped; then
-the ledger stays open with a coverage gap saying the store had no record, `partial: true` and
-`silent_ok: false`. Without a manifest it answers no `/remediate` — it cannot tell a held id from a
-typo — and logs `No stored report and no manifest` to say so; report that as you would any other
-partial run.
+report store's record of the open ledger is missing, unreadable, or written for a different issue
+(where the store has never held the ledger at all, `finish` seeds it once from the issue's hidden
+block instead) — the previous run's findings are unknowable, so the run announces nothing rather
+than declaring every live finding new, and logs `The previous run's findings are unknowable;
+skipping the delta comment` to stderr. It holds nothing it cannot name: the body is rewritten from
+this document, and a findings run leaves the next run a trusted record. A clean run closes unless it
+passed a manifest whose collector still flags something the document dropped; then the ledger stays
+open with a coverage gap saying the store had no record, `partial: true` and `silent_ok: false`.
+Without a manifest it answers no `/remediate` — it cannot tell a held id from a typo — and logs `No
+stored report and no manifest` to say so; report that as you would any other partial run.
 
 ## Red lines
 

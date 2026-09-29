@@ -1954,6 +1954,71 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
+def seed_memory_from_ledger(audit_id: str, issue_number: int, repo: str) -> dict | None:
+    """The previous run's memory read once off the open ledger, or None.
+
+    For a stream and repository the store has never held — the first run after
+    an upgrade that introduces the store, or after the volume was replaced.
+    Without it that run has no previous ids, so the guard that refuses to close
+    over findings the document does not account for has nothing to check, and
+    an empty document closes the ledger and its pull requests. The body's
+    hidden block is the id set the last run published, so it stands in for the
+    store this once; the run writes the store, and every later run reads that.
+
+    Never a fallback for a store that exists: an unreadable or mismatched
+    `latest.json` stays a lost memory, because two memories with a precedence
+    rule is how a divergence becomes undetectable. A body with no readable
+    block, or one that cannot be fetched, seeds nothing.
+    """
+    res = gh(
+        ["issue", "view", str(issue_number), "-R", repo, "--json", "body"], check=False
+    )
+    if res.returncode != 0:
+        log(
+            f"WARNING: no report store for {audit_id} in {repo} and issue #{issue_number} "
+            "could not be read to seed one; the previous run's findings are unknowable "
+            "this run."
+        )
+        return None
+    try:
+        body = json.loads(res.stdout or "{}").get("body")
+    except (json.JSONDecodeError, AttributeError):
+        body = None
+    if not isinstance(body, str) or not DELTA_RE.search(normalise_newlines(body)):
+        log(
+            f"No report store for {audit_id} in {repo} and issue #{issue_number} carries no "
+            "finding-id block to seed one from; the previous run's findings are unknowable "
+            "this run."
+        )
+        return None
+    log(
+        f"No report store for {audit_id} in {repo} yet; seeding this run's memory "
+        f"once from issue #{issue_number}'s finding-id block."
+    )
+    return {
+        "audit_id": audit_id,
+        "repo": repo,
+        "issue_number": issue_number,
+        "ledger_body": body,
+        "current_ids": parse_delta_block(body),
+        "seeded_from_ledger": True,
+    }
+
+
+def previous_run_memory(audit_id: str, issue_number: int | None, repo: str) -> dict | None:
+    """The memory `start` and `finish` join against: the store, or — where the
+    store has no directory for this ledger at all — one seed off the ledger."""
+    if issue_number is None:
+        return None
+    try:
+        never_stored = not reports_dir_for(audit_id, repo).exists()
+    except ValueError:
+        never_stored = False
+    if never_stored:
+        return seed_memory_from_ledger(audit_id, issue_number, repo)
+    return read_report_memory(audit_id, issue_number, repo)
+
+
 def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     """{finding id: title} for every finding the stored document carried.
 
@@ -10251,7 +10316,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
         # join against. A lost memory prints an empty list and says so on
         # stderr (read_report_memory logs it); `finish` then holds nothing, by
         # the same rule the delta applies.
-        memory = read_report_memory(audit_id, existing_issue, repo)
+        memory = previous_run_memory(audit_id, existing_issue, repo)
         carried = [
             {"id": fid, "check": fid.split(".", 1)[0], **where}
             for fid, where in sorted(
@@ -11334,7 +11399,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # is absent or was written for another ledger, which is unknowable rather
     # than empty — see `memory_lost` below. No open ledger is the one case that
     # genuinely is empty: the run is first, and everything present is new.
-    memory = read_report_memory(audit_id, existing_issue, repo)
+    memory = previous_run_memory(audit_id, existing_issue, repo)
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""

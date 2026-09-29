@@ -97,12 +97,20 @@ when the body came from GitHub, so a scheme bump costs what it always cost.
 used on a fetched body, so every join — delta, held set, carried held rows, the clean-close hold —
 is unchanged. Titles are also read from the stored document the body renders (`ledger_document`
 where the body was carried, `document` otherwise), which names findings the body budget cut. The
-issue body is no longer fetched for this at all; there is no fallback to it, because two memories
-with a precedence rule is how a divergence becomes undetectable.
+issue body is not a fallback for a store that exists, because two memories with a precedence rule
+is how a divergence becomes undetectable.
+
+It is read once, where the store has never held this ledger: no directory for the stream and
+repository at all, as on the first run after an upgrade that introduces the store or after the
+volume is replaced. That run would otherwise have no previous ids, so the guard that refuses to
+close over findings the document does not account for would have nothing to check, and an empty
+document would close the ledger and its pull requests. The body's hidden block is the id set the
+last run published, so it stands in for the store this once; the run writes the store, and every
+later run reads that.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
-the store is absent, unreadable, or written for another issue, the memory is **lost** — unknowable,
-not empty:
+its store is missing, unreadable, or written for another issue — or there is no store and the body
+has no readable block — the memory is **lost**, unknowable rather than empty:
 
 - The run publishes with no delta claim: `new: 0`, `resolved: 0`, the delta comment skipped, and a
   log line saying the previous run's findings are unknowable.
@@ -114,14 +122,14 @@ not empty:
 - A run with neither a memory nor a manifest answers no `/remediate`; the next run with a memory
   answers them.
 
-A wiped volume therefore never puts a wrong count in a public issue. The delta annotation costs one
+A lost memory therefore never puts a wrong count in a public issue. The delta annotation costs one
 cycle when that run writes the body, which a findings run or a close does. A clean run held open
 writes nothing to it, so the memory stays lost, and each such run files the gap again, until one
 rewrites the body or closes the ledger. The held rows cost more: a findings run rewrites the body
 without them, so the next run's memory has no marker id to hold and they are not rendered again.
 While the collector flags them they stay on each run's JSON line as `unpublished_candidates`, and
-their pull requests stay open; what is lost for good is their row on the ledger. The first run
-after an upgrade that introduces the store is such a run on every stream with an open ledger.
+their pull requests stay open; what is lost for good is their row on the ledger. A seeded run keeps
+them, since it holds the body's marker ids as any other memory does.
 
 The hidden block stays in every ledger body. It was never only `finish`'s round-trip state: the
 bench verifiers grade audit evals by parsing ids out of the published body, and it is the one way a
@@ -171,7 +179,8 @@ not grow two parsers of the same files.
 - **Committing reports into the GitOps repository.** Durable and diffable, but it writes machine
   telemetry into the user's repository, a commit per stream per day, and a network read is what the
   store exists to remove.
-- **Keeping the ledger read-back as a fallback.** Rejected in §4.
+- **Keeping the ledger read-back as a fallback.** Rejected in §4; the one read left seeds a store
+  that has never existed and is never consulted beside one.
 - **Removing the hidden block from bodies.** Breaks the bench verifiers and every external consumer
   of the published interface; only its read-back was worth retiring.
 - **Giving the Planning Agent file tools** to skip a delegation hop. It would turn the one profile

@@ -4337,7 +4337,7 @@ class TestStart(HarnessTestCase):
         self.harness.failures = {"--json body": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out.strip())["carried"], [])
-        self.assertIn("No stored report", self.err)
+        self.assertIn("unknowable", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.
@@ -17211,6 +17211,47 @@ class TestReportStore(HarnessTestCase):
             ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[])
         self.assertNotIn("ledger_document", normal)
         self.assertIs(normal["ledger_held_open"], False)
+
+    def run_finish_unseeded(self, doc):
+        """`finish` with no store the harness wrote on the test's behalf: the
+        ledger body the recorder serves is only what GitHub would return."""
+        findings_file = self.write_findings(doc)
+        return BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file]
+        )
+
+    def body_reads(self):
+        return [c for c in self.harness.calls if "--json" in c and "body" in c]
+
+    def test_a_never_stored_ledger_is_seeded_once_from_its_block(self):
+        """The first run after the store lands, or after the volume is replaced,
+        must still refuse to close over findings its empty document does not
+        account for; the ledger's hidden block stands in for the store once."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertIn("seeding this run's memory once", self.err)
+        stored = self.stored()
+        self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
+        self.assertIs(stored["ledger_held_open"], True)
+
+    def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
+        audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "x"})}
+        self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet"))
+        self.assertEqual(self.body_reads(), [])
+
+    def test_a_body_without_a_block_seeds_nothing(self):
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "hand-written"})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet"))
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("unknowable", err.getvalue())
 
     def test_titles_come_from_the_document_the_ledger_renders(self):
         own = {"findings": [{"id": "own", "title": "This run"}]}
