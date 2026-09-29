@@ -489,6 +489,9 @@
         "annotations": {
           "type": "object"
         },
+        "podMonitoring": {
+          "type": ["boolean", "null"]
+        },
         "harness": {
           "type": "object",
           "additionalProperties": false,
@@ -691,6 +694,18 @@
           "additionalProperties": false,
           "properties": {
             "projects": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "folders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "organizations": {
               "type": "array",
               "items": {
                 "type": "string"
