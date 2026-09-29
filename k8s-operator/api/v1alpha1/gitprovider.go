@@ -242,6 +242,14 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// host and one segment, such as an organisation URL, is a URL missing its
 	// repository, and the depth check below refuses it as that.
 	bare := ref.Host == ""
+	// A dotted first segment the namespace grammar refuses is a host, most
+	// often another forge's (`gitlab.com/group/project`). Said here, the
+	// refusal names it; left to the depth check, it would send the
+	// administrator to shorten the path instead.
+	if first, _, isPath := strings.Cut(ref.Path, pathSeparator); bare && isPath && strings.Contains(first, ".") && p.ValidateNamespace(first) != nil {
+		return RepoRef{}, fmt.Errorf("repository %q starts with %q, which reads as a host %s does not serve; a repository on another forge needs a forge of its own",
+			repository, first, p.Name)
+	}
 	ref.Host = canonical
 
 	if bare && !strings.Contains(ref.Path, pathSeparator) {

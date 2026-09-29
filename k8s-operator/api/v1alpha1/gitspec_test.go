@@ -238,6 +238,27 @@ func TestResolveLiftsEveryHostSpellingFromASchemelessPath(t *testing.T) {
 	}
 }
 
+// Another forge's host written without a scheme is refused for the host, not
+// for the path's depth: "at most 2 segments" would send the administrator to
+// shorten `gitlab.com/group/project` into `gitlab.com/project`, which is still
+// the wrong forge. A namespace does not change that.
+func TestResolveNamesAForeignHostInABarePath(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, input := range []string{"gitlab.com/group/project", "gitlab.com/project", "gitlab.com/group/sub/project"} {
+		for _, namespace := range []string{"", "gke-labs"} {
+			_, err := provider.Resolve("", input, namespace)
+			if err == nil || !strings.Contains(err.Error(), `"gitlab.com"`) || strings.Contains(err.Error(), "segments") {
+				t.Errorf("Resolve(%q, %q) = %v, expected a refusal naming the host gitlab.com", input, namespace, err)
+			}
+		}
+	}
+	// A forge whose namespaces may carry a dot still reads the segment as one.
+	nested := nestedProvider
+	if _, err := nested.Resolve("", "group.with_dots/project", ""); err != nil {
+		t.Errorf("nested refused a dotted namespace as a host: %v", err)
+	}
+}
+
 // TestResolveValidatesEveryPathSegment covers the segments a declared namespace
 // contributes. The repository value is checked as it is parsed; the namespace is
 // prepended afterwards, so without this loop `namespace: ..` reached the state

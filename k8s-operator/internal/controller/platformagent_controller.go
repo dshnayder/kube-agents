@@ -1432,18 +1432,19 @@ func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
 // always has. listName is for the log lines only. A list that is not JSON is
 // an error, never an empty result: the caller skips the whole sync on it,
 // because an empty result would read as "no repositories" and prune every
-// policy the operator tracks.
-func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
+// policy the operator tracks. An entry that does not resolve is returned in
+// unreadable, so the caller can tell a repository that left the list from one
+// it could not read.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) (bare, unreadable []string, err error) {
 	reposStr = strings.TrimSpace(reposStr)
 	if reposStr == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	repos, err := parseManagedRepos(reposStr)
 	if err != nil {
-		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
+		return nil, nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
 	}
 	seen := make(map[string]struct{}, len(repos))
-	var bare []string
 	for _, fullRepo := range repos {
 		fullRepo = strings.TrimSpace(fullRepo)
 		if fullRepo == "" {
@@ -1451,7 +1452,8 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		}
 		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
 		if err != nil {
-			logger.V(1).Info("skipping invalid repo in minter policy sync", "list", listName, "repo", fullRepo, "error", err)
+			logger.Info("skipping a repository entry the minter policy sync cannot read", "list", listName, "repo", fullRepo, "error", err.Error())
+			unreadable = append(unreadable, fullRepo)
 			continue
 		}
 		parts := strings.SplitN(slug, "/", 2)
@@ -1480,7 +1482,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		bare = append(bare, bareRepo)
 	}
 	sort.Strings(bare)
-	return bare, nil
+	return bare, unreadable, nil
 }
 
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
@@ -1568,16 +1570,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
 	// managed-only sync always did. Treating it as empty would prune every
 	// tracked policy and break every write until the JSON was repaired.
-	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	allBareRepos, unreadableManaged, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	contextCandidates, unreadableContext, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
 		return nil
 	}
+	unreadable := slices.Concat(unreadableManaged, unreadableContext)
 	// Managed wins: a repository registered in both lists is written to, so its
 	// policy is the write one, and it is left out of the read-only list too.
 	var contextBareRepos []string
@@ -1623,15 +1626,22 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
-	for key := range operatorManagedKeys {
-		if key == minterBaseTemplateKey {
-			continue
-		}
-		if _, active := expected[key]; !active {
-			delete(minterCM.Data, key)
-			delete(operatorManagedKeys, key)
-			updated = true
+	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active.
+	// An entry this release cannot read may be the repository a tracked policy is for -- a spelling
+	// an earlier release accepted, hand-added to the ConfigMap -- and nothing says which. Pruning
+	// then would revoke a policy that was working, so the sync only adds until every entry reads.
+	if len(unreadable) > 0 {
+		logger.Info("keeping every tracked minter policy: some repository entries cannot be read", "entries", unreadable)
+	} else {
+		for key := range operatorManagedKeys {
+			if key == minterBaseTemplateKey {
+				continue
+			}
+			if _, active := expected[key]; !active {
+				delete(minterCM.Data, key)
+				delete(operatorManagedKeys, key)
+				updated = true
+			}
 		}
 	}
 
@@ -1661,7 +1671,11 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
 	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
-	opts.heldGitHubOrg = r.heldGitHubOrg(ctx, agent)
+	held, err := r.heldGitHubOrg(ctx, agent)
+	if err != nil {
+		return err
+	}
+	opts.heldGitHubOrg = held
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -1705,34 +1719,45 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 // agent's cross-organisation guard for as long as the refusal lasts, on an
 // upgrade from a release that accepted the spelling now refused.
 //
-// Nothing live to read, or a read that fails, holds nothing: the variable is
-// then rendered unset, as it would have been.
-func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+// The hold lasts only as long as each pass re-reads it, so a read that fails
+// is returned and the pass retried: rendering the variable unset would apply
+// the loss, and every later pass would read it back. The workload kind the CR
+// selects is read first, then the other one, because a storage switch renders
+// the new kind while the old one still carries the value. Neither existing
+// holds nothing, as on a first install.
+func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	if agent.Spec.Integration == nil || r.Client == nil {
-		return ""
+		return "", nil
 	}
 	resolved, err := agent.Spec.Integration.ResolveGit()
 	if err == nil && !resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
-		return ""
+		return "", nil
 	}
-	var live client.Object = &appsv1.Deployment{}
+	kinds := []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}}
 	if useStatefulSet(agent) {
-		live = &appsv1.StatefulSet{}
+		kinds[0], kinds[1] = kinds[1], kinds[0]
 	}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, live); err != nil {
-		return ""
-	}
-	for _, container := range podTemplateOf(live).Spec.Containers {
-		if container.Name != appNamePlatformAgent {
-			continue
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	for _, live := range kinds {
+		if err := r.Get(ctx, key, live); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("reading the live gateway's GITHUB_ORG to hold it while the git declaration is refused: %w", err)
 		}
-		for _, env := range container.Env {
-			if env.Name == "GITHUB_ORG" && env.ValueFrom == nil {
-				return env.Value
+		for _, container := range podTemplateOf(live).Spec.Containers {
+			if container.Name != appNamePlatformAgent {
+				continue
+			}
+			for _, env := range container.Env {
+				if env.Name == "GITHUB_ORG" && env.ValueFrom == nil {
+					return env.Value, nil
+				}
 			}
 		}
+		return "", nil
 	}
-	return ""
+	return "", nil
 }
 
 // deleteLegacyCredentialIsolationResources removes the workload objects left

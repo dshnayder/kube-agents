@@ -228,6 +228,17 @@ class ChartGitIntegrationTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}repositories[0].repository", result.stderr)
+        # The operator drops surrounding slashes and one `.git` before it
+        # counts segments, so these are bare names too.
+        for bare in ("infra/", "/infra", "infra.git/"):
+            with self.subTest(bare=bare):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github"),
+                    *_repo(0, forge="github", repository=bare, role="gitops"),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}repositories[0].repository", result.stderr)
         for repo in (
             {"repository": "infra", "namespace": "gke-labs"},
             {"repository": "gke-labs/infra"},

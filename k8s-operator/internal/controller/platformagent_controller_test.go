@@ -5708,6 +5708,57 @@ func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t
 	}
 }
 
+func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy(t *testing.T) {
+	// repo-x's entry is a spelling an earlier release rewrote and this one
+	// refuses. Nothing says which tracked policy it was, so the sync must not
+	// prune -- here that would revoke repo-x's working policy -- while it still
+	// adds the policy for a repository it can read.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	const trackedPolicy = "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n"
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  trackedPolicy,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"ssh://git@github.com:test-org/repo-x"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if got.Data["repo-x.yaml"] != trackedPolicy {
+		t.Errorf("repo-x.yaml was pruned or rewritten while an entry could not be read: got %q", got.Data["repo-x.yaml"])
+	}
+	if !strings.Contains(got.Annotations[AnnotationManagedMinterKeys], "repo-x.yaml") {
+		t.Errorf("repo-x.yaml dropped from the ownership annotation: %q", got.Annotations[AnnotationManagedMinterKeys])
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added; an unreadable entry must stop only the pruning")
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 	scheme := setupScheme()
 
@@ -6402,9 +6453,9 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 		"ssh://git@github.com:gke-labs/infra",
 	} {
 		agent := agentWith(refused)
-		held := r.heldGitHubOrg(ctx, agent)
-		if held != "gke-labs" {
-			t.Errorf("%s: heldGitHubOrg() = %q, expected the live gke-labs", refused, held)
+		held, err := r.heldGitHubOrg(ctx, agent)
+		if err != nil || held != "gke-labs" {
+			t.Errorf("%s: heldGitHubOrg() = %q, %v, expected the live gke-labs", refused, held, err)
 		}
 		dep := buildDeployment(agent, "", "", "", "", nil, renderOptions{heldGitHubOrg: held})
 		if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
@@ -6415,7 +6466,7 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 	// A declaration that names the organisation renders its own, whatever
 	// the live pod carries.
 	accepted := agentWith("https://github.com/other-org/infra")
-	if held := r.heldGitHubOrg(ctx, accepted); held != "" {
+	if held, _ := r.heldGitHubOrg(ctx, accepted); held != "" {
 		t.Errorf("heldGitHubOrg() = %q for an accepted declaration, expected nothing held", held)
 	}
 	dep := buildDeployment(accepted, "", "", "", "", nil, renderOptions{})
@@ -6425,7 +6476,36 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 
 	// Nothing live holds nothing.
 	empty := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
-	if held := empty.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); held != "" {
-		t.Errorf("heldGitHubOrg() = %q with no live gateway, expected nothing", held)
+	if held, err := empty.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); held != "" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
+	}
+
+	// A storage switch renders the other workload kind while the old one still
+	// runs: the old one is what holds the value.
+	switched := agentWith("https://github.com:gke-labs/infra")
+	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
+		Storages: []agentv1alpha1.StorageSpec{{
+			Name:        "gateway-data",
+			MountPath:   "/srv/gateway-data",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		}},
+	}
+	if !useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	}
+	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	}
+
+	// A read that fails is returned, never taken for "nothing live": the render
+	// would drop the variable, and the next pass would read the loss back.
+	failing := &PlatformAgentReconciler{Scheme: scheme, Client: interceptor.NewClient(cl, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return errors.NewServiceUnavailable("apiserver is restarting")
+		},
+	})}
+	if held, err := failing.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); err == nil {
+		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
 	}
 }
