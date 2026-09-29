@@ -378,7 +378,8 @@ litellm:
   # default: on, the ConfigMap also carries the shared redactor module and a
   # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
   # the built-in credential patterns plus the rules below over messages,
-  # embeddings input and completion prompts before the provider sees them.
+  # tool-call arguments, embeddings input and completion prompts before the
+  # provider sees them.
   # Request bodies only: responses, tool results on disk and chat egress are
   # not covered. The concepts/inference-gateway page on the site owns the
   # model, including why a pseudonymised identifier is one the agent can no
@@ -590,6 +591,20 @@ platformAgent:
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
   # render too.
   annotations: {}
+  # GKE managed-Prometheus PodMonitoring for the gateway pod, where the
+  # k8s-event-watcher serves its metrics on the agent-api-auth sidecar's
+  # event-metrics port (9095). The operator's gateway NetworkPolicy admits the
+  # collector on that port whatever this is set to; this decides only whether a
+  # scrape is configured. A tri-state: null (the default) renders it when the
+  # cluster serves monitoring.googleapis.com/v1/PodMonitoring, which is where
+  # Managed Prometheus is installed, and renders nothing elsewhere, so an
+  # install on a cluster without the CRD upgrades without setting anything.
+  # true renders it regardless and fails at apply time where the CRD is
+  # absent, the caveat litellm.podMonitoring carries; false never renders it.
+  # helm template alone has no cluster to ask: pass
+  # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
+  # default render.
+  podMonitoring: null
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -615,9 +630,11 @@ platformAgent:
       userProfileEnabled: null # CRD default: false
     # Out-of-band change detection. The drift-detector reads GKE
     # admin-activity audit records from a Pub/Sub subscription and reports the
-    # ones a person made outside git, so it needs that subscription to exist:
-    # apply terraform/modules/drift-pubsub against this project before
-    # enabling it. Left off, the whole block is omitted and the detector is
+    # ones a person made outside git, so it needs that subscription to exist.
+    # terraform/examples/full-install creates it with enable_drift_pubsub =
+    # true, which defaults to false; an install that renders this chart without
+    # the composition applies terraform/modules/drift-pubsub against this
+    # project itself. Left off, the whole block is omitted and the detector is
     # shipped in the image without being started.
     driftDetector:
       enabled: null # CRD default: false

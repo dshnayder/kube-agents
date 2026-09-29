@@ -392,6 +392,19 @@ of applying the port-443 check. The site's telemetry page is canonical for this
 rule as well as for the full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
+`platformAgent.podMonitoring` renders a `PodMonitoring` for the gateway pod, so
+GKE Managed Prometheus scrapes the event watcher's `k8s_event_watcher_*` metrics
+from the `agent-api-auth` sidecar's port 9095. The operator's gateway
+NetworkPolicy admits the collector on that port either way; the value only
+decides whether a scrape is configured. It is a tri-state: `null`, the default,
+renders it when the cluster serves the `PodMonitoring` API and nothing
+elsewhere, so an install off GKE, or on a GKE cluster with Managed Prometheus
+turned off, upgrades without setting anything; `true` renders it regardless and
+fails at apply time where the CRD is absent, the caveat `litellm.podMonitoring`
+carries; `false` never renders it. `helm template` alone has no cluster to ask:
+pass `--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the
+default render.
+
 ### Turning telemetry off
 
 A cluster with no collector needs nothing done: when discovery completes and
@@ -570,7 +583,11 @@ Five knobs need context beyond the chart:
   install must pin the dashboard on or off rather than float with the CRD.
 - `harness.driftDetector.enabled` needs
   [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
-  applied against the project first. The chart does not check, and neither does
+  applied against the project first.
+  [`terraform/examples/full-install`](../../terraform/examples/full-install/README.md#drift-audit-log-ingress)
+  does that as part of its own apply when `enable_drift_pubsub = true`; an
+  install that renders this chart without the composition applies the module
+  itself. The chart does not check, and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
