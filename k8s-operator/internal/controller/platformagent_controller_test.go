@@ -5098,7 +5098,31 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Errorf("an invalid forge namespace must leave the policies as they were, got %v", updatedCM.Data)
 	}
 
-	// 6. An integration block with no forge declaration at all -- chat only --
+	// 6. A valid github forge with no namespace, whose only repository the agent
+	// writes to is refused: nothing accepted is left to read the organisation
+	// from, so the sync must again leave the policies alone.
+	agentRefusedRepo := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-refused-repo", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+					Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "test-org/in fra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+				},
+			},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentRefusedRepo, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a refused repository failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("a refused write repository must leave the policies as they were, got %v", updatedCM.Data)
+	}
+
+	// 7. An integration block with no forge declaration at all -- chat only --
 	// resolves to nil, and the sync must still run.
 	agentChatOnly := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-chat-only", Namespace: "test-ns"},

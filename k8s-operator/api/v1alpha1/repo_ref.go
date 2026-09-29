@@ -33,7 +33,7 @@ package v1alpha1
 // scp path wearing a URL scheme — resolves here to `owner/repo` and in
 // `repo_ref.py` to `repo`, because the Python side reads the non-numeric port
 // slot as a port and drops it. Go's reading is git's; the Python side is the one
-// to correct, and §9 step 3 is where it is touched.
+// to correct.
 //
 // A `RepoRef` carries a host, possibly empty, and an opaque path of any depth.
 // Depth is not checked here. "Exactly two segments" is a property of GitHub, so
@@ -180,7 +180,7 @@ func parseRepoRef(value string, schemelessHosts map[string]bool) (RepoRef, error
 		// it since before provider dispatch. The user is dropped as it is for
 		// a URL.
 		if first, rest, found := strings.Cut(path, pathSeparator); found && rest != "" {
-			if at := strings.LastIndex(first, "@"); at != -1 {
+			if at := strings.LastIndex(first, userInfoSeparator); at != -1 {
 				first = first[at+1:]
 			}
 			if schemelessHosts[strings.ToLower(first)] {

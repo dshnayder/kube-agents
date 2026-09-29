@@ -260,11 +260,13 @@ spec:
   except the host, and every host GitHub serves is the same forge, which
   kube-agents.forgeProviders has already checked.
 
-  Only a plain `name` or `owner/name` repository folds, and only a
-  declaration that says something: a URL, a remote or a deeper path would be
-  refused by the operator against `github.gitRepo`, a key the values file
-  never set, and a forge with neither a namespace nor a repository would fold
-  into no key at all. Those render as the lists, so the refusal names the
+  Only a plain `name` or `owner/name` repository folds, in the grammar the
+  operator accepts for GitHub, and only a declaration that says something: a
+  URL, a remote, a deeper path, an owner GitHub would not accept, or a name
+  that is `.`, `..` or starts with `-` would be refused by the operator against
+  `github.gitRepo`, a key the values file never set, and a forge with neither a
+  namespace nor a repository would fold into no key at all. A credentialsRef
+  with an empty name is unset, as values.yaml's example writes it. Those render as the lists, so the refusal names the
   entry the administrator wrote.
   */}}
   {{- $asAlias := false }}
@@ -280,9 +282,9 @@ spec:
   {{- $repo := "" }}
   {{- with $repos }}
   {{- $repo = (first .).repository | default "" }}
-  {{- $plain = regexMatch "^([A-Za-z0-9-]+/)?[A-Za-z0-9._-]+$" $repo }}
+  {{- $plain = and (regexMatch "^([a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/)?[A-Za-z0-9_.][A-Za-z0-9_.-]*$" $repo) (not (has (base $repo) (list "." ".."))) }}
   {{- end }}
-  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not $f.credentialsRef) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
   {{- end }}
   {{- $aliasOrg := "" }}
   {{- $aliasRepo := "" }}
@@ -335,9 +337,9 @@ spec:
         {{- with .namespace }}
         namespace: {{ . | quote }}
         {{- end }}
-        {{- with .credentialsRef }}
+        {{- with (.credentialsRef | default dict).name }}
         credentialsRef:
-          name: {{ .name | quote }}
+          name: {{ . | quote }}
         {{- end }}
       {{- end }}
     {{- end }}

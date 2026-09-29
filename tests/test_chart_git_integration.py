@@ -217,13 +217,20 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 )
 
     def test_a_declaration_the_alias_would_misname_renders_as_the_lists(self):
-        """A URL, a remote or a deeper path folded into `github.gitRepo` would
-        be refused against that key; a forge with no namespace and no
+        """A URL, a remote, a deeper path, an owner GitHub would not accept, or
+        a name that is a traversal or a flag, folded into `github.gitRepo`,
+        would be refused against that key; a forge with no namespace and no
         repository would fold into nothing. Each renders as the lists."""
         for repo in (
             "https://gitlab.com/group/project",
             "git@github.com:gke-labs/infra",
             "gke-labs/infra/extra",
+            "-org/infra",
+            "org-/infra",
+            "a" * 40 + "/infra",
+            "gke-labs/-x",
+            "gke-labs/..",
+            "gke-labs/.",
         ):
             with self.subTest(repo=repo):
                 integration = _integration(
@@ -235,6 +242,41 @@ class ChartGitIntegrationTest(unittest.TestCase):
         integration = _integration(*_forge(0, name="github", host="ssh.github.com"))
         self.assertNotIn("github", integration)
         self.assertEqual(integration["forges"][0]["name"], "github")
+
+    def test_a_name_github_accepts_still_folds(self):
+        """The tightened fold must not unfold names the operator accepts, a
+        leading dot and an empty credentialsRef name included."""
+        for repo in ("gke-labs/.github", "gke-labs/my_repo.v2", "infra"):
+            with self.subTest(repo=repo):
+                integration = _integration(
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository=repo, role="gitops"),
+                )
+                self.assertEqual(integration["github"]["gitRepo"], repo)
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            f"{_P}forges[0].credentialsRef.name=",
+            *_repo(0, forge="github", repository="infra", role="gitops"),
+        )
+        self.assertEqual(integration["github"], {"org": "gke-labs", "gitRepo": "infra"})
+
+    def test_an_empty_credentials_name_is_not_rendered(self):
+        integration = _integration(
+            *_forge(0, name="a", namespace="gke-labs"),
+            f"{_P}forges[0].credentialsRef.name=",
+            *_forge(1, name="b", namespace="kubernetes"),
+        )
+        self.assertNotIn("credentialsRef", integration["forges"][0])
+
+    def test_two_forges_with_one_name_fail_the_render(self):
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_forge(1, name="github", host="ssh.github.com"),
+            *_repo(0, forge="github", repository="infra", role="gitops"),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f'{_P}forges[1].name "github" is already declared', result.stderr)
 
     def test_declaring_both_spellings_fails_the_render(self):
         result = _render(

@@ -657,6 +657,14 @@ Enables external integrations. Only the enabled ones need to be present.
 Earlier operator versions passed arbitrary `https://` and `http://` URLs through to `CleanRepoURLWithOrg` without host validation. A repository now has to sit on a host its forge's provider serves — for `provider: github`, `github.com`, `www.github.com` or `ssh.github.com`. Existing `PlatformAgent` resources pointing at another forge reconcile into `phase: Degraded` with condition `Reason: InvalidGitRepoURL`, and subsequent updates to those resources are rejected at admission by the validating webhook, where it is enabled, until the `spec.integration.repositories` entry — or the deprecated `spec.integration.github.gitRepo` — is corrected or removed. Registering a second provider is what will admit those repositories; `provider` takes only `github` today.
 :::
 
+:::caution[Upgrade note: repository spellings no longer rescued]
+Earlier operator versions also rewrote three malformed GitHub spellings into a working repository. Each is now refused, with the same `Degraded` condition and admission behaviour as above:
+
+- A single path segment after a host, with the owner taken from `org`: `github.gitRepo: github.com/infra` (or `https://github.com/infra`, `git@github.com:infra`) and `github.org: gke-labs` used to mean `gke-labs/infra`. A URL with one segment names an account, not a repository, so only a bare name is qualified by the namespace. Write `infra` or `gke-labs/infra`.
+- A colon in place of the first slash of an `http` or `https` URL: `https://github.com:owner/repo`. After `http://` or `https://`, what follows the colon is a port. Write `https://github.com/owner/repo`, or `git@github.com:owner/repo`.
+- An owner containing `_` or `.`, which no GitHub account can have.
+  :::
+
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
 ## `status`

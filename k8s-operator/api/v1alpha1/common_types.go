@@ -1340,6 +1340,10 @@ const (
 	RepositoryRoleContext = "context"
 )
 
+// writeRoles are the roles of the repositories the agent writes to, in the
+// order they are seeded into managed_repos.
+var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
+
 // ForgeSpec declares one forge: which provider it is, where, and which
 // organisation the agent acts for there.
 //

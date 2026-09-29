@@ -32,8 +32,8 @@ package v1alpha1
 // `docs/designs/version-control-support.md` §6 is the design.
 //
 // Only GitHub is registered. The dispatch is what this file delivers; the
-// GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest
-// (§9 step 5), because a provider the CRD accepts and the agent discards is a
+// GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest,
+// because a provider the CRD accepts and the agent discards is a
 // worse failure than one the CRD refuses.
 
 import (
@@ -207,10 +207,10 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 // agree, where before the declared spelling was carried through verbatim and
 // seeded a clone URL git cannot fetch over HTTPS.
 //
-// A host outside Hosts survives only for a provider whose ValidateHost admits
-// one — a self-managed forge at a customer-chosen hostname, which §10 of the
-// design leaves open. GitHub's does not, so for GitHub this always resolves to
-// github.com.
+// ValidateHost admits only a host in Hosts, so every host resolves to
+// DefaultHost. A provider for a self-managed forge at a customer-chosen
+// hostname will need its own rule here, and it must not let the declared host
+// replace one the repository names.
 //
 // The namespace this produces is checked against the provider's grammar
 // wherever it came from. Checking only the declared `namespace` field would
@@ -222,9 +222,6 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 		return RepoRef{}, err
 	}
 	canonical := p.DefaultHost
-	if trimmed := strings.ToLower(strings.TrimSpace(host)); trimmed != "" && !p.Hosts[trimmed] {
-		canonical = trimmed
-	}
 
 	// Every spelling of this provider's host lifts out of a schemeless path,
 	// not just DefaultHost. The parser this replaces stripped both

@@ -579,8 +579,8 @@ the forge values directly to decide which forge this is -- everything calls
 this, and the minter guard is the reason it has to be one answer.
 
 It also carries the checks the chart can make before the API server does, so
-the failure names the values key: the two spellings are exclusive, a provider
-must be registered, a GitHub forge's host must be one GitHub serves and its
+the failure names the values key: the two spellings are exclusive, forge names
+are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
 namespace a GitHub organisation or user name, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name. The namespace checks matter beyond the error
@@ -616,6 +616,9 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
+{{- end -}}
+{{- if has $f.name $names -}}
+{{- fail (printf "platformAgent.integration.forges[%d].name %q is already declared; each forge needs its own name" $i $f.name) -}}
 {{- end -}}
 {{- $provider := $f.provider | default "github" -}}
 {{- if not (has $provider $registered) -}}

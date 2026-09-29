@@ -1528,18 +1528,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		// Admission and the reconcile-status check both report it; the minter
 		// policy sync is not the place to surface it a third time.
 		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
-			// A github forge is declared but validation refuses every one:
-			// PrimaryNamespace is then empty, and an empty primaryOrg accepts
-			// every organisation, which would widen the policies rather than
-			// leave them as they were. Skip the sync until the declaration is
-			// fixed; the reconcile status already reports it.
-			if resolved != nil && resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil && slices.ContainsFunc(resolved.Forges, func(f *agentv1alpha1.ResolvedForge) bool {
-				return f.Provider == agentv1alpha1.GitProviderGitHub
-			}) {
-				logger.Info("skipping minter policy sync: every declared github forge is invalid")
+			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+			// An empty primaryOrg accepts every organisation. That is right only
+			// where the declaration has nothing to scope to; where it declares a
+			// github forge or a repository the agent writes to on one and
+			// validation refused all of it, syncing would widen the policies
+			// rather than leave them as they were. Skip the sync until the
+			// declaration is fixed; the reconcile status already reports it.
+			if primaryOrg == "" && minterScopeRefused(resolved) {
+				logger.Info("skipping minter policy sync: validation refuses everything the github organisation would be read from")
 				return nil
 			}
-			primaryOrg = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
 		}
 	}
 
@@ -3465,6 +3464,25 @@ func hostPathDroppedEntryList(entries []string) string {
 		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
 	}
 	return b.String()
+}
+
+// minterScopeRefused reports that a declaration whose primary organisation is
+// empty had one to give: it declares a github forge, and either none of them
+// is valid or a repository the agent writes to is declared on one. Either way
+// validation refused what the organisation would have been read from.
+func minterScopeRefused(resolved *agentv1alpha1.ResolvedIntegration) bool {
+	if resolved == nil {
+		return false
+	}
+	onGitHub := func(f *agentv1alpha1.ResolvedForge) bool {
+		return f != nil && f.Provider == agentv1alpha1.GitProviderGitHub
+	}
+	if resolved.PrimaryForge(agentv1alpha1.GitProviderGitHub) == nil {
+		return slices.ContainsFunc(resolved.Forges, onGitHub)
+	}
+	return slices.ContainsFunc(resolved.Repositories, func(r *agentv1alpha1.ResolvedRepository) bool {
+		return r.Role != agentv1alpha1.RepositoryRoleContext && onGitHub(r.Forge)
+	})
 }
 
 // gitProblemList lists ValidateGit's problems under the same budget as the

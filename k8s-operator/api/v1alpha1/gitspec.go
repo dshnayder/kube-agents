@@ -252,31 +252,46 @@ func (ri *ResolvedIntegration) WithRole(role string) []*ResolvedRepository {
 }
 
 // PrimaryForge returns the forge of one provider the agent acts for first: the
-// GitOps repository's forge when it has that provider, else the first forge
-// declared with it. Nil when no forge has the provider.
+// forge of the first accepted repository the agent writes to on that provider,
+// the GitOps repository before the managed ones; else the first valid forge
+// declared with it that names a namespace; else the first valid forge declared
+// with it. Nil when no valid forge has the provider.
 //
 // A GitHub App token is scoped to one organisation, and GITHUB_ORG names one,
 // so where several GitHub forges are declared something has to pick; the
 // repository the agent's GitOps work lands in is the one that must work.
 //
-// A forge its provider refuses is skipped, as Accepted and the egress policy
-// skip it. Its namespace would otherwise become GITHUB_ORG and the minter's
-// primary organisation, and the minter prunes every policy outside that
-// organisation — with the webhook off, one mistyped namespace would revoke
-// tokens for repositories that were working.
+// Only accepted repositories and valid forges count, as for Accepted and the
+// egress policy. A refused forge's namespace would otherwise become GITHUB_ORG
+// and the minter's primary organisation, and the minter prunes every policy
+// outside that organisation: with the webhook off, one mistyped namespace would
+// revoke tokens for repositories that were working. A refused GitOps
+// repository must not pin the choice to a forge with nothing else to offer
+// while another forge has an organisation that would answer.
 func (ri *ResolvedIntegration) PrimaryForge(provider string) *ResolvedForge {
 	if ri == nil {
 		return nil
 	}
-	if gitops := ri.GitOps(); gitops != nil && gitops.Forge != nil && gitops.Forge.Provider == provider && gitops.Forge.valid() {
-		return gitops.Forge
-	}
-	for _, f := range ri.Forges {
-		if f.Provider == provider && f.valid() {
-			return f
+	for _, role := range writeRoles {
+		for _, r := range ri.Accepted(role) {
+			if r.Forge != nil && r.Forge.Provider == provider {
+				return r.Forge
+			}
 		}
 	}
-	return nil
+	var first *ResolvedForge
+	for _, f := range ri.Forges {
+		if f.Provider != provider || !f.valid() {
+			continue
+		}
+		if f.Namespace != "" {
+			return f
+		}
+		if first == nil {
+			first = f
+		}
+	}
+	return first
 }
 
 // PrimaryNamespace is the namespace of PrimaryForge(provider): as declared, or
@@ -298,7 +313,7 @@ func (ri *ResolvedIntegration) PrimaryNamespace(provider string) string {
 	if forge.Namespace != "" {
 		return forge.Namespace
 	}
-	for _, role := range []string{RepositoryRoleGitOps, RepositoryRoleManaged} {
+	for _, role := range writeRoles {
 		for _, r := range ri.Accepted(role) {
 			if r.Forge != forge {
 				continue

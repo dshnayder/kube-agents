@@ -530,6 +530,16 @@ func TestPrimaryNamespace(t *testing.T) {
 				repo("github", "gke-labs/infra", RepositoryRoleManaged),
 			}},
 			want: "gke-labs"},
+		{name: "a refused gitops repository does not pin the forge", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "a"}, ghForge("b", "acme")},
+			Repositories: []RepositorySpec{
+				repo("a", "https://x y@github.com/acme/app", RepositoryRoleGitOps),
+				repo("b", "acme/lib", RepositoryRoleManaged),
+			}},
+			want: "acme"},
+		{name: "a forge with a namespace wins over one without", spec: &IntegrationSpec{
+			Forges: []ForgeSpec{{Name: "a"}, ghForge("b", "acme")}},
+			want: "acme"},
 		{name: "the gitops forge wins over declaration order", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{ghForge("upstream", "kubernetes"), ghForge("ours", "gke-labs")},
 			Repositories: []RepositorySpec{
