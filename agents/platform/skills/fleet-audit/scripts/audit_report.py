@@ -11603,14 +11603,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # request it carries. It stays open until a findings run rewrites the body,
     # or a human closes it. Only the clean branch closes anything, so the
     # findings branch needs no gap for this: its delta is withheld already, and
-    # its `silent_ok` is false on a lost memory (see the payload).
+    # its `silent_ok` is false on a lost memory (see the payload). For the same
+    # reason the gap joins `gaps` only: `collector_gaps` feeds the findings
+    # branch's delta comment, which this branch never posts.
     if memory_lost and not findings and (still_flagged - held_exclude):
         gaps.append(LOST_MEMORY_GAP)
-        collector_gaps.append(LOST_MEMORY_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_GAP}")
     elif memory_lost and not findings:
         gaps.append(LOST_MEMORY_UNGUARDED_GAP)
-        collector_gaps.append(LOST_MEMORY_UNGUARDED_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
     for entry in held_entries:
         if carried_without_manifest:

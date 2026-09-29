@@ -63,6 +63,22 @@ STYLES = {
     "head": "\033[1;4m",
 }
 
+_LINKABLE_URL = re.compile(r"https?://", re.IGNORECASE)
+
+BOX_UNICODE = {
+    "h": "─", "v": "│",
+    "tl": "┌", "tm": "┬", "tr": "┐",
+    "ml": "├", "mm": "┼", "mr": "┤",
+    "bl": "└", "bm": "┴", "br": "┘",
+}
+
+BOX_ASCII = {
+    "h": "-", "v": "|",
+    "tl": "+", "tm": "+", "tr": "+",
+    "ml": "+", "mm": "+", "mr": "+",
+    "bl": "+", "bm": "+", "br": "+",
+}
+
 class Palette:
     """Applies or discards styles, so no renderer has to know which."""
 
@@ -142,8 +158,6 @@ def pr_ref(url: str) -> str:
     match = _PR_URL.match((url or "").strip())
     return "%s/%s#%s" % match.groups() if match else url
 
-_LINKABLE_URL = re.compile(r"https?://", re.IGNORECASE)
-
 def hyperlink(text: str, url: str, palette: Palette, link_id: str = "") -> str:
     """OSC 8, gated on the same signal as colour.
 
@@ -160,20 +174,6 @@ def hyperlink(text: str, url: str, palette: Palette, link_id: str = "") -> str:
     if not palette.enabled or not url or not _LINKABLE_URL.match(url):
         return text
     return "\x1b]8;%s;%s\x1b\\%s\x1b]8;;\x1b\\" % ("id=%s" % link_id if link_id else "", url, text)
-
-BOX_UNICODE = {
-    "h": "─", "v": "│",
-    "tl": "┌", "tm": "┬", "tr": "┐",
-    "ml": "├", "mm": "┼", "mr": "┤",
-    "bl": "└", "bm": "┴", "br": "┘",
-}
-
-BOX_ASCII = {
-    "h": "-", "v": "|",
-    "tl": "+", "tm": "+", "tr": "+",
-    "ml": "+", "mm": "+", "mr": "+",
-    "bl": "+", "bm": "+", "br": "+",
-}
 
 class Column:
     """One column.

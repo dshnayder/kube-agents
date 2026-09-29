@@ -621,8 +621,10 @@ def cmd_diff(args: argparse.Namespace) -> dict:
 def cmd_runs(args: argparse.Namespace) -> dict:
     """What the ring holds, so a `diff` can name real stamps.
 
-    Filenames only. Reading fourteen envelopes to decorate a listing would
-    spend the whole store to answer "which runs are there".
+    The ring by filename. Reading fourteen envelopes to decorate a listing
+    would spend the whole store to answer "which runs are there". Liveness and
+    the error come from the stream's projection, which reads each repository's
+    newest envelope as `streams` does; no older ring entry is parsed.
     """
     root = _root_of(args)
     repo = _resolve_repo(root, args.stream, args.repo)

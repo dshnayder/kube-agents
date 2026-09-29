@@ -712,12 +712,13 @@ class TestRepositories(StoreTestCase):
 
 
 class TestRuns(StoreTestCase):
-    def test_it_lists_stamps_without_reading_a_single_envelope(self):
+    def test_it_lists_stamps_without_parsing_the_ring(self):
         first = self.write_run(AUDIT, "20260825T063100.000000Z", [finding("a")], latest=False)
         second = self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
         # A ring entry nothing can parse. `runs` still answers, because a stamp
         # listing that reads fourteen documents is the cost this command exists
-        # to avoid.
+        # to avoid. Liveness reads `latest.json`, as `streams` does, and
+        # nothing else.
         broken = Path(self.root) / AUDIT / REPO / "runs" / "20260827T063100.000000Z.json"
         broken.write_text("{not json", encoding="utf-8")
         payload = self.ok("runs", AUDIT)
