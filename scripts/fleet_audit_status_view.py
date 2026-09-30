@@ -34,7 +34,9 @@ Five flags the raw rows cannot be trusted without:
     a lease nor a stored run — it has genuinely never run. A ring whose
     `latest.json` a failed run deleted still has its newest entry.
   - STALE: now is past the next expected fire plus slack. A silent stream is
-    rendered loudly — this is the whole reason the surface exists.
+    rendered loudly — this is the whole reason the surface exists. The roster's
+    cron fields are read in the pod's time zone, which this tool cannot see:
+    UTC unless `--timezone` names the IANA zone an install set the pod's TZ to.
 
 Only STALE and NEVER consult the roster, so roster drift can no longer suppress
 a death. `⚠` on STATUS marks a partial run; the default view counts its coverage
@@ -63,8 +65,9 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -111,6 +114,9 @@ DEFAULT_CONTAINER = STORE_CONTAINERS[0]
 # the longest observed audit run is ~20 minutes, so an hour of slack flags
 # real silence without paging on a slow morning.
 STALE_SLACK = timedelta(hours=1)
+# The zone the cron fields are read in when `--timezone` is not given: the
+# pod's own default, since the chart does not set TZ.
+DEFAULT_SCHEDULE_TIMEZONE = "UTC"
 
 #: How many kubeconfig contexts the "no agent pod" path will probe looking for
 #: the install, and how long it gives each. The probes run in parallel, one
@@ -507,8 +513,13 @@ def load_roster(path: Path) -> tuple[dict[str, dict], str]:
     return out, ""
 
 
-def next_fire(expr: str, after: datetime) -> datetime | None:
+def next_fire(expr: str, after: datetime, tz: tzinfo = timezone.utc) -> datetime | None:
     """Next fire for the roster's cron shapes: `M H * * *` and `M H * * D`.
+
+    The fields are wall-clock time in `tz`, the zone the scheduler runs in, so
+    `after` is moved into it before they apply and the answer is moved back to
+    `after`'s zone. Days step in wall-clock time, so a fire keeps its hour
+    across a DST change.
 
     The governance roster only uses these two forms. Anything fancier returns
     None and the STALE flag abstains for that stream rather than guessing.
@@ -521,20 +532,29 @@ def next_fire(expr: str, after: datetime) -> datetime | None:
     parts = expr.split()
     if len(parts) != 5 or parts[2] != "*" or parts[3] != "*":
         return None
+    local = after.astimezone(tz)
     try:
         minute, hour = int(parts[0]), int(parts[1])
         dows = None if parts[4] == "*" else {int(d) % 7 for d in parts[4].split(",")}
-        candidate = after.replace(minute=minute, hour=hour, second=0, microsecond=0)
+        candidate = local.replace(minute=minute, hour=hour, second=0, microsecond=0)
     except ValueError:
         return None
-    if candidate <= after:
+    if candidate <= local:
         candidate += timedelta(days=1)
     for _ in range(CRON_DOW_SCAN_DAYS):
         # cron dow: 0=Sunday; Python: Monday=0 → cron = (weekday+1) % 7
         if dows is None or ((candidate.weekday() + 1) % 7) in dows:
-            return candidate
+            return candidate.astimezone(after.tzinfo)
         candidate += timedelta(days=1)
     return None
+
+
+def schedule_zone(name: str) -> tzinfo:
+    """`--timezone`: an IANA name, refused rather than read as UTC when unknown."""
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"unknown time zone {name!r}") from exc
 
 
 def parse_iso(value: object) -> datetime | None:
@@ -582,7 +602,12 @@ def count_cell(value: object) -> str:
 
 
 def flags_for(
-    stream: dict, job: dict, now: datetime, root_exists: bool, leases_read: bool = True
+    stream: dict,
+    job: dict,
+    now: datetime,
+    root_exists: bool,
+    leases_read: bool = True,
+    schedule_tz: tzinfo = timezone.utc,
 ) -> list[str]:
     """The five flags, in severity order.
 
@@ -612,7 +637,7 @@ def flags_for(
         flags.append("NEVER")
     if enabled and liveness != "running" and leases_read:
         at = parse_iso((stream.get("latest") or {}).get("finished_at"))
-        expected = next_fire(job.get("expr", ""), at) if at else None
+        expected = next_fire(job.get("expr", ""), at, schedule_tz) if at else None
         if expected is not None and now > expected + STALE_SLACK:
             flags.append("STALE")
     return flags
@@ -667,7 +692,7 @@ def clip_gap(text: str, width: int = GAP_WIDTH) -> str:
     whole text is still in the envelope, which is what `fleet-audit-reports`
     reads; this is the index.
     """
-    line = " ".join(str(text).split())
+    line = _oneline(text)
     return line if len(line) <= width else line[: width - 1].rstrip() + "…"
 
 
@@ -679,7 +704,7 @@ def gap_parts(text: str) -> tuple[str, str]:
     only when the prefix reads like one rather than like a sentence that happens
     to contain a colon.
     """
-    line = " ".join(str(text).split())
+    line = _oneline(text)
     scope, sep, rest = line.partition(": ")
     if sep and rest and len(scope) <= SCOPE_PREFIX_MAX and " " not in scope.strip():
         return scope, rest
@@ -765,10 +790,11 @@ def row_for(
     root_exists: bool,
     utc: bool,
     leases_read: bool = True,
+    schedule_tz: tzinfo = timezone.utc,
 ) -> tuple[list[tuple], list[str], dict]:
     """One table row, its flags, and the `latest` envelope behind it."""
     latest = stream.get("latest") or {}
-    flags = flags_for(stream, job, now, root_exists, leases_read)
+    flags = flags_for(stream, job, now, root_exists, leases_read, schedule_tz)
     status, status_style = status_cell(stream, latest)
 
     findings = latest.get("findings")
@@ -901,6 +927,7 @@ def render(
     flagged_only: bool = False,
     show_gaps: bool = False,
     roster_error: str = "",
+    schedule_tz: tzinfo = timezone.utc,
 ) -> str:
     palette = palette or Palette(False)
     box = box or BOX_UNICODE
@@ -911,7 +938,8 @@ def render(
     built = []
     for label, audit_id, stream in stream_rows(streams, roster):
         row, flags, latest = row_for(
-            label, stream, roster.get(audit_id) or {}, now, root_exists, utc, leases_read
+            label, stream, roster.get(audit_id) or {}, now, root_exists, utc, leases_read,
+            schedule_tz,
         )
         # Scrubbed once here, because the gaps table and the pull-request list
         # below print the label too, and a stream directory's name is not
@@ -1267,6 +1295,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--ascii", action="store_true", help="ASCII borders instead of box-drawing characters"
     )
     parser.add_argument("--utc", action="store_true", help="timestamps in UTC, not local time")
+    parser.add_argument(
+        "--timezone", type=schedule_zone, default=DEFAULT_SCHEDULE_TIMEZONE,
+        metavar="ZONE",
+        help="IANA zone the pod's cron runs in, for STALE (default: UTC, the pod's own "
+        "unless its TZ was overridden)",
+    )
     parser.add_argument("--width", type=int, default=0, help="output width; 0 detects the terminal")
     parser.add_argument(
         "--watch", type=int, default=0, metavar="SECONDS",
@@ -1296,6 +1330,7 @@ def draw(args: argparse.Namespace, palette: Palette, box: dict, width: int) -> t
         flagged_only=args.flagged,
         show_gaps=args.gaps,
         roster_error=roster_error,
+        schedule_tz=args.timezone,
     )
     return text, max(exit_code(projection), 1 if roster_error else 0)
 

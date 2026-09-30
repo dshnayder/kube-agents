@@ -214,8 +214,8 @@ def _liveness(root: str, audit_id: str) -> dict:
 def _run_name(run: str | None) -> str:
     """A stamp as the ring spells it. `--run 20260826T063100.123456Z` and the
     same string with `.json` are the same run; no argument means the newest."""
-    if run is None or run in ("latest", "latest.json"):
-        return "latest.json"
+    if run is None or run in ("latest", report_status.LATEST_NAME):
+        return report_status.LATEST_NAME
     return _inside_store(run if run.endswith(".json") else f"{run}.json", "run")
 
 
@@ -225,7 +225,7 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
     `repo` is already resolved (`_resolve_repo`)."""
     name = _run_name(run)
     try:
-        if name == "latest.json":
+        if name == report_status.LATEST_NAME:
             envelope, loaded = report_status.load_last_named(root, audit_id, repo)
             if loaded not in (None, name):
                 # A run after the newest ring entry failed: answer from the
@@ -244,7 +244,7 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
             f"{audit_id}/{name} in {repo} could not be read: {_oneline(exc)}"
         ) from exc
     if envelope is None:
-        if name == "latest.json":
+        if name == report_status.LATEST_NAME:
             raise QueryError(
                 f"{audit_id} has no run stored for {repo}: the store holds no "
                 "record of it. That means unknown, not clean — say so and read "
@@ -569,7 +569,7 @@ def cmd_diff(args: argparse.Namespace) -> dict:
     if not ring:
         raise QueryError(f"{args.stream}: the run ring is empty, so there is nothing to diff")
     later = _run_name(args.to) if args.to else ring[-1]
-    if later == "latest.json":
+    if later == report_status.LATEST_NAME:
         later = ring[-1]
     if later not in ring:
         raise QueryError(f"{args.stream} has no run {later!r} in the ring", runs=ring)

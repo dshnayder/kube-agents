@@ -56,8 +56,9 @@ REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 # envelope carries except the keys below rides along untouched
 # (`_project_latest`), so a key added to the envelope later reaches a reader
 # without an edit here.
-# The stored record of the newest run, beside the `runs/` ring.
+# The stored record of the newest run, and the ring of runs beside it.
 LATEST_NAME = "latest.json"
+RUNS_DIR = "runs"
 LATEST_KEYS = (
     "audit_id",
     "repo",
@@ -312,7 +313,7 @@ def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
     """Filenames in `runs/`, sorted ascending — which is time order, because
     the stamp is UTC. [] when the ring does not exist yet."""
     try:
-        names = os.listdir(os.path.join(store_path(root, audit_id, repo), "runs"))
+        names = os.listdir(os.path.join(store_path(root, audit_id, repo), RUNS_DIR))
     except FileNotFoundError:
         return []
     # The atomic write replaces from a `.tmp` file in the same directory, so a
@@ -322,7 +323,7 @@ def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
 
 def load_run(root: str, audit_id: str, repo: str, name: str) -> dict | None:
     """One ring entry, whole. None when that stamp is not in the ring."""
-    return _read_object(os.path.join(store_path(root, audit_id, repo), "runs", name))
+    return _read_object(os.path.join(store_path(root, audit_id, repo), RUNS_DIR, name))
 
 
 def liveness(
@@ -448,7 +449,7 @@ def _project_repo(root: str, audit_id: str, repo: str) -> dict:
         # `latest.json` is gone and the ring behind it is what failed.
         error, latest_missing = _failure(exc.name, exc), True
     except (OSError, ValueError) as exc:
-        error = _failure("latest.json", exc)
+        error = _failure(LATEST_NAME, exc)
     try:
         runs = list_runs(root, audit_id, repo)
     except OSError as exc:

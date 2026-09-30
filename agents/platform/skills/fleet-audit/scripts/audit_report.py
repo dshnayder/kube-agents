@@ -391,6 +391,10 @@ REPORT_HISTORY = 14
 # The ring's filename: a UTC stamp that sorts lexically in time order, to the
 # microsecond so two runs finishing in one second do not replace each other.
 REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+# The store's two names under each stream's directory: the ring of envelopes,
+# and the copy of the newest. report_status.py spells them the same way.
+REPORT_RUNS_DIR = "runs"
+REPORT_LATEST_NAME = "latest.json"
 # One path segment of the `owner/name` a store directory is keyed on. The
 # GitHub charset, and never `.` or `..`, so a repository can only ever name a
 # directory under its stream's.
@@ -1912,14 +1916,14 @@ def write_report(
     except ValueError as exc:
         log(f"WARNING: report store write for {audit_id} skipped: {exc}")
         return
-    runs = directory / "runs"
+    runs = directory / REPORT_RUNS_DIR
     try:
         runs.mkdir(parents=True, exist_ok=True)
         text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
         stamp = now.astimezone(timezone.utc).strftime(REPORT_STAMP_FORMAT)
         _atomic_write(runs / f"{stamp}.json", text)
         # A copy, not a symlink: one fewer behaviour to ask of the mount.
-        _atomic_write(directory / "latest.json", text)
+        _atomic_write(directory / REPORT_LATEST_NAME, text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
         log(f"WARNING: report store write for {audit_id} failed: {exc}")
         if ledger_unchanged:
@@ -1931,7 +1935,7 @@ def write_report(
         # same ledger, same scheme, so the next run would trust a memory that
         # lacks everything this one published. Absent is honest; stale is not.
         try:
-            (directory / "latest.json").unlink(missing_ok=True)
+            (directory / REPORT_LATEST_NAME).unlink(missing_ok=True)
         except OSError as unlink_exc:
             log(f"WARNING: could not drop the stale latest.json for {audit_id}: {unlink_exc}")
         return
@@ -1968,7 +1972,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     if issue_number is None:
         return None
     try:
-        path = reports_dir_for(audit_id, repo) / "latest.json"
+        path = reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME
     except ValueError as exc:
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None
@@ -2016,7 +2020,7 @@ def invalidate_report_memory(audit_id: str, repo: str) -> None:
     alone.
     """
     try:
-        (reports_dir_for(audit_id, repo) / "latest.json").unlink()
+        (reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME).unlink()
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:

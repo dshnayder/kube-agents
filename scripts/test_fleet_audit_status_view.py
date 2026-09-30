@@ -21,6 +21,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -28,6 +29,7 @@ import fleet_audit_status_view as view  # noqa: E402
 import terminal_table  # noqa: E402
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+LOS_ANGELES = ZoneInfo("America/Los_Angeles")
 
 #: A roster that parses and holds no fleet-audit job. Most tests here are about
 #: something other than the roster and want the ENABLED/SCHEDULE columns out of
@@ -205,6 +207,21 @@ class TestNextFire(unittest.TestCase):
         fire = view.next_fire("20 7 * * 1", after)
         self.assertEqual(fire, datetime(2026, 8, 31, 7, 20, tzinfo=timezone.utc))
 
+    def test_the_fields_are_read_in_the_schedule_zone(self):
+        # 07:00 in Los Angeles; the 06:20 there is 13:20 UTC the next day, not
+        # the 06:20 UTC a zone-blind read would expect.
+        after = datetime(2026, 8, 26, 14, 0, tzinfo=timezone.utc)
+        fire = view.next_fire("20 6 * * *", after, LOS_ANGELES)
+        self.assertEqual(fire, datetime(2026, 8, 27, 13, 20, tzinfo=timezone.utc))
+        self.assertEqual(fire.tzinfo, timezone.utc)
+
+    def test_a_fire_keeps_its_wall_clock_hour_across_dst(self):
+        # Los Angeles leaves daylight time at 02:00 on 2026-11-01, so the
+        # 06:20 there moves from 13:20 UTC to 14:20 UTC.
+        after = datetime(2026, 10, 31, 14, 0, tzinfo=timezone.utc)
+        fire = view.next_fire("20 6 * * *", after, LOS_ANGELES)
+        self.assertEqual(fire, datetime(2026, 11, 1, 14, 20, tzinfo=timezone.utc))
+
     def test_anything_fancier_abstains(self):
         self.assertIsNone(view.next_fire("*/5 * * * *", NOW))
         self.assertIsNone(view.next_fire("20 6 1 * *", NOW))
@@ -305,6 +322,26 @@ class TestFlags(unittest.TestCase):
     def test_a_missed_fire_is_stale(self):
         old = latest(finished_at=(NOW - timedelta(days=3)).isoformat())
         self.assertEqual(self.flags(stream(last=old)), ["STALE"])
+
+    def test_stale_reads_the_schedule_in_the_pod_zone(self):
+        # Finished after yesterday's 06:20 in Los Angeles (13:25 UTC). NOW is
+        # 05:00 there, before today's fire, but past 06:20 UTC plus slack.
+        ran = latest(finished_at=datetime(2026, 8, 25, 13, 25, tzinfo=timezone.utc).isoformat())
+        (_, _, source), = view.stream_rows({"cost-audit": stream(last=ran)}, {})
+        self.assertEqual(view.flags_for(source, self.JOB, NOW, True), ["STALE"])
+        self.assertEqual(
+            view.flags_for(source, self.JOB, NOW, True, schedule_tz=LOS_ANGELES), []
+        )
+
+    def test_the_timezone_flag_defaults_to_utc_and_refuses_an_unknown_zone(self):
+        parser = view.build_parser()
+        self.assertEqual(parser.parse_args([]).timezone, ZoneInfo("UTC"))
+        self.assertEqual(
+            parser.parse_args(["--timezone", "America/Los_Angeles"]).timezone, LOS_ANGELES
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            parser.parse_args(["--timezone", "Mars/Olympus_Mons"])
+        self.assertIn("unknown time zone", err.getvalue())
 
     def test_a_stream_still_running_is_late_not_stale(self):
         # The lease says it is not silent; the STATUS cell carries its age.
@@ -893,7 +930,9 @@ class TestContextDiscovery(unittest.TestCase):
         fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
         rc, _, err = run_main(["--roster", NO_ROSTER, "--context", "hub-a"], fake)
         self.assertEqual(rc, 2)
-        self.assertNotIn("reading hub-b", err)
+        # hub-b holds the pod and the hint may name it, but nothing reads it:
+        # the only exec a fallback would run is the one that must not happen.
+        self.assertEqual(fake.cmds("exec"), [])
 
     def test_one_other_context_is_not_reported_as_more_than_one(self):
         # Reachable because an explicit `--context` is never second-guessed:

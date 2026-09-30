@@ -2732,6 +2732,22 @@ _WHOLE_ENVELOPE_READS = [
     f"find {_STORE} -name latest.json | xargs -0 head -c 4000",
     f"cd {_STORE}/runs && cat 2026*.json",
     "cd runs; less *.json",
+    # Filters that pass the whole file through, and the other printers.
+    f"jq . {_STORE}/latest.json",
+    f"jq '.' {_STORE}/latest.json",
+    f"jq -C . {_STORE}/runs/20260929T010000Z.json",
+    f"jq '' {_STORE}/latest.json",
+    f"jq . < {_STORE}/latest.json",
+    f"python3 -m json.tool {_STORE}/latest.json",
+    f"python -m json.tool {_STORE}/latest.json",
+    f"grep '' {_STORE}/latest.json",
+    f"grep -h '' {_STORE}/runs/20260929T010000Z.json",
+    f"sed -n p {_STORE}/latest.json",
+    f"sed '' {_STORE}/latest.json",
+    f"awk 1 {_STORE}/latest.json",
+    f"awk '{{print}}' {_STORE}/latest.json",
+    f"nl {_STORE}/latest.json",
+    f"bat {_STORE}/latest.json",
 ]
 # What the recorded greens ran, and projections of one key.
 _ENVELOPE_PROJECTIONS = [
@@ -2741,6 +2757,9 @@ _ENVELOPE_PROJECTIONS = [
     f"jq .status {_STORE}/latest.json",
     f"ls {_STORE}/runs",
     f"cd {_STORE}/runs && ls",
+    f"jq -r .status {_STORE}/latest.json",
+    f"jq '.status' {_STORE}/latest.json",
+    f"grep -c FINDINGS {_STORE}/latest.json",
 ]
 
 

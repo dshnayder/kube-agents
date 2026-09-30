@@ -15387,8 +15387,11 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertLessEqual(len(expected), audit_report.MAX_FINDING_ID)
 
     def replay_lost_store(self):
-        """A fresh recorder over an open ledger the report store has no record
-        of — a replaced volume, or a first run after the store landed."""
+        """A fresh recorder over an open ledger with no store directory and
+        nothing to seed from. A replaced volume alone is not this: its run
+        seeds from the body `gh issue list` returns. Here the store is removed
+        before that call answers, so `stored_ledger_body` lists "" — a ledger
+        whose body has lost its hidden blocks as well as its store."""
         self.harness = Recorder()
         self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": self.issue_list()}

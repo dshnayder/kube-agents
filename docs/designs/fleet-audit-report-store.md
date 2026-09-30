@@ -21,7 +21,8 @@ only until the next run overwrote it in scratch, and the ledger rewrites itself 
 run-over-run comparison had no source at all. And `finish` re-fetched the previous ledger body every
 run to parse its own hidden `<!-- audit-findings: … -->` block back out: a public issue body, which
 anyone with write access can edit between runs, was the harness's database. It is still read on
-every run, but only as a check that the store is current (§4), never as the memory itself.
+every run, but as a check that the store is current (§4), and as the memory only once, to seed a
+store that has never held this ledger (§4).
 
 Both are the same missing thing: the run's structured output, kept where it was produced.
 

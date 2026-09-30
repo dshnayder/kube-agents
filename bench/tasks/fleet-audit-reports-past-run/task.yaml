@@ -99,14 +99,20 @@ verification_spec:
       type: worker_commands
       # The skill's first red line: latest.json embeds the whole findings
       # document and the ledger body, and every runs/<stamp>.json ring entry
-      # is a byte-identical copy of one. A `jq` or `python3` projection of one
-      # key is a different command and does not match. Flags may sit between
-      # the command and the file (`head -n 40`, `cat -n`); a separator may not.
-      # No start anchor, so a wrapper (`timeout 30 cat`, `sudo cat`) does not
-      # hide the read. The other three name the file before the reader: `find
-      # -exec`, a list piped to `xargs`, and a bare glob after `cd` into runs/.
+      # is a byte-identical copy of one. The first pattern is a pager or
+      # printer over a store file; flags may sit between the command and the
+      # file (`head -n 40`, `cat -n`), a separator may not, and there is no
+      # start anchor, so a wrapper (`timeout 30 cat`, `sudo cat`) does not hide
+      # it. The next three name the file before the reader: `find -exec`, a
+      # list piped to `xargs`, and a bare glob after `cd` into runs/. The last
+      # is a filter that passes the whole file through: `jq .` or `jq ''`,
+      # `python3 -m json.tool`, `grep ''`, `sed -n p`, `awk 1`. A key
+      # projection (`jq .status`, `jq -r .x`) does not match. This is a
+      # heuristic over free-form shell, not a proof: a read it does not name
+      # (a script, a loop) passes it.
       forbidden_patterns:
-        - '\b(cat|less|more|head|tail)\b[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
-        - '\bfind\b[^\n|;&]*(latest\.json|runs\b)[^\n|;&]*\s-exec(dir)?\s+(\S*/)?(cat|less|more|head|tail)\b'
-        - '(latest\.json|runs/[^\s|;&]*)[^\n;&]*\|\s*xargs\b[^\n|;&]*\b(cat|less|more|head|tail)\b'
-        - '\bcd\s+(\S*/)?runs/?\s*(&&|;)[^\n|;&]*\b(cat|less|more|head|tail)\b[^\n|;&]*\.json\b'
+        - '\b(cat|less|more|head|tail|nl|bat|batcat)\b[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
+        - '\bfind\b[^\n|;&]*(latest\.json|runs\b)[^\n|;&]*\s-exec(dir)?\s+(\S*/)?(cat|less|more|head|tail|nl|bat|batcat)\b'
+        - '(latest\.json|runs/[^\s|;&]*)[^\n;&]*\|\s*xargs\b[^\n|;&]*\b(cat|less|more|head|tail|nl|bat|batcat)\b'
+        - '\bcd\s+(\S*/)?runs/?\s*(&&|;)[^\n|;&]*\b(cat|less|more|head|tail|nl|bat|batcat)\b[^\n|;&]*\.json\b'
+        - '\b(jq\s+(-\S+\s+)*(\.|''\.?''|"\.?")|python3?\s+-m\s+json\.tool|grep\s+(-\S+\s+)*(''\^?''|"\^?"|\^)|sed\s+(-n\s+)?(''p?''|"p?"|p)|awk\s+(''1''|"1"|1|''\{\s*print(\s+\$0)?\s*\}''))\s[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
