@@ -416,8 +416,10 @@ test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the op
 #
 # COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
 # which is what lets one run serve as both the verdict and the meter. CI's
-# required job sets it, so a pull request pays for the 5638 tests once instead
-# of running them again unmeasured in a second job. The default stays 0 because
+# required job sets it, so the verdict and the number come from one execution
+# rather than a measured run beside an unmeasured one on the same interpreter;
+# the one other run of the sweep in CI is on the agent image's Python, which is
+# a different question, not a second meter. The default stays 0 because
 # a local run against a tree with known-red directories should still print a
 # total. The failing list travels through a file because each recipe line is its
 # own shell: the sweep leaves `$$failed` set in the shell that called it, and
@@ -592,13 +594,17 @@ prompt-check: ## Verify the agent's instructions cite skills and files that exis
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
 # <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# The SOP line numbers each governance cron prompt cites are recomputed first,
+# so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
+	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
 docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
+	@python3 scripts/generate_sop_geography.py --check
 	@python3 scripts/generate_docs.py --check
 
 docs-check-links:
