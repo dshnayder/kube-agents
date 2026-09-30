@@ -17393,6 +17393,9 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["ledger_body"], previous)
 
     def test_a_findings_run_whose_store_write_fails_drops_the_memory(self):
+        # Seeded first, so the assertion below needs the drop to pass.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
         self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
@@ -17443,6 +17446,20 @@ class TestReportStore(HarnessTestCase):
         memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
         self.assertEqual(memory["ledger_body"], previous)
         self.assertEqual(len(self.body_reads()), 1)
+
+    def test_a_failing_issue_view_seeds_nothing(self):
+        """No store and no body in the listing: the fallback read is the only
+        source, and when it fails the memory is lost, not empty."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"--json body": json.dumps({"body": previous})}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertIsNone(memory)
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("could not be read to seed one", err.getvalue())
 
     def test_a_failed_close_leaves_the_memory_intact(self):
         """The close leaves the body as it was, so until it lands the stored
@@ -17657,6 +17674,19 @@ class TestReportStore(HarnessTestCase):
         self.assertNotEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
         self.assertEqual(self.stored()["issue_number"], 42)
+
+    def test_a_kill_before_the_findings_rewrite_keeps_the_memory(self):
+        # The comment read and the label sync are round trips that leave the
+        # body alone; a kill in them leaves the stored envelope still true.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        with patch.object(
+            audit_report, "sync_open_remediation_labels", side_effect=SystemExit(137)
+        ):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
 
     def test_a_dry_run_writes_no_report(self):
         self.harness.replies = {"issue list": "[]"}

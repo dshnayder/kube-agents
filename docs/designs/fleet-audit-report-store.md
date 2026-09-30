@@ -72,10 +72,14 @@ that fails leaves the memory in place. A run killed between the close and the de
 lands on GitHub but reports failure, leaves a record naming an issue that is now closed. A later run
 does not trust it while that issue stays closed, since the trust check needs it to be the open
 ledger; a reader quoting it shows the last findings run as latest until the next run rewrites it.
-Deleting first would trade that for a lost memory on every close that genuinely fails. A lookup that fails earlier, or a clean run held open that only comments, has
-changed nothing the envelope describes and leaves the memory in place. The ring
-is left alone, and the readers answer from its newest entry with `latest_missing: true`: the stream
-did run, and a later run may have changed the ledger unrecorded. Pruning runs in its own `try`: a
+Deleting first would trade that for a lost memory on every close that genuinely fails. A lookup that fails earlier, a run killed in the comment read or label sync that precede the
+findings rewrite, or a clean run held open that only comments, has changed nothing the envelope
+describes and leaves the memory in place. The ring is left alone, and the readers answer from its
+newest entry with `latest_missing: true`: the stream did run, and a later run may have changed the
+ledger unrecorded. A ring entry newer than a `latest.json` that is present is answered the same way,
+flagged: the ring entry is written first, so a failure between the two writes leaves `latest.json`
+one run behind the ring, and the readers compare its `finished_at` against the newest entry's name
+rather than trust whichever file exists. Pruning runs in its own `try`: a
 failed prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the

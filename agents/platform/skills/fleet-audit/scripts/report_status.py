@@ -54,6 +54,9 @@ REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 # The stored record of the newest run, and the ring of runs beside it.
 LATEST_NAME = "latest.json"
 RUNS_DIR = "runs"
+# `audit_report.REPORT_STAMP_FORMAT`: a ring entry's name is its envelope's
+# `finished_at` in UTC, in this form, so the two compare as strings.
+RUN_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 
 # Always present on a projected `latest`, null when the envelope lacks them, so
 # a reader never has to tell an absent key from a null one. Everything else the
@@ -283,6 +286,8 @@ def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
     restores it only on a completed write, so a run that failed in between leaves the ring
     and no `latest.json`. The newest ring entry is then the last run the store
     has, and the flag says a later run may have changed the ledger unrecorded.
+    A ring entry newer than a `latest.json` that is present wins the same way,
+    flagged: the second of `write_report`'s two writes failed.
     A failure reading the ring raises RingReadError naming the file.
     """
     envelope, name = load_last_named(root, audit_id, repo)
@@ -297,7 +302,7 @@ def load_last_named(root: str, audit_id: str, repo: str) -> tuple[dict | None, s
     another's content."""
     latest = load_latest(root, audit_id, repo)
     if latest is not None:
-        return latest, LATEST_NAME
+        return _newer_ring_entry(root, audit_id, repo, latest) or (latest, LATEST_NAME)
     try:
         runs = list_runs(root, audit_id, repo)
     except OSError as exc:
@@ -308,6 +313,35 @@ def load_last_named(root: str, audit_id: str, repo: str) -> tuple[dict | None, s
         return load_run(root, audit_id, repo, runs[-1]), runs[-1]
     except (OSError, ValueError) as exc:
         raise RingReadError(f"runs/{runs[-1]}", exc) from exc
+
+
+def _newer_ring_entry(
+    root: str, audit_id: str, repo: str, latest: dict
+) -> tuple[dict, str] | None:
+    """The newest ring entry and its name when it is newer than `latest.json`.
+
+    `write_report` writes the ring entry first and `latest.json` second, and a
+    held-open clean run keeps the old `latest.json` when the second write
+    fails. The ring then holds a run the file does not, and a reader quoting
+    the file would report the run before as the last one. None when the file
+    is the newest run, its `finished_at` does not parse, or the ring cannot be
+    read: the file is readable, so it still answers.
+    """
+    try:
+        finished = datetime.fromisoformat(str(latest.get("finished_at")))
+        if finished.tzinfo is None:
+            return None
+        stamp = finished.astimezone(timezone.utc).strftime(RUN_STAMP_FORMAT)
+        runs = list_runs(root, audit_id, repo)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not runs or runs[-1] <= f"{stamp}.json":
+        return None
+    try:
+        entry = load_run(root, audit_id, repo, runs[-1])
+    except (OSError, ValueError):
+        return None
+    return (entry, runs[-1]) if entry is not None else None
 
 
 def list_runs(root: str, audit_id: str, repo: str) -> list[str]:
@@ -458,7 +492,8 @@ def _project_repo(root: str, audit_id: str, repo: str) -> dict:
     return {
         "latest": _project_latest(latest),
         # True when `latest` is the newest ring entry because `latest.json` is
-        # gone: a run after it failed, and the ledger may be newer than this.
+        # gone or older than it: a run after it failed, and the ledger may be
+        # newer than this.
         "latest_missing": latest_missing,
         "runs": runs,
         "error": error,

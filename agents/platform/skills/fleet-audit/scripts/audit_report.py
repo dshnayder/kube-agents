@@ -12056,7 +12056,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
-    invalidate_report_memory(audit_id, repo)
     # Every finding in the document reproduces by definition — the resolved ones
     # are the ids that are absent from it.
     pr_by_finding, pr_urls = reconcile_remediation_prs(
@@ -12188,6 +12187,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
             + ", ".join(contradicted)
         )
+    # Here and not at the branch split: the comment read and the label sync
+    # above are proxied round trips that leave the body alone, so a kill in
+    # them must not cost the next run a memory that is still true.
+    invalidate_report_memory(audit_id, repo)
     if existing_issue is None:
         res = gh(
             [

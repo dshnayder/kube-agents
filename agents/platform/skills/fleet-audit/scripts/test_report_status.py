@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -209,6 +209,28 @@ class TestLiveness(ReportStatusTestCase):
         entry = stream["repos"][REPO]
         self.assertTrue(entry["latest_missing"])
         self.assertEqual(entry["latest"]["finished_at"], NOW.isoformat())
+
+    def test_a_ring_entry_newer_than_latest_is_the_last_run(self):
+        """A held-open run whose `latest.json` write failed after its ring
+        entry landed: the ring holds the newer run, and it is flagged."""
+        self.write_latest()
+        later = NOW + timedelta(hours=1)
+        newer = {"audit_id": AUDIT, "repo": REPO, "finished_at": later.isoformat(), "status": "CLEAN"}
+        stamp = later.astimezone(timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)
+        (self.root / AUDIT / REPO / "runs" / f"{stamp}.json").write_text(json.dumps(newer))
+        entry = self.project()["streams"][AUDIT]["repos"][REPO]
+        self.assertTrue(entry["latest_missing"])
+        self.assertEqual(entry["latest"]["finished_at"], later.isoformat())
+        self.assertEqual(entry["latest"]["status"], "CLEAN")
+
+    def test_a_latest_that_is_the_newest_run_is_not_flagged(self):
+        self.write_latest()
+        entry = self.project()["streams"][AUDIT]["repos"][REPO]
+        self.assertFalse(entry["latest_missing"])
+        self.assertEqual(entry["latest"]["status"], "UPDATED")
+
+    def test_the_run_stamp_is_the_one_finish_writes(self):
+        self.assertEqual(report_status.RUN_STAMP_FORMAT, audit_report.REPORT_STAMP_FORMAT)
 
     def test_a_corrupt_ring_entry_behind_a_missing_latest_is_named(self):
         self.write_latest()

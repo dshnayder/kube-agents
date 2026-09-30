@@ -117,6 +117,7 @@ STALE_SLACK = timedelta(hours=1)
 # The zone the cron fields are read in when `--timezone` is not given: the
 # pod's own default, since the chart does not set TZ.
 DEFAULT_SCHEDULE_TIMEZONE = "UTC"
+UTC_ZONE_NAMES = frozenset({"UTC", "Etc/UTC"})
 
 #: How many kubeconfig contexts the "no agent pod" path will probe looking for
 #: the install, and how long it gives each. The probes run in parallel, one
@@ -388,7 +389,8 @@ def resolve_target(
             raise
         # Silently, because the header's `context` field already says which
         # cluster was read and a note saying the same thing on stderr is one
-        # more line between the operator and the table.
+        # more line between the operator and the table. `--json` has no
+        # header, so `draw` writes that note there.
         return discover_pod(namespace, found[0]), found[0]
 
 
@@ -551,6 +553,10 @@ def next_fire(expr: str, after: datetime, tz: tzinfo = timezone.utc) -> datetime
 
 def schedule_zone(name: str) -> tzinfo:
     """`--timezone`: an IANA name, refused rather than read as UTC when unknown."""
+    # UTC needs no tz database, and the default is UTC: an interpreter without
+    # one (Windows without `tzdata`) must still start when no flag is given.
+    if name in UTC_ZONE_NAMES:
+        return timezone.utc
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -1061,6 +1067,12 @@ def header_lines(
     # What the ledgers list: a held-open row counts the findings it carried,
     # not this run's zero.
     findings = sum(ledger_count(e["latest"]) or 0 for e in built)
+    # A run whose ledger count is null is unknown, not zero: the total becomes
+    # a floor and says how many it could not count.
+    uncounted = sum(
+        1 for e in built
+        if e["latest"].get("finished_at") and ledger_count(e["latest"]) is None
+    )
     held = [e for e in built if held_open(e["latest"])]
     critical = sum(
         e["latest"].get("critical") or 0
@@ -1128,7 +1140,7 @@ def header_lines(
             "findings",
             "%s %s"
             % (
-                palette(str(findings), "bold"),
+                palette("%d%s" % (findings, "+" if uncounted else ""), "bold"),
                 palette(
                     "across %d run stream%s · %d critical"
                     % (ran_streams, "" if ran_streams == 1 else "s", critical),
@@ -1141,6 +1153,15 @@ def header_lines(
                         "yellow",
                     )
                     if held
+                    else ""
+                )
+                + (
+                    palette(
+                        " · %d ledger count%s unknown"
+                        % (uncounted, "" if uncounted == 1 else "s"),
+                        "yellow",
+                    )
+                    if uncounted
                     else ""
                 ),
             ),
@@ -1314,6 +1335,13 @@ def build_parser() -> argparse.ArgumentParser:
 def draw(args: argparse.Namespace, palette: Palette, box: dict, width: int) -> tuple[str, int]:
     projection, source, context = load_projection(args)
     if args.json:
+        # The file carries no context (`--file` reads it back as is), and the
+        # read may have been redirected to another one: stderr is the record.
+        if not args.file:
+            print(
+                f"note: read {scrub(source)} on context {scrub(context) or '(none)'}",
+                file=sys.stderr,
+            )
         return json.dumps(projection, indent=2, sort_keys=True), exit_code(projection)
     roster, roster_error = load_roster(Path(args.roster))
     text = render(

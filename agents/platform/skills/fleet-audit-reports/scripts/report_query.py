@@ -228,8 +228,8 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
         if name == report_status.LATEST_NAME:
             envelope, loaded = report_status.load_last_named(root, audit_id, repo)
             if loaded not in (None, name):
-                # A run after the newest ring entry failed: answer from the
-                # entry, and say the ledger may have moved on since.
+                # `latest.json` is gone or older than the newest ring entry:
+                # answer from the entry, and say the ledger may have moved on.
                 name = loaded
                 envelope = {**envelope, "latest_missing": True} if envelope else None
         else:

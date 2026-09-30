@@ -21,7 +21,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest import mock
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -339,12 +339,24 @@ class TestFlags(unittest.TestCase):
 
     def test_the_timezone_flag_defaults_to_utc_and_refuses_an_unknown_zone(self):
         parser = view.build_parser()
-        self.assertEqual(parser.parse_args([]).timezone, ZoneInfo("UTC"))
+        self.assertEqual(parser.parse_args([]).timezone, timezone.utc)
         self.assertEqual(
             parser.parse_args(["--timezone", "America/Los_Angeles"]).timezone, LOS_ANGELES
         )
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             parser.parse_args(["--timezone", "Mars/Olympus_Mons"])
+        self.assertIn("unknown time zone", err.getvalue())
+
+    def test_the_default_zone_needs_no_tz_database(self):
+        # Windows without `tzdata`: every ZoneInfo lookup fails, and a run with
+        # no `--timezone` must still start. A named zone still fails cleanly.
+        missing = ZoneInfoNotFoundError("no time zone found")
+        with mock.patch.object(view, "ZoneInfo", side_effect=missing):
+            parser = view.build_parser()
+            self.assertEqual(parser.parse_args([]).timezone, timezone.utc)
+            self.assertEqual(parser.parse_args(["--timezone", "UTC"]).timezone, timezone.utc)
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                parser.parse_args(["--timezone", "America/Los_Angeles"])
         self.assertIn("unknown time zone", err.getvalue())
 
     def test_the_timezone_flag_reaches_stale_through_main(self):
@@ -882,6 +894,14 @@ class TestDashboard(unittest.TestCase):
         row = next(r for r in self.body_rows(self.render(streams)) if "cost-audit" in r)
         self.assertIn("held ?", row)
 
+    def test_an_unknown_ledger_count_makes_the_total_a_floor(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(last=self.held_open_clean(current=0, issue_number=None))
+        out = self.render(streams)
+        findings = next(line for line in out.splitlines() if "across 2 run streams" in line)
+        self.assertIn("57+", findings)
+        self.assertIn("1 ledger count unknown", findings)
+
     def test_a_trusted_hold_of_an_empty_ledger_is_zero_not_unknown(self):
         """A coverage issue lists no finding; held open over a trusted memory
         of it, the store knows that zero."""
@@ -977,6 +997,15 @@ class TestContextDiscovery(unittest.TestCase):
         # hub-b holds the pod and the hint may name it, but nothing reads it:
         # the only exec a fallback would run is the one that must not happen.
         self.assertEqual(fake.cmds("exec"), [])
+
+    def test_json_names_the_context_it_was_redirected_to(self):
+        # The file carries no context and `--file` renders it with none, so
+        # stderr is the only record that the read went to another cluster.
+        fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
+        rc, emitted, err = run_main(["--roster", NO_ROSTER, "--json"], fake)
+        self.assertEqual(rc, 0)
+        json.loads(emitted)
+        self.assertIn("on context hub-b", err)
 
     def test_one_other_context_is_not_reported_as_more_than_one(self):
         # Reachable because an explicit `--context` is never second-guessed:
