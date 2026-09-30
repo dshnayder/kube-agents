@@ -2281,7 +2281,7 @@ def test_a_pull_url_over_an_issue_number_is_a_fail(token, github):
 def _closed_from(ref: str = "platform-agent/fix") -> str:
     return (
         f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls"
-        f"?state=closed&head=gke-agentic:{ref.replace('/', '%2F')}&per_page=30"
+        f"?state=closed&head=gke-agentic:{ref.replace('/', '%2F')}&per_page=100"
     )
 
 

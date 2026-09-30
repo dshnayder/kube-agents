@@ -1348,7 +1348,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
         status_code, listed = _http_get_json(
             f"https://api.github.com/repos/{owner}/{repo}/pulls"
-            f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page=30",
+            f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
             budget,
         )

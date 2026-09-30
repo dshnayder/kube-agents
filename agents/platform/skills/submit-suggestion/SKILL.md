@@ -121,8 +121,10 @@ forge still holds that branch, a change cut fresh from the base does not build
 on it and `submit` would be refused as `BRANCH_DIVERGED`. `prepare` handles this
 itself: it asks the forge whether the branch is still there and, when it is,
 deletes it — the broker allows that only for a branch under `platform-agent/`,
-with no open proposal, whose tip is exactly what a closed proposal this install
-opened from this repository carried.
+with no open proposal, whose tip is exactly what a closed proposal from this
+repository carried, and every proposal on it opened by this install's
+credential. A credential that cannot name its own login cannot show the last
+part, so for it the prefix and the same-repository rule are the whole bar.
 The log line says which happened. On GitHub nothing is lost: the revisions stay
 reachable from the closed pull request.
 

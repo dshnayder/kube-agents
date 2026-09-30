@@ -345,9 +345,9 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
     fast-forwards it. A squash-merge or a close leaves it unreachable, and that
     is the one `prepare` clears the branch for.
 
-    The tip is the proposal's own `sourceRevision`, which every forge reports
-    on the proposal itself: where its branch was when the proposal was read,
-    or, for a closed or merged one, where it was when it closed. Not the last entry of `proposal-commits`: that
+    The tip is the proposal's own `sourceRevision`: where its branch was when
+    the proposal was read. For a closed or merged one GitHub reports where it
+    was when it closed, and the design requires the same of any other forge. Not the last entry of `proposal-commits`: that
     listing is oldest first and bounded by `limit`, so a proposal with more
     revisions than the page held answered with the oldest handful and the
     "tip" was whichever of them came last -- a revision the base may well
