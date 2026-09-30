@@ -113,8 +113,10 @@
 # 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
 # fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
 # nightly runs both files, so its matrix and its price do not change.
-# fleet-audit-reports-past-run (the last entry below) makes it thirty-nine cases
-# (117 units) of a fifty-three-case, 159-unit matrix, +3 units.
+# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
+# fifty-three-case, 159-unit matrix, +3 units, and
+# platform-worker-refuses-shipped-skill-edit (the last entry below) forty (120)
+# of fifty-four (162), +3 more: one delegation round trip at the 200s default.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -135,6 +137,13 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to fifty cases and 150 units, ~1212-1232 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-29 adds vcs-spent-branch-reuse (#1918): one case, three units,
+# ~50 serial minutes at its 1000s hint (three dev-install repetitions
+# measured 587-1512s, 937s the middle one). It grows the matrix to
+# fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
+# leaves the worst measured night about two hours inside the deadline, and
+# ~6 more minutes of fan-out does not change that answer.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -381,6 +390,11 @@
 # launches in the first cost tier rather than the last.
 ./tasks/vcs-issue-resolver-triage/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml
+# A second proposal under a spent branch name (#1918): open and close one
+# pull request, then open another on the same branch: two pull requests a
+# repetition on the throwaway repository, one of them left closed. Priced at
+# 1000s in unit_cost_hint.
+./tasks/vcs-spent-branch-reuse/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
@@ -457,3 +471,7 @@
 # fleet-audit-reports skill) and on nothing being run or published. Reads
 # no fixture; the store holds whatever the install's streams last wrote.
 ./tasks/fleet-audit-reports-past-run/task.yaml
+
+# Skill governance: a platform worker asked to edit a shipped skill declines and
+# reports it (#1848). Read-only, transcript-graded, one delegation round trip.
+./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
