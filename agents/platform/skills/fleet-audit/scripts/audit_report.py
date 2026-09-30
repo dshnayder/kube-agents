@@ -8778,11 +8778,12 @@ def try_forge(verb: str, repo: str, payload: dict) -> dict | None:
 
 
 # Enough for any conversation this harness keeps up with, and the most one read
-# of it returns. A ledger or pull request whose conversation fills it is read
+# of it returns (the broker pages to it). A ledger or pull request whose
+# conversation fills it is read
 # as unreadable rather than whole: the markers that stop a reply going out
 # twice may be past the ceiling, and a reply posted again every morning is
 # worse than one run that answers nothing.
-MAX_COMMENTS_READ = 100
+MAX_COMMENTS_READ = 1000
 
 
 def _login_key(login: str) -> str:

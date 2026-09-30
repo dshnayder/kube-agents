@@ -24,8 +24,10 @@ import repo_ref
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import BrokeredCredential, Credential, MintedReadCredential, NoCredential
 from ..validate import (
+    MAX_PAGE_SIZE,
     repo_segments,
     validate_branch,
+    validate_comment_limit,
     validate_labels,
     validate_limit,
     validate_number,
@@ -40,6 +42,11 @@ from .errors import ERROR_OVERRIDES
 # diff instead of JSON.
 DIFF_MEDIA_TYPE = "application/vnd.github.v3.diff"
 
+
+# How many `/issues` pages one `issue-list` reads to get past the pull requests
+# GitHub mixes in. Enough for a label a few hundred proposals share; bounded
+# so a repository that is nearly all proposals cannot make one call unbounded.
+MAX_ISSUE_PAGES = 10
 
 # `repos/{r}/collaborators/{login}/permission` values that mean "may write".
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
@@ -120,13 +127,30 @@ class GitHubForge(Forge):
         # requests it has already answered: a marker past the ceiling is a
         # marker it cannot see, so it answers the same request again on every
         # tick, forever. Saying so is what lets that caller refuse instead.
-        limit = validate_limit(payload.get("limit"))
-        nodes = api(
-            "GET",
-            f"repos/{repo}/issues/{number}/comments",
-            params={"per_page": limit},
+        limit = validate_comment_limit(payload.get("limit"))
+        nodes, truncated = self._conversation_pages(
+            api, f"repos/{repo}/issues/{number}/comments", limit
         )
-        return [translate.comment(node, "issue") for node in nodes], len(nodes) >= limit
+        return [translate.comment(node, "issue") for node in nodes], truncated
+
+    @staticmethod
+    def _conversation_pages(api: Callable, path: str, limit: int) -> tuple[list, bool]:
+        """Up to `limit` nodes from a comment endpoint, and whether it held more.
+
+        Page by page, because a limit past one page is exactly the case the
+        caller cares about. A caller whose limit fits one page makes one call,
+        as it always has; truncated when the last page it read was full.
+        """
+        per_page = min(limit, MAX_PAGE_SIZE)
+        nodes: list = []
+        page = 1
+        while True:
+            batch = api("GET", path, params={"per_page": per_page, "page": page}) or []
+            nodes += batch
+            full = len(batch) >= per_page
+            if not full or len(nodes) >= limit:
+                return nodes[:limit], full
+            page += 1
 
     def _proposal_comments(
         self, api: Callable, repo: str, number: int, payload: dict
@@ -139,12 +163,15 @@ class GitHubForge(Forge):
         # from as `kind`, because that decides whether it can be acknowledged
         # (a review summary has no reaction endpoint) and whether `path` and
         # `line` mean anything. Oldest first, across all three.
-        limit = validate_limit(payload.get("limit"))
-        params = {"per_page": limit}
+        limit = validate_comment_limit(payload.get("limit"))
         out, truncated = self._comments(api, repo, number, payload)
-        inline = api("GET", f"repos/{repo}/pulls/{number}/comments", params=params)
+        inline, inline_full = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/comments", limit
+        )
         out += [translate.comment(node, "review_comment") for node in inline]
-        reviews = api("GET", f"repos/{repo}/pulls/{number}/reviews", params=params)
+        reviews, reviews_full = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/reviews", limit
+        )
         out += [
             translate.comment(node, "review")
             for node in reviews
@@ -156,7 +183,7 @@ class GitHubForge(Forge):
         # the reviews page is judged on what the forge sent rather than on what
         # survived the body test -- a page of bodiless approvals is still a
         # page, and there may be an utterance behind it.
-        truncated = truncated or len(inline) >= limit or len(reviews) >= limit
+        truncated = truncated or inline_full or reviews_full
         # `ref` and not `id` as the tie-break: two of these three endpoints
         # number independently, so a conversation comment and a review comment
         # can share an id and the order between them would depend on which of
@@ -459,21 +486,43 @@ class GitHubForge(Forge):
                 },
             )
             nodes = (found or {}).get("items") or []
+            issues = [node for node in nodes if "pull_request" not in node]
+            returned = len(nodes)
         else:
-            nodes = api("GET", f"repos/{repo}/issues", params=params)
-        # GitHub's issues endpoint returns pull requests too -- a PR *is* an
-        # issue there. Nowhere else models it that way, and a caller that asked
-        # for issues and got proposals mixed in would have to know that. The
-        # `pull_request` key is how they are told apart.
-        issues = [node for node in nodes if "pull_request" not in node]
-        # `per_page` bounded what GitHub sent, not what survived the filter, so
-        # `truncated` is judged on the page rather than on the remainder.
+            issues, returned = self._issue_pages(api, repo, params, limit)
         return listing(
-            [translate.issue(node) for node in issues],
+            [translate.issue(node) for node in issues[:limit]],
             limit,
             "issues",
-            returned=len(nodes),
+            returned=returned,
         )
+
+    @staticmethod
+    def _issue_pages(
+        api: Callable, repo: str, params: dict[str, Any], limit: int
+    ) -> tuple[list[dict], int]:
+        """Up to `limit` issues from `/issues`, and how many the forge held back.
+
+        GitHub's issues endpoint returns pull requests too -- a PR *is* an
+        issue there. Nowhere else models it that way, and a caller that asked
+        for issues and got proposals mixed in would have to know that. The
+        `pull_request` key is how they are told apart, and it is applied after
+        the page is fetched, so a label proposals share can fill a whole page
+        with nothing to return. Reading that page as the answer is how a caller
+        concludes an issue it is looking for does not exist, so this reads on
+        until it has `limit` issues or the forge runs out, within a bound.
+
+        The count is what `listing` judges `truncated` on: `limit` when the last
+        page was full (the forge may hold more), otherwise what survived.
+        """
+        issues: list[dict] = []
+        for page in range(1, MAX_ISSUE_PAGES + 1):
+            nodes = api("GET", f"repos/{repo}/issues", params={**params, "page": page}) or []
+            issues += [node for node in nodes if "pull_request" not in node]
+            full = len(nodes) >= limit
+            if len(issues) >= limit or not full:
+                break
+        return issues, (limit if full else len(issues))
 
     def issue_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

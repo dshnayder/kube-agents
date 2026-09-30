@@ -1533,6 +1533,39 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("labels=bug", recorder.path)
         self.assertIn("state=open", recorder.path)
 
+    def test_issue_list_reads_past_a_page_of_proposals(self):
+        # A label that proposals share -- every remediation pull request carries
+        # its audit's label -- can fill the first page with proposals alone.
+        # Reading that page as "no issues" is how a second ledger gets opened.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in (9, 8)]
+        broker, recorder = self.broker(prs, [{"number": 3, "title": "the ledger"}])
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertFalse(answer["truncated"])
+        self.assertEqual(len(recorder.calls), 2)
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[1][4]))
+
+    def test_a_conversation_is_read_past_one_page(self):
+        # A long-lived ledger passes a hundred comments; the markers that stop
+        # a reply going out twice are on the later pages, so one page is not
+        # the conversation.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, recorder = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 120)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 500}
+        )
+        self.assertEqual(answer["commentCount"], 120)
+        self.assertFalse(answer["commentsTruncated"])
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[2][4]))
+
     def test_a_listing_says_when_it_is_a_page(self):
         broker, _ = self.broker([{"number": n} for n in range(3)])
         answer = broker.issue_list({"repository": "acme/infra", "limit": 3})

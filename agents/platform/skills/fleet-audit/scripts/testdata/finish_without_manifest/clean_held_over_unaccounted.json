@@ -161,7 +161,7 @@
   },
   {
    "comments": true,
-   "limit": 100,
+   "limit": 1000,
    "number": 42,
    "repository": "acme/fleet"
   },
