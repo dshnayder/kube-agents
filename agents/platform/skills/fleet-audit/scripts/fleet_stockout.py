@@ -243,6 +243,14 @@ ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
 # carries to serve one; and the GPU resource and taint key §3.9 reads.
 COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
 GPU_RESOURCE = "nvidia.com/gpu"
+# GKE's built-in compute classes: selected through the same nodeSelector key,
+# but provided by GKE rather than defined as `ComputeClass` objects, so a dump
+# that lacks them does not mean the reference dangles. `autopilot*` are the
+# classes GKE pre-installs as objects on Autopilot, listed in case a dump or a
+# Standard cluster lacks them. Compared lower-cased.
+BUILT_IN_COMPUTE_CLASSES = frozenset(
+    {"balanced", "scale-out", "performance", "accelerator", "autopilot", "autopilot-arm", "autopilot-spot"}
+)
 OPT_OUT_LABEL = "kubeagents.x-k8s.io/stockout-audit"
 OPT_OUT_VALUE = "exempt"
 # §2's "non-production": one of these as a `-`/`_`-delimited token of a name,
@@ -856,6 +864,10 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
     obj = f"{workload['kind']}/{workload['metadata']['name']}"
     selector = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
     if selector and selector not in compute_classes_by_name:
+        if selector.lower() in BUILT_IN_COMPUTE_CLASSES:
+            # GKE provides it and provisions its nodes, so neither the dangling
+            # arm nor the node-pool arm below has anything to compare against.
+            return None
         return {"namespace": namespace, "object": obj, "excerpt": f"nodeSelector references ComputeClass {selector!r}, which does not exist"}
     if selector:
         cc = compute_classes_by_name[selector]
@@ -1899,35 +1911,44 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
     name = f"{PROJECT_TARGET_PREFIX}{project}"
     unevaluated: dict[str, str] = {}
     limitations: list[str] = []
-    if reservations is None:
+    # rc 0 with output that is not a list -- an object, or text that does
+    # not parse -- is a read that did not answer, as the siblings in
+    # `collect_cluster` treat it: iterating nothing would record the check
+    # as run and clean.
+    reservations_read = isinstance(reservations, list)
+    if not reservations_read:
         reservations_failure = (
-            f"`gcloud compute reservations list` failed (rc={res_result.rc}) — "
-            f"{res_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no parseable output'}"
-        )
+            "`gcloud compute reservations list` returned output that is not a JSON list (rc=0) — "
+            if res_result.rc == 0
+            else f"`gcloud compute reservations list` failed (rc={res_result.rc}) — "
+        ) + (res_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
         unevaluated["reservation-mismatch-risk"] = reservations_failure
         limitations.append(f"reservation-mismatch-risk's idle-capacity form could not be measured: {reservations_failure}")
-    if failed_regions and not quota_records:
-        unevaluated["quota-exhaustion-risk"] = f"every regional quota read failed: {', '.join(failed_regions)}"
     if failed_regions:
         # A region that failed is a region nobody checked. Recording the check
-        # as run on the strength of the regions that answered, with nothing
-        # naming the one that did not, published an all-clear for it.
+        # as run on the strength of the regions that answered published an
+        # all-clear for it, because the document path carries `limitations`
+        # only for a check the collector lists unevaluated. So one failed
+        # region makes the check unevaluated; the answered regions' findings
+        # are still filed.
+        answered = f"; answered: {', '.join(quota_records)}" if quota_records else ""
+        unevaluated["quota-exhaustion-risk"] = f"regional quota reads failed: {', '.join(failed_regions)}{answered}"
         limitations.append(f"quota-exhaustion-risk could not read these regions: {', '.join(failed_regions)}")
 
     commands = []
     candidates = []
-    if reservations is not None:
+    if reservations_read:
         commands.append({"check": "reservation-mismatch-risk", **_record(shlex.join(res_argv), res_result)})
-        for reservation in reservations if isinstance(reservations, list) else []:
+        for reservation in reservations:
             # §3.10 does not flag non-production.
             if is_non_production(reservation.get("name", ""), reservation.get("resourceLabels")):
                 continue
             for hit in [check_reservation(reservation)]:
                 if hit:
                     candidates.append(_emit("reservation-mismatch-risk", hit))
-    if quota_records:
+    if quota_records and not failed_regions:
         commands.append({"check": "quota-exhaustion-risk", **next(iter(quota_records.values()))})
-        candidates.extend(quota_candidates)
+    candidates.extend(quota_candidates)
 
     entry = {
         "name": name,

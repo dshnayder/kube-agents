@@ -3067,7 +3067,7 @@ class UnderrequestTest(unittest.TestCase):
         """
         pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
         pod["spec"]["containers"].append(
-            {"name": "sidecar", "resources": {"requests": {"memory": "0"}}}
+            {"name": "sidecar", "resources": {"requests": {"memory": "64Mi"}}}
         )
         [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1900.0})
         self.assertEqual(hit["severity"], "major")
@@ -3075,6 +3075,16 @@ class UnderrequestTest(unittest.TestCase):
         self.assertNotIn("GiB limit", hit["excerpt"])
         self.assertIn("Raise the memory request to", hit["excerpt"])
         self.assertNotIn("raise the limit", hit["excerpt"])
+
+    def test_a_sidecar_declaring_a_zero_memory_request_skips_the_pod(self):
+        """`memory: "0"` sets nothing against the sidecar's own usage, so the
+        summed mean would land its usage on the main container's request --
+        the mis-attribution a sidecar with no request at all is skipped for."""
+        pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
+        pod["spec"]["containers"].append(
+            {"name": "sidecar", "resources": {"requests": {"memory": "0"}}}
+        )
+        self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 700.0}), [])
 
     def test_a_fully_limited_pod_near_its_limit_is_critical(self):
         # The control for the test above: the same numbers with no sidecar.
@@ -3894,6 +3904,25 @@ class IdleAddressTest(unittest.TestCase):
     def test_does_not_flag_referenced_by_annotation(self):
         self.assertEqual(fw.check_idle_address([self.address(name="my-ip")], {"my-ip"}, project="p", now=NOW), [])
 
+    def test_does_not_flag_an_address_held_for_dr_failover_or_migration(self):
+        # §3.5's description exclusion, whole words in any case.
+        for description in ("DR standby for prod", "failover for prod-usc1", "Fail-over VIP", "Disaster Recovery", "planned migration to us-east4"):
+            with self.subTest(description=description):
+                addr = {**self.address(), "description": description}
+                self.assertEqual(fw.check_idle_address([addr], set(), project="p", now=NOW), [])
+
+    def test_dr_inside_a_word_does_not_exempt_an_address(self):
+        addr = {**self.address(), "description": "old address for the drain job"}
+        self.assertEqual(len(fw.check_idle_address([addr], set(), project="p", now=NOW)), 1)
+
+    def test_an_address_an_ingress_names_is_referenced(self):
+        """An Ingress holds its global address RESERVED until its load
+        balancer provisions, and names it only in its own annotation."""
+        ingress = {"kind": "Ingress", "metadata": {"namespace": "web", "name": "shop", "annotations": {"kubernetes.io/ingress.global-static-ip-name": "shop-ip"}}}
+        context = fw.build_context({"items": [ingress]})
+        referenced = fw._fleet_facts(context)["referenced_addresses"]
+        self.assertEqual(fw.check_idle_address([self.address(name="shop-ip", region=None)], referenced, project="p", now=NOW), [])
+
     def test_rolls_up_ten_or_more_into_one_major_finding(self):
         addrs = [self.address(name=f"a{i}") for i in range(10)]
         hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
@@ -4098,6 +4127,31 @@ class OrphanLbTest(unittest.TestCase):
     def test_does_not_flag_multicluster_ingress(self):
         rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout multiclusteringress", "creationTimestamp": "2026-01-01T00:00:00Z"}
         self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    def test_does_not_flag_a_psc_endpoint_rule(self):
+        for extra in ({"target": "projects/p/regions/us-central1/serviceAttachments/sa1"}, {"pscConnectionId": "123"}):
+            with self.subTest(extra=extra):
+                rule = {"name": "fr1", "description": self.GKE_DESC, "creationTimestamp": "2026-01-01T00:00:00Z", **extra}
+                self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    def test_does_not_flag_an_internal_rule_whose_backend_service_is_live(self):
+        bs = {"name": "bs1", "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1", "backends": [{"group": "ig1"}]}
+        rule = {
+            "name": "fr1",
+            "description": self.GKE_DESC,
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "loadBalancingScheme": "INTERNAL",
+            "backendService": "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1/backendServices/bs1",
+        }
+        self.assertEqual(fw.check_orphan_lb([rule], [], [bs], set(), now=NOW), [])
+        # The controls: an empty backend service, one in another region, and
+        # an external rule all still leave the rule orphaned.
+        empty = {**bs, "backends": []}
+        self.assertEqual(len([h for h in fw.check_orphan_lb([rule], [], [empty], set(), now=NOW) if h["object"].startswith("ForwardingRule")]), 1)
+        elsewhere = {**bs, "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"}
+        self.assertEqual(len(fw.check_orphan_lb([rule], [], [elsewhere], set(), now=NOW)), 1)
+        external = {**rule, "loadBalancingScheme": "EXTERNAL"}
+        self.assertEqual(len(fw.check_orphan_lb([external], [], [bs], set(), now=NOW)), 1)
 
     def test_flags_empty_target_pool(self):
         hits = fw.check_orphan_lb([], [{"name": "tp1", "instances": []}], [], set(), now=NOW)
@@ -4434,6 +4488,21 @@ class CollectClusterTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 return fw.collect_cluster(cluster or self.CLUSTER, run=run, session=session or usage_session(), now=NOW)
+
+    def test_the_object_dump_reads_ingresses(self):
+        # §3.5's Ingress annotation is only seen if the dump holds Ingresses.
+        seen = []
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["kubectl", "get"]:
+                seen.append(argv)
+                return run_of(0, json.dumps(dump_of()))
+            return run_of(0, "[]" if argv[:3] == ["gcloud", "container", "node-pools"] else "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertIn("ingress", seen[0][2].split(","))
 
     def test_every_outcome_publishes_the_mode(self):
         # The mode is a cluster property `enumerate_clusters` already resolved,

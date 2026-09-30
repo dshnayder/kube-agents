@@ -7,7 +7,7 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/fleet_wide_cost_analysis_sop.md.
 
-This stream's own collector: its targets are both GKE clusters (the fourteen
+This stream's own collector: its targets are both GKE clusters (the fifteen
 `kubectl` object kinds in `collect_cluster`'s `dump_kinds`, a Cloud
 Monitoring usage read, `gcloud container node-pools list`, and §3.7's
 `gcloud container operations list` for `CREATE_NODE_POOL`, which dates each
@@ -138,6 +138,13 @@ PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # The zone or region and name in a PV's disk handle
 # (`projects/p/zones/us-central1-a/disks/data-1`, `.../regions/r/disks/n`).
 PV_DISK_HANDLE_RE = re.compile(r"(?:^|/)(?:zones|regions)/([^/]+)/disks/([^/]+)$")
+# §3.5's description exclusion: an address held for DR, failover, or a planned
+# migration is waiting on purpose. Whole words, any case, so `DR` does not
+# match inside `address` or `drain`.
+HELD_ADDRESS_DESCRIPTION_RE = re.compile(r"\b(?:dr|disaster[\s-]+recovery|fail-?over|migrat(?:e|ion|ing))\b", re.IGNORECASE)
+# The region (absent for a global one) and name in a backend service URL,
+# `.../regions/<r>/backendServices/<n>` or `.../global/backendServices/<n>`.
+BACKEND_SERVICE_URL_RE = re.compile(r"(?:regions/([^/]+)|global)/backendServices/([^/]+)$")
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -489,6 +496,9 @@ IDLE_SERVICE_TRIAGE = "service-fronted"
 # genuinely not worth reporting -- 33 MiB of under-booking distorts no node's
 # scheduling, and it is an upstream chart default no operator here owns.
 UNDERREQUEST_FLOOR_MIB = 128.0
+# §3.11's `critical` arm: a sustained mean at or above this fraction of an
+# enforced memory limit is an OOMKill waiting for one more request.
+UNDERREQUEST_NEAR_LIMIT_FRACTION = 0.9
 
 # §3.11 sizes the new memory request at 1.3x the observed per-replica peak.
 # 1.3 and not §3.1's 2x because sizing up costs bookable capacity on every node
@@ -1517,6 +1527,7 @@ def build_context(dump: dict) -> dict:
         "deployments": _by_kind(dump, "Deployment"),
         "hpas": _by_kind(dump, "HorizontalPodAutoscaler"),
         "limitranges": _by_kind(dump, "LimitRange"),
+        "ingresses": _by_kind(dump, "Ingress"),
     }
 
 
@@ -3586,7 +3597,9 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # The mean is summed over the pod's containers, and a container with no
         # memory request adds usage with no request to set it against -- so the
         # overage would land on whichever container did declare one.
-        if any("memory" not in req for pod in entry["pods"] for req in pod["requests"]):
+        # A declared zero counts as none, as `_declares_cpu_or_memory` reads it:
+        # a sidecar's `memory: "0"` sets nothing against its own usage either.
+        if any(not (parse_mem_mib(str(req.get("memory") or "")) or 0) > 0 for pod in entry["pods"] for req in pod["requests"]):
             continue
 
         replicas = len(entry["pods"])
@@ -3611,7 +3624,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # 64Mi floor under a request already being exceeded.
         peak_per_replica = _per_replica(keys, usage_peaks, 1)
         peak_mem = mean_mem if peak_per_replica is None else peak_per_replica * replicas
-        peak_text = "peak not read" if peak_per_replica is None else f"peak {peak_mem / 1024.0:.2f} GiB"
+        peak_text = "peak not read" if peak_per_replica is None else f"peak {peak_mem / MIB_PER_GIB:.2f} GiB"
 
         overage = mean_mem - mem_req_total
         if overage <= 0 or overage < UNDERREQUEST_FLOOR_MIB:
@@ -3639,19 +3652,19 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             for pod in entry["pods"]
             for lim in pod["limits"]
         )
-        near_limit = limited and mem_lim_total > 0 and mean_mem >= 0.9 * mem_lim_total
+        near_limit = limited and mem_lim_total > 0 and mean_mem >= UNDERREQUEST_NEAR_LIMIT_FRACTION * mem_lim_total
         severity = "critical" if near_limit else "major"
 
         if limited and mem_lim_total > 0:
-            ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit"
+            ceiling = f"{mem_lim_total / MIB_PER_GIB:.1f} GiB limit"
         elif mem_lim_total > 0:
             ceiling = "a memory limit on only some containers"
         else:
             ceiling = "no memory limit"
         excerpt = (
-            f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
-            f"{mean_mem / 1024.0:.2f} GiB {measured_over} — "
-            f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / 1024.0:.2f} GiB above it; "
+            f"requests {mem_req_total / MIB_PER_GIB:.2f} GiB of memory ({ceiling}); mean observed "
+            f"{mean_mem / MIB_PER_GIB:.2f} GiB {measured_over} — "
+            f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / MIB_PER_GIB:.2f} GiB above it; "
             f"{peak_text}. Sustained, not a burst."
         )
         # State the prescribed request rather than leaving it to be recomputed,
@@ -3698,8 +3711,8 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         if replicas > 1:
             excerpt += (
                 f" Totals span {replicas} replicas — per replica that is "
-                f"{mem_req_total / replicas / 1024.0:.2f} GiB requested against a "
-                f"{mean_mem / replicas / 1024.0:.2f} GiB mean and a {peak_mem / replicas / 1024.0:.2f} GiB "
+                f"{mem_req_total / replicas / MIB_PER_GIB:.2f} GiB requested against a "
+                f"{mean_mem / replicas / MIB_PER_GIB:.2f} GiB mean and a {peak_mem / replicas / MIB_PER_GIB:.2f} GiB "
                 f"peak, and the manifest change is per replica."
             )
         hits.append(
@@ -4382,7 +4395,10 @@ def _fleet_facts(context: dict) -> dict:
         f"{s.get('metadata', {}).get('namespace', '')}/{s.get('metadata', {}).get('name', '')}" for s in context["services"]
     }
     referenced_addresses = set()
-    for svc in context["services"]:
+    # An Ingress names its global address with
+    # `kubernetes.io/ingress.global-static-ip-name`, and holds it RESERVED
+    # until its load balancer provisions.
+    for svc in context["services"] + context.get("ingresses", []):
         annotations = svc.get("metadata", {}).get("annotations") or {}
         for key in LB_ANNOTATION_KEYS:
             value = annotations.get(key)
@@ -4471,7 +4487,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     if cred_run.rc != 0:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
-    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange"
+    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
@@ -5063,6 +5079,8 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
             continue
         if addr.get("name") in referenced_addresses or addr.get("address") in referenced_addresses:
             continue
+        if HELD_ADDRESS_DESCRIPTION_RE.search(addr.get("description") or ""):
+            continue
         age = _age_days(addr.get("creationTimestamp", ""), now=now)
         if age is None or age < 14:
             continue
@@ -5198,6 +5216,17 @@ def check_registry_no_cleanup(repositories: list[dict], *, project: str, now: da
     return hits
 
 
+def _backend_service_key(backend: dict) -> tuple[str, str]:
+    """`(region, name)` for a listed backend service; region is empty for a global one."""
+    return (str(backend.get("region") or "").rsplit("/", 1)[-1], str(backend.get("name") or ""))
+
+
+def _backend_service_url_key(url: str) -> tuple[str, str] | None:
+    """`_backend_service_key` for a URL a forwarding rule names, or None."""
+    m = BACKEND_SERVICE_URL_RE.search(url)
+    return (m.group(1) or "", m.group(2)) if m else None
+
+
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
     hits = []
     # The GKE service controller writes this description as a JSON object --
@@ -5209,6 +5238,7 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
     # optional quotes accept both that shape and the bare `key: value` form the
     # SOP's own example uses.
     svc_name_re = re.compile(r"""kubernetes\.io/service-name["']?\s*:\s*["']?([\w.-]+/[\w.-]+)""")
+    live_backends = {_backend_service_key(b) for b in backend_services if b.get("backends")}
     for rule in forwarding_rules:
         desc = rule.get("description", "") or ""
         m = svc_name_re.search(desc)
@@ -5218,6 +5248,20 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
             continue
         if m.group(1) in known_services:
             continue
+        # §3.6's PSC exclusion, for the endpoint side the rule list shows: a
+        # rule targeting a service attachment, or carrying a PSC connection.
+        # A rule a service attachment *publishes* needs `service-attachments
+        # list`, which is not read; SOP §2 leaves that one to be checked by hand.
+        if "/serviceAttachments/" in str(rule.get("target") or "") or rule.get("pscConnectionId"):
+            continue
+        # §3.6's other exclusion: an internal rule still delivering to a
+        # backend service that has backends is serving, whatever its
+        # description says. Internal passthrough rules name it in
+        # `backendService`, not `target`.
+        if str(rule.get("loadBalancingScheme") or "").startswith("INTERNAL"):
+            url = str(rule.get("backendService") or rule.get("target") or "")
+            if _backend_service_url_key(url) in live_backends:
+                continue
         age = _age_days(rule.get("creationTimestamp", ""), now=now)
         if age is None or age < 7:
             continue

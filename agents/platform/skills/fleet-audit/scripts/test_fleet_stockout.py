@@ -441,6 +441,15 @@ class DanglingComputeClassTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("does not exist", hit["excerpt"])
 
+    def test_does_not_flag_gke_built_in_classes(self):
+        # Built-ins are not ComputeClass objects in the dump, on either cluster
+        # mode, and the name is matched case-insensitively.
+        for name in ("Balanced", "Scale-Out", "Performance", "Accelerator", "autopilot", "autopilot-spot", "autopilot-arm"):
+            with self.subTest(name=name):
+                d = deployment("api", node_selector={"cloud.google.com/compute-class": name})
+                self.assertIsNone(fs.check_dangling_compute_class(d, {}, set()))
+                self.assertIsNone(fs.check_dangling_compute_class(d, {}, None))
+
     def test_does_not_flag_valid_reference(self):
         cc = compute_class("cc1", [])
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "cc1"})
@@ -2290,10 +2299,42 @@ class CollectProjectTest(unittest.TestCase):
             return run_of(0, json.dumps({"quotas": []}))
 
         entry = fs.collect_project("acme", {"us-central1", "europe-west1"}, run=run)
-        self.assertIn("quota-exhaustion-risk", {c["check"] for c in entry["commands"]})
-        self.assertNotIn("checks_unevaluated", entry)
+        # Unevaluated, not run: the document carries `limitations` only for a
+        # check the collector lists unevaluated, so a recorded command here
+        # published the silent region as clean.
+        self.assertNotIn("quota-exhaustion-risk", {c["check"] for c in entry["commands"]})
+        [unevaluated] = entry["checks_unevaluated"]
+        self.assertEqual(unevaluated["check"], "quota-exhaustion-risk")
+        self.assertIn("europe-west1", unevaluated["reason"])
+        self.assertIn("answered: us-central1", unevaluated["reason"])
         self.assertIn("europe-west1", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_the_answered_region_s_findings_survive_another_region_failing(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            if argv[:4] == ["gcloud", "compute", "regions", "describe"] and argv[4] == "europe-west1":
+                return run_of(1, "", "PERMISSION_DENIED")
+            return run_of(0, json.dumps({"quotas": [{"metric": "CPUS", "limit": 10, "usage": 10}]}))
+
+        entry = fs.collect_project("acme", {"us-central1", "europe-west1"}, run=run)
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["Quota/us-central1:CPUS"])
+
+    def test_a_reservations_answer_that_is_not_a_list_is_unevaluated(self):
+        for label, stdout in (("object", json.dumps({"error": "shim"})), ("unparseable", '[{"name": "trunc')):
+            with self.subTest(label):
+                def run(argv, **kwargs):
+                    if argv[:3] == ["gcloud", "compute", "reservations"]:
+                        return run_of(0, stdout)
+                    return run_of(0, json.dumps({"quotas": []}))
+
+                entry = fs.collect_project("acme", {"us-central1"}, run=run)
+                self.assertNotIn("reservation-mismatch-risk", {c["check"] for c in entry["commands"]})
+                [unevaluated] = entry["checks_unevaluated"]
+                self.assertEqual(unevaluated["check"], "reservation-mismatch-risk")
+                self.assertIn("returned output that is not a JSON list (rc=0)", unevaluated["reason"])
+                self.assertIn("not a JSON list", entry["limitations"])
 
     def test_one_metric_over_the_line_in_two_regions_is_two_findings(self):
         def run(argv, **kwargs):
@@ -2529,6 +2570,67 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         for target in data["scope"]["clusters"]:
             for entry in target["checks_run"]:
                 audit_report.validate_check_command(entry["command"], target["name"], entry["check"])
+
+    def test_a_region_whose_quota_read_failed_reaches_finish_as_a_gap(self):
+        """One silent region used to leave the check in `commands` with only a
+        `limitations` string, which the SOP carries only for an unevaluated
+        check -- so the copied document named the check run and `finish`
+        published the region as clean."""
+        import audit_report
+
+        clusters_json = json.dumps([
+            {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+            {"name": "c2", "location": "europe-west1", "status": "RUNNING"},
+        ])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            if argv[:4] == ["gcloud", "compute", "regions", "describe"] and argv[4] == "europe-west1":
+                return run_of(1, "", "PERMISSION_DENIED")
+            if argv[:3] == ["gcloud", "compute", "regions"]:
+                return run_of(0, json.dumps({"quotas": []}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet("acme", run=run)
+
+        # Copied as the SOP says and as the survives-cross-check test copies.
+        data = {
+            "audit": "stockout-prevention",
+            "scope": {
+                "clusters": [
+                    {
+                        "name": e["name"],
+                        "location": e.get("location", "global"),
+                        "project": "acme",
+                        "checks_run": [{"check": c["check"], "command": c["command"]} for c in e["commands"]],
+                        **({"limitations": e["limitations"]} if e.get("checks_unevaluated") else {}),
+                    }
+                    for e in manifest["clusters"]
+                    if e["outcome"] == "collected"
+                ],
+                "skipped": [{"cluster": fs.UNENUMERATED_PROJECTS_TARGET, "reason": "scope narrowed by --project"}],
+            },
+        }
+        audit_report.cross_check_manifest(data, manifest)  # must not raise
+        [gap] = [g for g in audit_report.coverage_gaps(data) if g.startswith("project/acme")]
+        self.assertIn("europe-west1", gap)
+
+        # And the check cannot be claimed as run over the silent region.
+        project = next(c for c in data["scope"]["clusters"] if c["name"] == "project/acme")
+        project["checks_run"].append({"check": "quota-exhaustion-risk", "command": "gcloud compute regions describe us-central1"})
+        with self.assertRaisesRegex(audit_report.ValidationError, "as run or not applicable"):
+            audit_report.cross_check_manifest(data, manifest)
 
     def test_a_check_whose_read_failed_is_rejected_as_run(self):
         import audit_report

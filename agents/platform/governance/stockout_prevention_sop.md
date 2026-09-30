@@ -257,7 +257,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
 - **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; or (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations.
-- **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations.
+- **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations; workloads selecting one of GKE's built-in compute classes (`Balanced`, `Scale-Out`, `Performance`, `Accelerator`, `autopilot`, `autopilot-spot`, `autopilot-arm`, any case), which GKE provides and provisions without a `ComputeClass` object in the dump.
 - **Severity:** `critical`.
 - **Impact:** "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state."
 - **Remediation:** `kind: manifest`. Correct the ComputeClass name in GitOps, fix invalid CRD fields, or add required GPU tolerations to workload templates.
