@@ -490,6 +490,9 @@ class ClusterZoneSpanTest(unittest.TestCase):
     def test_an_unread_pool_list_is_unknown(self):
         self.assertIsNone(fs.cluster_zone_span({"location": "us-central1"}, [], False))
 
+class CccPodFamilyChainTest(unittest.TestCase):
+    """§3.1 on chains that name a `podFamily`, which pins no machine family."""
+
     def test_does_not_flag_a_pod_family_chain(self):
         """GKE's built-in `autopilot`, verbatim: one priority, no machine family.
 
@@ -2808,7 +2811,10 @@ class ProjectDiscoveryTest(unittest.TestCase):
 
         manifest = self.collect(run)
         self.assertEqual(describes.count("acme"), 1)
-        self.assertNotIn("project/acme", {c["name"] for c in manifest.get("clusters", [])})
+        # With both APIs off `acme` holds nothing and yields no target, not a
+        # failed one: the run's error cites only `beta`'s failure.
+        self.assertIn("First: project/beta: cluster enumeration refused", manifest["error"])
+        self.assertNotIn("project/acme", manifest["error"])
 
     def test_the_listing_runs_under_its_own_timeout_not_the_default(self):
         timeouts = []

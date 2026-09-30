@@ -14669,6 +14669,14 @@ class TestScopedCoverage(unittest.TestCase):
         )
         self.assertEqual(gaps, [])
 
+    def test_a_check_a_present_kind_carries_is_not_stranded(self):
+        """Stockout with clusters and no project: `reservation-mismatch-risk`
+        ran on its cluster arm, so only the project-only check is stranded."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("stockout-prevention", [{"name": "acme/us-east4/prod"}]),
+            ["no project targets were audited — 1 check(s) ran against nothing (quota-exhaustion-risk)"],
+        )
+
     def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
         self.assertEqual(
             audit_report._unenumerated_kind_gaps("compliance-audit", [{"name": "prod-us-east"}]),

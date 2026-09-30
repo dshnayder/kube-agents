@@ -7903,9 +7903,11 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             # A scalar or a list where the chart template goes is a malformed
             # document, and one malformed file must not crash the whole run
             # before the manifest prints. Skip it; `sourceRef` is guarded alike.
-            chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
-            chart_spec = chart.get("spec") if chart.get("spec") is not None else {}
-            if not isinstance(chart_spec, dict):
+            # An absent `chart` is the `chartRef` form, which still indexes, on
+            # an empty chart, for the values field it names.
+            chart = spec.get("chart") if spec.get("chart") is not None else {}
+            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
+            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
                 continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)

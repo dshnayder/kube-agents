@@ -1870,6 +1870,17 @@ class OverrequestTest(unittest.TestCase):
 
     IDLE = {("default", "api-1"): (0.0, 0.0)}
 
+    def test_a_native_sidecars_request_is_sized_and_the_target_is_a_pod_total(self):
+        """The app sits on the floor; the sidecar requests 4 vCPU / 8Gi and
+        uses none of it. Its usage is in the peak, so its request is in the
+        sum, and the Resize-to figure says it is the pod's to split."""
+        pod = self.deployment_pod(cpu_req="50m", mem_req="64Mi")
+        pod["spec"]["initContainers"] = [
+            {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "4", "memory": "8Gi"}}},
+        ]
+        [hit] = fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)
+        self.assertIn("That is the pod's total, native sidecar `proxy` included", hit["excerpt"])
+
     def hashed_pod(self):
         pod = self.deployment_pod(owner_name="api-5d8f7")
         pod["metadata"]["labels"]["pod-template-hash"] = "5d8f7"
@@ -2621,6 +2632,16 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
         self.assertIn("no resize can reclaim", hits[0]["excerpt"])
 
+    def test_a_request_on_a_native_sidecar_alone_makes_the_controller_sized(self):
+        """Sized on the sidecar, so §3.13 judges it and §3.12 does not."""
+        pod = self.pod(cpu_req=None, mem_req=None)
+        pod["spec"]["initContainers"] = [
+            {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}}},
+        ]
+        [hit] = self.hits(pods=[pod])
+        self.assertIn("requests 0.050 vCPU / 64 MiB", hit["excerpt"])
+        self.assertEqual(fw.check_unsized(self.context(pods=[pod]), self.IDLE, now=NOW, autopilot=False), [])
+
     def test_an_hpa_target_is_not_idle(self):
         """§3.13 applies §3.1's exclusions, the HPA one included: the HPA holds
         its target at `minReplicas`, so a merged `replicas: 0` is undone on
@@ -3108,6 +3129,25 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("unmeasured rather than zero", excerpt)
         self.assertNotIn("nothing measurable reached it", excerpt)
 
+    def test_every_measured_shape_names_the_unmeasured_rule(self):
+        """The mixed clause follows each of the measured rule's answers, not
+        only the under-the-floor one above."""
+        other = "35.245.254.69"
+        unmeasured = "; the other 1 carries no Cloud Monitoring traffic series, so what reached it is unmeasured rather than zero"
+        shapes = {
+            "outbound unmeasured": ({"egress_packets": None}, "because Cloud Monitoring holds no outbound series for the rule" + unmeasured),
+            "answered none": ({"egress_packets": 0}, "and answered none of them" + unmeasured),
+            "payload unmeasured": ({"egress_packets": 3000, "egress_bytes": None}, "their payload is unmeasured, because Cloud Monitoring holds no outbound series for the rule" + unmeasured),
+            "no payload": ({"egress_packets": 3000, "egress_bytes": 3000 * 60}, "rather than of sessions" + unmeasured),
+            "payload served": ({"egress_packets": 3000, "egress_bytes": 3000 * 900}, "something is being served" + unmeasured + ". Find out what"),
+        }
+        for label, (egress, expected) in shapes.items():
+            with self.subTest(label):
+                traffic = {**self.traffic(ingress=50000, **egress), **self.traffic(ip=other, rule="b-rule")}
+                excerpt = self.hits(services=[self.svc(ip=self.IP), self.svc("second", ip=other)], lb_traffic=traffic)[0]["excerpt"]
+                self.assertIn("1 of the 2 forwarding rules in front of it metered 50,000 inbound packets", excerpt)
+                self.assertIn(expected, excerpt)
+
     def test_no_traffic_read_at_all_writes_no_clause(self):
         # `lb_traffic=None` is a run with no Monitoring session, or the
         # collector invoked by hand. Silence, not a zero and not a caveat.
@@ -3240,6 +3280,42 @@ class UnderrequestTest(unittest.TestCase):
         self.assertIn("peak not read", hit["excerpt"])
         self.assertIn("GiB mean, and the manifest change is per replica", hit["excerpt"])
         self.assertNotIn("GiB peak", hit["excerpt"])
+
+    def with_sidecar(self, pod, mem_req="512Mi", mem_lim=None, app="app", sidecar="proxy"):
+        """A native sidecar: an init container with `restartPolicy: Always`,
+        whose usage Cloud Monitoring sums into the pod's with the app's."""
+        pod["spec"]["containers"][0]["name"] = app
+        resources = {"requests": {"memory": mem_req}} if mem_req else {}
+        if mem_lim:
+            resources["limits"] = {"memory": mem_lim}
+        pod["spec"]["initContainers"] = [{"name": sidecar, "restartPolicy": "Always", "resources": resources}]
+        return pod
+
+    def test_a_native_sidecars_request_is_set_against_the_usage_it_adds(self):
+        """512Mi app plus a 1Gi sidecar is 1.5Gi requested against a 973Mi
+        mean: under the request, where the app's 512Mi alone read as 190%."""
+        pod = self.with_sidecar(self.pod(), mem_req="1Gi")
+        self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 973.0}), [])
+
+    def test_a_native_sidecar_with_no_memory_request_makes_the_mean_unattributable(self):
+        pod = self.with_sidecar(self.pod(), mem_req=None)
+        self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 973.0}), [])
+
+    def test_the_raise_lands_on_the_app_container_net_of_the_sidecar(self):
+        """The sidecar requests more than the app, and still is not the one
+        named; its 512Mi comes off the pod figure rather than landing on the
+        app. ceil(1500 x 1.3) = 1950, less 512 = 1438."""
+        pod = self.with_sidecar(self.pod(mem_req="256Mi", mem_lim="4Gi"))
+        [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1500.0})
+        self.assertIn("Raise the memory request of container `app` to 1438Mi, leaving the others' 512Mi as it is.", hit["excerpt"])
+
+    def test_an_unlimited_native_sidecar_leaves_the_sum_no_ceiling(self):
+        """App limited at 1Gi, sidecar unlimited: the sum binds nothing, so a
+        mean near 1Gi is `major`, not the `critical` the app alone read as."""
+        pod = self.with_sidecar(self.pod(mem_req="256Mi", mem_lim="1Gi"))
+        [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1000.0})
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("a memory limit on only some containers", hit["excerpt"])
 
     def test_a_container_with_no_memory_request_makes_the_mean_unattributable(self):
         pod = self.pod()
@@ -7380,25 +7456,54 @@ class ReleaseDeclarationsSurviveMalformedDocumentsTest(unittest.TestCase):
         "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"
         "spec: {chart: {spec: {chart: web-chart, version: 1.0.0, sourceRef: {name: charts}}}}\n"
     )
+    # Each shape, and the release key it must not produce (None for a
+    # document that declares no release of its own).
     MALFORMED = {
-        "chart.spec scalar": "kind: HelmRelease\nmetadata: {name: a, namespace: apps}\nspec: {chart: {spec: oops}}\n",
-        "chart.spec list": "kind: HelmRelease\nmetadata: {name: b, namespace: apps}\nspec: {chart: {spec: [x]}}\n",
-        "chart list": "kind: HelmRelease\nmetadata: {name: c, namespace: apps}\nspec: {chart: [x]}\n",
-        "repository spec list": "kind: HelmRepository\nmetadata: {name: charts, namespace: apps}\nspec: [x]\n",
-        "secret labels list": "kind: Secret\nmetadata: {name: s, labels: [x]}\nstringData: {server: https://x, name: y}\n",
+        "chart.spec scalar": ("kind: HelmRelease\nmetadata: {name: a, namespace: apps}\nspec: {chart: {spec: oops}}\n", "a"),
+        "chart.spec list": ("kind: HelmRelease\nmetadata: {name: b, namespace: apps}\nspec: {chart: {spec: [x]}}\n", "b"),
+        "chart list": ("kind: HelmRelease\nmetadata: {name: c, namespace: apps}\nspec: {chart: [x]}\n", "c"),
+        "chart scalar": ("kind: HelmRelease\nmetadata: {name: d, namespace: apps}\nspec: {chart: oops}\n", "d"),
+        "repository spec list": ("kind: HelmRepository\nmetadata: {name: charts, namespace: apps}\nspec: [x]\n", None),
+        "secret labels list": ("kind: Secret\nmetadata: {name: s, labels: [x]}\nstringData: {server: https://x, name: y}\n", None),
     }
 
+    def index_with(self, release_declarations, text):
+        with TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "clusters" / "prod-usc1"
+            tree.mkdir(parents=True)
+            (tree / "good.yaml").write_text(self.GOOD)
+            (tree / "bad.yaml").write_text(text)
+            return release_declarations(Path(tmp))
+
+    def assert_skips_every_malformed_document(self, release_declarations, key_prefix):
+        for label, (text, release) in self.MALFORMED.items():
+            with self.subTest(label):
+                index = self.index_with(release_declarations, text)
+                good = index[(*key_prefix, "web")]
+                self.assertEqual(good["chart"], "web-chart")
+                # Neither malformed source document resolves a repository.
+                self.assertEqual(good["repo"], "")
+                if release:
+                    self.assertNotIn((*key_prefix, release), index)
+
     def test_each_malformed_document_is_skipped(self):
-        for label, text in self.MALFORMED.items():
-            with self.subTest(label), TemporaryDirectory() as tmp:
-                tree = Path(tmp) / "clusters" / "prod-usc1"
-                tree.mkdir(parents=True)
-                (tree / "good.yaml").write_text(self.GOOD)
-                (tree / "bad.yaml").write_text(text)
-                index = fw.release_declarations(Path(tmp))
-                self.assertEqual(index[("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "web")]["chart"], "web-chart")
-                self.assertNotIn(("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "a"), index)
-                self.assertNotIn(("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "b"), index)
+        self.assert_skips_every_malformed_document(fw.release_declarations, ("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps"))
+
+    def test_the_chart_ref_form_still_indexes_on_an_empty_chart(self):
+        """No `chart` at all is `spec.chartRef`, not a malformed template."""
+        text = "kind: HelmRelease\nmetadata: {name: e, namespace: apps}\nspec: {chartRef: {kind: OCIRepository, name: e}}\n"
+        entry = self.index_with(fw.release_declarations, text)[("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "e")]
+        self.assertEqual((entry["chart"], entry["values_field"]), ("", "spec.values"))
+
+
+class ClusterDumpKindsTest(unittest.TestCase):
+    """The SOP tells the model which kinds the dump already holds so it does
+    not read them again; that list has to be the one the collector runs."""
+
+    SOP = Path(__file__).resolve().parents[3] / "governance" / "fleet_wide_cost_analysis_sop.md"
+
+    def test_the_sop_quotes_the_kinds_the_collector_dumps(self):
+        self.assertIn(f"`fleet_waste.py` dumps `{fw.CLUSTER_DUMP_KINDS}`", self.SOP.read_text())
 
 
 class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
@@ -7408,8 +7513,9 @@ class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
     A right-size is the fix a pull request carries best, and `resources` is the
     key nearly every chart publishes -- so a chart-rendered workload resolving
     to the file declaring its release is the difference between a diff and a
-    paragraph. `release_declarations` itself is `collect.py`'s and tested
-    there; what is new here is the trip from `collect_fleet` through the thread
+    paragraph. `release_declarations` is a copy of `collect.py`'s
+    (`DeclarationIndexIsACopyTest`), tested on malformed documents in both
+    files; what is new here is the trip from `collect_fleet` through the thread
     pool, into the per-cluster index `_releases_by_object` builds off the dump,
     and out through the `emit` closure.
     """

@@ -89,14 +89,16 @@ from typing import Callable, NamedTuple
 MANIFEST_VERSION = 1
 # The stream this collector serves, as `audit_report.py finish --audit` names it.
 AUDIT_ID = "stockout-prevention"
+# `started_at` and `finished_at`: UTC, to the second, as the manifest contract spells them.
+MANIFEST_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-# A digest of this file, published in the manifest. `audit_report.py` compares
-# it against the previous run's to tell a finding that stopped reproducing from
-# a check that stopped looking; see `render_delta_comment`.
-# Long enough that two collector sources will not collide, short enough to
-# read in a log line. It has to agree across every collector: the comparison
-# is between one run's revision and the last one's, so a file that truncated
-# differently would report a moved collector on the run that changed it.
+# A digest of this file, published as `checks_revision`. The manifest contract
+# (docs/designs/fleet-audit-collector-manifest.md §2) carries it unread today,
+# reserved for the run-over-run comparison that tells a finding that stopped
+# reproducing from a check that stopped looking. Long enough that two collector
+# sources will not collide, short enough to read in a log line, and the same
+# width in every collector: a file that truncated differently would report a
+# moved collector on the run that changed it.
 REVISION_DIGEST_CHARS = 12
 CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
@@ -999,8 +1001,11 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     # the GitOps clone to write to. 49 of one run's 67 findings were this.
     #
     # `all()`, not `any()`: a chain mixing pod-family and machine-typed entries
-    # was hand-authored, its machine-typed entries are real pins, and a finding
-    # against it is something an operator can act on.
+    # was hand-authored and its machine-typed entries are real pins, so it is
+    # not exempt. It is never filed either: its pod-family entries leave family
+    # and size unknown, and with those two open it either varies enough or
+    # comes back `unevaluated` with `CCC_MACHINE_UNNAMED` -- a gap the manifest
+    # names rather than a silence.
     if all(_priority_is_pod_family(p) for p in priorities):
         return None
     default_zones = (((cc.get("spec") or {}).get("priorityDefaults") or {}).get("location") or {}).get("zones") or []
@@ -2448,7 +2453,7 @@ def _only_a_scope_note(entry: dict, project: str | None) -> bool:
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    started_at = time.strftime(MANIFEST_TIMESTAMP_FORMAT, time.gmtime())
     # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
     # `projects list` spends the same terminal timeout the reads do.
     deadline = time.monotonic() + project_budget_s
@@ -2463,7 +2468,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             "checks_revision": CHECKS_REVISION,
             "audit": AUDIT_ID,
             "started_at": started_at,
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "finished_at": time.strftime(MANIFEST_TIMESTAMP_FORMAT, time.gmtime()),
             "error": error,
             "clusters": [],
         }
@@ -2608,7 +2613,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         "checks_revision": CHECKS_REVISION,
         "audit": AUDIT_ID,
         "started_at": started_at,
-        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": time.strftime(MANIFEST_TIMESTAMP_FORMAT, time.gmtime()),
         "clusters": entries,
     }
 

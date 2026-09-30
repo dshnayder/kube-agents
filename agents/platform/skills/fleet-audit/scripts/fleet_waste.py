@@ -8,7 +8,7 @@ document against; the checks it runs are defined in
 governance/fleet_wide_cost_analysis_sop.md.
 
 This stream's own collector: its targets are both GKE clusters (the fifteen
-`kubectl` object kinds in `collect_cluster`'s `dump_kinds`, a Cloud
+`kubectl` object kinds in `CLUSTER_DUMP_KINDS`, a Cloud
 Monitoring usage read, `gcloud container node-pools list`, and §3.7's
 `gcloud container operations list` for `CREATE_NODE_POOL`, which dates each
 pool; a pool with no such operation is dated from the cluster's `createTime`,
@@ -74,14 +74,17 @@ from typing import Any, Callable, NamedTuple
 MANIFEST_VERSION = 1
 # The manifest's `audit` field: the stream this collector feeds.
 AUDIT_NAME = "fleet-wide-cost-analysis"
+# The one `kubectl get` each collected cluster costs. The SOP quotes this list
+# to tell the model which kinds not to read again.
+CLUSTER_DUMP_KINDS = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
-# A digest of this file, published in the manifest. `audit_report.py` compares
-# it against the previous run's to tell a finding that stopped reproducing from
-# a check that stopped looking; see `render_delta_comment`.
-# Long enough that two collector sources will not collide, short enough to
-# read in a log line. It has to agree across every collector: the comparison
-# is between one run's revision and the last one's, so a file that truncated
-# differently would report a moved collector on the run that changed it.
+# A digest of this file, published as `checks_revision`. The manifest contract
+# (docs/designs/fleet-audit-collector-manifest.md §2) carries it unread today,
+# reserved for the run-over-run comparison that tells a finding that stopped
+# reproducing from a check that stopped looking. Long enough that two collector
+# sources will not collide, short enough to read in a log line, and the same
+# width in every collector: a file that truncated differently would report a
+# moved collector on the run that changed it.
 REVISION_DIGEST_CHARS = 12
 CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
@@ -2112,6 +2115,21 @@ def _pod_is_mirror(pod: dict) -> bool:
     return any(o.get("kind") == "Node" for o in (pod.get("metadata", {}).get("ownerReferences") or []))
 
 
+def _sizing_containers(spec: dict) -> tuple[list[dict], list[dict]]:
+    """A pod's long-running containers, native sidecars last, and the rest.
+
+    Cloud Monitoring's per-pod usage sums every container that runs, and a
+    `restartPolicy: Always` init container runs for the pod's whole life. The
+    request side has to cover the same containers or a sidecar's usage is set
+    against the app containers' requests alone. The second list is the plain
+    init containers, which run to completion before the app starts.
+    """
+    init = spec.get("initContainers") or []
+    sidecars = [c for c in init if c.get("restartPolicy") == SIDECAR_RESTART_POLICY]
+    plain = [c for c in init if c.get("restartPolicy") != SIDECAR_RESTART_POLICY]
+    return (spec.get("containers") or []) + sidecars, plain
+
+
 def _container_requests(c: dict) -> tuple[float, float]:
     req = (c.get("resources") or {}).get("requests") or {}
     return parse_cpu_cores(str(req.get("cpu", "0"))) or 0, parse_mem_mib(str(req.get("memory", "0"))) or 0
@@ -2899,7 +2917,10 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
             continue
         if any(o.get("kind") == "DaemonSet" for o in owners):
             continue
-        containers = spec.get("containers") or []
+        # Native sidecars included: the usage these requests are set against
+        # sums them (`_sizing_containers`).
+        containers, init_containers = _sizing_containers(spec)
+        sidecars = [str(c.get("name") or "") for c in containers[len(spec.get("containers") or []):]]
         requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
         limits = [(c.get("resources") or {}).get("limits") or {} for c in containers]
         if not _declares_cpu_or_memory(requests):
@@ -2913,13 +2934,12 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         # silently wrong later.
         kind, owner_name = _sizing_owner(meta)
         entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None, "labels": {}})
-        # Init containers, native sidecars among them, take no part in the
-        # sizing sums above, but kubelet counts them for QoS: an init container
-        # without limits makes the pod Burstable. `_is_guaranteed` reads them.
-        init_containers = spec.get("initContainers") or []
+        # Plain init containers take no part in the sizing sums above, but
+        # kubelet counts them for QoS: an init container without limits makes
+        # the pod Burstable. `_is_guaranteed` reads them.
         init_requests = [(c.get("resources") or {}).get("requests") or {} for c in init_containers]
         init_limits = [(c.get("resources") or {}).get("limits") or {} for c in init_containers]
-        entry["pods"].append({"ns": ns, "name": name, "containers": [str(c.get("name") or "") for c in containers], "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits})
+        entry["pods"].append({"ns": ns, "name": name, "containers": [str(c.get("name") or "") for c in containers], "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits, "sidecars": sidecars})
         # For `check_idle_workload`'s Service join. Replicas of one controller
         # share the selector labels by construction, so the first pod's set
         # answers for the controller; a later pod merges in rather than
@@ -3553,6 +3573,16 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 f"against a {peak_cpu / replicas:.3f} vCPU / {peak_mem / replicas / MIB_PER_GIB:.2f} GiB peak, "
                 f"and the manifest change is per replica"
             )
+        # The usage behind the target sums every running container, native
+        # sidecars included, so the figure is the pod's. Written on the app
+        # container alone it would carry the sidecar's share as well.
+        sidecars = sorted({s for pod in entry["pods"] for s in pod.get("sidecars") or () if s})
+        if sidecars:
+            excerpt += (
+                ". That is the pod's total, native sidecar "
+                + ", ".join(f"`{s}`" for s in sidecars)
+                + " included: split it across the containers rather than writing it on one"
+            )
         excerpt += "."
 
         hits.append(
@@ -4012,7 +4042,12 @@ def _underrequest_target(pods: list[dict]) -> tuple[str, float, float | None]:
     first = pods[0]
     names = first.get("containers") or [""] * len(first["requests"])
     sizes = [parse_mem_mib(str(req.get("memory") or "")) or 0 for req in first["requests"]]
-    target = names[sizes.index(max(sizes))] if sizes else ""
+    # Never a native sidecar: the overage is the app's to carry, and the
+    # sidecar's own request is among the others' subtracted below, so the raise
+    # does not hand its usage to the app container either.
+    sidecars = set(first.get("sidecars") or ())
+    app = [(size, cname) for cname, size in zip(names, sizes) if cname not in sidecars]
+    target = max(app, key=lambda pair: pair[0])[1] if app else ""
     others: list[float] = []
     limits: list[float] = []
     for pod in pods:
@@ -4230,7 +4265,9 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
             continue
         if any(o.get("kind") == "DaemonSet" for o in owners):
             continue
-        containers = spec.get("containers") or []
+        # The containers `_eligible_pods_by_owner` sizes, so a pod whose only
+        # request is on a native sidecar lands in exactly one of the two.
+        containers, _ = _sizing_containers(spec)
         if not containers:
             continue
         requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
@@ -4720,9 +4757,11 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             # A scalar or a list where the chart template goes is a malformed
             # document, and one malformed file must not crash the whole run
             # before the manifest prints. Skip it; `sourceRef` is guarded alike.
-            chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
-            chart_spec = chart.get("spec") if chart.get("spec") is not None else {}
-            if not isinstance(chart_spec, dict):
+            # An absent `chart` is the `chartRef` form, which still indexes, on
+            # an empty chart, for the values field it names.
+            chart = spec.get("chart") if spec.get("chart") is not None else {}
+            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
+            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
                 continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)
@@ -4941,10 +4980,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     if cred_run.rc != 0:
         return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
-    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
-
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
+    dump_argv = ["kubectl", "get", CLUSTER_DUMP_KINDS, "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
@@ -5779,7 +5816,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         and refusal_names_project(project, disks_result.stderr, run=run)
     )
     compute_failed = bool(failed) and not compute_disabled
-    compute_error = f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed)
+    compute_error = f"{len(failed)} of {len(compute_reads)} compute list reads failed -- " + "; ".join(failed)
 
     # Outside the five-read gate above, on purpose. Those five gate as one
     # because §3.4-§3.6 cross-reference each other's objects; §3.14 shares

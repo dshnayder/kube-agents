@@ -3583,9 +3583,17 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     listed_empty = bool(projects) and all(
         t.get(CLUSTERS_LISTED_KEY) == 0 and not isinstance(t.get(CLUSTERS_LISTED_KEY), bool) for t in projects
     )
+    # A check owed by more than one kind ran wherever a present kind carried
+    # it: stockout's `reservation-mismatch-risk` has a cluster arm beside its
+    # project one, and a run with clusters and no project did not run it
+    # "against nothing".
+    covered = {check for kind, checks in spec.scopes if kind in seen for check in checks}
     gaps = []
     for kind, checks in spec.scopes:
         if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
+            continue
+        checks = tuple(c for c in checks if c not in covered)
+        if not checks:
             continue
         gaps.append(
             f"no {kind} targets were audited — {len(checks)} check(s) ran "
