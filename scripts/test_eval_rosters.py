@@ -497,7 +497,8 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         for case, count in listed.items():
             with self.subTest(listed=case):
                 self.assertIn(case, self.lane_cases())
-                self.assertLess(lane.requested_pull_requests(self.task_spec(case)), count, f"{case}'s own checks request {count} pull request(s) now; drop it from `requesting:`")
+                requested = lane.requested_pull_requests(self.task_spec(case))
+                self.assertLess(requested, count, f"{case}'s own checks request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
