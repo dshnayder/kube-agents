@@ -3378,13 +3378,13 @@ def broker_executables() -> tuple[str, ...]:
     read as one decision and was two.
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` is on both for now -- the broker issues it on its own
-    behalf for the verbs, and the sandbox shim still forwards it for the
-    shipped callers, whose move onto the verbs is what retires the forwarding
-    (see deploy/sandbox/Dockerfile). What this list decides on its own is the
-    forge CLI: one is here only if some forge this install built declares one,
-    so an install whose forges all speak HTTP grants no forge binary rather
-    than inheriting the union of every binary any forge could want.
+    runs them, and the sandbox may ask for nothing else. `git` is here only --
+    the broker issues it on its own behalf for the verbs, and the sandbox's
+    `git` is a local binary that never reaches this process. What this list
+    decides on its own is the forge CLI: one is here only if some forge this
+    install built declares one, so an install whose forges all speak HTTP
+    grants no forge binary rather than inheriting the union of every binary
+    any forge could want.
     """
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 

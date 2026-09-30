@@ -114,10 +114,9 @@ RUN pip install --no-cache-dir pyyaml requests
 # with hooks disarmed (deploy/sandbox/vcs-git.sh says what it covers and what it
 # does not). There is no credential shim named `git` or `gh` beside it: a shim
 # owning the name is how the agent leaves the abstraction, and the measurement
-# says so -- with the version-control skill loaded and a shim still on `git`, an
-# agent answered 8 of 60 read probes through the shim alone and issued 4
-# credentialed clones through it. docs/designs/version-control-support.md
-# carries the reasoning.
+# says so -- with the version-control skill loaded and a shim still on `git`,
+# agents still reached for the shim over the verbs.
+# docs/designs/version-control-support.md carries the reasoning.
 #
 # What makes putting this git on a PATH safe is that it cannot present a
 # request to a forge. Git reaches a network three ways and each

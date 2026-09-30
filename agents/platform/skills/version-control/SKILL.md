@@ -169,12 +169,11 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 - **`clone` before any other verb.** The read verbs answer from the local copy
   and say so when there is not one. The collaboration verbs do not need one if
   you pass `--repo`.
-- **Do not reach for `gh`, even though it answers.** A forge CLI is reachable
-  on this machine and it is not the sanctioned path: it answers a
-  forge-neutral question in one forge's dialect, and the same request against
-  the next forge this install adds would have to be written again. Nothing this
-  skill cannot do becomes possible through it. A verb you need and cannot find
-  is a gap worth reporting, not a reason to go around.
+- **Do not look for `gh` or another forge CLI.** None is on this machine, and
+  none is needed: one would answer a forge-neutral question in one forge's
+  dialect, and the same request against the next forge this install adds would
+  have to be written again. The `vcs.py` verbs are the path. A verb you need and
+  cannot find is a gap worth reporting, not a reason to go around.
 - **Do not `git push`, `git fetch`, `git clone` or `git remote add`.** The
   working copy has no remote on purpose, and the local git cannot speak the wire
   protocol in any case. Revisions go up through `publish` and come down through

@@ -73,7 +73,7 @@ Writing costs it more turns than today's design does. Method and results in
 | Each provider                | `providers/github/`, `providers/gitlab/` — one directory each        |
 | Registration                 | `providers/registry.py` — the one shared file a new provider edits   |
 | The declarative surface      | `spec.integration.forges` and `.repositories` on the CR              |
-| The local git                | `/opt/vcs/libexec/git` in the sandbox image                          |
+| The local git                | `/opt/vcs/bin/git`, a hardened wrapper, in the sandbox image         |
 
 ## How to read this document
 
