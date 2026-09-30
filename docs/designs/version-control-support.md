@@ -1849,8 +1849,10 @@ consults before it reports a posture as a finding — which the broker never com
 The state ConfigMap draws only the read-write/read-only line, as two keys: the operator seeds
 `gitops` and `managed` entries into `managed_repos` and `context` entries into `context_repos`,
 and only ever adds. Its entries carry no role, so the GitOps repository is the one listed first —
-the entry the agent falls back to when nothing else names it — and a GitOps repository the list
-does not yet hold is added at the front rather than the end.
+the entry the token refresh mints for when nothing names a repository — and a GitOps repository
+the list does not yet hold is added at the front rather than the end. The skills' own resolvers
+refuse to guess among several entries, so once a `managed` repository sits beside the GitOps one,
+a caller names its target with `--repo`.
 
 The two lists are separate because the relation between them is many-to-one: a forge carries a
 host and a credential once, however many repositories sit on it, and a second instance of the

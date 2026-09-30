@@ -1530,9 +1530,10 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 	// how the discriminator reaches the agent — written down rather than
 	// inferred from the URL's text. Only entries Problems accepts are seeded:
 	// with the webhook off, nothing else stops a refused one reaching the
-	// agent and the minter. The agent reads the first managed_repos entry as
-	// its GitOps repository, so while a declared gitops repository is refused
-	// no managed one is seeded either: it would take that place.
+	// agent and the minter. The token refresh mints for the first
+	// managed_repos entry when no repository is named, so while a declared
+	// gitops repository is refused no managed one is seeded either: it would
+	// take that place.
 	if agent.Spec.Integration != nil {
 		resolved, err := agent.Spec.Integration.ResolveGit()
 		if err != nil {
