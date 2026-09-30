@@ -163,8 +163,16 @@ class TestProjection(ReportStatusTestCase):
         self.addCleanup(self.root.chmod, 0o700)
         document = self.project()
         self.assertFalse(document["root_exists"])
-        self.assertIn(str(self.root), document["root_error"])
         self.assertIn("Permission denied", document["root_error"])
+
+    def test_a_file_where_the_store_should_be_is_unreadable_and_named_once(self):
+        # The reader prints `root` beside `root_error`, so the reason must not
+        # carry the path a second time.
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        self.root.write_text("not a directory")
+        document = self.project()
+        self.assertFalse(document["root_exists"])
+        self.assertEqual(document["root_error"], "Not a directory")
 
     def test_an_absent_store_has_no_root_error(self):
         self.assertIsNone(self.project()["root_error"])

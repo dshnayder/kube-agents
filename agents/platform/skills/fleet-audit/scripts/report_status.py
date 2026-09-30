@@ -428,10 +428,10 @@ def project(
     except OSError as exc:
         # A root that is present but cannot be listed is a store the view could
         # not read, not a fleet with no streams — and `root_exists` is the key
-        # its exit code hangs on. `root_error` keeps the reason, so a reader
-        # can say "unreadable" rather than "absent".
+        # its exit code hangs on. `root_error` keeps the reason, without the
+        # path — every reader already names `root` beside it.
         ids, root_exists = [], False
-        root_error = _failure(f"{root}/", exc)
+        root_error = os_reason(exc)
     lease_error: str | None = None
     try:
         in_flight = in_flight_ids(scratch)
@@ -578,6 +578,26 @@ def _is_critical(finding: object) -> bool:
 
 def _count(value: object) -> int | None:
     return len(value) if isinstance(value, list) else None
+
+
+def store_root_error(root: str) -> str | None:
+    """Why the store root cannot be listed, or None when it can or is absent.
+
+    Absent is None because it is a different answer: nothing stored yet, not
+    a store that could not be read.
+    """
+    try:
+        stream_ids(root)
+    except OSError as exc:
+        return os_reason(exc)
+    return None
+
+
+def os_reason(exc: OSError) -> str:
+    """The error without the path it names, for a caller that names it itself."""
+    if exc.filename is not None and exc.strerror:
+        return exc.strerror
+    return " ".join(str(exc).split()) or type(exc).__name__
 
 
 def _failure(label: str, exc: Exception) -> str:

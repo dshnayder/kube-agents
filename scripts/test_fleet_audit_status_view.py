@@ -622,12 +622,14 @@ class TestRender(unittest.TestCase):
         self.assertIn("store directory absent on the pod", out)
 
     def test_an_unlistable_store_is_unreadable_not_absent(self):
-        root_error = "/opt/data/fleet-audit/reports/: [Errno 13] Permission denied"
+        root_error = "Permission denied"
         out = view.render(
             projection({}, root_exists=False, root_error=root_error),
             self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
         )
-        self.assertIn("store directory unreadable on the pod: " + root_error, out)
+        line = next(l for l in out.splitlines() if "store directory unreadable" in l)
+        self.assertIn("/opt/data/fleet-audit/reports: Permission denied", line)
+        self.assertEqual(line.count("/opt/data/fleet-audit/reports"), 1)
         self.assertNotIn("absent", out)
 
     def test_a_long_coverage_gap_is_clipped(self):

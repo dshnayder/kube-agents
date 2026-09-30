@@ -673,7 +673,7 @@ def unreadable_reason(projection: dict) -> str | None:
     clean run would otherwise surface as a bare NO STORE flag.
     """
     if projection.get("root_error"):
-        return f"store directory unreadable on the pod: {projection['root_error']}"
+        return f"store directory unreadable on the pod: {projection.get('root')}: {projection['root_error']}"
     if not projection.get("root_exists"):
         return f"store directory absent on the pod: {projection.get('root')}"
     if projection.get("lease_error"):

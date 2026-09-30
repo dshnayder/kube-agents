@@ -352,6 +352,19 @@ class TestStreams(StoreTestCase):
         self.assertIn("not readable", payload["error"])
         self.assertIn("Permission denied", payload["error"])
 
+    def test_a_file_root_is_unreadable_for_every_subcommand_and_named_once(self):
+        """`streams` and a per-stream subcommand give the same answer, and the
+        reason does not repeat the path the message already names."""
+        shutil.rmtree(self.root)
+        Path(self.root).write_text("not a directory", encoding="utf-8")
+        self.addCleanup(Path(self.root).unlink, missing_ok=True)
+        for argv in (("streams",), ("findings", AUDIT), ("show", AUDIT)):
+            code, payload = self.query(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn(f"not readable at {self.root} (Not a directory)", payload["error"])
+            self.assertEqual(payload["error"].count(self.root), 1, argv)
+            self.assertEqual(payload["root_error"], "Not a directory", argv)
+
     def test_an_unlistable_lease_directory_blames_the_leases_not_the_stores(self):
         # `project` stamps the lease failure on every stream, so an answer that
         # listed those streams would call readable stores unreadable.

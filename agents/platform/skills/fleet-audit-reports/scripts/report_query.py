@@ -27,8 +27,9 @@ stream with several and no `--repo` is refused with the list, rather than
 answered from whichever repository happens to sort first.
 
 Exit 0 means answered. Exit 2 means the question could not be answered, and
-stdout still carries one JSON object whose `error` says why — an absent store,
-an absent stream, an absent stamp, a file that would not parse. **A missing
+stdout still carries one JSON object whose `error` says why — an absent or
+unlistable store, an absent stream, an absent stamp, a file that would not
+parse. **A missing
 `latest.json` is unknown, never clean.**
 """
 
@@ -121,12 +122,30 @@ def _inside_store(value: str, what: str) -> str:
     return value
 
 
+def _unreadable_store(root: str, reason: str | None) -> str:
+    """One wording for a store that is there but cannot be listed, whichever
+    subcommand found it."""
+    detail = f" ({reason})" if reason else ""
+    return (
+        f"report store not readable at {root}{detail}: no stream can be "
+        "answered from it. This is unknown, not clean."
+    )
+
+
 def _require_stream(root: str, audit_id: str) -> None:
     """Absent store and absent stream are different answers, so they are
     different messages — one is "I could not look", the other "nothing to look
     at"."""
     _inside_store(audit_id, "stream")
     if not os.path.isdir(root):
+        reason = report_status.store_root_error(root)
+        if reason:
+            raise QueryError(
+                _unreadable_store(root, reason),
+                root=root,
+                root_exists=False,
+                root_error=reason,
+            )
         raise QueryError(
             f"report store not found at {root}. Nothing can be answered from "
             "it — this is unknown, not clean.",
@@ -339,11 +358,7 @@ def cmd_streams(args: argparse.Namespace) -> dict:
     unreadable = sorted({row["audit_id"] for row in rows if row["error"]})
     error = None
     if not projection["root_exists"]:
-        reason = f" ({projection['root_error']})" if projection.get("root_error") else ""
-        error = (
-            f"report store not readable at {projection['root']}{reason}: no "
-            "stream can be answered from it. This is unknown, not clean."
-        )
+        error = _unreadable_store(projection["root"], projection.get("root_error"))
     # Before `unreadable`: `project` stamps the lease failure onto every
     # stream's error, so naming those streams would blame stores that read fine.
     elif projection.get("lease_error"):
