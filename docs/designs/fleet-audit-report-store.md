@@ -133,7 +133,10 @@ check on the store, never a memory in its place: a mismatch, or a listing that r
 a lost memory, and the store is not re-seeded from the issue. One consequence is deliberate: a
 public edit that changes the block's id set makes the memory lost. That fails safe — no delta claim,
 and a clean run holds the ledger open rather than closing it — and it lasts, because a held-open
-clean run stores `issue_number: null`, until a findings run rewrites the body.
+clean run stores `issue_number: null`, until a findings run rewrites the body. While it lasts, a
+clean run's comment and its answer to a standing `/remediate` say the store lost its record of the
+ledger, not that the run missed part of the fleet: coverage may be complete, and better coverage is
+not the way out.
 
 The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
 stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did

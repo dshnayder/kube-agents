@@ -1,5 +1,6 @@
 """Tests for report_status.py, the read side of the fleet-audit report store."""
 
+import importlib.util
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -19,6 +21,17 @@ import report_status  # noqa: E402
 AUDIT = "compliance-audit"
 REPO = "acme/fleet"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+SCRATCH_ENV = "FLEET_AUDIT_SCRATCH_DIR"
+REPORTS_ENV = "FLEET_AUDIT_REPORTS_DIR"
+
+
+def fresh_module(module):
+    """A second copy of `module`, loaded now, so its import-time reads see the
+    environment as it is at the call."""
+    spec = importlib.util.spec_from_file_location(f"fresh_{module.__name__}", module.__file__)
+    copy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copy)
+    return copy
 
 
 class ReportStatusTestCase(unittest.TestCase):
@@ -207,14 +220,27 @@ class TestLiveness(ReportStatusTestCase):
         self.assertEqual(report_status.INFLIGHT_TTL_S, audit_report.INFLIGHT_TTL_SECONDS)
 
     def test_the_note_path_is_the_one_start_writes(self):
-        audit_report_scratch = audit_report.SCRATCH_DIR
-        self.assertEqual(
-            os.path.join(
-                audit_report_scratch,
-                f"{report_status.INFLIGHT_PREFIX}{AUDIT}{report_status.INFLIGHT_SUFFIX}",
-            ),
-            audit_report.inflight_path_for(AUDIT),
-        )
+        # `audit_report` reads the environment at import and `scratch_root` at
+        # call time; with it unset both fall back to their module defaults.
+        with patch.dict(os.environ):
+            os.environ.pop(SCRATCH_ENV, None)
+            self.assertEqual(
+                os.path.join(
+                    report_status.scratch_root(),
+                    f"{report_status.INFLIGHT_PREFIX}{AUDIT}{report_status.INFLIGHT_SUFFIX}",
+                ),
+                audit_report.inflight_path_for(AUDIT),
+            )
+
+    def test_the_default_roots_are_the_writers(self):
+        # The copies are deliberate, so the defaults are compared as each
+        # module computes them with the environment empty, not as imported.
+        with patch.dict(os.environ):
+            for name in (SCRATCH_ENV, REPORTS_ENV):
+                os.environ.pop(name, None)
+            reader, writer = fresh_module(report_status), fresh_module(audit_report)
+        self.assertEqual(reader.SCRATCH_DIR, writer.SCRATCH_DIR)
+        self.assertEqual(reader.REPORTS_DIR, writer.REPORTS_DIR)
 
     def test_the_five_states(self):
         ttl = report_status.INFLIGHT_TTL_S

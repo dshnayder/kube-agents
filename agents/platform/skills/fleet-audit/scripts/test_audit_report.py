@@ -15491,6 +15491,34 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertEqual(payload["prs_closed"], [])
 
+    def test_a_remediate_over_a_lost_store_is_told_the_record_was_lost(self):
+        """The target is one the collector does not flag, but the lost record
+        may have carried it: neither "no longer reproduces" nor a coverage wait
+        that a clean fleet never ends."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        comments = self.harness.bodies_for("issue", "comment")
+        answers = [b for b in comments if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        answer = answers[0]
+        self.assertNotIn("no longer reproduces", answer)
+        self.assertNotIn("could not see the whole fleet", answer)
+        self.assertIn("the report store lost its record of this ledger", answer)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answer)
+        self.assertIn("until a run that reports findings rebuilds the record", answer)
+        partial = [b for b in comments if "found nothing" in b]
+        self.assertEqual(len(partial), 1)
+        self.assertIn("found nothing — but the report store lost its record", partial[0])
+        self.assertNotIn("did not see the whole fleet", partial[0])
+        self.assertNotIn("reads the whole fleet", partial[0])
+
     def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
         """A marker under another identity scheme is not a lost memory: the
         stored body keeps its own stamp and is re-spelled on read, so the

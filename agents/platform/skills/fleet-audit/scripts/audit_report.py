@@ -925,6 +925,15 @@ LOST_MEMORY_UNGUARDED_GAP = (
     "until a run that reports findings rewrites it, or a human who has checked "
     "them closes it"
 )
+LOST_MEMORY_GAPS = (LOST_MEMORY_GAP, LOST_MEMORY_UNGUARDED_GAP)
+# What a clean run says about a lost memory where a coverage gap would say
+# "did not see the whole fleet": the fleet may have been seen whole, and the
+# way out is a findings run or a maintainer, not better coverage.
+LOST_RECORD = "the report store lost its record of this ledger"
+LOST_RECORD_WAY_OUT = (
+    "The ledger stays open until a run that reports findings rebuilds the "
+    "record, or a maintainer who has checked its findings closes it."
+)
 # Every log line for a lost memory ends with this, whatever lost it: the
 # fleet-audit SKILL tells the agent to look for it on stderr.
 MEMORY_UNKNOWABLE = "the previous run's findings are unknowable this run."
@@ -8006,7 +8015,26 @@ def render_clean_comment(
     if len(clusters) > len(shown):
         names += f", and {len(clusters) - len(shown)} more"
 
-    if gaps:
+    # Lost-memory gaps alone are not a coverage shortfall: the run may have
+    # read every cluster, and no later run's coverage will close the ledger.
+    record_only = bool(gaps) and all(gap in LOST_MEMORY_GAPS for gap in gaps)
+    if record_only:
+        out = [
+            f"### `{audit_id}` found nothing — but {LOST_RECORD}",
+            "",
+            f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
+            f"{len(clusters)} audited cluster(s): {names}.",
+            "",
+            "**This is not an all-clear, and the ledger stays open.** With no "
+            "trusted record of the findings this ledger carries, the run cannot "
+            "tell whether they were fixed, so nothing has been reported as "
+            "resolved and no remediation pull request has been closed. "
+            + LOST_RECORD_WAY_OUT,
+            "",
+            f"Why the ledger stays open ({len(gaps)}):",
+            "",
+        ]
+    elif gaps:
         out = [
             f"### `{audit_id}` found nothing — but did not see the whole fleet",
             "",
@@ -8484,6 +8512,8 @@ def render_clean_remediate_answer(
     *,
     closing: bool,
     held: bool = False,
+    lost_memory: bool = False,
+    partial: bool = False,
 ) -> str:
     """Said once per `/remediate` standing on a ledger that came back clean.
 
@@ -8496,11 +8526,28 @@ def render_clean_remediate_answer(
     account for the findings the ledger carries, and the requester's target
     is, by construction, one of them. "No longer reproduces" would contradict
     the held-open comment posted right after it.
+
+    Over a lost memory (`lost_memory=True`) it cannot say either: the target
+    may be one of the findings the lost record carried, and the run has no way
+    to know. `partial` then says whether a coverage gap stood beside it. The
+    memory is never re-seeded from the issue, so the answer names the way out.
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     targets = request.get("targets") or []
     named = ", ".join(f"`{_ident(t)}`" for t in targets)
-    if held:
+    if lost_memory:
+        middle = (
+            f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
+            f"{LOST_RECORD}, so the run cannot tell "
+            + (
+                f"whether {named} was among the findings the ledger carried."
+                if targets
+                else "which findings the ledger carried."
+            )
+            + " A pull request here would propose a fix for a finding whose "
+            "state this run did not establish."
+        )
+    elif held:
         middle = (
             f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
             "it did not account for the findings this ledger was carrying"
@@ -8529,6 +8576,9 @@ def render_clean_remediate_answer(
             "This ledger is closing as completed. If the finding comes back, the "
             "next run opens a fresh ledger issue — ask again there."
             if closing
+            else LOST_RECORD_WAY_OUT
+            + (" This run also did not see the whole fleet." if partial else "")
+            if lost_memory
             # Two reasons a clean run leaves the ledger open, and they must not
             # share a sentence: a held close read the whole fleet.
             else "This ledger stays open because the run did not account for "
@@ -11757,6 +11807,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # its marker is not an answer and the refusal's is.
             withheld_ids = set(finding_ids(withheld))
             covered_by_id = declared_by_id(declared)
+            # Over a lost memory a target the collector does not flag may still
+            # be one the lost record carried, so it is not "no longer
+            # reproduces" and not a coverage wait either.
+            lost_gaps = [gap for gap in gaps if gap in LOST_MEMORY_GAPS]
             clean_comments = fetch_issue_comments(repo, existing_issue)
             for request in unanswered_remediate_comments(clean_comments):
                 targets = request.get("targets") or []
@@ -11817,6 +11871,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         now,
                         closing=not (gaps or unaccounted),
                         held=bool(unaccounted) and not gaps,
+                        lost_memory=bool(lost_gaps),
+                        partial=len(gaps) > len(lost_gaps),
                     ),
                     what="/remediate answer on a clean run",
                 )

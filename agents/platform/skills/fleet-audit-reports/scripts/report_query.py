@@ -132,25 +132,32 @@ def _unreadable_store(root: str, reason: str | None) -> str:
     )
 
 
+def _absent_store(root: str) -> str:
+    """One wording for a store root that does not exist yet, whichever
+    subcommand found it: nothing stored, not a store that could not be read."""
+    return (
+        f"report store not found at {root}. Nothing can be answered from it — "
+        "this is unknown, not clean."
+    )
+
+
+def _store_error(root: str, reason: str | None) -> str:
+    return _unreadable_store(root, reason) if reason else _absent_store(root)
+
+
 def _require_stream(root: str, audit_id: str) -> None:
     """Absent store and absent stream are different answers, so they are
     different messages — one is "I could not look", the other "nothing to look
-    at"."""
+    at". The root's listing is tried first: a directory the process cannot
+    search passes `isdir` and would otherwise read as an absent stream."""
     _inside_store(audit_id, "stream")
-    if not os.path.isdir(root):
-        reason = report_status.store_root_error(root)
-        if reason:
-            raise QueryError(
-                _unreadable_store(root, reason),
-                root=root,
-                root_exists=False,
-                root_error=reason,
-            )
+    reason = report_status.store_root_error(root)
+    if reason or not os.path.isdir(root):
         raise QueryError(
-            f"report store not found at {root}. Nothing can be answered from "
-            "it — this is unknown, not clean.",
+            _store_error(root, reason),
             root=root,
             root_exists=False,
+            root_error=reason,
         )
     if not os.path.isdir(os.path.join(root, audit_id)):
         raise QueryError(
@@ -358,7 +365,7 @@ def cmd_streams(args: argparse.Namespace) -> dict:
     unreadable = sorted({row["audit_id"] for row in rows if row["error"]})
     error = None
     if not projection["root_exists"]:
-        error = _unreadable_store(projection["root"], projection.get("root_error"))
+        error = _store_error(projection["root"], projection.get("root_error"))
     # Before `unreadable`: `project` stamps the lease failure onto every
     # stream's error, so naming those streams would blame stores that read fine.
     elif projection.get("lease_error"):

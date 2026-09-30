@@ -328,8 +328,27 @@ class TestStreams(StoreTestCase):
         code, payload = self.query("streams")
         self.assertEqual(code, 2)
         self.assertFalse(payload["root_exists"])
+        self.assertIsNone(payload["root_error"])
+        self.assertIn(f"report store not found at {self.root}", payload["error"])
         self.assertIn("unknown, not clean", payload["error"])
+        self.assertNotIn("not readable", payload["error"])
         self.assertEqual(payload["streams"], [])
+        # The per-stream subcommands give the same answer.
+        self.assertEqual(self.query("show", AUDIT)[1]["error"], payload["error"])
+
+    def test_an_unsearchable_directory_root_is_unreadable_for_a_stream(self):
+        """A mode-denied root passes `isdir`; the per-stream answer must be the
+        unreadable-store one `streams` gives, not an absent stream."""
+        self.write_run(AUDIT, "20260826T063100.000000Z", [])
+        denied = PermissionError(13, "Permission denied", self.root)
+        with patch.object(report_query.report_status, "stream_ids", side_effect=denied):
+            streams = self.query("streams")[1]
+            code, payload = self.query("show", AUDIT)
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["root_exists"])
+        self.assertEqual(payload["root_error"], "Permission denied")
+        self.assertEqual(payload["error"], streams["error"])
+        self.assertIn("unknown, not clean", payload["error"])
 
     def test_an_unlistable_lease_directory_over_an_empty_store_is_an_error(self):
         # No stream directory means no row to carry the lease error, and a
@@ -789,8 +808,9 @@ class TestRuns(StoreTestCase):
         second = self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
         # A ring entry nothing can parse. `runs` still answers, because a stamp
         # listing that reads fourteen documents is the cost this command exists
-        # to avoid. Liveness reads `latest.json`, as `streams` does, and
-        # nothing else.
+        # to avoid. Liveness reads `latest.json`, as `streams` does, and opens
+        # the newest ring entry only to check it is not a run the file missed;
+        # an entry that does not parse is passed over, so the file answers.
         broken = Path(self.root) / AUDIT / REPO / "runs" / "20260827T063100.000000Z.json"
         broken.write_text("{not json", encoding="utf-8")
         payload = self.ok("runs", AUDIT)

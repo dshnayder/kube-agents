@@ -1183,7 +1183,11 @@ findings run rewrites the body or a human who has checked the findings closes th
 your report: the gap names both ways out only when the collector flags nothing, and otherwise says
 the collector still flags something this run did not report. Without a manifest it also answers no `/remediate` — it cannot tell a held id
 from a typo — and logs `No trusted stored report and no manifest` to say so; report that as you would any
-other partial run.
+other partial run. With a manifest it answers a standing `/remediate` whose target the collector does
+not flag by saying the report store lost its record of this ledger, so the run cannot tell whether
+the target was among the findings the ledger carried — never "no longer reproduces", and never a wait
+for complete coverage, which a clean fleet already has. Its comment on the issue says the record was
+lost rather than that the run did not see the whole fleet, unless a coverage gap stands beside it.
 
 ## Red lines
 
