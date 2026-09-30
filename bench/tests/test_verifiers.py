@@ -2296,9 +2296,17 @@ def _commits_of(number: int = 7, page: int = 1) -> str:
     return f"{_pr_api('pulls', number)}/commits?per_page=100&page={page}"
 
 
+def _stash_spent_report(github) -> None:
+    """The case's reply, which names both: the closed pull request and the open one."""
+    _stash_pr_report(
+        f"Closed: https://github.com/gke-agentic/{_PR_REPO}/pull/6\nOpen: {_PR_URL}"
+    )
+    github.routes[_pr_api(number=6)] = (200, _closed_six() | {"pull_request": {}})
+
+
 def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
     """#1918's case: close a pull request, then propose again under its branch."""
-    _stash_pr_report()
+    _stash_spent_report(github)
     github.routes[_pr_api()] = (200, _pr_payload())
     github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
     github.routes[_closed_from()] = (200, [_closed_six()])
@@ -2308,6 +2316,20 @@ def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
     assert "closed pull request had used" in res.reason
     # The head ref comes from the pulls payload `_head_push` already read.
     assert [url for url, _ in github.calls].count(_pr_api("pulls")) == 1
+
+
+def test_a_report_that_leaves_the_closed_proposal_out_is_a_fail(token, github):
+    """Right on the forge, but the reply names only the open one. The inject
+    lane's write safeguard would red the closed one as a write nobody asked
+    for, so the objective does not pass what the safeguard fails."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "does not name #6" in res.reason
 
 
 def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
@@ -2538,7 +2560,7 @@ def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
     """`_head_push` already read the whole listing of a one-page proposal to
     date its head; the revision clause reuses it."""
-    _stash_pr_report()
+    _stash_spent_report(github)
     github.routes[_pr_api()] = (200, _pr_payload())
     _pr_head_routes(github)
     github.routes[_closed_from()] = (200, [_closed_six()])
@@ -2550,7 +2572,7 @@ def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
 def test_the_revision_clause_reads_the_pages_the_commit_total_names(token, github):
     """Two full pages and a total of 200: there is no third page to read, and
     reading one blind would error the check on GitHub's 404."""
-    _stash_pr_report()
+    _stash_spent_report(github)
     github.routes[_pr_api()] = (200, _pr_payload())
     github.routes[_pr_api("pulls")] = (
         200,

@@ -610,6 +610,35 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertNotIn("Deleted the spent branch", said)
         self.assertIn("went from the repository while this run was deleting it", said)
 
+    def test_a_failed_read_of_the_branch_says_retry_not_rename(self):
+        # The same moves as the delete's own failures: a read that did not
+        # finish, or a forge throttling it, is no verdict on the name.
+        moves = {
+            "FORGE_CALL_FAILED": "run prepare again",
+            "GIT_FAILED": "run prepare again",
+            "": "run prepare again",
+            "FORGE_RATE_LIMITED": "wait a few minutes, then run prepare again",
+            "FORGE_UNAVAILABLE": "wait a few minutes, then run prepare again",
+        }
+        for code, move in moves.items():
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-read-{code.lower() or 'unreached'}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {len(code) + 3}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.view_fails_with = vcs_client.VcsError(
+                    "could not read", code=code or None
+                )
+                with self.assertRaises(ValueError) as caught:
+                    self.prepare(branch)
+                said = str(caught.exception)
+                self.assertIn(move, said)
+                self.assertIn("was the source of", said)
+                self.assertNotIn("has not used", said)
+                self.assertEqual(self.broker.payloads("branch-delete"), [])
+
     def test_a_broker_without_the_branch_verbs_refuses_the_name_by_code(self):
         branch = "platform-agent/scale-web"
         git(self.origin, "checkout", "--quiet", "-b", branch)

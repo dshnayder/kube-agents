@@ -384,6 +384,8 @@ RETRY_THE_DELETE = frozenset(
 # The forge throttled or failed one of the delete's own reads. Transient, so
 # not a verdict on the name either, but retrying at once meets the same limit.
 WAIT_THEN_RETRY_THE_DELETE = frozenset({"FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"})
+# The `branch-view` read that comes before the delete failed the same way.
+READ_FAILED = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED"})
 
 
 def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, base: str) -> None:
@@ -413,6 +415,20 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
         held = (vcs_client.forge("branch-view", {"branch": branch}, repository=repo)
                 .get("branch") or {})
     except vcs_client.VcsError as unserved:
+        if unserved.code in READ_FAILED or not unserved.code:
+            # The read did not finish, which says nothing about the name.
+            raise ValueError(
+                f"{spent_named}. Reading whether the repository still holds the "
+                f"branch did not complete ({unserved.code or 'error'}: "
+                f"{unserved}). The name is still usable: run prepare again."
+            ) from unserved
+        if unserved.code in WAIT_THEN_RETRY_THE_DELETE:
+            raise ValueError(
+                f"{spent_named}. The forge turned away the read of whether the "
+                f"repository still holds the branch for now ({unserved.code}: "
+                f"{unserved}). The name is still usable: wait a few minutes, then "
+                "run prepare again."
+            ) from unserved
         if unserved.code != vcs_client.BROKER_ROUTE_UNSUPPORTED:
             raise
         # A broker older than this helper -- the sandbox and the credential

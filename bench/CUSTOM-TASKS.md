@@ -545,7 +545,9 @@ case exists to catch. Requiring the closed one to be this run's keeps an earlier
 a recurring name from counting. The name alone is not enough either: a worker that clones the spent
 branch and publishes on top of it lands on the same name, with the closed proposal's change carried
 back under review. So the passing pull request must also not contain the closed one's head
-revision, which GitHub freezes at close. It reads the head branch from `/pulls/{n}` when the issue
+revision, which GitHub freezes at close. And the reply must name the closed one as well: the
+inject lane's write safeguard excuses a pull request the run opened only when the reply names it,
+and the two checks must agree on the same reply. It reads the head branch from `/pulls/{n}` when the issue
 answer did not carry one, lists `/pulls?state=closed&head={owner}:{branch}`, then reads
 `/pulls/{n}/commits` — all three need `pull_requests: read`, not the `issues: read` the rest of the
 check gets by with. Any non-200 answer in this clause is an error rather than a fail, and names that
