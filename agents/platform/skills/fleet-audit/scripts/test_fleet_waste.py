@@ -887,15 +887,22 @@ class IdleNodepoolTest(unittest.TestCase):
                        "taints": taints or []},
         }
 
+    @staticmethod
+    def controlled(pod):
+        """A ReplicaSet owner, as a real add-on carries: `_drain_blockers`
+        lists a bare pod in a system namespace as a blocker of its own."""
+        pod["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "rs"}]
+        return pod
+
     def small_node_with_addons(self, node="n1", pool="default-pool"):
         """The `spot-capacity-test` shape measured on the fleet 2026-09-05: a
         lone e2-small whose GKE add-ons alone book 61% CPU / 39% memory."""
         return (
             self.node(node, pool, cpu_alloc="940m", mem_alloc="1372Mi"),
             [
-                self.pod_on(node, cpu_req="270m", mem_req="155Mi", ns="kube-system", name="kube-dns"),
-                self.pod_on(node, cpu_req="105m", mem_req="130Mi", ns="gke-managed-cim", name="ksm"),
-                self.pod_on(node, cpu_req="202m", mem_req="247Mi", ns="kube-system", name="rest"),
+                self.controlled(self.pod_on(node, cpu_req="270m", mem_req="155Mi", ns="kube-system", name="kube-dns")),
+                self.controlled(self.pod_on(node, cpu_req="105m", mem_req="130Mi", ns="gke-managed-cim", name="ksm")),
+                self.controlled(self.pod_on(node, cpu_req="202m", mem_req="247Mi", ns="kube-system", name="rest")),
             ],
         )
 
@@ -1246,6 +1253,28 @@ class IdleNodepoolTest(unittest.TestCase):
         excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
         self.assertNotIn("Draining will not happen", excerpt)
 
+    def test_system_namespace_pods_the_autoscaler_will_not_evict_are_blockers(self):
+        """§3.8 skips `SYSTEM_NS`, so a bare pod or a `safe-to-evict: "false"`
+        one there reaches no finding; the note is the only place it is named,
+        and a PDB clears neither rule. Outside `SYSTEM_NS` §3.8 reports both,
+        so the note leaves them out rather than count them twice."""
+        node, addons = self.small_node_with_addons()
+        dns, ksm, rest = addons
+        dns["metadata"]["labels"] = {"k8s-app": "kube-dns"}
+        dns["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: fw.SAFE_TO_EVICT_FALSE}
+        ksm["metadata"]["ownerReferences"] = []
+        rest["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: fw.SAFE_TO_EVICT_TRUE}
+        workload = self.pod_on("n1", ns="default", name="bare-app")
+        workload["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: fw.SAFE_TO_EVICT_FALSE}
+        context = {"nodes": [node], "pods": addons + [workload],
+                   "pdbs": [{"metadata": {"namespace": "kube-system"}, "spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}}}]}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Draining will not happen on its own: 2 pod(s)", excerpt)
+        self.assertIn('kube-system/kube-dns (system namespace, safe-to-evict "false")', excerpt)
+        self.assertIn("gke-managed-cim/ksm (system namespace, no controller)", excerpt)
+        self.assertNotIn("bare-app", excerpt)
+
     def test_a_pdb_with_no_selector_covers_no_pod(self):
         """In `policy/v1` an omitted selector selects nothing and `{}` selects
         everything; read as `{}`, a selector-less PDB hid every blocker."""
@@ -1281,7 +1310,7 @@ class IdleNodepoolTest(unittest.TestCase):
 
     def test_local_storage_outside_kube_system_still_blocks(self):
         node = self.node("n1", "pool")
-        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod = self.controlled(self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op"))
         pod["spec"]["volumes"] = [{"emptyDir": {}}]
         context = {"nodes": [node], "pods": [pod], "pdbs": []}
         pools = [self.pool("pool"), self.pool("other")]
@@ -1290,7 +1319,7 @@ class IdleNodepoolTest(unittest.TestCase):
 
     def test_a_safe_to_evict_local_storage_pod_is_not_a_blocker(self):
         node = self.node("n1", "pool")
-        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod = self.controlled(self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op"))
         pod["spec"]["volumes"] = [{"emptyDir": {}}]
         pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: "true"}
         context = {"nodes": [node], "pods": [pod], "pdbs": []}
@@ -1309,7 +1338,7 @@ class IdleNodepoolTest(unittest.TestCase):
 
     def test_local_volumes_all_listed_as_safe_are_not_a_blocker(self):
         node = self.node("n1", "pool")
-        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod = self.controlled(self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op"))
         pod["spec"]["volumes"] = [{"name": "cache", "emptyDir": {}}, {"name": "logs", "hostPath": {"path": "/l"}}]
         context = {"nodes": [node], "pods": [pod], "pdbs": []}
         pools = [self.pool("pool"), self.pool("other")]
@@ -1322,7 +1351,7 @@ class IdleNodepoolTest(unittest.TestCase):
 
     def test_a_memory_backed_empty_dir_is_not_local_storage(self):
         node = self.node("n1", "pool")
-        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod = self.controlled(self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op"))
         pod["spec"]["volumes"] = [{"name": "dshm", "emptyDir": {"medium": "Memory"}}]
         context = {"nodes": [node], "pods": [pod], "pdbs": []}
         pools = [self.pool("pool"), self.pool("other")]
@@ -2908,6 +2937,22 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("Service/hello-world still fronts it", hits[0]["excerpt"])
         self.assertIn("external IP", hits[0]["excerpt"])
 
+    def test_an_internal_load_balancer_claims_no_external_ip(self):
+        """An internal Service holds a forwarding rule and no external IP, by
+        either annotation GKE accepts. Grading is unchanged: still `major`."""
+        for key in fw.INTERNAL_LB_ANNOTATIONS:
+            with self.subTest(annotation=key):
+                svc = self.svc()
+                svc["metadata"]["annotations"] = {key: fw.INTERNAL_LB_ANNOTATION_VALUE}
+                hits = self.hits(services=[svc])
+                self.assertEqual(hits[0]["severity"], "major")
+                self.assertIn("so an internal forwarding rule bills for it too", hits[0]["excerpt"])
+                self.assertNotIn("external IP", hits[0]["excerpt"])
+        internal = self.svc(name="ilb")
+        internal["metadata"]["annotations"] = {fw.INTERNAL_LB_ANNOTATIONS[0]: fw.INTERNAL_LB_ANNOTATION_VALUE}
+        mixed = self.hits(services=[internal, self.svc()])[0]["excerpt"]
+        self.assertIn("forwarding rules, and external IPs for the external ones, bill", mixed)
+
     def test_a_load_balancer_selecting_something_else_is_not_fronting(self):
         self.assertEqual(self.hits(services=[self.svc(selector={"app": "other"})])[0]["severity"], "minor")
 
@@ -4098,6 +4143,23 @@ class UnattachedDiskTest(unittest.TestCase):
         hits = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"prod"})
         self.assertIn("labelled for cluster prod", hits[0]["excerpt"])
         self.assertNotIn("labelled for", fw.check_unattached_disk([self.disk()], set(), now=NOW)[0]["excerpt"])
+
+    def test_an_unlabelled_disk_is_attributed_by_its_gke_name_prefix(self):
+        """§3.4's second rung: the longest `gke-<cluster>-` prefix among the
+        project's clusters, named only when the audit read that cluster. The
+        7-day floor stays keyed on the label, so a prefix alone never lowers it."""
+        disk = self.disk(name="gke-prod-usc1-pvc-1")
+        known = {"prod", "prod-usc1"}
+        hits = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters=known)
+        self.assertIn("named for cluster prod-usc1", hits[0]["excerpt"])
+        unread = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters=known, unread_clusters=frozenset({"prod-usc1"}))
+        self.assertNotIn("named for", unread[0]["excerpt"])
+        self.assertNotIn("named for", fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"staging"})[0]["excerpt"])
+        self.assertNotIn("named for", fw.check_unattached_disk([disk], set(), now=NOW)[0]["excerpt"])
+        labelled = dict(disk, labels={fw.GKE_CLUSTER_LABEL: "prod"})
+        self.assertIn("labelled for cluster prod", fw.check_unattached_disk([labelled], set(), now=NOW, known_clusters=known)[0]["excerpt"])
+        recent = dict(disk, creationTimestamp=(NOW - timedelta(days=fw.DEAD_CLUSTER_AGE_DAYS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(fw.check_unattached_disk([recent], set(), now=NOW, known_clusters={"staging"}), [])
 
     def test_a_disk_labelled_for_an_unread_cluster_is_not_judged(self):
         """Its PersistentVolumes were never read, so a detached disk it still
@@ -7154,6 +7216,15 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
     and ignore the docstrings, which differ on purpose because each copy argues
     from the findings its own stream published.
     """
+
+    def test_the_internal_load_balancer_annotations_match_collect(self):
+        """The §3.13 excerpt's copy of collect.py's internal-LB test reads the
+        same annotations for the same value, so the two never disagree about
+        whether a Service has an external IP."""
+        import collect
+
+        self.assertEqual(fw.INTERNAL_LB_ANNOTATIONS, collect._INTERNAL_LB_ANNOTATIONS)
+        self.assertEqual(fw.INTERNAL_LB_ANNOTATION_VALUE, collect._INTERNAL_LB_ANNOTATION_VALUE)
 
     def bodies(self, name):
         """Both copies of one function, as ASTs with the docstring dropped."""

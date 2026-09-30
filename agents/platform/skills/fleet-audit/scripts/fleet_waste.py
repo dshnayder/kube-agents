@@ -815,6 +815,17 @@ GKE_NODE_DISK_LABEL = "goog-gke-node"
 #: The key PD-CSI writes into a provisioned disk's `description`, whose value is
 #: a JSON object naming the PersistentVolumeClaim the disk was cut for.
 CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
+#: GKE names the disks it creates for a cluster `gke-<cluster>-...`: §3.4's
+#: second attribution rung, after the label.
+GKE_DISK_NAME_PREFIX = "gke-"
+GKE_DISK_NAME_SEPARATOR = "-"
+# A copy of collect.py's pair: the two annotations GKE accepts for "give me an
+# internal load balancer", the second the legacy spelling it still honours.
+INTERNAL_LB_ANNOTATIONS = (
+    "networking.gke.io/load-balancer-type",
+    "cloud.google.com/load-balancer-type",
+)
+INTERNAL_LB_ANNOTATION_VALUE = "Internal"
 #: How many of a roll-up's members the excerpt names before it stops. Enough to
 #: start on without opening the console; short of the point where one finding's
 #: evidence crowds the rest of the ledger out of the 60,000-character body §5
@@ -2541,6 +2552,12 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     second. DaemonSet and mirror pods are exempt from both -- they go with the
     node.
 
+    Two more rules pin a node whatever the namespace: a pod annotated
+    `safe-to-evict: "false"`, and a bare pod no controller would recreate.
+    §3.8 reports both outside `SYSTEM_NS`, so they are listed here only inside
+    it -- including on a `kube-system` pod a PDB covers, which clears the first
+    rule and neither of these -- and never counted twice.
+
     §3.8 reports the workload half of this as findings of its own and skips
     `SYSTEM_NS` deliberately, because a GKE-managed add-on is not something the
     operator can annotate: addon-manager reverts the edit. That makes them
@@ -2563,6 +2580,12 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
         elif _blocking_local_storage(pod):
             blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
+        elif not _is_system_namespace(ns) or _pod_daemonset_owned(pod) or (pod.get("status") or {}).get("phase") in POD_TERMINAL_PHASES:
+            continue  # §3.8's to report, or nothing the autoscaler waits for
+        elif _safe_to_evict(annotations) is False:
+            blockers.append(f'{ns}/{name} (system namespace, safe-to-evict "false")')
+        elif not meta.get("ownerReferences"):
+            blockers.append(f"{ns}/{name} (system namespace, no controller)")
     return blockers
 
 
@@ -3619,6 +3642,25 @@ def _controller_age_days(context: dict, kind: str, ns: str, name: str, *, now: d
     return None
 
 
+def _is_internal_load_balancer(meta: dict) -> bool:
+    """Whether either GKE internal-load-balancer annotation is set on this Service.
+
+    A copy of collect.py's, as `release_declarations` is."""
+    annotations = meta.get("annotations") or {}
+    return any(annotations.get(key) == INTERNAL_LB_ANNOTATION_VALUE for key in INTERNAL_LB_ANNOTATIONS)
+
+
+def _internal_load_balancers(context: dict, ns: str) -> set[str]:
+    """`Service/<name>` for every internal LoadBalancer Service in `ns`."""
+    return {
+        f"Service/{(svc.get('metadata') or {}).get('name', '')}"
+        for svc in context["services"]
+        if (svc.get("spec") or {}).get("type") == "LoadBalancer"
+        and (svc.get("metadata") or {}).get("namespace", "") == ns
+        and _is_internal_load_balancer(svc.get("metadata") or {})
+    }
+
+
 def _fronting_load_balancers(context: dict, ns: str, labels: dict) -> list[str]:
     """LoadBalancer Services in `ns` whose selector this controller's pods match.
 
@@ -3949,10 +3991,18 @@ def check_idle_workload(
         # appeared in neither the finding nor its severity.
         fronting = _fronting_load_balancers(context, entry["ns"], entry["labels"])
         if fronting:
+            # An internal load balancer has a forwarding rule and no external
+            # IP, so the excerpt names only what each Service really holds.
+            internal = _internal_load_balancers(context, entry["ns"]) & set(fronting)
+            if not internal:
+                held = "a forwarding rule and its external IP bill"
+            elif len(internal) == len(fronting):
+                held = "an internal forwarding rule bills"
+            else:
+                held = "forwarding rules, and external IPs for the external ones, bill"
             excerpt += (
                 f". {' and '.join(fronting)} still front{'s' if len(fronting) == 1 else ''} it, "
-                f"so a forwarding rule and its external IP bill for it too — usually "
-                f"several times the pod's own cost"
+                f"so {held} for it too — usually several times the pod's own cost"
             )
         # Immediately after the cost clause and before the endpoints one,
         # because it is the same rule's story: what it costs, then what it
@@ -5391,6 +5441,25 @@ def _pvc_origin(disk: dict) -> str:
     return f"{namespace}/{name}" if namespace else name
 
 
+def _named_cluster_of(disk: dict, known_clusters: set[str] | None, unread_clusters: frozenset[str]) -> str:
+    """The cluster a `gke-<cluster>-` disk name points at, or "".
+
+    §3.4's second attribution rung, for a disk with no cluster label. The
+    longest match over every cluster the project lists wins, so
+    `gke-prod-usc1-...` is `prod-usc1`'s and not `prod`'s; it names a cluster
+    only when the audit read that one, because a prefix is a guess and the
+    fleet this run did not read is where the guess cannot be checked.
+    """
+    if known_clusters is None:
+        return ""
+    name = str(disk.get("name") or "")
+    matches = [c for c in known_clusters if c and name.startswith(f"{GKE_DISK_NAME_PREFIX}{c}{GKE_DISK_NAME_SEPARATOR}")]
+    if not matches:
+        return ""
+    longest = max(matches, key=len)
+    return "" if longest in unread_clusters else longest
+
+
 def _dead_cluster_of(disk: dict, known_clusters: set[str] | None) -> str:
     """The cluster this disk was provisioned for, if that cluster is gone.
 
@@ -5458,7 +5527,10 @@ def check_unattached_disk(
     belong to any of them. A disk no PVC created is judged as usual.
 
     A managed service's disk (Composer, Dataproc) is that service's to
-    reclaim, and a node boot disk is the node pool's while its cluster lives."""
+    reclaim, and a node boot disk is the node pool's while its cluster lives.
+
+    The excerpt names the owner by label, else by a `gke-<cluster>-` name
+    prefix (`_named_cluster_of`); the 7-day floor stays keyed on the label."""
     hits = []
     for disk in disks:
         if disk.get("users"):
@@ -5505,6 +5577,8 @@ def check_unattached_disk(
             orphan_note = f", provisioned for cluster {dead_cluster} which this project no longer runs"
         elif owner:
             orphan_note = f", labelled for cluster {owner}"
+        elif named := _named_cluster_of(disk, known_clusters, unread_clusters):
+            orphan_note = f", named for cluster {named}"
         else:
             orphan_note = ""
         pvc = _pvc_origin(disk)
