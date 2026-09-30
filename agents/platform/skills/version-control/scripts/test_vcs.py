@@ -999,11 +999,9 @@ class SkillTextTest(unittest.TestCase):
         # Review finding: every command reaches the sandbox as a fresh
         # non-interactive `bash -c`, which does not expand aliases, so an
         # aliased `git` followed by `git log` ran the credentialed shim. The
-        # skill points at the path, or at an exported variable, which the
-        # sandbox's environment snapshot does carry.
+        # name is the local git's now, so nothing needs aliasing.
         text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text()
         self.assertNotIn("alias git", text)
-        self.assertIn("/opt/vcs/libexec/git", text)
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):

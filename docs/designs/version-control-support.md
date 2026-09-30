@@ -7,16 +7,13 @@
 > over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
 > is `providers/github/`; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
-> through those verbs rather than by naming GitHub. Two things are deliberately
-> left behind by that migration and are not scheduling slips: `audit_report.py`
-> and the `fleet-audit` prose around it still shell `gh`, and
-> `inspect_repository.py` stays on the broker's content-workspace route rather
-> than moving to the verbs, because it reads repositories this install does not
-> manage and does it with a shallow clone — neither of which the verbs offer,
-> the second on purpose ([The seam](#3-the-seam)). Its fallback, `git clone`
-> through the sandbox's credential shim, is taken only against a broker that
-> does not serve that route, which no shipped install is; it goes when the shim
-> does. The CRD declares forges and repositories in `spec.integration.forges`
+> through those verbs rather than by naming GitHub. The sandbox carries no `gh`
+> and no credential shim named `git`. One thing is deliberately left behind and
+> is not a scheduling slip: `inspect_repository.py` stays on the broker's
+> content-workspace route rather than moving to the verbs, because it reads
+> repositories this install does not manage and does it with a shallow clone —
+> neither of which the verbs offer, the second on purpose
+> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories` with only `github` registered, and no
 > second forge exists.
 > This is the design for driving any forge, and the order the rest has to
@@ -618,7 +615,8 @@ directions) — say so in their refusals.
 ### One git in the sandbox
 
 The sandbox has exactly one git: the real binary at `/opt/vcs/libexec/git`,
-reached through a symlink in `/opt/vcs/bin`. There is no credential shim named
+reached through a wrapper at `/opt/vcs/bin/git` that runs it with a
+repository's hooks disarmed. There is no credential shim named
 `git` beside it, and that is worth stating explicitly because the sandbox does
 carry shims for `gcloud` and `kubectl`.
 
@@ -648,14 +646,27 @@ and neither has anything local to read. `SUPPORTED_EXECUTABLES` in
 are the two places that say so, and the image's smoke test asserts the two
 missing names by absence rather than by which path wins.
 
-The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in one
-place: the `SANDBOX_PATH` line in `deploy/sandbox/entrypoint.sh`, which becomes
-the `SetEnv` directive in the generated `/etc/ssh/sshd_config.d` drop-in. One
-place is not an accident of this design — sshd keeps the first `SetEnv` it reads
-and discards every later one whole, so the environment a sandbox session gets
-cannot be assembled from more than one directive. A missed prepend is therefore
-a `git: not found` on the first call rather than a silent forward, which is the
+The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in the
+two places a sandbox session's PATH comes from. The `SANDBOX_PATH` line in
+`deploy/sandbox/entrypoint.sh` becomes the `SetEnv` directive in the generated
+`/etc/ssh/sshd_config.d` drop-in, and it has to be that one line — sshd keeps
+the first `SetEnv` it reads and discards every later one whole. That covers a
+non-login command. A login shell runs `/etc/profile` first, which overwrites
+PATH wholesale, and Hermes takes its environment snapshot with `bash -l -c`; so
+`/etc/profile.d/vcs-path.sh` puts the directory back, the same way the shim
+directory's own profile.d entry always has. A missed prepend is a
+`git: not found` on the first call rather than a silent forward, which is the
 other thing deleting the shim buys.
+
+The wrapper applies to the agent's own `git` what `vcs.py` applies to its calls:
+`core.hooksPath` pointed at an empty, root-owned directory, `core.fsmonitor`
+off, `protocol.ext.allow=never`, and no system config. `-c` outranks every
+config file, so a working copy that sets its own `core.hooksPath` — the step an
+injected `CONTRIBUTING.md` asked for — still gets the empty one. It is not a
+boundary, and does not claim to be. A repository-local `filter.<name>.clean`
+still runs, because no `-c` can unset a name it does not know, and the binary is
+one absolute path away. What contains that is the sandbox: an unprivileged user
+with no credential and no transport to a forge.
 
 The image's existing build guard needs no change to cover this. It already fails
 the build if a bare `command -v` finds any of `gcloud`, `kubectl`, `gh` or `git`,

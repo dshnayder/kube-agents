@@ -28,25 +28,18 @@ who this install is on the forge and, with `--login`, whether that login may
 write to the repository.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
-onto this filesystem and prints its `path`. Inside it, use the local git, which
-is `/opt/vcs/libexec/git`. Call it by that path, or through a variable you
-export once — `export G=/opt/vcs/libexec/git`, then `$G log`, `$G show`,
-`$G blame`, `$G grep`, `$G diff`, `$G status`, `$G branch`, `$G commit`,
-`$G ls-files --stage` — and every read works as you expect. Do **not** define a
-shell alias for it: each command you run here arrives in a fresh
-non-interactive shell, which never expands aliases, so an aliased `git`
-followed by `git log` silently runs the other program. An exported variable
-survives from one command to the next; an alias does not. Read files in the
-working copy with `cat`, `rg`, or anything else. You do not need `vcs.py` for
-any of this and it is faster without it.
+onto this filesystem and prints its `path`. Inside it, use `git` —
+`git log`, `git show`, `git blame`, `git grep`, `git diff`, `git status`,
+`git branch`, `git commit`, `git ls-files --stage` — and every read works as you
+expect. Read files in the working copy with `cat`, `rg`, or anything else. You
+do not need `vcs.py` for any of this and it is faster without it.
 
-The full path matters: plain `git` on this machine is a different program that
-runs elsewhere and holds a credential. The one named above holds none and
-cannot reach a forge: its HTTP transport helpers are not in the image, so an
-`https://` URL fails with `'remote-https' is not a git command`, and there is
-no ssh client, so an `ssh://` URL fails with `cannot run ssh`. Seeing either
-message means you used the right git and asked it for the one thing it does not
-do; the answer is a `vcs.py` verb, not the other binary.
+This `git` holds no credential and cannot reach a forge: its HTTP transport
+helpers are not in the image, so an `https://` URL fails with
+`'remote-https' is not a git command`, and there is no ssh client, so an
+`ssh://` URL fails with `cannot run ssh`. Seeing either message means you asked
+it for the one thing it does not do; the answer is a `vcs.py` verb. There is no
+`gh` here either, for the same reason.
 
 `vcs.py` also offers `log`, `show`, `annotate`, `files`, `grep`, `diff`,
 `status`, `branch` and `commit` as thin wrappers over that same local git, for
@@ -103,15 +96,12 @@ V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
 python3 $V clone https://github.com/acme/infra
 
 # Local, in that working copy. No network, no credential, no vcs.py.
-# The path is the point: bare `git` is a different, credentialed program,
-# and an alias would not survive to your next command here.
-export G=/opt/vcs/libexec/git
-$G log      -n 20 -- inventory/clusters.yaml
-$G show     HEAD~3:inventory/clusters.yaml
-$G blame    scripts/rotate-keys.sh
-$G ls-files --stage
-$G grep     'nodeCount:'
-$G status
+git log      -n 20 -- inventory/clusters.yaml
+git show     HEAD~3:inventory/clusters.yaml
+git blame    scripts/rotate-keys.sh
+git ls-files --stage
+git grep     'nodeCount:'
+git status
 ```
 
 The same reads through `vcs.py`, if you want JSON instead:
@@ -221,37 +211,37 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 
 ## Reference
 
-| Subcommand             | What it does                                                                                                                                 |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `capabilities`         | What this install can do for this repository's forge, before anything is spent                                                               |
-| `clone`                | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                                                    |
-| `log`                  | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec                                  |
-| `show`                 | One revision, or `revision:path` for a file as of that revision                                                                              |
-| `diff`                 | Differences in the working copy, or against `--revision`                                                                                     |
-| `annotate`             | Per-line last-change attribution for one path                                                                                                |
-| `files`                | Tracked paths with the mode the revision records                                                                                             |
-| `grep`                 | Text search over the working copy; `--regex`, `--ignore-case`                                                                                |
-| `status`               | What the working copy has that its revision does not                                                                                         |
-| `branch`               | List lines of development, or start one. Local                                                                                               |
-| `commit`               | Record a revision locally, with a real parent and identifier. Paths, or tracked changes only                                                 |
-| `publish`              | Send the revisions made since `clone` to the shared repository                                                                               |
-| `discard`              | Remove the local copy; `--branch` when the repository is cloned once per branch                                                              |
-| `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                                               |
+| Subcommand             | What it does                                                                                                                                        |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `capabilities`         | What this install can do for this repository's forge, before anything is spent                                                                      |
+| `clone`                | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                                                           |
+| `log`                  | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec                                         |
+| `show`                 | One revision, or `revision:path` for a file as of that revision                                                                                     |
+| `diff`                 | Differences in the working copy, or against `--revision`                                                                                            |
+| `annotate`             | Per-line last-change attribution for one path                                                                                                       |
+| `files`                | Tracked paths with the mode the revision records                                                                                                    |
+| `grep`                 | Text search over the working copy; `--regex`, `--ignore-case`                                                                                       |
+| `status`               | What the working copy has that its revision does not                                                                                                |
+| `branch`               | List lines of development, or start one. Local                                                                                                      |
+| `commit`               | Record a revision locally, with a real parent and identifier. Paths, or tracked changes only                                                        |
+| `publish`              | Send the revisions made since `clone` to the shared repository                                                                                      |
+| `discard`              | Remove the local copy; `--branch` when the repository is cloned once per branch                                                                     |
+| `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                                                      |
 | `proposal list`        | Open proposals; `--state open\|closed\|all`, `--source`/`--target` to ask about one branch, `--labels` for all of these, `--page` for the next page |
-| `proposal view`        | One proposal; `--comments` for the discussion, `--diff` for the patch                                                                        |
-| `proposal comment`     | Reply on a proposal                                                                                                                          |
-| `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |
-| `proposal close`       | Close it without merging                                                                                                                     |
-| `proposal commits`     | The revisions on its source branch, **oldest first**; the last entry is the tip only when `"truncated": false`; `--page` for the next page   |
-| `proposal acknowledge` | React to one comment so its author sees it was read; needs `--comment-id` and `--kind` from `view --comments`                                |
-| `issue list`           | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                                                             |
-| `issue view`           | One issue; `--comments` for the discussion                                                                                                   |
-| `issue create`         | Open an issue; `--labels`                                                                                                                    |
-| `issue comment`        | Reply on an issue                                                                                                                            |
-| `issue update`         | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |
-| `issue close`          | Close it; `--reason completed\|not-planned`                                                                                                  |
-| `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                                                             |
-| `identity`             | Who this install is on this forge; `--login` asks whether that account may write here, `--bot` if `view --comments` said it is an automation |
+| `proposal view`        | One proposal; `--comments` for the discussion, `--diff` for the patch                                                                               |
+| `proposal comment`     | Reply on a proposal                                                                                                                                 |
+| `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                           |
+| `proposal close`       | Close it without merging                                                                                                                            |
+| `proposal commits`     | The revisions on its source branch, **oldest first**; the last entry is the tip only when `"truncated": false`; `--page` for the next page          |
+| `proposal acknowledge` | React to one comment so its author sees it was read; needs `--comment-id` and `--kind` from `view --comments`                                       |
+| `issue list`           | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                                                                    |
+| `issue view`           | One issue; `--comments` for the discussion                                                                                                          |
+| `issue create`         | Open an issue; `--labels`                                                                                                                           |
+| `issue comment`        | Reply on an issue                                                                                                                                   |
+| `issue update`         | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                           |
+| `issue close`          | Close it; `--reason completed\|not-planned`                                                                                                         |
+| `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                                                                    |
+| `identity`             | Who this install is on this forge; `--login` asks whether that account may write here, `--bot` if `view --comments` said it is an automation        |
 
 Every listing verb takes `-n/--limit` and answers with `count` and `truncated`.
 `truncated` is the forge's word for "there was more", judged on what it sent

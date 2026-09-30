@@ -1,6 +1,6 @@
 """Seam: credential proxy client ↔ server, over a real socket.
 
-Every kubectl/gcloud/gh/git an agent runs goes shim → client → HTTP → proxy.
+Every kubectl/gcloud an agent runs goes shim → client → HTTP → proxy.
 The server has real-socket tests and the client has mocked-urlopen tests, but
 until this file the pair had never met: nothing proved the bytes the client
 sends are the bytes the server's parser accepts, or that the server's refusals

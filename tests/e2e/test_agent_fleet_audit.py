@@ -30,8 +30,14 @@ _REFRESH_SCRIPT_CANDIDATES = (
     f"/opt/defaults/scripts/{_REFRESH_SCRIPT_NAME}",
 )
 _REFRESH_CONFIRMATION = "Refreshed GitHub credentials via"
+# The version-control client the agent reaches the forge through. There is no
+# `gh` in the sandbox; this is what the audit helper itself calls.
+_VCS_CANDIDATES = (
+    "/opt/data/skills/version-control/scripts/vcs.py",
+    "/opt/defaults/skills/version-control/scripts/vcs.py",
+)
 # The exec budget covers the refresh (its client waits up to 60s on the proxy)
-# plus the gh call, with room for a slow broker.
+# plus the forge call, with room for a slow broker.
 _PROBE_TIMEOUT_SECONDS = 180
 
 # All Registered Audit Streams and their human titles
@@ -155,22 +161,26 @@ if res_ref.returncode != 0:
     sys.exit(res_ref.returncode)
 print(f"{_REFRESH_CONFIRMATION} {{refresh_script}}")
 
-# 2. Execute read-only GitHub API verification via Envoy proxy from workspace root
-env = os.environ.copy()
-env['PWD'] = '/opt/data'
-env['PATH'] = '/opt/credential-proxy/bin:' + env.get('PATH', '')
-cmd_gh = ['gh', 'api', f'repos/{github_repo}', '--jq', '.full_name']
-res_gh = subprocess.run(cmd_gh, cwd='/opt/data', env=env, capture_output=True, text=True)
-if res_gh.returncode != 0:
-    print(f"GitHub API query failed: {{res_gh.stderr}}", file=sys.stderr)
-    sys.exit(res_gh.returncode)
-
-full_name = res_gh.stdout.strip()
-if full_name.lower() != '{github_repo}'.lower():
-    print(f"Expected repository '{github_repo}', got '{{full_name}}'", file=sys.stderr)
+# 2. A read-only forge call through the broker: who this install is on the
+# repository, which the broker answers with the token step 1 minted.
+import json
+vcs = [p for p in {_VCS_CANDIDATES!r} if os.path.isfile(p)]
+if not vcs:
+    print(f"vcs.py not found at any of {_VCS_CANDIDATES!r}", file=sys.stderr)
+    sys.exit(1)
+res_vcs = subprocess.run(
+    ['python3', vcs[0], 'identity', '--repo', '{github_repo}'],
+    cwd='/opt/data', capture_output=True, text=True,
+)
+if res_vcs.returncode != 0:
+    print(f"Forge query failed: {{res_vcs.stdout}}{{res_vcs.stderr}}", file=sys.stderr)
+    sys.exit(res_vcs.returncode)
+login = (json.loads(res_vcs.stdout).get("identity") or {{}}).get("login")
+if not login:
+    print(f"No identity for '{github_repo}': {{res_vcs.stdout}}", file=sys.stderr)
     sys.exit(1)
 
-print(f"Successfully authenticated and queried repository: {{full_name}}")
+print(f"Successfully authenticated and queried repository: {github_repo} as {{login}}")
 """
 
     base_exec = [
@@ -195,7 +205,7 @@ print(f"Successfully authenticated and queried repository: {{full_name}}")
             f"STDOUT:\n{proc_start.stdout}\nSTDERR:\n{proc_start.stderr}"
         )
         assert _REFRESH_CONFIRMATION in proc_start.stdout, (
-            f"The probe reached `gh` without running the token refresh; stdout was:\n{proc_start.stdout}"
+            f"The probe reached the forge without running the token refresh; stdout was:\n{proc_start.stdout}"
         )
         assert f"Successfully authenticated and queried repository: {github_repo}" in proc_start.stdout, (
             f"Expected successful repository query confirmation in stdout, got:\n{proc_start.stdout}"

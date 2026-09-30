@@ -146,9 +146,9 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # A command word, not a substring: `/opt/vcs/libexec/git` is the
-      # sanctioned local git and must not trip this; a bare `git clone` or any
-      # `gh` at the start of a command or after a shell join must.
+      # A command word, not a substring: `git log` on the working copy is the
+      # sanctioned local git and must not trip this; a `git clone` or any `gh`
+      # at the start of a command or after a shell join must.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'

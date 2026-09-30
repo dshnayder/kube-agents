@@ -26,8 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key. It holds no credential path.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
-durable `/opt/data`, and the shims that stand in for `gcloud`, `kubectl`, `gh`, and
-`git`. This is the Pod that executes anything the model wrote. Its ServiceAccount
+durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
+`git` that holds no credential and reaches no forge. This is the Pod that executes anything the model wrote. Its ServiceAccount
 carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server hands it
 an unbound principal that IAM grants nothing.
 
