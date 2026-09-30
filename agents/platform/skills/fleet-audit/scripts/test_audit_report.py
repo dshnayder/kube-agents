@@ -16959,8 +16959,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
     qualifying cluster names, from 3 to 4 when the patch-readiness
-    collector did the same, and from 4 to 5 when `collect.py` did it for three
-    more streams, and the stamp is global, so every stream's bodies
+    collector did the same, from 4 to 5 when `collect.py` did it for three
+    more streams, and from 5 to 6 when `fleet_waste.py` and `fleet_stockout.py`
+    did it for cost and stockout, and the stamp is global, so every stream's bodies
     carry the current number. That is the whole of the change here -- five
     lines, one per body -- and this class is what proves it. The compliance
     roster growing from eleven checks to sixteen is recorded the same way: the

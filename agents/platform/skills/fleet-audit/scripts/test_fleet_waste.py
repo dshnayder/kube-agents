@@ -1077,7 +1077,7 @@ class IdleNodepoolTest(unittest.TestCase):
         pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
         hits = fw.check_idle_nodepool(context, pools, now=NOW)
         self.assertEqual([h["object"] for h in hits], ["NodePool/default-pool"])
-        self.assertIn("other pools have 2.00 vCPU / 4.0 GiB unrequested to absorb it",
+        self.assertIn("other pools have 2.00 vCPU / 4.0 GiB unrequested on uncordoned nodes to absorb it",
                       hits[0]["excerpt"])
         self.assertIn("before taints, selectors and zonal spread", hits[0]["excerpt"])
 
@@ -1094,7 +1094,21 @@ class IdleNodepoolTest(unittest.TestCase):
         context = {"nodes": [node, busy], "pods": pods}
         pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
         hits = fw.check_idle_nodepool(context, pools, now=NOW)
-        self.assertIn("other pools have 1.50 vCPU / 3.0 GiB unrequested to absorb it",
+        self.assertIn("other pools have 1.50 vCPU / 3.0 GiB unrequested on uncordoned nodes to absorb it",
+                      hits[0]["excerpt"])
+
+    def test_the_headroom_leaves_out_cordoned_nodes(self):
+        """A cordoned node accepts no pod, so its free capacity is not room
+        for the drain: a surge upgrade that cordons `n3` must not count it."""
+        node, addons = self.small_node_with_addons()
+        busy = self.node("n2", "other", cpu_alloc="4", mem_alloc="8Gi")
+        cordoned = self.node("n3", "other", cpu_alloc="4", mem_alloc="8Gi")
+        cordoned["spec"] = {**(cordoned.get("spec") or {}), "unschedulable": True}
+        pods = addons + [self.pod_on("n2", cpu_req="2", mem_req="4Gi", name="busy")]
+        context = {"nodes": [node, busy, cordoned], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertIn("other pools have 2.00 vCPU / 4.0 GiB unrequested on uncordoned nodes to absorb it",
                       hits[0]["excerpt"])
 
     def test_taints_are_surfaced_so_a_dedicated_pool_can_be_dismissed(self):
@@ -3430,10 +3444,12 @@ class ReplacedPodPeaksTest(unittest.TestCase):
     # -- what the pattern must not claim ---------------------------------- #
 
     def test_a_siblings_pods_are_not_this_controllers(self):
-        """`web` and `web-api` in one namespace. The two-segment tail is what
-        keeps them apart -- the hash segment cannot span `api`'s hyphen."""
+        """`web` and `web-db` in one namespace. Every character of the
+        sibling's pod name is one a generated segment can carry, so only the
+        two-segment tail keeps them apart -- the hash segment cannot span
+        `db`'s hyphen."""
         ctx = self.context([self.pod()])
-        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-api-cccccccc-33333"): (11.0, 40000.0)}
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-db-cccccccc-x7k2p"): (11.0, 40000.0)}
         hits = self.over(ctx, peaks)
         self.assertEqual(len(hits), 1)
         self.assertIn("0.90 vCPU", hits[0]["excerpt"])
@@ -4924,14 +4940,14 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("although the usage read for the same cluster did", reasons["underrequest"])
         self.assertNotIn("not shipping system metrics", entry["limitations"])
 
-    def _unreadable_pools(self, cluster=None):
+    def _unreadable_pools(self, cluster=None, answer=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
             if argv[:3] == ["gcloud", "container", "node-pools"]:
-                return run_of(1, "", "PERMISSION_DENIED: container.nodePools.list")
+                return answer or run_of(1, "", "PERMISSION_DENIED: container.nodePools.list")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
@@ -4953,6 +4969,20 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("idle-nodepool", commands)
         self.assertNotIn("scaledown-blocked", commands)
         self.assertEqual(entry["outcome"], "collected")
+
+    def test_a_node_pool_answer_that_is_not_a_list_is_an_unread_list(self):
+        """An error object at rc=0: one key read as a sole pool and dispositioned
+        both checks not-applicable; two keys crashed the cluster on a string.
+        A list holding a non-object is as unread, not a pool dropped unseen."""
+        for answer in ({"error": "denied"}, {"error": "denied", "code": 403}, [{"name": "p1"}, "p2"]):
+            with self.subTest(answer=answer):
+                entry, _ = self._unreadable_pools(answer=run_of(0, json.dumps(answer)))
+                self.assertEqual(entry["outcome"], "collected")
+                self.assertEqual(
+                    [c["check"] for c in entry["checks_unevaluated"]], ["idle-nodepool", "scaledown-blocked"]
+                )
+                self.assertNotIn("checks_not_applicable", entry)
+                self.assertIn("not a JSON list of node pools (rc=0)", entry["limitations"])
 
     def test_the_unreadable_pool_list_says_why(self):
         entry, _ = self._unreadable_pools()
@@ -5298,7 +5328,7 @@ class CrashIsolationTest(unittest.TestCase):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
-                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                if "boom" in str((kwargs.get("env") or {}).get("KUBECONFIG", "")):
                     raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
                 return run_of(0, json.dumps(dump_of()))
             if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
@@ -5611,6 +5641,11 @@ class GetTargetProjectsTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             fw.enumerate_clusters("acme", run=run)
 
+    def test_a_refusal_naming_another_project_id_says_so(self):
+        run, _ = self.refusing_run("acme-prod")
+        with self.assertRaisesRegex(RuntimeError, r"names another project \('acme-prod'\)"):
+            fw.enumerate_clusters("acme", run=run)
+
     def test_a_quota_project_s_refusal_is_a_failed_list(self):
         """With `billing/quota_project` set to a project whose GKE API is off,
         every listing is refused in that project's name. Read as this project's
@@ -5674,6 +5709,39 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertIn("nothing collected", manifest["error"])
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
         self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
+
+    def _no_project_entry_run(self, status="RUNNING"):
+        """One cluster whose credentials fail, in a project whose registry read
+        crashes, so no `project/<id>` entry is collected."""
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(1, "", "ERROR: credential broker unavailable")
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "c1", "location": "us-central1", "status": status}]))
+            if argv[1] == "artifacts":
+                raise RuntimeError("project read crashed")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                return fw.collect_fleet(None, run=run, session=None, now=NOW)
+
+    def test_a_credential_failed_cluster_keeps_the_manifest_buildable(self):
+        """§2 retries an unreachable cluster by hand under a `limitations`
+        note, so a fleet of them is not nothing collected."""
+        manifest = self._no_project_entry_run()
+        self.assertNotIn("error", manifest)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["acme/us-central1/c1"]["outcome"], "unreachable")
+
+    def test_a_cluster_not_running_and_no_project_entry_is_nothing_collected(self):
+        manifest = self._no_project_entry_run(status="DEGRADED")
+        self.assertIn("nothing collected", manifest.get("error", ""))
+        self.assertIn("and no running cluster", manifest["error"])
 
     def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
         """A `projects list` that succeeded without naming the active project
@@ -7151,6 +7219,29 @@ class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
         self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit))
         index = {("", "Disk/orphaned-pd"): dict(self.ENTRY)}
         self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit, releases=index))
+
+
+class RefusedProjectIdTest(unittest.TestCase):
+    """Which project id a refusal names, read only from gcloud's phrasings."""
+
+    def owner(self, stderr):
+        def run(argv, **kwargs):
+            raise AssertionError(argv)
+
+        return fw.refusal_owner("acme", stderr, run=run)
+
+    def test_english_words_after_project_are_not_project_ids(self):
+        for stderr in (
+            "ERROR: Kubernetes Engine API is not enabled on this project either.",
+            "ERROR: the quota project should be set",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self.owner(stderr), (False, "the refusal names no project, so it cannot be tied to 'acme'"))
+
+    def test_a_capitalised_project_keyword_names_its_id(self):
+        owned, reason = self.owner("ERROR: Project acme-prod is not found")
+        self.assertFalse(owned)
+        self.assertIn("names another project ('acme-prod')", reason)
 
 
 if __name__ == "__main__":

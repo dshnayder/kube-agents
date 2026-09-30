@@ -1820,7 +1820,8 @@ class CollectClusterTest(unittest.TestCase):
         """A cut or non-list answer at exit 0 used to raise inside the pool
         checks and fail the whole cluster's gate."""
         truncated = json.dumps([{"name": "p1", "locations": ["us-central1-a"]}] * 3)[:-10]
-        for stdout in (truncated, json.dumps({"error": "shim"})):
+        stray = json.dumps([{"name": "p1", "locations": ["us-central1-a"]}, "p2"])
+        for stdout in (truncated, json.dumps({"error": "shim"}), stray):
             with self.subTest(stdout=stdout[:20]):
                 entry = self.run_with(
                     dump_items=[], pools_stdout=stdout, pools_stderr="credential proxy output truncated"
@@ -1828,7 +1829,7 @@ class CollectClusterTest(unittest.TestCase):
                 self.assertEqual(entry["outcome"], "collected")
                 self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
                 self.assertIn("single-zone-nodepool", {e["check"] for e in entry["checks_unevaluated"]})
-                self.assertIn("not a JSON list (rc=0)", entry["limitations"])
+                self.assertIn("not a JSON list of node pools (rc=0)", entry["limitations"])
 
     def test_an_empty_node_pool_read_is_still_a_cluster_with_no_pools(self):
         entry = self.run_with(dump_items=[], pools_stdout="")
@@ -2239,6 +2240,22 @@ class ProjectDiscoveryTest(unittest.TestCase):
         self.assertIn("1 project(s) could not be listed", error)
         self.assertNotIn("project discovery also failed", error)
 
+    def test_every_cluster_unreachable_and_no_project_entry_is_nothing_collected(self):
+        """An unreachable cluster evaluated no check: counting it as read
+        emitted a manifest with nothing `finish` could take as a cluster."""
+        inner = fleet_run({"acme": ["c1"]}, projects="acme\n")
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(1, "", "ERROR: credential broker unavailable")
+            if argv[:2] == ["gcloud", "compute"]:
+                raise RuntimeError("project read crashed")
+            return inner(argv, **kwargs)
+
+        manifest = self.collect(run)
+        self.assertIn("nothing collected", manifest.get("error", ""))
+        self.assertIn("reached none of its clusters", manifest["error"])
+
     def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
         """A `projects list` that succeeded without naming the active project
         was read in full; its note says what the run may have missed, so the
@@ -2443,6 +2460,28 @@ class ProjectDiscoveryTest(unittest.TestCase):
         clusters = [c for c in manifest["clusters"] if not c["name"].startswith("project/")]
         ran = ["spot-scarcity-risk" in {x["check"] for x in c["commands"]} for c in clusters]
         self.assertEqual(sorted(ran), [False, True])
+
+    def test_capacity_history_rc0_answers_are_kept_only_when_they_parse(self):
+        """Garbled output is a failed read and is asked again; an empty answer
+        is a read that measured nothing and is kept."""
+        for first, asked in (("{not json", 2), ("", 1), ("[]", 1), ("{}", 1)):
+            with self.subTest(first=first):
+                cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+                inner = fleet_run({"acme": ["c1", "c2"]}, projects="acme\n")
+                advice = []
+
+                def run(argv, **kwargs):
+                    if argv[:2] == ["kubectl", "get"]:
+                        return run_of(0, json.dumps(dump_of(cc)))
+                    if argv[: len(fs.CAPACITY_HISTORY_ARGV)] == fs.CAPACITY_HISTORY_ARGV:
+                        advice.append(argv)
+                        if len(advice) == 1:
+                            return run_of(0, first)
+                        return run_of(0, json.dumps(capacity_history([0.01] * 7)))
+                    return inner(argv, **kwargs)
+
+                self.collect_with(run, max_workers=1)
+                self.assertEqual(len(advice), asked)
 
     def collect_with(self, run, **kwargs):
         with TemporaryDirectory() as tmp:
@@ -2721,6 +2760,14 @@ class ClustersListedMarkerTest(unittest.TestCase):
         manifest = self.manifest(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme-prod before"))
         self.assertEqual([c["name"] for c in manifest["clusters"] if fs.CLUSTERS_LISTED_KEY in c], ["project/beta"])
 
+    def test_a_refusal_naming_another_project_id_says_so(self):
+        """The reason must match the stderr quoted beside it: this refusal
+        names `acme-prod`, not no project."""
+        manifest = self.manifest(run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project acme-prod before"))
+        acme = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertIn("names another project ('acme-prod')", acme["error"])
+        self.assertNotIn("names no project", acme["error"])
+
     def test_a_quota_project_s_refusal_does_not_mark_the_project(self):
         # The refusal names a project other than acme (fleet_run's describe answers no number),
         # so acme's clusters are unknown, not absent.
@@ -2916,6 +2963,29 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         data = {"audit": "stockout-prevention", "scope": {"clusters": clusters, "skipped": skipped}}
         with self.assertRaisesRegex(audit_report.ValidationError, "as run or not applicable"):
             audit_report.cross_check_manifest(data, manifest)
+
+
+class RefusedProjectIdTest(unittest.TestCase):
+    """Which project id a refusal names, read only from gcloud's phrasings."""
+
+    def owner(self, stderr):
+        def run(argv, **kwargs):
+            raise AssertionError(argv)
+
+        return fs.refusal_owner("acme", stderr, run=run)
+
+    def test_english_words_after_project_are_not_project_ids(self):
+        for stderr in (
+            "ERROR: Kubernetes Engine API is not enabled on this project either.",
+            "ERROR: the quota project should be set",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self.owner(stderr), (False, "the refusal names no project, so it cannot be tied to 'acme'"))
+
+    def test_a_capitalised_project_keyword_names_its_id(self):
+        owned, reason = self.owner("ERROR: Project acme-prod is not found")
+        self.assertFalse(owned)
+        self.assertIn("names another project ('acme-prod')", reason)
 
 
 if __name__ == "__main__":

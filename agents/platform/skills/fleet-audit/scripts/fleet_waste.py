@@ -102,6 +102,8 @@ MAX_WORKERS = 8
 # `audit_report.py` reads both shapes, so keep them in step with it.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
+# A cluster the collector never read: not running, or its credentials failed.
+UNREACHABLE_OUTCOME = "unreachable"
 # On a `project/<id>` entry whose `clusters list` completed and came back
 # empty -- never a failed or zone-incomplete one. `audit_report.py` reads it
 # (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
@@ -132,6 +134,18 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 # the consumer project's, and with a quota project set (`billing/quota_project`)
 # that is not the project being listed.
 REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The project *id* a refusal names, when it names one rather than a number,
+# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
+# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
+# lowercase letters, digits and hyphens, starting with a letter and not ending
+# in a hyphen. Used only to say which project a refusal was about.
+REFUSED_PROJECT_ID_RE = re.compile(
+    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
+    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
+)
+# English words of id shape that gcloud's prose puts where an id could sit
+# ("... on this project either."): never read as the project a refusal names.
+REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
 # The read `refusal_names_project` makes to turn a project id into the number
 # a refusal names. `collect_fleet` answers a repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
@@ -189,7 +203,7 @@ PROJECT_DEADLINE_ERROR = (
 NOTHING_COLLECTED_ERROR = (
     "nothing collected: none of the {count} project(s) in scope yielded a target -- each failed "
     "its cluster listing, went unread past the deadline, or has neither the Compute Engine nor "
-    "the Artifact Registry API on. First: {first}"
+    "the Artifact Registry API on and no running cluster. First: {first}"
 )
 # The opening of the note a filtered `projects list` leaves: the listing
 # succeeded, so like the `--project` note it says what a run may have
@@ -212,10 +226,9 @@ NO_TARGET_REASON = (
 GITOPS_CLUSTER_TREE_ROOT = "clusters"
 GITOPS_CLUSTER_TREE_DEPTH = 2
 GIT_DIR_NAME = ".git"
-# Config Connector's API group. Its objects are indexed by `audit_report.py`'s
-# `kcc_declarations`, keyed by the GCP resource name `spec.resourceID` can
-# override, so `workload_declarations` skips them rather than resolving a
-# `Cluster/<name>` finding through the wrong table.
+# Config Connector's API group. Its objects name a GCP resource, which
+# `spec.resourceID` can override, not a workload, so `workload_declarations`
+# skips them rather than resolving a `Cluster/<name>` finding against one.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
 # `release_declarations` indexes the objects that render a workload a GitOps
 # repo holds no manifest for -- an Argo CD `Application`, from either a chart
@@ -803,7 +816,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "project": project,
         "location": location,
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
-        "outcome": "unreachable",
+        "outcome": UNREACHABLE_OUTCOME,
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
     }
 
@@ -842,6 +855,9 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     if not numbers:
         if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
             return True, ""
+        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
+        if others:
+            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
         return False, f"the refusal names no project, so it cannot be tied to {project!r}"
     described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
     if described.rc != 0:
@@ -2128,12 +2144,13 @@ def check_idle_nodepool(
         # an actionable finding and a research task -- so state the headroom.
         # It is pool-level arithmetic and takes no account of taints, node
         # selectors or zonal spread, hence the hedge in the wording: it is a
-        # necessary condition for the drain, not a sufficient one.
+        # necessary condition for the drain, not a sufficient one. A cordoned
+        # node accepts no pod, so its free capacity is not counted.
         pool_node_names = {n.get("metadata", {}).get("name", "") for n in nodes}
         free_cpu = free_mem = 0.0
         for other in context["nodes"]:
             other_name = other.get("metadata", {}).get("name", "")
-            if other_name in pool_node_names:
+            if other_name in pool_node_names or (other.get("spec") or {}).get("unschedulable"):
                 continue
             other_cpu, other_mem = _allocatable(other)
             used_cpu, used_mem = _sum_requests(all_pods_by_node.get(other_name, []))
@@ -2190,7 +2207,7 @@ def check_idle_nodepool(
                     f"also weighs, non-DS CPU is {cpu_pct * 100:.0f}% / mem {mem_pct * 100:.0f}% "
                     f"of allocatable ({cpu_req_total:.2f} vCPU / {mem_req_total / MIB_PER_GIB:.1f} GiB), "
                     f"and the cluster's other pools have {free_cpu:.2f} vCPU / {free_mem / MIB_PER_GIB:.1f} GiB "
-                    f"unrequested to absorb it — before taints, selectors and zonal spread, which "
+                    f"unrequested on uncordoned nodes to absorb it — before taints, selectors and zonal spread, which "
                     f"this figure does not model.{blocker_note}{taint_note}"
                 ),
                 "severity": severity,
@@ -4654,7 +4671,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
+        return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
     dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
@@ -4735,18 +4752,24 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # cluster with no node pools has no idle ones, so 3.7 and 3.8 recorded
         # their command and reported nothing found. The evidence line carried the
         # non-zero rc, but nothing downstream reads it: the ledger said the pools
-        # were checked and were fine.
-        node_pools, pools_result = run_and_gate(node_pools_argv, run=run)
-        pools_readable = node_pools is not None
-        node_pools = node_pools or []
+        # were checked and were fine. An answer that parses to anything but a
+        # list of objects (an error object, a stray string) is as unread: one
+        # key read as a sole pool, and more crashed the cluster on a string.
+        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        pools_readable = isinstance(parsed_pools, list) and all(isinstance(p, dict) for p in parsed_pools)
+        node_pools = parsed_pools if pools_readable else []
         pools_record = _record(shlex.join(node_pools_argv), pools_result)
         if not pools_readable:
+            pools_failure = (
+                "returned output that is not a JSON list of node pools (rc=0)"
+                if pools_result.rc == 0
+                else f"failed (rc={pools_result.rc})"
+            )
             for slug in ("idle-nodepool", "scaledown-blocked"):
-                unevaluated[slug] = f"`gcloud container node-pools list` failed (rc={pools_result.rc})"
+                unevaluated[slug] = f"`gcloud container node-pools list` {pools_failure}"
             limitations.append(
                 f"idle-nodepool and scaledown-blocked could not be measured on "
-                f"this cluster: `gcloud container node-pools list` failed "
-                f"(rc={pools_result.rc}) — "
+                f"this cluster: `gcloud container node-pools list` {pools_failure} — "
                 f"{pools_result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'}"
             )
         elif len(node_pools) == 1:
@@ -6021,6 +6044,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         )
 
     entries = cluster_entries + project_entries + unaudited + discovery_entries
+    # Only a cluster that is not running counts as unread, and it is in
+    # `unaudited`, never here: an unreachable cluster whose credentials failed
+    # stays eligible, since §2 retries it by hand under a `limitations` note.
     if not cluster_entries and not read_projects:
         # Every target left is one §2 sends straight to `scope.skipped` -- an
         # unlisted or unreached project, a cluster not running -- and `finish`

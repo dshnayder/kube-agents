@@ -159,6 +159,10 @@ RESERVATION_IDLE_MIN_INSTANCES = 4
 MIN_FALLBACK_FAMILIES = 2
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
+# `2026-09-30T14:43:39`: an RFC 3339 log timestamp cut to whole seconds.
+TIMESTAMP_TO_SECONDS_CHARS = 19
+# A `google.type.Money` carries `units` plus `nanos` billionths of a unit.
+NANOS_PER_UNIT = 1e9
 
 # A cluster target is `<project>/<location>/<name>`, the qualified name
 # `collect.py` publishes: a bare name is not unique once two locations of one
@@ -166,6 +170,9 @@ STDERR_EXCERPT_CHARS = 200
 # lists one name twice. Project-scoped checks keep `project/<id>`.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
+# A cluster the collector never read: not running, or its credentials failed.
+# The nothing-collected guard does not count it as read.
+UNREACHABLE_OUTCOME = "unreachable"
 # On a `project/<id>` entry whose `clusters list` completed and came back
 # empty -- never a failed or zone-incomplete one. `audit_report.py` reads it
 # (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
@@ -189,6 +196,18 @@ API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been
 # The project an API refusal names; `fleet_waste.REFUSED_PROJECT_NUMBER_RE`
 # carries the reasoning.
 REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The project *id* a refusal names, when it names one rather than a number,
+# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
+# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
+# lowercase letters, digits and hyphens, starting with a letter and not ending
+# in a hyphen. Used only to say which project a refusal was about.
+REFUSED_PROJECT_ID_RE = re.compile(
+    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
+    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
+)
+# English words of id shape that gcloud's prose puts where an id could sit
+# ("... on this project either."): never read as the project a refusal names.
+REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
 # The read `refusal_names_project` makes; `collect_fleet` answers a repeat of
 # it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
@@ -220,8 +239,8 @@ NO_CLUSTER_QUOTA_REASON = (
 )
 NOTHING_COLLECTED_ERROR = (
     "nothing collected: none of the {count} project(s) in scope yielded a target -- each failed "
-    "its cluster listing, went unread past the deadline, or has the Compute Engine API off "
-    "and no cluster. First: {first}"
+    "its cluster listing, went unread past the deadline, reached none of its clusters, or has "
+    "the Compute Engine API off and no cluster. First: {first}"
 )
 # The opening of the note a filtered `projects list` leaves: the listing
 # succeeded, so like the `--project` note it says what a run may have
@@ -483,7 +502,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "location": location,
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
-        "outcome": "unreachable",
+        "outcome": UNREACHABLE_OUTCOME,
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
     }
 
@@ -569,6 +588,9 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     if not numbers:
         if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
             return True, ""
+        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
+        if others:
+            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
         return False, f"the refusal names no project, so it cannot be tied to {project!r}"
     described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
     if described.rc != 0:
@@ -602,6 +624,21 @@ def _describing_once(run: RunFn) -> RunFn:
     return wrapped
 
 
+def _is_readable_answer(result: Run) -> bool:
+    """Whether `collect_cluster` takes `result` as a successful read: exit 0
+    with no output or output that parses as JSON. An empty answer measured
+    nothing, but it is an answer; only unparseable output is a failed read."""
+    if result.rc != 0:
+        return False
+    if not result.stdout.strip():
+        return True
+    try:
+        json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
 def _advising_once(run: RunFn) -> RunFn:
     """`run`, answering a repeated `capacity-history` read from its first
     successful answer.
@@ -610,10 +647,12 @@ def _advising_once(run: RunFn) -> RunFn:
     per-cluster, but the read is issued per cluster: a fleet of N clusters in
     one region asking about one Spot shape paid N identical calls. Clusters
     are read in parallel, so unlike `_describing_once` a lock per argv makes
-    the racers wait for the first answer instead of each asking. A failed
-    answer is not kept, so a transient failure on one cluster's read leaves
-    the next cluster free to ask again; the cache lives only as long as the
-    `collect_fleet` call that made it.
+    the racers wait for the first answer instead of each asking. Only an
+    answer the caller reads as successful is kept: exit 0 with output that
+    is empty or parses as JSON, so an empty history is asked once. A failed
+    exit or garbled output is not kept, so a transient fault on one
+    cluster's read leaves the next cluster free to ask again; the cache
+    lives only as long as the `collect_fleet` call that made it.
     """
     answers: dict[tuple[str, ...], Run] = {}
     locks: dict[tuple[str, ...], threading.Lock] = {}
@@ -629,7 +668,7 @@ def _advising_once(run: RunFn) -> RunFn:
             if key in answers:
                 return answers[key]
             result = run(argv, **kwargs)
-            if result.rc == 0:
+            if _is_readable_answer(result):
                 answers[key] = result
             return result
 
@@ -1231,7 +1270,7 @@ def check_autoscaler_out_of_resources(message_ids: dict[str, dict]) -> list[dict
         # cannot know what window it asked for, and a hardcoded "over the last
         # 24h" beside timestamps that say otherwise is worse than no claim.
         window = (
-            f", {seen['first_seen'][:19]} .. {seen['last_seen'][:19]}"
+            f", {seen['first_seen'][:TIMESTAMP_TO_SECONDS_CHARS]} .. {seen['last_seen'][:TIMESTAMP_TO_SECONDS_CHARS]}"
             if seen["first_seen"]
             else ""
         )
@@ -1385,7 +1424,7 @@ def spot_list_price(advice: object) -> str:
     if not prices:
         return ""
     price = prices[-1]["listPrice"]
-    amount = float(price.get("units") or 0) + float(price.get("nanos") or 0) / 1e9
+    amount = float(price.get("units") or 0) + float(price.get("nanos") or 0) / NANOS_PER_UNIT
     return f"{amount:.4f} {price.get('currencyCode') or ''}".strip()
 
 
@@ -1546,7 +1585,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     mode = {"autopilot": bool(cluster.get("autopilot")), "has_nap": bool(cluster.get("has_nap"))}
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
+        return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses,nodes", "-A", "-o", "json"]
@@ -1604,11 +1643,13 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
         parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
         # Empty output at exit 0 is a cluster with no pools; output that does
-        # not parse to a list (the shim's cut, an error object) is a failed
-        # read, filed below as unevaluated rather than crashing the cluster.
-        pools_unreadable = pools_result.rc == 0 and bool(pools_result.stdout.strip()) and not isinstance(parsed_pools, list)
+        # not parse to a list of objects (the shim's cut, an error object, a
+        # stray string) is a failed read, filed below as unevaluated rather
+        # than crashing the cluster or dropping a pool unseen.
+        pools_listed = isinstance(parsed_pools, list) and all(isinstance(p, dict) for p in parsed_pools)
+        pools_unreadable = pools_result.rc == 0 and bool(pools_result.stdout.strip()) and not pools_listed
         pools_readable = pools_result.rc == 0 and not pools_unreadable
-        node_pools = [p for p in parsed_pools if isinstance(p, dict)] if isinstance(parsed_pools, list) else []
+        node_pools = parsed_pools if pools_listed else []
         pools_record = _record(shlex.join(node_pools_argv), pools_result)
     has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
@@ -1770,7 +1811,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
         pools_failure = (
-            "`gcloud container node-pools list` returned output that is not a JSON list (rc=0) — "
+            "`gcloud container node-pools list` returned output that is not a JSON list of node pools (rc=0) — "
             if pools_result.rc == 0
             else f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
         ) + (pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
@@ -2257,8 +2298,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         if p in enumeration_failed
     ]
 
-    read_clusters = [e for e in cluster_entries if e]
-    entries = read_clusters + project_entries + failed_entries + not_running + discovery_entries
+    returned_clusters = [e for e in cluster_entries if e]
+    entries = returned_clusters + project_entries + failed_entries + not_running + discovery_entries
+    # An unreachable cluster evaluated no check, so it leaves `scope.clusters`
+    # as empty as no cluster at all; a gate-failed one stays eligible, since
+    # §3's manual retry can still bring it into scope.
+    read_clusters = [e for e in returned_clusters if e.get("outcome") != UNREACHABLE_OUTCOME]
     if not read_clusters and not project_entries:
         # Every target left is one §2 sends straight to `scope.skipped` -- an
         # unlisted or unreached project, a cluster not running -- and `finish`
