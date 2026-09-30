@@ -144,6 +144,9 @@ SPOT_MIN_INTERVALS = 7
 # whole stream reports on.
 SPOT_MAX_SHAPES = 8
 
+# The label GKE stamps on every node with the name of its node pool.
+NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
+
 # §3.3's ">32 cores", §3.4's "> 10" rules, §3.7's 90%, and §3.10(c)'s idle
 # reservation: at most half in use with at least this many instances idle.
 LARGE_VM_VCPUS = 32
@@ -222,6 +225,10 @@ NOTHING_COLLECTED_ERROR = (
 FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
 # `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
 # way a project yields nothing without recording why.
+# Appended to the every-project-failed error when discovery itself failed:
+# the active-project fallback is why the run held one project to fail, and the
+# error is the one line §2 tells the worker to report.
+DISCOVERY_FAILED_SUFFIX = "; project discovery also failed: {error}"
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has the Compute Engine API off"
 )
@@ -970,7 +977,7 @@ def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
     return per_zone * zones, f"maxNodeCount {per_zone}/zone x {zones} zones"
 
 
-def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int) -> dict | None:
+def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int, *, multi_zone_pool: bool = False) -> dict | None:
     """`current_node_count` must be the pool's *live* node count (counted
     from the cluster's own `Node` objects, grouped by the
     `cloud.google.com/gke-nodepool` label) -- `initialNodeCount` is a
@@ -983,12 +990,18 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     makes the stall contingent on a future stockout when scale-up is already
     stopped for a reason that has nothing to do with supply. Both conditions
     hold, so both are reported.
+
+    `multi_zone_pool` is whether any pool on the cluster spans more than one
+    zone. §3.9's zone-locked arm is cluster-level -- no NAP *and* no
+    multi-zone pool -- so a zonal pool beside a multi-zone one is spared, and
+    the excerpt's "no multi-zone node pool" is a fact this call was given
+    rather than one it asserted.
     """
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
     # Exactly one: an empty `locations` is an unknown zone span, as
     # `_pool_ceiling` reads it, not a pool locked to a zone.
-    zone_locked = len(locations) == 1 and autoscaling.get("enabled") and not has_nap
+    zone_locked = len(locations) == 1 and autoscaling.get("enabled") and not has_nap and not multi_zone_pool
     ceiling, basis = _pool_ceiling(autoscaling, locations)
     at_ceiling = bool(ceiling) and current_node_count >= NODEPOOL_CEILING_FRACTION * ceiling
     if not zone_locked and not at_ceiling:
@@ -996,7 +1009,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     excerpts, impacts = [], []
     if zone_locked:
         excerpts.append(
-            f"single-zone ({locations}), autoscaling enabled, no NAP and no regional multi-zone configuration"
+            f"single-zone ({locations}), autoscaling enabled, no NAP and no multi-zone node pool on the cluster"
         )
         impacts.append(_IMPACT_ZONE_LOCKED)
     if at_ceiling:
@@ -1504,7 +1517,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # `fleet_waste.py`'s idle-nodepool check already groups by.
     live_node_count_by_pool: dict[str, int] = {}
     for node in (i for i in items if i.get("kind") == "Node"):
-        pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
+        pool = (node.get("metadata", {}).get("labels") or {}).get(NODEPOOL_LABEL, "")
         live_node_count_by_pool[pool] = live_node_count_by_pool.get(pool, 0) + 1
 
     autopilot = bool(cluster.get("autopilot"))
@@ -1677,9 +1690,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
+        multi_zone_pool = any(len(pool.get("locations") or []) > 1 for pool in node_pools)
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
-            for hit in [check_single_zone_nodepool(pool, has_nap, live_count)]:
+            for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_pool=multi_zone_pool)]:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
@@ -1744,6 +1758,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     shapes = spot_shapes(compute_classes, node_pools if pools_readable else [])
     region = region_of(location)
     spot_hits: dict[str, dict] = {}
+    failed_shapes: list[str] = []
+    answered_shapes: list[str] = []
     for machine_type in sorted(shapes)[:SPOT_MAX_SHAPES]:
         advice_argv = [
             "gcloud", "beta", "compute", "advice", "capacity-history",
@@ -1766,7 +1782,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"{region}: `gcloud beta compute advice capacity-history` {failure} — "
                 f"{advice_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
             )
+            failed_shapes.append(machine_type)
             continue
+        answered_shapes.append(machine_type)
         commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)
         # The live read returned a bare object (the module docstring's shape);
         # a list of one is unwrapped as well, here rather than in the helpers,
@@ -1785,13 +1803,27 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         if limitation:
             limitations.append(limitation)
     candidates += [_emit("spot-scarcity-risk", hit) for hit in spot_hits.values()]
-    if shapes and "spot-scarcity-risk" not in commands:
+    unread_shapes = sorted(shapes)[SPOT_MAX_SHAPES:]
+    if shapes and not answered_shapes:
         unevaluated["spot-scarcity-risk"] = "every capacity-history read for this cluster's Spot shapes failed"
-    if len(shapes) > SPOT_MAX_SHAPES:
+    elif failed_shapes or unread_shapes:
+        # A shape that failed or was never read is a shape nobody checked, and
+        # `finish` carries `limitations` only for a check listed unevaluated,
+        # so recording the check as run on the shapes that answered published
+        # an all-clear for the rest. As with the regional quota reads: the
+        # check is unevaluated, and the answered shapes' findings still file.
+        gaps = []
+        if failed_shapes:
+            gaps.append(f"capacity-history reads failed: {', '.join(failed_shapes)}")
+        if unread_shapes:
+            gaps.append(f"not read past the {SPOT_MAX_SHAPES}-shape ceiling: {', '.join(unread_shapes)}")
+        unevaluated["spot-scarcity-risk"] = f"{'; '.join(gaps)}; answered: {', '.join(answered_shapes)}"
+        commands.pop("spot-scarcity-risk", None)
+    if unread_shapes:
         limitations.append(
             f"spot-scarcity-risk read {SPOT_MAX_SHAPES} of this cluster's "
             f"{len(shapes)} distinct Spot machine shapes; the rest were not "
-            f"measured: {', '.join(sorted(shapes)[SPOT_MAX_SHAPES:])}"
+            f"measured: {', '.join(unread_shapes)}"
         )
     unqueryable, unpinned, inert = spot_without_a_shape(
         compute_classes,
@@ -2043,13 +2075,24 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         for future in as_completed(futures):
             enumerated[futures[future]] = future.result()
     enumeration_failed = {p: r for p, r in enumerated.items() if isinstance(r, str)}
+    discovery_entries = (
+        [{"name": UNENUMERATED_PROJECTS_TARGET, "project": "", "location": "global", "outcome": "gate-failed", "error": partial_discovery[:ERROR_EXCERPT_CHARS]}]
+        if partial_discovery
+        else []
+    )
     if len(enumeration_failed) == len(projects):
         # Nothing was read anywhere, which is the same run a single failed
         # project used to be. One project quoted, the rest counted: a
         # credential that expired across two hundred projects would
         # otherwise produce an error nobody can read as a one-line summary.
+        # A failed `projects list` is named too: it is why the run held only
+        # the active project, as the nothing-collected path below says.
         first = projects[0]
-        return failed(f"{len(projects)} project(s) could not be listed or were not reached; first, {first}: {enumeration_failed[first]}")
+        error = f"{len(projects)} project(s) could not be listed or were not reached; first, {first}: {enumeration_failed[first]}"
+        explaining = [e for e in discovery_entries if not _only_a_scope_note(e, project)]
+        if explaining:
+            error += DISCOVERY_FAILED_SUFFIX.format(error=explaining[0]["error"])
+        return failed(error)
 
     clusters: list[dict] = []
     not_running: list[dict] = []
@@ -2110,11 +2153,6 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         for p in projects
         if p in enumeration_failed
     ]
-    discovery_entries = (
-        [{"name": UNENUMERATED_PROJECTS_TARGET, "project": "", "location": "global", "outcome": "gate-failed", "error": partial_discovery[:ERROR_EXCERPT_CHARS]}]
-        if partial_discovery
-        else []
-    )
 
     read_clusters = [e for e in cluster_entries if e]
     entries = read_clusters + project_entries + failed_entries + not_running + discovery_entries

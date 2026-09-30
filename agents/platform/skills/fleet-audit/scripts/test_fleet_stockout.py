@@ -570,6 +570,11 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1))
 
+    def test_does_not_flag_a_zonal_pool_beside_a_multi_zone_pool(self):
+        # §3.9's Do-NOT-flag: a regional cluster with multi-zone node pools.
+        pool = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1, multi_zone_pool=True))
+
     def test_does_not_flag_single_zone_with_nap(self):
         pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
@@ -1217,11 +1222,12 @@ class CollectClusterTest(unittest.TestCase):
                 # what the bare `run_of(0, "")` below stands in for elsewhere.
                 return run_of(0, json.dumps(log_entries) if log_entries else "")
             if argv[:5] == ["gcloud", "beta", "compute", "advice", "capacity-history"]:
-                if advice_rc:
-                    return run_of(advice_rc, "", advice_stderr)
+                machine_type = argv[argv.index("--machine-type") + 1]
+                rc = advice_rc(machine_type) if callable(advice_rc) else advice_rc
+                if rc:
+                    return run_of(rc, "", advice_stderr)
                 if advice_stdout is not None:
                     return run_of(0, advice_stdout, advice_stderr)
-                machine_type = argv[argv.index("--machine-type") + 1]
                 body = advice(machine_type) if callable(advice) else advice
                 return run_of(0, json.dumps(body) if body is not None else "")
             return run_of(0, "")
@@ -1232,6 +1238,16 @@ class CollectClusterTest(unittest.TestCase):
 
     def issued_node_pools_read(self):
         return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
+
+    def test_the_collector_tells_the_check_about_the_cluster_s_other_pools(self):
+        zonal = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        regional = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        with patch.object(fs, "check_single_zone_nodepool", wraps=fs.check_single_zone_nodepool) as check:
+            for pools in ([zonal, regional], [zonal]):
+                check.reset_mock()
+                self.run_with(pools=pools)
+                flags = {c.args[0]["name"]: c.kwargs["multi_zone_pool"] for c in check.call_args_list}
+                self.assertEqual(flags["gpu"], len(pools) > 1)
 
     def declared_not_applicable(self, entry):
         return {e["check"] for e in entry.get("checks_not_applicable") or []}
@@ -1484,6 +1500,33 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc], advice=lambda mt: capacity_history([0.05] * 10, mt))
         self.assertEqual(len(self.issued_advice_reads()), fs.SPOT_MAX_SHAPES)
         self.assertIn("8 of this cluster's 9 distinct Spot machine shapes", entry["limitations"])
+
+    def test_one_failed_shape_leaves_the_check_unevaluated_and_keeps_the_other_s_finding(self):
+        """The regional quota reads' rule: `finish` carries `limitations` only
+        for a check listed unevaluated, so recording spot-scarcity-risk as run
+        because one shape answered published the failed shape as clean."""
+        classes = [
+            compute_class("gpu", [{"machineType": "a2-highgpu-1g", "spot": True}]),
+            compute_class("cpu", [{"machineType": "n2-standard-8", "spot": True}]),
+        ]
+        entry = self.run_with(
+            dump_items=classes,
+            advice=lambda mt: capacity_history([0.4] * 10, mt),
+            advice_rc=lambda mt: 1 if mt == "n2-standard-8" else 0,
+        )
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        unevaluated = {e["check"]: e["reason"] for e in entry["checks_unevaluated"]}
+        self.assertIn("reads failed: n2-standard-8", unevaluated["spot-scarcity-risk"])
+        self.assertIn("answered: a2-highgpu-1g", unevaluated["spot-scarcity-risk"])
+        hits = {c["object"] for c in entry["candidates"] if c["check"] == "spot-scarcity-risk"}
+        self.assertEqual(hits, {"ComputeClass/gpu"})
+
+    def test_shapes_past_the_ceiling_leave_the_check_unevaluated(self):
+        many = [{"machineType": f"n2-standard-{n}", "spot": True} for n in (2, 4, 8, 16, 32, 48, 64, 80, 96)]
+        entry = self.run_with(dump_items=[compute_class("cc1", many)], advice=lambda mt: capacity_history([0.05] * 10, mt))
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        unevaluated = {e["check"]: e["reason"] for e in entry["checks_unevaluated"]}
+        self.assertIn("not read past the 8-shape ceiling: n2-standard-96", unevaluated["spot-scarcity-risk"])
 
     def test_a_refused_advice_read_is_a_limitation_not_a_clean_shape(self):
         cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
@@ -2047,6 +2090,32 @@ class ProjectDiscoveryTest(unittest.TestCase):
 
         error = self.collect(run)["error"]
         self.assertIn(f"First: {fs.UNENUMERATED_PROJECTS_TARGET}: `gcloud projects list` rc=1", error)
+
+    def test_a_failed_listing_is_named_when_the_fallback_project_fails_too(self):
+        """A failed `projects list` falls back to the active project; when
+        that project's `clusters list` fails as well, the run ends before any
+        target is built, and the error still names the listing that left the
+        run holding one project."""
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "ERROR: PERMISSION_DENIED")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(1, "", "ERROR: UNAUTHENTICATED")
+            return fleet_run({})(argv, **kwargs)
+
+        error = self.collect(run)["error"]
+        self.assertIn("1 project(s) could not be listed", error)
+        self.assertIn("project discovery also failed: `gcloud projects list` rc=1", error)
+
+    def test_a_scoped_project_whose_listing_fails_names_no_discovery(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(1, "", "ERROR: UNAUTHENTICATED")
+            return fleet_run({})(argv, **kwargs)
+
+        error = self.collect(run, project="acme")["error"]
+        self.assertIn("1 project(s) could not be listed", error)
+        self.assertNotIn("project discovery also failed", error)
 
     def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
         """A `projects list` that succeeded without naming the active project

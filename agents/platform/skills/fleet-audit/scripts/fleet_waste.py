@@ -360,6 +360,15 @@ LB_EGRESS_BYTES_METRIC = "loadbalancing.googleapis.com/l3/external/egress_bytes_
 # series totalling 743,426 packets where the resource grouping returned three,
 # the largest of them 374,158.
 LB_RULE_LABEL = "resource.labels.forwarding_rule_name"
+# A query pair made only of characters a URL carries unescaped, which a
+# Monitoring label may therefore pass as `-d` rather than `--data-urlencode`.
+LB_EGRESS_UNMEASURED = "{what} is unmeasured, because Cloud Monitoring holds no outbound series for the rule"
+URL_SAFE_PAIR_RE = re.compile(r"^[A-Za-z0-9._~:-]+=[A-Za-z0-9._~:-]+$")
+# A rule name is unique only per region, and `forwarding-rules list` returns
+# every region, so the answer is grouped by region too: grouped by name alone,
+# two regions' `web` rules folded into one total credited to one address.
+# Both monitored resources the counters arrive under carry the label.
+LB_REGION_LABEL = "resource.labels.region"
 # The forwarding-rule scheme these metrics cover. An INTERNAL rule and a
 # Private Service Connect attachment report nothing under `l3/external`, and an
 # EXTERNAL_MANAGED (proxy) rule reports under `https/` instead -- so including
@@ -529,6 +538,8 @@ UNSIZED_FLOOR_VCPU = 0.01
 UNSIZED_FLOOR_MIB = 32.0
 # §3.7's "pools created < 7 days ago" exclusion.
 IDLE_NODEPOOL_MIN_AGE_DAYS = 7
+# §3.7's "workload requests <= 15% of allocatable", per node and per dimension.
+IDLE_NODEPOOL_REQUEST_FRACTION = 0.15
 # The GKE operation type whose start time is a node pool's creation time.
 CREATE_NODE_POOL_OPERATION = "CREATE_NODE_POOL"
 # GKE operation timestamps carry nanoseconds; `fromisoformat` takes six digits.
@@ -994,10 +1005,15 @@ def _monitoring_command(project: str, requests: list[dict]) -> str:
     url = MONITORING_TIMESERIES_URL.format(project=project)
     curls = []
     for params in requests:
+        # A pair with nothing to encode goes as the short `-d`, which `-G`
+        # appends unchanged: the label has to fit `finish`'s per-command
+        # limit, and the load-balancer read's three queries at the longest
+        # project name did not.
         args = [
-            f"--data-urlencode {shlex.quote(f'{key}={item}')}"
+            f"-d {pair}" if URL_SAFE_PAIR_RE.match(pair) else f"--data-urlencode {shlex.quote(pair)}"
             for key, value in params.items()
             for item in (value if isinstance(value, list) else [value])
+            for pair in [f"{key}={item}"]
         ]
         curls.append(" ".join([MONITORING_CURL_PREFIX, url, *args]))
     return " && ".join(curls)
@@ -1030,7 +1046,7 @@ def _lb_traffic_params(metric: str, *, start: datetime, now: datetime) -> dict:
         "aggregation.alignmentPeriod": f"{LB_TRAFFIC_ALIGNMENT_S}s",
         "aggregation.perSeriesAligner": "ALIGN_SUM",
         "aggregation.crossSeriesReducer": "REDUCE_SUM",
-        "aggregation.groupByFields": [LB_RULE_LABEL],
+        "aggregation.groupByFields": [LB_RULE_LABEL, LB_REGION_LABEL],
     }
 
 
@@ -1256,8 +1272,9 @@ def _read_lb_series(
     metric: str,
     start: datetime,
     now: datetime,
-) -> tuple[dict[str, float], tuple[int, str] | None]:
-    """One load-balancer counter, totalled over the window per forwarding rule.
+) -> tuple[dict[tuple[str, str], float], tuple[int, str] | None]:
+    """One load-balancer counter, totalled over the window per forwarding rule,
+    keyed by `(region, rule name)`.
 
     Two collapses happen here and they are different operations. Confusing them
     doubles a number that goes into a published finding, which is the failure
@@ -1278,7 +1295,7 @@ def _read_lb_series(
     published 745,404 for a rule that saw 374,158. `max` also does the right
     thing for a rule only one of the two types reports, which is most of them.
     """
-    sink: dict[str, float] = {}
+    sink: dict[tuple[str, str], float] = {}
     page_token = None
     while True:
         params = {**_lb_traffic_params(metric, start=start, now=now), "pageSize": MONITORING_PAGE_SIZE}
@@ -1296,17 +1313,21 @@ def _read_lb_series(
         for series in body.get("timeSeries") or []:
             labels = (series.get("resource") or {}).get("labels") or {}
             rule = labels.get("forwarding_rule_name", "")
+            region = labels.get("region", "")
             # An unlabelled series is the mis-grouped answer `LB_RULE_LABEL`
             # describes, and it carries the project's whole traffic. Dropping it
             # loses a rule's figures at worst; keeping it invents them.
-            if not rule:
+            # A series with no region cannot be told from a same-named rule in
+            # another region, so it is dropped the same way: unmeasured, never
+            # credited to the wrong address.
+            if not rule or not region:
                 continue
             total = 0.0
             for point in series.get("points") or []:
                 value = _point_value(point)
                 if value is not None:
                     total += value
-            sink[rule] = max(sink.get(rule, 0.0), total)
+            sink[(region, rule)] = max(sink.get((region, rule), 0.0), total)
         page_token = body.get("nextPageToken")
         if not page_token:
             return sink, None
@@ -1354,7 +1375,7 @@ def fetch_lb_traffic(
         return {}, Run([label], rc, "", message[:ERROR_EXCERPT_CHARS], time.monotonic() - started)
 
     addresses = {
-        str(rule.get("name") or ""): str(rule.get("IPAddress") or "")
+        (_location_of(rule), str(rule.get("name") or "")): str(rule.get("IPAddress") or "")
         for rule in (rules or [])
         if isinstance(rule, dict)
         and rule.get("loadBalancingScheme") == LB_EXTERNAL_SCHEME
@@ -1366,7 +1387,7 @@ def fetch_lb_traffic(
     if session is None:
         return fail(-1, NO_SESSION_MESSAGE)
 
-    totals: dict[str, dict[str, float]] = {}
+    totals: dict[tuple[str, str], dict[str, float]] = {}
     for key, metric in metrics:
         sink, err = _read_lb_series(session, url, metric=metric, start=start, now=now)
         if err is not None:
@@ -1379,8 +1400,8 @@ def fetch_lb_traffic(
     # rather than the last rule read overwriting the others. One unmeasured
     # rule leaves the sum unknown rather than understated.
     by_address: dict[str, dict] = {}
-    for rule, address in sorted(addresses.items()):
-        measured = {key: totals.get(rule, {}).get(key) for key, _ in metrics}
+    for (region, rule), address in sorted(addresses.items()):
+        measured = {key: totals.get((region, rule), {}).get(key) for key, _ in metrics}
         entry = by_address.get(address)
         if entry is None:
             by_address[address] = {"rule": rule, **measured}
@@ -1769,11 +1790,27 @@ def _is_large_or_ssd(spec: dict) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _template_pod_spec(controller: dict) -> dict:
+    """The pod spec a Job or CronJob will create, or `{}`."""
+    spec = controller.get("spec") or {}
+    if controller.get("kind") == "CronJob":
+        spec = ((spec.get("jobTemplate") or {}).get("spec")) or {}
+    return ((spec.get("template") or {}).get("spec")) or {}
+
+
 def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
     referenced = set()
-    for pod in context["pods"]:
-        ns = pod.get("metadata", {}).get("namespace", "")
-        for vol in (pod.get("spec") or {}).get("volumes") or []:
+    # §3.3 spares a claim a suspended CronJob or a not-yet-started Job will
+    # mount: no pod references it yet, but one will. Any Job or CronJob
+    # template counts, not only the suspended and unstarted ones -- a live
+    # CronJob between runs holds its claim the same way.
+    templates = [
+        (item.get("metadata", {}).get("namespace", ""), _template_pod_spec(item))
+        for item in (context.get("jobs") or []) + (context.get("cronjobs") or [])
+    ]
+    pods = [(pod.get("metadata", {}).get("namespace", ""), pod.get("spec") or {}) for pod in context["pods"]]
+    for ns, pod_spec in pods + templates:
+        for vol in pod_spec.get("volumes") or []:
             claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
             if claim:
                 referenced.add((ns, claim))
@@ -1839,7 +1876,7 @@ def _allocatable(node: dict) -> tuple[float, float]:
     return parse_cpu_cores(str(alloc.get("cpu", "0"))) or 0, parse_mem_mib(str(alloc.get("memory", "0"))) or 0
 
 
-MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem)-(\d+)(?:-\w+)?$")
+MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem|hypermem)-(\d+)(?:-\w+)?$")
 CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
 # `a2-highgpu-1g`, `a2-ultragpu-8g`, `a3-megagpu-8g`, `ct5lp-hightpu-4t`. The
 # trailing number on an accelerator machine type counts GPUs or TPU chips, not
@@ -2027,7 +2064,7 @@ def check_idle_nodepool(
                 # not-idle rather than divide by zero: an unreadable node is
                 # not evidence the pool is reclaimable.
                 every_node_idle = False
-            elif cpu_wk / cpu_alloc > 0.15 or mem_wk / mem_alloc > 0.15:
+            elif cpu_wk / cpu_alloc > IDLE_NODEPOOL_REQUEST_FRACTION or mem_wk / mem_alloc > IDLE_NODEPOOL_REQUEST_FRACTION:
                 every_node_idle = False
         if not every_node_idle:
             continue
@@ -3267,6 +3304,17 @@ def _fronting_addresses(context: dict, ns: str, fronting: list[str]) -> list[str
     return sorted(found)
 
 
+def _sum_or_none(values) -> float | None:
+    """The sum, or None when any value is None: one unmeasured term leaves the
+    total unknown rather than understated."""
+    total = 0.0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _idle_traffic_clause(
     context: dict, ns: str, fronting: list[str], lb_traffic: dict | None
 ) -> str:
@@ -3325,8 +3373,11 @@ def _idle_traffic_clause(
         else ""
     )
     ingress = sum(entry["ingress_packets"] for entry in measured)
-    egress_packets = sum(entry.get("egress_packets") or 0.0 for entry in measured)
-    egress_bytes = sum(entry.get("egress_bytes") or 0.0 for entry in measured)
+    # The two egress counters are read independently of ingress, and a rule
+    # with no series under one of them is unmeasured on that figure, not zero:
+    # "answered none" or "0 bytes each" would be a reply this run never saw.
+    egress_packets = _sum_or_none(entry.get("egress_packets") for entry in measured)
+    egress_bytes = _sum_or_none(entry.get("egress_bytes") for entry in measured)
     metered = (
         f". {subject} metered {ingress:,.0f} inbound packet"
         f"{'' if ingress == 1 else 's'} over {USAGE_WINDOW_HOURS}h"
@@ -3340,8 +3391,15 @@ def _idle_traffic_clause(
         if unmeasured:
             return floor + unmeasured_clause
         return f"{floor} -- nothing measurable reached it"
+    if egress_packets is None:
+        return f"{metered}; {LB_EGRESS_UNMEASURED.format(what='what it answered')}{unmeasured_clause}"
     if not egress_packets:
         return f"{metered} and answered none of them{unmeasured_clause}"
+    if egress_bytes is None:
+        return (
+            f"{metered} and answered with {egress_packets:,.0f} outbound packets; "
+            f"{LB_EGRESS_UNMEASURED.format(what='their payload')}{unmeasured_clause}"
+        )
     per_packet = egress_bytes / egress_packets
     answered = (
         f"{metered} and answered with {egress_bytes:,.0f} bytes across "
@@ -4620,7 +4678,11 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
                 "--format", "json",
             ]
             operations, _ops_result = run_and_gate(ops_argv, run=run)
-            pool_ages = None if operations is None else node_pool_creation_ages(operations, name, now=now)
+            # A read that parsed to anything but a list said nothing about
+            # pool creations; handed on, it read as "no pool created lately"
+            # and dated every pool from the cluster. It takes the failed-read
+            # path instead: node age, with the pool named in `limitations`.
+            pool_ages = node_pool_creation_ages(operations, name, now=now) if isinstance(operations, list) else None
             idle_pool_hits = check_idle_nodepool(
                 context, node_pools, now=now, pool_ages=pool_ages,
                 cluster_age=_age_days(cluster.get("create_time") or "", now=now), limitations=limitations,
@@ -4790,7 +4852,16 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     else:
         # Where the peak read failed the mean read was never issued and
         # `means_result` is the usage read's `Run`, so name that read.
-        means_gap = _metrics_gap_phrase(means_result, "mean-memory" if metrics_ok else "usage")
+        if metrics_ok and means_result.rc == 0:
+            # The usage read answered, so the cluster is shipping system
+            # metrics and "not shipping" would contradict the other checks'
+            # records; what came back empty is this one query.
+            means_gap = (
+                "the Cloud Monitoring mean-memory read returned no container"
+                " time series although the usage read for the same cluster did"
+            )
+        else:
+            means_gap = _metrics_gap_phrase(means_result, "mean-memory" if metrics_ok else "usage")
         unevaluated["underrequest"] = means_gap
         limitations.append(f"underrequest could not be measured on this cluster: {means_gap}")
 

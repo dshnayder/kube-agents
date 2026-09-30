@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for fleet_waste.py, the fleet-wide-cost-analysis collector."""
 
+import inspect
 import json
 import shlex
 import subprocess
@@ -136,7 +137,7 @@ def requests_in_label(label):
         words = shlex.split(curl)
         params = {}
         for flag, value in zip(words, words[1:]):
-            if flag == "--data-urlencode":
+            if flag in ("--data-urlencode", "-d"):
                 key, _, item = value.partition("=")
                 if key not in params:
                     params[key] = item
@@ -409,9 +410,9 @@ class FetchMemoryMeansTest(unittest.TestCase):
         self.assertIn(f"secondaryAggregation.alignmentPeriod={fw.USAGE_WINDOW_HOURS * 3600}s", result.argv[0])
 
 
-def lb_series(rule, *values, resource="loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule"):
+def lb_series(rule, *values, resource="loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule", region="us-central1"):
     return {
-        "resource": {"type": resource, "labels": {"project_id": "acme", "forwarding_rule_name": rule}},
+        "resource": {"type": resource, "labels": {"project_id": "acme", "forwarding_rule_name": rule, "region": region}},
         "points": [{"value": {"int64Value": str(v)}} for v in values],
     }
 
@@ -441,8 +442,8 @@ class FetchLbTrafficTest(unittest.TestCase):
     """§3.13's traffic read -- what the rule in front of an idle workload met."""
 
     RULES = [
-        {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
-        {"name": "rule-b", "IPAddress": "35.245.254.69", "loadBalancingScheme": "EXTERNAL"},
+        {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
+        {"name": "rule-b", "IPAddress": "35.245.254.69", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
     ]
 
     def fetch(self, session, rules=None, **kwargs):
@@ -501,11 +502,28 @@ class FetchLbTrafficTest(unittest.TestCase):
         traffic, _ = self.fetch(FakeLbSession(ingress=[unlabelled, lb_series("rule-a", 374158)]))
         self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 374158)
 
+    def test_same_named_rules_in_two_regions_keep_their_own_traffic(self):
+        # A rule name is unique per region, and the list spans every region.
+        rules = [
+            {"name": "web", "IPAddress": "34.1.1.1", "loadBalancingScheme": "EXTERNAL", "region": "https://www.googleapis.com/compute/v1/projects/acme/regions/us-central1"},
+            {"name": "web", "IPAddress": "34.2.2.2", "loadBalancingScheme": "EXTERNAL", "region": "https://www.googleapis.com/compute/v1/projects/acme/regions/europe-west1"},
+        ]
+        session = FakeLbSession(ingress=[lb_series("web", 900000, region="us-central1"), lb_series("web", 5, region="europe-west1")])
+        traffic, _ = self.fetch(session, rules=rules)
+        self.assertEqual(traffic["34.1.1.1"]["ingress_packets"], 900000)
+        self.assertEqual(traffic["34.2.2.2"]["ingress_packets"], 5)
+        self.assertIn(fw.LB_REGION_LABEL, session.calls[0]["aggregation.groupByFields"])
+
+    def test_a_series_with_no_region_label_is_dropped(self):
+        unregioned = {"resource": {"type": "tcp_lb_rule", "labels": {"project_id": "acme", "forwarding_rule_name": "rule-a"}}, "points": [{"value": {"int64Value": "5"}}]}
+        traffic, _ = self.fetch(FakeLbSession(ingress=[unregioned]))
+        self.assertIsNone(traffic["34.186.100.26"]["ingress_packets"])
+
     def test_only_external_rules_are_measured(self):
         rules = [
             {"name": "internal", "IPAddress": "10.150.0.78", "loadBalancingScheme": "INTERNAL"},
             {"name": "psc", "IPAddress": "10.150.0.60"},
-            {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+            {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
         ]
         traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 5)]), rules=rules)
         self.assertEqual(sorted(traffic), ["34.186.100.26"])
@@ -514,8 +532,8 @@ class FetchLbTrafficTest(unittest.TestCase):
         """A TCP and a UDP Service on one static IP: the quiet rule must not
         stand in for the busy one."""
         rules = [
-            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
-            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
+            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
         ]
         traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-tcp", 900000), lb_series("rule-udp", 5)]), rules=rules)
         self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 900005)
@@ -523,8 +541,8 @@ class FetchLbTrafficTest(unittest.TestCase):
 
     def test_one_unmeasured_rule_leaves_the_shared_address_unknown(self):
         rules = [
-            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
-            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+            {"name": "rule-tcp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
+            {"name": "rule-udp", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"},
         ]
         traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-udp", 5)]), rules=rules)
         self.assertIsNone(traffic["34.186.100.26"]["ingress_packets"])
@@ -581,7 +599,7 @@ class FetchLbTrafficTest(unittest.TestCase):
         session = FakeLbSession(ingress=[lb_series("rule-a", 1)])
         self.fetch(session, window_hours=24)
         params = session.calls[0]
-        self.assertEqual(params["aggregation.groupByFields"], ["resource.labels.forwarding_rule_name"])
+        self.assertEqual(params["aggregation.groupByFields"], ["resource.labels.forwarding_rule_name", "resource.labels.region"])
         self.assertEqual(params["aggregation.crossSeriesReducer"], "REDUCE_SUM")
         self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_SUM")
         self.assertEqual(params["aggregation.alignmentPeriod"], "86400s")
@@ -752,6 +770,21 @@ class UnconsumedPvcTest(unittest.TestCase):
         pod = obj("Pod", "p", ns="default", **{"spec.volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]})
         context = {"pods": [pod], "pvcs": [self.pvc()], "statefulsets": []}
         self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_a_claim_a_suspended_cronjob_will_mount(self):
+        cronjob = obj("CronJob", "nightly", ns="default", **{"spec.suspend": True, "spec.jobTemplate": {"spec": {"template": {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]}}}}})
+        context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": [], "cronjobs": [cronjob]}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_does_not_flag_a_claim_an_unstarted_job_will_mount(self):
+        job = obj("Job", "backfill", ns="default", **{"spec.template": {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]}}})
+        context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": [], "jobs": [job]}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_a_job_in_another_namespace_does_not_spare_the_claim(self):
+        job = obj("Job", "backfill", ns="other", **{"spec.template": {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]}}})
+        context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": [], "jobs": [job]}
+        self.assertEqual(len(fw.check_unconsumed_pvc(context, now=NOW)), 1)
 
     def test_does_not_flag_under_14_days(self):
         context = {"pods": [], "pvcs": [self.pvc(created="2026-07-25T00:00:00Z")], "statefulsets": []}
@@ -1202,6 +1235,12 @@ class MachineTypeVcpusTest(unittest.TestCase):
 
     def test_custom(self):
         self.assertEqual(fw._machine_type_vcpus("custom-4-16384"), 4)
+
+    def test_hypermem(self):
+        # M2's hypermem shapes are the largest non-accelerator machines, so
+        # an idle one-node pool of them is §3.7's `major`, not `minor`.
+        self.assertEqual(fw._machine_type_vcpus("m2-hypermem-416"), 416)
+        self.assertTrue(fw._is_big_machine("m2-hypermem-208"))
 
     def test_small_is_unmatched(self):
         self.assertIsNone(fw._machine_type_vcpus("e2-small"))
@@ -2743,6 +2782,19 @@ class IdleWorkloadTest(unittest.TestCase):
             lb_traffic=self.traffic(ingress=50000, egress_packets=0, egress_bytes=0),
         )
         self.assertIn("answered none of them", hits[0]["excerpt"])
+
+    def test_an_absent_egress_series_is_unmeasured_not_unanswered(self):
+        hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=self.traffic(ingress=50000))
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("metered 50,000 inbound packets", excerpt)
+        self.assertIn("what it answered is unmeasured", excerpt)
+        self.assertNotIn("answered none", excerpt)
+
+    def test_an_absent_bytes_series_is_not_read_as_zero_bytes_each(self):
+        hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=self.traffic(ingress=50000, egress_packets=3000))
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("answered with 3,000 outbound packets; their payload is unmeasured", excerpt)
+        self.assertNotIn("bytes each", excerpt)
 
     def test_an_unmeasured_rule_is_not_reported_as_quiet(self):
         """The distinction the whole read exists for.
@@ -4448,7 +4500,7 @@ class CollectProjectComputeTest(unittest.TestCase):
         Re-reading it would double a per-project gcloud call and leave two
         answers that can disagree about the same project."""
         run, seen = self.recording()
-        pre = ([{"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"}], run_of(0, "[]"))
+        pre = ([{"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL", "region": "us-central1"}], run_of(0, "[]"))
         target = fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW, forwarding_rules=pre)
         self.assertEqual(target["outcome"], "collected")
         self.assertEqual([argv for argv in seen if argv[2] == "forwarding-rules"], [])
@@ -4714,6 +4766,18 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("rc=0", entry["limitations"])
         self.assertNotIn("failed", entry["limitations"])
 
+    def test_an_empty_mean_read_beside_a_usage_read_that_answered_is_not_a_cluster_without_metrics(self):
+        """The usage read's records say the cluster ships system metrics, so
+        an empty mean-memory answer described as "not shipping system metrics"
+        contradicted them in the same entry."""
+        empty_means = ({}, False, fw.Run(["curl ..."], 0, "", "no time series", 0.0))
+        with patch.object(fw, "fetch_memory_means", return_value=empty_means):
+            entry = self._metrics_down(obj("Node", "node-1"), session=usage_session())
+        reasons = {c["check"]: c["reason"] for c in entry["checks_unevaluated"]}
+        self.assertEqual(set(reasons), {"underrequest"})
+        self.assertIn("although the usage read for the same cluster did", reasons["underrequest"])
+        self.assertNotIn("not shipping system metrics", entry["limitations"])
+
     def _unreadable_pools(self, cluster=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -4914,6 +4978,13 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
         entry, _ = self.collect([])
         self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"] if c["check"] == "idle-nodepool"})
         self.assertNotIn("limitations", entry)
+
+    def test_an_operations_read_that_is_not_a_list_falls_back_to_node_age(self):
+        # The node is a day old, so node age spares the pool; read as "no
+        # recent creation", the object answer judged it idle.
+        entry, _ = self.collect({"operations": []})
+        self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
+        self.assertIn("operations read failed", entry.get("limitations", ""))
 
     def test_a_young_cluster_s_pools_are_dated_from_its_create_time(self):
         young = {**self.CLUSTER, "create_time": (NOW - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")}
@@ -6101,7 +6172,7 @@ class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
     """
 
     IP = "34.186.100.26"
-    RULE = {"name": "rule-a", "IPAddress": IP, "loadBalancingScheme": "EXTERNAL"}
+    RULE = {"name": "rule-a", "IPAddress": IP, "loadBalancingScheme": "EXTERNAL", "region": "us-central1"}
 
     class Session:
         """`usage_session`'s answers plus the three load-balancer counters."""
@@ -6678,17 +6749,23 @@ class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
 
     def test_a_project_scoped_candidate_is_never_annotated(self):
         """A disk, a reserved address and a forwarding rule are GCP resources
-        with no cluster tree and no namespace, so there is nothing for this
-        index to key on. This pins that `_emit` cannot annotate such a
-        candidate even when handed an index that resolves it; which arguments
-        the three checks' call sites pass is not asserted here. Annotating one
-        would name a Kubernetes manifest as the place to delete a persistent disk.
-        """
-        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
-        self.assertNotIn("declaration", fw._emit("unattached-disk", hit))
-        # Even handed an index that resolves it, the call signature cannot.
-        index = {("prod-usc1", "Disk", "default", "orphaned-pd"): {"clusters/prod-usc1/x.yaml"}}
-        self.assertNotIn("declaration", fw._emit("unattached-disk", hit, declarations=index))
+        with no cluster tree and no namespace, so there is nothing for any
+        index to key on, and annotating one would name a Kubernetes manifest
+        as the place to delete a persistent disk. `_emit` itself cannot tell a
+        disk from a Deployment, so what keeps them apart is the caller:
+        `collect_project_compute`, the only emitter of the project-scoped
+        checks, takes no index and hands `_emit` no cluster or index."""
+        params = set(inspect.signature(fw.collect_project_compute).parameters)
+        self.assertFalse(params & {"cluster", "declarations", "workspace", "reconcilers", "releases"}, params)
+        hit = {"object": "Address/us-central1:idle-ip", "severity": "minor", "excerpt": "x"}
+        facts = {"pv_handles": set(), "referenced_addresses": set(), "service_names": set()}
+        with patch.object(fw, "check_idle_address", return_value=[hit]), \
+                patch.object(fw, "_emit", wraps=fw._emit) as emit:
+            target = fw.collect_project_compute("acme", True, facts, run=lambda argv, **kw: run_of(0, "[]"), now=NOW)
+        self.assertEqual([c["object"] for c in target["candidates"]], [hit["object"]])
+        self.assertTrue(emit.call_args_list)
+        for call in emit.call_args_list:
+            self.assertEqual(call.kwargs, {}, call)
 
 
 class CandidatesCarryTheirReconcilerTest(unittest.TestCase):
