@@ -231,7 +231,8 @@ platform specialist, which runs in the same shell `finish` does. The `fleet-audi
 answers from the store through `report_query.py`, whose subcommands (`streams`, `show`, `findings`,
 `finding`, `checks`, `diff`, `runs`) each return one small JSON object. `streams` returns a row per
 stream and repository; the others take `--repo`, which may be omitted when the stream has published
-to exactly one. Every answer is bounded and
+to exactly one. An owner directory that cannot be listed makes every per-stream answer the unreadable
+one `streams` gives, not "no record". Every answer is bounded and
 the full document is opt-in: `show` omits `document` so the cheap call stays cheap, and `finding`
 returns one finding's prose. `checks` reaches `scope.clusters[].checks_run[]`, which a finding-heavy
 ledger drops from its body with a notice pointing at the stored report. The reader is its own skill
@@ -242,7 +243,10 @@ question about a past run should not pull the publish procedure into context.
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and
 renders one row per stream and repository, labelled with the repository only when a stream has more
 than one. A row taken from the ring carries the `UNRECORDED` flag, and a stream-level error (the
-lease, a stray directory, a sibling repository) is shown on every row of that stream. `report_status.py` therefore imports nothing outside the standard
+lease, a stray directory, a sibling repository) is shown on every row of that stream. `STALE` is
+the stream's too, from its newest run across every repository: nothing prunes a repository's
+directory, so one the stream stopped publishing to keeps its last row, unflagged, until an operator
+deletes `<audit-id>/<owner>/<name>/` from the store. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
 

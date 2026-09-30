@@ -38,6 +38,10 @@ Five flags the raw rows cannot be trusted without:
     rendered loudly — this is the whole reason the surface exists. The roster's
     cron fields are read in the pod's time zone, which this tool cannot see:
     UTC unless `--timezone` names the IANA zone an install set the pod's TZ to.
+    It is the stream's, from its newest run across every repository, and goes
+    on all of the stream's rows: a repository the stream stopped publishing to
+    keeps its old row, which is history, not silence. That row stays until its
+    `<audit-id>/<owner>/<name>/` directory is deleted from the pod's store.
 
 Only STALE and NEVER consult the roster, so roster drift can no longer suppress
 a death. `⚠` on STATUS marks a partial run; the default view counts its coverage
@@ -638,7 +642,11 @@ def flags_for(
     if liveness == "never" and enabled and not unreadable and leases_read:
         flags.append("NEVER")
     if enabled and liveness != "running" and leases_read:
-        at = parse_iso((stream.get("latest") or {}).get("finished_at"))
+        # The stream's newest run when `stream_rows` supplied it, so one
+        # repository's old row does not make a running stream silent.
+        at = parse_iso(
+            stream.get("stream_finished_at") or (stream.get("latest") or {}).get("finished_at")
+        )
         expected = next_fire(job.get("expr", ""), at, schedule_tz) if at else None
         if expected is not None and now > expected + STALE_SLACK:
             flags.append("STALE")
@@ -893,7 +901,9 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
     an SOP finishes across several managed repositories is several rows, each
     labelled with its repository; one repository, or none yet, is one row
     under the bare id. The row source is the stream's lease and liveness with
-    that repository's `latest`, which is the shape `row_for` reads.
+    that repository's `latest`, which is the shape `row_for` reads, plus
+    `stream_finished_at`, the newest run across the stream's repositories,
+    which STALE reads.
     """
     out = []
     for audit_id in sorted(set(roster) | set(streams)):
@@ -902,6 +912,15 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
         if not repos:
             out.append((audit_id, audit_id, {**stream, "latest": None}))
             continue
+        # STALE is the stream's silence, not a repository's: the store keeps a
+        # directory for every repository a stream ever published to, and one
+        # it stopped publishing to must not flag a stream still running.
+        finished = [
+            ((entry or {}).get("latest") or {}).get("finished_at") for entry in repos.values()
+        ]
+        newest = max(
+            (value for value in finished if parse_iso(value)), key=parse_iso, default=None
+        )
         for repo, entry in sorted(repos.items()):
             label = audit_id if len(repos) == 1 else f"{audit_id} {repo}"
             source = {
@@ -912,6 +931,7 @@ def stream_rows(streams: dict, roster: dict) -> list[tuple[str, str, dict]]:
                 # clearing a sibling repository's error.
                 "error": (entry or {}).get("error") or stream.get("error"),
                 "latest_missing": bool((entry or {}).get("latest_missing")),
+                "stream_finished_at": newest,
             }
             out.append((label, audit_id, source))
     return out

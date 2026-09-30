@@ -17130,8 +17130,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     from every transcript that had an open ledger, and the `gh issue list`
     that finds the ledger asks for `number,url,body` rather than
     `number,url`, the body being what the store's record is checked against
-    and, where the store never held the ledger, what seeds it. Nothing else
-    moved.
+    and, where the store never held the ledger, what seeds it. One line of
+    output moved with it: the clean-over-a-gap run's stderr says the gaps mean
+    it "cannot vouch for the ledger's state", where it said it "cannot speak
+    for the fleet", because a lost store record also makes a clean run
+    partial, and the line now covers both causes. Nothing else moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

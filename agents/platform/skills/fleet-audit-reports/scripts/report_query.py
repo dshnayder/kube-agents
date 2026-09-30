@@ -24,7 +24,10 @@ envelope.
 A stream is stored once per repository it publishes to. Every subcommand but
 `streams` reads one of them: `--repo owner/name`, or the only one there is. A
 stream with several and no `--repo` is refused with the list, rather than
-answered from whichever repository happens to sort first.
+answered from whichever repository happens to sort first. An owner directory
+that cannot be listed makes the stream unreadable, as `streams` reports it:
+the default then is not known to be the only one, and a repository named under
+that owner could not be looked for.
 
 Exit 0 means answered. Exit 2 means the question could not be answered, and
 stdout still carries one JSON object whose `error` says why — an absent or
@@ -172,18 +175,7 @@ def _require_stream(root: str, audit_id: str) -> None:
     except FileNotFoundError:
         is_stream = False
     except OSError as exc:
-        reason = report_status.os_reason(exc)
-        # The same projection `streams` reads, so `stream_error` is that
-        # stream's row `error`, verbatim; the stat's reason only if the
-        # projection, run a moment later, read the stream after all.
-        fields = _liveness(root, audit_id)
-        raise QueryError(
-            f"streams that could not be read: {audit_id} ({reason}). This is "
-            "unknown, not clean.",
-            root=root,
-            liveness="error",
-            stream_error=fields.get("stream_error") or reason,
-        ) from exc
+        raise _unreadable_stream(root, audit_id, report_status.os_reason(exc)) from exc
     if not is_stream:
         raise QueryError(
             f"no reports for stream {audit_id!r} under {root}",
@@ -193,11 +185,31 @@ def _require_stream(root: str, audit_id: str) -> None:
         )
 
 
-def _repos(root: str, audit_id: str) -> list[str]:
+def _unreadable_stream(root: str, audit_id: str, reason: str, **extra: object) -> QueryError:
+    """The refusal `streams` gives a stream it could not read. The same
+    projection `streams` reads, so `stream_error` is that stream's row
+    `error`, verbatim; `reason` only if the projection, run a moment later,
+    read the stream after all."""
+    fields = _liveness(root, audit_id)
+    return QueryError(
+        f"streams that could not be read: {audit_id} ({reason}). This is "
+        "unknown, not clean.",
+        root=root,
+        liveness="error",
+        stream_error=fields.get("stream_error") or reason,
+        **extra,
+    )
+
+
+def _repos(root: str, audit_id: str) -> tuple[list[str], list[str]]:
+    """The stream's repositories, and a line per owner directory that could
+    not be listed: `repo_ids` drops those, and a repository hidden behind one
+    is unread, not absent."""
     try:
-        return report_status.repo_ids(root, audit_id)
+        dirs, unreadable = report_status.scan_repo_dirs(root, audit_id)
     except OSError as exc:
         raise QueryError(f"{audit_id}/ could not be listed: {_oneline(exc)}") from exc
+    return [repo for repo in dirs if repo == repo.lower()], unreadable
 
 
 def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
@@ -205,18 +217,34 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
     one the stream has. Several and none named is refused with the list — a
     default would answer a question about one ledger from another's runs."""
     _require_stream(root, audit_id)
-    repos = _repos(root, audit_id)
+    repos, unreadable = _repos(root, audit_id)
     if repo is not None:
         try:
-            report_status.store_path(root, audit_id, repo)
+            path = report_status.store_path(root, audit_id, repo)
         except ValueError as exc:
             raise QueryError(str(exc)) from exc
         if repo.lower() not in repos:
+            # Its owner may not have listed: whether the directory is there is
+            # the stat's to say, and a stat that fails is unread, not absent.
+            try:
+                is_repo = stat.S_ISDIR(os.stat(path).st_mode)
+            except FileNotFoundError:
+                is_repo = False
+            except OSError as exc:
+                raise _unreadable_stream(
+                    root, audit_id, report_status.os_reason(exc), repos=repos
+                ) from exc
+            if is_repo and unreadable:
+                return repo.lower()
             raise QueryError(
                 f"no reports for {audit_id} in {repo}", repos=repos,
                 **_liveness(root, audit_id),
             )
         return repo.lower()
+    if unreadable:
+        # "The only one there is" is not known while an owner is unlisted,
+        # and none listed is not "no record".
+        raise _unreadable_stream(root, audit_id, "; ".join(unreadable), repos=repos)
     if len(repos) == 1:
         return repos[0]
     if not repos:
@@ -471,7 +499,11 @@ def cmd_show(args: argparse.Namespace) -> dict:
         # report_status' own callers; this script is one of them by design,
         # and a second copy of "every key except these, plus these counts" is
         # exactly the drift that sharing the helpers prevents.
-        "envelope": report_status._project_latest(envelope),
+        "envelope": report_status._project_latest(
+            {key: value for key, value in envelope.items() if key != "latest_missing"}
+        ),
+        # Always a boolean, as on the other per-run subcommands.
+        "latest_missing": bool(envelope.get("latest_missing")),
         "error": None,
     }
 

@@ -13,19 +13,28 @@ The subprocess boundary is stubbed everywhere; no test reaches a cluster.
 import contextlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from unittest import mock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The producer's side, for the round trip: the writer and the projection the
+# view streams into the pod.
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[1] / "agents/platform/skills/fleet-audit/scripts")
+)
 
+import audit_report  # noqa: E402
 import fleet_audit_status_view as view  # noqa: E402
+import report_status  # noqa: E402
 import terminal_table  # noqa: E402
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -64,6 +73,8 @@ def latest(**overrides):
         "prs_closed": [],
         "silent_ok": None,
         "id_scheme": "sha1-12",
+        # Always on a projected `latest` (report_status.LATEST_KEYS).
+        "delta_known": True,
         "new": 3,
         "resolved": 1,
         "current": 57,
@@ -76,9 +87,12 @@ def latest(**overrides):
     return base
 
 
-def stream(liveness="completed", last=None, started=None, error=None, runs=(), repo="acme/fleet"):
+def stream(liveness=None, last=None, started=None, error=None, runs=(), repo="acme/fleet"):
     """One stream as `report_status.project` shapes it: the lease, and the one
-    repository's store when it has a run or a read error to carry."""
+    repository's store when it has a run or a read error to carry. Without a
+    lease, an error makes the liveness `error`, as `report_status.liveness`
+    decides it."""
+    liveness = liveness or ("error" if error else "completed")
     repos = {}
     if last is not None or runs or error:
         repos[repo] = {"latest": last, "runs": list(runs), "error": error}
@@ -410,6 +424,97 @@ class TestFlags(unittest.TestCase):
         self.assertEqual(self.flags(stream(liveness="never"), {"enabled": False}), [])
 
 
+class TestProducerRoundTrip(unittest.TestCase):
+    """The view over a projection `report_status.project` made from an
+    envelope `audit_report.write_report` stored, not a hand-built one. The
+    view streams the projection script into a pod rather than importing it,
+    so a key renamed on one side reaches no import error: only this."""
+
+    ROSTER = {"compliance-audit": {"enabled": True, "expr": "20 6 * * *"}}
+    FINISHED = datetime(2026, 8, 26, 6, 31, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.root = mkdtemp(prefix="view-store-")
+        self.scratch = mkdtemp(prefix="view-scratch-")
+        for path in (self.root, self.scratch):
+            self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root})
+        env.start()
+        self.addCleanup(env.stop)
+        findings = [
+            {"id": "a1", "severity": "critical", "title": "a"},
+            {"id": "b2", "severity": "major", "title": "b"},
+            {"id": "c3", "severity": "minor", "title": "c"},
+        ]
+        envelope = audit_report.report_envelope(
+            "compliance-audit",
+            {
+                "status": "UPDATED",
+                "partial": False,
+                "coverage_gaps": [],
+                "issue_url": "https://github.com/acme/fleet/issues/12",
+                "prs_opened": ["https://github.com/acme/fleet/pull/9"],
+            },
+            {"findings": findings, "scope": {"clusters": [{"name": "prod"}], "skipped": []}},
+            self.FINISHED,
+            repo="acme/fleet",
+            issue_number=12,
+            ledger_body="body",
+            new_ids=["a1", "b2"],
+            resolved_ids=["z9"],
+            rendered_ids=["a1", "b2", "c3"],
+        )
+        audit_report.write_report("compliance-audit", envelope, self.FINISHED)
+
+    def project(self):
+        return report_status.project(self.root, now=NOW, scratch=self.scratch)
+
+    def rows(self, projection):
+        return [
+            view.row_for(label, source, self.ROSTER[audit_id], NOW, True, True)
+            for label, audit_id, source in view.stream_rows(
+                projection["streams"], self.ROSTER
+            )
+        ]
+
+    def cells(self, row):
+        titles = [column.title for column in view.COLUMNS]
+        return {title: cell[0] for title, cell in zip(titles, row)}
+
+    def test_the_counts_and_the_clean_flags_come_through(self):
+        [(row, flags, latest)] = self.rows(self.project())
+        self.assertEqual(flags, [])
+        self.assertEqual(latest["findings"], 3)
+        self.assertEqual(latest["critical"], 1)
+        cells = self.cells(row)
+        self.assertEqual(cells["STATUS"], "UPDATED")
+        self.assertEqual(cells["FINDINGS"], "3 (1 c)")
+        self.assertEqual(cells["Δ"], "+2 / −1")
+        self.assertEqual(cells["PRS"], "1")
+        self.assertEqual(cells["ISSUE"], "#12")
+        out = view.render(
+            self.project(), self.ROSTER, NOW, str(view.REPO_ROOT / "scripts" / "jobs.json"),
+            "ns/agent-0 [platform-agent]",
+        )
+        self.assertIn("3 (1 c)", out)
+        self.assertIn("1 critical", out)
+
+    def test_a_ring_without_latest_is_unrecorded(self):
+        (Path(self.root) / "compliance-audit" / "acme" / "fleet" / "latest.json").unlink()
+        [(row, flags, latest)] = self.rows(self.project())
+        self.assertEqual(flags, ["UNRECORDED"])
+        self.assertEqual(self.cells(row)["FINDINGS"], "3 (1 c)")
+
+    def test_a_running_lease_comes_through(self):
+        (Path(self.scratch) / "inflight_compliance-audit.json").write_text(
+            json.dumps({"audit": "compliance-audit", "started_at": NOW.timestamp() - 90}),
+            encoding="utf-8",
+        )
+        [(row, flags, _)] = self.rows(self.project())
+        self.assertEqual(self.cells(row)["STATUS"], "running… 1m30s")
+        self.assertEqual(flags, [])
+
+
 class TestRender(unittest.TestCase):
     ROSTER = {"compliance-audit": {"enabled": True, "expr": "20 6 * * *"}}
 
@@ -461,6 +566,24 @@ class TestRender(unittest.TestCase):
         self.assertIn("compliance-audit acme/other", out)
         self.assertIn("#7", out)
         self.assertIn("#12", out)
+
+    def test_an_abandoned_repository_does_not_make_the_stream_stale(self):
+        # The store never prunes a repository's directory; one the stream
+        # stopped publishing to keeps a weeks-old row beside the current one.
+        doc = stream(last=latest())
+        doc["repos"]["acme/gone"] = {
+            "latest": latest(repo="acme/gone", finished_at="2026-07-01T06:31:00+00:00"),
+            "runs": [],
+            "error": None,
+            "latest_missing": False,
+        }
+        out = self.render({"compliance-audit": doc})
+        self.assertIn("compliance-audit acme/gone", out)
+        self.assertNotIn("STALE", out)
+        # Every repository silent is the stream silent, on each of its rows.
+        doc["repos"]["acme/fleet"]["latest"] = latest(finished_at="2026-07-02T06:31:00+00:00")
+        out = self.render({"compliance-audit": doc})
+        self.assertEqual(out.count("STALE"), 2)
 
     def test_a_held_run_is_a_known_status(self):
         out = self.render({"compliance-audit": stream(last=latest(status="HELD"))})

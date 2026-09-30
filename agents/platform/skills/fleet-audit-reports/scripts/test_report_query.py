@@ -465,6 +465,11 @@ class TestShow(StoreTestCase):
         self.assertNotIn("document", payload["envelope"])
         self.assertNotIn(PROSE, json.dumps(payload))
 
+    def test_latest_missing_is_always_a_boolean(self):
+        # As on `findings`, `finding` and `checks`: false is said, not implied.
+        self.assertIs(self.ok("show", AUDIT)["latest_missing"], False)
+        self.assertIs(self.ok("show", AUDIT, "--run", self.older)["latest_missing"], False)
+
     def test_it_carries_the_outcome_and_the_delta(self):
         row = self.ok("show", AUDIT)["envelope"]
         self.assertEqual(row["status"], "UPDATED")
@@ -495,7 +500,8 @@ class TestShow(StoreTestCase):
         (Path(self.root) / AUDIT / REPO / "latest.json").unlink()
         payload = self.ok("show", AUDIT)
         self.assertEqual(payload["run"], self.newest)
-        self.assertTrue(payload["envelope"]["latest_missing"])
+        self.assertIs(payload["latest_missing"], True)
+        self.assertNotIn("latest_missing", payload["envelope"])
         self.assertTrue(self.ok("findings", AUDIT)["latest_missing"])
         self.assertTrue(self.ok("checks", AUDIT)["latest_missing"])
         self.assertFalse(self.ok("findings", AUDIT, "--run", self.older)["latest_missing"])
@@ -834,6 +840,51 @@ class TestRepositories(StoreTestCase):
         self.assertIn(
             "is not owner/name", self.refused("show", AUDIT, "--repo", "../acme")["error"]
         )
+
+
+@unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root lists a mode-000 directory")
+class TestAnUnlistableOwner(StoreTestCase):
+    """An owner directory that cannot be listed hides its repositories. The
+    per-stream answer is the unreadable one `streams` gives, never "no
+    record": a store that could not be read is not one never written."""
+
+    def deny(self, owner):
+        path = Path(self.root) / AUDIT / owner
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o700)
+
+    def assert_unreadable(self, payload):
+        streams = self.query("streams")[1]
+        self.assertIn(f"streams that could not be read: {AUDIT}", streams["error"])
+        self.assertIn(f"streams that could not be read: {AUDIT}", payload["error"])
+        self.assertIn("unknown, not clean", payload["error"])
+        self.assertNotIn("no record", payload["error"])
+        self.assertNotIn("no reports", payload["error"])
+        self.assertEqual(payload["liveness"], "error")
+        row = next(row for row in streams["streams"] if row["audit_id"] == AUDIT)
+        self.assertEqual(payload["stream_error"], row["error"])
+
+    def test_the_only_owner_unlisted_is_unreadable(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.deny("acme")
+        for command in ("show", "findings", "runs"):
+            self.assert_unreadable(self.refused(command, AUDIT))
+
+    def test_a_repository_named_under_it_is_unreadable(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.deny("acme")
+        self.assert_unreadable(self.refused("show", AUDIT, "--repo", REPO))
+
+    def test_a_readable_sibling_is_not_the_default_while_one_is_unlisted(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        self.write_run(AUDIT, "20260826T064100.000000Z", [finding("z")], repo="other/repo")
+        self.deny("acme")
+        payload = self.refused("findings", AUDIT)
+        self.assert_unreadable(payload)
+        self.assertEqual(payload["repos"], ["other/repo"])
+        # Named, the readable one still answers.
+        chosen = self.ok("findings", AUDIT, "--repo", "other/repo")
+        self.assertEqual([row["id"] for row in chosen["findings"]], ["z"])
 
 
 class TestRuns(StoreTestCase):
