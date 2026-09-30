@@ -211,7 +211,7 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   `remote-branch view` reads its revision and `remote-branch delete` clears it.
   That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
   the closed proposal is not this install's, or it has carried a full page of
-  proposals, too many to read), `OPEN_PROPOSAL`, `NOT_SPENT` (it holds revisions
+  proposals, too many to read, or an open proposal targets it), `OPEN_PROPOSAL`, `NOT_SPENT` (it holds revisions
   no proposal carried); treat each as somebody's work — pick another name or
   report it. `DELETE_REFUSED` means the remote itself refuses
   the delete (a branch rule, a hook, or a credential without the right); it

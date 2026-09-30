@@ -868,6 +868,25 @@ class VcsBroker:
                     status=409,
                     code="OPEN_PROPOSAL",
                 )
+            # A proposal is on a branch as its target too: somebody stacked
+            # work on it. Deleting a proposal's target closes it, and that
+            # proposal is somebody's work in review, not this install's to end.
+            stacked = bound.forge.proposal_list(
+                bound.api, bound.repo, {"state": "open", "target": branch, "limit": 1}
+            )
+            onto = [
+                item for item in stacked.get("proposals") or []
+                if item.get("state", "open") == "open"
+            ]
+            if onto:
+                named = onto[0].get("url") or "#%s" % (onto[0].get("number"),)
+                raise WorkspaceError(
+                    f"an open proposal, {named}, targets {branch}. Deleting the "
+                    "branch would close that proposal, which is somebody's work "
+                    "in review, so the branch is not this install's to delete.",
+                    status=409,
+                    code="BRANCH_NOT_OURS",
+                )
             tip = self._remote_tip(bound, root, branch)
             if not tip:
                 return bound.stamp(

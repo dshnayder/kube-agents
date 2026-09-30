@@ -109,7 +109,8 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    **If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
    the old branch holds revisions no closed pull request carried.
    `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
-   it has carried a full page of pull requests, too many to read. Treat those
+   it has carried a full page of pull requests, too many to read, or an open
+   pull request targets it. Treat those
    revisions as somebody's. Report the refusal, its code and the branch,
    and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
    request was opened on it just now; the next run adds to it), and

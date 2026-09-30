@@ -847,7 +847,8 @@ because `branch` is already the local verb.
 The delete is held to exactly that one case. The branch must be under the
 install's own prefix (`BRANCH_NOT_OURS` otherwise); it must not be protected, by
 the rule `publish` applies (`PROTECTED_BRANCH`); no proposal from it may be open
-(`OPEN_PROPOSAL`); and its tip must be the revision some merged or closed
+(`OPEN_PROPOSAL`), and no open proposal may target it, since deleting a
+proposal's target closes it (`BRANCH_NOT_OURS`); and its tip must be the revision some merged or closed
 proposal from it carried (`NOT_SPENT`), so a branch that moved on after its
 proposal closed keeps the revisions no proposal holds. The comparison is sound
 only because GitHub freezes that revision when the proposal closes rather than

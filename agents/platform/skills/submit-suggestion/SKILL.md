@@ -136,8 +136,8 @@ to it, that second run refuses it as `NOT_SPENT`. `OPEN_PROPOSAL` means a
 proposal was opened on the name since `prepare` looked; run `prepare` once
 more, and it adds to that proposal's branch. `BRANCH_NOT_OURS` means a proposal from it was
 not this install's, or the name is not under `platform-agent/`, or it has
-carried a full page of proposals, too long a history to read (the message says
-which). Either way, do not delete it another way. `DELETE_REFUSED` means the
+carried a full page of proposals, too long a history to read, or an open
+proposal targets it (the message says which). Either way, do not delete it another way. `DELETE_REFUSED` means the
 repository itself refuses to delete the branch (a branch rule, a hook, or a
 credential without the right), and it will refuse again. Choose a different name where
 the derived one is only a default, or report the refusal and stop where the name

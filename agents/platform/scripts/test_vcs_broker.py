@@ -1306,11 +1306,17 @@ class HistoryLocalForge(LocalForge):
     def __init__(self, root, minted=None, history=None):
         super().__init__(root, minted)
         self.history: dict[str, list[dict]] = dict(history or {})
+        # Open proposals by the branch they target, which is a separate
+        # question from the ones a branch is the source of.
+        self.targeting: dict[str, list[dict]] = {}
         self.listed: list[dict] = []
 
     def proposal_list(self, api, repo, payload):
         self.listed.append(dict(payload))
-        found = list(self.history.get(payload.get("source"), []))
+        if payload.get("target") is not None:
+            found = list(self.targeting.get(payload["target"], []))
+        else:
+            found = list(self.history.get(payload.get("source"), []))
         if payload.get("state") == "open":
             found = [item for item in found if item.get("state") == "open"]
         # One page, as the real forge answers: newest first, `limit` long, and
@@ -1422,6 +1428,19 @@ class BranchVerbTest(unittest.TestCase):
         self.closed(self.SPENT, tip, state="open")
         self.assertEqual(self.refused(self.SPENT, tip), "OPEN_PROPOSAL")
         self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_branch_an_open_proposal_targets(self):
+        # Somebody stacked a proposal on the spent branch. Deleting a
+        # proposal's target closes it, so the branch is not ours to delete.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.forge.targeting[self.SPENT] = [
+            {"number": 9, "state": "open", "source": "feature/follow-up",
+             "target": self.SPENT, "url": "https://local.test/acme/infra/pull/9"}
+        ]
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+        self.assertIn({"state": "open", "target": self.SPENT, "limit": 1}, self.forge.listed)
 
     def test_delete_asks_for_an_open_proposal_rather_than_reading_the_history(self):
         tip = self.push_branch(self.SPENT)

@@ -1548,7 +1548,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # only when the report names it. Graded here too, so the two
             # checks agree on the same reply instead of one passing a run the
             # other reds.
-            unnamed = sorted(n for n in carried.values() if n not in named)
+            # From `spent`, not `carried`: two closed at one revision share a
+            # key there, and both are writes the safeguard reads.
+            unnamed = sorted(
+                c.get("number") for c in spent if c.get("number") not in named
+            )
             if unnamed:
                 return (
                     f"{slug}: the report does not name "

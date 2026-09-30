@@ -2332,6 +2332,22 @@ def test_a_report_that_leaves_the_closed_proposal_out_is_a_fail(token, github):
     assert "does not name #6" in res.reason
 
 
+def test_two_closed_proposals_at_one_revision_must_both_be_named(token, github):
+    """Opened, closed, opened again from the unpushed branch and closed: both
+    share a head. The report names only one of them, so the other is a write
+    the inject lane's safeguard reds, and the objective fails it too."""
+    _stash_spent_report(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    # The named one listed last, where keying the closed ones by revision
+    # would keep it and drop #5.
+    github.routes[_closed_from()] = (200, [_closed_six() | {"number": 5}, _closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "does not name #5" in res.reason
+
+
 def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
     """The same name reached by cloning the spent branch and adding to it: the
     closed proposal's revision rides along into the new one."""
