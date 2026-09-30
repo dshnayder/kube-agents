@@ -292,6 +292,51 @@ class CccMissingFallbacksTest(unittest.TestCase):
     def test_no_priorities_is_not_a_crash(self):
         self.assertIsNone(fs.check_ccc_missing_fallbacks(compute_class("cc1", [])))
 
+    THREE_ZONES = {"zones": ["us-central1-a", "us-central1-b", "us-central1-c"]}
+    FAMILIES = ("c3", "n4", "n2")
+
+    def test_a_multi_family_chain_sharing_three_zones_is_not_flagged(self):
+        """§3.1's own Do-NOT-flag example: multi-zone `c3` falling back to
+        `n4` and `n2`, the same zones on every priority."""
+        cc = compute_class("cc1", [{"machineFamily": f, "location": self.THREE_ZONES} for f in self.FAMILIES])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, cluster_zones=1))
+
+    def test_a_multi_family_chain_naming_no_zone_on_a_regional_cluster_is_not_flagged(self):
+        cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, cluster_zones=3))
+
+    def test_a_multi_family_chain_sharing_one_zone_is_still_flagged(self):
+        single = {"zones": ["us-central1-a"]}
+        cc = compute_class("cc1", [{"machineFamily": f, "location": single} for f in self.FAMILIES])
+        hit = fs.check_ccc_missing_fallbacks(cc, cluster_zones=3)
+        self.assertIn("1/4", hit["excerpt"])
+        self.assertNotIn("not established", hit["excerpt"])
+
+    def test_no_zone_on_a_single_zone_cluster_is_still_flagged(self):
+        cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
+        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc, cluster_zones=1))
+
+    def test_no_zone_where_the_cluster_span_is_unknown_is_flagged_and_says_so(self):
+        cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
+        hit = fs.check_ccc_missing_fallbacks(cc)
+        self.assertIn("the cluster's zones were not established", hit["excerpt"])
+
+
+class ClusterZoneSpanTest(unittest.TestCase):
+    def test_the_node_pools_locations_decide(self):
+        pools = [{"locations": ["us-central1-a"]}, {"locations": ["us-central1-a", "us-central1-b"]}]
+        self.assertEqual(fs.cluster_zone_span({"location": "us-central1"}, pools, True), 2)
+
+    def test_a_regional_cluster_with_single_zone_pools_spans_one(self):
+        pools = [{"locations": ["us-central1-a"]}]
+        self.assertEqual(fs.cluster_zone_span({"location": "us-central1"}, pools, True), 1)
+
+    def test_autopilot_spans_more_than_one(self):
+        self.assertGreater(fs.cluster_zone_span({"autopilot": True}, [], False), 1)
+
+    def test_an_unread_pool_list_is_unknown(self):
+        self.assertIsNone(fs.cluster_zone_span({"location": "us-central1"}, [], False))
+
     def test_does_not_flag_a_pod_family_chain(self):
         """GKE's built-in `autopilot`, verbatim: one priority, no machine family.
 
@@ -1062,10 +1107,13 @@ class AutoscalerVisibilityTest(unittest.TestCase):
 
     def test_quota_and_ip_findings_are_never_marked(self):
         """Both are `kind: manual`; there is no manifest for the sweep to open."""
-        entry = json.loads(json.dumps(ERROR_MSG_ENTRY))
-        entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"]["messageId"] = "scale.up.error.quota.exceeded"
-        hits = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([entry]))
-        self.assertNotIn("needs_triage", hits[0])
+        for message_id in ("scale.up.error.quota.exceeded", "scale.up.error.ip.space.exhausted"):
+            with self.subTest(message_id=message_id):
+                entry = json.loads(json.dumps(ERROR_MSG_ENTRY))
+                entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"]["messageId"] = message_id
+                [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([entry]))
+                self.assertEqual(hit["object"], f"ScaleUpError/{message_id}")
+                self.assertNotIn("needs_triage", hit)
 
 
 class SpotScarcityTest(unittest.TestCase):

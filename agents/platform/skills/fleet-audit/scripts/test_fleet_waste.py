@@ -1003,7 +1003,9 @@ class IdleNodepoolTest(unittest.TestCase):
         hits = fw.check_idle_nodepool(context, pools, now=NOW, pool_ages=None, limitations=limitations)
         self.assertEqual(hits, [])
         self.assertEqual(len(limitations), 1)
-        self.assertIn("pool", limitations[0])
+        # The pool is named `pool`, so a bare "pool" matched the sentence's own
+        # wording; this pins the name in the slot it fills.
+        self.assertIn(f"skipped pool pool as under {fw.IDLE_NODEPOOL_MIN_AGE_DAYS} days", limitations[0])
         self.assertIn("operations read failed", limitations[0])
 
     def test_creation_ages_take_the_newest_create_of_this_cluster_s_pools(self):
@@ -1429,13 +1431,12 @@ class ScaledownBlockedTest(unittest.TestCase):
     def test_a_pdb_does_not_hide_a_blocker_that_is_not_the_pdb(self):
         """§3.8 withholds the finding only where the PDB is the only blocker.
         A bare PDB-selected pod with local storage still pins the node for good
-        once the PDB is fixed, and an empty selector covers the namespace."""
+        once the PDB is fixed. The check reads no PDB at all, so which selector
+        the PDB carries cannot matter and is not varied here."""
         pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.labels": {"app": "web"}, "metadata.ownerReferences": [], "spec.volumes": [{"emptyDir": {}}]})
-        for selector in ({"matchLabels": {"app": "web"}}, {}):
-            with self.subTest(selector=selector):
-                pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": selector})
-                [hit] = fw.check_scaledown_blocked({"pods": [pod], "pdbs": [pdb]}, [{"_node_names": {"n1"}}])
-                self.assertEqual(hit["severity"], "critical")
+        pdb = obj("PodDisruptionBudget", "pdb1", ns="default", **{"spec.selector": {"matchLabels": {"app": "web"}}})
+        [hit] = fw.check_scaledown_blocked({"pods": [pod], "pdbs": [pdb]}, [{"_node_names": {"n1"}}])
+        self.assertEqual(hit["severity"], "critical")
 
     def test_no_idle_pool_hits_means_nothing_to_check(self):
         self.assertEqual(fw.check_scaledown_blocked({"pods": [], "pdbs": []}, []), [])
@@ -2548,6 +2549,29 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("LimitRange default", hits[0]["excerpt"])
 
+    def test_a_defaulted_cpu_beside_a_sub_material_memory_names_both_reasons(self):
+        """CPU is the LimitRange's 250m, memory a hand-written 100Mi between
+        the resize and materiality floors. "The request is under the 100m /
+        128Mi" alone is false of the 250m CPU and hides the LimitRange."""
+        lr = obj("LimitRange", "limits", ns=self.NS, **{"spec.limits": [{"type": "Container", "defaultRequest": {"cpu": "250m"}}]})
+        ctx = {**self.context(pods=[self.pod(cpu_req="250m", mem_req="100Mi")]), "limitranges": [lr]}
+        [hit] = fw.check_idle_workload(ctx, self.IDLE, now=NOW)
+        self.assertIn(
+            "The memory request is under the 100m / 128Mi a resize is worth proposing for, "
+            "and the CPU request is the namespace LimitRange default",
+            hit["excerpt"],
+        )
+
+    def test_a_defaulted_memory_beside_a_sub_material_cpu_names_both_reasons(self):
+        lr = obj("LimitRange", "limits", ns=self.NS, **{"spec.limits": [{"type": "Container", "defaultRequest": {"memory": "1Gi"}}]})
+        ctx = {**self.context(pods=[self.pod(cpu_req="80m", mem_req="1Gi")]), "limitranges": [lr]}
+        [hit] = fw.check_idle_workload(ctx, self.IDLE, now=NOW)
+        self.assertIn(
+            "The CPU request is under the 100m / 128Mi a resize is worth proposing for, "
+            "and the memory request is the namespace LimitRange default",
+            hit["excerpt"],
+        )
+
     def test_a_fully_idle_guaranteed_controller_stands_down_instead_of_resizing(self):
         """The `ai-inference` shape: §3.1 can resize it and refuses to.
 
@@ -3238,16 +3262,18 @@ class UnderrequestTest(unittest.TestCase):
         self.assertIn("Raise the memory request to", excerpt)
         self.assertNotIn("raise the limit", excerpt)
 
-    def test_a_partially_limited_pod_gets_no_limit_clause(self):
+    def test_a_partially_limited_pod_is_graded_on_no_sum_but_its_limit_still_binds(self):
         """Admission is per container; the summed limit binds neither.
 
         The main container declares a 2Gi limit and the sidecar declares none,
-        so `mem_lim_total` is a real number that enforces nothing. The 1900 MiB
-        mean is past 90% of that 2Gi and its 1.3x prescription is past 2Gi, so
-        this reaches both guards: without them it would publish `critical`,
-        print a 2.0 GiB ceiling, and tell the reader to raise the limit.
+        so `mem_lim_total` is a real number that enforces nothing: the grade
+        stays `major` and no 2.0 GiB ceiling is printed. The main container's
+        own limit still binds the raise written on it, though -- 1.3x the
+        1900 MiB mean is 2470Mi for the pod, 2406Mi on `main` beside the
+        sidecar's 64Mi, past its 2048Mi -- so the limit clause fires.
         """
         pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
+        pod["spec"]["containers"][0]["name"] = "main"
         pod["spec"]["containers"].append(
             {"name": "sidecar", "resources": {"requests": {"memory": "64Mi"}}}
         )
@@ -3255,7 +3281,31 @@ class UnderrequestTest(unittest.TestCase):
         self.assertEqual(hit["severity"], "major")
         self.assertIn("a memory limit on only some containers", hit["excerpt"])
         self.assertNotIn("GiB limit", hit["excerpt"])
-        self.assertIn("Raise the memory request to", hit["excerpt"])
+        self.assertIn("Raise the memory request of container `main` to 2406Mi", hit["excerpt"])
+        self.assertIn("exceeds the 2048Mi memory limit declared on that container", hit["excerpt"])
+
+    def test_a_fully_limited_pod_is_compared_with_the_named_containers_limit(self):
+        """main 2Gi + sidecar 512Mi sums to 2560Mi. The 2470Mi pod figure fits
+        the sum, and written on `main` (2470 - 64 = 2406Mi) it is past main's
+        own 2048Mi, which admission rejects."""
+        pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
+        pod["spec"]["containers"][0]["name"] = "main"
+        pod["spec"]["containers"].append(
+            {"name": "sidecar", "resources": {"requests": {"memory": "64Mi"}, "limits": {"memory": "512Mi"}}}
+        )
+        [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1900.0})
+        self.assertIn("Raise the memory request of container `main` to 2406Mi", hit["excerpt"])
+        self.assertIn("exceeds the 2048Mi memory limit declared on that container", hit["excerpt"])
+        self.assertIn("raise the limit to", hit["excerpt"])
+
+    def test_the_raise_lands_on_the_container_with_the_largest_request(self):
+        pod = self.pod(mem_req="64Mi", mem_lim="4Gi")
+        pod["spec"]["containers"][0]["name"] = "proxy"
+        pod["spec"]["containers"].append(
+            {"name": "app", "resources": {"requests": {"memory": "512Mi"}, "limits": {"memory": "4Gi"}}}
+        )
+        [hit] = self.check([pod], {("kubeagents-system", "litellm-1"): 1900.0})
+        self.assertIn("container `app` to 2406Mi", hit["excerpt"])
         self.assertNotIn("raise the limit", hit["excerpt"])
 
     def test_a_sidecar_declaring_a_zero_memory_request_skips_the_pod(self):
@@ -5724,6 +5774,15 @@ class DisabledApiProjectTest(unittest.TestCase):
         self.assertIn("nothing collected", manifest["error"])
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
         self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
+
+    def test_a_project_with_both_apis_off_is_logged_once(self):
+        """The prefetch records the project's reads by walking the same path
+        the replay then walks, so the line was said twice per run."""
+        run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
+        with patch.object(fw, "log") as logged:
+            fw.collect_fleet("acme", run=run, session=None, now=NOW)
+        said = [c.args[0] for c in logged.call_args_list if "no project-scoped check applies" in c.args[0]]
+        self.assertEqual(len(said), 1, said)
 
     def _no_project_entry_run(self, status="RUNNING"):
         """One cluster whose credentials fail, in a project whose registry read

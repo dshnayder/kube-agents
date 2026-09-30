@@ -585,7 +585,8 @@ LARGE_VOLUME_GIB = 100
 SSD_STORAGE_CLASS_MARKERS = ("ssd", "extreme", "premium")
 
 # §3.10: a namespace under an active GitOps sync is the controller's to delete.
-GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.io/")
+CONFIG_SYNC_MARKER_PREFIX = "configsync.gke.io/"
+GITOPS_SYNC_MARKER_PREFIXES = (CONFIG_SYNC_MARKER_PREFIX, "kustomize.toolkit.fluxcd.io/")
 #: §3.10's "explicit ownership or retention annotation": an annotation whose
 #: key's name part (after any `prefix/`) holds one of these words once split
 #: on `-`, `_` and `.` -- `owner`, `team-owner`, `example.com/retain`,
@@ -623,6 +624,50 @@ IDLE_ADDRESS_ROLLUP_MIN = 10
 # object the service controller writes as its description; see
 # `check_orphan_lb` for why both quote shapes are accepted.
 SERVICE_NAME_DESCRIPTION_RE = re.compile(r"""kubernetes\.io/service-name["']?\s*:\s*["']?([\w.-]+/[\w.-]+)""")
+# Resource-quantity parsing -- the request and limit strings in pod specs.
+CPU_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
+# Both suffix families a resource.Quantity accepts: `512M` and `1G` are as
+# common in manifests as `512Mi`, and a request the regex rejects drops the
+# container out of §3.1 and §3.11 without a word.
+MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$")
+MILLICORES_PER_CORE = 1000.0
+BYTES_PER_MIB = 1024.0 * 1024.0
+BINARY_UNIT_STEP = 1024.0
+DECIMAL_UNIT_STEP = 1000.0
+BINARY_UNITS = ("Ki", "Mi", "Gi", "Ti", "Pi", "Ei")
+DECIMAL_UNITS = ("k", "M", "G", "T", "P", "E")
+MEM_UNIT_TO_MIB = {
+    **{unit: BINARY_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(BINARY_UNITS)},
+    **{unit: DECIMAL_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(DECIMAL_UNITS)},
+}
+MIB_PER_GIB = 1024.0
+
+IMPACT = {
+    "overrequest": "This controller reserves far more than it uses, so the scheduler and autoscaler size the cluster for capacity nothing needs.",
+    "unsized-workload": "With no nonzero CPU or memory request, the scheduler books nothing for this controller: it lands on nodes that are already full, it is BestEffort so kubelet evicts it first under pressure, and the autoscaler cannot count it when sizing the cluster.",
+    "underrequest": "Sustained memory use above the request means the scheduler has under-booked every node this controller lands on, and kubelet ranks Burstable pods for eviction by exactly this overage — so it is the first thing evicted when any workload on that node needs memory.",
+    "orphan-pv": "The backing disk still exists and no claim can bind it -- capacity paid for and unusable.",
+    "unconsumed-pvc": "Provisioned storage sits bound with nothing reading or writing it.",
+    "unattached-disk": "A persistent disk bills continuously whether or not anything is attached to it.",
+    "idle-address": "A reserved external IP bills continuously whether or not anything answers on it.",
+    "orphan-lb": "An orphaned forwarding rule keeps a load balancer, and usually an external IP, alive for nothing.",
+    "idle-nodepool": "Nodes reserved by a non-zero autoscaler floor sit idle instead of being reclaimed.",
+    "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
+    "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
+    "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
+    # "nobody is calling it" was in this sentence for eleven days and nothing in
+    # the collector ever measured a call. On 2026-09-07 three findings carrying
+    # it auto-promoted, merged unattended, and stood down three Deployments --
+    # two of them behind forwarding rules that had metered 837,460 and 785,748
+    # inbound packets over the same week the finding quoted. The traffic turned
+    # out to be internet background scanning, so the claim was probably true in
+    # substance; it was certainly unmeasured, and an audit that guesses right is
+    # still an audit a reader cannot check. What this check measures is CPU and
+    # memory, so that is all it now asserts.
+    "idle-workload": f"This controller's peak usage stayed at or below {IDLE_WORKLOAD_UTILISATION:.0%} of its requests on every dimension it declares over the measured window the excerpt names, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. "
+    "Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
+    "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
+}
 
 
 def _is_system_namespace(ns: str) -> bool:
@@ -956,15 +1001,6 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
 # Resource-quantity parsing — the request and limit strings in pod specs.
 # --------------------------------------------------------------------------- #
 
-CPU_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
-# Both suffix families a resource.Quantity accepts: `512M` and `1G` are as
-# common in manifests as `512Mi`, and a request the regex rejects drops the
-# container out of §3.1 and §3.11 without a word.
-MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$")
-
-
-MILLICORES_PER_CORE = 1000.0
-
 
 def parse_cpu_cores(s: str) -> float | None:
     m = CPU_RE.match((s or "").strip())
@@ -972,18 +1008,6 @@ def parse_cpu_cores(s: str) -> float | None:
         return None
     value, unit = m.groups()
     return float(value) / MILLICORES_PER_CORE if unit == "m" else float(value)
-
-
-BYTES_PER_MIB = 1024.0 * 1024.0
-BINARY_UNIT_STEP = 1024.0
-DECIMAL_UNIT_STEP = 1000.0
-BINARY_UNITS = ("Ki", "Mi", "Gi", "Ti", "Pi", "Ei")
-DECIMAL_UNITS = ("k", "M", "G", "T", "P", "E")
-MEM_UNIT_TO_MIB = {
-    **{unit: BINARY_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(BINARY_UNITS)},
-    **{unit: DECIMAL_UNIT_STEP ** (power + 1) / BYTES_PER_MIB for power, unit in enumerate(DECIMAL_UNITS)},
-}
-MIB_PER_GIB = 1024.0
 
 
 def parse_mem_mib(s: str) -> float | None:
@@ -1893,7 +1917,7 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
         if _matches_live_statefulset_pvc(name, sts_by_ns.get(ns, set())):
             continue
         annotations = meta.get("annotations") or {}
-        if any(k.startswith("configsync.gke.io/") for k in annotations):
+        if any(k.startswith(CONFIG_SYNC_MARKER_PREFIX) for k in annotations):
             continue
         age = _age_days(meta.get("creationTimestamp", ""), now=now)
         if age is None or age < UNCONSUMED_PVC_MIN_AGE_DAYS:
@@ -2735,7 +2759,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         init_containers = spec.get("initContainers") or []
         init_requests = [(c.get("resources") or {}).get("requests") or {} for c in init_containers]
         init_limits = [(c.get("resources") or {}).get("limits") or {} for c in init_containers]
-        entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits})
+        entry["pods"].append({"ns": ns, "name": name, "containers": [str(c.get("name") or "") for c in containers], "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits})
         # For `check_idle_workload`'s Service join. Replicas of one controller
         # share the selector labels by construction, so the first pod's set
         # answers for the controller; a later pod merges in rather than
@@ -3247,7 +3271,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # near-idle workload, and a rule quoted without its clamp reads as
         # though the answer were `1m`.
         targets = {
-            "cpu": f"{_resize_target(peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001) * 1000:.0f}m",
+            "cpu": f"{_resize_target(peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=1 / MILLICORES_PER_CORE) * MILLICORES_PER_CORE:.0f}m",
             "memory": f"{_resize_target(peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0):.0f}Mi",
         }
         measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / MIB_PER_GIB:.1f} GiB {measured_over}"
@@ -3649,15 +3673,25 @@ def check_idle_workload(
         )
         # Why no resize is on the table, which is the reader's first question
         # and has three answers. Naming the wrong one would send them to
-        # check a floor the manifest is nowhere near.
+        # check a floor the manifest is nowhere near. A sub-material dimension
+        # beside a LimitRange-defaulted one is both answers at once, so the
+        # sentence names each dimension with its own.
+        shrinking = [dim for dim, shrinks in (("CPU", cpu_shrinks), ("memory", mem_shrinks)) if shrinks]
+        defaulted_names = [label for dim, label in (("cpu", "CPU"), ("memory", "memory")) if dim in defaulted]
+        also_defaulted = (
+            f", and the {' and '.join(defaulted_names)} request is the namespace LimitRange "
+            f"default, which is fixed in the LimitRange rather than here"
+            if defaulted_names
+            else ""
+        )
         no_resize = (
             "Requests and limits are equal, so any resize would lower the "
             "enforcement ceiling with them -- a sizing observation is not a "
             "safe limit, which is why no resize is offered"
             if guaranteed
-            else "The request is under the 100m / 128Mi a resize is worth "
-            "proposing for, so no resize is offered"
-            if cpu_shrinks or mem_shrinks
+            else f"The {' and '.join(shrinking)} request is under the 100m / 128Mi a resize is worth "
+            f"proposing for{also_defaulted}, so no resize is offered"
+            if shrinking
             else "Every dimension is already at or below the 50m/64Mi floor or is the "
             "namespace LimitRange default, which is fixed in the LimitRange "
             "rather than here, so no resize of this workload can reclaim any of it"
@@ -3668,7 +3702,7 @@ def check_idle_workload(
         excerpt = (
             f"requests {cpu_req:.3f} vCPU / {mem_req:.0f} MiB across {replicas} "
             f"replica{'s' if replicas != 1 else ''}; peak observed "
-            f"{peak_cpu * 1000:.1f}m vCPU / {peak_mem:.1f} MiB {measured_over}. "
+            f"{peak_cpu * MILLICORES_PER_CORE:.1f}m vCPU / {peak_mem:.1f} MiB {measured_over}. "
             f"Declared {_whole_days(age_days)} days ago. {no_resize}"
         )
         # The reservation is the smaller half of the bill. A LoadBalancer
@@ -3749,6 +3783,46 @@ def check_idle_workload(
             }
         )
     return hits
+
+
+def _underrequest_target(pods: list[dict]) -> tuple[str, float, float | None]:
+    """The container §3.11's raise lands on, what the rest of the pod requests,
+    and that container's own memory limit.
+
+    The mean is read per pod, so the prescription is a pod figure, but
+    admission compares each container's request with its own limit: a pod
+    of a 2Gi main and a 512Mi sidecar has a 2560Mi summed limit, and a 2470Mi
+    prescription that fits it is still rejected once it is written on the
+    main container. So the raise is named on one container -- the one with
+    the largest memory request, which is the one a reader would pick -- sized
+    as the pod figure less the other containers' requests, and compared with
+    that container's limit alone.
+
+    Across the controller's pods the smallest of the others' requests and the
+    smallest of the container's limits, so a rollout mid-way leaves the
+    request no smaller and the limit clause no quieter than either revision
+    needs. The name is "" for a single-container pod, which needs no naming,
+    and the limit None when no pod declares one on that container.
+    """
+    first = pods[0]
+    names = first.get("containers") or [""] * len(first["requests"])
+    sizes = [parse_mem_mib(str(req.get("memory") or "")) or 0 for req in first["requests"]]
+    target = names[sizes.index(max(sizes))] if sizes else ""
+    others: list[float] = []
+    limits: list[float] = []
+    for pod in pods:
+        pod_names = pod.get("containers") or [""] * len(pod["requests"])
+        other = 0.0
+        for cname, req, lim in zip(pod_names, pod["requests"], pod["limits"]):
+            mem_req = parse_mem_mib(str(req.get("memory") or "")) or 0
+            if cname == target:
+                mem_lim = parse_mem_mib(str(lim.get("memory") or "")) or 0
+                if mem_lim > 0:
+                    limits.append(mem_lim)
+            else:
+                other += mem_req
+        others.append(other)
+    return (target if len(names) > 1 else ""), min(others), (min(limits) if limits else None)
 
 
 def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, now: datetime) -> list[dict]:
@@ -3868,7 +3942,15 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             multiplier=UNDERREQUEST_PEAK_MULTIPLIER,
         )
         per_replica = " per replica" if replicas > 1 else ""
-        excerpt += f" Raise the memory request to {new_request:.0f}Mi{per_replica}."
+        target, others_mib, target_limit = _underrequest_target(entry["pods"])
+        if target:
+            new_request -= others_mib
+            excerpt += (
+                f" Raise the memory request of container `{target}` to {new_request:.0f}Mi{per_replica}, "
+                f"leaving the others' {others_mib:.0f}Mi as it is."
+            )
+        else:
+            excerpt += f" Raise the memory request to {new_request:.0f}Mi{per_replica}."
         # A request above its limit is rejected at admission, so a remediation
         # that raises the request and leaves the limit alone does not degrade
         # the workload -- it stops it scheduling at all. On 2026-09-07 that is
@@ -3877,14 +3959,16 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # limit, and the model had no way to see it. The only limit the excerpt
         # printed was the 4.0 GiB controller total, which is twice the
         # prescription, so the comparison a reader makes from the excerpt alone
-        # says it fits. Divide by the replica count here rather than asking for
-        # that division to be remembered.
-        # `limited` above keeps a partial limit out of this sentence too: it
-        # would describe a limit that does not exist.
-        if limited and new_request > mem_lim_total / replicas:
+        # says it fits. Compare one replica's container here rather than asking
+        # for that division to be remembered.
+        # Against the named container's own limit (`_underrequest_target`),
+        # never the pod's sum: admission is per container, so a sum fits
+        # prescriptions one container rejects, and an unlimited sidecar beside
+        # a limited main container still leaves the main one's limit binding.
+        if target_limit is not None and new_request > target_limit:
             excerpt += (
-                f" That exceeds the {mem_lim_total / replicas:.0f}Mi memory limit declared"
-                f"{per_replica}, and a request above its limit is rejected at admission, so "
+                f" That exceeds the {target_limit:.0f}Mi memory limit declared"
+                f"{' on that container' if target else ''}{per_replica}, and a request above its limit is rejected at admission, so "
                 f"raise the limit to {new_request * UNDERREQUEST_LIMIT_MULTIPLIER:.0f}Mi in "
                 f"the same edit."
             )
@@ -4020,16 +4104,11 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # severity ceiling reserves `critical` for a drain blocker or a
         # last-copy deletion, neither of which a missing request is.
         #
-        # That ceiling used to double as a promotion guard: `major` was below
-        # `AUTO_PROMOTION_FLOOR`, so a bumped finding could not open a pull
-        # request unasked. The floor is `major` now, so it can, and this bump
-        # is the one place in the audit where a *platform* attribute rather
-        # than a magnitude decides that. Left as is deliberately -- a
-        # right-size is a one-screen diff a reviewer can decline, and
-        # `AUTO_PROMOTION_CAP` bounds a bad night at five. Worth revisiting if
-        # an Autopilot fleet ever makes this the bulk of the sweep, which on
-        # the 2026-09-06 fleet it was not: every overrequest and unsized
-        # finding was `minor`, all of them on one Standard cluster.
+        # The ceiling is also what keeps this out of the automatic sweep,
+        # which promotes `critical` findings only (`promotion_candidates` in
+        # audit_report.py): a bumped `major` still waits for `/remediate`, so
+        # a *platform* attribute moves this finding up the ledger and never
+        # opens a pull request by itself.
         severity = "major" if autopilot else "minor"
         # §3.1's units are vCPU and GiB, and this check does not use them. The
         # workloads it finds are small by construction -- nobody forgets a
@@ -4068,7 +4147,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             if hit
         ]
         if floored:
-            names = {"cpu": f"{UNSIZED_FLOOR_VCPU * 1000:.0f}m", "memory": f"{UNSIZED_FLOOR_MIB:.0f}Mi"}
+            names = {"cpu": f"{UNSIZED_FLOOR_VCPU * MILLICORES_PER_CORE:.0f}m", "memory": f"{UNSIZED_FLOOR_MIB:.0f}Mi"}
             excerpt += (
                 f" — the {' and '.join(floored)} figure is the "
                 f"{'/'.join(names[d] for d in floored)} floor rather than 2x the peak, "
@@ -4084,34 +4163,6 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             }
         )
     return hits
-
-
-IMPACT = {
-    "overrequest": "This controller reserves far more than it uses, so the scheduler and autoscaler size the cluster for capacity nothing needs.",
-    "unsized-workload": "With no nonzero CPU or memory request, the scheduler books nothing for this controller: it lands on nodes that are already full, it is BestEffort so kubelet evicts it first under pressure, and the autoscaler cannot count it when sizing the cluster.",
-    "underrequest": "Sustained memory use above the request means the scheduler has under-booked every node this controller lands on, and kubelet ranks Burstable pods for eviction by exactly this overage — so it is the first thing evicted when any workload on that node needs memory.",
-    "orphan-pv": "The backing disk still exists and no claim can bind it -- capacity paid for and unusable.",
-    "unconsumed-pvc": "Provisioned storage sits bound with nothing reading or writing it.",
-    "unattached-disk": "A persistent disk bills continuously whether or not anything is attached to it.",
-    "idle-address": "A reserved external IP bills continuously whether or not anything answers on it.",
-    "orphan-lb": "An orphaned forwarding rule keeps a load balancer, and usually an external IP, alive for nothing.",
-    "idle-nodepool": "Nodes reserved by a non-zero autoscaler floor sit idle instead of being reclaimed.",
-    "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
-    "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
-    "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
-    # "nobody is calling it" was in this sentence for eleven days and nothing in
-    # the collector ever measured a call. On 2026-09-07 three findings carrying
-    # it auto-promoted, merged unattended, and stood down three Deployments --
-    # two of them behind forwarding rules that had metered 837,460 and 785,748
-    # inbound packets over the same week the finding quoted. The traffic turned
-    # out to be internet background scanning, so the claim was probably true in
-    # substance; it was certainly unmeasured, and an audit that guesses right is
-    # still an audit a reader cannot check. What this check measures is CPU and
-    # memory, so that is all it now asserts.
-    "idle-workload": f"This controller's peak usage stayed at or below {IDLE_WORKLOAD_UTILISATION:.0%} of its requests on every dimension it declares over the measured window the excerpt names, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. "
-    "Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
-    "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
-}
 
 
 def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:
@@ -5521,7 +5572,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -5602,8 +5653,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # Nothing any project-scoped check looks for can exist here, so there
         # is no target to report: a row naming four inapplicable checks and
         # no read would still need a `limitations` note in the document,
-        # which makes every such project a coverage gap.
-        log(f"{project}: Compute Engine and Artifact Registry APIs are not enabled; no project-scoped check applies")
+        # which makes every such project a coverage gap. `announce` is off
+        # for `_prefetch_compute`'s recording pass, which walks this same
+        # path once before the replay does; the line is said once per run.
+        if announce:
+            log(f"{project}: Compute Engine and Artifact Registry APIs are not enabled; no project-scoped check applies")
         return None
 
     not_applicable: dict[str, str] = {}
@@ -5801,7 +5855,7 @@ def _prefetch_compute(p: str, *, run: RunFn, now: datetime, known_clusters: set[
         return result
 
     empty_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
-    collect_project_compute(p, False, empty_facts, run=recording, now=now, known_clusters=known_clusters, forwarding_rules=forwarding_rules)
+    collect_project_compute(p, False, empty_facts, run=recording, now=now, known_clusters=known_clusters, forwarding_rules=forwarding_rules, announce=False)
     return recorded
 
 

@@ -139,6 +139,11 @@ AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
 # separately because neither imports the other.
 NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 
+# §3.1: the zone span credited to an Autopilot cluster, which has no node
+# pools to read and places nodes across its region's zones. Any value above
+# one scores the same; two is the least that claim needs.
+AUTOPILOT_ZONE_SPAN = 2
+
 # §3.8's ">20%", as a fraction, against the mean of the daily preemption
 # rates the API returns.
 SPOT_PREEMPTION_CEILING = 0.20
@@ -362,6 +367,52 @@ _CEILING_SUPPLY_CLAUSE = (
     "supply, or because regional quota binds below the configured limit."
 )
 
+# §3.10(a): the reservation affinities that silently bypass a ComputeClass's
+# priority chain.
+BYPASSING_RESERVATION_AFFINITIES = ("AnyBestEffort", "Automatic")
+# See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
+# unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
+# API server stays up, it is transient and ordinary, and excluding it dropped
+# clusters from audits for the duration of any routine config change. The
+# enumeration helpers here are near-copies of fleet_waste.py's; the two
+# collectors import only the leaf parsers they share, not each other's fleet
+# walk, so a change to one stream's enumeration cannot move the other's.
+AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+IMPACT = {
+    "ccc-missing-fallbacks": "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable.",
+    "ccc-no-ondemand-floor": "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state.",
+    "ccc-large-vm-scarcity": "Very large VM shapes (>32 cores) draw from thin regional capacity pools and are highly prone to sudden stockouts during scale-up.",
+    "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
+    "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
+    "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
+    "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
+    # Both arms of §3.9 set their own `impact` on the hit -- and a pool
+    # matching both gets both sentences -- so this entry is the fallback
+    # nothing reaches. It says only what every hit has in common: "cannot
+    # scale when it needs to" was the previous wording and is false of a
+    # zone-locked pool at 1 of 2 nodes, which scales fine until the zone
+    # runs out.
+    "single-zone-nodepool": "Node pool's scale-up has a single point of failure: it is locked to one zone, at its own configured ceiling, or both.",
+    "reservation-mismatch-risk": "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts.",
+    "dangling-compute-class": "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state.",
+    "spot-scarcity-risk": "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk.",
+    "autoscaler-out-of-resources": "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion.",
+}
+SEVERITY = {
+    "ccc-missing-fallbacks": "critical",
+    "ccc-no-ondemand-floor": "major",  # overridden to critical when referenced by an inference workload
+    "ccc-large-vm-scarcity": "major",
+    "ccc-priority-starvation": "critical",
+    "ccc-mixed-disk-generations": "critical",
+    "ccc-hyperdisk-incompatible": "critical",
+    "quota-exhaustion-risk": "critical",
+    "single-zone-nodepool": "major",
+    "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
+    "dangling-compute-class": "critical",
+    "spot-scarcity-risk": "major",
+    "autoscaler-out-of-resources": "critical",
+}
+
 
 def log(msg: str) -> None:
     print(f"[fleet_stockout] {msg}", file=sys.stderr, flush=True)
@@ -479,16 +530,6 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
         env=env,
     )
     return kc, result
-
-
-# See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
-# unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
-# API server stays up, it is transient and ordinary, and excluding it dropped
-# clusters from audits for the duration of any routine config change. The
-# enumeration helpers here are near-copies of fleet_waste.py's; the two
-# collectors import only the leaf parsers they share, not each other's fleet
-# walk, so a change to one stream's enumeration cannot move the other's.
-AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 
 
 def not_running_entry(c: dict, project: str) -> dict:
@@ -816,7 +857,33 @@ def _priority_is_pod_family(p: dict) -> bool:
     return bool(p.get("podFamily")) and not p.get("machineFamily") and not p.get("machineType")
 
 
-def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
+def cluster_zone_span(cluster: dict, node_pools: list[dict], pools_readable: bool) -> int | None:
+    """How many zones this cluster's nodes can land in, or None when unknown.
+
+    The node pools' `locations` when the read returned any: a regional
+    cluster's node locations can still be one zone, so the cluster's own
+    location does not settle it. An Autopilot cluster has no pools to read
+    and is regional across the region's zones by construction. Anything else
+    is unknown, and §3.1 then scores no zone spread it cannot see.
+    """
+    if pools_readable and node_pools:
+        return len({zone for pool in node_pools for zone in (pool.get("locations") or [])}) or None
+    if cluster.get("autopilot"):
+        return AUTOPILOT_ZONE_SPAN
+    return None
+
+
+def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> dict | None:
+    """§3.1: fewer than two obtainability dimensions varied across the chain.
+
+    Zone counts as varied when the chain can place in more than one zone,
+    not only when priorities differ in zone: §3.1's own Do-NOT-flag example,
+    a multi-zone `c3` falling back to `n4` and `n2`, varies family and zone
+    with every priority on the same zones. A priority reaches more than one
+    zone if it lists two or more, or lists none on a cluster whose nodes span
+    more than one (`cluster_zones`, from `cluster_zone_span`). With the span
+    unknown an unzoned priority earns nothing, and the excerpt says so.
+    """
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities:
         return None
@@ -844,12 +911,19 @@ def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
     spots = {_priority_is_spot(p) for p in priorities}
     sizes = {_priority_size_class(p) for p in priorities if _priority_size_class(p)}
     zones = {_priority_zones(p) for p in priorities if _priority_zones(p)}
-    dimensions_varied = sum(1 for s in (families, spots, sizes, zones) if len(s) > 1)
+    unzoned = any(not _priority_zones(p) for p in priorities)
+    multi_zone = (
+        len(zones) > 1
+        or any(len(z) > 1 for z in zones)
+        or (unzoned and cluster_zones is not None and cluster_zones > 1)
+    )
+    dimensions_varied = sum(1 for s in (families, spots, sizes) if len(s) > 1) + int(multi_zone)
     if dimensions_varied >= 2:
         return None
+    zone_note = "; the cluster's zones were not established" if unzoned and cluster_zones is None else ""
     return {
         "object": f"ComputeClass/{cc['metadata']['name']}",
-        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
+        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)}){zone_note}",
     }
 
 
@@ -1174,7 +1248,7 @@ def check_reservation_affinity(cc: dict) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
     for p in priorities:
         affinity = ((p.get("reservations") or {}).get("affinity") or "")
-        if affinity in ("AnyBestEffort", "Automatic"):
+        if affinity in BYPASSING_RESERVATION_AFFINITIES:
             return {
                 "object": f"ComputeClass/{cc['metadata']['name']}",
                 "excerpt": f"reservations.affinity={affinity!r} bypasses this ComputeClass's priority chain",
@@ -1496,41 +1570,6 @@ def check_spot_scarcity(
 # Assembly
 # --------------------------------------------------------------------------- #
 
-IMPACT = {
-    "ccc-missing-fallbacks": "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable.",
-    "ccc-no-ondemand-floor": "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state.",
-    "ccc-large-vm-scarcity": "Very large VM shapes (>32 cores) draw from thin regional capacity pools and are highly prone to sudden stockouts during scale-up.",
-    "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
-    "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
-    "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
-    "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
-    # Both arms of §3.9 set their own `impact` on the hit -- and a pool
-    # matching both gets both sentences -- so this entry is the fallback
-    # nothing reaches. It says only what every hit has in common: "cannot
-    # scale when it needs to" was the previous wording and is false of a
-    # zone-locked pool at 1 of 2 nodes, which scales fine until the zone
-    # runs out.
-    "single-zone-nodepool": "Node pool's scale-up has a single point of failure: it is locked to one zone, at its own configured ceiling, or both.",
-    "reservation-mismatch-risk": "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts.",
-    "dangling-compute-class": "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state.",
-    "spot-scarcity-risk": "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk.",
-    "autoscaler-out-of-resources": "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion.",
-}
-SEVERITY = {
-    "ccc-missing-fallbacks": "critical",
-    "ccc-no-ondemand-floor": "major",  # overridden to critical when referenced by an inference workload
-    "ccc-large-vm-scarcity": "major",
-    "ccc-priority-starvation": "critical",
-    "ccc-mixed-disk-generations": "critical",
-    "ccc-hyperdisk-incompatible": "critical",
-    "quota-exhaustion-risk": "critical",
-    "single-zone-nodepool": "major",
-    "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
-    "dangling-compute-class": "critical",
-    "spot-scarcity-risk": "major",
-    "autoscaler-out-of-resources": "critical",
-}
-
 
 def _emit(slug: str, hit: dict) -> dict:
     emitted = {
@@ -1756,11 +1795,12 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "reservation-mismatch-risk",
     ):
         commands[cc_slug] = dump_record
+    cluster_zones = cluster_zone_span(cluster, node_pools, pools_readable)
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
         non_production = is_non_production(cc_meta.get("name", ""), cc_meta.get("labels"))
-        for hit in [check_ccc_missing_fallbacks(cc)]:
+        for hit in [check_ccc_missing_fallbacks(cc, cluster_zones)]:
             if hit:
                 candidates.append(_emit("ccc-missing-fallbacks", hit))
         if not non_production:
