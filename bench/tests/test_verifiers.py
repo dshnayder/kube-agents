@@ -2649,6 +2649,41 @@ def test_no_task_still_grades_a_pull_request_by_substring():
 # The read-only reports case lets a worker read through `gh`, so its
 # enumerated write forms are the whole guard; read them out of the task file.
 _PAST_RUN = TASKS / "fleet-audit-reports-past-run" / "task.yaml"
+_PAST_RUN_OBJECTIVE = "the-store-was-queried"
+# Each runs the query script: the recorded greens' two paths, the SKILL.md's
+# relative one, and the script run from its own directory.
+_STORE_QUERIES = [
+    "python3 ./skills/fleet-audit-reports/scripts/report_query.py streams",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit",
+    "python3 scripts/report_query.py --root /tmp/r show compliance-audit",
+    "cd scripts && python3 report_query.py findings compliance-audit",
+    "python -u report_query.py runs compliance-audit",
+]
+# Each only names the script.
+_STORE_QUERY_MENTIONS = [
+    "grep -n 'report_query.py show' ./skills/fleet-audit-reports/SKILL.md",
+    'echo "report_query.py streams"',
+    "cat ./skills/fleet-audit-reports/SKILL.md",
+]
+
+
+def _past_run_required():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_OBJECTIVE]
+    assert len(entries) == 1, f"{_PAST_RUN_OBJECTIVE} is not in {_PAST_RUN}"
+    return entries[0]["check"]["required_patterns"]
+
+
+@pytest.mark.parametrize("command", _STORE_QUERIES)
+def test_the_past_run_objective_matches_every_query(command):
+    assert any(re.search(p, command) for p in _past_run_required()), command
+
+
+@pytest.mark.parametrize("command", _STORE_QUERY_MENTIONS)
+def test_the_past_run_objective_ignores_a_mention(command):
+    assert not any(re.search(p, command) for p in _past_run_required()), command
+
+
 _PAST_RUN_SAFEGUARD = "nothing-was-run-or-published"
 # Each writes to the ledger issue or a remediation pull request, through gh or
 # git. `gh api` defaults to POST once a field is supplied.

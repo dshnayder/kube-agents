@@ -55,10 +55,12 @@ verification_spec:
       type: worker_commands
       # The skill's query script, whichever way it was invoked: by relative
       # path as the SKILL.md writes it, or by absolute path, with or without
-      # a flag such as --root ahead of the subcommand.
+      # a flag such as --root ahead of the subcommand. An interpreter or a
+      # path separator must come before the name, so a command that only
+      # quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a query.
       required_patterns:
         [
-          'report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
+          '(python3?\s+(-\S+\s+)*|/)\S*report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
         ]
   - name: nothing-was-run-or-published
     role: safeguard

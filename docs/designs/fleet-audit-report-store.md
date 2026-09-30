@@ -87,7 +87,9 @@ ledger open — over a coverage gap or an unaccounted previous finding — only 
 body still renders the previous run's findings. That path stores the previous body and ids forward
 instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
 ledger, and every finding the body carries would be announced as new. The document that body renders
-rides beside it as `ledger_document`, which only `finish` reads, for titles. `document` stays this
+rides beside it as `ledger_document`, which only `finish` reads, for titles. It is known only from
+a run that wrote the body; after a seed, whose memory has no document, it is absent until a
+findings run rewrites the body, rather than a held-open run's empty document standing in for it. `document` stays this
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
 handed the previous run's scope under this run's status; `ledger_held_open` tells that reader the
 issue still lists findings this run's zero does not. Where the previous memory is itself lost, the

@@ -308,6 +308,8 @@ class TestFlags(unittest.TestCase):
     def test_died_needs_no_roster_and_no_schedule(self):
         doc = stream(liveness="died", started=started(age_s=9000))
         self.assertEqual(view.flags_for(doc, {}, NOW, True), ["DIED"])
+        # It ran: the STATUS cell must not say otherwise beside the flag.
+        self.assertEqual(view.status_cell(doc, {}), ("died before finish", "red"))
 
     def test_an_in_flight_run_never_trips_died(self):
         doc = stream(liveness="running", started=started(age_s=300))
@@ -478,7 +480,7 @@ class TestRender(unittest.TestCase):
         urls = ["https://x/pull/1", "https://x/pull/2"]
         out = self.render({"compliance-audit": stream(last=latest(prs_opened=urls))})
         row = next(line for line in out.splitlines() if "compliance-audit" in line and "│" in line)
-        cells = [cell.strip() for cell in view.plain(row).strip("│").split("│")]
+        cells = [cell.strip() for cell in terminal_table.plain(row).strip("│").split("│")]
         titles = [column.title for column in view.COLUMNS]
         self.assertEqual(cells[titles.index("PRS")], "2")
 
@@ -541,7 +543,7 @@ class TestRender(unittest.TestCase):
             show_gaps=True,
         )
         printed = next(line for line in out.splitlines() if "quota exhausted" in line)
-        self.assertRegex(view.plain(printed), r"prod-eu-1\s+│\s+quota exhausted")
+        self.assertRegex(terminal_table.plain(printed), r"prod-eu-1\s+│\s+quota exhausted")
 
     def test_a_gap_that_is_a_sentence_is_not_split_at_its_colon(self):
         gap = "partially audited — 3 checks did not run: release-channel, node-image"
@@ -648,7 +650,7 @@ class TestRender(unittest.TestCase):
             show_gaps=True,
         )
         printed = next(line for line in out.splitlines() if "prod-eu-1" in line)
-        cell = view.plain(printed).split("│")[3].strip()
+        cell = terminal_table.plain(printed).split("│")[3].strip()
         self.assertLessEqual(len(cell), view.GAP_WIDTH)
         self.assertTrue(cell.endswith("…"))
 
@@ -756,7 +758,7 @@ class TestDashboard(unittest.TestCase):
             "error": None,
         }
         scope = next(
-            line for line in view.plain(self.render(streams)).splitlines()
+            line for line in terminal_table.plain(self.render(streams)).splitlines()
             if line.strip().startswith("scope")
         )
         self.assertIn("9 units widest", scope)
@@ -797,7 +799,7 @@ class TestDashboard(unittest.TestCase):
         return {
             terminal_table.display_width(line)
             for line in out.splitlines()
-            if view.plain(line).startswith(("┌", "│", "├", "└"))
+            if terminal_table.plain(line).startswith(("┌", "│", "├", "└"))
         }
 
     def test_every_border_line_is_the_same_width(self):
@@ -862,7 +864,7 @@ class TestDashboard(unittest.TestCase):
             "cost-audit": stream(last=latest(audit_id="cost-audit")),
             "審計審計": stream(last=latest(audit_id="審計審計")),
         }
-        out = view.plain(self.render(streams))
+        out = terminal_table.plain(self.render(streams))
         listed = out.split("PULL REQUESTS OPENED", 1)[1].splitlines()[1:3]
         starts = {
             terminal_table.display_width(line[: line.index("acme/fleet#9")]) for line in listed

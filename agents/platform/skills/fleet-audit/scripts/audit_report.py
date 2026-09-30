@@ -12155,7 +12155,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             stored_issue = existing_issue if memory else None
             stored_body, stored_ids = previous_body, previous_ids
             carried = (memory or {}).get("ledger_document")
-            if not isinstance(carried, dict):
+            # A held-open run's own `document` is its empty set, not what the
+            # body renders, and a seed has none: only a run that wrote the
+            # body vouches for it. Otherwise the key is left out, and a
+            # reader falls back to the run's own document, as it would.
+            if not isinstance(carried, dict) and not (memory or {}).get("ledger_held_open"):
                 carried = (memory or {}).get("document")
             if isinstance(carried, dict):
                 ledger_document = carried

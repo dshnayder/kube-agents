@@ -83,7 +83,6 @@ try:
         ago,
         display_width,
         hyperlink,
-        plain,
         pr_ref,
         render_table,
         want_colour,
@@ -151,10 +150,12 @@ STATUS_STYLE = {
     "HELD": "yellow",
     "OPENED": "cyan",
     "UPDATED": "cyan",
-    "running…": "yellow",
     "never ran": "dim",
 }
 KNOWN_STATUS = frozenset(STATUS_STYLE)
+# The STATUS of a stream whose run took the lease and died with no stored run
+# to show: it ran, so "never ran" beside the DIED flag would contradict it.
+DIED_STATUS = "died before finish"
 
 SORTS = ("stream", "last", "findings", "flags")
 # A collector writes coverage gaps at whatever length; one is clipped to this.
@@ -734,9 +735,10 @@ def status_cell(stream: dict, latest: dict) -> tuple[str, str]:
     if stream.get("liveness") == "running":
         age = (stream.get("started") or {}).get("age_s")
         # The lease's age, so a run twenty minutes in reads differently from
-        # one about to hit the TTL. Its own style: the STATUS_STYLE key is the
-        # bare word, and the age would never match it.
+        # one about to hit the TTL.
         return ("running… " + duration(age) if age is not None else "running…"), "yellow"
+    if stream.get("liveness") == "died" and not latest.get("status") and not stream.get("error"):
+        return DIED_STATUS, "red"
     style = STATUS_STYLE.get(text, "yellow")
     if stream.get("error") and not latest.get("status"):
         style = "red"

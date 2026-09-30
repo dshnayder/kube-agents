@@ -280,7 +280,8 @@ def _natural_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
     return natural
 
 def _overhead(count: int) -> int:
-    """Borders and padding: `| ` before each cell and ` |` after the last."""
+    """Borders and padding: `│ ` before each cell, a space after each, and the
+    closing `│`, so three columns a cell and one more."""
     return 3 * count + 1
 
 def _minimum_width(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[Any]]]) -> int:

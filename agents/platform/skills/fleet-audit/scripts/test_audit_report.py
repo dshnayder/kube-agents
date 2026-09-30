@@ -17633,6 +17633,22 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
         self.assertIs(stored["ledger_held_open"], True)
 
+    def test_a_held_open_run_after_a_seed_carries_no_empty_document(self):
+        """Seeded off the block, then held open twice: neither memory wrote
+        the body, so neither run's empty document may ride forward as the
+        document the body renders."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        for run in (1, 2):
+            with self.subTest(run=run):
+                self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+                self.assertEqual(self.stdout_json()["status"], "HELD")
+                stored = self.stored()
+                self.assertIs(stored["ledger_held_open"], True)
+                self.assertEqual(stored["ledger_body"], previous)
+                self.assertNotIn("ledger_document", stored)
+
     def test_a_closed_ledger_is_not_remembered_for_its_issue(self):
         """Reopened by hand, a closed ledger is not the empty one the close
         left, so its next run must read a lost memory, not a trusted empty one."""
