@@ -3539,6 +3539,29 @@ class ReplacedPodPeaksTest(unittest.TestCase):
         self.assertIn("oldest pod started", excerpt)
         self.assertNotIn("replaced since", excerpt)
 
+    def statefulset(self, created):
+        pod = self.pod(name="db-0", owner="db", kind="StatefulSet")
+        pod["status"]["startTime"] = "2026-07-31T18:00:00Z"
+        ctx = {
+            "pods": [pod],
+            "statefulsets": [obj("StatefulSet", "db", ns=self.NS, **{"metadata.creationTimestamp": created})],
+        }
+        return ctx, {(self.NS, "db-0"): (0.9, 3072.0)}
+
+    def test_a_statefulset_recreated_under_its_old_name_is_measured_over_the_week(self):
+        """`db-0` restarted 6h ago as `db-0`, so its series holds the week the
+        read asked for, and the excerpt may not claim only the live pod's 6h."""
+        excerpt = self.over(*self.statefulset("2026-07-01T00:00:00Z"))[0]["excerpt"]
+        self.assertNotIn("over the trailing 6h", excerpt)
+        self.assertNotIn("oldest pod started", excerpt)
+        self.assertIn(f"over the trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("recreates its pods under the same names", excerpt)
+
+    def test_a_statefulset_younger_than_the_read_clamps_to_its_own_life(self):
+        excerpt = self.over(*self.statefulset("2026-07-30T00:00:00Z"))[0]["excerpt"]
+        self.assertIn("over the trailing 48h", excerpt)
+        self.assertIn("this controller's whole life", excerpt)
+
     # -- what the pattern must not claim ---------------------------------- #
 
     def test_a_siblings_pods_are_not_this_controllers(self):
@@ -4795,7 +4818,8 @@ class CollectProjectComputeTest(unittest.TestCase):
         )
         self.assertIn("orphan-lb was not evaluated", target["limitations"])
         self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
-        self.assertEqual([c["check"] for c in target["checks_unevaluated"]], ["orphan-lb", "registry-no-cleanup"])
+        self.assertIn("idle-address was not evaluated", target["limitations"])
+        self.assertEqual([c["check"] for c in target["checks_unevaluated"]], ["idle-address", "orphan-lb", "registry-no-cleanup"])
 
     def recording(self, fail=None):
         seen = []
@@ -6551,11 +6575,15 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
         self.assertNotIn("orphan-lb", {c["check"] for c in project["candidates"]})
         self.assertIn("orphan-lb was not evaluated", project["limitations"])
-        # The other project checks still run: only 3.6 needs the union.
+        # §3.5 needs the union too: an unread cluster's Service or Ingress
+        # can name an address. §3.4 narrows instead, and the registry is
+        # project-wide.
         self.assertEqual(
             {c["check"] for c in project["commands"]},
-            {"unattached-disk", "idle-address", "registry-no-cleanup"},
+            {"unattached-disk", "registry-no-cleanup"},
         )
+        self.assertIn("idle-address was not evaluated", project["limitations"])
+        self.assertIn("idle-address", {e["check"] for e in project["checks_unevaluated"]})
 
     def test_an_unlistable_only_project_is_a_run_error(self):
         def run(argv, **kwargs):

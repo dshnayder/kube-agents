@@ -349,6 +349,29 @@ class CccMissingFallbacksTest(unittest.TestCase):
         self.assertNotIn("unevaluated", hit)
 
 
+    NO_MACHINE_CHAINS = {
+        "nodepools": [{"nodepools": ["a"]}, {"nodepools": ["b"]}],
+        "gpu only": [{"gpu": {"type": "nvidia-l4", "count": 1}}],
+    }
+
+    def test_a_chain_naming_no_machine_is_unevaluated_not_critical(self):
+        """A `nodepools` or accelerator-only rule names no family to score."""
+        for label, chain in self.NO_MACHINE_CHAINS.items():
+            for zones in (None, 1, 3):
+                with self.subTest(label, cluster_zones=zones):
+                    hit = fs.check_ccc_missing_fallbacks(compute_class("cc1", chain), zones)
+                    self.assertEqual(hit["unevaluated"], fs.CCC_MACHINE_UNNAMED)
+
+    def test_a_mixed_chain_the_named_priorities_already_pass_is_clean(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}, {"machineFamily": "n4", "spot": True}, {"nodepools": ["a"]}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, 1))
+
+    def test_a_mixed_chain_the_named_priorities_do_not_pass_is_unevaluated(self):
+        """The pool could be the second family the chain is short of."""
+        cc = compute_class("cc1", [{"machineFamily": "c3"}, {"nodepools": ["a"]}])
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], fs.CCC_MACHINE_UNNAMED)
+
+
 class ClusterZoneSpanTest(unittest.TestCase):
     def test_the_node_pools_locations_decide(self):
         pools = [{"locations": ["us-central1-a"]}, {"locations": ["us-central1-a", "us-central1-b"]}]
@@ -582,6 +605,28 @@ class DanglingComputeClassTest(unittest.TestCase):
             tolerations=[{"key": "nvidia.com/gpu", "operator": "Exists"}],
         )
         self.assertIsNone(fs.check_dangling_compute_class(d, {"cc1": cc}, set()))
+
+    def test_does_not_flag_gpu_workload_with_a_keyless_exists_toleration(self):
+        # No key and `operator: Exists` tolerates every taint, the GPU one included.
+        cc = compute_class("cc1", [])
+        d = deployment(
+            "api",
+            node_selector={"cloud.google.com/compute-class": "cc1"},
+            containers=[{"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}],
+            tolerations=[{"operator": "Exists"}],
+        )
+        self.assertIsNone(fs.check_dangling_compute_class(d, {"cc1": cc}, set()))
+
+    def test_flags_gpu_workload_whose_keyless_toleration_matches_by_equality(self):
+        # Keyless `operator: Equal` matches no taint, so it is no GPU toleration.
+        cc = compute_class("cc1", [])
+        d = deployment(
+            "api",
+            node_selector={"cloud.google.com/compute-class": "cc1"},
+            containers=[{"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}],
+            tolerations=[{"operator": "Equal", "value": "x"}],
+        )
+        self.assertIn("without an nvidia.com/gpu toleration", fs.check_dangling_compute_class(d, {"cc1": cc}, set())["excerpt"])
 
     def test_no_selector_is_never_flagged(self):
         d = deployment("api")
@@ -1781,7 +1826,8 @@ class CollectClusterTest(unittest.TestCase):
         reason = self.spot_non_applicability(entry)
         self.assertIn("ComputeClass/autopilot-spot", reason)
         self.assertIn("leaves the machine shape entirely to GKE", reason)
-        self.assertNotIn("limitations", entry)
+        # ccc-missing-fallbacks is the one limitation: the chain names no machine.
+        self.assertNotIn("spot-scarcity-risk", entry["limitations"])
 
     def test_node_auto_provisioning_makes_a_standard_cluster_read_the_same_way(self):
         """`brokered` is about whether a node can be created through the class,
@@ -1814,7 +1860,8 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("Every Spot request", reason)
         self.assertNotIn("auto-provisioning", reason)
         self.assertNotIn("no node can be created", reason)
-        self.assertNotIn("limitations", entry)
+        # ccc-missing-fallbacks is the one limitation: the chain names no machine.
+        self.assertNotIn("spot-scarcity-risk", entry["limitations"])
 
     def test_a_hand_authored_shape_free_class_is_not_called_pre_installed(self):
         # The collector reads neither the class's origin nor the workloads, so
@@ -2157,6 +2204,20 @@ class CollectClusterTest(unittest.TestCase):
         # The slug's record is popped, so the filed finding carries its own.
         [filed] = [c for c in entry["candidates"] if c["check"] == "ccc-missing-fallbacks"]
         self.assertIn("kubectl get", filed.get("command", ""))
+
+    def test_a_chain_naming_no_machine_files_no_critical(self):
+        pools_only = compute_class("cc1", [{"nodepools": ["a"]}, {"nodepools": ["b"]}])
+        gpu_only = compute_class("cc3", [{"gpu": {"type": "nvidia-l4", "count": 1}}])
+        pinned = compute_class("cc2", [{"machineFamily": "c3"}])
+        pools = [{"name": "p1", "locations": ["us-central1-a"]}]
+        entry = self.run_with(dump_items=[pools_only, gpu_only, pinned], pools=pools)
+        fallbacks = [c["object"] for c in entry["candidates"] if c["check"] == "ccc-missing-fallbacks"]
+        self.assertEqual(fallbacks, ["ComputeClass/cc2"])
+        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == "ccc-missing-fallbacks"]
+        self.assertIn("ComputeClass/cc1, ComputeClass/cc3", reason)
+        self.assertIn("node pools, an accelerator or nothing", reason)
+        self.assertIn("does not read the machines those resolve to", entry["limitations"])
+        self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
 
     def test_an_unzoned_chain_on_read_multi_zone_pools_is_run_and_clean(self):
         span_decides = compute_class("cc1", [{"machineFamily": f} for f in ("c3", "n4", "n2")])

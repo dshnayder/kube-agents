@@ -143,6 +143,11 @@ NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 # pools to read and places nodes across its region's zones. Any value above
 # one scores the same; two is the least that claim needs.
 AUTOPILOT_ZONE_SPAN = 2
+# Why `check_ccc_missing_fallbacks` could not judge a chain, as its hit's
+# `unevaluated` value: the cluster's zone span was not read, or a priority
+# names node pools, an accelerator or nothing where a machine would go.
+CCC_SPAN_UNREAD = "zone-span"
+CCC_MACHINE_UNNAMED = "machine-unnamed"
 
 # §3.8's ">20%", as a fraction, against the mean of the daily preemption
 # rates the API returns.
@@ -288,6 +293,8 @@ ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
 # carries to serve one; and the GPU resource and taint key §3.9 reads.
 COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
 GPU_RESOURCE = "nvidia.com/gpu"
+# A toleration with this operator and no key tolerates every taint.
+TOLERATION_EXISTS = "Exists"
 # GKE's built-in compute classes, as GKE documents them: selected through the
 # same nodeSelector key, but provided by GKE rather than defined as
 # `ComputeClass` objects, so a dump that lacks them does not mean the reference
@@ -872,6 +879,18 @@ def _priority_is_pod_family(p: dict) -> bool:
     return bool(p.get("podFamily")) and not p.get("machineFamily") and not p.get("machineType")
 
 
+def _priority_names_no_machine(p: dict) -> bool:
+    """Does this priority leave its machine to something the collector does not read?
+
+    The CRD lets a priority name neither `machineFamily`, `machineType` nor
+    `podFamily`: a `nodepools` rule targets manual pools whose machines live on
+    the pools, and a `gpu`/`tpu` rule can leave the VM to GKE. Its family and
+    size are unknown, not absent. So is one naming only `spot` or a
+    location, which leaves the shape to GKE.
+    """
+    return not (p.get("machineFamily") or p.get("machineType") or p.get("podFamily"))
+
+
 def cluster_zone_span(cluster: dict, node_pools: list[dict], pools_readable: bool) -> int | None:
     """How many zones this cluster's nodes can land in, or None when unknown.
 
@@ -903,6 +922,13 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     and the caller files the check unevaluated for the cluster rather than a
     `critical` nobody established. A chain the span cannot rescue -- nothing
     else varied, or every priority zoned -- is judged as usual.
+
+    A chain that fails with a priority naming no machine
+    (`_priority_names_no_machine`) is unevaluated the same way: that
+    priority's family and size could supply the dimensions the chain lacks,
+    and scoring it as an empty family filed a `critical` reading
+    `families=[] sizes=[]` against a class that pins none. A chain whose named
+    priorities already vary two dimensions passes regardless.
     """
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities:
@@ -944,8 +970,10 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
         "object": f"ComputeClass/{cc['metadata']['name']}",
         "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
     }
-    if unzoned and cluster_zones is None and not multi_zone and dimensions_varied == 1:
-        hit["unevaluated"] = True
+    if any(_priority_names_no_machine(p) for p in priorities):
+        hit["unevaluated"] = CCC_MACHINE_UNNAMED
+    elif unzoned and cluster_zones is None and not multi_zone and dimensions_varied == 1:
+        hit["unevaluated"] = CCC_SPAN_UNREAD
     return hit
 
 
@@ -1096,7 +1124,11 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
             )
 
         requests_gpu = any(_wants_gpu(c) for c in template_spec.get("containers") or [])
-        tolerates_gpu = any(t.get("key") == GPU_RESOURCE for t in template_spec.get("tolerations") or [])
+        # A keyless `operator: Exists` tolerates every taint, the GPU one included.
+        tolerates_gpu = any(
+            t.get("key") == GPU_RESOURCE or (not t.get("key") and t.get("operator") == TOLERATION_EXISTS)
+            for t in template_spec.get("tolerations") or []
+        )
         if requests_gpu and not tolerates_gpu:
             return {"namespace": namespace, "object": obj, "excerpt": f"GPU workload references ComputeClass {selector!r} without an nvidia.com/gpu toleration"}
     return None
@@ -1826,12 +1858,15 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         commands[cc_slug] = dump_record
     cluster_zones = cluster_zone_span(cluster, node_pools, pools_readable)
     span_decides: list[str] = []
+    machine_unnamed: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
         non_production = is_non_production(cc_meta.get("name", ""), cc_meta.get("labels"))
         for hit in [check_ccc_missing_fallbacks(cc, cluster_zones)]:
-            if hit and hit.get("unevaluated"):
+            if hit and hit.get("unevaluated") == CCC_MACHINE_UNNAMED:
+                machine_unnamed.append(hit["object"])
+            elif hit and hit.get("unevaluated"):
                 span_decides.append(hit["object"])
             elif hit:
                 # Stamped, as spot-scarcity-risk's are: an unread span on
@@ -1947,6 +1982,23 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         limitations.append(
             f"ccc-missing-fallbacks could not be judged for {', '.join(span_decides)}: "
             f"the node pools that give the cluster's zone span were not read ({span_gap})"
+        )
+    if machine_unnamed:
+        # The same filing for a priority whose machine was never read: a
+        # `nodepools` rule's pools, or the VM GKE picks for an accelerator
+        # or shape-free rule, could be the family or size the chain lacks.
+        reason = (
+            f"{', '.join(machine_unnamed)} vary fewer than two dimensions across the priorities "
+            f"that name a machine, and a priority names node pools, an accelerator or nothing "
+            f"in place of a machine family"
+        )
+        prior = unevaluated.get("ccc-missing-fallbacks")
+        unevaluated["ccc-missing-fallbacks"] = f"{prior}; {reason}" if prior else reason
+        commands.pop("ccc-missing-fallbacks", None)
+        limitations.append(
+            f"ccc-missing-fallbacks could not be judged for {', '.join(machine_unnamed)}: "
+            f"a priority names node pools, an accelerator or nothing in place of a machine "
+            f"family, and the collector does not read the machines those resolve to"
         )
 
     # §3.11. One read per cluster, and it is recorded whether or not it found

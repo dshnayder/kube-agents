@@ -318,6 +318,9 @@ SHORT_OBSERVATION_HOURS = 24
 # It keeps out most hook Jobs, not all: one whose name suffix is vowel-free
 # (`api-db`) still matches, and nothing in a pod name tells the two apart.
 K8S_GENERATED_CHARS = "[bcdfghjklmnpqrstvwxz2456789]"
+# Controller kinds that recreate a pod under its old name, so the Monitoring
+# series keyed by that name already spans the pod's earlier incarnations.
+SAME_NAME_RECREATION_KINDS = frozenset({"StatefulSet"})
 REPLACED_POD_PATTERNS = {
     "Deployment": rf"^{{name}}-{K8S_GENERATED_CHARS}+-{K8S_GENERATED_CHARS}{{{{5}}}}$",
     "StatefulSet": r"^{name}-[0-9]+$",
@@ -2888,7 +2891,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
 
 
 def _measured_over(
-    oldest_h: float | None, *, replaced: int = 0, controller_h: float | None = None
+    oldest_h: float | None, *, replaced: int = 0, controller_h: float | None = None, kind: str = ""
 ) -> tuple[int, str]:
     """The window a controller was really measured over, and how to say it.
 
@@ -2896,8 +2899,15 @@ def _measured_over(
     answer is how far back a pod of this controller reported, and there are two
     of those bounds because there are two pod populations.
 
-    Without `replaced`, the only series in hand are the live pods', so the bound
-    is the longest-lived one's age and a finding may not claim more.
+    Without `replaced`, the series in hand are the live pods' names, and for
+    most kinds that is the live pods' history: the bound is the longest-lived
+    one's age and a finding may not claim more. A kind in
+    `SAME_NAME_RECREATION_KINDS` is the exception. A StatefulSet recreates
+    `db-0` as `db-0`, and the read groups by pod name, so the live name's
+    series already holds every earlier incarnation and the bound is the
+    controller's age, as it is with `replaced`. The read collapses each series
+    to one point, so when that history starts is not in the answer; the
+    controller's creation is the bound it cannot exceed.
 
     With `replaced`, `_observed_pod_keys` found series from pods this controller
     has since rolled away, so the read reaches back past every live pod -- as
@@ -2942,6 +2952,23 @@ def _measured_over(
             f"over up to the trailing {USAGE_WINDOW_HOURS}h (Cloud Monitoring, "
             f"across this controller's live pods and the {pods}; the "
             f"controller's own age was not read, so its history may be shorter)"
+        )
+    if kind in SAME_NAME_RECREATION_KINDS:
+        if controller_h is None:
+            return USAGE_WINDOW_HOURS, (
+                f"over up to the trailing {USAGE_WINDOW_HOURS}h (Cloud Monitoring; a "
+                f"{kind} recreates its pods under the same names, so their series span "
+                f"earlier incarnations, and the controller's own age was not read)"
+            )
+        window_h = max(1, min(USAGE_WINDOW_HOURS, round(controller_h)))
+        short = (
+            ""
+            if window_h >= USAGE_WINDOW_HOURS
+            else f", which is this controller's whole life -- the read covers {USAGE_WINDOW_HOURS}h"
+        )
+        return window_h, (
+            f"over the trailing {window_h}h (Cloud Monitoring; a {kind} recreates "
+            f"its pods under the same names, so their series span every incarnation{short})"
         )
     window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
     if window_h >= USAGE_WINDOW_HOURS:
@@ -3370,7 +3397,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             continue
 
         _, measured_over = _measured_over(
-            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
         severity = "major" if delta_cpu >= NODE_WORTH_VCPU or delta_mem_gib >= NODE_WORTH_GIB else "minor"
         if autopilot and severity == "minor":
@@ -3792,7 +3819,7 @@ def check_idle_workload(
             continue
 
         _, measured_over = _measured_over(
-            entry["oldest_h"], replaced=replaced, controller_h=age_days * HOURS_PER_DAY
+            entry["oldest_h"], replaced=replaced, controller_h=age_days * HOURS_PER_DAY, kind=kind
         )
         # Why no resize is on the table, which is the reader's first question
         # and has three answers. Naming the wrong one would send them to
@@ -4014,7 +4041,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             continue
 
         _, measured_over = _measured_over(
-            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
         # `critical` is reserved for the case that is already failing rather
         # than merely mis-scheduled: sustained usage within 10% of the ceiling
@@ -4213,7 +4240,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         peak_cpu, peak_mem = peaks
 
         _, measured_over = _measured_over(
-            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
         # §3.1's 2x, per replica, because the manifest declares one replica's
         # request, ceiled to a whole millicore / MiB by the helper §3.1 uses so
@@ -5747,7 +5774,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
-    if compute_ok:
+    # §3.5 clears an address any Service or Ingress annotation names, and
+    # `referenced_addresses` holds only the read clusters' annotations, so an
+    # unread cluster's reference would read as idle: withheld, as `orphan-lb` is.
+    addresses_judged = compute_ok and all_reachable
+    if addresses_judged:
         candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     # A project with the Compute Engine API off holds no cluster either, so
     # there is no unread one to withhold `orphan-lb` over; it is inapplicable.
@@ -5763,7 +5794,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         "location": "global",
         "outcome": "collected",
         "commands": ([{"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)}] if disks_judged else [])
-        + ([{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}] if compute_ok else [])
+        + ([{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}] if addresses_judged else [])
         + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else [])
         # Recorded only when the read succeeded, which is what puts
         # `registry-no-cleanup` into §6's `coverage_gaps` when it did not. A
@@ -5817,11 +5848,20 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "are unknown, so a detached disk one of them still binds would read as abandoned."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
+    if compute_ok and not addresses_judged:
+        address_gap = (
+            "idle-address was not evaluated for this project: §3.5 clears any address a "
+            "Service or Ingress annotation names, and "
+            + (f"the clusters this run did not read ({unread_named})" if unread_named else "a cluster this run did not read")
+            + " could name one, so an address they hold would read as idle."
+        )
+        entry["limitations"] = f"{entry['limitations']} {address_gap}" if entry.get("limitations") else address_gap
     unevaluated = {}
     if compute_failed:
         unevaluated.update({slug: compute_error for slug in COMPUTE_CHECKS})
     elif not all_reachable and not compute_disabled:
         unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
+        unevaluated["idle-address"] = "a cluster in this project could not be read, so its Service and Ingress address annotations are unknown"
     if not disks_judged and compute_ok:
         unevaluated["unattached-disk"] = "none of this project's clusters could be read"
     if reg_parsed is None and not registry_disabled:
