@@ -153,14 +153,19 @@ func TestGitHubResolveRefusesAnEmptyOrColonUser(t *testing.T) {
 	}
 }
 
-// urlsplit refuses a bracket without its pair anywhere in the authority, so
-// repo_ref.py reads none of these; neither does the provider.
-func TestGitHubParseRepoRefRefusesAnUnpairedBracket(t *testing.T) {
+// urlsplit refuses a bracket without its pair anywhere in the authority, and
+// any bracket in the userinfo, so repo_ref.py reads none of these; neither
+// does the provider.
+func TestGitHubParseRepoRefRefusesABracketOutsideTheHost(t *testing.T) {
 	provider, _ := LookupGitProvider(GitProviderGitHub)
 	for _, repo := range []string{
 		"https://[x@github.com/gke-labs/kube-agents",
 		"https://a]b@github.com/gke-labs/kube-agents",
 		"ssh://git@github.com]/gke-labs/kube-agents",
+		// Paired, but in the userinfo: urlsplit then needs an address literal
+		// for the host, and github.com is not one.
+		"https://[TOKEN]@github.com/gke-labs/kube-agents",
+		"https://a[b]c@github.com/gke-labs/kube-agents",
 	} {
 		t.Run(repo, func(t *testing.T) {
 			if ref, err := provider.ParseRepoRef(repo); err == nil {

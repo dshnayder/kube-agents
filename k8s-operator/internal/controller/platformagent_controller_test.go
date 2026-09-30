@@ -5901,7 +5901,8 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 		// A bracket without its pair in the netloc is an invalid IPv6 URL to
 		// urlsplit, wherever it sits.
 		`{"type":"github","url":"https://[x@github.com/test-org/open"},` +
-		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"}]`
+		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"},` +
+		`{"type":"github","url":"https://[TOKEN]@github.com/test-org/paired"}]`
 	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
@@ -5909,7 +5910,7 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-n", "repo-o", "repo-p", "repo-q", "repo-t", "repo-u"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
-	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]"}; !slices.Equal(unreadable, want) {
+	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]", "managed_repos[17]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
 	}
 }
@@ -6476,6 +6477,9 @@ func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
 		// urlsplit refuses a bracket without its pair, the userinfo included.
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[x@github.com/gke-labs/kube-agents"},
 		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://a]b@github.com/gke-labs/kube-agents"},
+		// Paired, the agent still refuses it: the host must then be an
+		// address literal.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[TOKEN]@github.com/gke-labs/kube-agents"},
 	}
 	for _, existing := range different {
 		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {

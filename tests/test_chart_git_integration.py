@@ -329,6 +329,10 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs//infra",
             "https://evil.example#@github.com/gke-labs/infra",
             "https://evil.example?x=@github.com/gke-labs/infra",
+            # The operator refuses any bracket in a URL's userinfo.
+            "https://[x@github.com/gke-labs/infra",
+            "https://x]@github.com/gke-labs/infra",
+            "https://[TOKEN]@github.com/gke-labs/infra",
             # `://` after the host is a scheme separator to the operator, and
             # `git@github.com` is no scheme.
             "git@github.com://gke-labs/infra",

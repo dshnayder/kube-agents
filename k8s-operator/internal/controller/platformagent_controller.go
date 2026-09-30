@@ -1567,6 +1567,11 @@ func agentURLSpelling(value string) (string, bool) {
 		return "", false
 	}
 	if at := strings.LastIndex(authority, "@"); at != -1 {
+		// With any bracket in the userinfo, urlsplit requires the host to be
+		// an address literal, so it refuses every GitHub spelling.
+		if strings.ContainsAny(authority[:at], "[]") {
+			return "", false
+		}
 		authority = authority[at+1:]
 	}
 	if strings.HasPrefix(authority, "[") {

@@ -257,6 +257,12 @@ func splitAuthority(rest string) (string, string, error) {
 		return "", "", fmt.Errorf("unpaired bracket in URL authority %q", authority)
 	}
 	if idx := strings.LastIndex(authority, userInfoSeparator); idx != -1 {
+		// A paired bracket in the userinfo (`https://[TOKEN]@github.com/o/r`)
+		// is refused too: urlsplit then requires the host after the `@` to be
+		// an address literal, so the agent reads no repository from it.
+		if strings.ContainsAny(authority[:idx], ipv6Open+ipv6Close) {
+			return "", "", fmt.Errorf("bracket in URL userinfo of %q", authority)
+		}
 		authority = authority[idx+1:]
 	}
 
