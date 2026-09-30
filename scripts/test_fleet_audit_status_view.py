@@ -568,8 +568,11 @@ class TestRender(unittest.TestCase):
     def test_a_stream_error_reaches_the_status_cell(self):
         doc = stream(liveness="error", error="latest.json: not a JSON object")
         out = self.render({"compliance-audit": doc})
-        self.assertIn("latest.json: not a JSON object", out)
-        self.assertIn("NO STORE", out)
+        # In the row itself: the footer prints the same text, so the whole
+        # output carries it even when the cell does not.
+        row = next(line for line in out.splitlines() if "compliance-audit" in line and "│" in line)
+        self.assertIn("latest.json: not a JSON object", row)
+        self.assertIn("NO STORE", row)
 
     def test_a_stream_error_beside_a_completed_run_is_printed(self):
         # STATUS shows the run's status, so the error text has to reach the
@@ -851,6 +854,20 @@ class TestDashboard(unittest.TestCase):
         coloured = self.render(self.two(), palette=view.Palette(True))
         row = next(line for line in coloured.splitlines() if "cost-audit" in line and "│" in line)
         self.assertIn("\x1b]8;;https://github.com/acme/fleet/pull/9\x1b\\1\x1b]8;;\x1b\\", row)
+
+    def test_the_pull_request_list_pads_by_display_width(self):
+        """A wide stream id counts one character per glyph and draws two:
+        padded by `len`, its link column sits left of the others'."""
+        streams = {
+            "cost-audit": stream(last=latest(audit_id="cost-audit")),
+            "審計審計": stream(last=latest(audit_id="審計審計")),
+        }
+        out = view.plain(self.render(streams))
+        listed = out.split("PULL REQUESTS OPENED", 1)[1].splitlines()[1:3]
+        starts = {
+            terminal_table.display_width(line[: line.index("acme/fleet#9")]) for line in listed
+        }
+        self.assertEqual(len(starts), 1, listed)
 
     def test_stream_filters_by_substring_and_says_what_it_hid(self):
         out = self.render(self.two(), patterns=("cost",))
@@ -1317,6 +1334,15 @@ class TestExitCodes(unittest.TestCase):
         rc, out, _ = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 1)
         self.assertIn("store directory absent on the pod", out)
+        lead = out.splitlines()[0]
+        self.assertNotIn("all clear", lead)
+        self.assertIn("store absent", lead)
+        # And over a root that exists but cannot be listed.
+        doc = projection(root_exists=False, root_error="Permission denied")
+        rc, out, _ = run_main(["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc)))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("all clear", out.splitlines()[0])
+        self.assertIn("store unreadable", out.splitlines()[0])
 
     def test_an_unreadable_stream_is_exit_1(self):
         doc = projection({"compliance-audit": stream(liveness="error", error="boom")})
@@ -1535,6 +1561,11 @@ class TestFormatting(unittest.TestCase):
         # U+200D, U+200B and U+FE0F have combining class 0 and draw nothing.
         self.assertEqual(terminal_table.display_width("a\u200db\u200bc\ufe0f"), 3)
         self.assertEqual(terminal_table.display_width("e\u0301"), 1)
+        # Spacing marks (Mc) with a non-zero combining class still draw: the
+        # Javanese virama U+A953 (class 9) one column, the Hangul tone mark
+        # U+302E (class 224, East Asian Wide) two.
+        self.assertEqual(terminal_table.display_width("a\ua953"), 2)
+        self.assertEqual(terminal_table.display_width("a\u302e"), 3)
         # The soft hyphen is Cf too, but terminals draw it as a hyphen.
         self.assertEqual(terminal_table.display_width("co\u00adop"), 5)
 

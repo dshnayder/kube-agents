@@ -319,6 +319,20 @@ class TestStreams(StoreTestCase):
         payload = self.refused("show", OTHER)
         self.assertEqual(payload["liveness"], "running")
 
+    def test_a_first_run_in_flight_is_running_before_the_store_exists(self):
+        """A fresh volume: no `finish` has made the root yet, and the lease in
+        scratch says the first run is in flight."""
+        shutil.rmtree(self.root)
+        (Path(self.scratch) / f"inflight_{OTHER}.json").write_text(
+            json.dumps({"audit": OTHER, "started_at": time.time() - 30}), encoding="utf-8"
+        )
+        rows = {row["audit_id"]: row for row in self.query("streams")[1]["streams"]}
+        self.assertEqual(rows[OTHER]["liveness"], "running")
+        code, payload = self.query("show", OTHER)
+        self.assertEqual(code, 2)
+        self.assertIn("report store not found", payload["error"])
+        self.assertEqual(payload["liveness"], "running")
+
     def test_a_run_past_the_ceiling_is_dead(self):
         self.write_claim(AUDIT, age_s=report_query.report_status.INFLIGHT_TTL_S + 60)
         self.assertEqual(self.ok("streams")["streams"][0]["liveness"], "died")

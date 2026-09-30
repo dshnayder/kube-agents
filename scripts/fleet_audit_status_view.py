@@ -28,8 +28,9 @@ Five flags the raw rows cannot be trusted without:
     the lease's age against its own two-hour TTL alone. No roster and no
     schedule parsing, so it fires within two hours on every cron shape and on
     kanban-dispatched runs that have no schedule at all.
-  - UNRECORDED: `latest.json` is gone, so the row is the ring's newest entry
-    and a later run changed the ledger, or began to, without storing itself.
+  - UNRECORDED: `latest.json` is gone or older than the ring's newest entry,
+    so the row is that entry and a later run changed the ledger, or began to,
+    without storing itself.
   - NEVER: roster-enabled, the store was readable, and the stream has neither
     a lease nor a stored run — it has genuinely never run. A ring whose
     `latest.json` a failed run deleted still has its newest entry.
@@ -80,6 +81,7 @@ try:
         Column,
         Palette,
         ago,
+        display_width,
         hyperlink,
         plain,
         pr_ref,
@@ -1033,11 +1035,11 @@ def render(
     ]
     if prs:
         out += ["", palette("PULL REQUESTS OPENED", "head")]
-        width_id = max(len(audit_id) for audit_id, _ in prs)
+        width_id = max(display_width(audit_id) for audit_id, _ in prs)
         out += [
             "  %s  %s"
             % (
-                palette(audit_id.ljust(width_id), "dim"),
+                palette(audit_id + " " * (width_id - display_width(audit_id)), "dim"),
                 hyperlink(palette(pr_ref(scrub(url)), "cyan"), scrub(url), palette),
             )
             for audit_id, url in prs
@@ -1103,12 +1105,21 @@ def header_lines(
     # the caveat is appended in either case, and only "all clear" is withheld.
     # Unlisted leases disarm the same two flags, and a roster row the store has
     # no directory for carries no error to raise NO STORE instead.
+    # A store that is absent or cannot be listed has no rows to flag when the
+    # roster has none either, and nothing looked at is not nothing wrong.
     lease_error = projection.get("lease_error")
+    store_missing = not projection.get("root_exists")
     verdicts = []
     if attention:
         verdicts.append(palette("%d need attention" % attention_streams, "yellow"))
-    elif not roster_error and not lease_error:
+    elif not roster_error and not lease_error and not store_missing:
         verdicts.append(palette("all clear", "green"))
+    if store_missing:
+        verdicts.append(
+            palette(
+                "store unreadable" if projection.get("root_error") else "store absent", "crit"
+            )
+        )
     if roster_error:
         verdicts.append(
             palette("roster unreadable — NEVER and STALE not checked", "crit")

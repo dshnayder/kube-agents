@@ -113,6 +113,14 @@ its own, separate from the gateway's; without it, the gateway pod's `platform-ag
 in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make fleet-audit-view`
 probes the agent pods for both containers and reads the sandbox first.
 
+The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
+run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
+creates to the owner of the nearest directory that already existed. Mode alone would not do: the
+tick and every session run as uid 1000, which can read a root-owned directory but cannot write the
+next run into it. The residual is a store a root run wrote before this handover existed, or one
+under a root-owned ancestor; the next run's warning names the path and both uids, and only an
+operator restoring ownership clears it.
+
 ## 4. `finish`'s own memory
 
 The previous run's memory is the `latest.json` in this run's repository directory, trusted when its

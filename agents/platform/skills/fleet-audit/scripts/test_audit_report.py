@@ -16157,9 +16157,10 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn(current, audit_report.parse_delta_block(bumped))
 
     def test_a_flagless_unreadable_run_answers_no_remediate(self):
-        """Without a manifest and without the body, the held set is unknown,
-        so a standing `/remediate` gets no answer this run — not a refusal,
-        not a deferral, not an acknowledgement — and the next readable run
+        """Without a manifest and with the report store's record of the ledger
+        lost, the held set is unknown, so a standing `/remediate` gets no
+        answer this run — not a refusal, not a deferral, not an
+        acknowledgement — and the next run that can read the held set
         defers it."""
         body_n, doc_b = self.held_run()
         a_id = derived_id(fid="a")
@@ -17318,6 +17319,69 @@ class TestReportStore(HarnessTestCase):
                     self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, repo))
         self.assertFalse(self.reports_dir.exists())
         self.assertIn("is not owner/name", err.getvalue())
+
+    def test_a_store_write_is_readable_whatever_the_umask(self):
+        """A temp file is 0600 and a directory narrows to the umask: under a
+        hardened operator shell's 077 a root hand-run would leave a store no
+        uid-1000 run can read."""
+        mask = os.umask(0o077)
+        try:
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        finally:
+            os.umask(mask)
+        directory = self.store_dir()
+        for path in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        for path in (directory / "latest.json", *(directory / "runs").glob("*.json")):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
+        """Mode cannot let uid 1000 write into a root-owned directory; root
+        hands every directory and file it creates to the nearest existing
+        directory's owner, so the next scheduled run can write."""
+        self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
+        owner = self.reports_dir.parent.stat()
+        chowned = []
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(
+                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
+                    (Path(path), uid, gid)
+                )
+            ),
+        ):
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        directory = self.store_dir()
+        paths = {path for path, _, _ in chowned}
+        for created in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(created=created):
+                self.assertIn(created, paths)
+        # One temp file per write: the ring entry and latest.json.
+        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+
+    def test_another_uids_store_is_named_when_it_is_denied(self):
+        """What a root hand-run from before the handover left behind: the
+        warning names the path and both uids rather than a bare lost memory."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 0000 file")
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        latest = self.store_dir() / "latest.json"
+        latest.chmod(0)
+        self.addCleanup(latest.chmod, 0o644)
+        err = io.StringIO()
+        other = os.geteuid() + 1
+        with (
+            contextlib.redirect_stderr(err),
+            patch.object(audit_report.os, "geteuid", return_value=other),
+        ):
+            self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+        self.assertIn(
+            f"{latest} is owned by uid {latest.stat().st_uid} and this run is uid {other}",
+            err.getvalue(),
+        )
 
     def test_a_malformed_report_is_not_trusted_and_fails_nothing(self):
         directory = self.store_dir()

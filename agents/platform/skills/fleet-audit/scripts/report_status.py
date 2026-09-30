@@ -163,17 +163,12 @@ def repo_ids(root: str, audit_id: str) -> list[str]:
     walking `managed_repos` finishes it once per repository and each run's
     memory is its own ledger's. Only lower-case directories count: the writer
     spells every one so and `store_path` opens nothing else, so a mixed-case
-    one would list as a repository that never ran. `stray_repo_dirs` names
-    those. An owner directory that cannot be listed is left out here and
+    one would list as a repository that never ran. `project_stream` names
+    those in the stream's error. An owner directory that cannot be listed is left out here and
     named by `scan_repo_dirs`; the stream directory's own OSError other than
     absence propagates, as in `stream_ids`.
     """
     return [repo for repo in _repo_dirs(root, audit_id) if repo == repo.lower()]
-
-
-def stray_repo_dirs(root: str, audit_id: str) -> list[str]:
-    """The stream's repository directories no reader opens: not lower-case."""
-    return [repo for repo in _repo_dirs(root, audit_id) if repo != repo.lower()]
 
 
 def store_path(root: str, audit_id: str, repo: str) -> str:

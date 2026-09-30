@@ -2748,6 +2748,12 @@ _WHOLE_ENVELOPE_READS = [
     f"awk '{{print}}' {_STORE}/latest.json",
     f"nl {_STORE}/latest.json",
     f"bat {_STORE}/latest.json",
+    # One key, but the key is the payload.
+    f"jq .document {_STORE}/latest.json",
+    f"jq -r .ledger_body {_STORE}/latest.json",
+    f"jq -c '.document' {_STORE}/runs/20260929T010000Z.json",
+    f'jq -r ".ledger_body" {_STORE}/latest.json',
+    f"jq .ledger_document < {_STORE}/latest.json",
 ]
 # What the recorded greens ran, and projections of one key.
 _ENVELOPE_PROJECTIONS = [
@@ -2760,6 +2766,10 @@ _ENVELOPE_PROJECTIONS = [
     f"jq -r .status {_STORE}/latest.json",
     f"jq '.status' {_STORE}/latest.json",
     f"grep -c FINDINGS {_STORE}/latest.json",
+    # Bounded reads of the payload keys.
+    f"jq '.document.findings | length' {_STORE}/latest.json",
+    f"jq -r .document_sha {_STORE}/latest.json",
+    f"jq '.ledger_body | length' {_STORE}/latest.json",
 ]
 
 

@@ -107,8 +107,10 @@ verification_spec:
       # list piped to `xargs`, and a bare glob after `cd` into runs/. The last
       # is a filter that passes the whole file through: `jq .` or `jq ''`,
       # `python3 -m json.tool`, `grep ''`, `sed -n p`, `awk 1`. A key
-      # projection (`jq .status`, `jq -r .x`) does not match. This is a
-      # heuristic over free-form shell, not a proof: a read it does not name
+      # projection (`jq .status`, `jq -r .x`) does not match, except of the
+      # keys that are the payload: the sixth is `jq .document`,
+      # `.ledger_document` or `.ledger_body`, with flags, quoted or not. This
+      # is a heuristic over free-form shell, not a proof: a read it does not name
       # (a script, a loop) passes it.
       forbidden_patterns:
         - '\b(cat|less|more|head|tail|nl|bat|batcat)\b[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
@@ -116,3 +118,4 @@ verification_spec:
         - '(latest\.json|runs/[^\s|;&]*)[^\n;&]*\|\s*xargs\b[^\n|;&]*\b(cat|less|more|head|tail|nl|bat|batcat)\b'
         - '\bcd\s+(\S*/)?runs/?\s*(&&|;)[^\n|;&]*\b(cat|less|more|head|tail|nl|bat|batcat)\b[^\n|;&]*\.json\b'
         - '\b(jq\s+(-\S+\s+)*(\.|''\.?''|"\.?")|python3?\s+-m\s+json\.tool|grep\s+(-\S+\s+)*(''\^?''|"\^?"|\^)|sed\s+(-n\s+)?(''p?''|"p?"|p)|awk\s+(''1''|"1"|1|''\{\s*print(\s+\$0)?\s*\}''))\s[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'
+        - '\bjq\s+(-\S+\s+)*(''|")?\.(document|ledger_document|ledger_body)(''|")?\s[^\n|;&]*(latest\.json|runs/[^\s/]+\.json)'

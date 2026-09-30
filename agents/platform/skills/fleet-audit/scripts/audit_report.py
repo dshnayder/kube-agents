@@ -395,6 +395,15 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The store's modes, whatever the writer's umask, for the reason the in-flight
+# lock clears its umask: a hand-run `finish` over `kubectl exec` lands as root,
+# the tick and every session as uid 1000, and a mode is only a request the
+# creating umask narrows (a temp file is 0600 whatever it is).
+REPORT_DIR_MODE = 0o755
+REPORT_FILE_MODE = 0o644
+# The effective uid a hand-run lands as: the one that can, and must, hand what
+# it creates to the store's owner.
+ROOT_UID = 0
 # One path segment of the `owner/name` a store directory is keyed on. The
 # GitHub charset, and never `.` or `..`, so a repository can only ever name a
 # directory under its stream's.
@@ -1889,11 +1898,65 @@ def report_envelope(
     }
 
 
+def _adopt_owner(path: Path, owner: os.stat_result) -> None:
+    """Give `path` to `owner`'s uid and gid when this run is root.
+
+    Mode alone cannot fix a root hand-run: uid 1000 can read a root-owned 0755
+    directory but cannot create the temp file or rename over `latest.json` in
+    it, so every later run would lose its memory and fail its write. Root is
+    the one writer that can hand what it creates to the store's owner, and
+    any other uid creates what it owns.
+    """
+    if os.geteuid() == ROOT_UID:
+        os.chown(path, owner.st_uid, owner.st_gid)
+
+
+def _make_store_dirs(path: Path) -> None:
+    """Create `path` and its missing parents at `REPORT_DIR_MODE`, owned like
+    the nearest directory that already existed."""
+    missing: list[Path] = []
+    existing = path
+    while not existing.exists():
+        missing.append(existing)
+        existing = existing.parent
+    owner = existing.stat()
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            # A rival run made it, and chose its ownership then.
+            continue
+        os.chmod(directory, REPORT_DIR_MODE)
+        _adopt_owner(directory, owner)
+
+
+def _ownership_note(exc: BaseException) -> str:
+    """Why a denied store path is denied, when it is another uid's: the
+    residual a root hand-run from before `_adopt_owner` leaves, which only an
+    operator can repair. Empty when this run owns the path."""
+    if not isinstance(exc, PermissionError) or not exc.filename:
+        return ""
+    where = Path(exc.filename)
+    try:
+        where = where if where.exists() else where.parent
+        owner = where.stat().st_uid
+    except OSError:
+        return ""
+    if owner == os.geteuid():
+        return ""
+    return (
+        f" ({where} is owned by uid {owner} "
+        f"and this run is uid {os.geteuid()}; a run as another user created it, "
+        f"and it stays unwritable until its ownership is restored)"
+    )
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Replace `path` in one step, from a temp file in its own directory.
 
     Same directory because `os.replace` is atomic only within one filesystem,
-    and the chat path reads `latest.json` at arbitrary times.
+    and the chat path reads `latest.json` at arbitrary times. The file lands
+    at `REPORT_FILE_MODE`, owned like its directory.
     """
     handle = tempfile.NamedTemporaryFile(
         "w", dir=str(path.parent), suffix=".tmp", delete=False, encoding="utf-8"
@@ -1901,6 +1964,8 @@ def _atomic_write(path: Path, text: str) -> None:
     try:
         with handle:
             handle.write(text)
+        os.chmod(handle.name, REPORT_FILE_MODE)
+        _adopt_owner(Path(handle.name), path.parent.stat())
         os.replace(handle.name, path)
     except BaseException:
         # Anything that leaves the temp file behind leaves it in the store,
@@ -1927,14 +1992,14 @@ def write_report(
         return
     runs = directory / REPORT_RUNS_DIR
     try:
-        runs.mkdir(parents=True, exist_ok=True)
+        _make_store_dirs(runs)
         text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
         stamp = now.astimezone(timezone.utc).strftime(REPORT_STAMP_FORMAT)
         _atomic_write(runs / f"{stamp}.json", text)
         # A copy, not a symlink: one fewer behaviour to ask of the mount.
         _atomic_write(directory / REPORT_LATEST_NAME, text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
-        log(f"WARNING: report store write for {audit_id} failed: {exc}")
+        log(f"WARNING: report store write for {audit_id} failed: {exc}{_ownership_note(exc)}")
         if ledger_unchanged:
             # Nothing was published to the body, so the record from before is
             # still exactly the ledger; dropping it would cost the next run a
@@ -1946,7 +2011,10 @@ def write_report(
         try:
             (directory / REPORT_LATEST_NAME).unlink(missing_ok=True)
         except OSError as unlink_exc:
-            log(f"WARNING: could not drop the stale latest.json for {audit_id}: {unlink_exc}")
+            log(
+                f"WARNING: could not drop the stale latest.json for {audit_id}: "
+                f"{unlink_exc}{_ownership_note(unlink_exc)}"
+            )
         return
     try:
         for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
@@ -1994,7 +2062,10 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         )
         return None
     except (OSError, ValueError) as exc:
-        log(f"WARNING: stored report for {audit_id} is unreadable ({exc}); {MEMORY_UNKNOWABLE}")
+        log(
+            f"WARNING: stored report for {audit_id} is unreadable "
+            f"({exc}{_ownership_note(exc)}); {MEMORY_UNKNOWABLE}"
+        )
         return None
     if not isinstance(envelope, dict):
         log(f"WARNING: stored report for {audit_id} is not an object; {MEMORY_UNKNOWABLE}")

@@ -136,13 +136,15 @@ def display_width(text: str) -> int:
     single one of either shifted every border below its row -- and the test
     that exists to catch that measured with `len(plain(...))` too, so it agreed
     with the renderer and reported the table aligned. Zero-width is decided by
-    category, not by combining class: the zero-width joiner, a variation
-    selector and many vowel signs have combining class 0 and still draw nothing.
+    category, not by combining class, in both directions: the zero-width
+    joiner, a variation selector and many vowel signs have combining class 0
+    and still draw nothing, and a spacing mark such as a Javanese virama or a
+    Hangul tone mark has a non-zero class and still draws.
     """
     return sum(
         0
         if ch != SOFT_HYPHEN
-        and (unicodedata.combining(ch) or unicodedata.category(ch) in ZERO_WIDTH_CATEGORIES)
+        and unicodedata.category(ch) in ZERO_WIDTH_CATEGORIES
         else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
         for ch in plain(text)
     )

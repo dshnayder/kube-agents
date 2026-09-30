@@ -163,6 +163,9 @@ def _require_stream(root: str, audit_id: str) -> None:
             root=root,
             root_exists=False,
             root_error=reason,
+            # The lease is in scratch, not under the root: a first run in
+            # flight before any `finish` has made the root is `running`.
+            **_liveness(root, audit_id),
         )
     try:
         is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
