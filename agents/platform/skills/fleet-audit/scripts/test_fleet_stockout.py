@@ -189,6 +189,14 @@ class EnumerateClustersTest(unittest.TestCase):
         self.assertEqual(not_running[0]["location"], "us-east4")
         self.assertIn("DEGRADED", not_running[0]["error"])
 
+    def test_an_answer_that_is_not_a_list_of_clusters_fails_the_listing(self):
+        """A non-empty object crashed on its string keys, and `{}` iterated
+        nothing and read as a project with no cluster."""
+        for answer in ('{"error": "denied"}', "{}", '[{"name": "c1", "status": "RUNNING"}, "c2"]'):
+            with self.subTest(answer=answer):
+                with self.assertRaisesRegex(RuntimeError, "not a list of clusters"):
+                    fs.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, answer))
+
     def test_a_reconciling_cluster_is_enumerated(self):
         """A reconcile is work in progress on a cluster whose API server stays
         up, and any config change causes one. Skipping it dropped the cluster
@@ -221,13 +229,20 @@ class RegionOfTest(unittest.TestCase):
 
 class CccMissingFallbacksTest(unittest.TestCase):
     def test_flags_single_family_single_priority(self):
+        # Nothing varies, so the verdict needs no zone span and files.
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}])
-        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc))
+        hit = fs.check_ccc_missing_fallbacks(cc)
+        self.assertIsNotNone(hit)
+        self.assertNotIn("unevaluated", hit)
 
     def test_flags_family_and_spot_only_varying_one_dimension(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}, {"machineFamily": "c3", "spot": True}])
-        # only the spot dimension varies -- family is constant, no size, no zones
-        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc))
+        # Only the spot dimension varies -- family is constant, no size, no
+        # zones -- on a cluster read as spanning one zone. With the span
+        # unread this chain is unevaluated instead; see below.
+        hit = fs.check_ccc_missing_fallbacks(cc, 1)
+        self.assertIsNotNone(hit)
+        self.assertNotIn("unevaluated", hit)
 
     def test_does_not_flag_family_and_spot_both_varying(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}, {"machineFamily": "n4", "spot": True}])
@@ -2051,6 +2066,18 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("dangling-compute-class", {e["check"] for e in entry["checks_unevaluated"]})
         self.assertNotIn("dangling-compute-class", {c["check"] for c in entry["commands"]})
 
+    def test_a_missing_class_found_beside_the_unevaluated_arm_carries_its_own_command(self):
+        """The missing-class arm still files, and the slug's record is popped."""
+        cc = compute_class("cc1", [{"machineFamily": "n4"}], node_pool_auto_creation=False)
+        reader = deployment("web", node_selector={fs.COMPUTE_CLASS_LABEL: "cc1"})
+        dangling = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "missing"})
+        entry = self.run_with(dump_items=[cc, reader, dangling], pools_rc=1)
+        self.assertNotIn("dangling-compute-class", {c["check"] for c in entry["commands"]})
+        hits = [c for c in entry["candidates"] if c["check"] == "dangling-compute-class"]
+        self.assertTrue(hits)
+        for hit in hits:
+            self.assertIn("kubectl get", hit.get("command", ""))
+
     def test_a_failed_node_pool_read_leaves_an_auto_creating_class_evaluated(self):
         cc = compute_class("cc1", [{"machineFamily": "n4"}])
         workload = deployment("web", node_selector={fs.COMPUTE_CLASS_LABEL: "cc1"})
@@ -2091,6 +2118,15 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
         self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
 
+    def test_findings_on_a_full_autoscaler_page_carry_their_own_command(self):
+        """The slug's `commands` record is popped, and `adopt_collector_evidence`
+        skips a candidate with no command of its own."""
+        entry = self.run_with(dump_items=[], log_entries=[ERROR_MSG_ENTRY] * fs.AUTOSCALER_LOG_LIMIT)
+        hits = [c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"]
+        self.assertTrue(hits)
+        for hit in hits:
+            self.assertIn("gcloud logging read", hit.get("command", ""))
+
     def test_a_page_under_the_limit_is_recorded_as_run(self):
         entry = self.run_with(dump_items=[], log_entries=[{"jsonPayload": {}}] * (fs.AUTOSCALER_LOG_LIMIT - 1))
         self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
@@ -2108,6 +2144,9 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("node-pools list", reason)
         self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
         self.assertIn("ccc-missing-fallbacks could not be judged", entry["limitations"])
+        # The slug's record is popped, so the filed finding carries its own.
+        [filed] = [c for c in entry["candidates"] if c["check"] == "ccc-missing-fallbacks"]
+        self.assertIn("kubectl get", filed.get("command", ""))
 
     def test_an_unzoned_chain_on_read_multi_zone_pools_is_run_and_clean(self):
         span_decides = compute_class("cc1", [{"machineFamily": f} for f in ("c3", "n4", "n2")])
@@ -3168,6 +3207,21 @@ class RefusedProjectIdTest(unittest.TestCase):
         """The ownership test read only a lowercase keyword, so this refusal
         was "names no project" although it names acme."""
         self.assertEqual(self.owner("ERROR: SERVICE_DISABLED: Project acme is not found"), (True, ""))
+
+    def test_a_quoted_project_id_naming_this_project_owns_it(self):
+        """`REFUSED_PROJECT_ID_RE` admits a quote or bracket before the id and
+        the ownership test did not, so the id was subtracted as this
+        project's and the refusal read as naming none."""
+        def run(argv, **kwargs):
+            raise AssertionError(argv)
+
+        for stderr in (
+            "ERROR: SERVICE_DISABLED: project 'acme-prod' is not found",
+            'ERROR: SERVICE_DISABLED: project "acme-prod" is not found',
+            "ERROR: SERVICE_DISABLED: project [acme-prod] is not found",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(fs.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
 
 if __name__ == "__main__":

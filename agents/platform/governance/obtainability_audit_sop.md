@@ -126,7 +126,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 
 #### 3.1 No CPU or memory request (`no-requests`)
 
-**This check owns the _absence_ of a request and nothing else.** The **value** of a request belongs to the Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.1, `overrequest`), which has the usage samples this audit does not collect. Never propose a number here: two audits sizing the same container in opposite directions makes each run flag the state the other just created.
+**This check owns the _absence_ of a request and nothing else.** The **value** of a request belongs to the Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.1, `overrequest`), which has the usage history this audit does not read. Never propose a number here: two audits sizing the same container in opposite directions makes each run flag the state the other just created.
 
 - **Command:** derived from `$STATE`; confirmed with the object-scoped read above.
 - **Flag when:** any container in `spec.template.spec.containers[]`, or any native sidecar (`initContainers[]` with `restartPolicy: Always`, which counts toward the pod's effective request), declares **no** `resources.requests.cpu` or **no** `resources.requests.memory`.

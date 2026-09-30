@@ -4441,9 +4441,9 @@ class OrphanLbTest(unittest.TestCase):
         self.assertEqual(hits[0]["object"], "BackendService/global:bs1")
 
     #: What the GKE service controller actually writes into a forwarding rule's
-    #: description. Every test above uses the bare `key: value` form, which is
-    #: what the SOP's prose example shows and what no live rule carries -- so
-    #: the whole leg passed its tests while matching nothing in the fleet.
+    #: description. The bare `key: value` form is what the SOP's prose example
+    #: shows and what no live rule carries; while every test used it, the whole
+    #: leg passed its tests while matching nothing in the fleet.
     GKE_DESC = '{"kubernetes.io/service-name":"staging/checkout","kubernetes.io/api-version":"v1"}'
 
     def test_the_json_description_gke_really_writes_is_matched(self):
@@ -5035,6 +5035,35 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("although the usage read for the same cluster did", reasons["underrequest"])
         self.assertNotIn("not shipping system metrics", entry["limitations"])
 
+    def test_one_usage_metric_empty_beside_the_other_leaves_the_peak_checks_unevaluated(self):
+        """Every pod is unmeasured on the empty dimension, so `_measured_peaks`
+        skips every controller; recorded as run, the three checks read clean
+        over a cluster nothing measured."""
+        peak_checks = {"overrequest", "unsized-workload", "idle-workload"}
+        for missing, present, session in (
+            ("memory", "CPU", FakeSession(cpu=[series_of("default", "api-1", 0.3)], mem=[])),
+            ("CPU", "memory", FakeSession(cpu=[], mem=[series_of("default", "api-1", 512 * MIB)])),
+        ):
+            with self.subTest(missing=missing):
+                entry = self._metrics_down(obj("Node", "node-1"), session=session)
+                reasons = {c["check"]: c["reason"] for c in entry["checks_unevaluated"]}
+                self.assertTrue(peak_checks <= set(reasons), reasons)
+                for slug in peak_checks:
+                    self.assertIn(f"returned no {missing} container time series", reasons[slug])
+                    self.assertIn(f"although it returned {present} series", reasons[slug])
+                self.assertFalse(peak_checks & {c["check"] for c in entry["commands"]})
+                self.assertIn(
+                    f"idle-workload could not be measured on this cluster: the Cloud Monitoring usage read returned no {missing}",
+                    entry["limitations"],
+                )
+
+    def test_underrequest_still_runs_when_only_the_cpu_metric_is_empty(self):
+        # Its figure is the mean-memory read; the CPU peak is not an input.
+        session = FakeSession(cpu=[], mem=[series_of("default", "api-1", 512 * MIB)])
+        entry = self._metrics_down(obj("Node", "node-1"), session=session)
+        self.assertIn("underrequest", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("underrequest", {c["check"] for c in entry.get("checks_unevaluated", [])})
+
     def _unreadable_pools(self, cluster=None, answer=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -5507,6 +5536,14 @@ class ZoneTimeoutTest(unittest.TestCase):
         self.assertEqual([c["name"] for c in caught.exception.running], ["c1"])
         self.assertIn("did not respond", str(caught.exception))
 
+    def test_an_answer_that_is_not_a_list_of_clusters_fails_the_listing(self):
+        """A non-empty object crashed on its string keys, and `{}` iterated
+        nothing and read as a project with no cluster."""
+        for answer in ('{"error": "denied"}', "{}", '[{"name": "c1", "status": "RUNNING"}, "c2"]'):
+            with self.subTest(answer=answer):
+                with self.assertRaisesRegex(RuntimeError, "not a list of clusters"):
+                    fw.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, answer))
+
     def test_a_silent_zone_audits_the_listed_clusters_and_fails_the_project_target(self):
         """The project checks read the cluster list to tell an orphan from
         something a cluster still owns, so a silent zone's cluster would make
@@ -5576,7 +5613,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "")
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertEqual(manifest["error"], fw.NO_PROJECT_IN_SCOPE_ERROR)
         self.assertEqual(manifest["clusters"], [])
 
@@ -5588,7 +5625,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(1, "", "permission denied")
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertIn("permission denied", manifest["error"])
         self.assertEqual(manifest["clusters"], [])
 
@@ -5604,7 +5641,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "[]")
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertNotIn("error", manifest)
         self.assertEqual(
             {(c["name"], c["outcome"]) for c in manifest["clusters"]},
@@ -5676,7 +5713,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "[]")
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
         # gamma's failure is not an answer, so it is recorded rather than dropped.
         self.assertEqual(outcomes, {"project/acme": "collected", "project/gamma": "gate-failed"})
@@ -5699,7 +5736,7 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "[]")
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         beta = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
         self.assertEqual(beta["outcome"], "collected")
         self.assertIn("unattached-disk", {c["check"] for c in beta["candidates"]})
@@ -5799,7 +5836,7 @@ class DisabledApiProjectTest(unittest.TestCase):
         note as the first failure, which says nothing about why acme yielded
         nothing."""
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
-        manifest = fw.collect_fleet("acme", run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet("acme", run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertEqual(manifest["clusters"], [])
         self.assertIn("nothing collected", manifest["error"])
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
@@ -5810,7 +5847,7 @@ class DisabledApiProjectTest(unittest.TestCase):
         the replay then walks, so the line was said twice per run."""
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
         with patch.object(fw, "log") as logged:
-            fw.collect_fleet("acme", run=run, session=None, now=NOW)
+            fw.collect_fleet("acme", run=run, session=FakeSession(**NO_USAGE), now=NOW)
         said = [c.args[0] for c in logged.call_args_list if "no project-scoped check applies" in c.args[0]]
         self.assertEqual(len(said), 1, said)
 
@@ -5832,7 +5869,7 @@ class DisabledApiProjectTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                return fw.collect_fleet(None, run=run, session=None, now=NOW)
+                return fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
 
     def test_a_credential_failed_cluster_keeps_the_manifest_buildable(self):
         """§2 retries an unreachable cluster by hand under a `limitations`
@@ -5858,7 +5895,7 @@ class DisabledApiProjectTest(unittest.TestCase):
                 return run_of(0, "other\n")
             return inner(argv, **kwargs)
 
-        manifest = fw.collect_fleet(run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertEqual(manifest["clusters"], [])
         self.assertNotIn(fw.UNENUMERATED_PROJECTS_TARGET, manifest["error"])
         self.assertIn(f"First: {fw.NO_TARGET_REASON}", manifest["error"])
@@ -5874,12 +5911,12 @@ class DisabledApiProjectTest(unittest.TestCase):
                 return run_of(1, "", "ERROR: PERMISSION_DENIED")
             return inner(argv, **kwargs)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertIn(f"First: {fw.UNENUMERATED_PROJECTS_TARGET}: `gcloud projects list` rc=1", manifest["error"])
 
     def test_compute_off_declares_its_checks_inapplicable_and_still_reads_the_registry(self):
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF), registry=lambda p: None)
-        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)["clusters"] if c["name"] == "project/acme")
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual([c["check"] for c in entry["commands"]], ["registry-no-cleanup"])
         self.assertEqual({c["check"] for c in entry["checks_not_applicable"]}, set(fw.COMPUTE_CHECKS))
@@ -5888,7 +5925,7 @@ class DisabledApiProjectTest(unittest.TestCase):
 
     def test_registry_off_is_inapplicable_not_a_coverage_gap(self):
         run = cluster_free_run(compute=lambda p: None, registry=lambda p: run_of(1, "", self.REGISTRY_OFF))
-        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)["clusters"] if c["name"] == "project/acme")
         self.assertEqual([c["check"] for c in entry["checks_not_applicable"]], ["registry-no-cleanup"])
         self.assertEqual({c["check"] for c in entry["commands"]}, {"unattached-disk", "idle-address", "orphan-lb"})
         self.assertNotIn("checks_unevaluated", entry)
@@ -5897,13 +5934,13 @@ class DisabledApiProjectTest(unittest.TestCase):
     def test_a_quota_project_s_compute_refusal_gates_and_declares_nothing_inapplicable(self):
         # A project with no cluster has nothing else to say the refusal is someone else's.
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF.replace("acme", "quota-proj")), registry=lambda p: None)
-        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)["clusters"] if c["name"] == "project/acme")
         self.assertEqual(set(fw.COMPUTE_CHECKS), {c["check"] for c in entry["checks_unevaluated"]})
         self.assertNotIn("checks_not_applicable", entry)
 
     def test_a_quota_project_s_registry_refusal_is_unevaluated_not_inapplicable(self):
         run = cluster_free_run(compute=lambda p: None, registry=lambda p: run_of(1, "", self.REGISTRY_OFF.replace("acme", "quota-proj")))
-        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)["clusters"] if c["name"] == "project/acme")
         self.assertNotIn("registry-no-cleanup", {c["check"] for c in entry.get("checks_not_applicable", [])})
         self.assertIn("registry-no-cleanup", {c["check"] for c in entry.get("checks_unevaluated", [])})
 
@@ -5917,7 +5954,7 @@ class DisabledApiProjectTest(unittest.TestCase):
             return run_of(1, "", "PERMISSION_DENIED" if len(calls) == 1 else self.COMPUTE_OFF)
 
         run = cluster_free_run(compute=compute, registry=lambda p: None)
-        entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
+        entry = next(c for c in fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)["clusters"] if c["name"] == "project/acme")
         self.assertEqual(set(fw.COMPUTE_CHECKS), {c["check"] for c in entry["checks_unevaluated"]})
         self.assertNotIn("checks_not_applicable", entry)
 
@@ -6002,7 +6039,7 @@ class ProjectReadScaleTest(unittest.TestCase):
                 disks_barrier.wait()
             return run_of(0, "[]")
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, max_workers=2)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW, max_workers=2)
         self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"collected"})
 
     def test_a_run_past_the_deadline_reads_nothing_and_says_so(self):
@@ -6016,7 +6053,7 @@ class ProjectReadScaleTest(unittest.TestCase):
                 return run_of(0, "acme\nbeta\n")
             raise AssertionError(f"read a project after the deadline: {argv}")
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=0)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW, project_budget_s=0)
         self.assertEqual(manifest["clusters"], [])
         self.assertIn("2 project(s)", manifest["error"])
         self.assertIn("not read:", manifest["error"])
@@ -6036,7 +6073,7 @@ class ProjectReadScaleTest(unittest.TestCase):
             raise AssertionError(f"read a project after the deadline: {argv}")
 
         with patch.object(fw.time, "monotonic", lambda: clock[0]):
-            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertEqual(manifest["clusters"], [])
         self.assertIn("2 project(s)", manifest["error"])
         self.assertIn("not read:", manifest["error"])
@@ -6062,7 +6099,7 @@ class ProjectReadScaleTest(unittest.TestCase):
 
         admitted = iter([True])
         with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "_before", lambda deadline: next(admitted, False)):
-            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertIn("acme/us-central1/c1", by_name)
         self.assertEqual(by_name["project/acme"]["outcome"], "gate-failed")
@@ -6086,7 +6123,7 @@ class ProjectReadScaleTest(unittest.TestCase):
             return run_of(0, "[]") if argv[0] == "gcloud" else run_of(0, "")
 
         with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, max_workers=2)
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW, max_workers=2)
         self.assertIn("acme/us-central1/c1", {c["name"] for c in manifest["clusters"]})
         self.assertEqual(next(c for c in manifest["clusters"] if c["name"] == "project/acme")["outcome"], "collected")
 
@@ -6103,7 +6140,7 @@ class ProjectReadScaleTest(unittest.TestCase):
                 return run_of(0, "acme\n")
             return run_of(0, "[]")
 
-        fw.collect_fleet(None, run=run, session=None, now=NOW)
+        fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         self.assertEqual(len(seen), len(set(seen)))
 
     def test_a_project_with_every_api_off_by_number_is_described_once(self):
@@ -6130,7 +6167,7 @@ class ProjectReadScaleTest(unittest.TestCase):
                 return run_of(1, "", refusal.format(api="Artifact Registry"))
             raise AssertionError(argv)
 
-        manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
+        manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
         # The refusals were read as the project's own: nothing to report.
         self.assertIn("error", manifest)
         describes = [a for a in seen if a[:3] == ("gcloud", "projects", "describe")]
@@ -7352,6 +7389,21 @@ class RefusedProjectIdTest(unittest.TestCase):
         """The ownership test read only a lowercase keyword, so this refusal
         was "names no project" although it names acme."""
         self.assertEqual(self.owner("ERROR: SERVICE_DISABLED: Project acme is not found"), (True, ""))
+
+    def test_a_quoted_project_id_naming_this_project_owns_it(self):
+        """`REFUSED_PROJECT_ID_RE` admits a quote or bracket before the id and
+        the ownership test did not, so the id was subtracted as this
+        project's and the refusal read as naming none."""
+        def run(argv, **kwargs):
+            raise AssertionError(argv)
+
+        for stderr in (
+            "ERROR: SERVICE_DISABLED: project 'acme-prod' is not found",
+            'ERROR: SERVICE_DISABLED: project "acme-prod" is not found',
+            "ERROR: SERVICE_DISABLED: project [acme-prod] is not found",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(fw.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
 
 if __name__ == "__main__":

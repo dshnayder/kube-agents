@@ -637,7 +637,7 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     `fleet_waste.refusal_owner`, which carries the reasoning."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        if re.search(rf"\b(?i:projects?)[ /]{re.escape(project)}(?![\w-])", stderr):
+        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
             return True, ""
         others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
         if others:
@@ -748,6 +748,10 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         clusters = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"cluster enumeration returned no parseable JSON: {exc}") from exc
+    # Not only a crash guard: an rc-0 `{}` iterates nothing and would record
+    # the project as holding no cluster.
+    if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
+        raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
     running = [
         {
             "name": c["name"],
@@ -1821,7 +1825,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             if hit and hit.get("unevaluated"):
                 span_decides.append(hit["object"])
             elif hit:
-                candidates.append(_emit("ccc-missing-fallbacks", hit))
+                # Stamped, as spot-scarcity-risk's are: an unread span on
+                # another class pops this slug's `commands` record below, and
+                # `adopt_collector_evidence` skips a candidate with no command.
+                candidates.append(_emit("ccc-missing-fallbacks", {**hit, "command": dump_record["command"]}))
         if not non_production:
             for hit in [check_ccc_no_ondemand_floor(cc, cc_meta["name"] in cc_referenced_by_inference)]:
                 if hit:
@@ -1849,7 +1856,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     for workload in workloads:
         for hit in [check_dangling_compute_class(workload, compute_classes_by_name, node_pool_labels, autopilot=autopilot)]:
             if hit:
-                candidates.append(_emit("dangling-compute-class", hit))
+                # Stamped for the same reason: a failed pool list pops this
+                # slug's record after the missing-class arm has filed.
+                candidates.append(_emit("dangling-compute-class", {**hit, "command": dump_record["command"]}))
 
     not_applicable: list[dict] = []
     limitations: list[str] = []
@@ -1962,8 +1971,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) in compute_classes_by_name
             for url in pool.get("instanceGroupUrls") or []
         )
+        # Stamped: a full page pops this slug's record below.
         for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries), class_backed_groups):
-            candidates.append(_emit("autoscaler-out-of-resources", hit))
+            candidates.append(_emit("autoscaler-out-of-resources", {**hit, "command": shlex.join(logging_argv)}))
         if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
             # gcloud returns newest first, so a full page drops the oldest
             # entries of the window, and a stockout among them is unseen. As

@@ -72,6 +72,8 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 MANIFEST_VERSION = 1
+# The manifest's `audit` field: the stream this collector feeds.
+AUDIT_NAME = "fleet-wide-cost-analysis"
 
 # A digest of this file, published in the manifest. `audit_report.py` compares
 # it against the previous run's to tell a finding that stopped reproducing from
@@ -287,6 +289,9 @@ KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomiz
 # ten-minute sample was blind to. Monitoring retains these metrics well past
 # this, so the bound is a judgement about relevance, not availability.
 USAGE_WINDOW_HOURS = 168
+# The two dimensions of a `fetch_usage_peaks` tuple, by index, named as a
+# limitation names them when one came back with no series at all.
+USAGE_DIMENSIONS = (("CPU", 0), ("memory", 1))
 # Under this much observation the measurement has not seen a full daily cycle,
 # so a workload with any diurnal shape can read as idle for want of having been
 # watched overnight. The finding still publishes -- it is usually right, and the
@@ -348,6 +353,7 @@ MONITORING_PAGE_SIZE = "2000"
 #: hands back a bare `requests.Response`, so a misbehaving intermediary's HTML
 #: page arrives as a 200 and would otherwise raise out of the read.
 NON_JSON_BODY = "HTTP 200 with a body that is not a JSON object"
+# Also the manifest's `started_at` / `finished_at` form: both are UTC to the second.
 MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
 # `--oauth2-bearer`, not an `Authorization: Bearer` header: `finish` redacts
@@ -1050,7 +1056,7 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     if not numbers:
         # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
         # `Project acme` names acme as surely as `project acme` does.
-        if re.search(rf"\b(?i:projects?)[ /]{re.escape(project)}(?![\w-])", stderr):
+        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
             return True, ""
         others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
         if others:
@@ -1115,6 +1121,10 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         clusters = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"cluster enumeration returned no parseable JSON: {exc}") from exc
+    # Not only a crash guard: an rc-0 `{}` iterates nothing and would record
+    # the project as holding no cluster.
+    if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
+        raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
     running = [
         {
             "name": c["name"],
@@ -3017,6 +3027,23 @@ def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = 
             continue
         best = value if best is None else max(best, value)
     return best
+
+
+def _missing_usage_dimension(usage_peaks: dict) -> tuple[str, str] | None:
+    """`(missing, present)` when one metric of a non-empty usage answer
+    carried no series on any pod, else `None`.
+
+    `fetch_usage_peaks` refuses only an answer empty on both metrics. One
+    empty beside the other leaves every pod unmeasured on that dimension, and
+    `_measured_peaks` then skips every controller -- so the three checks that
+    read it would be recorded as run clean over a cluster nothing measured.
+    """
+    if not usage_peaks:
+        return None
+    for (name, index), (other, _) in zip(USAGE_DIMENSIONS, reversed(USAGE_DIMENSIONS)):
+        if all(value[index] is None for value in usage_peaks.values()):
+            return name, other
+    return None
 
 
 def _measured_peaks(
@@ -4963,7 +4990,12 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             for slug in ("idle-nodepool", "scaledown-blocked")
         ]
 
-    if metrics_ok:
+    # All three peak checks go through `_measured_peaks`, which needs both
+    # dimensions, so one metric missing cluster-wide loses all three. Not
+    # `underrequest`: it reads the mean-memory query, and prints "peak not
+    # read" where the memory peak is absent.
+    missing_dimension = _missing_usage_dimension(usage_peaks) if metrics_ok else None
+    if metrics_ok and missing_dimension is None:
         commands["overrequest"] = usage_record
         commands["unsized-workload"] = usage_record
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
@@ -5018,6 +5050,17 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             if hit.get("_selected_by"):
                 emitted["needs_triage"] = IDLE_SERVICE_TRIAGE
             candidates.append(emitted)
+    elif metrics_ok:
+        missing, present = missing_dimension
+        usage_gap = (
+            f"the Cloud Monitoring usage read returned no {missing} container"
+            f" time series although it returned {present} series for the same cluster"
+        )
+        for slug in ("overrequest", "unsized-workload", "idle-workload"):
+            unevaluated[slug] = usage_gap
+        limitations.append(
+            f"overrequest, unsized-workload and idle-workload could not be measured on this cluster: {usage_gap}"
+        )
     elif not context["nodes"] and usage_result.rc == 0:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
@@ -5652,7 +5695,6 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     not_applicable: dict[str, str] = {}
     if compute_disabled:
         not_applicable.update({slug: COMPUTE_DISABLED_REASON.format(project=project) for slug in COMPUTE_CHECKS})
-        disks_parsed = addr_parsed = fwd_parsed = tp_parsed = bs_parsed = []
     if registry_disabled:
         not_applicable["registry-no-cleanup"] = REGISTRY_DISABLED_REASON.format(project=project)
 
@@ -5893,7 +5935,7 @@ def _only_a_scope_note(entry: dict, project: str | None) -> bool:
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
     now = now or datetime.now(timezone.utc)
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    started_at = time.strftime(MONITORING_TIME_FORMAT, time.gmtime())
     deadline = time.monotonic() + project_budget_s
     run = _describing_once(run)
 
@@ -5921,9 +5963,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         return {
             "version": MANIFEST_VERSION,
             "checks_revision": CHECKS_REVISION,
-            "audit": "fleet-wide-cost-analysis",
+            "audit": AUDIT_NAME,
             "started_at": started_at,
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "finished_at": time.strftime(MONITORING_TIME_FORMAT, time.gmtime()),
             "error": str(exc),
             "clusters": [],
         }
@@ -6037,7 +6079,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             not skipped_by_project.get(p)
             and all(entry["outcome"] == "collected" for entry, _ in group)
         )
-        fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
+        fleet_facts = empty_fleet_facts()
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
@@ -6113,9 +6155,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         return {
             "version": MANIFEST_VERSION,
             "checks_revision": CHECKS_REVISION,
-            "audit": "fleet-wide-cost-analysis",
+            "audit": AUDIT_NAME,
             "started_at": started_at,
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "finished_at": time.strftime(MONITORING_TIME_FORMAT, time.gmtime()),
             "error": NOTHING_COLLECTED_ERROR.format(count=len(projects), first=f"{first['name']}: {first['error']}" if first else NO_TARGET_REASON),
             "clusters": [],
         }
@@ -6123,9 +6165,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     return {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
-        "audit": "fleet-wide-cost-analysis",
+        "audit": AUDIT_NAME,
         "started_at": started_at,
-        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": time.strftime(MONITORING_TIME_FORMAT, time.gmtime()),
         "clusters": entries,
     }
 
