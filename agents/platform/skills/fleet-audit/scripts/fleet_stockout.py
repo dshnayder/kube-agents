@@ -125,11 +125,19 @@ GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 AUTOSCALER_LOG_ID = "container.googleapis.com/cluster-autoscaler-visibility"
 AUTOSCALER_FRESHNESS = "24h"
 AUTOSCALER_LOG_LIMIT = 1000
+AUTOSCALER_OUT_OF_RESOURCES = "scale.up.error.out.of.resources"
 AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
-    "scale.up.error.out.of.resources",
+    AUTOSCALER_OUT_OF_RESOURCES,
     "scale.up.error.quota.exceeded",
     "scale.up.error.ip.space.exhausted",
 }
+# The `needs_triage` marker on a §3.11 out-of-resources finding whose fix is
+# a new ComputeClass: two files, the class and the workload that selects it,
+# where a finding carries one path. Read by `triage_marked_findings` in
+# audit_report.py, which withholds these from the automatic sweep -- so the
+# string has to match the one that file names, and the two files carry it
+# separately because neither imports the other.
+NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 
 # §3.8's ">20%", as a fraction, against the mean of the daily preemption
 # rates the API returns.
@@ -1247,7 +1255,9 @@ def autoscaler_message_ids(entries: object) -> dict[str, dict]:
     return found
 
 
-def check_autoscaler_out_of_resources(message_ids: dict[str, dict]) -> list[dict]:
+def check_autoscaler_out_of_resources(
+    message_ids: dict[str, dict], class_backed_groups: frozenset[str] = frozenset()
+) -> list[dict]:
     """One finding per distinct message id, not per log entry, and the id is
     the object: §3.11's remediation branches on it, and two ids on one cluster
     under one `Cluster/<name>` object shared a finding id.
@@ -1256,6 +1266,13 @@ def check_autoscaler_out_of_resources(message_ids: dict[str, dict]) -> list[dict
     autoscaler tick, and the SOP's remediation branches on the id rather than
     on the occurrence — three hundred findings saying `out.of.resources` are
     one problem written three hundred times.
+
+    `class_backed_groups` names the instance groups of node pools labelled
+    with a ComputeClass the cluster has. An `out.of.resources` finding is
+    marked `NEW_COMPUTE_CLASS_TRIAGE` unless every group it names is one of
+    them: the fix is then a new class, not an edit to one, and a finding
+    naming no group, or one this cannot place, is marked too, since the
+    create case is the one the sweep must not open unattended.
     """
     hits = []
     for message_id in sorted(message_ids):
@@ -1274,16 +1291,20 @@ def check_autoscaler_out_of_resources(message_ids: dict[str, dict]) -> list[dict
             if seen["first_seen"]
             else ""
         )
-        hits.append(
-            {
-                "object": f"ScaleUpError/{message_id}",
-                "excerpt": (
-                    f"{message_id}, {seen['count']} occurrence"
-                    f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
-                    f"visibility log{window}; first affected: {where}"
-                ),
-            }
+        hit = {
+            "object": f"ScaleUpError/{message_id}",
+            "excerpt": (
+                f"{message_id}, {seen['count']} occurrence"
+                f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
+                f"visibility log{window}; first affected: {where}"
+            ),
+        }
+        class_backed = bool(seen["parameters"]) and all(
+            param.rsplit("/", 1)[-1] in class_backed_groups for param in seen["parameters"]
         )
+        if message_id == AUTOSCALER_OUT_OF_RESOURCES and not class_backed:
+            hit["needs_triage"] = NEW_COMPUTE_CLASS_TRIAGE
+        hits.append(hit)
     return hits
 
 
@@ -1522,7 +1543,7 @@ def _emit(slug: str, hit: dict) -> dict:
         # already supplies its own `severity`. `IMPACT[slug]` stays the default
         # for the checks that mean one thing.
         "impact": hit.get("impact") or IMPACT[slug],
-        "needs_triage": None,
+        "needs_triage": hit.get("needs_triage"),
     }
     if hit.get("impact"):
         # Which arm fired is an observation the model cannot infer from the
@@ -1859,7 +1880,16 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     logs_unreadable = logging_result.rc == 0 and bool(logging_result.stdout.strip()) and not isinstance(entries, list)
     if logging_result.rc == 0 and not logs_unreadable:
         commands["autoscaler-out-of-resources"] = _record(shlex.join(logging_argv), logging_result)
-        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries)):
+        # The instance groups of pools a ComputeClass the cluster has put
+        # there: a stockout in one is fixed by editing that class. Empty when
+        # the pool list failed, which marks every out-of-resources finding.
+        class_backed_groups = frozenset(
+            url.rsplit("/", 1)[-1]
+            for pool in node_pools
+            if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) in compute_classes_by_name
+            for url in pool.get("instanceGroupUrls") or []
+        )
+        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries), class_backed_groups):
             candidates.append(_emit("autoscaler-out-of-resources", hit))
         if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
             # gcloud returns newest first, so a full page drops the oldest

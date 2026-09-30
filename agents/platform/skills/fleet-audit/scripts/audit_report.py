@@ -968,7 +968,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out.
 #
-# One marker so far. A cost collector sets `service-fronted` on an idle
+# Two markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -977,7 +977,14 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # thousands of packets a week. `/remediate <id>` is unaffected and is the
 # point: a person who reads the finding and asks for it by name has supplied
 # the judgement the collector could not.
-NO_SWEEP_TRIAGE = frozenset({"service-fronted"})
+#
+# The stockout collector sets `new-computeclass` on a §3.11 out-of-resources
+# finding whose affected pool no existing ComputeClass owns, and on one it
+# cannot place. That fix is a new class plus the workload that selects it:
+# two files, where a finding carries one `remediation.path`, so the sweep's
+# pull request would land a class nothing selects. `/remediate` opens the same
+# one-file pull request, for a person who knows to add the selector to it.
+NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass"})
 
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
@@ -3784,7 +3791,7 @@ def triage_marked_findings(
     declined to make; the cap catches volume; severity catches grade. This
     catches a finding the collector made, meant, and graded, whose
     *remediation* can break something the collector never looked at. See
-    `NO_SWEEP_TRIAGE` for the one marker that qualifies.
+    `NO_SWEEP_TRIAGE` for the markers that qualify.
 
     Read off the manifest rather than the finding, because `needs_triage` is
     not a findings-schema field: the candidate is the only place it exists.
@@ -7106,7 +7113,7 @@ def _render_withheld(
     `uncorroborated_findings` for the two Deployments that cost — while a
     finding it flagged and marked `needs_triage` is the opposite case: the
     observation is sound and the *fix* is what nobody has judged. See
-    `NO_SWEEP_TRIAGE` for the three that cost.
+    `NO_SWEEP_TRIAGE` for the markers, and the three findings that cost.
     """
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])

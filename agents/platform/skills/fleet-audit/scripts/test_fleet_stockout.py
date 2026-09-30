@@ -1027,6 +1027,46 @@ class AutoscalerVisibilityTest(unittest.TestCase):
         self.assertNotIn("googleapis.com", hits[0]["excerpt"])
         self.assertEqual(hits[0]["object"], "ScaleUpError/scale.up.error.out.of.resources")
 
+    GROUP = "gk3-prod-usc1-pool-3-b07eba62-grp"
+
+    def test_a_stockout_in_no_class_backed_group_is_marked_for_a_new_class(self):
+        """The fix is a new ComputeClass plus the workload that selects it:
+        two files where a finding carries one path."""
+        hits = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([ERROR_MSG_ENTRY]))
+        self.assertEqual(hits[0]["needs_triage"], fs.NEW_COMPUTE_CLASS_TRIAGE)
+
+    def test_a_stockout_in_a_class_backed_group_stays_unmarked(self):
+        hits = fs.check_autoscaler_out_of_resources(
+            fs.autoscaler_message_ids([ERROR_MSG_ENTRY]), frozenset({self.GROUP})
+        )
+        self.assertNotIn("needs_triage", hits[0])
+
+    def test_a_stockout_naming_no_group_is_marked(self):
+        """The NAP arm names no instance group, so which case applies is
+        unknown, and the unknown errs to the one the sweep skips."""
+        entry = json.loads(json.dumps(NAP_ENTRY))
+        entry["jsonPayload"]["noDecisionStatus"]["noScaleUp"]["unhandledPodGroups"][0]["napFailureReasons"] = [
+            {"messageId": "scale.up.error.out.of.resources"}
+        ]
+        hits = fs.check_autoscaler_out_of_resources(
+            fs.autoscaler_message_ids([entry]), frozenset({self.GROUP})
+        )
+        self.assertEqual(hits[0]["needs_triage"], fs.NEW_COMPUTE_CLASS_TRIAGE)
+
+    def test_the_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift here would
+        mark the finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertIn(fs.NEW_COMPUTE_CLASS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_quota_and_ip_findings_are_never_marked(self):
+        """Both are `kind: manual`; there is no manifest for the sweep to open."""
+        entry = json.loads(json.dumps(ERROR_MSG_ENTRY))
+        entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"]["messageId"] = "scale.up.error.quota.exceeded"
+        hits = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([entry]))
+        self.assertNotIn("needs_triage", hits[0])
+
 
 class SpotScarcityTest(unittest.TestCase):
     SHAPE = {"owners": ["ComputeClass/cc1"], "families": {"ComputeClass/cc1": 1}}
@@ -1491,6 +1531,37 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "critical")
         self.assertIn("scale.up.error.out.of.resources", hits[0]["excerpt"])
+
+    GROUP_URL = (
+        "https://www.googleapis.com/compute/v1/projects/acme/zones/"
+        "us-central1-b/instanceGroupManagers/gk3-prod-usc1-pool-3-b07eba62-grp"
+    )
+
+    def stockout_marker(self, pool_class, dump_items=()):
+        pool = {
+            "name": "pool-3",
+            "locations": ["us-central1-b"],
+            "config": {"labels": {fs.COMPUTE_CLASS_LABEL: pool_class} if pool_class else {}},
+            "instanceGroupUrls": [self.GROUP_URL],
+        }
+        entry = self.run_with(dump_items=dump_items, pools=[pool], log_entries=[ERROR_MSG_ENTRY])
+        (hit,) = [c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"]
+        return hit["needs_triage"]
+
+    def test_a_stockout_in_a_pool_its_compute_class_owns_is_sweepable(self):
+        cc = compute_class("burst", [{"machineFamily": "n2"}, {"machineFamily": "n4"}])
+        self.assertIsNone(self.stockout_marker("burst", dump_items=[cc]))
+
+    def test_a_stockout_in_a_pool_no_compute_class_owns_is_marked(self):
+        self.assertEqual(self.stockout_marker(None), fs.NEW_COMPUTE_CLASS_TRIAGE)
+
+    def test_a_pool_labelled_with_a_class_the_cluster_lacks_is_marked(self):
+        self.assertEqual(self.stockout_marker("gone"), fs.NEW_COMPUTE_CLASS_TRIAGE)
+
+    def test_a_stockout_on_an_unread_pool_list_is_marked(self):
+        entry = self.run_with(pools_rc=1, log_entries=[ERROR_MSG_ENTRY])
+        (hit,) = [c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"]
+        self.assertEqual(hit["needs_triage"], fs.NEW_COMPUTE_CLASS_TRIAGE)
 
     def test_a_refused_logging_read_is_a_limitation_not_a_clean_cluster(self):
         entry = self.run_with(log_rc=1, log_stderr="PERMISSION_DENIED on logging.logEntries.list")

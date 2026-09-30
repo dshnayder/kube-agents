@@ -14236,6 +14236,28 @@ class TestTriageMarkedFindings(BaseTestCase):
         self.assertEqual(plan.needs_triage, ["fronted"])
         self.assertEqual(plan.uncorroborated, [])
 
+    def test_a_new_compute_class_stockout_is_passed_over_and_an_edit_is_not(self):
+        """§3.11's create case is two files under one path; editing an
+        existing class is one, and stays the sweep's to open."""
+        slug = "autoscaler-out-of-resources"
+        obj = "ScaleUpError/scale.up.error.out.of.resources"
+        manifest = {
+            "clusters": [
+                _ran("c1", slug, candidates=[{**_cand(slug, "c1", obj), "needs_triage": "new-computeclass"}]),
+                _ran("c2", slug, candidates=[{**_cand(slug, "c2", obj), "needs_triage": None}]),
+            ]
+        }
+        remediation = {"kind": "manifest", "note": "n"}
+        findings = [
+            _pub("create", slug, "c1", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/new.yaml"}},
+            _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
+        ]
+        plan = audit_report.promotion_candidates(
+            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+        )
+        self.assertEqual(plan.promote, ["edit"])
+        self.assertEqual(plan.needs_triage, ["create"])
+
     def test_an_explicit_remediate_still_opens_it(self):
         plan = audit_report.promotion_candidates(
             [manifest_finding("fronted", "b.yaml")],
