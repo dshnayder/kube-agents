@@ -197,6 +197,26 @@ class EnumerateClustersTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "not a list of clusters"):
                     fs.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, answer))
 
+    def test_the_cluster_s_node_locations_are_read(self):
+        """§3.1's zone span needs the zones auto-created pools land in, which
+        the cluster's `locations` and auto-provisioning locations give."""
+        seen = []
+        clusters_json = json.dumps([{
+            "name": "c1", "location": "us-central1", "status": "RUNNING",
+            "locations": ["us-central1-a", "us-central1-b", "us-central1-c"],
+            "autoscaling": {"autoprovisioningLocations": ["us-central1-a"]},
+        }])
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            return run_of(0, clusters_json)
+
+        [cluster], _ = fs.enumerate_clusters("acme", run=run)
+        self.assertIn("locations", seen[0][-1])
+        self.assertIn("autoscaling.autoprovisioningLocations", seen[0][-1])
+        self.assertEqual(cluster["locations"], ["us-central1-a", "us-central1-b", "us-central1-c"])
+        self.assertEqual(cluster["autoprovisioning_locations"], ["us-central1-a"])
+
     def test_a_reconciling_cluster_is_enumerated(self):
         """A reconcile is work in progress on a cluster whose API server stays
         up, and any config change causes one. Skipping it dropped the cluster
@@ -360,7 +380,9 @@ class CccMissingFallbacksTest(unittest.TestCase):
             for zones in (None, 1, 3):
                 with self.subTest(label, cluster_zones=zones):
                     hit = fs.check_ccc_missing_fallbacks(compute_class("cc1", chain), zones)
-                    self.assertEqual(hit["unevaluated"], fs.CCC_MACHINE_UNNAMED)
+                    self.assertIn(fs.CCC_MACHINE_UNNAMED, hit["unevaluated"])
+                    # The unread span is a third unknown only where it was not read.
+                    self.assertEqual(fs.CCC_SPAN_UNREAD in hit["unevaluated"], zones is None)
 
     def test_a_mixed_chain_the_named_priorities_already_pass_is_clean(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}, {"machineFamily": "n4", "spot": True}, {"nodepools": ["a"]}])
@@ -369,7 +391,42 @@ class CccMissingFallbacksTest(unittest.TestCase):
     def test_a_mixed_chain_the_named_priorities_do_not_pass_is_unevaluated(self):
         """The pool could be the second family the chain is short of."""
         cc = compute_class("cc1", [{"machineFamily": "c3"}, {"nodepools": ["a"]}])
-        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], fs.CCC_MACHINE_UNNAMED)
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], (fs.CCC_MACHINE_UNNAMED,))
+
+    def test_class_level_default_zones_count(self):
+        """`redis-memory-optimized` from the gke-compute-classes assets: three
+        families, its zones only in `priorityDefaults`, on a one-zone cluster."""
+        cc = compute_class("redis-memory-optimized", [
+            {"machineFamily": f, "minCores": 8, "minMemoryGb": 64, "spot": False} for f in ("c4d", "n4d", "c4")
+        ])
+        cc["spec"]["priorityDefaults"] = {"location": {"zones": ["us-central1-a", "us-central1-b", "us-central1-c"]}}
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, 1))
+
+    def test_default_zones_do_not_reach_a_specific_reservation(self):
+        """`affinity: Specific` cannot combine with a class-level location, so
+        its priorities keep only the zones their reservations name."""
+        reserved = {"affinity": "Specific", "specific": [{"name": "r1", "zones": ["us-central1-a"]}]}
+        cc = compute_class("cc1", [{"machineFamily": f, "reservations": reserved} for f in ("c3", "n4")])
+        cc["spec"]["priorityDefaults"] = {"location": {"zones": ["us-central1-a", "us-central1-b"]}}
+        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc, 1))
+
+    def test_a_priority_s_own_zones_are_not_widened_by_the_default(self):
+        cc = compute_class("cc1", [{"machineFamily": f, "location": {"zones": ["us-central1-a"]}} for f in ("c3", "n4")])
+        cc["spec"]["priorityDefaults"] = {"location": {"zones": ["us-central1-a", "us-central1-b"]}}
+        self.assertNotIn("unevaluated", fs.check_ccc_missing_fallbacks(cc, 1))
+
+    def test_a_pod_family_fallback_in_a_mixed_chain_is_unevaluated(self):
+        """GKE picks the pod-family priority's family and size, either of which
+        could be the dimension the chain is short of."""
+        cc = compute_class("cc1", [{"machineFamily": "c3"}, {"podFamily": "general-purpose"}])
+        for zones in (1, 3):
+            with self.subTest(cluster_zones=zones):
+                self.assertEqual(fs.check_ccc_missing_fallbacks(cc, zones)["unevaluated"], (fs.CCC_MACHINE_UNNAMED,))
+
+    def test_every_unknown_dimension_s_reason_is_listed(self):
+        """An unread span and a pool-targeted priority both leave dimensions open."""
+        cc = compute_class("cc1", [{"machineFamily": "c3"}, {"nodepools": ["a"]}])
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc)["unevaluated"], (fs.CCC_SPAN_UNREAD, fs.CCC_MACHINE_UNNAMED))
 
     def test_custom_shapes_size_by_vcpus_not_memory(self):
         """`n2-custom-4-8192` ends in its memory in MB; reading the trailing
@@ -392,7 +449,7 @@ class CccMissingFallbacksTest(unittest.TestCase):
         """An accelerator shape names no vCPU count, so the chain's size may
         be the second dimension it is short of."""
         cc = compute_class("cc1", [{"machineType": "a2-highgpu-1g", "spot": False}, {"machineType": "a2-highgpu-2g", "spot": True}])
-        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], fs.CCC_SIZE_UNKNOWN)
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], (fs.CCC_SIZE_UNKNOWN,))
 
 
 class ClusterZoneSpanTest(unittest.TestCase):
@@ -403,6 +460,27 @@ class ClusterZoneSpanTest(unittest.TestCase):
     def test_a_regional_cluster_with_single_zone_pools_spans_one(self):
         pools = [{"locations": ["us-central1-a"]}]
         self.assertEqual(fs.cluster_zone_span({"location": "us-central1"}, pools, True), 1)
+
+    def test_the_cluster_s_node_locations_outweigh_a_narrower_pool(self):
+        """A regional cluster's auto-created pools span its node locations,
+        whatever zone its one existing pool sits in."""
+        cluster = {"location": "us-central1", "locations": ["us-central1-a", "us-central1-b", "us-central1-c"]}
+        pools = [{"locations": ["us-central1-a"]}]
+        self.assertEqual(fs.cluster_zone_span(cluster, pools, True), 3)
+        cc = compute_class("cc1", [{"machineFamily": "n4"}, {"machineFamily": "n4", "spot": True}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, fs.cluster_zone_span(cluster, pools, True)))
+
+    def test_the_widest_of_the_three_counts_is_taken(self):
+        pools = [{"locations": ["us-central1-a", "us-central1-b"]}]
+        for cluster, span in (
+            ({"locations": ["us-central1-a"]}, 2),
+            ({"locations": ["us-central1-a"], "autoprovisioning_locations": ["us-central1-a", "us-central1-b", "us-central1-c"]}, 3),
+        ):
+            with self.subTest(cluster=cluster):
+                self.assertEqual(fs.cluster_zone_span(cluster, pools, True), span)
+
+    def test_node_locations_answer_when_the_pools_were_not_read(self):
+        self.assertEqual(fs.cluster_zone_span({"locations": ["us-central1-a", "us-central1-b"]}, [], False), 2)
 
     def test_autopilot_spans_more_than_one(self):
         self.assertGreater(fs.cluster_zone_span({"autopilot": True}, [], False), 1)
@@ -430,10 +508,11 @@ class ClusterZoneSpanTest(unittest.TestCase):
         cc = compute_class("cc1", [{"podFamily": "general-purpose", "spot": True}])
         self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
 
-    def test_still_flags_a_chain_that_only_partly_delegates(self):
-        """A mixed chain was hand-authored and its machine-typed entry is a real pin."""
+    def test_a_chain_that_only_partly_delegates_is_unevaluated(self):
+        """A mixed chain was hand-authored, but its pod-family entry leaves the
+        family and size to GKE, so it is neither exempt nor a `critical`."""
         cc = compute_class("cc1", [{"podFamily": "general-purpose"}, {"machineFamily": "c3"}])
-        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc))
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], (fs.CCC_MACHINE_UNNAMED,))
 
     def test_a_pod_family_naming_a_machine_type_is_still_a_pin(self):
         """`podFamily` alongside an explicit shape delegates nothing."""
@@ -2260,9 +2339,17 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(fallbacks, ["ComputeClass/cc2"])
         [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == "ccc-missing-fallbacks"]
         self.assertIn("ComputeClass/cc1, ComputeClass/cc3", reason)
-        self.assertIn("node pools, an accelerator or nothing", reason)
+        self.assertIn("node pools, a pod family, an accelerator or nothing", reason)
         self.assertIn("does not read the machines those resolve to", entry["limitations"])
         self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+
+    def test_a_regional_cluster_s_node_locations_clear_an_unzoned_chain(self):
+        cc = compute_class("cc1", [{"machineFamily": "n4"}, {"machineFamily": "n4", "spot": True}])
+        cluster = {**self.CLUSTER, "locations": ["us-central1-a", "us-central1-b", "us-central1-c"]}
+        pools = [{"name": "gpu", "locations": ["us-central1-a"]}]
+        entry = self.run_with(dump_items=[cc], pools=pools, cluster=cluster)
+        self.assertIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["candidates"]})
 
     def test_an_unzoned_chain_on_read_multi_zone_pools_is_run_and_clean(self):
         span_decides = compute_class("cc1", [{"machineFamily": f} for f in ("c3", "n4", "n2")])

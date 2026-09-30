@@ -145,11 +145,19 @@ NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 AUTOPILOT_ZONE_SPAN = 2
 # Why `check_ccc_missing_fallbacks` could not judge a chain, as its hit's
 # `unevaluated` value: the cluster's zone span was not read, or a priority
-# names node pools, an accelerator or nothing where a machine would go.
+# names node pools, a pod family, an accelerator or nothing where a machine
+# would go.
 CCC_SPAN_UNREAD = "zone-span"
 CCC_MACHINE_UNNAMED = "machine-unnamed"
 # ... or a priority's `machineType` is one whose vCPU count is not parsed.
 CCC_SIZE_UNKNOWN = "size-unknown"
+# The order a hit lists those reasons in, one per dimension left unknown.
+CCC_UNKNOWN_ORDER = (CCC_SPAN_UNREAD, CCC_MACHINE_UNNAMED, CCC_SIZE_UNKNOWN)
+# §3.1 files a chain varying fewer obtainability dimensions than this.
+CCC_DIMENSIONS_NEEDED = 2
+# The reservation affinity that carries its own zones, which a class-level
+# `priorityDefaults.location` cannot combine with.
+SPECIFIC_RESERVATION_AFFINITY = "Specific"
 # The field `gcloud compute regions describe --format json(quotas)` answers with.
 QUOTAS_FIELD = "quotas"
 
@@ -750,7 +758,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     result = run(
         [
             "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning)",
+            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations)",
         ]
     )
     if result.rc != 0:
@@ -782,6 +790,9 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             # pool's own autoscaling config -- see `check_single_zone_nodepool`.
             "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
             "version": c.get("currentMasterVersion") or "",
+            # The zones auto-created node pools land in -- see `cluster_zone_span`.
+            "locations": c.get("locations") or [],
+            "autoprovisioning_locations": (c.get("autoscaling") or {}).get("autoprovisioningLocations") or [],
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -862,8 +873,9 @@ def _priority_size_unknown(p: dict) -> bool:
     return bool(p.get("machineType")) and not _priority_size_class(p)
 
 
-def _priority_zones(p: dict) -> tuple[str, ...]:
-    """The zones a priority will attempt, from either of the CRD's two homes.
+def _priority_zones(p: dict, default_zones: list | tuple = ()) -> tuple[str, ...]:
+    """The zones a priority will attempt, from either of the CRD's two homes
+    or the class-level default.
 
     `location.zones` is the field, per
     `skills/gke-compute-classes/references/compute-class-crd-fields.md`. There
@@ -875,8 +887,16 @@ def _priority_zones(p: dict) -> tuple[str, ...]:
     `reservations.specific[].zones` is the second home: the same reference notes
     that `location.zones` cannot be combined with `affinity: Specific`, so a
     chain using specific reservations expresses its zone spread there instead.
+
+    `default_zones` is `spec.priorityDefaults.location.zones`, which the same
+    reference says applies to every priority: the repository's own templates
+    spell their zone spread there and on no priority. It fills a priority that
+    names no zones of its own, and never one with `affinity: Specific`.
     """
     location_zones = (p.get("location") or {}).get("zones") or []
+    specific = (p.get("reservations") or {}).get("affinity") == SPECIFIC_RESERVATION_AFFINITY
+    if not location_zones and not specific:
+        location_zones = default_zones
     reserved_zones = [
         zone
         for entry in ((p.get("reservations") or {}).get("specific") or [])
@@ -899,26 +919,32 @@ def _priority_is_pod_family(p: dict) -> bool:
 def _priority_names_no_machine(p: dict) -> bool:
     """Does this priority leave its machine to something the collector does not read?
 
-    The CRD lets a priority name neither `machineFamily`, `machineType` nor
-    `podFamily`: a `nodepools` rule targets manual pools whose machines live on
-    the pools, and a `gpu`/`tpu` rule can leave the VM to GKE. Its family and
-    size are unknown, not absent. So is one naming only `spot` or a
-    location, which leaves the shape to GKE.
+    The CRD lets a priority name neither `machineFamily` nor `machineType`: a
+    `nodepools` rule targets manual pools whose machines live on the pools, a
+    `gpu`/`tpu` rule can leave the VM to GKE, and a `podFamily` rule hands GKE
+    the family outright. Its family and size are unknown, not absent. So is
+    one naming only `spot` or a location, which leaves the shape to GKE.
     """
-    return not (p.get("machineFamily") or p.get("machineType") or p.get("podFamily"))
+    return not (p.get("machineFamily") or p.get("machineType"))
 
 
 def cluster_zone_span(cluster: dict, node_pools: list[dict], pools_readable: bool) -> int | None:
     """How many zones this cluster's nodes can land in, or None when unknown.
 
-    The node pools' `locations` when the read returned any: a regional
-    cluster's node locations can still be one zone, so the cluster's own
-    location does not settle it. An Autopilot cluster has no pools to read
-    and is regional across the region's zones by construction. Anything else
-    is unknown, and §3.1 then scores no zone spread it cannot see.
+    The largest of three counts: the cluster's node `locations`, which a
+    ComputeClass's auto-created pools span on a regional cluster; the node
+    auto-provisioning locations when set; and the union of the existing
+    pools' `locations`. The cluster's `location` is a region name and settles
+    nothing. Taking the widest errs toward not filing a `critical` on a class
+    GKE can place in more zones than the existing pools happen to cover. An
+    Autopilot cluster with none of these read is regional across the region's
+    zones by construction. Anything else is unknown, and §3.1 then scores no
+    zone spread it cannot see.
     """
-    if pools_readable and node_pools:
-        return len({zone for pool in node_pools for zone in (pool.get("locations") or [])}) or None
+    pool_zones = {zone for pool in node_pools for zone in (pool.get("locations") or [])} if pools_readable else set()
+    span = max(len(cluster.get("locations") or []), len(cluster.get("autoprovisioning_locations") or []), len(pool_zones))
+    if span:
+        return span
     if cluster.get("autopilot"):
         return AUTOPILOT_ZONE_SPAN
     return None
@@ -946,6 +972,11 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     and scoring it as an empty family filed a `critical` reading
     `families=[] sizes=[]` against a class that pins none. A chain whose named
     priorities already vary two dimensions passes regardless.
+
+    So every dimension is varied, not varied or unknown, and the chain files
+    only when the varied ones are short of two and the unknown ones could not
+    make up the difference. Otherwise the hit's `unevaluated` lists the
+    reason for each unknown dimension, in `CCC_UNKNOWN_ORDER`.
     """
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities:
@@ -970,31 +1001,42 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     # against it is something an operator can act on.
     if all(_priority_is_pod_family(p) for p in priorities):
         return None
+    default_zones = (((cc.get("spec") or {}).get("priorityDefaults") or {}).get("location") or {}).get("zones") or []
+    zones_of = [_priority_zones(p, default_zones) for p in priorities]
     families = {_priority_family(p) for p in priorities if _priority_family(p)}
     spots = {_priority_is_spot(p) for p in priorities}
     sizes = {_priority_size_class(p) for p in priorities if _priority_size_class(p)}
-    zones = {_priority_zones(p) for p in priorities if _priority_zones(p)}
-    unzoned = any(not _priority_zones(p) for p in priorities)
+    zones = {z for z in zones_of if z}
+    unzoned = any(not z for z in zones_of)
     multi_zone = (
         len(zones) > 1
         or any(len(z) > 1 for z in zones)
         or (unzoned and cluster_zones is not None and cluster_zones > 1)
     )
-    dimensions_varied = sum(1 for s in (families, spots, sizes) if len(s) > 1) + int(multi_zone)
-    if dimensions_varied >= 2:
+    # Each dimension is varied, not varied, or unknown. Unknown ones map to
+    # the reason the collector could not read them: a priority that leaves
+    # its machine to pools or GKE hides its family and size; an unparsed
+    # machine type hides its size where two priorities could differ in it;
+    # an unread span hides whether an unzoned priority reaches two zones.
+    no_machine = any(_priority_names_no_machine(p) for p in priorities)
+    size_unparsed = len(priorities) > 1 and any(_priority_size_unknown(p) for p in priorities)
+    varied = {"family": len(families) > 1, "spot": len(spots) > 1, "size": len(sizes) > 1, "zone": multi_zone}
+    unknown = {
+        "family": {CCC_MACHINE_UNNAMED} if no_machine else set(),
+        "size": ({CCC_MACHINE_UNNAMED} if no_machine else set()) | ({CCC_SIZE_UNKNOWN} if size_unparsed else set()),
+        "zone": {CCC_SPAN_UNREAD} if unzoned and cluster_zones is None else set(),
+    }
+    dimensions_varied = sum(varied.values())
+    if dimensions_varied >= CCC_DIMENSIONS_NEEDED:
         return None
     hit = {
         "object": f"ComputeClass/{cc['metadata']['name']}",
         "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
     }
-    # What the unread inputs could still add: one dimension each, the size
-    # only where two priorities could differ in it and do not already.
-    size_could_vary = len(priorities) > 1 and len(sizes) <= 1 and any(_priority_size_unknown(p) for p in priorities)
-    span_could_help = unzoned and cluster_zones is None and not multi_zone
-    if any(_priority_names_no_machine(p) for p in priorities):
-        hit["unevaluated"] = CCC_MACHINE_UNNAMED
-    elif dimensions_varied + int(size_could_vary) + int(span_could_help) >= 2:
-        hit["unevaluated"] = CCC_SIZE_UNKNOWN if size_could_vary else CCC_SPAN_UNREAD
+    open_dimensions = [d for d, reasons in unknown.items() if reasons and not varied[d]]
+    if dimensions_varied + len(open_dimensions) >= CCC_DIMENSIONS_NEEDED:
+        reasons = set().union(*(unknown[d] for d in open_dimensions))
+        hit["unevaluated"] = tuple(r for r in CCC_UNKNOWN_ORDER if r in reasons)
     return hit
 
 
@@ -1886,12 +1928,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # §3.2 and §3.10 do not flag non-production.
         non_production = is_non_production(cc_meta.get("name", ""), cc_meta.get("labels"))
         for hit in [check_ccc_missing_fallbacks(cc, cluster_zones)]:
-            if hit and hit.get("unevaluated") == CCC_MACHINE_UNNAMED:
-                machine_unnamed.append(hit["object"])
-            elif hit and hit.get("unevaluated") == CCC_SIZE_UNKNOWN:
-                size_unknown.append(hit["object"])
-            elif hit and hit.get("unevaluated"):
-                span_decides.append(hit["object"])
+            if hit and hit.get("unevaluated"):
+                unread = {CCC_SPAN_UNREAD: span_decides, CCC_MACHINE_UNNAMED: machine_unnamed, CCC_SIZE_UNKNOWN: size_unknown}
+                for reason in hit["unevaluated"]:
+                    unread[reason].append(hit["object"])
             elif hit:
                 # Stamped, as spot-scarcity-risk's are: an unread span on
                 # another class pops this slug's `commands` record below, and
@@ -1990,22 +2030,23 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         )
 
     if span_decides:
-        # §3.1 with the zone span unread: these classes vary one dimension
-        # and name no zone, so they pass if the cluster spans several zones
-        # and fail if it spans one. Filed like single-zone-nodepool on the
+        # §3.1 with the zone span unread: these classes vary too few
+        # dimensions and name no zone, so they may pass if the cluster spans
+        # several zones and fail if it spans one. Filed like single-zone-nodepool on the
         # same failed read -- unevaluated, the other classes' findings still
         # filing -- because a `critical` `manifest` candidate is what the
         # automatic sweep opens a pull request for, and a caveat in its
         # excerpt stops nothing.
         span_gap = pools_failure or "the node pools list names no zone"
+        span_gap = f"the cluster lists no node locations, and {span_gap}"
         unevaluated["ccc-missing-fallbacks"] = (
-            f"{', '.join(span_decides)} vary one other dimension and name no zone, so the "
+            f"{', '.join(span_decides)} vary fewer than two dimensions and name no zone, so the "
             f"verdict turns on the cluster's zone span, which was not read: {span_gap}"
         )
         commands.pop("ccc-missing-fallbacks", None)
         limitations.append(
             f"ccc-missing-fallbacks could not be judged for {', '.join(span_decides)}: "
-            f"the node pools that give the cluster's zone span were not read ({span_gap})"
+            f"the node locations and node pools that give the cluster's zone span were not read ({span_gap})"
         )
     if machine_unnamed:
         # The same filing for a priority whose machine was never read: a
@@ -2013,22 +2054,22 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # or shape-free rule, could be the family or size the chain lacks.
         reason = (
             f"{', '.join(machine_unnamed)} vary fewer than two dimensions across the priorities "
-            f"that name a machine, and a priority names node pools, an accelerator or nothing "
-            f"in place of a machine family"
+            f"that name a machine, and a priority names node pools, a pod family, an accelerator "
+            f"or nothing in place of a machine family"
         )
         prior = unevaluated.get("ccc-missing-fallbacks")
         unevaluated["ccc-missing-fallbacks"] = f"{prior}; {reason}" if prior else reason
         commands.pop("ccc-missing-fallbacks", None)
         limitations.append(
             f"ccc-missing-fallbacks could not be judged for {', '.join(machine_unnamed)}: "
-            f"a priority names node pools, an accelerator or nothing in place of a machine "
-            f"family, and the collector does not read the machines those resolve to"
+            f"a priority names node pools, a pod family, an accelerator or nothing in place of a "
+            f"machine family, and the collector does not read the machines those resolve to"
         )
     if size_unknown:
         # A size the parser cannot read could be the dimension the chain is
         # one short of, so its verdict is not established either way.
         reason = (
-            f"{', '.join(size_unknown)} vary one dimension short of two, and a priority's "
+            f"{', '.join(size_unknown)} vary fewer than two dimensions, and a priority's "
             f"machineType has a vCPU count the collector does not parse, so its size is unknown"
         )
         prior = unevaluated.get("ccc-missing-fallbacks")
