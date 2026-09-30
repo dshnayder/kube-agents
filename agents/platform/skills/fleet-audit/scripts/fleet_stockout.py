@@ -1669,11 +1669,17 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # web app calling one is not a Spot-preemption SLA breach.
     from collect import _is_inference_workload as _is_inference
 
+    # A non-production workload does not escalate §3.2 either: its
+    # Do-NOT-flag names non-production, and §2 tests the workload's name, its
+    # namespace and its environment labels, not only the class's.
     cc_referenced_by_inference = set()
     for workload in workloads:
         spec = workload.get("spec") or {}
+        meta = workload.get("metadata") or {}
         template_spec = ((spec.get("template") or {}).get("spec")) or spec
         cc_ref = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
+        if is_non_production(meta.get("name", ""), meta.get("labels"), meta.get("namespace", "")):
+            continue
         if cc_ref and _is_inference(template_spec):
             cc_referenced_by_inference.add(cc_ref)
 

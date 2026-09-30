@@ -1186,6 +1186,27 @@ class IdleNodepoolTest(unittest.TestCase):
         self.assertNotIn("Draining will not happen",
                          fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
 
+    def test_a_safe_to_evict_kube_system_pod_without_a_pdb_is_not_a_blocker(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="kube-system", name="metrics-server")
+        pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: "true"}
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_local_volumes_all_listed_as_safe_are_not_a_blocker(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"name": "cache", "emptyDir": {}}, {"name": "logs", "hostPath": {"path": "/l"}}]
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        for listed, blocks in (("cache, logs", False), ("cache", True)):
+            with self.subTest(listed=listed):
+                pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION: listed}
+                excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+                self.assertEqual("Draining will not happen" in excerpt, blocks)
+
     def test_an_empty_pool_gets_no_blocker_note(self):
         context = {"nodes": [self.node("n1", "pool")], "pods": [], "pdbs": []}
         pools = [self.pool("pool"), self.pool("other")]
@@ -1854,11 +1875,14 @@ class OverrequestTest(unittest.TestCase):
         self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
 
     def test_a_ten_milli_sidecar_is_still_excluded(self):
-        """What the floor exists for, and the reason not to simply delete it.
+        """What the resize floors exist for, and the reason not to simply
+        delete them.
 
         `cert-manager` and its webhook on the live fleet: 10m and 32Mi each,
-        both under 20% of both requests all week, and neither shrinkable in any
-        way worth an engineer's attention.
+        both under 20% of both requests all week. Both requests already sit at
+        or under `OVERREQUEST_RESIZE_FLOOR_VCPU`/`_MIB`, so no resize shrinks
+        either, and the resize floor excludes them before the materiality
+        floor is consulted.
         """
         for label, cpu, mem in (("cert-manager", "10m", "32Mi"), ("bad-app", "50m", "64Mi")):
             with self.subTest(label):
@@ -2750,6 +2774,13 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertNotIn("nobody is calling", impact)
         self.assertIn("CPU or memory", impact)
         self.assertIn("packets are not sessions", impact)
+
+    def test_the_impact_claims_no_idle_span_longer_than_it_read(self):
+        """The read covers at most `USAGE_WINDOW_HOURS`, often less; the
+        controller's 14-day age is not observed idleness."""
+        impact = fw.IMPACT["idle-workload"]
+        self.assertNotIn("weeks", impact)
+        self.assertIn("measured window", impact)
 
     # ----------------------------------------------------------------- #
     # The traffic clause. Every one of these turns on the same question:

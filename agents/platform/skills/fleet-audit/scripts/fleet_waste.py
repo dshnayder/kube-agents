@@ -577,6 +577,13 @@ GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.i
 RETENTION_ANNOTATION_WORDS = ("owner", "retain", "retention")
 
 POD_TERMINAL_PHASES = ("Succeeded", "Failed")
+# §3.5: this many idle addresses in one project become one per-project roll-up
+# finding rather than one finding each.
+IDLE_ADDRESS_ROLLUP_MIN = 10
+# §3.6: the Service a GKE-created forwarding rule fronts, read from the JSON
+# object the service controller writes as its description; see
+# `check_orphan_lb` for why both quote shapes are accepted.
+SERVICE_NAME_DESCRIPTION_RE = re.compile(r"""kubernetes\.io/service-name["']?\s*:\s*["']?([\w.-]+/[\w.-]+)""")
 
 
 def _is_system_namespace(ns: str) -> bool:
@@ -904,7 +911,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
 
 
 # --------------------------------------------------------------------------- #
-# `kubectl top` parsing — plain columnar text, not JSON.
+# Resource-quantity parsing — the request and limit strings in pod specs.
 # --------------------------------------------------------------------------- #
 
 CPU_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
@@ -2192,6 +2199,10 @@ SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 # its pin dropped although the autoscaler still honours it.
 SAFE_TO_EVICT_TRUE = "true"
 SAFE_TO_EVICT_FALSE = "false"
+# The autoscaler's per-volume form: a comma-separated list of local volume
+# names it may discard on eviction. A pod whose every local volume is listed
+# no longer pins its node under `--skip-nodes-with-local-storage`.
+SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes"
 
 
 def _safe_to_evict(annotations: dict) -> bool | None:
@@ -2205,6 +2216,12 @@ def _safe_to_evict(annotations: dict) -> bool | None:
     if raw == SAFE_TO_EVICT_FALSE:
         return False
     return None
+
+
+def _local_volumes_all_safe(annotations: dict, local_names: list[str]) -> bool:
+    """Whether `safe-to-evict-local-volumes` lists every local volume."""
+    listed = {n.strip() for n in (annotations.get(SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION) or "").split(",") if n.strip()}
+    return bool(local_names) and set(local_names) <= listed
 
 
 def _expression_matches(expr: dict, labels: dict) -> bool:
@@ -2251,8 +2268,11 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     turn off: `--skip-nodes-with-system-pods` pins a node carrying any
     `kube-system` pod that has no PodDisruptionBudget, and
     `--skip-nodes-with-local-storage` pins one carrying an `emptyDir` or
-    `hostPath` pod that is not annotated `safe-to-evict: "true"`. DaemonSet and
-    mirror pods are exempt from both -- they go with the node.
+    `hostPath` pod. A pod annotated `safe-to-evict: "true"` is exempt from
+    both, as the autoscaler checks the annotation before either rule; one whose
+    `safe-to-evict-local-volumes` lists every local volume is exempt from the
+    second. DaemonSet and mirror pods are exempt from both -- they go with the
+    node.
 
     §3.8 reports the workload half of this as findings of its own and skips
     `SYSTEM_NS` deliberately, because a GKE-managed add-on is not something the
@@ -2268,13 +2288,15 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
             continue  # static, goes with the node
         ns, name = meta.get("namespace", ""), meta.get("name", "")
         labels = meta.get("labels") or {}
-        evictable = _safe_to_evict(meta.get("annotations") or {})
+        annotations = meta.get("annotations") or {}
+        if _safe_to_evict(annotations) is True:
+            continue
         volumes = (pod.get("spec") or {}).get("volumes") or []
-        local = any(("emptyDir" in v or "hostPath" in v) for v in volumes)
+        local_names = [v.get("name", "") for v in volumes if "emptyDir" in v or "hostPath" in v]
         has_pdb = any(_selector_matches(sel, ns, labels) for sel in pdb_selectors)
         if ns == "kube-system" and not has_pdb:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
-        elif local and evictable is not True:
+        elif local_names and not _local_volumes_all_safe(annotations, local_names):
             blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
     return blockers
 
@@ -4042,7 +4064,7 @@ IMPACT = {
     # substance; it was certainly unmeasured, and an audit that guesses right is
     # still an audit a reader cannot check. What this check measures is CPU and
     # memory, so that is all it now asserts.
-    "idle-workload": "Nothing has used this controller's CPU or memory for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
+    "idle-workload": "Nothing has used this controller's CPU or memory over the measured window the excerpt names, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
@@ -5224,7 +5246,7 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
         if age is None or age < IDLE_ADDRESS_MIN_AGE_DAYS:
             continue
         idle.append((addr, age))
-    if len(idle) >= 10:
+    if len(idle) >= IDLE_ADDRESS_ROLLUP_MIN:
         # §3.5's roll-up is per *project*, and §5 requires a roll-up to be named
         # after the scope it covers rather than after one of its members. It was
         # named `Address/rollup-<region of idle[0]>`: a region only the first
@@ -5379,7 +5401,8 @@ INTERNAL_SCHEME_PREFIX = "INTERNAL"
 
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
     hits = []
-    # The GKE service controller writes this description as a JSON object --
+    # `SERVICE_NAME_DESCRIPTION_RE`: the GKE service controller writes the
+    # description as a JSON object --
     # `{"kubernetes.io/service-name":"ns/name","kubernetes.io/api-version":"v1"}`
     # -- so the key is followed by a closing quote before the colon. A pattern
     # requiring `service-name:` therefore matched no real forwarding rule at
@@ -5387,11 +5410,10 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
     # orphaned-rule leg has never emitted a finding against a live fleet. The
     # optional quotes accept both that shape and the bare `key: value` form the
     # SOP's own example uses.
-    svc_name_re = re.compile(r"""kubernetes\.io/service-name["']?\s*:\s*["']?([\w.-]+/[\w.-]+)""")
     live_backends = {_backend_service_key(b) for b in backend_services if b.get("backends")}
     for rule in forwarding_rules:
         desc = rule.get("description", "") or ""
-        m = svc_name_re.search(desc)
+        m = SERVICE_NAME_DESCRIPTION_RE.search(desc)
         if not m:
             continue
         if "multiclusteringress" in desc.lower() or "multiclusterservice" in desc.lower():

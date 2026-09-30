@@ -133,7 +133,8 @@ NAP_ENTRY = {
     },
 }
 
-# A healthy tick. Matched by the SOP's log filter, carries neither arm.
+# A healthy tick. The SOP's log filter does not return it; it carries neither
+# arm, so an entry like it that arrives anyway must count for nothing.
 HEALTHY_ENTRY = {"timestamp": "2026-08-14T02:00:00Z", "jsonPayload": {"status": "ok"}}
 
 
@@ -1989,6 +1990,19 @@ class CollectClusterTest(unittest.TestCase):
         floor = [c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"]
         self.assertEqual([c["severity"] for c in floor], ["major"])
 
+    def test_a_non_production_workload_does_not_make_a_class_inference_referenced(self):
+        cc = compute_class("gpu-spot", [{"machineFamily": "a2", "spot": True}])
+        for name, ns, labels in (("vllm", "ml-dev", {}), ("serve-staging", "default", {}), ("vllm", "default", {"env": "qa"})):
+            with self.subTest(name=name, ns=ns, labels=labels):
+                gpu = deployment(
+                    name, ns=ns, node_selector={"cloud.google.com/compute-class": "gpu-spot"},
+                    containers=[{"name": "m", "image": "vllm/vllm-openai", "resources": {"limits": {"nvidia.com/gpu": 1}}}],
+                )
+                gpu["metadata"].setdefault("labels", {}).update(labels)
+                entry = self.run_with(dump_items=[cc, gpu])
+                floor = [c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"]
+                self.assertEqual([c["severity"] for c in floor], ["major"])
+
     def test_a_non_production_class_is_not_flagged_for_its_spot_floor(self):
         cc = compute_class("batch-staging", [{"machineFamily": "n2", "spot": True}])
         entry = self.run_with(dump_items=[cc])
@@ -2594,7 +2608,7 @@ class CrashIsolationTest(unittest.TestCase):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
-                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                if "boom" in str((kwargs.get("env") or {}).get("KUBECONFIG", "")):
                     raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
                 return run_of(0, json.dumps(dump_of()))
             if argv[:3] == ["gcloud", "container", "node-pools"]:
