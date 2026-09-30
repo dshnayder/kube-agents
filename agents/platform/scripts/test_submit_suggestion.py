@@ -572,6 +572,23 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 self.assertIn(code, said)
                 self.assertNotIn("has not used", said)
 
+    def test_a_credential_fault_on_the_delete_keeps_its_code_not_rename(self):
+        # The delete lists proposals before it pushes, and the forge can turn
+        # the credential away there. A new name meets the same refusal, so it
+        # is not advice; the code reaches the skill's own rule for it.
+        for code in ("FORGE_UNAUTHENTICATED", "FORGE_FORBIDDEN", "FORGE_REJECTED"):
+            with self.subTest(code=code):
+                branch = f"platform-agent/scale-web-{code.lower()}"
+                git(self.origin, "checkout", "--quiet", "-b", branch)
+                (self.origin / "app.yaml").write_text(f"replicas: {len(code) + 1}\n")
+                git(self.origin, "commit", "--quiet", "-am", "round one")
+                git(self.origin, "checkout", "--quiet", "main")
+                self.existing_proposal(branch)["state"] = "closed"
+                self.broker.delete_fails_with = vcs_client.VcsError("turned away", code=code)
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    self.prepare(branch)
+                self.assertEqual(caught.exception.code, code)
+
     def test_a_proposal_opened_before_the_delete_says_run_prepare_again(self):
         # `prepare` read no open proposal, then one was opened on the name
         # before the broker's own check. A second `prepare` joins it.

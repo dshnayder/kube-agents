@@ -386,6 +386,13 @@ RETRY_THE_DELETE = frozenset(
 WAIT_THEN_RETRY_THE_DELETE = frozenset({"FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"})
 # The `branch-view` read that comes before the delete failed the same way.
 READ_FAILED = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED"})
+# The delete's verdicts on the name itself, the only refusals a different name
+# answers. Anything else -- a credential the forge turned away on one of the
+# delete's own reads, say -- would meet a new name the same way, so it keeps
+# its code and the skill's rule for that code applies.
+NAME_REFUSED = frozenset(
+    {"BRANCH_NOT_OURS", "NOT_SPENT", "DELETE_REFUSED", "PROTECTED_BRANCH", "FORGE_UNSUPPORTED"}
+)
 
 
 def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, base: str) -> None:
@@ -470,6 +477,8 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
                 f"({refused.code}: {refused}). The name is still usable: wait a "
                 "few minutes, then run prepare again, which reads the branch afresh."
             ) from refused
+        if refused.code not in NAME_REFUSED:
+            raise
         raise ValueError(
             f"{spent_named}. The repository still holds the branch at "
             f"{revision[:12]}, so a change cut fresh from '{base}' does not build "
