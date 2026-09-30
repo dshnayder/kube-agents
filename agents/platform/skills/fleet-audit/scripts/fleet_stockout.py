@@ -216,13 +216,12 @@ NOTHING_COLLECTED_ERROR = (
     "its cluster listing, went unread past the deadline, or has the Compute Engine API off "
     "and no cluster. First: {first}"
 )
-# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
-# way a project yields nothing without recording why.
 # The opening of the note a filtered `projects list` leaves: the listing
 # succeeded, so like the `--project` note it says what a run may have
 # missed, never why nothing was collected.
 FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
-
+# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
+# way a project yields nothing without recording why.
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has the Compute Engine API off"
 )
@@ -240,6 +239,10 @@ SYSTEM_NAMESPACES = frozenset(
 )
 SYSTEM_NAMESPACE_PREFIXES = ("gke-", "config-management-")
 ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
+# The node label a workload selects a ComputeClass by, and a node pool
+# carries to serve one; and the GPU resource and taint key §3.9 reads.
+COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
+GPU_RESOURCE = "nvidia.com/gpu"
 OPT_OUT_LABEL = "kubeagents.x-k8s.io/stockout-audit"
 OPT_OUT_VALUE = "exempt"
 # §2's "non-production": one of these as a `-`/`_`-delimited token of a name,
@@ -534,11 +537,29 @@ class IncompleteEnumeration(RuntimeError):
 def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     """Whether an API-disabled refusal is `project`'s own; a copy of
     `fleet_waste.refusal_names_project`, which carries the reasoning."""
+    return refusal_owner(project, stderr, run=run)[0]
+
+
+def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
+    """`refusal_names_project`'s answer with why when it is no; a copy of
+    `fleet_waste.refusal_owner`, which carries the reasoning."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
+        if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
+            return True, ""
+        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
     described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    return described.rc == 0 and numbers == {described.stdout.strip()}
+    if described.rc != 0:
+        return False, (
+            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
+            f"number could not be compared with this project's: "
+            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+        )
+    if numbers == {described.stdout.strip()}:
+        return True, ""
+    return False, (
+        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
+    )
 
 
 def _describing_once(run: RunFn) -> RunFn:
@@ -568,12 +589,12 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     )
     if result.rc != 0:
         if _api_disabled(result):
-            if refusal_names_project(project, result.stderr, run=run):
+            ours, why_not = refusal_owner(project, result.stderr, run=run)
+            if ours:
                 log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
                 return [], []
             raise RuntimeError(
-                f"cluster enumeration refused (rc={result.rc}) by a Kubernetes Engine API that is off in a "
-                f"project other than {project!r}, such as a quota project, so this project's clusters are "
+                f"cluster enumeration refused (rc={result.rc}) and {why_not}, so this project's clusters are "
                 f"unknown: {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
             )
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
@@ -833,7 +854,7 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
     # delta alternates between them run to run.
     namespace = (workload.get("metadata") or {}).get("namespace", "")
     obj = f"{workload['kind']}/{workload['metadata']['name']}"
-    selector = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
+    selector = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
     if selector and selector not in compute_classes_by_name:
         return {"namespace": namespace, "object": obj, "excerpt": f"nodeSelector references ComputeClass {selector!r}, which does not exist"}
     if selector:
@@ -855,12 +876,12 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
         def _wants_gpu(container: dict) -> bool:
             resources = container.get("resources") or {}
             return any(
-                "nvidia.com/gpu" in (resources.get(field) or {})
+                GPU_RESOURCE in (resources.get(field) or {})
                 for field in ("requests", "limits")
             )
 
         requests_gpu = any(_wants_gpu(c) for c in template_spec.get("containers") or [])
-        tolerates_gpu = any(t.get("key") == "nvidia.com/gpu" for t in template_spec.get("tolerations") or [])
+        tolerates_gpu = any(t.get("key") == GPU_RESOURCE for t in template_spec.get("tolerations") or [])
         if requests_gpu and not tolerates_gpu:
             return {"namespace": namespace, "object": obj, "excerpt": f"GPU workload references ComputeClass {selector!r} without an nvidia.com/gpu toleration"}
     return None
@@ -1494,16 +1515,20 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     pools_readable = False
     if not autopilot:
         node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-        pools_result = run(node_pools_argv)
-        pools_readable = pools_result.rc == 0
-        node_pools = json.loads(pools_result.stdout) if pools_readable and pools_result.stdout.strip() else []
+        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        # Empty output at exit 0 is a cluster with no pools; output that does
+        # not parse to a list (the shim's cut, an error object) is a failed
+        # read, filed below as unevaluated rather than crashing the cluster.
+        pools_unreadable = pools_result.rc == 0 and bool(pools_result.stdout.strip()) and not isinstance(parsed_pools, list)
+        pools_readable = pools_result.rc == 0 and not pools_unreadable
+        node_pools = [p for p in parsed_pools if isinstance(p, dict)] if isinstance(parsed_pools, list) else []
         pools_record = _record(shlex.join(node_pools_argv), pools_result)
     has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
     # wrong field and never actually find the reference.
     node_pool_labels = (
-        {v for p in node_pools for v in [((p.get("config") or {}).get("labels") or {}).get("cloud.google.com/compute-class")] if v}
+        {v for p in node_pools for v in [((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)] if v}
         if pools_readable
         else None
     )
@@ -1536,7 +1561,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     cc_referenced_by_stateful = set()
     cc_referenced_by_hyperdisk = set()
     for sts in statefulsets:
-        cc_ref = ((sts.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("nodeSelector") or {}).get("cloud.google.com/compute-class")
+        cc_ref = ((sts.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
         if not cc_ref:
             continue
         # §3.5 flags "a stateful workload *using PersistentVolumes*" -- a
@@ -1561,7 +1586,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     for workload in workloads:
         spec = workload.get("spec") or {}
         template_spec = ((spec.get("template") or {}).get("spec")) or spec
-        cc_ref = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
+        cc_ref = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
         if cc_ref and _is_inference(template_spec):
             cc_referenced_by_inference.add(cc_ref)
 
@@ -1647,9 +1672,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
         pools_failure = (
-            f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
-            f"{pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
-        )
+            "`gcloud container node-pools list` returned output that is not a JSON list (rc=0) — "
+            if pools_result.rc == 0
+            else f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
+        ) + (pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
         unevaluated["single-zone-nodepool"] = pools_failure
         limitations.append(
             f"single-zone-nodepool could not be measured on this cluster: "
@@ -1714,11 +1740,19 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             "--project", project, "--format", "json",
         ]
         advice, advice_result = run_and_gate(advice_argv, run=run)
-        if advice_result.rc != 0:
+        # As with the autoscaler read: exit 0 with output that does not parse
+        # is a cut or garbled answer, not an empty history.
+        advice_unreadable = advice_result.rc == 0 and bool(advice_result.stdout.strip()) and advice is None
+        if advice_result.rc != 0 or advice_unreadable:
+            failure = (
+                "returned output that is not JSON (rc=0)"
+                if advice_unreadable
+                else f"failed (rc={advice_result.rc})"
+            )
             limitations.append(
                 f"spot-scarcity-risk could not be measured for {machine_type} in "
-                f"{region}: `gcloud beta compute advice capacity-history` failed "
-                f"(rc={advice_result.rc}) — {advice_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
+                f"{region}: `gcloud beta compute advice capacity-history` {failure} — "
+                f"{advice_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no stderr'}"
             )
             continue
         commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)

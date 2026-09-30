@@ -636,14 +636,8 @@ class FetchLbTrafficTest(unittest.TestCase):
 
 class OrphanPvTest(unittest.TestCase):
     def pv(self, phase, reclaim="Retain", **overrides):
-        doc = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": reclaim, "status.phase": phase, "spec.capacity": {"storage": "10Gi"}})
-        for path, value in overrides.items():
-            target = doc
-            keys = path.split(".")
-            for key in keys[:-1]:
-                target = target.setdefault(key, {})
-            target[keys[-1]] = value
-        return doc
+        defaults = {"spec.persistentVolumeReclaimPolicy": reclaim, "status.phase": phase, "spec.capacity": {"storage": "10Gi"}}
+        return obj("PersistentVolume", "pv-1", **{**defaults, **overrides})
 
     def context(self, pvs, pvcs=None, sts=None):
         return {"pvs": pvs, "pvcs": pvcs or [], "statefulsets": sts or []}
@@ -656,6 +650,15 @@ class OrphanPvTest(unittest.TestCase):
     def test_does_not_flag_released_under_7_days(self):
         pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-07-30T00:00:00Z"})
         self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
+
+    def test_an_addon_manager_label_excludes_the_pv(self):
+        """addon-manager stamps its mode as a label; the guard read only
+        annotations, so an addon's Retain volume was flagged."""
+        released = {"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"}
+        for where in ("labels", "annotations"):
+            with self.subTest(where=where):
+                pv = self.pv("Released", **released, **{f"metadata.{where}": {fw.ADDON_MANAGER_KEY: "Reconcile"}})
+                self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW), [])
 
     def test_delete_policy_is_never_flagged(self):
         pv = self.pv("Released", reclaim="Delete", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
@@ -2355,6 +2358,16 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
         self.assertIn("no resize can reclaim", hits[0]["excerpt"])
 
+    def test_an_hpa_target_is_not_idle(self):
+        """§3.13 applies §3.1's exclusions, the HPA one included: the HPA holds
+        its target at `minReplicas`, so a merged `replicas: 0` is undone on
+        the next sync."""
+        hpa = obj("HorizontalPodAutoscaler", "hpa", ns=self.NS, **{"spec.scaleTargetRef": {"kind": "Deployment", "name": "hello-world"}})
+        ctx = {**self.context(), "hpas": [hpa]}
+        self.assertEqual(fw.check_idle_workload(ctx, self.IDLE, now=NOW), [])
+        # Control: the same controller with no HPA is reported.
+        self.assertEqual(len(self.hits()), 1)
+
     def test_a_sub_floor_controller_is_not_described_as_on_the_floor(self):
         hits = self.hits({(self.NS, self.POD): (0.001, 3.0)}, pods=[self.pod(cpu_req="10m", mem_req="32Mi")])
         self.assertEqual(len(hits), 1)
@@ -3380,10 +3393,12 @@ class UnsizedWorkloadTest(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "minor")
 
     def test_a_request_naming_no_cpu_or_memory_is_unsized(self):
-        """`collect.py`'s `no-requests` files these three shapes as request-less
-        and defers the number here. Partitioned on whether `requests` was an
-        empty dict, they read as sized, every sizing check dropped them for
-        having no CPU or memory to compare, and nothing produced the number."""
+        """None of these names a nonzero CPU or memory request. Partitioned on
+        whether `requests` was an empty dict, they read as sized, every sizing
+        check dropped them for having no CPU or memory to compare, and nothing
+        produced the number. `collect.py`'s `no-requests` files the first two
+        as request-less; the declared `cpu: "0"` it passes, since it asks only
+        whether the key is present."""
         shapes = {
             "gpu-only": {"nvidia.com/gpu": "1"},
             "ephemeral-storage-only": {"ephemeral-storage": "1Gi"},
@@ -3468,7 +3483,7 @@ class UnsizedWorkloadTest(unittest.TestCase):
     def test_a_partially_sized_controller_belongs_to_the_sizing_checks(self):
         """One container with a request and one without is a pod the other two
         checks already measure, and `_eligible_pods_by_owner` admits it on
-        `any(requests)`. Claiming it here too would double-report it."""
+        `_declares_cpu_or_memory`. Claiming it here too would double-report it."""
         pod = self.pod(containers=[
             {"name": "main", "resources": {"requests": {"cpu": "100m"}}},
             {"name": "sidecar", "resources": {}},
@@ -5326,13 +5341,18 @@ class GetTargetProjectsTest(unittest.TestCase):
             fw.enumerate_clusters("acme", run=run)
 
     def test_a_refusal_whose_project_number_cannot_be_read_is_a_failed_list(self):
+        """And says the describe failed, with its stderr: calling it a quota
+        project sent the operator after the wrong setting."""
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "projects", "describe"]:
-                return run_of(1, "", "PERMISSION_DENIED")
+                return run_of(1, "", "PERMISSION_DENIED: resourcemanager.projects.get")
             return run_of(1, "", self.GKE_OFF.format(number="123456789"))
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as raised:
             fw.enumerate_clusters("acme", run=run)
+        self.assertIn("`gcloud projects describe acme` failed (rc=1)", str(raised.exception))
+        self.assertIn("resourcemanager.projects.get", str(raised.exception))
+        self.assertNotIn("quota project", str(raised.exception))
 
 
 def cluster_free_run(compute=None, registry=None, projects="acme\n"):
@@ -5538,6 +5558,26 @@ class ProjectReadScaleTest(unittest.TestCase):
             raise AssertionError(f"read a project after the deadline: {argv}")
 
         manifest = fw.collect_fleet(None, run=run, session=None, now=NOW, project_budget_s=0)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("2 project(s)", manifest["error"])
+        self.assertIn("not read:", manifest["error"])
+
+    def test_a_slow_project_listing_spends_the_read_budget(self):
+        """The clock starts before discovery, so a `projects list` that takes
+        the whole budget leaves none for the reads; a deadline taken after
+        discovery would read both projects and overrun the terminal timeout."""
+        clock = [0.0]
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                clock[0] += fw.PROJECT_READ_DEADLINE_S + 1
+                return run_of(0, "acme\nbeta\n")
+            raise AssertionError(f"read a project after the deadline: {argv}")
+
+        with patch.object(fw.time, "monotonic", lambda: clock[0]):
+            manifest = fw.collect_fleet(None, run=run, session=None, now=NOW)
         self.assertEqual(manifest["clusters"], [])
         self.assertIn("2 project(s)", manifest["error"])
         self.assertIn("not read:", manifest["error"])
@@ -6351,8 +6391,10 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 class DeclarationIndexIsACopyTest(unittest.TestCase):
     """`workload_declarations` and `declaration_for` are duplicated from
-    `collect.py`, because every collector here runs standalone under
-    `python3 <file>` and none imports a sibling.
+    `collect.py` rather than imported. Every collector here runs standalone
+    under `python3 <file>`; `fleet_stockout.py` imports a few leaf helpers
+    from its siblings, but this one keeps its own copy, for the reason
+    `fleet_waste.workload_declarations` gives.
 
     Duplication is the convention, and drift is what it costs: two collectors
     resolving the same object to different files, or one of them keeping a bug

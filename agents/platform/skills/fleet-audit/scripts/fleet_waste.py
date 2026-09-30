@@ -117,6 +117,9 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 ERROR_EXCERPT_CHARS = 300
+# §3.2's addon exclusion: addon-manager stamps this as a label; an
+# annotation is read too, as before.
+ADDON_MANAGER_KEY = "addonmanager.kubernetes.io/mode"
 # The shorter excerpt a stderr gets where it sits inside a longer sentence.
 DETAIL_EXCERPT_CHARS = 200
 # gcloud's words for a project whose Kubernetes Engine API is off. Such a
@@ -782,11 +785,31 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
     project cluster-free, so `finish` closed an audit that read no cluster. A
     refusal naming no project, or one this project's number cannot be read
     for, is a failed read."""
+    return refusal_owner(project, stderr, run=run)[0]
+
+
+def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
+    """`refusal_names_project`'s answer, with why when it is no: which project
+    the refusal named, or that this project's number could not be read. The
+    two call for different fixes -- a quota-project setting, or the describe
+    permission -- and collapsing them sent the operator after the wrong one."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        return re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr) is not None
+        if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
+            return True, ""
+        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
     described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    return described.rc == 0 and numbers == {described.stdout.strip()}
+    if described.rc != 0:
+        return False, (
+            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
+            f"number could not be compared with this project's: "
+            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+        )
+    if numbers == {described.stdout.strip()}:
+        return True, ""
+    return False, (
+        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
+    )
 
 
 def _describing_once(run: RunFn) -> RunFn:
@@ -821,12 +844,12 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
         # Discovery lists no project, so this is where a project whose
         # Kubernetes Engine API is off first answers: with no cluster.
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
-            if refusal_names_project(project, result.stderr, run=run):
+            ours, why_not = refusal_owner(project, result.stderr, run=run)
+            if ours:
                 log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
                 return [], []
             raise RuntimeError(
-                f"cluster enumeration refused (rc={result.rc}) by a Kubernetes Engine API that is off in a "
-                f"project other than {project!r}, such as a quota project, so this project's clusters are "
+                f"cluster enumeration refused (rc={result.rc}) and {why_not}, so this project's clusters are "
                 f"unknown: {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
             )
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
@@ -1668,7 +1691,7 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
         annotations = meta.get("annotations") or {}
         if any(k.startswith(prefix) for k in annotations for prefix in BACKUP_ANNOTATION_PREFIXES):
             continue
-        if annotations.get("addonmanager.kubernetes.io/mode"):
+        if (meta.get("labels") or {}).get(ADDON_MANAGER_KEY) or annotations.get(ADDON_MANAGER_KEY):
             continue
         phase = status.get("phase", "")
         claim_ref = spec.get("claimRef") or {}
@@ -3365,8 +3388,14 @@ def check_idle_workload(
         return []
     live_owners = _live_pod_owners(context)
     lr_defaults = _limitrange_defaults(context)
+    hpa_targets = _hpa_targets(context)
     hits = []
     for (_ns, kind, name), entry in _eligible_pods_by_owner(context, now=now).items():
+        # §3.1's HPA exclusion holds here too, for a sharper reason: the HPA
+        # cannot hold its target below `minReplicas`, so a merged
+        # `replicas: 0` is scaled straight back up on its next sync.
+        if (entry["ns"], kind, name) in hpa_targets:
+            continue
         # A controller the dump does not carry -- anything but a Deployment or
         # a StatefulSet -- has no age to test, and this check does not guess one
         # from its pods. Skipping is the safe direction: the cost of staying

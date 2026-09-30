@@ -1172,6 +1172,7 @@ class CollectClusterTest(unittest.TestCase):
         cluster=None,
         pools_rc=0,
         pools_stderr="denied",
+        pools_stdout=None,
         log_entries=None,
         log_rc=0,
         log_stderr="denied",
@@ -1179,6 +1180,7 @@ class CollectClusterTest(unittest.TestCase):
         advice=None,
         advice_rc=0,
         advice_stderr="denied",
+        advice_stdout=None,
     ):
         target = cluster or self.CLUSTER
         self.issued = []
@@ -1194,6 +1196,8 @@ class CollectClusterTest(unittest.TestCase):
                     return run_of(1, "", self.AUTOPILOT_NODE_POOLS_ERROR)
                 if pools_rc:
                     return run_of(pools_rc, "", pools_stderr)
+                if pools_stdout is not None:
+                    return run_of(0, pools_stdout, pools_stderr)
                 return run_of(0, json.dumps(list(pools)))
             if argv[:3] == ["gcloud", "logging", "read"]:
                 if log_rc:
@@ -1206,6 +1210,8 @@ class CollectClusterTest(unittest.TestCase):
             if argv[:5] == ["gcloud", "beta", "compute", "advice", "capacity-history"]:
                 if advice_rc:
                     return run_of(advice_rc, "", advice_stderr)
+                if advice_stdout is not None:
+                    return run_of(0, advice_stdout, advice_stderr)
                 machine_type = argv[argv.index("--machine-type") + 1]
                 body = advice(machine_type) if callable(advice) else advice
                 return run_of(0, json.dumps(body) if body is not None else "")
@@ -1477,6 +1483,20 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("n2-standard-8", entry["limitations"])
         self.assertIn("not enabled", entry["limitations"])
 
+    def test_a_truncated_advice_read_is_a_limitation_not_a_clean_shape(self):
+        """Same shim cut as the autoscaler read: exit 0, stdout that does not
+        parse. `run_and_gate` returns None for it, which read as "no history"
+        and published the shape as clean."""
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        truncated = json.dumps(capacity_history([0.05] * 10, "n2-standard-8"))[:-20]
+        entry = self.run_with(
+            dump_items=[cc], advice_stdout=truncated, advice_stderr="credential proxy output truncated"
+        )
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        self.assertIn("n2-standard-8", entry["limitations"])
+        self.assertIn("not JSON (rc=0)", entry["limitations"])
+        self.assertIn("credential proxy output truncated", entry["limitations"])
+
     def test_a_family_only_spot_chain_is_a_limitation_not_a_non_applicability(self):
         """The cluster does ask for Spot; the API just cannot be asked about it."""
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
@@ -1694,6 +1714,24 @@ class CollectClusterTest(unittest.TestCase):
             {"single-zone-nodepool", "spot-scarcity-risk"},
         )
         self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
+
+    def test_a_truncated_node_pool_read_is_unevaluated_not_gate_failed(self):
+        """A cut or non-list answer at exit 0 used to raise inside the pool
+        checks and fail the whole cluster's gate."""
+        truncated = json.dumps([{"name": "p1", "locations": ["us-central1-a"]}] * 3)[:-10]
+        for stdout in (truncated, json.dumps({"error": "shim"})):
+            with self.subTest(stdout=stdout[:20]):
+                entry = self.run_with(
+                    dump_items=[], pools_stdout=stdout, pools_stderr="credential proxy output truncated"
+                )
+                self.assertEqual(entry["outcome"], "collected")
+                self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+                self.assertIn("single-zone-nodepool", {e["check"] for e in entry["checks_unevaluated"]})
+                self.assertIn("not a JSON list (rc=0)", entry["limitations"])
+
+    def test_an_empty_node_pool_read_is_still_a_cluster_with_no_pools(self):
+        entry = self.run_with(dump_items=[], pools_stdout="")
+        self.assertNotIn("single-zone-nodepool", {e["check"] for e in entry.get("checks_unevaluated", [])})
 
     def test_a_failed_node_pool_read_beside_a_family_only_spot_class_is_unevaluated(self):
         # The family-only request is a limitation, but it says nothing about
@@ -2081,6 +2119,28 @@ class ProjectDiscoveryTest(unittest.TestCase):
         self.assertEqual(by_name["project/beta"]["outcome"], "gate-failed")
         self.assertIn("quota project", by_name["project/beta"]["error"])
 
+    def test_a_refusal_whose_project_number_cannot_be_read_names_the_describe(self):
+        """A describe the credential may not make is not a quota project; the
+        error said "quota project" for both and sent the operator after the
+        wrong setting."""
+        def cluster_list(project):
+            if project == "acme":
+                return run_of(1, "", "ERROR: SERVICE_DISABLED: Kubernetes Engine API has not been used in project 123456789")
+            return run_of(0, "[]")
+
+        base = fleet_run({}, cluster_list=cluster_list)
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return run_of(1, "", "PERMISSION_DENIED: resourcemanager.projects.get")
+            return base(argv, **kwargs)
+
+        by_name = {c["name"]: c for c in self.collect(run)["clusters"]}
+        error = by_name["project/acme"]["error"]
+        self.assertIn("`gcloud projects describe acme` failed (rc=1)", error)
+        self.assertIn("resourcemanager.projects.get", error)
+        self.assertNotIn("quota project", error)
+
     def test_a_project_with_both_apis_off_is_described_once(self):
         # Kubernetes Engine and Compute Engine both refuse, each naming the
         # project by number; the second refusal is answered from the first describe.
@@ -2162,6 +2222,25 @@ class ProjectDiscoveryTest(unittest.TestCase):
         for name in ("project/acme", "project/beta"):
             self.assertEqual(by_name[name]["outcome"], "gate-failed")
             self.assertTrue(by_name[name]["error"].startswith("not read:"))
+
+    def test_a_slow_project_listing_spends_the_read_budget(self):
+        """The clock starts before discovery: a `projects list` that takes the
+        whole budget leaves none for the reads, or listing plus reads overrun
+        the terminal timeout and the run is killed with no manifest. Taking
+        the deadline after discovery would collect this fleet."""
+        clock = [0.0]
+        base = fleet_run({"acme": ["c1"]})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                clock[0] += fs.PROJECT_READ_DEADLINE_S + 1
+            return base(argv, **kwargs)
+
+        with patch.object(fs.time, "monotonic", lambda: clock[0]):
+            manifest = self.collect_with(run)
+        self.assertEqual(manifest["clusters"], [])
+        self.assertIn("2 project(s) could not be listed", manifest["error"])
+        self.assertIn("not read:", manifest["error"])
 
     def test_an_error_across_many_projects_quotes_one_and_counts_the_rest(self):
         projects = "".join(f"p{i}\n" for i in range(200))
