@@ -2218,10 +2218,16 @@ def _safe_to_evict(annotations: dict) -> bool | None:
     return None
 
 
-def _local_volumes_all_safe(annotations: dict, local_names: list[str]) -> bool:
-    """Whether `safe-to-evict-local-volumes` lists every local volume."""
+def _blocking_local_storage(pod: dict) -> bool:
+    """Whether the pod's local storage pins its node under
+    `--skip-nodes-with-local-storage`: it has an `emptyDir` or `hostPath`
+    volume that `safe-to-evict-local-volumes` does not list. The pod-wide
+    `safe-to-evict` annotation is the caller's to weigh."""
+    volumes = (pod.get("spec") or {}).get("volumes") or []
+    local_names = {v.get("name", "") for v in volumes if "emptyDir" in v or "hostPath" in v}
+    annotations = (pod.get("metadata") or {}).get("annotations") or {}
     listed = {n.strip() for n in (annotations.get(SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION) or "").split(",") if n.strip()}
-    return bool(local_names) and set(local_names) <= listed
+    return bool(local_names - listed)
 
 
 def _expression_matches(expr: dict, labels: dict) -> bool:
@@ -2291,12 +2297,10 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
         annotations = meta.get("annotations") or {}
         if _safe_to_evict(annotations) is True:
             continue
-        volumes = (pod.get("spec") or {}).get("volumes") or []
-        local_names = [v.get("name", "") for v in volumes if "emptyDir" in v or "hostPath" in v]
         has_pdb = any(_selector_matches(sel, ns, labels) for sel in pdb_selectors)
         if ns == "kube-system" and not has_pdb:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
-        elif local_names and not _local_volumes_all_safe(annotations, local_names):
+        elif _blocking_local_storage(pod):
             blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
     return blockers
 
@@ -2331,7 +2335,7 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         owners = pod.get("metadata", {}).get("ownerReferences") or []
         annotations = pod.get("metadata", {}).get("annotations") or {}
         evictable = _safe_to_evict(annotations)
-        has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
+        has_local_storage = _blocking_local_storage(pod)
 
         # A PDB is not a reason this check reports -- obtainability-audit's
         # 3.3/3.4 own it -- but it is not a reason to skip the pod either. A

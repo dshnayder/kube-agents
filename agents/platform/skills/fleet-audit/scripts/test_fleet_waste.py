@@ -1331,6 +1331,20 @@ class ScaledownBlockedTest(unittest.TestCase):
         pod = obj("Pod", "debug", ns="ci", **{"spec.nodeName": "n1", "metadata.ownerReferences": [], "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: "true"}})
         self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
 
+    def test_local_volumes_listed_as_safe_do_not_pin_an_owned_pod(self):
+        """The autoscaler's per-volume form, as the §3.7 drain note reads it:
+        an owned pod whose every local volume is listed is evictable."""
+        for listed, expected in (("cache,logs", []), ("cache", ["major"])):
+            with self.subTest(listed=listed):
+                pod = obj(
+                    "Pod", "app", ns="default",
+                    **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}],
+                       "metadata.annotations": {fw.SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION: listed},
+                       "spec.volumes": [{"name": "cache", "emptyDir": {}}, {"name": "logs", "hostPath": {"path": "/l"}}]},
+                )
+                hits = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])
+                self.assertEqual([h["severity"] for h in hits], expected)
+
     def test_a_finished_bare_pod_is_not_a_blocker(self):
         """The autoscaler ignores a pod that has already exited."""
         for phase in ("Succeeded", "Failed"):
