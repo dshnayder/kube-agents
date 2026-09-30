@@ -1099,6 +1099,25 @@ class IdleNodepoolTest(unittest.TestCase):
         self.assertIn("other pools have 1.50 vCPU / 3.0 GiB unrequested on uncordoned nodes to absorb it",
                       hits[0]["excerpt"])
 
+    def test_two_idle_pools_do_not_count_each_other_as_room(self):
+        """Each excerpt counted the other idle pool's free capacity, so a
+        reader acting on both deleted the room each was told would absorb it."""
+        node_a, addons = self.small_node_with_addons("na", "pool-a")
+        node_b = self.node("nb", "pool-b", cpu_alloc="4", mem_alloc="8Gi")
+        busy = self.node("n2", "other", cpu_alloc="4", mem_alloc="8Gi")
+        pods = addons + [self.pod_on("n2", cpu_req="2", mem_req="4Gi", name="busy")]
+        context = {"nodes": [node_a, node_b, busy], "pods": pods}
+        pools = [self.pool("pool-a", machine_type="e2-small"), self.pool("pool-b"), self.pool("other")]
+        hits = {h["object"]: h["excerpt"] for h in fw.check_idle_nodepool(context, pools, now=NOW)}
+        self.assertEqual(set(hits), {"NodePool/pool-a", "NodePool/pool-b"})
+        for this, other in (("NodePool/pool-a", "NodePool/pool-b"), ("NodePool/pool-b", "NodePool/pool-a")):
+            with self.subTest(pool=this):
+                self.assertIn(
+                    f"other pools have 2.00 vCPU / 4.0 GiB unrequested on uncordoned nodes and not on {other}, "
+                    f"which this run also finds idle, to absorb it",
+                    hits[this],
+                )
+
     def test_the_headroom_leaves_out_cordoned_nodes(self):
         """A cordoned node accepts no pod, so its free capacity is not room
         for the drain: a surge upgrade that cordons `n3` must not count it."""
@@ -3099,6 +3118,17 @@ class UnderrequestTest(unittest.TestCase):
         self.assertIn("peak not read", hits[0]["excerpt"])
         self.assertNotIn("64Mi", hits[0]["excerpt"])
         self.assertIn("1265Mi", hits[0]["excerpt"])  # ceil(973 x 1.3)
+
+    def test_an_unread_peak_on_two_replicas_prints_no_per_replica_peak(self):
+        """The per-replica clause printed the mean relabelled as a peak a
+        sentence after "peak not read"."""
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        means = {("kubeagents-system", "litellm-1"): 973.0, ("kubeagents-system", "litellm-2"): 973.0}
+        peaks = {k: (0.05, None) for k in means}
+        [hit] = self.check(pods, means, peaks)
+        self.assertIn("peak not read", hit["excerpt"])
+        self.assertIn("GiB mean, and the manifest change is per replica", hit["excerpt"])
+        self.assertNotIn("GiB peak", hit["excerpt"])
 
     def test_a_container_with_no_memory_request_makes_the_mean_unattributable(self):
         pod = self.pod()
@@ -7317,6 +7347,11 @@ class RefusedProjectIdTest(unittest.TestCase):
         owned, reason = self.owner("ERROR: Project acme-prod is not found")
         self.assertFalse(owned)
         self.assertIn("names another project ('acme-prod')", reason)
+
+    def test_a_capitalised_project_keyword_naming_this_project_owns_it(self):
+        """The ownership test read only a lowercase keyword, so this refusal
+        was "names no project" although it names acme."""
+        self.assertEqual(self.owner("ERROR: SERVICE_DISABLED: Project acme is not found"), (True, ""))
 
 
 if __name__ == "__main__":

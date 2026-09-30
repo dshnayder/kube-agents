@@ -316,10 +316,22 @@ class CccMissingFallbacksTest(unittest.TestCase):
         cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
         self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc, cluster_zones=1))
 
-    def test_no_zone_where_the_cluster_span_is_unknown_is_flagged_and_says_so(self):
+    def test_no_zone_where_the_cluster_span_is_unknown_is_left_unevaluated(self):
+        """The span decides this chain, so it is not a finding either way."""
         cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
+        self.assertTrue(fs.check_ccc_missing_fallbacks(cc)["unevaluated"])
+
+    def test_one_shared_zone_is_flagged_whatever_the_span(self):
+        """Every priority names the same single zone: the span cannot rescue it."""
+        cc = compute_class("cc1", [{"machineFamily": f, "location": {"zones": ["us-central1-a"]}} for f in self.FAMILIES])
         hit = fs.check_ccc_missing_fallbacks(cc)
-        self.assertIn("the cluster's zones were not established", hit["excerpt"])
+        self.assertNotIn("unevaluated", hit)
+
+    def test_nothing_else_varied_is_flagged_whatever_the_span(self):
+        """One family, no zone: even a multi-zone span leaves one dimension."""
+        cc = compute_class("cc1", [{"machineFamily": "c3"}, {"machineFamily": "c3"}])
+        hit = fs.check_ccc_missing_fallbacks(cc)
+        self.assertNotIn("unevaluated", hit)
 
 
 class ClusterZoneSpanTest(unittest.TestCase):
@@ -2071,9 +2083,38 @@ class CollectClusterTest(unittest.TestCase):
         read = next(a for a in self.issued if a[:3] == ["gcloud", "logging", "read"])
         self.assertIn(f'resource.labels.location="{self.CLUSTER["location"]}"', read[3])
 
-    def test_a_full_autoscaler_page_says_the_window_was_cut(self):
+    def test_a_full_autoscaler_page_leaves_the_check_unevaluated(self):
+        """A limitations sentence alone left the check recorded as run, and
+        `finish` carries limitations only for an unevaluated check."""
         entry = self.run_with(dump_items=[], log_entries=[{"jsonPayload": {}}] * fs.AUTOSCALER_LOG_LIMIT)
         self.assertIn("older entries", entry["limitations"])
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+
+    def test_a_page_under_the_limit_is_recorded_as_run(self):
+        entry = self.run_with(dump_items=[], log_entries=[{"jsonPayload": {}}] * (fs.AUTOSCALER_LOG_LIMIT - 1))
+        self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {e["check"] for e in entry.get("checks_unevaluated", [])})
+
+    def test_an_unzoned_chain_on_unread_pools_is_unevaluated_not_critical(self):
+        """§3.1's own Do-NOT-flag chain, with the pools read failing."""
+        span_decides = compute_class("cc1", [{"machineFamily": f} for f in ("c3", "n4", "n2")])
+        pinned = compute_class("cc2", [{"machineFamily": "c3"}])
+        entry = self.run_with(dump_items=[span_decides, pinned], pools_rc=1)
+        fallbacks = [c["object"] for c in entry["candidates"] if c["check"] == "ccc-missing-fallbacks"]
+        self.assertEqual(fallbacks, ["ComputeClass/cc2"])
+        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == "ccc-missing-fallbacks"]
+        self.assertIn("ComputeClass/cc1", reason)
+        self.assertIn("node-pools list", reason)
+        self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+        self.assertIn("ccc-missing-fallbacks could not be judged", entry["limitations"])
+
+    def test_an_unzoned_chain_on_read_multi_zone_pools_is_run_and_clean(self):
+        span_decides = compute_class("cc1", [{"machineFamily": f} for f in ("c3", "n4", "n2")])
+        pools = [{"name": "p1", "locations": ["us-central1-a", "us-central1-b"]}]
+        entry = self.run_with(dump_items=[span_decides], pools=pools)
+        self.assertIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("ccc-missing-fallbacks", {c["check"] for c in entry["candidates"]})
 
     def test_every_capacity_read_failing_leaves_spot_unevaluated(self):
         cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
@@ -3122,6 +3163,11 @@ class RefusedProjectIdTest(unittest.TestCase):
         owned, reason = self.owner("ERROR: Project acme-prod is not found")
         self.assertFalse(owned)
         self.assertIn("names another project ('acme-prod')", reason)
+
+    def test_a_capitalised_project_keyword_naming_this_project_owns_it(self):
+        """The ownership test read only a lowercase keyword, so this refusal
+        was "names no project" although it names acme."""
+        self.assertEqual(self.owner("ERROR: SERVICE_DISABLED: Project acme is not found"), (True, ""))
 
 
 if __name__ == "__main__":

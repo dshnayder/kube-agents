@@ -669,6 +669,166 @@ IMPACT = {
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
+# `RECONCILING` is not a cluster you cannot read. GKE sets it while work is in
+# progress on an otherwise-operational cluster -- a control-plane upgrade, a
+# node-pool resize, a setting change -- and the API server stays up throughout.
+# It is also transient and ordinary: any config change puts a cluster there for
+# minutes, so an audit that happened to fire during one dropped that cluster
+# with no check evaluated against it. On the sixteen-cluster fleet that cost
+# the only cluster with more than one node pool, and so the only one where
+# `idle-nodepool` and `scaledown-blocked` can run at all, because a
+# `gcpPublicCidrsAccessEnabled` edit had left it reconciling.
+#
+# The cost of reading one is that node state may be mid-transition. That is
+# worth accepting rather than noting as a `limitations` string: a limitation
+# makes the run `partial`, a partial run closes no ledger, and on a fleet this
+# size with GitOps driving it something is reconciling often enough to pin the
+# stream partial for good. The checks that could see a half-finished node pool
+# already exclude `SchedulingDisabled` nodes and pools under seven days old,
+# and a finding that was only ever transient disappears from next week's run.
+#
+# `PROVISIONING` has no API server yet and `STOPPING` is on its way out; both
+# stay recorded rather than audited. A read that fails anyway still lands on
+# the existing per-cluster `unreachable`/`gate-failed` path.
+AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+# The markers a reconciling controller stamps on an object it owns. Duplicated
+# from `collect.reconciler_of` for the reason `declaration_for` below is: these
+# collectors are standalone scripts, and none imports a sibling collector at
+# module level.
+#
+# Helm 3 writes both halves of its pair on every object in a release, and the
+# release namespace is not the object's. Argo CD's tracking id is
+# `<application>:<group>/<Kind>:<namespace>/<name>`. `app.kubernetes.io/managed-by`
+# is the fallback and only the fallback: Helm sets it to the literal `Helm`,
+# which names no release.
+_HELM_RELEASE_ANNOTATION = "meta.helm.sh/release-name"
+_HELM_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
+_ARGOCD_TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
+_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+_HELM_MANAGED_BY = "helm"
+SECONDS_PER_DAY = 86400.0
+HOURS_PER_DAY = 24
+BACKUP_ANNOTATION_PREFIXES = ("velero.io/", "gke.io/backup-")
+ORPHAN_PV_RELEASED_DAYS = 7
+ORPHAN_PV_UNCLAIMED_DAYS = 30
+# Spans a deploy/rollback cycle and two runs of this weekly audit (SOP §3.3).
+UNCONSUMED_PVC_MIN_AGE_DAYS = 14
+MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem|hypermem)-(\d+)(?:-\w+)?$")
+CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
+# `a2-highgpu-1g`, `a2-ultragpu-8g`, `a3-megagpu-8g`, `ct5lp-hightpu-4t`. The
+# trailing number on an accelerator machine type counts GPUs or TPU chips, not
+# vCPUs, so the family cannot go in the pattern above: `highgpu` sat in it and
+# never matched anything, because the suffix is `8g` rather than `8`. Reading
+# the digit as a vCPU count would be worse than not matching -- `a3-highgpu-8g`
+# is a 208-vCPU machine and would have scored 8. Every member of these families
+# is far past the 8-vCPU line §3.7's severity rule draws, so they are answered
+# directly. `config.accelerators` covers most of them anyway, but not TPU pools:
+# a TPU node pool carries its topology, not an `accelerators` list, and §3.7 is
+# explicit that "an idle accelerator pool with a non-zero floor is the single
+# largest reclaimable item this audit can find".
+#
+# TPU v6e (`ct6e-standard-4t`) and TPU7x (`tpu7x-standard-4t`) name their
+# chips under `standard` instead, with a `t` suffix no vCPU-counted type
+# carries, so the second alternative admits exactly that shape.
+ACCELERATOR_MACHINE_RE = re.compile(
+    r"^[a-z0-9]+-(?:(?:high|ultra|mega)(?:gpu|tpu)-\d+[a-z]?|standard-\d+t)$"
+)
+# §3.7's severity legs: a pool this many nodes large, or of this machine size.
+IDLE_NODEPOOL_MAJOR_NODES = 3
+BIG_MACHINE_VCPUS = 8
+# How many drain-blocking pods the idle-pool excerpt names before it elides.
+BLOCKERS_NAMED = 3
+GC_OWNED_LABEL_PREFIXES = ("workflows.argoproj.io/", "tekton.dev/", "fluxcd.io/")
+#: A namespace holding this many terminal pods is flagged whatever their age
+#: (SOP §3.9).
+TERMINAL_PODS_PILE = 50
+#: How long a terminal pod or a finished Job is left before it is waste.
+TERMINAL_MIN_AGE_DAYS = 7
+#: `major` past these: etcd object growth and API-server list latency.
+TERMINAL_PODS_MAJOR_NS = 500
+TERMINAL_PODS_MAJOR_TOTAL = 2000
+#: A CronJob keeping more finished Jobs than this is flagged itself.
+CRONJOB_HISTORY_LIMIT_MAX = 10
+#: The Job conditions that mean "this Job is over". `SuccessCriteriaMet` is
+#: what a Job with a `successPolicy` gets instead of `Complete`.
+JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
+# A monthly release cycle, and a pre-provisioned environment awaiting its first
+# deploy (SOP §3.10).
+IDLE_NAMESPACE_MIN_AGE_DAYS = 30
+# §3.1's `major`: a reclaimable delta of a node's worth.
+NODE_WORTH_VCPU = 8
+NODE_WORTH_GIB = 32
+LB_ANNOTATION_KEYS = ("kubernetes.io/ingress.global-static-ip-name", "networking.gke.io/load-balancer-ip", "cloud.google.com/load-balancer-ip", "networking.gke.io/addresses")
+NON_WASTE_ADDRESS_PURPOSES = {"GCE_ENDPOINT", "VPC_PEERING", "PRIVATE_SERVICE_CONNECT", "NAT_AUTO", "SHARED_LOADBALANCER_VIP", "IPSEC_INTERCONNECT"}
+#: §3.4's floor for a disk whose owning cluster is still there. The SOP
+#: justifies it as outliving "node upgrades, pod rescheduling, and maintenance
+#: windows" -- a full monthly GKE maintenance cycle, after which a reattach is
+#: churn nobody should be paged about.
+UNATTACHED_AGE_DAYS = 30
+#: §3.4's `major` size, the SOP's ">=500 GiB of storage" magnitude.
+UNATTACHED_DISK_MAJOR_GB = 500
+#: §3.4's floor for a disk labelled for a cluster the project no longer runs.
+#: Every clause of the 30-day justification is about something reattaching the
+#: disk, and a deleted cluster reattaches nothing: there is no node pool to
+#: upgrade, no scheduler to move a pod, no maintenance window. What is left to
+#: outlive is the deletion itself -- GKE tears a cluster's PD-CSI volumes down
+#: asynchronously, and a `Delete`-policy disk can outlive its cluster by
+#: minutes -- plus the case where the same cluster is being recreated under the
+#: same name in the same sitting. A week covers both and still catches the
+#: waste three weeks before the 30-day floor would.
+DEAD_CLUSTER_AGE_DAYS = 7
+#: The label GKE stamps on every PD it provisions, naming the owning cluster.
+GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+# §3.4's managed-service exclusions.
+MANAGED_DISK_LABEL_PREFIXES = ("goog-composer", "goog-dataproc")
+GKE_NODE_DISK_LABEL = "goog-gke-node"
+#: The key PD-CSI writes into a provisioned disk's `description`, whose value is
+#: a JSON object naming the PersistentVolumeClaim the disk was cut for.
+CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
+#: How many of a roll-up's members the excerpt names before it stops. Enough to
+#: start on without opening the console; short of the point where one finding's
+#: evidence crowds the rest of the ledger out of the 60,000-character body §5
+#: warns about.
+ROLLUP_EXCERPT_MEMBERS = 12
+# Two weeks outlasts a typical cutover window (SOP §3.5).
+IDLE_ADDRESS_MIN_AGE_DAYS = 14
+#: Below this, a repository is not worth a finding whatever its policy. A
+#: registry is one of the few GCP resources whose cost is *only* size, so the
+#: threshold is the bill: 50 GiB is about $5/month of Artifact Registry storage,
+#: which is the order §3.5 already treats as `minor`, and a finding that
+#: recommends work costing more than it saves is noise. Nothing is lost
+#: permanently by setting it here rather than lower -- a repository with no
+#: policy only grows, so a smaller one crosses the floor and reports later.
+REGISTRY_SIZE_FLOOR_BYTES = 50 * 1024**3
+#: A repository is billed for what it holds, so the size that matters is what it
+#: will hold, not what it holds now. `major` needs a repository already large
+#: enough that a cleanup pass returns real money.
+REGISTRY_SIZE_MAJOR_BYTES = 500 * 1024**3
+#: Or growing fast enough to get there. Average daily growth is `sizeBytes` over
+#: the repository's age -- the only growth figure a single `list` can produce,
+#: and enough to separate a repository that filled up once from one a CI job is
+#: still pushing to. 2 GiB/day is 730 GiB a year.
+REGISTRY_GROWTH_MAJOR_BYTES_PER_DAY = 2 * 1024**3
+#: A repository younger than this has no history to clean. Its average-growth
+#: figure is also noise -- one day of pushes divided by one day of age reads as
+#: a runaway.
+REGISTRY_MIN_AGE_DAYS = 30
+#: Only a repository that stores its own artifacts. A `REMOTE_REPOSITORY` is a
+#: pull-through cache whose contents GCP evicts on its own schedule, and a
+#: `VIRTUAL_REPOSITORY` stores nothing at all -- it is a view over others, and
+#: `sizeBytes` on one double-counts the upstreams this check already reads.
+REGISTRY_BILLED_MODE = "STANDARD_REPOSITORY"
+BYTES_PER_GIB = 1024**3
+# The service controller tears LB resources down within minutes of the
+# Service; a week is far past that (SOP §3.6).
+ORPHAN_LB_MIN_AGE_DAYS = 7
+# The path segment of a forwarding rule's `target` that names a Private
+# Service Connect service attachment.
+SERVICE_ATTACHMENT_PATH = "/serviceAttachments/"
+# Every internal `loadBalancingScheme` starts with this: `INTERNAL`,
+# `INTERNAL_MANAGED`, `INTERNAL_SELF_MANAGED`.
+INTERNAL_SCHEME_PREFIX = "INTERNAL"
+
 
 def _is_system_namespace(ns: str) -> bool:
     return ns in SYSTEM_NAMESPACES or ns.startswith("gke-") or ns.startswith("config-management-")
@@ -833,30 +993,6 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     return projects, None
 
 
-# `RECONCILING` is not a cluster you cannot read. GKE sets it while work is in
-# progress on an otherwise-operational cluster -- a control-plane upgrade, a
-# node-pool resize, a setting change -- and the API server stays up throughout.
-# It is also transient and ordinary: any config change puts a cluster there for
-# minutes, so an audit that happened to fire during one dropped that cluster
-# with no check evaluated against it. On the sixteen-cluster fleet that cost
-# the only cluster with more than one node pool, and so the only one where
-# `idle-nodepool` and `scaledown-blocked` can run at all, because a
-# `gcpPublicCidrsAccessEnabled` edit had left it reconciling.
-#
-# The cost of reading one is that node state may be mid-transition. That is
-# worth accepting rather than noting as a `limitations` string: a limitation
-# makes the run `partial`, a partial run closes no ledger, and on a fleet this
-# size with GitOps driving it something is reconciling often enough to pin the
-# stream partial for good. The checks that could see a half-finished node pool
-# already exclude `SchedulingDisabled` nodes and pools under seven days old,
-# and a finding that was only ever transient disappears from next week's run.
-#
-# `PROVISIONING` has no API server yet and `STOPPING` is on its way out; both
-# stay recorded rather than audited. A read that fails anyway still lands on
-# the existing per-cluster `unreachable`/`gate-failed` path.
-AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-
-
 def not_running_entry(c: dict, project: str) -> dict:
     """A manifest target for a cluster whose state rules out auditing it.
 
@@ -912,7 +1048,9 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     permission -- and collapsing them sent the operator after the wrong one."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
+        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
+        # `Project acme` names acme as surely as `project acme` does.
+        if re.search(rf"\b(?i:projects?)[ /]{re.escape(project)}(?![\w-])", stderr):
             return True, ""
         others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
         if others:
@@ -1516,23 +1654,6 @@ def _by_kind(dump: dict, kind: str) -> list[dict]:
     return [i for i in dump.get("items", []) or [] if i.get("kind") == kind]
 
 
-# The markers a reconciling controller stamps on an object it owns. Duplicated
-# from `collect.reconciler_of` for the reason `declaration_for` below is: these
-# collectors are standalone scripts, and none imports a sibling collector at
-# module level.
-#
-# Helm 3 writes both halves of its pair on every object in a release, and the
-# release namespace is not the object's. Argo CD's tracking id is
-# `<application>:<group>/<Kind>:<namespace>/<name>`. `app.kubernetes.io/managed-by`
-# is the fallback and only the fallback: Helm sets it to the literal `Helm`,
-# which names no release.
-_HELM_RELEASE_ANNOTATION = "meta.helm.sh/release-name"
-_HELM_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
-_ARGOCD_TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
-_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
-_HELM_MANAGED_BY = "helm"
-
-
 def reconciler_of(meta: dict) -> str | None:
     """What continuously reasserts this object's spec, named, or None.
 
@@ -1708,10 +1829,6 @@ def _namespace_defaulted_dimensions(entry: dict, defaults: dict) -> frozenset[st
     return frozenset(defaulted)
 
 
-SECONDS_PER_DAY = 86400.0
-HOURS_PER_DAY = 24
-
-
 def _age_days(timestamp: str, *, now: datetime) -> float | None:
     if not timestamp:
         return None
@@ -1766,18 +1883,12 @@ def _ago(age: float | None) -> str:
 # 3.2 orphan-pv
 # --------------------------------------------------------------------------- #
 
-BACKUP_ANNOTATION_PREFIXES = ("velero.io/", "gke.io/backup-")
-
 
 def _matches_live_statefulset_pvc(claim_name: str, sts_names: set[str]) -> bool:
     """`<volumeClaimTemplate>-<statefulSet>-<ordinal>` for a StatefulSet that
     still exists is a scaled-to-zero StatefulSet's own claim, deliberate and
     never waste -- regardless of what the volumeClaimTemplate is named."""
     return any(re.match(rf"^.+-{re.escape(sts)}-\d+$", claim_name) for sts in sts_names if sts)
-
-
-ORPHAN_PV_RELEASED_DAYS = 7
-ORPHAN_PV_UNCLAIMED_DAYS = 30
 
 
 def _statefulsets_by_namespace(context: dict) -> dict[str, set[str]]:
@@ -1874,9 +1985,6 @@ def _is_large_or_ssd(spec: dict) -> bool:
 # 3.3 unconsumed-pvc
 # --------------------------------------------------------------------------- #
 
-# Spans a deploy/rollback cycle and two runs of this weekly audit (SOP §3.3).
-UNCONSUMED_PVC_MIN_AGE_DAYS = 14
-
 
 def _template_pod_spec(controller: dict) -> dict:
     """The pod spec a Job or CronJob will create, or `{}`."""
@@ -1964,39 +2072,12 @@ def _allocatable(node: dict) -> tuple[float, float]:
     return parse_cpu_cores(str(alloc.get("cpu", "0"))) or 0, parse_mem_mib(str(alloc.get("memory", "0"))) or 0
 
 
-MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem|hypermem)-(\d+)(?:-\w+)?$")
-CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
-# `a2-highgpu-1g`, `a2-ultragpu-8g`, `a3-megagpu-8g`, `ct5lp-hightpu-4t`. The
-# trailing number on an accelerator machine type counts GPUs or TPU chips, not
-# vCPUs, so the family cannot go in the pattern above: `highgpu` sat in it and
-# never matched anything, because the suffix is `8g` rather than `8`. Reading
-# the digit as a vCPU count would be worse than not matching -- `a3-highgpu-8g`
-# is a 208-vCPU machine and would have scored 8. Every member of these families
-# is far past the 8-vCPU line §3.7's severity rule draws, so they are answered
-# directly. `config.accelerators` covers most of them anyway, but not TPU pools:
-# a TPU node pool carries its topology, not an `accelerators` list, and §3.7 is
-# explicit that "an idle accelerator pool with a non-zero floor is the single
-# largest reclaimable item this audit can find".
-#
-# TPU v6e (`ct6e-standard-4t`) and TPU7x (`tpu7x-standard-4t`) name their
-# chips under `standard` instead, with a `t` suffix no vCPU-counted type
-# carries, so the second alternative admits exactly that shape.
-ACCELERATOR_MACHINE_RE = re.compile(
-    r"^[a-z0-9]+-(?:(?:high|ultra|mega)(?:gpu|tpu)-\d+[a-z]?|standard-\d+t)$"
-)
-
-
 def _machine_type_vcpus(machine_type: str) -> int | None:
     for pattern in (MACHINE_TYPE_VCPU_RE, CUSTOM_MACHINE_TYPE_VCPU_RE):
         m = pattern.match(machine_type or "")
         if m:
             return int(m.group(1))
     return None
-
-
-# §3.7's severity legs: a pool this many nodes large, or of this machine size.
-IDLE_NODEPOOL_MAJOR_NODES = 3
-BIG_MACHINE_VCPUS = 8
 
 
 def _is_big_machine(machine_type: str) -> bool:
@@ -2183,17 +2264,9 @@ def check_idle_nodepool(
         # It is pool-level arithmetic and takes no account of taints, node
         # selectors or zonal spread, hence the hedge in the wording: it is a
         # necessary condition for the drain, not a sufficient one. A cordoned
-        # node accepts no pod, so its free capacity is not counted.
+        # node accepts no pod, so its free capacity is not counted. Computed
+        # after the loop, once every idle pool is known: see `_absorbing_room`.
         pool_node_names = {n.get("metadata", {}).get("name", "") for n in nodes}
-        free_cpu = free_mem = 0.0
-        for other in context["nodes"]:
-            other_name = other.get("metadata", {}).get("name", "")
-            if other_name in pool_node_names or (other.get("spec") or {}).get("unschedulable"):
-                continue
-            other_cpu, other_mem = _allocatable(other)
-            used_cpu, used_mem = _sum_requests(all_pods_by_node.get(other_name, []))
-            free_cpu += max(0.0, other_cpu - used_cpu)
-            free_mem += max(0.0, other_mem - used_mem)
 
         # Whether the *graceful* path works at all. Lowering the floor to zero
         # asks the autoscaler to drain, and it will refuse for as long as one
@@ -2239,18 +2312,44 @@ def check_idle_nodepool(
         hits.append(
             {
                 "object": f"NodePool/{pool_name}",
-                "excerpt": (
+                "_excerpt_head": (
                     f"{len(nodes)} node(s), {machine_type}, {floor}: "
                     f"{occupancy} outside SYSTEM_NS. Counting the system add-ons the autoscaler "
                     f"also weighs, non-DS CPU is {cpu_pct * 100:.0f}% / mem {mem_pct * 100:.0f}% "
                     f"of allocatable ({cpu_req_total:.2f} vCPU / {mem_req_total / MIB_PER_GIB:.1f} GiB), "
-                    f"and the cluster's other pools have {free_cpu:.2f} vCPU / {free_mem / MIB_PER_GIB:.1f} GiB "
-                    f"unrequested on uncordoned nodes to absorb it — before taints, selectors and zonal spread, which "
-                    f"this figure does not model.{blocker_note}{taint_note}"
                 ),
+                "_excerpt_tail": f"{blocker_note}{taint_note}",
                 "severity": severity,
                 "_node_names": pool_node_names,
             }
+        )
+    return _absorbing_room(hits, context["nodes"], all_pods_by_node)
+
+
+def _absorbing_room(hits: list[dict], nodes: list[dict], all_pods_by_node: dict[str, list[dict]]) -> list[dict]:
+    """Finish each idle-pool excerpt with the room the rest of the cluster has.
+
+    Every pool this run finds idle is left out of that room, not only the one
+    the excerpt is about: with two idle pools each counted the other's free
+    capacity, so a reader acting on both findings deleted the capacity each was
+    told would absorb the other."""
+    idle_nodes = set().union(*(hit["_node_names"] for hit in hits))
+    free_cpu = free_mem = 0.0
+    for node in nodes:
+        name = node.get("metadata", {}).get("name", "")
+        if name in idle_nodes or (node.get("spec") or {}).get("unschedulable"):
+            continue
+        cpu, mem = _allocatable(node)
+        used_cpu, used_mem = _sum_requests(all_pods_by_node.get(name, []))
+        free_cpu += max(0.0, cpu - used_cpu)
+        free_mem += max(0.0, mem - used_mem)
+    for hit in hits:
+        others = sorted(h["object"] for h in hits if h is not hit)
+        excluded = f" and not on {', '.join(others)}, which this run also finds idle," if others else ""
+        hit["excerpt"] = (
+            f"{hit.pop('_excerpt_head')}and the cluster's other pools have {free_cpu:.2f} vCPU / "
+            f"{free_mem / MIB_PER_GIB:.1f} GiB unrequested on uncordoned nodes{excluded} to absorb it — before "
+            f"taints, selectors and zonal spread, which this figure does not model.{hit.pop('_excerpt_tail')}"
         )
     return hits
 
@@ -2365,10 +2464,6 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     return blockers
 
 
-# How many drain-blocking pods the idle-pool excerpt names before it elides.
-BLOCKERS_NAMED = 3
-
-
 def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[dict]:
     flagged_nodes: set[str] = set()
     for hit in idle_pool_hits:
@@ -2434,21 +2529,6 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
 # --------------------------------------------------------------------------- #
 # 3.9 terminal-pods
 # --------------------------------------------------------------------------- #
-
-GC_OWNED_LABEL_PREFIXES = ("workflows.argoproj.io/", "tekton.dev/", "fluxcd.io/")
-#: A namespace holding this many terminal pods is flagged whatever their age
-#: (SOP §3.9).
-TERMINAL_PODS_PILE = 50
-#: How long a terminal pod or a finished Job is left before it is waste.
-TERMINAL_MIN_AGE_DAYS = 7
-#: `major` past these: etcd object growth and API-server list latency.
-TERMINAL_PODS_MAJOR_NS = 500
-TERMINAL_PODS_MAJOR_TOTAL = 2000
-#: A CronJob keeping more finished Jobs than this is flagged itself.
-CRONJOB_HISTORY_LIMIT_MAX = 10
-#: The Job conditions that mean "this Job is over". `SuccessCriteriaMet` is
-#: what a Job with a `successPolicy` gets instead of `Complete`.
-JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
 
 
 def _job_finished_at(status: dict) -> str:
@@ -2528,10 +2608,6 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 3.10 idle-namespace
 # --------------------------------------------------------------------------- #
-
-# A monthly release cycle, and a pre-provisioned environment awaiting its first
-# deploy (SOP §3.10).
-IDLE_NAMESPACE_MIN_AGE_DAYS = 30
 
 
 def _is_retention_key(key: str) -> bool:
@@ -3129,11 +3205,6 @@ def _stands_down_instead_of_resizing(
     if age_days is None or age_days < IDLE_WORKLOAD_MIN_AGE_DAYS:
         return False
     return _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem)
-
-
-# §3.1's `major`: a reclaimable delta of a node's worth.
-NODE_WORTH_VCPU = 8
-NODE_WORTH_GIB = 32
 
 
 def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
@@ -3979,11 +4050,15 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # finding is about the scheduler's booking being inaccurate. Spell out
         # the per-replica arithmetic rather than trusting it to be redone.
         if replicas > 1:
+            # No peak clause where the peak was not read: `peak_mem` is then
+            # the mean, and printing it as a peak is a measurement never made.
+            peak_clause = (
+                "" if peak_per_replica is None else f" and a {peak_mem / replicas / MIB_PER_GIB:.2f} GiB peak"
+            )
             excerpt += (
                 f" Totals span {replicas} replicas — per replica that is "
                 f"{mem_req_total / replicas / MIB_PER_GIB:.2f} GiB requested against a "
-                f"{mean_mem / replicas / MIB_PER_GIB:.2f} GiB mean and a {peak_mem / replicas / MIB_PER_GIB:.2f} GiB "
-                f"peak, and the manifest change is per replica."
+                f"{mean_mem / replicas / MIB_PER_GIB:.2f} GiB mean{peak_clause}, and the manifest change is per replica."
             )
         hits.append(
             {
@@ -5069,9 +5144,6 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
 # Project-scoped GCP compute checks (3.4, 3.5, 3.6)
 # --------------------------------------------------------------------------- #
 
-LB_ANNOTATION_KEYS = ("kubernetes.io/ingress.global-static-ip-name", "networking.gke.io/load-balancer-ip", "cloud.google.com/load-balancer-ip", "networking.gke.io/addresses")
-NON_WASTE_ADDRESS_PURPOSES = {"GCE_ENDPOINT", "VPC_PEERING", "PRIVATE_SERVICE_CONNECT", "NAT_AUTO", "SHARED_LOADBALANCER_VIP", "IPSEC_INTERCONNECT"}
-
 
 def _idle_since(disk: dict) -> tuple[str, str]:
     """When the disk stopped being used, and how the excerpt should say it.
@@ -5095,33 +5167,6 @@ def _idle_since(disk: dict) -> tuple[str, str]:
         return str(detached), f"unattached since {detached}"
     created = disk.get("creationTimestamp", "")
     return str(created), f"never attached, created {created}"
-
-
-#: §3.4's floor for a disk whose owning cluster is still there. The SOP
-#: justifies it as outliving "node upgrades, pod rescheduling, and maintenance
-#: windows" -- a full monthly GKE maintenance cycle, after which a reattach is
-#: churn nobody should be paged about.
-UNATTACHED_AGE_DAYS = 30
-#: §3.4's `major` size, the SOP's ">=500 GiB of storage" magnitude.
-UNATTACHED_DISK_MAJOR_GB = 500
-#: §3.4's floor for a disk labelled for a cluster the project no longer runs.
-#: Every clause of the 30-day justification is about something reattaching the
-#: disk, and a deleted cluster reattaches nothing: there is no node pool to
-#: upgrade, no scheduler to move a pod, no maintenance window. What is left to
-#: outlive is the deletion itself -- GKE tears a cluster's PD-CSI volumes down
-#: asynchronously, and a `Delete`-policy disk can outlive its cluster by
-#: minutes -- plus the case where the same cluster is being recreated under the
-#: same name in the same sitting. A week covers both and still catches the
-#: waste three weeks before the 30-day floor would.
-DEAD_CLUSTER_AGE_DAYS = 7
-#: The label GKE stamps on every PD it provisions, naming the owning cluster.
-GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
-# §3.4's managed-service exclusions.
-MANAGED_DISK_LABEL_PREFIXES = ("goog-composer", "goog-dataproc")
-GKE_NODE_DISK_LABEL = "goog-gke-node"
-#: The key PD-CSI writes into a provisioned disk's `description`, whose value is
-#: a JSON object naming the PersistentVolumeClaim the disk was cut for.
-CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
 
 
 def _pvc_origin(disk: dict) -> str:
@@ -5326,17 +5371,6 @@ def _scope_flag(obj: dict) -> str:
     return f"--zone={location}" if obj.get("zone") else f"--region={location}"
 
 
-#: How many of a roll-up's members the excerpt names before it stops. Enough to
-#: start on without opening the console; short of the point where one finding's
-#: evidence crowds the rest of the ledger out of the 60,000-character body §5
-#: warns about.
-ROLLUP_EXCERPT_MEMBERS = 12
-
-
-# Two weeks outlasts a typical cutover window (SOP §3.5).
-IDLE_ADDRESS_MIN_AGE_DAYS = 14
-
-
 def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, project: str, now: datetime) -> list[dict]:
     hits = []
     idle = []
@@ -5379,40 +5413,6 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
     for addr, age in idle:
         hits.append({"object": _located("Address", addr), "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')}{_ago(age)} ({_scope_flag(addr)})", "severity": "minor"})
     return hits
-
-
-#: Below this, a repository is not worth a finding whatever its policy. A
-#: registry is one of the few GCP resources whose cost is *only* size, so the
-#: threshold is the bill: 50 GiB is about $5/month of Artifact Registry storage,
-#: which is the order §3.5 already treats as `minor`, and a finding that
-#: recommends work costing more than it saves is noise. Nothing is lost
-#: permanently by setting it here rather than lower -- a repository with no
-#: policy only grows, so a smaller one crosses the floor and reports later.
-REGISTRY_SIZE_FLOOR_BYTES = 50 * 1024**3
-
-#: A repository is billed for what it holds, so the size that matters is what it
-#: will hold, not what it holds now. `major` needs a repository already large
-#: enough that a cleanup pass returns real money.
-REGISTRY_SIZE_MAJOR_BYTES = 500 * 1024**3
-
-#: Or growing fast enough to get there. Average daily growth is `sizeBytes` over
-#: the repository's age -- the only growth figure a single `list` can produce,
-#: and enough to separate a repository that filled up once from one a CI job is
-#: still pushing to. 2 GiB/day is 730 GiB a year.
-REGISTRY_GROWTH_MAJOR_BYTES_PER_DAY = 2 * 1024**3
-
-#: A repository younger than this has no history to clean. Its average-growth
-#: figure is also noise -- one day of pushes divided by one day of age reads as
-#: a runaway.
-REGISTRY_MIN_AGE_DAYS = 30
-
-#: Only a repository that stores its own artifacts. A `REMOTE_REPOSITORY` is a
-#: pull-through cache whose contents GCP evicts on its own schedule, and a
-#: `VIRTUAL_REPOSITORY` stores nothing at all -- it is a view over others, and
-#: `sizeBytes` on one double-counts the upstreams this check already reads.
-REGISTRY_BILLED_MODE = "STANDARD_REPOSITORY"
-
-BYTES_PER_GIB = 1024**3
 
 
 def check_registry_no_cleanup(repositories: list[dict], *, project: str, now: datetime) -> list[dict]:
@@ -5493,17 +5493,6 @@ def _backend_service_url_key(url: str) -> tuple[str, str] | None:
     """`_backend_service_key` for a URL a forwarding rule names, or None."""
     m = BACKEND_SERVICE_URL_RE.search(url)
     return (m.group(1) or "", m.group(2)) if m else None
-
-
-# The service controller tears LB resources down within minutes of the
-# Service; a week is far past that (SOP §3.6).
-ORPHAN_LB_MIN_AGE_DAYS = 7
-# The path segment of a forwarding rule's `target` that names a Private
-# Service Connect service attachment.
-SERVICE_ATTACHMENT_PATH = "/serviceAttachments/"
-# Every internal `loadBalancingScheme` starts with this: `INTERNAL`,
-# `INTERNAL_MANAGED`, `INTERNAL_SELF_MANAGED`.
-INTERNAL_SCHEME_PREFIX = "INTERNAL"
 
 
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
@@ -5854,8 +5843,7 @@ def _prefetch_compute(p: str, *, run: RunFn, now: datetime, known_clusters: set[
         recorded[tuple(argv)] = result
         return result
 
-    empty_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
-    collect_project_compute(p, False, empty_facts, run=recording, now=now, known_clusters=known_clusters, forwarding_rules=forwarding_rules, announce=False)
+    collect_project_compute(p, False, empty_fleet_facts(), run=recording, now=now, known_clusters=known_clusters, forwarding_rules=forwarding_rules, announce=False)
     return recorded
 
 

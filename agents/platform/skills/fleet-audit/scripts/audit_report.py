@@ -915,10 +915,12 @@ TARGET_KIND_SUBNET = "subnet"
 PROJECT_TARGET_PREFIX = "project/"
 TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_SUBNET})
 # Set by the cost and stockout collectors on a `project/<id>` entry whose
-# `gcloud container clusters list` completed and came back empty -- never on a
-# failed or zone-incomplete one -- and carried verbatim onto that project's
-# `scope.clusters` entry. It is what tells a fleet with no clusters apart from
-# a run that lost them (`_unenumerated_kind_gaps`).
+# `gcloud container clusters list` completed and came back empty, or was
+# refused because that project's own Kubernetes Engine API is off -- no
+# cluster can exist there -- and never on any other failed or zone-incomplete
+# list. Carried verbatim onto that project's `scope.clusters` entry. It is
+# what tells a fleet with no clusters apart from a run that lost them
+# (`_unenumerated_kind_gaps`).
 CLUSTERS_LISTED_KEY = "clusters_listed"
 # The one manifest `outcome` under which the collector vouches for a cluster's
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —

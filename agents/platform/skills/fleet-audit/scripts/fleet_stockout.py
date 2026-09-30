@@ -186,6 +186,8 @@ PROJECT_TARGET_PREFIX = "project/"
 # A cluster the collector never read: not running, or its credentials failed.
 # The nothing-collected guard does not count it as read.
 UNREACHABLE_OUTCOME = "unreachable"
+GATE_FAILED_OUTCOME = "gate-failed"
+COLLECTED_OUTCOME = "collected"
 # On a `project/<id>` entry whose `clusters list` completed and came back
 # empty -- never a failed or zone-incomplete one. `audit_report.py` reads it
 # (as `CLUSTERS_LISTED_KEY`) to tell a fleet with no clusters from a run that
@@ -635,7 +637,7 @@ def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
     `fleet_waste.refusal_owner`, which carries the reasoning."""
     numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
     if not numbers:
-        if re.search(rf"\bprojects?[ /]{re.escape(project)}(?![\w-])", stderr):
+        if re.search(rf"\b(?i:projects?)[ /]{re.escape(project)}(?![\w-])", stderr):
             return True, ""
         others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
         if others:
@@ -881,8 +883,13 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     a multi-zone `c3` falling back to `n4` and `n2`, varies family and zone
     with every priority on the same zones. A priority reaches more than one
     zone if it lists two or more, or lists none on a cluster whose nodes span
-    more than one (`cluster_zones`, from `cluster_zone_span`). With the span
-    unknown an unzoned priority earns nothing, and the excerpt says so.
+    more than one (`cluster_zones`, from `cluster_zone_span`).
+
+    With the span unknown, a chain varying exactly one other dimension has a
+    verdict that turns on the span: the hit comes back with `unevaluated` set,
+    and the caller files the check unevaluated for the cluster rather than a
+    `critical` nobody established. A chain the span cannot rescue -- nothing
+    else varied, or every priority zoned -- is judged as usual.
     """
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities:
@@ -920,11 +927,13 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
     dimensions_varied = sum(1 for s in (families, spots, sizes) if len(s) > 1) + int(multi_zone)
     if dimensions_varied >= 2:
         return None
-    zone_note = "; the cluster's zones were not established" if unzoned and cluster_zones is None else ""
-    return {
+    hit = {
         "object": f"ComputeClass/{cc['metadata']['name']}",
-        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)}){zone_note}",
+        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
     }
+    if unzoned and cluster_zones is None and not multi_zone and dimensions_varied == 1:
+        hit["unevaluated"] = True
+    return hit
 
 
 def check_ccc_no_ondemand_floor(cc: dict, referenced_by_inference: bool) -> dict | None:
@@ -1621,7 +1630,7 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
         "location": cluster.get("location", "?"),
         "autopilot": bool(cluster.get("autopilot")),
         "has_nap": bool(cluster.get("has_nap")),
-        "outcome": "gate-failed",
+        "outcome": GATE_FAILED_OUTCOME,
         "error": f"collector raised {type(exc).__name__}: {exc}"[:ERROR_EXCERPT_CHARS],
     }
 
@@ -1651,11 +1660,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses,nodes", "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
+        return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
         # Parsed but not a List: read as `items: []` it would be a cluster with
         # nothing on it, audited clean.
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}
+        return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": "object dump gate failed: the answer has no `items` list"}
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
 
     items = parsed.get("items", [])
@@ -1711,6 +1720,13 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         pools_readable = pools_result.rc == 0 and not pools_unreadable
         node_pools = parsed_pools if pools_listed else []
         pools_record = _record(shlex.join(node_pools_argv), pools_result)
+    pools_failure = ""
+    if not autopilot and not pools_readable:
+        pools_failure = (
+            "`gcloud container node-pools list` returned output that is not a JSON list of node pools (rc=0) — "
+            if pools_result.rc == 0
+            else f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
+        ) + (pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
     has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
@@ -1796,12 +1812,15 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     ):
         commands[cc_slug] = dump_record
     cluster_zones = cluster_zone_span(cluster, node_pools, pools_readable)
+    span_decides: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
         non_production = is_non_production(cc_meta.get("name", ""), cc_meta.get("labels"))
         for hit in [check_ccc_missing_fallbacks(cc, cluster_zones)]:
-            if hit:
+            if hit and hit.get("unevaluated"):
+                span_decides.append(hit["object"])
+            elif hit:
                 candidates.append(_emit("ccc-missing-fallbacks", hit))
         if not non_production:
             for hit in [check_ccc_no_ondemand_floor(cc, cc_meta["name"] in cc_referenced_by_inference)]:
@@ -1873,11 +1892,6 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
-        pools_failure = (
-            "`gcloud container node-pools list` returned output that is not a JSON list of node pools (rc=0) — "
-            if pools_result.rc == 0
-            else f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
-        ) + (pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
         unevaluated["single-zone-nodepool"] = pools_failure
         if any(_reads_pool_labels(w, compute_classes_by_name) for w in workloads):
             # The nodePoolAutoCreation arm needs the pool labels this read
@@ -1896,6 +1910,25 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"{pools_failure}. The same failure left dangling-compute-class "
             f"without node pool labels, so its nodePoolAutoCreation arm did not "
             f"run either, and spot-scarcity-risk read no Spot node pool"
+        )
+
+    if span_decides:
+        # §3.1 with the zone span unread: these classes vary one dimension
+        # and name no zone, so they pass if the cluster spans several zones
+        # and fail if it spans one. Filed like single-zone-nodepool on the
+        # same failed read -- unevaluated, the other classes' findings still
+        # filing -- because a `critical` `manifest` candidate is what the
+        # automatic sweep opens a pull request for, and a caveat in its
+        # excerpt stops nothing.
+        span_gap = pools_failure or "the node pools list names no zone"
+        unevaluated["ccc-missing-fallbacks"] = (
+            f"{', '.join(span_decides)} vary one other dimension and name no zone, so the "
+            f"verdict turns on the cluster's zone span, which was not read: {span_gap}"
+        )
+        commands.pop("ccc-missing-fallbacks", None)
+        limitations.append(
+            f"ccc-missing-fallbacks could not be judged for {', '.join(span_decides)}: "
+            f"the node pools that give the cluster's zone span were not read ({span_gap})"
         )
 
     # §3.11. One read per cluster, and it is recorded whether or not it found
@@ -1933,7 +1966,17 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             candidates.append(_emit("autoscaler-out-of-resources", hit))
         if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
             # gcloud returns newest first, so a full page drops the oldest
-            # entries of the window, and a stockout among them is unseen.
+            # entries of the window, and a stockout among them is unseen. As
+            # with the Spot shapes past their ceiling: unevaluated, and what
+            # the page did show still files. `finish` carries `limitations`
+            # only for a check listed unevaluated, so a check recorded as run
+            # published the cut window complete -- and resolved any stockout
+            # the previous run saw in the part this one did not read.
+            unevaluated["autoscaler-out-of-resources"] = (
+                f"the read returned a full page of {AUTOSCALER_LOG_LIMIT} entries, so the "
+                f"oldest of the {AUTOSCALER_FRESHNESS} window were not read"
+            )
+            commands.pop("autoscaler-out-of-resources", None)
             limitations.append(
                 f"autoscaler-out-of-resources read the newest {AUTOSCALER_LOG_LIMIT} "
                 f"visibility-log entries, the read's limit; older entries in the "
@@ -2111,7 +2154,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
 
     entry = {
         "name": target, "project": project, "location": location, **mode,
-        "outcome": "collected",
+        "outcome": COLLECTED_OUTCOME,
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
@@ -2202,7 +2245,7 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
         "name": name,
         "project": project,
         "location": "global",
-        "outcome": "collected",
+        "outcome": COLLECTED_OUTCOME,
         "commands": commands,
         "candidates": candidates,
     }
@@ -2292,7 +2335,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             enumerated[futures[future]] = future.result()
     enumeration_failed = {p: r for p, r in enumerated.items() if isinstance(r, str)}
     discovery_entries = (
-        [{"name": UNENUMERATED_PROJECTS_TARGET, "project": "", "location": "global", "outcome": "gate-failed", "error": partial_discovery[:ERROR_EXCERPT_CHARS]}]
+        [{"name": UNENUMERATED_PROJECTS_TARGET, "project": "", "location": "global", "outcome": GATE_FAILED_OUTCOME, "error": partial_discovery[:ERROR_EXCERPT_CHARS]}]
         if partial_discovery
         else []
     )
@@ -2365,7 +2408,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             project_entries.append(read[0])
 
     failed_entries = [
-        {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": "gate-failed", "error": enumeration_failed[p]}
+        {"name": f"{PROJECT_TARGET_PREFIX}{p}", "project": p, "location": "global", "outcome": GATE_FAILED_OUTCOME, "error": enumeration_failed[p]}
         for p in projects
         if p in enumeration_failed
     ]
