@@ -720,6 +720,21 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("3 streams", out)
         self.assertIn("across 2 run streams", out)
 
+    def test_a_stream_on_two_repositories_counts_once_in_the_scope_line(self):
+        streams = self.two()
+        streams["cost-audit"]["repos"]["acme/other"] = {
+            "latest": latest(audit_id="cost-audit", repo="acme/other", clusters=9, skipped=2),
+            "runs": [],
+            "error": None,
+        }
+        scope = next(
+            line for line in view.plain(self.render(streams)).splitlines()
+            if line.strip().startswith("scope")
+        )
+        self.assertIn("9 units widest", scope)
+        self.assertIn("across 2 run streams", scope)
+        self.assertIn("2 skipped", scope)
+
     def test_a_stream_on_two_repositories_counts_once_in_the_gap_count(self):
         streams = {"cost-audit": stream(last=latest(audit_id="cost-audit", coverage_gaps=["a: b"]))}
         streams["cost-audit"]["repos"]["acme/other"] = {
@@ -807,6 +822,10 @@ class TestDashboard(unittest.TestCase):
         out = self.render(self.two())
         self.assertIn("PULL REQUESTS OPENED", out)
         self.assertIn("acme/fleet#9", out)
+        # The PRS cell's count is itself the link when there is only one.
+        coloured = self.render(self.two(), palette=view.Palette(True))
+        row = next(line for line in coloured.splitlines() if "cost-audit" in line and "│" in line)
+        self.assertIn("\x1b]8;;https://github.com/acme/fleet/pull/9\x1b\\1\x1b]8;;\x1b\\", row)
 
     def test_stream_filters_by_substring_and_says_what_it_hid(self):
         out = self.render(self.two(), patterns=("cost",))
@@ -1504,6 +1523,16 @@ class TestFormatting(unittest.TestCase):
         widths = terminal_table._resolve_widths(columns, rows, total)
         self.assertEqual(sum(widths), 40)
         self.assertEqual(widths, [5, 35])
+
+    def test_the_rounding_remainder_never_widens_a_column_past_its_content(self):
+        # Three equal wrap columns share 59 columns as 19 each, two short. The
+        # two go one apiece, and never to a column already at its content.
+        columns = [terminal_table.Column(t, wrap=True, min_width=12) for t in "ABC"]
+        rows = [[("x" * 20,), ("y" * 20,), ("z" * 20,)]]
+        total = 59 + terminal_table._overhead(3)
+        widths = terminal_table._resolve_widths(columns, rows, total)
+        self.assertEqual(sum(widths), 59)
+        self.assertEqual(sorted(widths), [19, 20, 20])
 
     def test_a_short_wrap_column_is_counted_at_its_content_when_fitting(self):
         # STATUS-like: min_width 11, content 5. The table fits at its natural

@@ -125,19 +125,35 @@ def _subdirs(path: str) -> list[str]:
         return sorted(entry.name for entry in entries if entry.is_dir())
 
 
-def _repo_dirs(root: str, audit_id: str) -> list[str]:
-    """Every `owner/name` directory under the stream, spelled as on disk."""
+def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
+    """Every `owner/name` directory under the stream, spelled as on disk, and
+    one failure line per owner directory that could not be listed.
+
+    An owner is listed on its own, so one unreadable owner (a different uid
+    or umask on the shared volume) costs only its own repositories, not its
+    readable siblings'. The stream directory's own failure other than absence
+    still propagates: then there is nothing to list at all.
+    """
     try:
         owners = _subdirs(os.path.join(root, audit_id))
     except FileNotFoundError:
-        return []
-    return [
-        f"{owner}/{name}"
-        for owner in owners
-        if REPO_SEGMENT_RE.match(owner)
-        for name in _subdirs(os.path.join(root, audit_id, owner))
-        if REPO_SEGMENT_RE.match(name)
-    ]
+        return [], []
+    dirs: list[str] = []
+    unreadable: list[str] = []
+    for owner in owners:
+        if not REPO_SEGMENT_RE.match(owner):
+            continue
+        try:
+            names = _subdirs(os.path.join(root, audit_id, owner))
+        except OSError as exc:
+            unreadable.append(_failure(f"{owner}/", exc))
+            continue
+        dirs.extend(f"{owner}/{name}" for name in names if REPO_SEGMENT_RE.match(name))
+    return dirs, unreadable
+
+
+def _repo_dirs(root: str, audit_id: str) -> list[str]:
+    return scan_repo_dirs(root, audit_id)[0]
 
 
 def repo_ids(root: str, audit_id: str) -> list[str]:
@@ -148,7 +164,9 @@ def repo_ids(root: str, audit_id: str) -> list[str]:
     memory is its own ledger's. Only lower-case directories count: the writer
     spells every one so and `store_path` opens nothing else, so a mixed-case
     one would list as a repository that never ran. `stray_repo_dirs` names
-    those. OSError other than absence propagates, as in `stream_ids`.
+    those. An owner directory that cannot be listed is left out here and
+    named by `scan_repo_dirs`; the stream directory's own OSError other than
+    absence propagates, as in `stream_ids`.
     """
     return [repo for repo in _repo_dirs(root, audit_id) if repo == repo.lower()]
 
@@ -452,11 +470,14 @@ def project_stream(
         started, error = None, _failure("the in-flight note", exc)
     repos: dict[str, dict] = {}
     try:
-        ids = repo_ids(root, audit_id)
-        strays = stray_repo_dirs(root, audit_id)
+        dirs, unreadable = scan_repo_dirs(root, audit_id)
     except OSError as exc:
-        ids, strays = [], []
+        dirs, unreadable = [], []
         error = error or _failure(f"{audit_id}/", exc)
+    ids = [repo for repo in dirs if repo == repo.lower()]
+    strays = [repo for repo in dirs if repo != repo.lower()]
+    if unreadable:
+        error = error or "; ".join(unreadable)
     if strays:
         error = error or f"{', '.join(strays)}: not lower-case, so no reader opens it"
     any_latest = None

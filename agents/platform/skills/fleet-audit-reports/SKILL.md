@@ -163,9 +163,9 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
   `latest.json` before it rewrites the ledger, and after the clean close lands (the close leaves
   the body as it was), so a run that fails partway leaves no superseded envelope reading as
   current; the ring stays, and answers come from it flagged `latest_missing`. After a failed clean
-  close the newest ring entry can be a `FINDINGS` run whose issue is now closed, and a human can
-  close one by hand: either way it is not the open ledger. Check the issue's state, or say the
-  findings are as of that run.
+  close the newest ring entry can be an `OPENED` or `UPDATED` run whose issue is now closed, and a
+  human can close one by hand: either way it is not the open ledger. Check the issue's state, or say
+  the findings are as of that run.
   **No stored run means unknown, not clean** — say the store has no record, and read the ledger
   issue.
 

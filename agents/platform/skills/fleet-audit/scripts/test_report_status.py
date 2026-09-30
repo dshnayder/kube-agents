@@ -123,6 +123,22 @@ class TestProjection(ReportStatusTestCase):
         self.assertIn("Zeta/Fleet: not lower-case", stream["error"])
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_one_unreadable_owner_keeps_its_readable_siblings(self):
+        # Owner directories created by different uids on one volume: the
+        # unreadable owner is named, and the other owner's store still shows.
+        self.write_latest()
+        locked = self.root / AUDIT / "zeta"
+        (locked / "fleet").mkdir(parents=True)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        stream = self.project()["streams"][AUDIT]
+        self.assertEqual(sorted(stream["repos"]), [REPO])
+        self.assertEqual(stream["repos"][REPO]["latest"]["findings"], 2)
+        self.assertEqual(stream["liveness"], "error")
+        self.assertIn("zeta/: ", stream["error"])
+        self.assertEqual(report_status.repo_ids(str(self.root), AUDIT), [REPO])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-000 directory")
     def test_an_unreadable_scratch_is_an_error_not_nothing_in_flight(self):
         self.write_latest()
         self.write_note(age_s=60)

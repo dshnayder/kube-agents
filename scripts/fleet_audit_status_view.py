@@ -1167,17 +1167,21 @@ def header_lines(
             ),
         )
     )
-    scopes = [
-        e["latest"]["clusters"]
-        for e in ran
-        if isinstance(e["latest"].get("clusters"), int)
-    ]
+    # One scope per stream, not per row: a stream on two repositories is two
+    # rows, and counting both would report it as two run streams and weigh its
+    # scope twice in the median. The stream's widest row stands for it.
+    stream_scopes: dict[str, int] = {}
+    stream_skips: dict[str, int] = {}
+    for e in ran:
+        clusters = e["latest"].get("clusters")
+        if isinstance(clusters, int):
+            stream_scopes[e["audit_id"]] = max(clusters, stream_scopes.get(e["audit_id"], clusters))
+        skips = e["latest"].get("skipped")
+        if isinstance(skips, int):
+            stream_skips[e["audit_id"]] = max(skips, stream_skips.get(e["audit_id"], skips))
+    scopes = list(stream_scopes.values())
     if scopes:
-        skipped = sum(
-            e["latest"].get("skipped") or 0
-            for e in ran
-            if isinstance(e["latest"].get("skipped"), int)
-        )
+        skipped = sum(stream_skips.values())
         # Widest, not summed: the streams overlap almost entirely -- nearly
         # all of them audit the same fleet -- so a total would report one
         # 16-cluster fleet as 150 clusters audited. The widest run is the

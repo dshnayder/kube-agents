@@ -17393,12 +17393,17 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["ledger_body"], previous)
 
     def test_a_findings_run_whose_store_write_fails_drops_the_memory(self):
-        # Seeded first, so the assertion below needs the drop to pass.
+        # Seeded first, so the assertion below needs the drop to pass. The
+        # pre-edit invalidation is patched out: it drops the same file before
+        # the body is rewritten, and left in, it would pass this test with
+        # `write_report`'s own drop deleted.
         audit_report.write_report(AUDIT, self.envelope(), NOW)
         self.assertTrue((self.store_dir() / "latest.json").exists())
         self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+        with patch.object(audit_report, "invalidate_report_memory"), patch.object(
+            audit_report, "_atomic_write", side_effect=OSError("disk full")
+        ):
             self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         self.assertFalse((self.store_dir() / "latest.json").exists())
 

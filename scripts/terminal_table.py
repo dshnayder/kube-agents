@@ -350,10 +350,16 @@ def _resolve_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[
     for i in flex:
         widths[i] = max(minimum[i], int(room * (natural[i] / share)))
     # Integer division loses a column or two of the budget; hand the remainder
-    # to the widest flexible column rather than leaving the table short.
+    # out a column at a time, widest first, rather than leaving the table
+    # short. Never past a column's natural width: the columns share the
+    # truncation, so a lump on one would push it wider than its content.
     drift = room - sum(widths[i] for i in flex)
-    if drift > 0:
-        widths[max(flex, key=lambda i: widths[i])] += drift
+    while drift > 0:
+        short = [i for i in flex if widths[i] < natural[i]]
+        if not short:
+            break
+        widths[max(short, key=lambda i: widths[i])] += 1
+        drift -= 1
     # Clamping a narrow column up to its minimum overspends the budget; take
     # the excess back from the columns above theirs, widest first. `room >=
     # floor` above guarantees there is enough slack to cover it.
