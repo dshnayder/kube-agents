@@ -80,6 +80,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -191,6 +192,9 @@ REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
 # The read `refusal_names_project` makes; `collect_fleet` answers a repeat of
 # it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
+# §3.8's read. Its answer depends on region and machine type only, so
+# `_advising_once` answers a repeat from the first success.
+CAPACITY_HISTORY_ARGV = ["gcloud", "beta", "compute", "advice", "capacity-history"]
 # gcloud's word for a zone that timed out during `clusters list`: the command
 # still exits 0, with the clusters the other zones returned and this line on
 # stderr, so the silent zone's clusters would read as nonexistent. See
@@ -223,12 +227,12 @@ NOTHING_COLLECTED_ERROR = (
 # succeeded, so like the `--project` note it says what a run may have
 # missed, never why nothing was collected.
 FILTERED_LISTING_NOTE = "`gcloud projects list` rc=0 did not name the active project"
-# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
-# way a project yields nothing without recording why.
 # Appended to the every-project-failed error when discovery itself failed:
 # the active-project fallback is why the run held one project to fail, and the
 # error is the one line §2 tells the worker to report.
 DISCOVERY_FAILED_SUFFIX = "; project discovery also failed: {error}"
+# `NOTHING_COLLECTED_ERROR`'s `first` when no target carries an error: the one
+# way a project yields nothing without recording why.
 NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has the Compute Engine API off"
 )
@@ -250,14 +254,17 @@ ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
 # carries to serve one; and the GPU resource and taint key §3.9 reads.
 COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
 GPU_RESOURCE = "nvidia.com/gpu"
-# GKE's built-in compute classes: selected through the same nodeSelector key,
-# but provided by GKE rather than defined as `ComputeClass` objects, so a dump
-# that lacks them does not mean the reference dangles. `autopilot*` are the
-# classes GKE pre-installs as objects on Autopilot, listed in case a dump or a
-# Standard cluster lacks them. Compared lower-cased.
-BUILT_IN_COMPUTE_CLASSES = frozenset(
-    {"balanced", "scale-out", "performance", "accelerator", "autopilot", "autopilot-arm", "autopilot-spot"}
+# GKE's built-in compute classes, as GKE documents them: selected through the
+# same nodeSelector key, but provided by GKE rather than defined as
+# `ComputeClass` objects, so a dump that lacks them does not mean the reference
+# dangles. Matched exactly, because a nodeSelector value is case-sensitive and
+# `balanced` selects nothing. Autopilot provides all of them; a Standard
+# cluster provides only the two it can run Autopilot workloads through, so a
+# Standard workload selecting `Balanced` stays Pending.
+AUTOPILOT_BUILT_IN_COMPUTE_CLASSES = frozenset(
+    {"Balanced", "Scale-Out", "Performance", "Accelerator", "autopilot", "autopilot-arm", "autopilot-spot"}
 )
+STANDARD_BUILT_IN_COMPUTE_CLASSES = frozenset({"autopilot", "autopilot-spot"})
 OPT_OUT_LABEL = "kubeagents.x-k8s.io/stockout-audit"
 OPT_OUT_VALUE = "exempt"
 # §2's "non-production": one of these as a `-`/`_`-delimited token of a name,
@@ -595,6 +602,40 @@ def _describing_once(run: RunFn) -> RunFn:
     return wrapped
 
 
+def _advising_once(run: RunFn) -> RunFn:
+    """`run`, answering a repeated `capacity-history` read from its first
+    successful answer.
+
+    The advice is keyed on project, region and machine type, none of them
+    per-cluster, but the read is issued per cluster: a fleet of N clusters in
+    one region asking about one Spot shape paid N identical calls. Clusters
+    are read in parallel, so unlike `_describing_once` a lock per argv makes
+    the racers wait for the first answer instead of each asking. A failed
+    answer is not kept, so a transient failure on one cluster's read leaves
+    the next cluster free to ask again; the cache lives only as long as the
+    `collect_fleet` call that made it.
+    """
+    answers: dict[tuple[str, ...], Run] = {}
+    locks: dict[tuple[str, ...], threading.Lock] = {}
+    guard = threading.Lock()
+
+    def wrapped(argv: list[str], **kwargs) -> Run:
+        if argv[: len(CAPACITY_HISTORY_ARGV)] != CAPACITY_HISTORY_ARGV:
+            return run(argv, **kwargs)
+        key = tuple(argv)
+        with guard:
+            lock = locks.setdefault(key, threading.Lock())
+        with lock:
+            if key in answers:
+                return answers[key]
+            result = run(argv, **kwargs)
+            if result.rc == 0:
+                answers[key] = result
+            return result
+
+    return wrapped
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
@@ -850,7 +891,18 @@ def check_ccc_hyperdisk_incompatible(cc: dict, uses_hyperdisk: bool) -> dict | N
     return None
 
 
-def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str] | None) -> dict | None:
+def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict]) -> bool:
+    """Whether `check_dangling_compute_class`'s nodePoolAutoCreation arm
+    applies to `workload`: it selects an existing ComputeClass whose
+    auto-creation is not on, so only the node pool labels can clear it."""
+    spec = workload.get("spec") or {}
+    template_spec = ((spec.get("template") or {}).get("spec")) or spec
+    selector = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
+    cc = compute_classes_by_name.get(selector) if selector else None
+    return cc is not None and ((cc.get("spec") or {}).get("nodePoolAutoCreation") or {}).get("enabled") is not True
+
+
+def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str] | None, *, autopilot: bool = False) -> dict | None:
     """`node_pool_labels` is `None` when the pool labels are unknown -- an
     Autopilot cluster with no user node pools, or a `node-pools list` the
     caller could not read -- and a set, possibly empty, when they are known.
@@ -871,7 +923,8 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
     obj = f"{workload['kind']}/{workload['metadata']['name']}"
     selector = (template_spec.get("nodeSelector") or {}).get(COMPUTE_CLASS_LABEL)
     if selector and selector not in compute_classes_by_name:
-        if selector.lower() in BUILT_IN_COMPUTE_CLASSES:
+        built_ins = AUTOPILOT_BUILT_IN_COMPUTE_CLASSES if autopilot else STANDARD_BUILT_IN_COMPUTE_CLASSES
+        if selector in built_ins:
             # GKE provides it and provisions its nodes, so neither the dangling
             # arm nor the node-pool arm below has anything to compare against.
             return None
@@ -977,7 +1030,7 @@ def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
     return per_zone * zones, f"maxNodeCount {per_zone}/zone x {zones} zones"
 
 
-def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int, *, multi_zone_pool: bool = False) -> dict | None:
+def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int, *, multi_zone_machine_types: frozenset[str] = frozenset()) -> dict | None:
     """`current_node_count` must be the pool's *live* node count (counted
     from the cluster's own `Node` objects, grouped by the
     `cloud.google.com/gke-nodepool` label) -- `initialNodeCount` is a
@@ -991,26 +1044,35 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     stopped for a reason that has nothing to do with supply. Both conditions
     hold, so both are reported.
 
-    `multi_zone_pool` is whether any pool on the cluster spans more than one
-    zone. §3.9's zone-locked arm is cluster-level -- no NAP *and* no
-    multi-zone pool -- so a zonal pool beside a multi-zone one is spared, and
-    the excerpt's "no multi-zone node pool" is a fact this call was given
-    rather than one it asserted.
+    `multi_zone_machine_types` holds the machine type of every pool on the
+    cluster that spans more than one zone. A zonal pool is spared only when
+    one of them is its own machine type and it carries no taints: that pool
+    is somewhere its pods can go when the zone stocks out. Any multi-zone pool
+    used to spare every zonal one, which let a GPU pool pinned to one zone
+    beside a regional default pool pass -- the zone-locked pool this check is
+    for. The excerpt names what was tested, a fact this call was given.
     """
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
+    config = pool.get("config") or {}
+    machine_type = config.get("machineType") or ""
+    taints = config.get("taints") or []
+    fallback = bool(machine_type) and machine_type in multi_zone_machine_types and not taints
     # Exactly one: an empty `locations` is an unknown zone span, as
     # `_pool_ceiling` reads it, not a pool locked to a zone.
-    zone_locked = len(locations) == 1 and autoscaling.get("enabled") and not has_nap and not multi_zone_pool
+    zone_locked = len(locations) == 1 and autoscaling.get("enabled") and not has_nap and not fallback
     ceiling, basis = _pool_ceiling(autoscaling, locations)
     at_ceiling = bool(ceiling) and current_node_count >= NODEPOOL_CEILING_FRACTION * ceiling
     if not zone_locked and not at_ceiling:
         return None
     excerpts, impacts = [], []
     if zone_locked:
-        excerpts.append(
-            f"single-zone ({locations}), autoscaling enabled, no NAP and no multi-zone node pool on the cluster"
-        )
+        if taints:
+            keys = ", ".join(sorted({str(t.get("key", "")) for t in taints if isinstance(t, dict)}))
+            why = f"tainted ({keys}), so no other pool is counted as its fallback"
+        else:
+            why = f"no multi-zone node pool of machine type {machine_type or 'unknown'} on the cluster"
+        excerpts.append(f"single-zone ({locations}), autoscaling enabled, no NAP, {why}")
         impacts.append(_IMPACT_ZONE_LOCKED)
     if at_ceiling:
         # Name the arm and the zone span. This condition has nothing to do with
@@ -1658,7 +1720,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
 
     commands["dangling-compute-class"] = dump_record
     for workload in workloads:
-        for hit in [check_dangling_compute_class(workload, compute_classes_by_name, node_pool_labels)]:
+        for hit in [check_dangling_compute_class(workload, compute_classes_by_name, node_pool_labels, autopilot=autopilot)]:
             if hit:
                 candidates.append(_emit("dangling-compute-class", hit))
 
@@ -1690,10 +1752,14 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
-        multi_zone_pool = any(len(pool.get("locations") or []) > 1 for pool in node_pools)
+        multi_zone_machine_types = frozenset(
+            (pool.get("config") or {}).get("machineType") or ""
+            for pool in node_pools
+            if len(pool.get("locations") or []) > 1
+        ) - {""}
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
-            for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_pool=multi_zone_pool)]:
+            for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_machine_types=multi_zone_machine_types)]:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
     else:
@@ -1703,6 +1769,18 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             else f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
         ) + (pools_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
         unevaluated["single-zone-nodepool"] = pools_failure
+        if any(_reads_pool_labels(w, compute_classes_by_name) for w in workloads):
+            # The nodePoolAutoCreation arm needs the pool labels this read
+            # would have given, and a workload here selects a class it applies
+            # to, so recording the check as run claimed an arm nobody ran. As
+            # with the Spot shapes below: unevaluated, and the missing-class
+            # arm's findings still file.
+            unevaluated["dangling-compute-class"] = (
+                f"a workload selects a ComputeClass with nodePoolAutoCreation "
+                f"disabled, and the node pool labels that arm compares against "
+                f"were not read: {pools_failure}"
+            )
+            commands.pop("dangling-compute-class", None)
         limitations.append(
             f"single-zone-nodepool could not be measured on this cluster: "
             f"{pools_failure}. The same failure left dangling-compute-class "
@@ -1759,10 +1837,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     region = region_of(location)
     spot_hits: dict[str, dict] = {}
     failed_shapes: list[str] = []
+    unmeasured_shapes: list[str] = []
     answered_shapes: list[str] = []
     for machine_type in sorted(shapes)[:SPOT_MAX_SHAPES]:
         advice_argv = [
-            "gcloud", "beta", "compute", "advice", "capacity-history",
+            *CAPACITY_HISTORY_ARGV,
             "--region", region, "--machine-type", machine_type,
             "--provisioning-model", "SPOT", "--types", "PREEMPTION,PRICE",
             "--project", project, "--format", "json",
@@ -1784,12 +1863,19 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             )
             failed_shapes.append(machine_type)
             continue
-        answered_shapes.append(machine_type)
         commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)
         # The live read returned a bare object (the module docstring's shape);
         # a list of one is unwrapped as well, here rather than in the helpers,
         # so they take the shape the API documents.
         first = advice[0] if isinstance(advice, list) and advice else advice
+        # An empty answer, one with no preemptionHistory, or one too thin to
+        # average read successfully and measured nothing: the shape is as
+        # unchecked as one whose read failed.
+        rate, intervals = mean_preemption_rate(first)
+        if rate is None or intervals < SPOT_MIN_INTERVALS:
+            unmeasured_shapes.append(machine_type)
+        else:
+            answered_shapes.append(machine_type)
         hit, limitation = check_spot_scarcity(machine_type, shapes[machine_type], region, first)
         if hit:
             hit["command"] = shlex.join(advice_argv)
@@ -1804,20 +1890,36 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             limitations.append(limitation)
     candidates += [_emit("spot-scarcity-risk", hit) for hit in spot_hits.values()]
     unread_shapes = sorted(shapes)[SPOT_MAX_SHAPES:]
-    if shapes and not answered_shapes:
-        unevaluated["spot-scarcity-risk"] = "every capacity-history read for this cluster's Spot shapes failed"
-    elif failed_shapes or unread_shapes:
-        # A shape that failed or was never read is a shape nobody checked, and
-        # `finish` carries `limitations` only for a check listed unevaluated,
-        # so recording the check as run on the shapes that answered published
-        # an all-clear for the rest. As with the regional quota reads: the
-        # check is unevaluated, and the answered shapes' findings still file.
-        gaps = []
+    unqueryable, unpinned, inert = spot_without_a_shape(
+        compute_classes,
+        node_pools if pools_readable else [],
+        brokered=autopilot or bool(cluster.get("has_nap")),
+    )
+    gaps = []
+    if shapes:
+        # Every Spot request the check did not measure is one nobody checked,
+        # and `finish` carries `limitations` only for a check listed
+        # unevaluated, so recording the check as run on the shapes that
+        # answered published an all-clear for the rest. As with the regional
+        # quota reads: the check is unevaluated, and the answered shapes'
+        # findings still file. A failed pools read is the same gap one step
+        # earlier: the shapes came from ComputeClasses alone, and every Spot
+        # node pool's shape went unasked.
+        if not autopilot and not pools_readable:
+            gaps.append("the node pools could not be read, so no Spot node pool's shape was asked about")
         if failed_shapes:
             gaps.append(f"capacity-history reads failed: {', '.join(failed_shapes)}")
+        if unmeasured_shapes:
+            gaps.append(
+                f"capacity-history returned under {SPOT_MIN_INTERVALS} days of preemption history: "
+                f"{', '.join(unmeasured_shapes)}"
+            )
         if unread_shapes:
             gaps.append(f"not read past the {SPOT_MAX_SHAPES}-shape ceiling: {', '.join(unread_shapes)}")
-        unevaluated["spot-scarcity-risk"] = f"{'; '.join(gaps)}; answered: {', '.join(answered_shapes)}"
+        if unqueryable:
+            gaps.append(f"Spot requests naming no machine type, which capacity-history cannot query: {', '.join(unqueryable)}")
+    if gaps:
+        unevaluated["spot-scarcity-risk"] = f"{'; '.join(gaps)}; answered: {', '.join(answered_shapes) or 'none'}"
         commands.pop("spot-scarcity-risk", None)
     if unread_shapes:
         limitations.append(
@@ -1825,11 +1927,6 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"{len(shapes)} distinct Spot machine shapes; the rest were not "
             f"measured: {', '.join(unread_shapes)}"
         )
-    unqueryable, unpinned, inert = spot_without_a_shape(
-        compute_classes,
-        node_pools if pools_readable else [],
-        brokered=autopilot or bool(cluster.get("has_nap")),
-    )
     if unqueryable:
         limitations.append(
             f"spot-scarcity-risk could not be measured for Spot requests that "
@@ -2024,7 +2121,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
     # `projects list` spends the same terminal timeout the reads do.
     deadline = time.monotonic() + project_budget_s
-    run = _describing_once(run)
+    run = _advising_once(_describing_once(run))
 
     def failed(error: str) -> dict:
         # The manifest contract's top-level `error`: a run that enumerated

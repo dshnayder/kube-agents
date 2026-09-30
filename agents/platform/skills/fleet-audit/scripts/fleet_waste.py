@@ -326,6 +326,7 @@ NO_SESSION_MESSAGE = (
 )
 MONITORING_TIMEOUT_S = 120
 MONITORING_TIMESERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+HTTP_OK = 200
 MONITORING_PAGE_SIZE = "2000"
 #: The failure a 200 whose body is not a JSON object reports. `ApiSession.get`
 #: hands back a bare `requests.Response`, so a misbehaving intermediary's HTML
@@ -340,6 +341,8 @@ CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # Pod phases that do not count as a running replica of their controller.
 NOT_A_REPLICA_PHASES = ("Pending", "Failed", "Succeeded")
+# A pod younger than an hour has not settled into the usage it will run at.
+POD_SETTLE_DAYS = 1 / 24
 # `used_bytes` is split by `memory_type`, and the `evictable` half is page
 # cache the kernel reclaims under pressure. Kubelet evicts on the working set,
 # so summing the two would size requests, and flag underrequest, on cache.
@@ -360,9 +363,11 @@ LB_EGRESS_BYTES_METRIC = "loadbalancing.googleapis.com/l3/external/egress_bytes_
 # series totalling 743,426 packets where the resource grouping returned three,
 # the largest of them 374,158.
 LB_RULE_LABEL = "resource.labels.forwarding_rule_name"
+# §3.13's fifth traffic shape: ingress above the floor with an outbound series
+# missing, so what the workload sent back is not known.
+LB_EGRESS_UNMEASURED = "{what} is unmeasured, because Cloud Monitoring holds no outbound series for the rule"
 # A query pair made only of characters a URL carries unescaped, which a
 # Monitoring label may therefore pass as `-d` rather than `--data-urlencode`.
-LB_EGRESS_UNMEASURED = "{what} is unmeasured, because Cloud Monitoring holds no outbound series for the rule"
 URL_SAFE_PAIR_RE = re.compile(r"^[A-Za-z0-9._~:-]+=[A-Za-z0-9._~:-]+$")
 # A rule name is unique only per region, and `forwarding-rules list` returns
 # every region, so the answer is grouped by region too: grouped by name alone,
@@ -909,12 +914,15 @@ CPU_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
 MEM_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$")
 
 
+MILLICORES_PER_CORE = 1000.0
+
+
 def parse_cpu_cores(s: str) -> float | None:
     m = CPU_RE.match((s or "").strip())
     if not m:
         return None
     value, unit = m.groups()
-    return float(value) / 1000.0 if unit == "m" else float(value)
+    return float(value) / MILLICORES_PER_CORE if unit == "m" else float(value)
 
 
 BYTES_PER_MIB = 1024.0 * 1024.0
@@ -1106,7 +1114,7 @@ def _read_pod_series(
             response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
         except Exception as exc:
             return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
-        if response.status_code != 200:
+        if response.status_code != HTTP_OK:
             return {}, (response.status_code, f"{metric}: {response.text}")
         body = _json_body(response)
         if body is None:
@@ -1305,7 +1313,7 @@ def _read_lb_series(
             response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
         except Exception as exc:
             return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
-        if response.status_code != 200:
+        if response.status_code != HTTP_OK:
             return {}, (response.status_code, f"{metric}: {response.text}")
         body = _json_body(response)
         if body is None:
@@ -1627,6 +1635,10 @@ def _namespace_defaulted_dimensions(entry: dict, defaults: dict) -> frozenset[st
     return frozenset(defaulted)
 
 
+SECONDS_PER_DAY = 86400.0
+HOURS_PER_DAY = 24
+
+
 def _age_days(timestamp: str, *, now: datetime) -> float | None:
     if not timestamp:
         return None
@@ -1634,7 +1646,7 @@ def _age_days(timestamp: str, *, now: datetime) -> float | None:
         ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return (now - ts).total_seconds() / 86400.0
+    return (now - ts).total_seconds() / SECONDS_PER_DAY
 
 
 def _whole_days(age: float) -> int:
@@ -1789,6 +1801,9 @@ def _is_large_or_ssd(spec: dict) -> bool:
 # 3.3 unconsumed-pvc
 # --------------------------------------------------------------------------- #
 
+# Spans a deploy/rollback cycle and two runs of this weekly audit (SOP §3.3).
+UNCONSUMED_PVC_MIN_AGE_DAYS = 14
+
 
 def _template_pod_spec(controller: dict) -> dict:
     """The pod spec a Job or CronJob will create, or `{}`."""
@@ -1832,7 +1847,7 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
         if any(k.startswith("configsync.gke.io/") for k in annotations):
             continue
         age = _age_days(meta.get("creationTimestamp", ""), now=now)
-        if age is None or age < 14:
+        if age is None or age < UNCONSUMED_PVC_MIN_AGE_DAYS:
             continue
         capacity = (status.get("capacity") or {}).get("storage", "0")
         gib = _gib(capacity)
@@ -1906,11 +1921,16 @@ def _machine_type_vcpus(machine_type: str) -> int | None:
     return None
 
 
+# §3.7's severity legs: a pool this many nodes large, or of this machine size.
+IDLE_NODEPOOL_MAJOR_NODES = 3
+BIG_MACHINE_VCPUS = 8
+
+
 def _is_big_machine(machine_type: str) -> bool:
     """§3.7's "machine type of >= 8 vCPU, or attached accelerators" severity leg."""
     if ACCELERATOR_MACHINE_RE.match(machine_type or ""):
         return True
-    return (_machine_type_vcpus(machine_type) or 0) >= 8
+    return (_machine_type_vcpus(machine_type) or 0) >= BIG_MACHINE_VCPUS
 
 
 def node_pool_creation_ages(operations: object, cluster: str, *, now: datetime) -> dict[str, float]:
@@ -2080,7 +2100,7 @@ def check_idle_nodepool(
 
         machine_type = ((pool.get("config") or {}).get("machineType") or "")
         has_accelerator = bool((pool.get("config") or {}).get("accelerators"))
-        severity = "major" if len(nodes) >= 3 or _is_big_machine(machine_type) or has_accelerator else "minor"
+        severity = "major" if len(nodes) >= IDLE_NODEPOOL_MAJOR_NODES or _is_big_machine(machine_type) or has_accelerator else "minor"
 
         # Everything the pool holds has to land somewhere before a node drains,
         # and that includes the add-ons the gate above deliberately ignores. A
@@ -2111,8 +2131,8 @@ def check_idle_nodepool(
         blockers = _drain_blockers(pool_pods, _pdb_selectors(context))
         blocker_note = (
             f" Draining will not happen on its own: {len(blockers)} pod(s) on these nodes are ones "
-            f"the cluster autoscaler refuses to evict ({', '.join(blockers[:3])}"
-            + (", …" if len(blockers) > 3 else "")
+            f"the cluster autoscaler refuses to evict ({', '.join(blockers[:BLOCKERS_NAMED])}"
+            + (", …" if len(blockers) > BLOCKERS_NAMED else "")
             + "), so lowering the floor reclaims nothing and deleting the pool is the remediation "
             "that works."
             if blockers
@@ -2149,8 +2169,8 @@ def check_idle_nodepool(
                     f"{len(nodes)} node(s), {machine_type}, {floor}: "
                     f"{occupancy} outside SYSTEM_NS. Counting the system add-ons the autoscaler "
                     f"also weighs, non-DS CPU is {cpu_pct * 100:.0f}% / mem {mem_pct * 100:.0f}% "
-                    f"of allocatable ({cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB), "
-                    f"and the cluster's other pools have {free_cpu:.2f} vCPU / {free_mem / 1024.0:.1f} GiB "
+                    f"of allocatable ({cpu_req_total:.2f} vCPU / {mem_req_total / MIB_PER_GIB:.1f} GiB), "
+                    f"and the cluster's other pools have {free_cpu:.2f} vCPU / {free_mem / MIB_PER_GIB:.1f} GiB "
                     f"unrequested to absorb it — before taints, selectors and zonal spread, which "
                     f"this figure does not model.{blocker_note}{taint_note}"
                 ),
@@ -2259,6 +2279,10 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     return blockers
 
 
+# How many drain-blocking pods the idle-pool excerpt names before it elides.
+BLOCKERS_NAMED = 3
+
+
 def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[dict]:
     flagged_nodes: set[str] = set()
     for hit in idle_pool_hits:
@@ -2322,6 +2346,16 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
 # --------------------------------------------------------------------------- #
 
 GC_OWNED_LABEL_PREFIXES = ("workflows.argoproj.io/", "tekton.dev/", "fluxcd.io/")
+#: A namespace holding this many terminal pods is flagged whatever their age
+#: (SOP §3.9).
+TERMINAL_PODS_PILE = 50
+#: How long a terminal pod or a finished Job is left before it is waste.
+TERMINAL_MIN_AGE_DAYS = 7
+#: `major` past these: etcd object growth and API-server list latency.
+TERMINAL_PODS_MAJOR_NS = 500
+TERMINAL_PODS_MAJOR_TOTAL = 2000
+#: A CronJob keeping more finished Jobs than this is flagged itself.
+CRONJOB_HISTORY_LIMIT_MAX = 10
 #: The Job conditions that mean "this Job is over". `SuccessCriteriaMet` is
 #: what a Job with a `successPolicy` gets instead of `Complete`.
 JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
@@ -2367,9 +2401,9 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
     for ns, pods in by_ns.items():
         oldest = min((p.get("metadata", {}).get("creationTimestamp", "") for p in pods), default="")
         oldest_age = _age_days(oldest, now=now)
-        old_enough = any((_age_days(p.get("metadata", {}).get("creationTimestamp", ""), now=now) or 0) >= 7 for p in pods)
-        if len(pods) >= 50 or old_enough:
-            severity = "major" if len(pods) > 500 or total > 2000 else "minor"
+        old_enough = any((_age_days(p.get("metadata", {}).get("creationTimestamp", ""), now=now) or 0) >= TERMINAL_MIN_AGE_DAYS for p in pods)
+        if len(pods) >= TERMINAL_PODS_PILE or old_enough:
+            severity = "major" if len(pods) > TERMINAL_PODS_MAJOR_NS or total > TERMINAL_PODS_MAJOR_TOTAL else "minor"
             hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": f"{len(pods)} terminal pods, oldest from {oldest}{_ago(oldest_age)}", "severity": severity})
 
     for job in context["jobs"]:
@@ -2387,7 +2421,7 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
         if not (status.get("succeeded") or status.get("failed")):
             continue
         age = _age_days(done, now=now)
-        if age is None or age < 7:
+        if age is None or age < TERMINAL_MIN_AGE_DAYS:
             continue
         hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, no ttlSecondsAfterFinished", "severity": "minor"})
 
@@ -2396,7 +2430,7 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
         ns = meta.get("namespace", "")
         if _is_system_namespace(ns):
             continue
-        if (spec.get("successfulJobsHistoryLimit") or 0) > 10:
+        if (spec.get("successfulJobsHistoryLimit") or 0) > CRONJOB_HISTORY_LIMIT_MAX:
             hits.append({"namespace": ns, "object": f"CronJob/{meta.get('name', '')}", "excerpt": f"successfulJobsHistoryLimit={spec.get('successfulJobsHistoryLimit')}", "severity": "minor"})
     return hits
 
@@ -2404,6 +2438,10 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 3.10 idle-namespace
 # --------------------------------------------------------------------------- #
+
+# A monthly release cycle, and a pre-provisioned environment awaiting its first
+# deploy (SOP §3.10).
+IDLE_NAMESPACE_MIN_AGE_DAYS = 30
 
 
 def _is_retention_key(key: str) -> bool:
@@ -2413,6 +2451,12 @@ def _is_retention_key(key: str) -> bool:
 
 
 def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
+    """Namespaces with no Running/Pending pod that still hold a billable object.
+
+    The pod dump is a snapshot, so what it measures is "no pod now". The age is
+    the namespace's own, from `creationTimestamp`; nothing here records when its
+    last pod stopped, and the excerpt says only what was read.
+    """
     active_ns = {
         p.get("metadata", {}).get("namespace", "")
         for p in context["pods"]
@@ -2459,7 +2503,7 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         if name in cronjob_ns:
             continue
         age = _age_days(ns_obj.get("metadata", {}).get("creationTimestamp", ""), now=now)
-        if age is None or age < 30:
+        if age is None or age < IDLE_NAMESPACE_MIN_AGE_DAYS:
             continue
         billable = name in lb_ns or pvc_gib_by_ns.get(name, 0) > 0
         if not billable:
@@ -2480,11 +2524,11 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         # LoadBalancer holds no PVCs and still prints "0", which the excerpt
         # names the LoadBalancer alongside so the reason is never absent.
         gib_text = str(whole_gib) if whole_gib or not gib else "<1"
-        severity = "major" if name in lb_ns or whole_gib >= 100 else "minor"
+        severity = "major" if name in lb_ns or whole_gib >= LARGE_VOLUME_GIB else "minor"
         hits.append(
             {
                 "object": f"Namespace/{name}",
-                "excerpt": f"no Running/Pending pods for {_whole_days(age)}d; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{gib_text} GiB of PVCs",
+                "excerpt": f"no Running/Pending pods now; namespace created {_whole_days(age)}d ago; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{gib_text} GiB of PVCs",
                 "severity": severity,
             }
         )
@@ -2598,7 +2642,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         if status.get("phase") in NOT_A_REPLICA_PHASES or meta.get("deletionTimestamp"):
             continue
         age = _age_days(status.get("startTime", ""), now=now)
-        if age is not None and age < (1 / 24):
+        if age is not None and age < POD_SETTLE_DAYS:
             continue
         owners = meta.get("ownerReferences") or []
         if any(o.get("kind") in ("Job",) for o in owners):
@@ -2619,7 +2663,13 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         # silently wrong later.
         kind, owner_name = _sizing_owner(meta)
         entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None, "labels": {}})
-        entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
+        # Init containers, native sidecars among them, take no part in the
+        # sizing sums above, but kubelet counts them for QoS: an init container
+        # without limits makes the pod Burstable. `_is_guaranteed` reads them.
+        init_containers = spec.get("initContainers") or []
+        init_requests = [(c.get("resources") or {}).get("requests") or {} for c in init_containers]
+        init_limits = [(c.get("resources") or {}).get("limits") or {} for c in init_containers]
+        entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits})
         # For `check_idle_workload`'s Service join. Replicas of one controller
         # share the selector labels by construction, so the first pod's set
         # answers for the controller; a later pod merges in rather than
@@ -2632,7 +2682,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         # exist. Carry the longest-lived pod's age so the excerpt can state the
         # window it really measured.
         if age is not None:
-            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * 24)
+            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * HOURS_PER_DAY)
     return by_owner
 
 
@@ -2706,7 +2756,7 @@ def _measured_over(
 def _controller_hours(context: dict, kind: str, ns: str, name: str, now: datetime) -> float | None:
     """`_controller_age_days` in the unit `_measured_over` bounds a window in."""
     age_days = _controller_age_days(context, kind, ns, name, now=now)
-    return None if age_days is None else age_days * 24
+    return None if age_days is None else age_days * HOURS_PER_DAY
 
 
 def _live_pod_owners(context: dict) -> dict[tuple[str, str], tuple[str, str]]:
@@ -2911,9 +2961,14 @@ def _is_guaranteed(entry: dict) -> bool:
     `check_idle_workload`, which needs the same verdict because that refusal is
     what hands it the finding. Spelt once so the two cannot drift into either
     reporting one controller twice or dropping it between them.
+
+    Init containers count as well, as they do for kubelet: an unlimited
+    init container or native sidecar leaves the pod Burstable.
     """
     for pod in entry["pods"]:
-        for req, lim in zip(pod["requests"], pod["limits"]):
+        requests = pod["requests"] + pod.get("init_requests", [])
+        limits = pod["limits"] + pod.get("init_limits", [])
+        for req, lim in zip(requests, limits):
             for resource, parse in (("cpu", parse_cpu_cores), ("memory", parse_mem_mib)):
                 limit = parse(str(lim.get(resource, "")))
                 if not limit:
@@ -2984,6 +3039,11 @@ def _stands_down_instead_of_resizing(
     if age_days is None or age_days < IDLE_WORKLOAD_MIN_AGE_DAYS:
         return False
     return _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem)
+
+
+# §3.1's `major`: a reclaimable delta of a node's worth.
+NODE_WORTH_VCPU = 8
+NODE_WORTH_GIB = 32
 
 
 def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
@@ -3085,13 +3145,13 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             continue
 
         delta_cpu = (cpu_req_total - peak_cpu) if cpu_idle else 0.0
-        delta_mem_gib = ((mem_req_total - peak_mem) / 1024.0) if mem_idle else 0.0
+        delta_mem_gib = ((mem_req_total - peak_mem) / MIB_PER_GIB) if mem_idle else 0.0
         # The floor is a property of the request, not of the delta, and only an
         # idle dimension can satisfy it: a workload consuming all 8 GiB it asked
         # for and none of its 10m of CPU must not clear a materiality test on
         # the strength of the memory it is using.
         material = (cpu_idle and cpu_req_total >= OVERREQUEST_FLOOR_VCPU) or (
-            mem_idle and mem_req_total / 1024.0 >= OVERREQUEST_FLOOR_GIB
+            mem_idle and mem_req_total / MIB_PER_GIB >= OVERREQUEST_FLOOR_GIB
         )
         if not material:
             continue
@@ -3099,7 +3159,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         _, measured_over = _measured_over(
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
         )
-        severity = "major" if delta_cpu >= 8 or delta_mem_gib >= 32 else "minor"
+        severity = "major" if delta_cpu >= NODE_WORTH_VCPU or delta_mem_gib >= NODE_WORTH_GIB else "minor"
         if autopilot and severity == "minor":
             severity = "major"
 
@@ -3124,7 +3184,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             "cpu": f"{_resize_target(peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001) * 1000:.0f}m",
             "memory": f"{_resize_target(peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0):.0f}Mi",
         }
-        measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB {measured_over}"
+        measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / MIB_PER_GIB:.1f} GiB {measured_over}"
         # Every number above is summed across the controller's pods, because
         # that is what the fleet is actually paying for -- but the remediation
         # edits one container's request in one manifest, and §3.1 sizes it at
@@ -3133,7 +3193,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # is the only channel -- `_emit` whitelists the keys it forwards, and
         # `adopt_collector_evidence` overwrites the model's own wording with
         # this string -- so the arithmetic has to be spelled out here.
-        excerpt = f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; {measured}"
+        excerpt = f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / MIB_PER_GIB:.1f} GiB; {measured}"
         if len(dimensions) == 1:
             over = dimensions[0]
             at = (peak_cpu / cpu_req_total) if over == "cpu" else (peak_mem / mem_req_total)
@@ -3194,8 +3254,8 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             excerpt += " per replica"
             excerpt += (
                 f". Totals span {replicas} replicas — per replica that is "
-                f"{cpu_req_total / replicas:.3f} vCPU / {mem_req_total / replicas / 1024.0:.2f} GiB requested "
-                f"against a {peak_cpu / replicas:.3f} vCPU / {peak_mem / replicas / 1024.0:.2f} GiB peak, "
+                f"{cpu_req_total / replicas:.3f} vCPU / {mem_req_total / replicas / MIB_PER_GIB:.2f} GiB requested "
+                f"against a {peak_cpu / replicas:.3f} vCPU / {peak_mem / replicas / MIB_PER_GIB:.2f} GiB peak, "
                 f"and the manifest change is per replica"
             )
         excerpt += "."
@@ -3327,11 +3387,13 @@ def _idle_traffic_clause(
     thousand packets in the same window the finding quoted. `d1b8fd23`
     retracted the claim. This supplies the measurement it was standing in for.
 
-    Four answers, and the distinction between the last two is the one that
-    matters. A rule with figures gets them, with the mean payload per outbound
-    packet, because packet counts alone cannot tell a session from a port scan
-    and the payload can. A rule Monitoring holds no series for is reported as
-    unmeasured, never as quiet. And an address this run knows nothing about --
+    Five answers, and the distinction between unmeasured and quiet is the one
+    that matters. A rule with figures gets them, with the mean payload per
+    outbound packet, because packet counts alone cannot tell a session from a
+    port scan and the payload can. A rule Monitoring holds no series for is
+    reported as unmeasured, never as quiet, and so is a rule above the floor
+    whose outbound series is missing (LB_EGRESS_UNMEASURED), because without
+    it the payload cannot be computed. And an address this run knows nothing about --
     no session, no rules read, a Service still waiting for an IP -- gets no
     clause at all, because silence is honest and a zero is not.
     """
@@ -3512,12 +3574,12 @@ def check_idle_workload(
         )
         if not guaranteed and (
             (cpu_shrinks and cpu_req >= OVERREQUEST_FLOOR_VCPU)
-            or (mem_shrinks and mem_req / 1024.0 >= OVERREQUEST_FLOOR_GIB)
+            or (mem_shrinks and mem_req / MIB_PER_GIB >= OVERREQUEST_FLOOR_GIB)
         ):
             continue
 
         _, measured_over = _measured_over(
-            entry["oldest_h"], replaced=replaced, controller_h=age_days * 24
+            entry["oldest_h"], replaced=replaced, controller_h=age_days * HOURS_PER_DAY
         )
         # Why no resize is on the table, which is the reader's first question
         # and has three answers. Naming the wrong one would send them to
@@ -3614,7 +3676,7 @@ def check_idle_workload(
                     guaranteed
                     and (
                         cpu_req >= OVERREQUEST_FLOOR_VCPU
-                        or mem_req / 1024.0 >= OVERREQUEST_FLOOR_GIB
+                        or mem_req / MIB_PER_GIB >= OVERREQUEST_FLOOR_GIB
                     )
                 )
                 else "minor",
@@ -3802,7 +3864,7 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
         if status.get("phase") in NOT_A_REPLICA_PHASES or meta.get("deletionTimestamp"):
             continue
         age = _age_days(status.get("startTime", ""), now=now)
-        if age is not None and age < (1 / 24):
+        if age is not None and age < POD_SETTLE_DAYS:
             continue
         owners = meta.get("ownerReferences") or []
         if any(o.get("kind") in ("Job",) for o in owners):
@@ -3825,7 +3887,7 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
             if container.get("name") and container["name"] not in entry["containers"]:
                 entry["containers"].append(container["name"])
         if age is not None:
-            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * 24)
+            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * HOURS_PER_DAY)
     return by_owner
 
 
@@ -3912,7 +3974,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # memory figure cannot be compared to its own recommendation without
         # arithmetic. So: millicores and mebibytes, the units the manifest
         # edit is written in, and the peak is directly twice-able by eye.
-        peak_cpu_m, want_cpu_m = peak_cpu * 1000, want_cpu * 1000
+        peak_cpu_m, want_cpu_m = peak_cpu * MILLICORES_PER_CORE, want_cpu * MILLICORES_PER_CORE
         excerpt = (
             f"declares no nonzero CPU or memory request on "
             f"{'container' if len(entry['containers']) == 1 else 'containers'} "
@@ -4916,6 +4978,8 @@ def _idle_since(disk: dict) -> tuple[str, str]:
 #: windows" -- a full monthly GKE maintenance cycle, after which a reattach is
 #: churn nobody should be paged about.
 UNATTACHED_AGE_DAYS = 30
+#: §3.4's `major` size, the SOP's ">=500 GiB of storage" magnitude.
+UNATTACHED_DISK_MAJOR_GB = 500
 #: §3.4's floor for a disk labelled for a cluster the project no longer runs.
 #: Every clause of the 30-day justification is about something reattaching the
 #: disk, and a deleted cluster reattaches nothing: there is no node pool to
@@ -5081,7 +5145,7 @@ def check_unattached_disk(
             {
                 "object": _located("Disk", disk),
                 "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk_type} ({_scope_flag(disk)}){pvc_note}{orphan_note}",
-                "severity": "major" if size_gb >= 500 or "ssd" in disk_type.lower() or "extreme" in disk_type.lower() else "minor",
+                "severity": "major" if size_gb >= UNATTACHED_DISK_MAJOR_GB or "ssd" in disk_type.lower() or "extreme" in disk_type.lower() else "minor",
             }
         )
     return hits
@@ -5140,6 +5204,10 @@ def _scope_flag(obj: dict) -> str:
 ROLLUP_EXCERPT_MEMBERS = 12
 
 
+# Two weeks outlasts a typical cutover window (SOP §3.5).
+IDLE_ADDRESS_MIN_AGE_DAYS = 14
+
+
 def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, project: str, now: datetime) -> list[dict]:
     hits = []
     idle = []
@@ -5153,7 +5221,7 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
         if HELD_ADDRESS_DESCRIPTION_RE.search(addr.get("description") or ""):
             continue
         age = _age_days(addr.get("creationTimestamp", ""), now=now)
-        if age is None or age < 14:
+        if age is None or age < IDLE_ADDRESS_MIN_AGE_DAYS:
             continue
         idle.append((addr, age))
     if len(idle) >= 10:
@@ -5298,6 +5366,17 @@ def _backend_service_url_key(url: str) -> tuple[str, str] | None:
     return (m.group(1) or "", m.group(2)) if m else None
 
 
+# The service controller tears LB resources down within minutes of the
+# Service; a week is far past that (SOP §3.6).
+ORPHAN_LB_MIN_AGE_DAYS = 7
+# The path segment of a forwarding rule's `target` that names a Private
+# Service Connect service attachment.
+SERVICE_ATTACHMENT_PATH = "/serviceAttachments/"
+# Every internal `loadBalancingScheme` starts with this: `INTERNAL`,
+# `INTERNAL_MANAGED`, `INTERNAL_SELF_MANAGED`.
+INTERNAL_SCHEME_PREFIX = "INTERNAL"
+
+
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
     hits = []
     # The GKE service controller writes this description as a JSON object --
@@ -5323,18 +5402,18 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
         # rule targeting a service attachment, or carrying a PSC connection.
         # A rule a service attachment *publishes* needs `service-attachments
         # list`, which is not read; SOP §2 leaves that one to be checked by hand.
-        if "/serviceAttachments/" in str(rule.get("target") or "") or rule.get("pscConnectionId"):
+        if SERVICE_ATTACHMENT_PATH in str(rule.get("target") or "") or rule.get("pscConnectionId"):
             continue
         # §3.6's other exclusion: an internal rule still delivering to a
         # backend service that has backends is serving, whatever its
         # description says. Internal passthrough rules name it in
         # `backendService`, not `target`.
-        if str(rule.get("loadBalancingScheme") or "").startswith("INTERNAL"):
+        if str(rule.get("loadBalancingScheme") or "").startswith(INTERNAL_SCHEME_PREFIX):
             url = str(rule.get("backendService") or rule.get("target") or "")
             if _backend_service_url_key(url) in live_backends:
                 continue
         age = _age_days(rule.get("creationTimestamp", ""), now=now)
-        if age is None or age < 7:
+        if age is None or age < ORPHAN_LB_MIN_AGE_DAYS:
             continue
         hits.append({"object": _located("ForwardingRule", rule), "excerpt": f"targets deleted Service {m.group(1)}, created {rule.get('creationTimestamp')}{_ago(age)} ({_scope_flag(rule)})", "severity": "major"})
     for pool in target_pools:
@@ -5416,14 +5495,8 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         and all(_api_disabled(result) for _, _, result in compute_reads)
         and refusal_names_project(project, disks_result.stderr, run=run)
     )
-    if failed and not compute_disabled:
-        return {
-            "name": f"project/{project}",
-            "project": project,
-            "location": "global",
-            "outcome": "gate-failed",
-            "error": f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed),
-        }
+    compute_failed = bool(failed) and not compute_disabled
+    compute_error = f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed)
 
     # Outside the five-read gate above, on purpose. Those five gate as one
     # because §3.4-§3.6 cross-reference each other's objects; §3.14 shares
@@ -5436,6 +5509,17 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
     reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
     registry_disabled = reg_parsed is None and _api_disabled(reg_result) and refusal_names_project(project, reg_result.stderr, run=run)
+    # The reverse holds too (SOP §3.14): a failed compute read leaves
+    # `registry-no-cleanup` running, and only when that read has nothing to
+    # give either is there no check left for the target to carry.
+    if compute_failed and reg_parsed is None:
+        return {
+            "name": f"project/{project}",
+            "project": project,
+            "location": "global",
+            "outcome": "gate-failed",
+            "error": compute_error,
+        }
     if compute_disabled and registry_disabled:
         # Nothing any project-scoped check looks for can exist here, so there
         # is no target to report: a row naming four inapplicable checks and
@@ -5460,13 +5544,17 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         none_read = bool(known_clusters) and unread_clusters >= known_clusters
     else:
         none_read = bool(known_clusters) and clusters_read == 0
-    disks_judged = not compute_disabled and not none_read
+    # `compute_ok`: the three compute checks can run. False when the API is
+    # off (they are inapplicable) or a read failed (they are unevaluated).
+    compute_ok = not compute_disabled and not compute_failed
+    disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
-    candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
+    if compute_ok:
+        candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     # A project with the Compute Engine API off holds no cluster either, so
     # there is no unread one to withhold `orphan-lb` over; it is inapplicable.
-    all_reachable = all_reachable and not compute_disabled
+    all_reachable = all_reachable and compute_ok
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
     if reg_parsed is not None:
@@ -5478,7 +5566,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         "location": "global",
         "outcome": "collected",
         "commands": ([{"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)}] if disks_judged else [])
-        + ([{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}] if not compute_disabled else [])
+        + ([{"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)}] if compute_ok else [])
         + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else [])
         # Recorded only when the read succeeded, which is what puts
         # `registry-no-cleanup` into §6's `coverage_gaps` when it did not. A
@@ -5489,7 +5577,15 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     }
     if not_applicable:
         entry["checks_not_applicable"] = [{"check": slug, "reason": reason} for slug, reason in sorted(not_applicable.items())]
-    if not all_reachable and not compute_disabled:
+    if compute_failed:
+        # The compute gate's sentence. It is assigned, as the orphan-lb one
+        # below is, because the two cannot both apply.
+        entry["limitations"] = (
+            "unattached-disk, idle-address and orphan-lb were not evaluated for "
+            f"this project: {compute_error}. §3.4-§3.6 cross-reference each "
+            "other's objects, so the five reads gate as one."
+        )
+    elif not all_reachable and not compute_disabled:
         # §6 already reports the missing check -- `orphan-lb` drops out of
         # `commands`, so the roster half of `coverage_gaps` names it whatever
         # this entry says in prose. What it cannot supply is why, and a gap
@@ -5509,14 +5605,14 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "See this project's cluster "
             "entries in this manifest for the reason each one failed."
         )
-    if not disks_judged and not compute_disabled:
+    if not disks_judged and compute_ok:
         disk_gap = (
             "unattached-disk was not evaluated for this project: none of its clusters "
             f"({unread_named}) could be read, so no disk can be "
             "cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
-    elif unread_clusters and not compute_disabled:
+    elif unread_clusters and compute_ok:
         disk_gap = (
             "unattached-disk skipped every disk that a PersistentVolumeClaim created "
             "and that could belong to a cluster this run did not read "
@@ -5525,9 +5621,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     unevaluated = {}
-    if not all_reachable and not compute_disabled:
+    if compute_failed:
+        unevaluated.update({slug: compute_error for slug in COMPUTE_CHECKS})
+    elif not all_reachable and not compute_disabled:
         unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
-    if not disks_judged and not compute_disabled:
+    if not disks_judged and compute_ok:
         unevaluated["unattached-disk"] = "none of this project's clusters could be read"
     if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"

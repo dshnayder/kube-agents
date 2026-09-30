@@ -441,14 +441,37 @@ class DanglingComputeClassTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("does not exist", hit["excerpt"])
 
-    def test_does_not_flag_gke_built_in_classes(self):
-        # Built-ins are not ComputeClass objects in the dump, on either cluster
-        # mode, and the name is matched case-insensitively.
+    def test_does_not_flag_gke_built_in_classes_on_autopilot(self):
+        # Built-ins are not ComputeClass objects in the dump.
         for name in ("Balanced", "Scale-Out", "Performance", "Accelerator", "autopilot", "autopilot-spot", "autopilot-arm"):
             with self.subTest(name=name):
                 d = deployment("api", node_selector={"cloud.google.com/compute-class": name})
+                self.assertIsNone(fs.check_dangling_compute_class(d, {}, None, autopilot=True))
+
+    def test_standard_spares_only_the_autopilot_classes_it_provides(self):
+        for name in ("autopilot", "autopilot-spot"):
+            with self.subTest(name=name):
+                d = deployment("api", node_selector={"cloud.google.com/compute-class": name})
                 self.assertIsNone(fs.check_dangling_compute_class(d, {}, set()))
-                self.assertIsNone(fs.check_dangling_compute_class(d, {}, None))
+        # Standard does not provide the Autopilot-only classes, so a workload
+        # selecting one stays Pending.
+        for name in ("Balanced", "Scale-Out", "Performance", "Accelerator", "autopilot-arm"):
+            with self.subTest(name=name):
+                d = deployment("api", node_selector={"cloud.google.com/compute-class": name})
+                self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, set()))
+
+    def test_a_built_in_name_in_the_wrong_case_selects_nothing(self):
+        # nodeSelector values are case-sensitive; `balanced` is not `Balanced`.
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "balanced"})
+        self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, None, autopilot=True))
+
+    def test_the_collector_tells_the_check_the_cluster_mode(self):
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "Balanced"})
+        for autopilot in (True, False):
+            with self.subTest(autopilot=autopilot):
+                entry = CollectClusterTest().run_with(dump_items=[d], cluster={**CollectClusterTest.CLUSTER, "autopilot": autopilot})
+                flagged = {c["object"] for c in entry["candidates"] if c["check"] == "dangling-compute-class"}
+                self.assertEqual(flagged, set() if autopilot else {"Deployment/api"})
 
     def test_does_not_flag_valid_reference(self):
         cc = compute_class("cc1", [])
@@ -570,10 +593,27 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1))
 
-    def test_does_not_flag_a_zonal_pool_beside_a_multi_zone_pool(self):
-        # §3.9's Do-NOT-flag: a regional cluster with multi-zone node pools.
-        pool = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
-        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1, multi_zone_pool=True))
+    def test_does_not_flag_a_zonal_pool_beside_a_multi_zone_pool_of_its_shape(self):
+        # §3.9's Do-NOT-flag: a multi-zone pool its pods can move to.
+        pool = {"name": "web-a", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1, multi_zone_machine_types=frozenset({"e2-standard-4"})))
+
+    def test_flags_a_zonal_pool_whose_shape_no_multi_zone_pool_offers(self):
+        # A GPU pool pinned to one zone beside a regional default pool is
+        # still zone-locked; any multi-zone pool used to spare it.
+        pool = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "a2-highgpu-1g"}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1, multi_zone_machine_types=frozenset({"e2-standard-4"}))
+        self.assertIsNotNone(hit)
+        self.assertIn("no multi-zone node pool of machine type a2-highgpu-1g on the cluster", hit["excerpt"])
+
+    def test_flags_a_tainted_zonal_pool_beside_a_multi_zone_pool_of_its_shape(self):
+        pool = {
+            "name": "batch", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10},
+            "config": {"machineType": "e2-standard-4", "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}]},
+        }
+        hit = fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1, multi_zone_machine_types=frozenset({"e2-standard-4"}))
+        self.assertIsNotNone(hit)
+        self.assertIn("tainted (dedicated)", hit["excerpt"])
 
     def test_does_not_flag_single_zone_with_nap(self):
         pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
@@ -1240,14 +1280,22 @@ class CollectClusterTest(unittest.TestCase):
         return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
 
     def test_the_collector_tells_the_check_about_the_cluster_s_other_pools(self):
-        zonal = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
-        regional = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        zonal = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "a2-highgpu-1g"}}
+        regional = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
         with patch.object(fs, "check_single_zone_nodepool", wraps=fs.check_single_zone_nodepool) as check:
-            for pools in ([zonal, regional], [zonal]):
+            for pools, expected in (([zonal, regional], {"e2-standard-4"}), ([zonal], set())):
                 check.reset_mock()
                 self.run_with(pools=pools)
-                flags = {c.args[0]["name"]: c.kwargs["multi_zone_pool"] for c in check.call_args_list}
-                self.assertEqual(flags["gpu"], len(pools) > 1)
+                shapes = {c.args[0]["name"]: c.kwargs["multi_zone_machine_types"] for c in check.call_args_list}
+                self.assertEqual(shapes["gpu"], expected)
+
+    def test_a_zonal_pool_of_a_multi_zone_pool_s_shape_is_spared_end_to_end(self):
+        zonal = {"name": "web-a", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+        gpu = {"name": "gpu", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "a2-highgpu-1g"}}
+        regional = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+        entry = self.run_with(pools=[zonal, gpu, regional])
+        flagged = {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"}
+        self.assertEqual(flagged, {"NodePool/gpu"})
 
     def declared_not_applicable(self, entry):
         return {e["check"] for e in entry.get("checks_not_applicable") or []}
@@ -1802,6 +1850,66 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
         self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
 
+    def test_a_failed_node_pool_read_beside_a_typed_spot_class_is_unevaluated(self):
+        # The class's shape was read and answered, so the check looked run,
+        # but no Spot node pool's shape was ever asked about.
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        entry = self.run_with(dump_items=[cc], pools_rc=1, advice=capacity_history([0.01] * 7))
+        self.assertEqual(len(self.issued_advice_reads()), 1)
+        self.assertIn("spot-scarcity-risk", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        reason = {e["check"]: e["reason"] for e in entry["checks_unevaluated"]}["spot-scarcity-risk"]
+        self.assertIn("no Spot node pool's shape was asked about", reason)
+        self.assertIn("answered: n2-standard-8", reason)
+
+    def test_a_shape_answered_with_no_history_is_unevaluated(self):
+        # Exit 0 and nothing measured: an empty stdout, an object with no
+        # preemptionHistory, or too few days to average. Each left the check
+        # recorded as run over a shape nobody measured.
+        hot = compute_class("hot", [{"machineType": "n2-standard-8", "spot": True}])
+        cold = compute_class("cold", [{"machineType": "c3-standard-8", "spot": True}])
+        # `None` is the fake's empty stdout at exit 0.
+        for label, cold_answer in (
+            ("empty", None),
+            ("no history", {"machineType": "c3-standard-8"}),
+            ("thin", capacity_history([0.9] * 2, "c3-standard-8")),
+        ):
+            with self.subTest(label):
+                def advice(machine_type, cold_answer=cold_answer):
+                    return capacity_history([0.9] * 7, machine_type) if machine_type == "n2-standard-8" else cold_answer
+                entry = self.run_with(dump_items=[hot, cold], pools=[], advice=advice)
+                reason = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated", [])}.get("spot-scarcity-risk", "")
+                self.assertIn("c3-standard-8", reason)
+                self.assertIn("answered: n2-standard-8", reason)
+                self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+                # The measured shape's finding still files.
+                self.assertIn("spot-scarcity-risk", {c["check"] for c in entry["candidates"]})
+
+    def test_a_family_only_request_beside_a_named_shape_is_unevaluated(self):
+        typed = compute_class("typed", [{"machineType": "n2-standard-8", "spot": True}])
+        family = compute_class("family", [{"machineFamily": "c3", "spot": True}])
+        entry = self.run_with(dump_items=[typed, family], pools=[], advice=capacity_history([0.01] * 7))
+        reason = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated", [])}.get("spot-scarcity-risk", "")
+        self.assertIn("family:c3", reason)
+        self.assertIn("answered: n2-standard-8", reason)
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_node_pool_read_leaves_the_auto_creation_arm_unevaluated(self):
+        # With auto-creation off, the class is dangling only if no node pool
+        # carries its label, and the labels were never read.
+        cc = compute_class("cc1", [{"machineFamily": "n4"}], node_pool_auto_creation=False)
+        workload = deployment("web", node_selector={fs.COMPUTE_CLASS_LABEL: "cc1"})
+        entry = self.run_with(dump_items=[cc, workload], pools_rc=1)
+        self.assertIn("dangling-compute-class", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertNotIn("dangling-compute-class", {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_node_pool_read_leaves_an_auto_creating_class_evaluated(self):
+        cc = compute_class("cc1", [{"machineFamily": "n4"}])
+        workload = deployment("web", node_selector={fs.COMPUTE_CLASS_LABEL: "cc1"})
+        entry = self.run_with(dump_items=[cc, workload], pools_rc=1)
+        self.assertNotIn("dangling-compute-class", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertIn("dangling-compute-class", {c["check"] for c in entry["commands"]})
+
     def test_a_failed_autoscaler_read_is_unevaluated(self):
         entry = self.run_with(dump_items=[], log_rc=1)
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
@@ -2278,6 +2386,49 @@ class ProjectDiscoveryTest(unittest.TestCase):
 
         manifest = self.collect_with(run, max_workers=2)
         self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"collected"})
+
+    def test_one_capacity_history_read_answers_every_cluster_in_the_region(self):
+        # The advice is per region and shape; three clusters asking about one
+        # shape paid three identical calls.
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        inner = fleet_run({"acme": ["c1", "c2", "c3"]}, projects="acme\n")
+        advice = []
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(cc)))
+            if argv[: len(fs.CAPACITY_HISTORY_ARGV)] == fs.CAPACITY_HISTORY_ARGV:
+                advice.append(argv)
+                return run_of(0, json.dumps(capacity_history([0.01] * 7)))
+            return inner(argv, **kwargs)
+
+        manifest = self.collect_with(run, max_workers=3)
+        self.assertEqual(len(advice), 1)
+        clusters = [c for c in manifest["clusters"] if not c["name"].startswith("project/")]
+        self.assertEqual(len(clusters), 3)
+        for c in clusters:
+            self.assertIn("spot-scarcity-risk", {x["check"] for x in c["commands"]})
+
+    def test_a_failed_capacity_history_read_is_asked_again(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        inner = fleet_run({"acme": ["c1", "c2"]}, projects="acme\n")
+        advice = []
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(cc)))
+            if argv[: len(fs.CAPACITY_HISTORY_ARGV)] == fs.CAPACITY_HISTORY_ARGV:
+                advice.append(argv)
+                if len(advice) == 1:
+                    return run_of(1, "", "UNAVAILABLE")
+                return run_of(0, json.dumps(capacity_history([0.01] * 7)))
+            return inner(argv, **kwargs)
+
+        manifest = self.collect_with(run, max_workers=1)
+        self.assertEqual(len(advice), 2)
+        clusters = [c for c in manifest["clusters"] if not c["name"].startswith("project/")]
+        ran = ["spot-scarcity-risk" in {x["check"] for x in c["commands"]} for c in clusters]
+        self.assertEqual(sorted(ran), [False, True])
 
     def collect_with(self, run, **kwargs):
         with TemporaryDirectory() as tmp:

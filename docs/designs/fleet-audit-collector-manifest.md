@@ -123,8 +123,8 @@ the qualified form into `scope.clusters[].name`, which is the key §3.1 matches 
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
 then truncates. The exception is a project-scoped resource whose name is unique only per zone,
-region or location (a disk, address or Artifact Registry repository), which reads
-`<Kind>/<location>:<name>`.
+region or location — a disk, address, forwarding rule, target pool, backend service or Artifact
+Registry repository, and stockout's reservation and quota — which reads `<Kind>/<location>:<name>`.
 
 ## 3. What `finish` does with it
 

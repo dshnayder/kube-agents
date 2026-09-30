@@ -1612,7 +1612,17 @@ class IdleNamespaceTest(unittest.TestCase):
         # 30d 14h, against a 30-day gate. See the matching case in OrphanPvTest.
         pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
         context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo", created="2026-07-01T10:00:00Z")]}
-        self.assertIn("for 30d;", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+        self.assertIn("created 30d ago;", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_the_excerpt_claims_no_pod_free_duration(self):
+        # The pod dump is a snapshot and the age is the namespace's; the live
+        # `default` namespace read "no Running/Pending pods for 69d" when all
+        # anyone knew was that it had none now and was 69 days old.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo", created="2026-07-01T10:00:00Z")]}
+        excerpt = fw.check_idle_namespace(context, now=NOW)[0]["excerpt"]
+        self.assertTrue(excerpt.startswith("no Running/Pending pods now; namespace created 30d ago;"), excerpt)
+        self.assertNotIn("pods for", excerpt)
 
     def test_capacity_just_under_the_severity_gate_is_not_printed_as_the_gate(self):
         # 102000Mi is 99.6 GiB. Rounding to nearest printed "100 GiB" while the
@@ -2475,6 +2485,30 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "major")
         # And §3.1 must have let go of it, or the object reports twice.
         self.assertEqual(fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False), [])
+
+    def test_an_unlimited_init_container_makes_the_pod_burstable(self):
+        # kubelet reads init containers, native sidecars among them, when it
+        # sets QoS; reading `containers` alone called this pod Guaranteed and
+        # took it from §3.1 for §3.13's stand-down.
+        for restart in (None, "Always"):
+            with self.subTest(restart_policy=restart):
+                pod = self.guaranteed_pod()
+                init = {"name": "proxy", "resources": {"requests": {"cpu": "10m"}}}
+                if restart:
+                    init["restartPolicy"] = restart
+                pod["spec"]["initContainers"] = [init]
+                ctx = self.context(pods=[pod])
+                peaks = {(self.NS, self.POD): (0.0, 0.0)}
+                self.assertEqual(fw.check_idle_workload(ctx, peaks, now=NOW), [])
+                over = fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+                self.assertEqual(len(over), 1)
+                self.assertFalse(over[0].get("_guaranteed"))
+
+    def test_a_limited_init_container_leaves_the_pod_guaranteed(self):
+        pod = self.guaranteed_pod()
+        pod["spec"]["initContainers"] = [{"name": "setup", "resources": {"limits": {"cpu": "100m", "memory": "64Mi"}}}]
+        hits = fw.check_idle_workload(self.context(pods=[pod]), {(self.NS, self.POD): (0.0, 0.0)}, now=NOW)
+        self.assertEqual(len(hits), 1)
 
     def test_the_guaranteed_excerpt_names_the_ceiling_not_the_floor(self):
         # Both arms answer "why is no resize offered", and they answer it
@@ -4410,23 +4444,24 @@ class CollectProjectComputeTest(unittest.TestCase):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
         )
-        self.assertEqual(target["outcome"], "gate-failed")
-        self.assertIn("1 of 5", target["error"])
-        self.assertIn("gcloud compute addresses list", target["error"])
-        self.assertIn("PERMISSION_DENIED", target["error"])
+        self.assertIn("1 of 5", target["limitations"])
+        self.assertIn("gcloud compute addresses list", target["limitations"])
+        self.assertIn("PERMISSION_DENIED", target["limitations"])
+        reasons = {c["check"]: c["reason"] for c in target["checks_unevaluated"]}
+        self.assertIn("PERMISSION_DENIED", reasons["idle-address"])
 
     def test_the_error_names_every_read_that_failed_not_just_the_first(self):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "denied-a", "target-pools": "denied-t"}), now=NOW
         )
-        self.assertIn("2 of 5", target["error"])
-        self.assertIn("denied-a", target["error"])
-        self.assertIn("denied-t", target["error"])
+        self.assertIn("2 of 5", target["limitations"])
+        self.assertIn("denied-a", target["limitations"])
+        self.assertIn("denied-t", target["limitations"])
 
     def test_a_read_that_returns_no_stderr_still_names_its_command(self):
         target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(fail={"disks": ""}), now=NOW)
-        self.assertIn("gcloud compute disks list", target["error"])
-        self.assertIn("no stderr", target["error"])
+        self.assertIn("gcloud compute disks list", target["limitations"])
+        self.assertIn("no stderr", target["limitations"])
 
     def test_withholding_orphan_lb_says_why_rather_than_just_dropping_it(self):
         """§6's roster half names the missing check on its own, so the gap reads
@@ -4464,11 +4499,39 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
         self.assertIn("PERMISSION_DENIED", target["limitations"])
 
-    def test_a_failed_compute_read_still_gates_everything(self):
-        """The other direction. Splitting the registry read out must not have
-        loosened the five that cross-reference each other."""
+    def test_a_failed_compute_read_leaves_the_registry_check_running(self):
+        """The other direction, as SOP §3.14 states it: a failed compute read
+        does not take the registry check with it. The five that cross-reference
+        each other still gate as one, so all three compute checks go."""
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"disks": "denied"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "collected")
+        self.assertEqual([c["check"] for c in target["commands"]], ["registry-no-cleanup"])
+        self.assertEqual(
+            [c["check"] for c in target["checks_unevaluated"]], ["idle-address", "orphan-lb", "unattached-disk"]
+        )
+        self.assertIn("1 of 5", target["limitations"])
+        self.assertNotIn("checks_not_applicable", target)
+
+    def test_a_failed_compute_read_files_the_registry_finding(self):
+        repo = {
+            "name": "projects/acme/locations/us/repositories/big", "format": "DOCKER", "mode": "STANDARD_REPOSITORY",
+            "sizeBytes": str(600 * 1024**3), "createTime": "2026-01-01T00:00:00Z",
+        }
+        inner = self.run_with(fail={"disks": "denied"})
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "artifacts", "repositories"]:
+                return run_of(0, json.dumps([repo]))
+            return inner(argv, **kwargs)
+
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW)
+        self.assertEqual([c["check"] for c in target["candidates"]], ["registry-no-cleanup"])
+
+    def test_a_failed_compute_and_registry_read_gates_the_target(self):
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"disks": "denied", "repositories": "denied-r"}), now=NOW
         )
         self.assertEqual(target["outcome"], "gate-failed")
         self.assertIn("1 of 5", target["error"])
@@ -4513,15 +4576,16 @@ class CollectProjectComputeTest(unittest.TestCase):
         fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW)
         self.assertEqual(len([argv for argv in seen if argv[2] == "forwarding-rules"]), 1)
 
-    def test_a_pre_read_that_failed_still_fails_the_gate(self):
+    def test_a_pre_read_that_failed_still_fails_the_compute_gate(self):
         """§3.6 owns this read's failure whoever issued it. Passing the pair
         down must not turn a PERMISSION_DENIED into a project that collected
         cleanly with `orphan-lb` silently missing."""
         pre = (None, run_of(1, "", "PERMISSION_DENIED: compute.forwardingRules.list"))
         target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW, forwarding_rules=pre)
-        self.assertEqual(target["outcome"], "gate-failed")
-        self.assertIn("gcloud compute forwarding-rules list", target["error"])
-        self.assertIn("PERMISSION_DENIED", target["error"])
+        self.assertNotIn("orphan-lb", {c["check"] for c in target["commands"]})
+        self.assertIn("orphan-lb", {c["check"] for c in target["checks_unevaluated"]})
+        self.assertIn("gcloud compute forwarding-rules list", target["limitations"])
+        self.assertIn("PERMISSION_DENIED", target["limitations"])
 
 
 class CollectClusterTest(unittest.TestCase):
@@ -5580,7 +5644,7 @@ class DisabledApiProjectTest(unittest.TestCase):
         # A project with no cluster has nothing else to say the refusal is someone else's.
         run = cluster_free_run(compute=lambda p: run_of(1, "", self.COMPUTE_OFF.replace("acme", "quota-proj")), registry=lambda p: None)
         entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
-        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertEqual(set(fw.COMPUTE_CHECKS), {c["check"] for c in entry["checks_unevaluated"]})
         self.assertNotIn("checks_not_applicable", entry)
 
     def test_a_quota_project_s_registry_refusal_is_unevaluated_not_inapplicable(self):
@@ -5600,7 +5664,8 @@ class DisabledApiProjectTest(unittest.TestCase):
 
         run = cluster_free_run(compute=compute, registry=lambda p: None)
         entry = next(c for c in fw.collect_fleet(None, run=run, session=None, now=NOW)["clusters"] if c["name"] == "project/acme")
-        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertEqual(set(fw.COMPUTE_CHECKS), {c["check"] for c in entry["checks_unevaluated"]})
+        self.assertNotIn("checks_not_applicable", entry)
 
 
 class ClustersListedMarkerTest(unittest.TestCase):
