@@ -1201,11 +1201,21 @@ class IdleNodepoolTest(unittest.TestCase):
         pod["spec"]["volumes"] = [{"name": "cache", "emptyDir": {}}, {"name": "logs", "hostPath": {"path": "/l"}}]
         context = {"nodes": [node], "pods": [pod], "pdbs": []}
         pools = [self.pool("pool"), self.pool("other")]
-        for listed, blocks in (("cache, logs", False), ("cache", True)):
+        # Untrimmed, as the autoscaler compares: " logs" is not `logs`.
+        for listed, blocks in (("cache,logs", False), ("cache, logs", True), ("cache", True)):
             with self.subTest(listed=listed):
                 pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION: listed}
                 excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
                 self.assertEqual("Draining will not happen" in excerpt, blocks)
+
+    def test_a_memory_backed_empty_dir_is_not_local_storage(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"name": "dshm", "emptyDir": {"medium": "Memory"}}]
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
 
     def test_an_empty_pool_gets_no_blocker_note(self):
         context = {"nodes": [self.node("n1", "pool")], "pods": [], "pdbs": []}
@@ -1344,6 +1354,27 @@ class ScaledownBlockedTest(unittest.TestCase):
                 )
                 hits = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])
                 self.assertEqual([h["severity"] for h in hits], expected)
+
+    def test_a_memory_backed_empty_dir_does_not_pin_an_owned_pod(self):
+        pod = obj(
+            "Pod", "trainer", ns="default",
+            **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}],
+               "spec.volumes": [{"name": "dshm", "emptyDir": {"medium": "Memory"}}]},
+        )
+        self.assertEqual(fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}]), [])
+
+    def test_the_excerpt_reports_the_raw_local_storage_evidence(self):
+        """`local-storage=` is the shape on the object, as it always was, and
+        the per-volume annotation sits beside it verbatim."""
+        pod = obj(
+            "Pod", "debug", ns="ci",
+            **{"spec.nodeName": "n1", "metadata.ownerReferences": [],
+               "metadata.annotations": {fw.SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION: "cache"},
+               "spec.volumes": [{"name": "cache", "emptyDir": {}}]},
+        )
+        excerpt = fw.check_scaledown_blocked({"pods": [pod], "pdbs": []}, [{"_node_names": {"n1"}}])[0]["excerpt"]
+        self.assertIn("local-storage=True", excerpt)
+        self.assertIn("safe-to-evict-local-volumes=cache", excerpt)
 
     def test_a_finished_bare_pod_is_not_a_blocker(self):
         """The autoscaler ignores a pod that has already exited."""
@@ -2786,7 +2817,6 @@ class IdleWorkloadTest(unittest.TestCase):
         eleven days over a check that has never measured a call."""
         impact = fw.IMPACT["idle-workload"]
         self.assertNotIn("nobody is calling", impact)
-        self.assertIn("CPU or memory", impact)
         self.assertIn("packets are not sessions", impact)
 
     def test_the_impact_claims_no_idle_span_longer_than_it_read(self):
@@ -2795,6 +2825,13 @@ class IdleWorkloadTest(unittest.TestCase):
         impact = fw.IMPACT["idle-workload"]
         self.assertNotIn("weeks", impact)
         self.assertIn("measured window", impact)
+
+    def test_the_impact_states_the_peak_rule_rather_than_no_use(self):
+        """The check passes a controller peaking at up to 20% of its
+        requests; "nothing has used" it is not what was measured."""
+        impact = fw.IMPACT["idle-workload"]
+        self.assertNotIn("Nothing has used", impact)
+        self.assertIn(f"at or below {fw.IDLE_WORKLOAD_UTILISATION:.0%} of its requests on every dimension", impact)
 
     # ----------------------------------------------------------------- #
     # The traffic clause. Every one of these turns on the same question:

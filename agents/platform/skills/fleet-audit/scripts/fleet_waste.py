@@ -577,6 +577,18 @@ GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.i
 RETENTION_ANNOTATION_WORDS = ("owner", "retain", "retention")
 
 POD_TERMINAL_PHASES = ("Succeeded", "Failed")
+# The autoscaler's per-volume form of `safe-to-evict`: local volume names it may
+# discard on eviction, split on the separator and compared untrimmed, as the
+# autoscaler compares them. A pod whose every local volume is listed no longer
+# pins its node under `--skip-nodes-with-local-storage`.
+SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes"
+SAFE_TO_EVICT_LOCAL_VOLUMES_SEPARATOR = ","
+# The volume sources the autoscaler's `isLocalVolume` counts: a `hostPath`, or
+# an `emptyDir` not backed by memory (a `/dev/shm` tmpfs holds nothing that
+# outlives the pod on the node's disk).
+EMPTY_DIR_VOLUME = "emptyDir"
+HOST_PATH_VOLUME = "hostPath"
+EMPTY_DIR_MEMORY_MEDIUM = "Memory"
 # §3.5: this many idle addresses in one project become one per-project roll-up
 # finding rather than one finding each.
 IDLE_ADDRESS_ROLLUP_MIN = 10
@@ -2199,10 +2211,6 @@ SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 # its pin dropped although the autoscaler still honours it.
 SAFE_TO_EVICT_TRUE = "true"
 SAFE_TO_EVICT_FALSE = "false"
-# The autoscaler's per-volume form: a comma-separated list of local volume
-# names it may discard on eviction. A pod whose every local volume is listed
-# no longer pins its node under `--skip-nodes-with-local-storage`.
-SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes"
 
 
 def _safe_to_evict(annotations: dict) -> bool | None:
@@ -2218,15 +2226,25 @@ def _safe_to_evict(annotations: dict) -> bool | None:
     return None
 
 
+def _is_local_volume(volume: dict) -> bool:
+    """The autoscaler's `isLocalVolume`: a `hostPath`, or a disk-backed `emptyDir`."""
+    if HOST_PATH_VOLUME in volume:
+        return True
+    if EMPTY_DIR_VOLUME not in volume:
+        return False
+    return (volume.get(EMPTY_DIR_VOLUME) or {}).get("medium") != EMPTY_DIR_MEMORY_MEDIUM
+
+
 def _blocking_local_storage(pod: dict) -> bool:
     """Whether the pod's local storage pins its node under
-    `--skip-nodes-with-local-storage`: it has an `emptyDir` or `hostPath`
-    volume that `safe-to-evict-local-volumes` does not list. The pod-wide
+    `--skip-nodes-with-local-storage`: it has a local volume (`_is_local_volume`)
+    that `safe-to-evict-local-volumes` does not list. The pod-wide
     `safe-to-evict` annotation is the caller's to weigh."""
     volumes = (pod.get("spec") or {}).get("volumes") or []
-    local_names = {v.get("name", "") for v in volumes if "emptyDir" in v or "hostPath" in v}
+    local_names = {v.get("name", "") for v in volumes if _is_local_volume(v)}
     annotations = (pod.get("metadata") or {}).get("annotations") or {}
-    listed = {n.strip() for n in (annotations.get(SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION) or "").split(",") if n.strip()}
+    raw = annotations.get(SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION) or ""
+    listed = set(raw.split(SAFE_TO_EVICT_LOCAL_VOLUMES_SEPARATOR)) if raw else set()
     return bool(local_names - listed)
 
 
@@ -2335,7 +2353,11 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         owners = pod.get("metadata", {}).get("ownerReferences") or []
         annotations = pod.get("metadata", {}).get("annotations") or {}
         evictable = _safe_to_evict(annotations)
-        has_local_storage = _blocking_local_storage(pod)
+        volumes = (pod.get("spec") or {}).get("volumes") or []
+        # `has_local_storage` is the raw shape the excerpt reports; the verdict
+        # reads `blocking_local_storage`, which applies the autoscaler's rules.
+        has_local_storage = any(EMPTY_DIR_VOLUME in v or HOST_PATH_VOLUME in v for v in volumes)
+        blocking_local_storage = _blocking_local_storage(pod)
 
         # A PDB is not a reason this check reports -- obtainability-audit's
         # 3.3/3.4 own it -- but it is not a reason to skip the pod either. A
@@ -2345,14 +2367,14 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         # withholds the finding only where the PDB is the *only* blocker, and
         # `unevictable` below never counts a PDB.
         bare_pod = not owners
-        unevictable = evictable is False or ((bare_pod or has_local_storage) and evictable is not True)
+        unevictable = evictable is False or ((bare_pod or blocking_local_storage) and evictable is not True)
         if not unevictable:
             continue
 
         # §3.8: permanent only when nothing will ever reschedule the pod. A
         # controller recreates its pod elsewhere once someone deletes it, so
         # `safe-to-evict: "false"` on a controlled pod is `major`.
-        permanent = bare_pod and (has_local_storage or evictable is False)
+        permanent = bare_pod and (blocking_local_storage or evictable is False)
         if node_name in by_node and not permanent:
             continue  # the node already carries a blocker at least this bad
         pod_name = pod.get("metadata", {}).get("name", "")
@@ -2361,7 +2383,7 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
         # is really on the object.
         by_node[node_name] = {
             "object": f"Node/{node_name}",
-            "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage})",
+            "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage}, safe-to-evict-local-volumes={annotations.get(SAFE_TO_EVICT_LOCAL_VOLUMES_ANNOTATION)})",
             "severity": "critical" if permanent else "major",
         }
     return list(by_node.values())
@@ -4068,7 +4090,8 @@ IMPACT = {
     # substance; it was certainly unmeasured, and an audit that guesses right is
     # still an audit a reader cannot check. What this check measures is CPU and
     # memory, so that is all it now asserts.
-    "idle-workload": "Nothing has used this controller's CPU or memory over the measured window the excerpt names, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
+    "idle-workload": f"This controller's peak usage stayed at or below {IDLE_WORKLOAD_UTILISATION:.0%} of its requests on every dimension it declares over the measured window the excerpt names, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. "
+    "Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the three no-resize reasons applies.",
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
