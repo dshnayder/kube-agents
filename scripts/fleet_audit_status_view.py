@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -583,7 +584,7 @@ def when_cell(at: datetime | None, utc: bool) -> str:
 
 
 def duration(seconds: object) -> str:
-    if not isinstance(seconds, (int, float)):
+    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
         return "?"
     seconds = int(seconds)
     return (
@@ -802,7 +803,9 @@ def row_for(
     status, status_style = status_cell(stream, latest)
 
     findings = latest.get("findings")
-    crit = latest.get("critical")
+    # Typed as the header's total and the findings sort key are: anything
+    # but a count is a missing one, so store text never reaches this cell.
+    crit = latest.get("critical") if isinstance(latest.get("critical"), int) else 0
     if held_open(latest):
         # The issue still lists the previous run's findings; this run's zero
         # is not the ledger's. Their criticality is not in the projection.
@@ -838,7 +841,7 @@ def row_for(
     row = [
         (scrub(audit_id), "bold" if flags else None),
         (enabled, {"yes": "green", "no": "dim"}.get(enabled, "yellow")),
-        (job.get("expr", "?"), "dim"),
+        (scrub(job.get("expr", "?")), "dim"),
         (when_cell(at, utc), None),
         (ago(at, now) if at else "—", "dim"),
         (status, status_style),

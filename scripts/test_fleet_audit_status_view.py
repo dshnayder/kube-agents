@@ -476,6 +476,28 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("\x1b]52", out)
         self.assertNotIn("\x07", out)
 
+    def test_a_non_count_critical_is_a_missing_one(self):
+        # Rendered bare into FINDINGS, a string here was an escape in the terminal.
+        out = self.render(
+            {"compliance-audit": stream(last=latest(critical="\x1b]0;x\x07"))},
+            palette=view.Palette(True),
+        )
+        self.assertNotIn("\x1b]0", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("57", out)
+        self.assertNotIn(" c)", out)
+
+    def test_the_schedule_cell_is_scrubbed(self):
+        roster = {"compliance-audit": {"enabled": True, "expr": "20 6 * * *\x1b]0;x\x07"}}
+        out = self.render({"compliance-audit": stream(last=latest())}, roster=roster)
+        self.assertNotIn("\x1b]0", out)
+        self.assertNotIn("\x07", out)
+
+    def test_a_non_finite_lease_age_renders_as_unknown(self):
+        for age in (float("nan"), float("inf")):
+            doc = stream(liveness="running", started={"age_s": age})
+            self.assertEqual(view.status_cell(doc, {}), ("running… ?", "yellow"))
+
     def test_the_prs_column_counts_the_url_list(self):
         urls = ["https://x/pull/1", "https://x/pull/2"]
         out = self.render({"compliance-audit": stream(last=latest(prs_opened=urls))})
