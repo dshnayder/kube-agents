@@ -21,8 +21,8 @@ lead rather than swallowed: it disarms NEVER and STALE, so the empty flag list
 it produces is "not checked", not "clean", and the exit code is 1.
 
 Five flags the raw rows cannot be trusted without:
-  - NO STORE: the store directory is absent, or this stream's files could not
-    be read. "I could not look" is not "nothing is wrong", and the exit code
+  - NO STORE: the store directory is absent or cannot be listed, or this
+    stream's files could not be read. "I could not look" is not "nothing is wrong", and the exit code
     says so too.
   - DIED: a run took the stream's in-flight lease and never released it, from
     the lease's age against its own two-hour TTL alone. No roster and no
@@ -672,6 +672,8 @@ def unreadable_reason(projection: dict) -> str | None:
     only when the row has no completed status, and a stray directory beside a
     clean run would otherwise surface as a bare NO STORE flag.
     """
+    if projection.get("root_error"):
+        return f"store directory unreadable on the pod: {projection['root_error']}"
     if not projection.get("root_exists"):
         return f"store directory absent on the pod: {projection.get('root')}"
     if projection.get("lease_error"):
@@ -1099,14 +1101,21 @@ def header_lines(
     # outright lie, but a count is one too -- it is a count of what was looked
     # for, and the two flags that catch a silent stream were not among them. So
     # the caveat is appended in either case, and only "all clear" is withheld.
+    # Unlisted leases disarm the same two flags, and a roster row the store has
+    # no directory for carries no error to raise NO STORE instead.
+    lease_error = projection.get("lease_error")
     verdicts = []
     if attention:
         verdicts.append(palette("%d need attention" % attention_streams, "yellow"))
-    elif not roster_error:
+    elif not roster_error and not lease_error:
         verdicts.append(palette("all clear", "green"))
     if roster_error:
         verdicts.append(
             palette("roster unreadable — NEVER and STALE not checked", "crit")
+        )
+    if lease_error:
+        verdicts.append(
+            palette("leases unreadable — NEVER and STALE not checked", "crit")
         )
     for verdict in verdicts:
         lead += "  %s  %s" % (palette("·", "dim"), verdict)

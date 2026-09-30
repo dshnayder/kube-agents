@@ -154,6 +154,21 @@ class TestProjection(ReportStatusTestCase):
         self.assertFalse(document["root_exists"])
         self.assertEqual(document["streams"], {})
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_an_unlistable_store_keeps_its_reason(self):
+        # Present but unlistable is not absent: the key the exit code hangs on
+        # stays false, and the reason travels so a reader can say which.
+        self.write_latest()
+        self.root.chmod(0)
+        self.addCleanup(self.root.chmod, 0o700)
+        document = self.project()
+        self.assertFalse(document["root_exists"])
+        self.assertIn(str(self.root), document["root_error"])
+        self.assertIn("Permission denied", document["root_error"])
+
+    def test_an_absent_store_has_no_root_error(self):
+        self.assertIsNone(self.project()["root_error"])
+
     def test_the_temp_file_of_a_write_in_progress_is_not_a_run(self):
         self.write_latest()
         (self.root / AUDIT / REPO / "runs" / "tmpabc.tmp").write_text("{")

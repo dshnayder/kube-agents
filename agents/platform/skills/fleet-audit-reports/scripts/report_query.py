@@ -339,9 +339,10 @@ def cmd_streams(args: argparse.Namespace) -> dict:
     unreadable = sorted({row["audit_id"] for row in rows if row["error"]})
     error = None
     if not projection["root_exists"]:
+        reason = f" ({projection['root_error']})" if projection.get("root_error") else ""
         error = (
-            f"report store not readable at {projection['root']}: no stream can "
-            "be answered from it. This is unknown, not clean."
+            f"report store not readable at {projection['root']}{reason}: no "
+            "stream can be answered from it. This is unknown, not clean."
         )
     # Before `unreadable`: `project` stamps the lease failure onto every
     # stream's error, so naming those streams would blame stores that read fine.
@@ -355,6 +356,7 @@ def cmd_streams(args: argparse.Namespace) -> dict:
     return {
         "root": projection["root"],
         "root_exists": projection["root_exists"],
+        "root_error": projection.get("root_error"),
         "generated_at": projection["generated_at"],
         "ttl_s": projection["ttl_s"],
         "lease_error": projection.get("lease_error"),

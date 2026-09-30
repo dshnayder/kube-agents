@@ -71,7 +71,7 @@ object per call.
 | `runs <stream>`                     | the stamps the ring holds, so a `diff` can name real ones             |
 
 - Exit 0 answered the question. Exit 2 could not, and stdout still holds one JSON object whose
-  `error` says why — absent store, absent stream, absent stamp, a file that would not parse.
+  `error` says why — absent or unlistable store, absent stream, absent stamp, a file that would not parse.
   Arguments that do not parse are the exception: argparse prints usage to stderr and stdout is
   empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.

@@ -90,10 +90,11 @@ def stream(liveness="completed", last=None, started=None, error=None, runs=(), r
     }
 
 
-def projection(streams=None, root_exists=True, lease_error=None):
+def projection(streams=None, root_exists=True, lease_error=None, root_error=None):
     return {
         "root": "/opt/data/fleet-audit/reports",
         "root_exists": root_exists,
+        "root_error": root_error,
         "lease_error": lease_error,
         "generated_at": NOW.isoformat(),
         "ttl_s": 7200,
@@ -595,7 +596,20 @@ class TestRender(unittest.TestCase):
             projection({}, lease_error="/opt/data/scratch/: Permission denied"),
             self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
         )
-        self.assertNotIn("NEVER", out)
+        # The lead's caveat names the flag; the table must not raise it.
+        table = out.split("STREAMS", 1)[1].split("\n!", 1)[0]
+        self.assertNotIn("NEVER", table)
+
+    def test_the_lead_is_not_all_clear_while_the_leases_are_unread(self):
+        # No stream directory yet, so no row carries the lease error to raise
+        # NO STORE; the lead has to say the silent-stream flags were not run.
+        out = view.render(
+            projection({}, lease_error="/opt/data/scratch/: Permission denied"),
+            self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
+        )
+        lead = out.splitlines()[0]
+        self.assertNotIn("all clear", lead)
+        self.assertIn("leases unreadable — NEVER and STALE not checked", lead)
 
     def test_a_hidden_repository_row_is_counted_as_a_row(self):
         doc = stream(last=latest())
@@ -606,6 +620,15 @@ class TestRender(unittest.TestCase):
     def test_a_missing_store_says_so_below_the_table(self):
         out = self.render({}, root_exists=False)
         self.assertIn("store directory absent on the pod", out)
+
+    def test_an_unlistable_store_is_unreadable_not_absent(self):
+        root_error = "/opt/data/fleet-audit/reports/: [Errno 13] Permission denied"
+        out = view.render(
+            projection({}, root_exists=False, root_error=root_error),
+            self.ROSTER, NOW, self.ROSTER_PATH, "ns/agent-0 [platform-agent]",
+        )
+        self.assertIn("store directory unreadable on the pod: " + root_error, out)
+        self.assertNotIn("absent", out)
 
     def test_a_long_coverage_gap_is_clipped(self):
         """Even opened deliberately, the section has a ceiling.

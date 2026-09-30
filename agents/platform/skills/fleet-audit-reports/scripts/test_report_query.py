@@ -15,6 +15,7 @@ leaking the document fails here rather than in a context window.
 """
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,26 +38,20 @@ PROSE = "PROSE-MARKER"
 REPO = "acme/fleet"
 
 
-@contextlib.contextmanager
-def no_helpers():
-    """The module as it loads where the writer skill is not installed.
+def without_helpers():
+    """A fresh copy of the module, loaded where `import report_status` fails.
 
-    Stood up rather than reproduced by breaking the checkout: the import
-    happens once, at module load, so the only way to exercise the guard from
-    inside the process is to put it in the state a failed import leaves.
+    The import happens once, at module load, so the guard is exercised by
+    loading the file again with the sibling masked in `sys.modules` — the
+    message then comes from the module's own `except`, not from this test.
     """
-    saved, saved_error = report_query.report_status, report_query.IMPORT_ERROR
-    report_query.report_status = None
-    report_query.IMPORT_ERROR = (
-        f"cannot import report_status from {report_query.HELPERS_DIR}: boom. "
-        "The fleet-audit skill must be installed alongside this one — it owns "
-        "the report store and the helpers that read it."
+    spec = importlib.util.spec_from_file_location(
+        "report_query_without_helpers", report_query.__file__
     )
-    try:
-        yield
-    finally:
-        report_query.report_status = saved
-        report_query.IMPORT_ERROR = saved_error
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {"report_status": None}):
+        spec.loader.exec_module(module)
+    return module
 
 
 def finding(fid, severity="critical", cluster="prod-us-east", check="netpol-missing"):
@@ -88,6 +84,19 @@ def scope_document(audit_id, findings, clusters):
         "scope": {"clusters": clusters, "skipped": []},
         "findings": findings,
     }
+
+
+def finished_at_for(stamp):
+    """The `finished_at` a writer would pair with a ring stamp.
+
+    A parseable value matters: the reader compares it with the ring to find an
+    entry newer than `latest.json`, and an unparseable one skips that path.
+    """
+    try:
+        at = datetime.strptime(stamp, report_query.report_status.RUN_STAMP_FORMAT)
+    except ValueError:
+        return f"{stamp}+00:00"
+    return at.replace(tzinfo=timezone.utc).isoformat()
 
 
 def envelope(audit_id, finished_at, findings, **overrides):
@@ -146,7 +155,7 @@ class StoreTestCase(unittest.TestCase):
         """One ring entry, and (by default) the `latest.json` copy of it."""
         directory = self.stream_dir(audit_id, repo)
         text = json.dumps(
-            envelope(audit_id, f"{stamp}+00:00", findings, repo=repo, **overrides),
+            envelope(audit_id, finished_at_for(stamp), findings, repo=repo, **overrides),
             indent=2,
             sort_keys=True,
         )
@@ -202,9 +211,14 @@ class TestSharedHelpers(StoreTestCase):
     def test_a_missing_sibling_is_reported_and_never_fallen_back_from(self):
         """The guard names the path it looked in and answers nothing else."""
         self.assertIsNone(report_query.IMPORT_ERROR)
-        with no_helpers():
-            code, payload = self.query("streams")
+        module = without_helpers()
+        self.assertIsNone(module.report_status)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main(["--root", self.root, "streams"])
+        payload = json.loads(out.getvalue())
         self.assertEqual(code, 2)
+        self.assertIn("cannot import report_status", payload["error"])
         self.assertIn(str(report_query.HELPERS_DIR), payload["error"])
         self.assertIn("fleet-audit skill must be installed", payload["error"])
         self.assertEqual(payload["looked_in"], str(report_query.HELPERS_DIR))
@@ -326,6 +340,17 @@ class TestStreams(StoreTestCase):
         self.assertEqual(code, 2)
         self.assertEqual(payload["streams"], [])
         self.assertIn("in-flight leases not readable", payload["error"])
+
+    def test_an_unlistable_store_says_why(self):
+        self.write_run(AUDIT, "20260826T063100.000000Z", [])
+        denied = PermissionError(13, "Permission denied")
+        with patch.object(report_query.report_status, "stream_ids", side_effect=denied):
+            code, payload = self.query("streams")
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["root_exists"])
+        self.assertIn("Permission denied", payload["root_error"])
+        self.assertIn("not readable", payload["error"])
+        self.assertIn("Permission denied", payload["error"])
 
     def test_an_unlistable_lease_directory_blames_the_leases_not_the_stores(self):
         # `project` stamps the lease failure on every stream, so an answer that
@@ -460,6 +485,16 @@ class TestUnknownIsNotClean(StoreTestCase):
         row = self.ok("streams")["streams"][0]
         self.assertEqual(row["liveness"], "completed")
         self.assertTrue(row["latest_missing"])
+
+    def test_a_ring_entry_newer_than_latest_answers_flagged(self):
+        """A held-open run whose `latest.json` write failed leaves the ring a
+        run ahead of the file; the CLI answers from the ring and says so."""
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        newer = self.write_run(AUDIT, "20260902T063100.000000Z", [finding("b")], latest=False)
+        payload = self.ok("findings", AUDIT)
+        self.assertEqual(payload["run"], newer)
+        self.assertTrue(payload["latest_missing"])
+        self.assertEqual([f["id"] for f in payload["findings"]], ["b"])
 
     def test_the_run_named_is_the_run_read_when_a_finish_lands_between(self):
         """The ring entry the fallback answers from is named from the same

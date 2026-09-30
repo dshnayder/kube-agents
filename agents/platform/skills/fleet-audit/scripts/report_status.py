@@ -422,13 +422,16 @@ def project(
     scratch = scratch_root(scratch)
     now_epoch = _now_epoch(now)
     root_exists = os.path.isdir(root)
+    root_error: str | None = None
     try:
         ids = stream_ids(root)
-    except OSError:
+    except OSError as exc:
         # A root that is present but cannot be listed is a store the view could
         # not read, not a fleet with no streams — and `root_exists` is the key
-        # its exit code hangs on.
+        # its exit code hangs on. `root_error` keeps the reason, so a reader
+        # can say "unreadable" rather than "absent".
         ids, root_exists = [], False
+        root_error = _failure(f"{root}/", exc)
     lease_error: str | None = None
     try:
         in_flight = in_flight_ids(scratch)
@@ -438,6 +441,7 @@ def project(
     return {
         "root": root,
         "root_exists": root_exists,
+        "root_error": root_error,
         "generated_at": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat(),
         "ttl_s": INFLIGHT_TTL_S,
         # Also on every stream, but a store with no stream directory yet has no
