@@ -3766,6 +3766,11 @@ class UnattachedDiskTest(unittest.TestCase):
     def test_flags_unattached_over_30_days(self):
         self.assertEqual(len(fw.check_unattached_disk([self.disk()], set(), now=NOW)), 1)
 
+    def test_a_disk_whose_size_does_not_parse_is_skipped_alone(self):
+        odd = {**self.disk(name="odd"), "sizeGb": "n/a"}
+        hits = fw.check_unattached_disk([odd, self.disk(name="d2")], set(), now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["Disk/us-central1-a:d2"])
+
     def test_a_pv_claims_only_the_disk_in_its_own_zone(self):
         """A detached PV holding `us-central1-a/data-1` used to claim every
         disk named `data-1`, so a truly orphaned one in `us-central1-b` was
@@ -4094,6 +4099,16 @@ class IdleAddressTest(unittest.TestCase):
             with self.subTest(description=description):
                 addr = {**self.address(), "description": description}
                 self.assertEqual(fw.check_idle_address([addr], set(), project="p", now=NOW), [])
+
+    def test_every_form_of_migrate_holds_an_address(self):
+        for description in ("migrated from us-central1", "migrates to prod next quarter", "held for migrations", "migrate target"):
+            with self.subTest(description=description):
+                addr = {**self.address(), "description": description}
+                self.assertEqual(fw.check_idle_address([addr], set(), project="p", now=NOW), [])
+
+    def test_a_word_that_only_starts_with_migrat_does_not_exempt_an_address(self):
+        addr = {**self.address(), "description": "migratory bird telemetry"}
+        self.assertEqual(len(fw.check_idle_address([addr], set(), project="p", now=NOW)), 1)
 
     def test_dr_inside_a_word_does_not_exempt_an_address(self):
         addr = {**self.address(), "description": "old address for the drain job"}
@@ -5094,7 +5109,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
 
     def test_neither_check_is_also_reported_as_having_run(self):
         """A check cannot be both dispositioned and performed -- that is the
-        double-count `_limitation_restates_na` exists to catch downstream."""
+        contradiction `audit_report.cross_check_manifest` rejects downstream."""
         entry = self.collect(autopilot=True)
         ran = {c["check"] for c in entry["commands"]}
         self.assertNotIn("idle-nodepool", ran)
@@ -5348,7 +5363,8 @@ class CrashIsolationTest(unittest.TestCase):
     def test_a_crashing_project_read_costs_that_project_and_no_other(self):
         """The project pools had no `crashed_entry`: a 200 whose body is not
         JSON, or a disk with a non-numeric size, raised out of the pool and
-        left the SOP's redirect a zero-byte manifest."""
+        left the SOP's redirect a zero-byte manifest. The disk is skipped on
+        its own now, so the crash is raised by the read itself."""
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
                 return run_of(0, "acme\n")
@@ -5357,8 +5373,7 @@ class CrashIsolationTest(unittest.TestCase):
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return run_of(0, "[]")
             if argv[:3] == ["gcloud", "compute", "disks"] and argv[argv.index("--project") + 1] == "beta":
-                disk = {"name": "bad", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "ten", "type": "pd-standard", "zone": "z"}
-                return run_of(0, json.dumps([disk]))
+                raise ValueError("could not convert string to float: 'ten'")
             if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             raise AssertionError(argv)
@@ -6834,6 +6849,7 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             "FLUX_HELM_REPOSITORY_KIND",
             "RELEASE_KEY_APPLICATION",
             "RELEASE_KEY_RELEASE",
+            "RELEASE_KEY_NAMESPACE",
             "ARGOCD_VALUES_OBJECT_FIELD",
             "ARGOCD_VALUES_STRING_FIELD",
             "FLUX_VALUES_FIELD",

@@ -1298,6 +1298,21 @@ class CollectClusterTest(unittest.TestCase):
         flagged = {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"}
         self.assertEqual(flagged, {"NodePool/gpu"})
 
+    def test_a_tainted_multi_zone_pool_spares_no_zonal_pool(self):
+        """The zonal pool's pods do not tolerate the regional pool's taint, so
+        a stockout in its zone leaves them nowhere to go."""
+        zonal = {"name": "web-a", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+        regional = {
+            "name": "web", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10},
+            "config": {"machineType": "e2-standard-4", "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}]},
+        }
+        with patch.object(fs, "check_single_zone_nodepool", wraps=fs.check_single_zone_nodepool) as check:
+            entry = self.run_with(pools=[zonal, regional])
+        shapes = {c.args[0]["name"]: c.kwargs["multi_zone_machine_types"] for c in check.call_args_list}
+        self.assertEqual(shapes["web-a"], frozenset())
+        flagged = {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"}
+        self.assertEqual(flagged, {"NodePool/web-a"})
+
     def declared_not_applicable(self, entry):
         return {e["check"] for e in entry.get("checks_not_applicable") or []}
 
@@ -2254,7 +2269,9 @@ class ProjectDiscoveryTest(unittest.TestCase):
 
         manifest = self.collect(run)
         self.assertIn("nothing collected", manifest.get("error", ""))
-        self.assertIn("reached none of its clusters", manifest["error"])
+        # The template names every way to yield nothing; `First:` is what the
+        # run itself records, the cluster and the read that left it unreached.
+        self.assertIn("First: acme/us-central1/c1: get-credentials rc=1", manifest["error"])
 
     def test_a_filtered_listing_is_not_named_as_why_nothing_was_collected(self):
         """A `projects list` that succeeded without naming the active project

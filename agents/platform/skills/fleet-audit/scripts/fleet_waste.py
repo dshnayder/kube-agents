@@ -155,7 +155,7 @@ PV_DISK_HANDLE_RE = re.compile(r"(?:^|/)(?:zones|regions)/([^/]+)/disks/([^/]+)$
 # §3.5's description exclusion: an address held for DR, failover, or a planned
 # migration is waiting on purpose. Whole words, any case, so `DR` does not
 # match inside `address` or `drain`.
-HELD_ADDRESS_DESCRIPTION_RE = re.compile(r"\b(?:dr|disaster[\s-]+recovery|fail-?over|migrat(?:e|ion|ing))\b", re.IGNORECASE)
+HELD_ADDRESS_DESCRIPTION_RE = re.compile(r"\b(?:dr|disaster[\s-]+recovery|fail-?over|migrat(?:e[ds]?|ions?|ing))\b", re.IGNORECASE)
 # The region (absent for a global one) and name in a backend service URL,
 # `.../regions/<r>/backendServices/<n>` or `.../global/backendServices/<n>`.
 BACKEND_SERVICE_URL_RE = re.compile(r"(?:regions/([^/]+)|global)/backendServices/([^/]+)$")
@@ -183,11 +183,14 @@ REGISTRY_DISABLED_REASON = (
 # handful of gcloud reads, so a credential that sees hundreds of projects
 # would get there. A project not reached by this point becomes a
 # `gate-failed` `project/<p>` target, which the document carries into
-# `scope.skipped`, and the run reports partial rather than nothing. The
-# margin is for the project reads already in flight, which take seconds on a
-# healthy API; it is not a guarantee, because one project's reads run in
-# sequence under `DEFAULT_TIMEOUT_S` each, and the cluster reads, which this
-# does not bound, finish on their own time as they did before it.
+# `scope.skipped`, and the run reports partial rather than nothing. This is a
+# best-effort cutoff, not a bound. The 180 s left before the terminal timeout
+# is for the project reads already in flight, which take seconds on a healthy
+# API, but one project's reads run in sequence: its gcloud reads under
+# `DEFAULT_TIMEOUT_S` each, then `fetch_lb_traffic`'s three Monitoring metrics,
+# each paged with every page under `MONITORING_TIMEOUT_S`, so a single slow
+# project can outlast the margin on its own. The cluster reads, which this does
+# not bound either, finish on their own time as they did before it.
 PROJECT_READ_DEADLINE_S = 420
 # `gcloud projects list`'s own timeout. Under `DEFAULT_TIMEOUT_S` a credential
 # that sees hundreds of projects was killed mid-listing, and the run fell back
@@ -590,6 +593,17 @@ GITOPS_SYNC_MARKER_PREFIXES = ("configsync.gke.io/", "kustomize.toolkit.fluxcd.i
 RETENTION_ANNOTATION_WORDS = ("owner", "retain", "retention")
 
 POD_TERMINAL_PHASES = ("Succeeded", "Failed")
+SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
+# What the cluster autoscaler itself compares against: the exact strings
+# `"true"` and `"false"`, untrimmed and case-sensitive. §3.8 states the rule
+# in those literals, and `gke-cluster-autoscaler`'s
+# `find-scale-down-blockers.sh` selects on `== "false"` / `!= "true"`. Folding
+# case or accepting `strconv.ParseBool`'s other spellings inverts the
+# autoscaler both ways: a pod annotated `"False"` was published as pinning a
+# node the autoscaler drains, and a local-storage pod annotated `"True"` had
+# its pin dropped although the autoscaler still honours it.
+SAFE_TO_EVICT_TRUE = "true"
+SAFE_TO_EVICT_FALSE = "false"
 # The autoscaler's per-volume form of `safe-to-evict`: local volume names it may
 # discard on eviction, split on the separator and compared untrimmed, as the
 # autoscaler compares them. A pod whose every local volume is listed no longer
@@ -2215,19 +2229,6 @@ def check_idle_nodepool(
             }
         )
     return hits
-
-
-SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
-# What the cluster autoscaler itself compares against: the exact strings
-# `"true"` and `"false"`, untrimmed and case-sensitive. §3.8 states the rule
-# in those literals, and `gke-cluster-autoscaler`'s
-# `find-scale-down-blockers.sh` selects on `== "false"` / `!= "true"`. Folding
-# case or accepting `strconv.ParseBool`'s other spellings inverts the
-# autoscaler both ways: a pod annotated `"False"` was published as pinning a
-# node the autoscaler drains, and a local-storage pod annotated `"True"` had
-# its pin dropped although the autoscaler still honours it.
-SAFE_TO_EVICT_TRUE = "true"
-SAFE_TO_EVICT_FALSE = "false"
 
 
 def _safe_to_evict(annotations: dict) -> bool | None:
@@ -5190,8 +5191,13 @@ def check_unattached_disk(
         name = disk.get("name", "")
         if name in live_pv_handles or f"{_location_of(disk)}/{name}" in live_pv_handles:
             continue
-        size_gb = disk.get("sizeGb")
-        size_gb = float(size_gb) if size_gb else 0
+        # `sizeGb` is an int64 string in the API's JSON; a value that does not
+        # parse skips this one disk rather than failing the project's read,
+        # as `check_registry_no_cleanup` does with `sizeBytes`.
+        try:
+            size_gb = float(disk.get("sizeGb") or 0)
+        except (TypeError, ValueError):
+            continue
         # gcloud returns `type` as a full diskTypes selfLink, so the excerpt
         # used to carry 100 characters of URL where `pd-balanced` belongs --
         # next to a `--zone` flag `_scope_flag` shortens for the same reason.

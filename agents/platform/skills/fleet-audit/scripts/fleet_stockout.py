@@ -1083,8 +1083,8 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     stopped for a reason that has nothing to do with supply. Both conditions
     hold, so both are reported.
 
-    `multi_zone_machine_types` holds the machine type of every pool on the
-    cluster that spans more than one zone. A zonal pool is spared only when
+    `multi_zone_machine_types` holds the machine type of every untainted pool
+    on the cluster that spans more than one zone. A zonal pool is spared only when
     one of them is its own machine type and it carries no taints: that pool
     is somewhere its pods can go when the zone stocks out. Any multi-zone pool
     used to spare every zonal one, which let a GPU pool pinned to one zone
@@ -1799,10 +1799,12 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
+        # A tainted multi-zone pool is no fallback: the zonal pool's pods do
+        # not tolerate its taints, so a stockout leaves them nowhere to go.
         multi_zone_machine_types = frozenset(
             (pool.get("config") or {}).get("machineType") or ""
             for pool in node_pools
-            if len(pool.get("locations") or []) > 1
+            if len(pool.get("locations") or []) > 1 and not (pool.get("config") or {}).get("taints")
         ) - {""}
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
