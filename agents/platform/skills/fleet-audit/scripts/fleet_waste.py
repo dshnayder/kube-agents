@@ -353,6 +353,8 @@ MONITORING_PAGE_SIZE = "2000"
 #: hands back a bare `requests.Response`, so a misbehaving intermediary's HTML
 #: page arrives as a 200 and would otherwise raise out of the read.
 NON_JSON_BODY = "HTTP 200 with a body that is not a JSON object"
+#: What a rc-0 `gcloud ... list` read that `object_list` refused reports.
+NOT_AN_OBJECT_LIST = "returned no JSON list of objects"
 # Also the manifest's `started_at` / `finished_at` form: both are UTC to the second.
 MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
@@ -361,6 +363,16 @@ POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_na
 MONITORING_CURL_PREFIX = 'curl -sG --oauth2-bearer "$(gcloud auth print-access-token)"'
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# Cloud Monitoring's aggregation enums, as the query string spells them.
+ALIGN_RATE = "ALIGN_RATE"
+ALIGN_MAX = "ALIGN_MAX"
+ALIGN_MEAN = "ALIGN_MEAN"
+ALIGN_SUM = "ALIGN_SUM"
+REDUCE_SUM = "REDUCE_SUM"
+# The keys `fetch_usage_peaks` files each metric's per-pod peaks under.
+CPU_USAGE_KEY = "cpu"
+MEM_USAGE_KEY = "mem"
+NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
 # Pod phases that do not count as a running replica of their controller.
 NOT_A_REPLICA_PHASES = ("Pending", "Failed", "Succeeded")
 # A pod younger than an hour has not settled into the usage it will run at.
@@ -888,6 +900,19 @@ def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tup
         return None, result
 
 
+def object_list(parsed: object) -> list | None:
+    """`parsed` when it is a JSON list of objects, else `None`.
+
+    What every `gcloud ... list` read here has to be before a check iterates
+    it. rc 0 with any other shape is a read that did not answer: an empty
+    object iterates to nothing and would record the check as run clean, and
+    a string element crashes the first `.get`.
+    """
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        return parsed
+    return None
+
+
 def output_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1259,7 +1284,7 @@ def _pod_series_params(
         "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
         "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
         "aggregation.perSeriesAligner": primary,
-        "aggregation.crossSeriesReducer": "REDUCE_SUM",
+        "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
         "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
         "secondaryAggregation.perSeriesAligner": secondary,
@@ -1273,8 +1298,8 @@ def _lb_traffic_params(metric: str, *, start: datetime, now: datetime) -> dict:
         "interval.startTime": start.strftime(MONITORING_TIME_FORMAT),
         "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
         "aggregation.alignmentPeriod": f"{LB_TRAFFIC_ALIGNMENT_S}s",
-        "aggregation.perSeriesAligner": "ALIGN_SUM",
-        "aggregation.crossSeriesReducer": "REDUCE_SUM",
+        "aggregation.perSeriesAligner": ALIGN_SUM,
+        "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": [LB_RULE_LABEL, LB_REGION_LABEL],
     }
 
@@ -1389,11 +1414,11 @@ def fetch_usage_peaks(
     started = time.monotonic()
     start = now - timedelta(hours=window_hours)
     url = MONITORING_TIMESERIES_URL.format(project=project)
-    reads = ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem"))
+    reads = ((CPU_METRIC, ALIGN_RATE, CPU_USAGE_KEY), (MEM_METRIC, ALIGN_MAX, MEM_USAGE_KEY))
     label = _monitoring_command(project, [
         _pod_series_params(
             metric, cluster, location, start=start, now=now,
-            primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
+            primary=aligner, secondary=ALIGN_MAX, window_hours=window_hours,
         )
         for metric, aligner, _ in reads
     ])
@@ -1404,11 +1429,11 @@ def fetch_usage_peaks(
     if session is None:
         return fail(-1, NO_SESSION_MESSAGE)
 
-    peaks: dict[str, dict[tuple[str, str], float]] = {"cpu": {}, "mem": {}}
+    peaks: dict[str, dict[tuple[str, str], float]] = {CPU_USAGE_KEY: {}, MEM_USAGE_KEY: {}}
     for metric, aligner, key in reads:
         sink, err = _read_pod_series(
             session, url, metric=metric, cluster=cluster, location=location, start=start, now=now,
-            primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
+            primary=aligner, secondary=ALIGN_MAX, window_hours=window_hours,
         )
         if err is not None:
             return fail(*err)
@@ -1419,10 +1444,10 @@ def fetch_usage_peaks(
     # `_per_replica` keeps apart from zero. Read as `0.0`, the missing
     # dimension cleared §3.1's 20% bar by the widest margin available and the
     # finding proposed shrinking a request nothing had measured.
-    mem_mib = {pod_key: value / BYTES_PER_MIB for pod_key, value in peaks["mem"].items()}
+    mem_mib = {pod_key: value / BYTES_PER_MIB for pod_key, value in peaks[MEM_USAGE_KEY].items()}
     merged = {
-        pod_key: (peaks["cpu"].get(pod_key), mem_mib.get(pod_key))
-        for pod_key in set(peaks["cpu"]) | set(peaks["mem"])
+        pod_key: (peaks[CPU_USAGE_KEY].get(pod_key), mem_mib.get(pod_key))
+        for pod_key in set(peaks[CPU_USAGE_KEY]) | set(peaks[MEM_USAGE_KEY])
     }
     if not merged:
         return fail(0, f'no time series for cluster_name="{cluster}" over the trailing {window_hours}h')
@@ -1470,7 +1495,7 @@ def fetch_memory_means(
     label = _monitoring_command(project, [
         _pod_series_params(
             MEM_METRIC, cluster, location, start=start, now=now,
-            primary="ALIGN_MAX", secondary="ALIGN_MEAN", window_hours=window_hours,
+            primary=ALIGN_MAX, secondary=ALIGN_MEAN, window_hours=window_hours,
         )
     ])
 
@@ -1482,7 +1507,7 @@ def fetch_memory_means(
 
     sink, err = _read_pod_series(
         session, url, metric=MEM_METRIC, cluster=cluster, location=location, start=start, now=now,
-        primary="ALIGN_MAX", secondary="ALIGN_MEAN", window_hours=window_hours,
+        primary=ALIGN_MAX, secondary=ALIGN_MEAN, window_hours=window_hours,
     )
     if err is not None:
         return fail(*err)
@@ -2140,7 +2165,7 @@ def check_idle_nodepool(
     that is unknown."""
     nodes_by_pool: dict[str, list[dict]] = {}
     for node in context["nodes"]:
-        pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
+        pool = (node.get("metadata", {}).get("labels") or {}).get(NODEPOOL_LABEL, "")
         nodes_by_pool.setdefault(pool, []).append(node)
 
     running_pods = [p for p in context["pods"] if (p.get("status") or {}).get("phase") == "Running"]
@@ -3324,7 +3349,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # back on any dimension is dropped, and one with a floor-bound
         # dimension alongside a shrinkable one reports only the shrinkable one.
         cpu_idle = cpu_unused and _resize_shrinks_request(
-            cpu_req_total, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+            cpu_req_total, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=1 / MILLICORES_PER_CORE
         )
         mem_idle = mem_unused and _resize_shrinks_request(
             mem_req_total, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
@@ -3755,7 +3780,7 @@ def check_idle_workload(
         guaranteed = _is_guaranteed(entry)
         defaulted = _namespace_defaulted_dimensions(entry, lr_defaults.get(entry["ns"], {}))
         cpu_shrinks = "cpu" not in defaulted and _resize_shrinks_request(
-            cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+            cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=1 / MILLICORES_PER_CORE
         )
         mem_shrinks = "memory" not in defaulted and _resize_shrinks_request(
             mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
@@ -4197,7 +4222,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # handed a `1m`/`1Mi` request that no scheduler decision can turn on.
         raw_cpu = peak_cpu / replicas * OVERREQUEST_PEAK_MULTIPLIER
         raw_mem_mib = peak_mem / replicas * OVERREQUEST_PEAK_MULTIPLIER
-        want_cpu = _resize_target(peak_cpu, replicas, floor=UNSIZED_FLOOR_VCPU, unit=0.001)
+        want_cpu = _resize_target(peak_cpu, replicas, floor=UNSIZED_FLOOR_VCPU, unit=1 / MILLICORES_PER_CORE)
         want_mem_mib = _resize_target(peak_mem, replicas, floor=UNSIZED_FLOOR_MIB, unit=1.0)
         # Autopilot bills on requests and injects its own defaults where a
         # manifest declares none, so an unsized workload there is not merely
@@ -4966,11 +4991,11 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
                 "--format", "json",
             ]
             operations, _ops_result = run_and_gate(ops_argv, run=run)
-            # A read that parsed to anything but a list said nothing about
+            # A read that parsed to anything but a list of objects said nothing about
             # pool creations; handed on, it read as "no pool created lately"
             # and dated every pool from the cluster. It takes the failed-read
             # path instead: node age, with the pool named in `limitations`.
-            pool_ages = node_pool_creation_ages(operations, name, now=now) if isinstance(operations, list) else None
+            pool_ages = node_pool_creation_ages(operations, name, now=now) if object_list(operations) is not None else None
             idle_pool_hits = check_idle_nodepool(
                 context, node_pools, now=now, pool_ages=pool_ages,
                 cluster_age=_age_days(cluster.get("create_time") or "", now=now), limitations=limitations,
@@ -5626,6 +5651,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     tp_parsed, tp_result = run_and_gate(tp_argv, run=run)
     bs_argv = ["gcloud", "compute", "backend-services", "list", "--project", project, "--format", "json"]
     bs_parsed, bs_result = run_and_gate(bs_argv, run=run)
+    # Anything but a list of objects is a failed read, and gates below as one.
+    disks_parsed, addr_parsed, fwd_parsed, tp_parsed, bs_parsed = (
+        object_list(parsed) for parsed in (disks_parsed, addr_parsed, fwd_parsed, tp_parsed, bs_parsed)
+    )
 
     # Name the read that failed and what it said. "one or more compute list
     # reads failed" was what this returned for as long as the disks filter was
@@ -5640,7 +5669,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         (bs_argv, bs_parsed, bs_result),
     )
     failed = [
-        f"{shlex.join(argv)} rc={result.rc}: {result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'}"
+        f"{shlex.join(argv)} rc={result.rc}: "
+        + (
+            result.stderr.strip()[:DETAIL_EXCERPT_CHARS]
+            or ("no stderr" if result.rc else NOT_AN_OBJECT_LIST)
+        )
         for argv, parsed, result in compute_reads
         if parsed is None
     ]
@@ -5669,13 +5702,14 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # every location in one read, and the banner it prints goes to stderr.
     reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
     reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
+    reg_parsed = object_list(reg_parsed)
     registry_disabled = reg_parsed is None and _api_disabled(reg_result) and refusal_names_project(project, reg_result.stderr, run=run)
     # The reverse holds too (SOP §3.14): a failed compute read leaves
     # `registry-no-cleanup` running, and only when that read has nothing to
     # give either is there no check left for the target to carry.
     if compute_failed and reg_parsed is None:
         return {
-            "name": f"project/{project}",
+            "name": f"{PROJECT_TARGET_PREFIX}{project}",
             "project": project,
             "location": "global",
             "outcome": "gate-failed",
@@ -5724,7 +5758,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         candidates += [_emit("registry-no-cleanup", h) for h in check_registry_no_cleanup(reg_parsed, project=project, now=now)]
 
     entry = {
-        "name": f"project/{project}",
+        "name": f"{PROJECT_TARGET_PREFIX}{project}",
         "project": project,
         "location": "global",
         "outcome": "collected",
@@ -5791,7 +5825,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     if not disks_judged and compute_ok:
         unevaluated["unattached-disk"] = "none of this project's clusters could be read"
     if reg_parsed is None and not registry_disabled:
-        unevaluated["registry-no-cleanup"] = f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
+        unevaluated["registry-no-cleanup"] = (
+            f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
+            if reg_result.rc != 0
+            else f"`gcloud artifacts repositories list` exited 0 and {NOT_AN_OBJECT_LIST}"
+        )
     if unevaluated:
         entry["checks_unevaluated"] = [{"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())]
     # After the block above, not before it: that one assigns `limitations`
@@ -5805,7 +5843,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         why = (
             f"exited {reg_result.rc} ({reg_result.stderr.strip()[:DETAIL_EXCERPT_CHARS] or 'no stderr'})"
             if reg_result.rc != 0
-            else "exited 0 and returned no parseable JSON"
+            else f"exited 0 and {NOT_AN_OBJECT_LIST}"
         )
         registry_gap = (
             "registry-no-cleanup was not evaluated for this project: "
@@ -5861,7 +5899,7 @@ def _read_project(p: str, *, run: RunFn, session: SessionFn, now: datetime) -> t
     # the silence `_idle_traffic_clause` prefers to a fabricated zero.
     # Only a running cluster's idle workload reads the traffic, so a project
     # without one skips the three Monitoring calls.
-    traffic = fetch_lb_traffic(p, rules, session=session, now=now) if running and isinstance(rules, list) else None
+    traffic = fetch_lb_traffic(p, rules, session=session, now=now) if running and object_list(rules) is not None else None
     return running, not_running, None, forwarding_rules, traffic
 
 

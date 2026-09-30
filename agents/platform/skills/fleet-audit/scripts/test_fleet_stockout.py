@@ -2100,6 +2100,16 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
         self.assertIn("credential proxy output truncated", entry["limitations"])
 
+    def test_an_autoscaler_answer_that_is_not_a_list_of_entries_is_unevaluated(self):
+        # `{}` iterated nothing, and a string element was skipped: both read
+        # as a clean window.
+        for stdout in ("{}", json.dumps([ERROR_MSG_ENTRY, "entry"])):
+            with self.subTest(stdout=stdout[:20]):
+                entry = self.run_with(dump_items=[], log_stdout=stdout)
+                self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+                self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+                self.assertIn("not a JSON list of entries", entry["limitations"])
+
     def test_an_empty_autoscaler_read_is_still_clean(self):
         entry = self.run_with(dump_items=[], log_stdout="\n")
         self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
@@ -2811,7 +2821,12 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual([c["object"] for c in entry["candidates"]], ["Quota/us-central1:CPUS"])
 
     def test_a_reservations_answer_that_is_not_a_list_is_unevaluated(self):
-        for label, stdout in (("object", json.dumps({"error": "shim"})), ("unparseable", '[{"name": "trunc')):
+        for label, stdout in (
+            ("object", json.dumps({"error": "shim"})),
+            ("unparseable", '[{"name": "trunc'),
+            ("empty object", "{}"),
+            ("string element", json.dumps([{"name": "r1"}, "r2"])),
+        ):
             with self.subTest(label):
                 def run(argv, **kwargs):
                     if argv[:3] == ["gcloud", "compute", "reservations"]:
@@ -2822,7 +2837,7 @@ class CollectProjectTest(unittest.TestCase):
                 self.assertNotIn("reservation-mismatch-risk", {c["check"] for c in entry["commands"]})
                 [unevaluated] = entry["checks_unevaluated"]
                 self.assertEqual(unevaluated["check"], "reservation-mismatch-risk")
-                self.assertIn("returned output that is not a JSON list (rc=0)", unevaluated["reason"])
+                self.assertIn("returned output that is not a JSON list of reservations (rc=0)", unevaluated["reason"])
                 self.assertIn("not a JSON list", entry["limitations"])
 
     def test_one_metric_over_the_line_in_two_regions_is_two_findings(self):

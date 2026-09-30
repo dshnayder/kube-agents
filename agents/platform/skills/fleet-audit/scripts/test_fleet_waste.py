@@ -449,6 +449,24 @@ class FetchLbTrafficTest(unittest.TestCase):
     def fetch(self, session, rules=None, **kwargs):
         return fw.fetch_lb_traffic("acme", self.RULES if rules is None else rules, session=session, now=NOW, **kwargs)
 
+    def test_a_rule_list_that_is_not_a_list_of_objects_reads_no_traffic(self):
+        """The rule list gates §3.6 as a failed read; the traffic sentence
+        drawn from the rules that did parse would be the only claim left
+        standing on it, so it goes unwritten instead."""
+        clusters = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+        for stdout in ("{}", json.dumps([self.RULES[0], "rule-b"])):
+            def run(argv, **kwargs):
+                if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                    return run_of(0, clusters)
+                if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
+                    return run_of(0, stdout)
+                return run_of(0, "")
+
+            with self.subTest(stdout=stdout[:20]), patch.object(fw, "fetch_lb_traffic") as fetch:
+                *_, traffic = fw._read_project("acme", run=run, session=FakeLbSession(), now=NOW)
+                self.assertIsNone(traffic)
+                fetch.assert_not_called()
+
     def test_the_answer_is_keyed_by_address_not_by_rule_name(self):
         # The join on the other end is a Service's
         # `status.loadBalancer.ingress[].ip`, and nothing in the Monitoring
@@ -2178,10 +2196,10 @@ class OverrequestPrescribesTheResizeTest(unittest.TestCase):
 
     Left to infer it, the model works the number out of the peaks the excerpt
     quotes -- which are rounded to two decimals of a vCPU and one of a GiB, so
-    a small workload reads as `0.00 vCPU / 0.0 GiB` -- and it does not know
-    about the `50m`/`64Mi` clamp at all, because `ceil(peak x 2)` is the only
-    half of the rule the SOP states. The 2026-09-06 cost report asked for
-    `about 10m` on a dimension whose floor is `50m`.
+    a small workload reads as `0.00 vCPU / 0.0 GiB` -- and it has to recall
+    the `50m`/`64Mi` clamp the SOP states beside `ceil(peak x 2)` to get the
+    number right. The 2026-09-06 cost report asked for `about 10m` on a
+    dimension whose floor is `50m`.
     """
 
     pod = OverrequestTest().deployment_pod
@@ -4673,6 +4691,45 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
         self.assertNotIn("limitations", target)
 
+    #: rc-0 answers that parse but are not a list of objects. `{}` iterated
+    #: to nothing and recorded the check as run clean; a string element
+    #: crashed the first `.get`.
+    NOT_OBJECT_LISTS = ("{}", json.dumps([{"name": "x"}, "y"]))
+
+    def answering(self, resource: str, stdout: str):
+        inner = self.run_with()
+
+        def run(argv, **kwargs):
+            if len(argv) > 2 and argv[2] == resource:
+                return run_of(0, stdout)
+            return inner(argv, **kwargs)
+
+        return run
+
+    def test_a_compute_read_that_is_not_a_list_of_objects_fails_the_gate(self):
+        for resource in ("disks", "addresses", "forwarding-rules", "target-pools", "backend-services"):
+            for stdout in self.NOT_OBJECT_LISTS:
+                with self.subTest(resource=resource, stdout=stdout):
+                    target = fw.collect_project_compute("acme", True, self.FACTS, run=self.answering(resource, stdout), now=NOW)
+                    self.assertEqual([c["check"] for c in target["commands"]], ["registry-no-cleanup"])
+                    self.assertEqual(
+                        [c["check"] for c in target["checks_unevaluated"]],
+                        ["idle-address", "orphan-lb", "unattached-disk"],
+                    )
+                    self.assertIn("1 of 5", target["limitations"])
+                    self.assertIn(f"gcloud compute {resource} list", target["limitations"])
+                    self.assertIn(fw.NOT_AN_OBJECT_LIST, target["limitations"])
+
+    def test_a_registry_read_that_is_not_a_list_of_objects_is_unevaluated(self):
+        for stdout in self.NOT_OBJECT_LISTS:
+            with self.subTest(stdout=stdout):
+                target = fw.collect_project_compute("acme", True, self.FACTS, run=self.answering("repositories", stdout), now=NOW)
+                self.assertNotIn("registry-no-cleanup", [c["check"] for c in target["commands"]])
+                reasons = {c["check"]: c["reason"] for c in target["checks_unevaluated"]}
+                self.assertIn(fw.NOT_AN_OBJECT_LIST, reasons["registry-no-cleanup"])
+                self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
+                self.assertIn("unattached-disk", [c["check"] for c in target["commands"]])
+
     def test_the_registry_read_is_recorded_alongside_the_compute_ones(self):
         target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
         entry = next(c for c in target["commands"] if c["check"] == "registry-no-cleanup")
@@ -5282,9 +5339,13 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
     def test_an_operations_read_that_is_not_a_list_falls_back_to_node_age(self):
         # The node is a day old, so node age spares the pool; read as "no
         # recent creation", the object answer judged it idle.
-        entry, _ = self.collect({"operations": []})
-        self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
-        self.assertIn("operations read failed", entry.get("limitations", ""))
+        # A string element was skipped the same way. `{}` needs no case of
+        # its own: `node_pool_creation_ages` never took it for a list.
+        for answer in ({"operations": []}, {}, ["op"]):
+            with self.subTest(answer=answer):
+                entry, _ = self.collect(answer)
+                self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
+                self.assertIn("operations read failed", entry.get("limitations", ""))
 
     def test_a_young_cluster_s_pools_are_dated_from_its_create_time(self):
         young = {**self.CLUSTER, "create_time": (NOW - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")}
@@ -5669,8 +5730,6 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "acme\n")
             if argv[:2] == ["gcloud", "projects"] and "list" in argv:
                 return run_of(0, "beta\n")
-            if argv[:3] == ["gcloud", "container", "clusters"]:
-                return run_of(0, json.dumps([{"name": "c2"}]))
             raise AssertionError(argv)
 
         projects, partial = fw.get_target_projects(None, run=run)
@@ -5683,8 +5742,6 @@ class GetTargetProjectsTest(unittest.TestCase):
                 return run_of(0, "acme\n")
             if argv[:2] == ["gcloud", "projects"] and "list" in argv:
                 return run_of(0, "acme\nbeta\n")
-            if argv[:3] == ["gcloud", "container", "clusters"]:
-                return run_of(0, json.dumps([{"name": "c2"}]))
             raise AssertionError(argv)
 
         self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "beta"], None))

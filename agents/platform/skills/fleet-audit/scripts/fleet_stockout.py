@@ -506,6 +506,15 @@ def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tup
         return None, result
 
 
+def object_list(parsed: object) -> list | None:
+    """`parsed` when it is a JSON list of objects, else `None` -- the shape
+    `fleet_waste.object_list` requires of a list read, for the same reason:
+    any other rc-0 shape iterates to nothing or crashes the first `.get`."""
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        return parsed
+    return None
+
+
 def output_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1959,7 +1968,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # the sandbox's `gcloud` shim cuts stdout at the broker's cap, says so on
     # stderr and keeps the child's exit code, and the busiest cluster's window
     # is the one that reaches the cap.
-    logs_unreadable = logging_result.rc == 0 and bool(logging_result.stdout.strip()) and not isinstance(entries, list)
+    logs_unreadable = logging_result.rc == 0 and bool(logging_result.stdout.strip()) and object_list(entries) is None
     if logging_result.rc == 0 and not logs_unreadable:
         commands["autoscaler-out-of-resources"] = _record(shlex.join(logging_argv), logging_result)
         # The instance groups of pools a ComputeClass the cluster has put
@@ -1994,7 +2003,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             )
     else:
         logging_failure = (
-            f"`gcloud logging read` returned output that is not a JSON list (rc=0) — "
+            f"`gcloud logging read` returned output that is not a JSON list of entries (rc=0) — "
             if logs_unreadable
             else f"`gcloud logging read` failed (rc={logging_result.rc}) — "
         ) + (logging_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
@@ -2212,14 +2221,14 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
     name = f"{PROJECT_TARGET_PREFIX}{project}"
     unevaluated: dict[str, str] = {}
     limitations: list[str] = []
-    # rc 0 with output that is not a list -- an object, or text that does
-    # not parse -- is a read that did not answer, as the siblings in
-    # `collect_cluster` treat it: iterating nothing would record the check
-    # as run and clean.
-    reservations_read = isinstance(reservations, list)
+    # rc 0 with output that is not a list of objects -- an object, a string
+    # element, or text that does not parse -- is a read that did not answer,
+    # as the siblings in `collect_cluster` treat it: iterating nothing would
+    # record the check as run and clean.
+    reservations_read = object_list(reservations) is not None
     if not reservations_read:
         reservations_failure = (
-            "`gcloud compute reservations list` returned output that is not a JSON list (rc=0) — "
+            "`gcloud compute reservations list` returned output that is not a JSON list of reservations (rc=0) — "
             if res_result.rc == 0
             else f"`gcloud compute reservations list` failed (rc={res_result.rc}) — "
         ) + (res_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr")
