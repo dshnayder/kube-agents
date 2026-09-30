@@ -405,8 +405,10 @@ COLLECTOR_AUDITS = frozenset(
         "ai-security-audit",
         "compliance-audit",
         "fleet-consistency-drift",
+        "fleet-wide-cost-analysis",
         "obtainability-audit",
         "security-patch-orchestrator",
+        "stockout-prevention",
     }
 )
 

@@ -87,6 +87,8 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
+# The stream this collector serves, as `audit_report.py finish --audit` names it.
+AUDIT_ID = "stockout-prevention"
 
 # A digest of this file, published in the manifest. `audit_report.py` compares
 # it against the previous run's to tell a finding that stopped reproducing from
@@ -1042,7 +1044,18 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
 
 def check_ccc_no_ondemand_floor(cc: dict, referenced_by_inference: bool) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
-    if not priorities or not all(_priority_is_spot(p) for p in priorities):
+    if not priorities:
+        return None
+    if not all(_priority_is_spot(p) for p in priorities):
+        # §3.2's second arm. An On-Demand floor exists, but an inference
+        # workload tries Spot first, so a preemption still evicts a serving pod
+        # mid-request before the floor is reached. The default `major` rather
+        # than the all-Spot escalation's `critical`: the pod does come back.
+        if referenced_by_inference and _priority_is_spot(priorities[0]):
+            return {
+                "object": f"ComputeClass/{cc['metadata']['name']}",
+                "excerpt": f"{len(priorities)} priorities, Spot first with an On-Demand fallback after it; referenced by an inference workload",
+            }
         return None
     # The guard `check_ccc_missing_fallbacks` carries, for the reason §3.1
     # already gives and §3.2 omits: `autopilot-spot` is one of the three classes
@@ -2448,7 +2461,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         return {
             "version": MANIFEST_VERSION,
             "checks_revision": CHECKS_REVISION,
-            "audit": "stockout-prevention",
+            "audit": AUDIT_ID,
             "started_at": started_at,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "error": error,
@@ -2593,7 +2606,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     return {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
-        "audit": "stockout-prevention",
+        "audit": AUDIT_ID,
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "clusters": entries,

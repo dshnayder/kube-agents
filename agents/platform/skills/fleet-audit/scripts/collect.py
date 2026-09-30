@@ -7804,7 +7804,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
         kind = str(doc.get("kind") or "")
         meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
         if kind == "Secret":
-            labels = meta.get("labels") or {}
+            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
             if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
                 continue
             # `stringData` is what a committed registration uses; `data` is
@@ -7818,7 +7818,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             if server and cluster:
                 servers[server] = cluster
         elif kind == FLUX_HELM_REPOSITORY_KIND:
-            url = str((doc.get("spec") or {}).get("url") or "").strip()
+            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            url = str(repo_spec.get("url") or "").strip()
             name = str(meta.get("name") or "")
             namespace = str(meta.get("namespace") or "")
             if url and name:
@@ -7899,7 +7900,13 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
                 continue
             cluster = parts[1]
             namespace = str(meta.get("namespace") or "")
-            chart_spec = ((spec.get("chart") or {}).get("spec") or {}) if isinstance(spec.get("chart"), dict) else {}
+            # A scalar or a list where the chart template goes is a malformed
+            # document, and one malformed file must not crash the whole run
+            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
+            chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+            chart_spec = chart.get("spec") if chart.get("spec") is not None else {}
+            if not isinstance(chart_spec, dict):
+                continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)
             repo_name = str(source_ref.get("name") or "")

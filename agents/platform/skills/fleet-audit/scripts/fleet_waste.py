@@ -782,6 +782,9 @@ IDLE_NAMESPACE_MIN_AGE_DAYS = 30
 # §3.1's `major`: a reclaimable delta of a node's worth.
 NODE_WORTH_VCPU = 8
 NODE_WORTH_GIB = 32
+# The `restartPolicy` that makes an init container a native sidecar, which
+# runs beside the app containers and so counts in the pod's effective request.
+SIDECAR_RESTART_POLICY = "Always"
 LB_ANNOTATION_KEYS = ("kubernetes.io/ingress.global-static-ip-name", "networking.gke.io/load-balancer-ip", "cloud.google.com/load-balancer-ip", "networking.gke.io/addresses")
 NON_WASTE_ADDRESS_PURPOSES = {"GCE_ENDPOINT", "VPC_PEERING", "PRIVATE_SERVICE_CONNECT", "NAT_AUTO", "SHARED_LOADBALANCER_VIP", "IPSEC_INTERCONNECT"}
 #: §3.4's floor for a disk whose owning cluster is still there. The SOP
@@ -2051,6 +2054,13 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
             claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
             if claim:
                 referenced.add((ns, claim))
+    # A generic ephemeral volume names no claim: Kubernetes creates one called
+    # `<pod>-<volume>` for the pod's life and deletes it with the pod.
+    for pod in context["pods"]:
+        meta = pod.get("metadata", {})
+        for vol in (pod.get("spec") or {}).get("volumes") or []:
+            if vol.get("ephemeral") and vol.get("name"):
+                referenced.add((meta.get("namespace", ""), f"{meta.get('name', '')}-{vol['name']}"))
     sts_by_ns = _statefulsets_by_namespace(context)
 
     hits = []
@@ -2062,6 +2072,10 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
         if status.get("phase") != "Bound":
             continue
         if (ns, name) in referenced:
+            continue
+        # A claim a Pod owns is garbage-collected with it; there is nothing to
+        # reclaim by hand, even if the pod list above missed the pod.
+        if any(ref.get("kind") == "Pod" for ref in meta.get("ownerReferences") or []):
             continue
         if _matches_live_statefulset_pvc(name, sts_by_ns.get(ns, set())):
             continue
@@ -2098,13 +2112,42 @@ def _pod_is_mirror(pod: dict) -> bool:
     return any(o.get("kind") == "Node" for o in (pod.get("metadata", {}).get("ownerReferences") or []))
 
 
+def _container_requests(c: dict) -> tuple[float, float]:
+    req = (c.get("resources") or {}).get("requests") or {}
+    return parse_cpu_cores(str(req.get("cpu", "0"))) or 0, parse_mem_mib(str(req.get("memory", "0"))) or 0
+
+
+def _pod_effective_requests(pod: dict) -> tuple[float, float]:
+    """The requests the scheduler reserves for one pod, per resource.
+
+    App containers plus native sidecars (`restartPolicy: Always` init
+    containers), which run alongside them; or, if larger, the heaviest plain
+    init container together with the sidecars started before it, since those
+    run while it does. Summing app containers alone understated a node's
+    requests and read a node carrying a heavy sidecar as idler than the
+    scheduler does. `_is_guaranteed` reads init containers for the same reason.
+    """
+    spec = pod.get("spec") or {}
+    cpu, mem = 0.0, 0.0
+    for c in spec.get("containers") or []:
+        c_cpu, c_mem = _container_requests(c)
+        cpu, mem = cpu + c_cpu, mem + c_mem
+    sidecar_cpu = sidecar_mem = init_cpu = init_mem = 0.0
+    for c in spec.get("initContainers") or []:
+        c_cpu, c_mem = _container_requests(c)
+        if c.get("restartPolicy") == SIDECAR_RESTART_POLICY:
+            sidecar_cpu, sidecar_mem = sidecar_cpu + c_cpu, sidecar_mem + c_mem
+        else:
+            init_cpu, init_mem = max(init_cpu, sidecar_cpu + c_cpu), max(init_mem, sidecar_mem + c_mem)
+    return max(init_cpu, cpu + sidecar_cpu), max(init_mem, mem + sidecar_mem)
+
+
 def _sum_requests(pods: list[dict]) -> tuple[float, float]:
     cpu_total, mem_total = 0.0, 0.0
     for pod in pods:
-        for c in (pod.get("spec") or {}).get("containers") or []:
-            req = (c.get("resources") or {}).get("requests") or {}
-            cpu_total += parse_cpu_cores(str(req.get("cpu", "0"))) or 0
-            mem_total += parse_mem_mib(str(req.get("memory", "0"))) or 0
+        cpu, mem = _pod_effective_requests(pod)
+        cpu_total += cpu
+        mem_total += mem
     return cpu_total, mem_total
 
 
@@ -3387,17 +3430,21 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if not (cpu_idle or mem_idle):
             continue
 
-        delta_cpu = (cpu_req_total - peak_cpu) if cpu_idle else 0.0
-        delta_mem_gib = ((mem_req_total - peak_mem) / MIB_PER_GIB) if mem_idle else 0.0
         # The floor is a property of the request, not of the delta, and only an
         # idle dimension can satisfy it: a workload consuming all 8 GiB it asked
         # for and none of its 10m of CPU must not clear a materiality test on
-        # the strength of the memory it is using.
-        material = (cpu_idle and cpu_req_total >= OVERREQUEST_FLOOR_VCPU) or (
-            mem_idle and mem_req_total / MIB_PER_GIB >= OVERREQUEST_FLOOR_GIB
-        )
-        if not material:
+        # the strength of the memory it is using. It is also applied per
+        # dimension, as the resize floor above is: a dimension idle but under
+        # the materiality floor is left out of the delta, the severity, the
+        # both-dimensions sentence and the Resize-to prescription alike, so a
+        # finding carried by its other dimension does not also ask to shrink it.
+        cpu_reclaimable, mem_reclaimable = cpu_idle, mem_idle
+        cpu_idle = cpu_idle and cpu_req_total >= OVERREQUEST_FLOOR_VCPU
+        mem_idle = mem_idle and mem_req_total / MIB_PER_GIB >= OVERREQUEST_FLOOR_GIB
+        if not (cpu_idle or mem_idle):
             continue
+        delta_cpu = (cpu_req_total - peak_cpu) if cpu_idle else 0.0
+        delta_mem_gib = ((mem_req_total - peak_mem) / MIB_PER_GIB) if mem_idle else 0.0
 
         _, measured_over = _measured_over(
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
@@ -3454,6 +3501,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             # A fourth: no request declared at all, where "in use" would be
             # a verdict about a dimension nothing was measured against.
             other, other_unused = ("memory", mem_unused) if over == "cpu" else ("cpu", cpu_unused)
+            other_reclaimable = mem_reclaimable if over == "cpu" else cpu_reclaimable
             other_req_total = mem_req_total if over == "cpu" else cpu_req_total
             if other in defaulted:
                 why = "the namespace LimitRange default, which is fixed in the LimitRange rather than resized here"
@@ -3467,6 +3515,10 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 # Idle and not reclaimable covers a request under the floor as
                 # well as one on it, and "at the floor" is false of the first.
                 why = "already below the 50m/64Mi sizing floor, where a resize would raise it rather than reduce it"
+            elif other_reclaimable:
+                # Idle and shrinkable, but its request is under the
+                # materiality floor, so the finding does not ask for it.
+                why = "idle, but its request is under the 100m/128Mi materiality floor and is not worth a resize"
             elif other_unused:
                 why = "already at the 50m/64Mi sizing floor and cannot be reduced further"
             else:
@@ -4569,7 +4621,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
         kind = str(doc.get("kind") or "")
         meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
         if kind == "Secret":
-            labels = meta.get("labels") or {}
+            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
             if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
                 continue
             # `stringData` is what a committed registration uses; `data` is
@@ -4583,7 +4635,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             if server and cluster:
                 servers[server] = cluster
         elif kind == FLUX_HELM_REPOSITORY_KIND:
-            url = str((doc.get("spec") or {}).get("url") or "").strip()
+            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            url = str(repo_spec.get("url") or "").strip()
             name = str(meta.get("name") or "")
             namespace = str(meta.get("namespace") or "")
             if url and name:
@@ -4664,7 +4717,13 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
                 continue
             cluster = parts[1]
             namespace = str(meta.get("namespace") or "")
-            chart_spec = ((spec.get("chart") or {}).get("spec") or {}) if isinstance(spec.get("chart"), dict) else {}
+            # A scalar or a list where the chart template goes is a malformed
+            # document, and one malformed file must not crash the whole run
+            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
+            chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+            chart_spec = chart.get("spec") if chart.get("spec") is not None else {}
+            if not isinstance(chart_spec, dict):
+                continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)
             repo_name = str(source_ref.get("name") or "")

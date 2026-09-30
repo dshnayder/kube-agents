@@ -14711,9 +14711,13 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
     def test_every_collector_stream_requires_its_manifest(self):
         import collect
         import fleet_drift
+        import fleet_stockout
+        import fleet_waste
         import patch_readiness
 
-        expected = set(collect.CHECK_TABLES) | {fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID}
+        expected = set(collect.CHECK_TABLES) | {
+            fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+        }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
 

@@ -799,6 +799,25 @@ class UnconsumedPvcTest(unittest.TestCase):
         context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": [], "jobs": [job]}
         self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
 
+    def test_does_not_flag_a_generic_ephemeral_volume_claim(self):
+        """An `ephemeral` volume names no claim; its PVC is `<pod>-<volume>`."""
+        pod = obj("Pod", "web-0", ns="default", **{"spec.volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {}}}]})
+        context = {"pods": [pod], "pvcs": [self.pvc(name="web-0-scratch")], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_an_ephemeral_volume_on_another_pod_does_not_spare_the_claim(self):
+        pod = obj("Pod", "web-1", ns="default", **{"spec.volumes": [{"name": "scratch", "ephemeral": {"volumeClaimTemplate": {}}}]})
+        context = {"pods": [pod], "pvcs": [self.pvc(name="web-0-scratch")], "statefulsets": []}
+        self.assertEqual(len(fw.check_unconsumed_pvc(context, now=NOW)), 1)
+
+    def test_does_not_flag_a_claim_a_pod_owns(self):
+        """Garbage collection deletes it with the pod, whether or not the pod
+        list caught the pod."""
+        pvc = self.pvc(name="web-0-scratch")
+        pvc["metadata"]["ownerReferences"] = [{"kind": "Pod", "name": "web-0"}]
+        context = {"pods": [], "pvcs": [pvc], "statefulsets": []}
+        self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
     def test_a_job_in_another_namespace_does_not_spare_the_claim(self):
         job = obj("Job", "backfill", ns="other", **{"spec.template": {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]}}})
         context = {"pods": [], "pvcs": [self.pvc()], "statefulsets": [], "jobs": [job]}
@@ -1084,6 +1103,37 @@ class IdleNodepoolTest(unittest.TestCase):
         hits = fw.check_idle_nodepool(context, pools, now=NOW)
         self.assertEqual(len(hits), 1)
         self.assertIn("1 workload pod(s) requesting 5% CPU / 1% memory", hits[0]["excerpt"])
+
+    def test_a_native_sidecar_counts_toward_the_node_request(self):
+        """A `restartPolicy: Always` init container runs beside the app for the
+        pod's life and the scheduler reserves its request. Summing app
+        containers alone read this node as 3% requested and idle."""
+        node = self.node("n1", "default-pool")
+        pod = self.pod_on("n1", cpu_req="100m", mem_req="100Mi", name="app")
+        pod["spec"]["initContainers"] = [
+            {"restartPolicy": "Always", "resources": {"requests": {"cpu": "1500m", "memory": "2Gi"}}},
+        ]
+        context = {"nodes": [node], "pods": [pod]}
+        pools = [self.pool("default-pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_the_effective_request_follows_the_scheduler_formula(self):
+        """Per resource: app containers plus every sidecar, or a plain init
+        container plus the sidecars started before it, whichever is larger. A
+        plain init container runs to completion first, so it is not added."""
+        pod = self.pod_on("n1", cpu_req="100m", mem_req="100Mi")
+        pod["spec"]["initContainers"] = [
+            {"resources": {"requests": {"cpu": "200m", "memory": "50Mi"}}},
+            {"restartPolicy": "Always", "resources": {"requests": {"cpu": "300m", "memory": "10Mi"}}},
+            {"resources": {"requests": {"cpu": "2", "memory": "20Mi"}}},
+            {"restartPolicy": "Always", "resources": {"requests": {"cpu": "400m", "memory": "30Mi"}}},
+        ]
+        cpu, mem = fw._sum_requests([pod])
+        # cpu: the second plain init (2) plus the sidecar before it (0.3)
+        # outweighs app + both sidecars (0.8).
+        self.assertAlmostEqual(cpu, 2.3)
+        # memory: app + both sidecars (140Mi) outweighs either plain init.
+        self.assertAlmostEqual(mem, 140.0)
 
     def test_the_excerpt_keeps_the_autoscaler_facing_figure(self):
         """The add-ons are excluded from the *gate*, not from the reader: the
@@ -1971,10 +2021,17 @@ class OverrequestTest(unittest.TestCase):
         250m test whose stated justification ("about the smallest request a
         first-class service is given") describes a request. Comparing the
         request is what makes the justification true of the code.
+
+        The values make the two tests disagree: a 100m request sits on the
+        100m floor, while its 81m delta (peak 19m, idle at 19%) is under it.
+        Memory is on its 64Mi resize floor, so CPU alone decides.
         """
-        pod = self.deployment_pod(cpu_req="200m", mem_req="256Mi")
+        pod = self.deployment_pod(cpu_req="100m", mem_req="64Mi")
+        peak_cpu = 0.019
+        self.assertGreaterEqual(0.1, fw.OVERREQUEST_FLOOR_VCPU)
+        self.assertLess(0.1 - peak_cpu, fw.OVERREQUEST_FLOOR_VCPU)
         hits = fw.check_overrequest(
-            {"pods": [pod]}, {("default", "api-1"): (0.001, 24.0)}, now=NOW, autopilot=False
+            {"pods": [pod]}, {("default", "api-1"): (peak_cpu, 24.0)}, now=NOW, autopilot=False
         )
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "minor")
@@ -2051,12 +2108,33 @@ class OverrequestTest(unittest.TestCase):
         dimension running at 94% of its request must not be part of the finding
         at all -- neither reaching the materiality floor for it nor raising its
         severity. 8 GiB of nominal slack under a 128 GiB request that is in use
-        is not 8 GiB anyone can reclaim."""
+        is not 8 GiB anyone can reclaim.
+
+        Memory here runs at 50% of 128 GiB, so its 64 GiB of nominal slack is
+        twice `NODE_WORTH_GIB`: counted, it would grade the finding `major`,
+        where the idle CPU's 0.95 vCPU alone grades `minor`."""
         pod = self.deployment_pod(cpu_req="1", mem_req="128Gi")
-        peaks = {("default", "api-1"): (0.05, 120 * 1024.0)}
+        peaks = {("default", "api-1"): (0.05, 64 * 1024.0)}
+        self.assertGreater(64, fw.NODE_WORTH_GIB)
         hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "minor")
+        self.assertIn("Over-requested on cpu only", hits[0]["excerpt"])
+
+    def test_an_idle_dimension_under_the_materiality_floor_is_left_out(self):
+        """CPU idle on a full vCPU carries the finding; memory is idle and
+        shrinkable too, but its 100Mi request is under the 128Mi materiality
+        floor, so the finding neither calls it over-requested nor asks to
+        resize it."""
+        pod = self.deployment_pod(cpu_req="1", mem_req="100Mi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.01, 10.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("Over-requested on cpu only", excerpt)
+        self.assertIn("memory is idle, but its request is under the 100m/128Mi materiality floor", excerpt)
+        self.assertNotIn("both dimensions", excerpt)
+        self.assertIn("Resize to cpu 50m.", excerpt)
+        self.assertNotIn("memory 64Mi", excerpt)
 
     def test_an_idle_dimension_under_the_floor_is_not_rescued_by_one_in_use(self):
         # 64 GiB is far over the memory floor, but memory is the dimension in
@@ -5378,8 +5456,9 @@ class NodePoolAgeFromOperationsTest(unittest.TestCase):
     def test_an_operations_read_that_is_not_a_list_falls_back_to_node_age(self):
         # The node is a day old, so node age spares the pool; read as "no
         # recent creation", the object answer judged it idle.
-        # A string element was skipped the same way. `{}` needs no case of
-        # its own: `node_pool_creation_ages` never took it for a list.
+        # A string element was skipped the same way. `{}` was never taken for
+        # a list by `node_pool_creation_ages`; it stays as a guard that an
+        # empty object keeps falling back rather than reading as no creation.
         for answer in ({"operations": []}, {}, ["op"]):
             with self.subTest(answer=answer):
                 entry, _ = self.collect(answer)
@@ -7291,6 +7370,35 @@ class CandidatesCarryTheirReconcilerTest(unittest.TestCase):
         self.assertNotIn("reconciler", fw._emit("unattached-disk", hit))
         index = {("", "Disk/orphaned-pd"): "the Helm release `x`"}
         self.assertNotIn("reconciler", fw._emit("unattached-disk", hit, reconcilers=index))
+
+
+class ReleaseDeclarationsSurviveMalformedDocumentsTest(unittest.TestCase):
+    """One malformed file in the clone crashed the run before the manifest
+    printed; each is skipped and the well-formed release still indexes."""
+
+    GOOD = (
+        "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"
+        "spec: {chart: {spec: {chart: web-chart, version: 1.0.0, sourceRef: {name: charts}}}}\n"
+    )
+    MALFORMED = {
+        "chart.spec scalar": "kind: HelmRelease\nmetadata: {name: a, namespace: apps}\nspec: {chart: {spec: oops}}\n",
+        "chart.spec list": "kind: HelmRelease\nmetadata: {name: b, namespace: apps}\nspec: {chart: {spec: [x]}}\n",
+        "chart list": "kind: HelmRelease\nmetadata: {name: c, namespace: apps}\nspec: {chart: [x]}\n",
+        "repository spec list": "kind: HelmRepository\nmetadata: {name: charts, namespace: apps}\nspec: [x]\n",
+        "secret labels list": "kind: Secret\nmetadata: {name: s, labels: [x]}\nstringData: {server: https://x, name: y}\n",
+    }
+
+    def test_each_malformed_document_is_skipped(self):
+        for label, text in self.MALFORMED.items():
+            with self.subTest(label), TemporaryDirectory() as tmp:
+                tree = Path(tmp) / "clusters" / "prod-usc1"
+                tree.mkdir(parents=True)
+                (tree / "good.yaml").write_text(self.GOOD)
+                (tree / "bad.yaml").write_text(text)
+                index = fw.release_declarations(Path(tmp))
+                self.assertEqual(index[("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "web")]["chart"], "web-chart")
+                self.assertNotIn(("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "a"), index)
+                self.assertNotIn(("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "b"), index)
 
 
 class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):

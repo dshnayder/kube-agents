@@ -344,8 +344,10 @@ class CccMissingFallbacksTest(unittest.TestCase):
         single = {"zones": ["us-central1-a"]}
         cc = compute_class("cc1", [{"machineFamily": f, "location": single} for f in self.FAMILIES])
         hit = fs.check_ccc_missing_fallbacks(cc, cluster_zones=3)
+        # A finding, not an unevaluated verdict: the one shared zone is known.
+        self.assertNotIn("unevaluated", hit)
         self.assertIn("1/4", hit["excerpt"])
-        self.assertNotIn("not established", hit["excerpt"])
+        self.assertIn("zones=[('us-central1-a',)]", hit["excerpt"])
 
     def test_no_zone_on_a_single_zone_cluster_is_still_flagged(self):
         cc = compute_class("cc1", [{"machineFamily": f} for f in self.FAMILIES])
@@ -528,6 +530,18 @@ class CccNoOndemandFloorTest(unittest.TestCase):
     def test_does_not_flag_with_ondemand_floor(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}, {"machineFamily": "n4", "spot": False}])
         self.assertIsNone(fs.check_ccc_no_ondemand_floor(cc, False))
+
+    def test_flags_an_inference_class_that_tries_spot_first(self):
+        """§3.2's second arm: the On-Demand floor exists but comes after Spot,
+        so a serving pod is still preempted before it gets there."""
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}, {"machineFamily": "n4", "spot": False}])
+        hit = fs.check_ccc_no_ondemand_floor(cc, True)
+        self.assertIn("Spot first with an On-Demand fallback", hit["excerpt"])
+        self.assertNotIn("severity", hit)
+
+    def test_does_not_flag_an_inference_class_that_tries_on_demand_first(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": False}, {"machineFamily": "n4", "spot": True}])
+        self.assertIsNone(fs.check_ccc_no_ondemand_floor(cc, True))
 
     def test_recognizes_provisioning_model_spelling(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "provisioningModel": "SPOT"}])
