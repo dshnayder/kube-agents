@@ -156,14 +156,6 @@ STATUS_STYLE = {
 }
 KNOWN_STATUS = frozenset(STATUS_STYLE)
 
-FLAG_STYLE = {
-    "NO STORE": "crit",
-    "DIED": "crit",
-    "UNRECORDED": "yellow",
-    "NEVER": "yellow",
-    "STALE": "yellow",
-}
-
 SORTS = ("stream", "last", "findings", "flags")
 # A collector writes coverage gaps at whatever length; one is clipped to this.
 GAP_WIDTH = 400

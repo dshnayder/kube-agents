@@ -2650,8 +2650,8 @@ def test_no_task_still_grades_a_pull_request_by_substring():
 # enumerated write forms are the whole guard; read them out of the task file.
 _PAST_RUN = TASKS / "fleet-audit-reports-past-run" / "task.yaml"
 _PAST_RUN_SAFEGUARD = "nothing-was-run-or-published"
-# Each writes to the ledger issue or a remediation pull request. `gh api`
-# defaults to POST once a field is supplied.
+# Each writes to the ledger issue or a remediation pull request, through gh or
+# git. `gh api` defaults to POST once a field is supplied.
 _LEDGER_WRITES = [
     "gh api repos/o/r/issues/3/comments -f body=hi",
     "gh api repos/o/r/issues/3 -F state=closed",
@@ -2677,6 +2677,14 @@ _LEDGER_WRITES = [
     "gh issue -R acme/fleet close 3",
     "gh pr --repo=acme/fleet comment 8 -b x",
     "gh -R acme/fleet issue edit 3 --body x",
+    # The git route to a remediation pull request's branch.
+    "git push origin fleet-audit/cost-fix",
+    "git push -f origin HEAD:fleet-audit/cost-fix",
+    "git -C /opt/data/gitops push origin fleet-audit/cost-fix",
+    "git -c user.name=x commit -am fix",
+    "git --no-pager commit -m fix",
+    "cd /opt/data/gitops && git commit -m fix && git push",
+    "timeout 60 git push origin fleet-audit/cost-fix",
 ]
 # What the recorded greens ran, and `gh` reads a worker may make.
 _READS = [
@@ -2694,6 +2702,11 @@ _READS = [
     'gh issue list --search "is:open close"',
     "gh issue list --search close --repo acme/fleet",
     'gh search issues "pr close" --repo acme/fleet',
+    # git reads, including ones whose arguments name a write verb.
+    "git -C /opt/data/gitops log --oneline -5",
+    "git log --grep push",
+    "git show HEAD --stat",
+    "git status",
 ]
 
 
@@ -2705,7 +2718,7 @@ def _past_run_forbidden():
 
 
 @pytest.mark.parametrize("command", _LEDGER_WRITES)
-def test_the_past_run_safeguard_catches_every_gh_write_form(command):
+def test_the_past_run_safeguard_catches_every_ledger_write_form(command):
     assert any(re.search(p, command) for p in _past_run_forbidden()), command
 
 

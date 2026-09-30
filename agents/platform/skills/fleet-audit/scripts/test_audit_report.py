@@ -17465,7 +17465,14 @@ class TestReportStore(HarnessTestCase):
 
     def test_a_clean_run_held_open_carries_the_previous_body_forward(self):
         previous = published_body(make_doc(), generated_at=NOW)
-        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        # A store a findings run left: its own document, which the carried
+        # body renders.
+        self.seed_report(previous)
+        latest = self.store_dir() / "latest.json"
+        seeded = json.loads(latest.read_text())
+        seeded["document"] = make_doc()
+        latest.write_text(json.dumps(seeded), encoding="utf-8")
+        self.harness.replies = {"issue list": self.issue_list()}
         gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
         gap["resolved_because"] = resolved_for(previous)
         self.assertEqual(self.run_finish(gap), 0, self.err)
@@ -17479,7 +17486,7 @@ class TestReportStore(HarnessTestCase):
         # beside it for the next run's titles, and no reader is handed both.
         self.assertEqual(stored["document"]["findings"], [])
         self.assertEqual(stored["document"]["scope"]["skipped"][0]["cluster"], "dr-west")
-        self.assertIn("ledger_document", stored)
+        self.assertEqual(stored["ledger_document"], make_doc())
         # A reader counting this run's zero must be told the issue is not clear.
         self.assertIs(stored["ledger_held_open"], True)
         normal = audit_report.report_envelope(

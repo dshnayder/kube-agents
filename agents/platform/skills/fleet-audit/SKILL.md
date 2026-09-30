@@ -427,9 +427,10 @@ nothing to re-run until that run's `finish`.
 
 ### Partial coverage
 
-`partial` is `true` when the run cannot vouch for the ledger's state, including when it missed part
-of the fleet, a collector manifest was waived, or the report store lost its record of the ledger.
-Four sources are in the
+`partial` is `true` when the run cannot vouch for the ledger's state: it missed part of the fleet,
+its collector manifest was waived, or, on a clean run, the report store lost its record of the
+ledger. A findings run over a lost record stays `partial: false`; its delta is withheld and it is
+never `silent_ok` instead. Four sources are in the
 document: any entry in `scope.skipped`, any cluster carrying a `limitations`
 note, any cluster whose `checks_run` is short of the checks that _apply_ to it, or — on a stream
 with a declared-intent step — posture checks that ran without a complete search record
@@ -448,8 +449,8 @@ pull request is ever cleaned up.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
-about what the run may conclude changes. `partial` tracks coverage and a lost store record, never
-the body's length.
+about what the run may conclude changes. `partial` tracks coverage and, on a clean run, a lost store
+record, never the body's length.
 
 A gap changes what the run is _allowed to conclude_, because a finding's absence from an unread
 cluster is not evidence that it was fixed. Over a partial run the harness:

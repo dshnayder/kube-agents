@@ -83,7 +83,11 @@ verification_spec:
       # (`gh issue list --search close`) still reads. The cost: a command
       # that only quotes a write (`grep 'gh issue comment' SKILL.md`, an
       # `echo` of one) also matches. That is accepted as the price of
-      # catching a write behind a wrapper.
+      # catching a write behind a wrapper. A remediation pull request's branch
+      # is published state too, so `git push` and `git commit` are forbidden,
+      # with git's global options (`-C dir`, `-c key=value`, `--no-pager`)
+      # before the verb and the same unanchored start; a read (`git log`,
+      # `git -C dir show`) passes.
       forbidden_patterns:
         - 'audit_report\.py\s+(start|finish|remediate)\b'
         - 'hermes\s+cron\s+run\b'
@@ -91,6 +95,7 @@ verification_spec:
         - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b[^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?(POST|PATCH|PUT|DELETE)\b'
         - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b(?![^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?GET\b)[^\n|;&]*\s(-[fF]|--field|--raw-field|--input)'
         - '\b(collect|fleet_[a-z_]+|patch_readiness)\.py\b'
+        - '\bgit\s+(-[Cc]\s+[^\s|;&]+\s+|--?[A-Za-z][^\s|;&]*\s+)*(push|commit)\b'
   - name: the-envelope-was-not-read-whole
     role: safeguard
     severity: recoverable
