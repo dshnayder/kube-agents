@@ -61,10 +61,6 @@
   ],
   [
    "forge",
-   "issue-view"
-  ],
-  [
-   "forge",
    "proposal-list"
   ],
   [
@@ -182,7 +178,6 @@
   null,
   null,
   null,
-  null,
   "<TMP>/gitops/compliance-audit/acme__fleet",
   null,
   null,
@@ -251,10 +246,6 @@
    "limit": 20,
    "repository": "acme/fleet",
    "state": "open"
-  },
-  {
-   "number": 42,
-   "repository": "acme/fleet"
   },
   {
    "labels": [
@@ -340,5 +331,5 @@
   }
  ],
  "stdout": "{\"status\": \"UPDATED\", \"issue_url\": \"https://github.com/acme/fleet/issues/42\", \"new\": 1, \"resolved\": 1, \"prs_opened\": [\"https://github.com/acme/fleet/pull/8\"], \"prs_closed\": [], \"silent_ok\": false, \"partial\": false, \"coverage_gaps\": [], \"declared\": 0, \"postures_withheld\": [], \"unaccounted\": []}\n",
- "stderr": "[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-view acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-view acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge identity acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge proposal-create acme/fleet\n[<TS>] [FLEET-AUDIT] forge proposal-update acme/fleet #8\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-comment acme/fleet #42\n"
+ "stderr": "[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-view acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge identity acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge proposal-create acme/fleet\n[<TS>] [FLEET-AUDIT] forge proposal-update acme/fleet #8\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-comment acme/fleet #42\n"
 }
