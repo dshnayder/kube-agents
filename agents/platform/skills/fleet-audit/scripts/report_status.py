@@ -56,6 +56,8 @@ REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 # envelope carries except the keys below rides along untouched
 # (`_project_latest`), so a key added to the envelope later reaches a reader
 # without an edit here.
+# The stored record of the newest run, beside the `runs/` ring.
+LATEST_NAME = "latest.json"
 LATEST_KEYS = (
     "audit_id",
     "repo",
@@ -260,7 +262,7 @@ def load_latest(root: str, audit_id: str, repo: str) -> dict | None:
     The projection strips `document`; report_query.py needs it, so this helper
     is the one that does not.
     """
-    return _read_object(os.path.join(store_path(root, audit_id, repo), "latest.json"))
+    return _read_object(os.path.join(store_path(root, audit_id, repo), LATEST_NAME))
 
 
 class RingReadError(ValueError):
@@ -281,17 +283,27 @@ def load_last(root: str, audit_id: str, repo: str) -> tuple[dict | None, bool]:
     has, and the flag says a later run may have changed the ledger unrecorded.
     A failure reading the ring raises RingReadError naming the file.
     """
+    envelope, name = load_last_named(root, audit_id, repo)
+    return envelope, name not in (None, LATEST_NAME)
+
+
+def load_last_named(root: str, audit_id: str, repo: str) -> tuple[dict | None, str | None]:
+    """`load_last`, with the file it read: `latest.json`, the ring entry it
+    fell back to, or None when there was nothing. A caller that names the run
+    takes the name from here rather than listing the ring again, since a
+    `finish` landing between two listings would pair one entry's name with
+    another's content."""
     latest = load_latest(root, audit_id, repo)
     if latest is not None:
-        return latest, False
+        return latest, LATEST_NAME
     try:
         runs = list_runs(root, audit_id, repo)
     except OSError as exc:
         raise RingReadError("runs/", exc) from exc
     if not runs:
-        return None, False
+        return None, None
     try:
-        return load_run(root, audit_id, repo, runs[-1]), True
+        return load_run(root, audit_id, repo, runs[-1]), runs[-1]
     except (OSError, ValueError) as exc:
         raise RingReadError(f"runs/{runs[-1]}", exc) from exc
 

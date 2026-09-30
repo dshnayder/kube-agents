@@ -1896,11 +1896,16 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
+def write_report(
+    audit_id: str, envelope: dict, now: datetime, *, ledger_unchanged: bool = False
+) -> None:
     """Keep what this run just published. Best-effort: never fails the run.
 
     Called on the exit-0 publish path only; a dry run, a rejected document and
-    `remediate` return before reaching it.
+    `remediate` return before reaching it. `ledger_unchanged` says this run
+    left the ledger's body as it found it (a clean run held open, which only
+    comments), so a failed write leaves `latest.json` in place: it still
+    describes that body exactly.
     """
     try:
         directory = reports_dir_for(audit_id, str(envelope.get("repo")))
@@ -1917,6 +1922,11 @@ def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
         _atomic_write(directory / "latest.json", text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
         log(f"WARNING: report store write for {audit_id} failed: {exc}")
+        if ledger_unchanged:
+            # Nothing was published to the body, so the record from before is
+            # still exactly the ledger; dropping it would cost the next run a
+            # memory it had no reason to lose.
+            return
         # `latest.json` now describes an older run, and nothing in it says so:
         # same ledger, same scheme, so the next run would trust a memory that
         # lacks everything this one published. Absent is honest; stale is not.
@@ -12036,6 +12046,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 delta_known=delta_known,
             ),
             now,
+            ledger_unchanged=body_untouched,
         )
         print(json.dumps(payload))
         return

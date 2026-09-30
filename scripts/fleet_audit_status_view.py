@@ -1317,8 +1317,10 @@ def main(argv: list[str] | None = None) -> int:
             if exc.search_namespace:
                 lines += context_hint(exc, args.context)
             if not args.watch:
+                # The message carries the pod's own stderr or stdout, so it
+                # crosses the same boundary as any cell: scrub it here too.
                 for line in lines:
-                    print(line, file=sys.stderr)
+                    print(scrub(line), file=sys.stderr)
                 return 2
             # A watch that exits on the first failure is a dashboard nobody
             # leaves open: a rolled agent pod, an API server restart, or a

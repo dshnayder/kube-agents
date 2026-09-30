@@ -1172,8 +1172,10 @@ check it against) (where the store has never held the ledger at all, `finish` se
 block instead, and a block that is absent or cannot be fetched is the same loss) — the previous
 run's findings are unknowable, so the run announces nothing rather than declaring every live finding
 new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
-that fails once it has started changing the ledger has already deleted the record, so that a record
-older than the issue is never trusted, and the run after it is one of these. It holds nothing it
+that rewrites the body deletes the record just before the rewrite, and a clean close deletes it just
+after the close lands, so that a record older than the issue is never trusted; a `finish` that fails
+after either delete leaves the run after it one of these. A held-open run only comments, so a failed
+store write there keeps the record, which still describes the body. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
 trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a

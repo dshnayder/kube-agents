@@ -17294,6 +17294,17 @@ class TestReportStore(HarnessTestCase):
         self.assertFalse((self.store_dir() / "latest.json").exists())
         self.assertIn("report store write", err.getvalue())
 
+    def test_a_failed_write_over_an_unchanged_ledger_keeps_latest(self):
+        """A run that left the body as it found it has nothing the stored
+        record lacks, so a failed write must not cost the next run its memory."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_report.write_report(AUDIT, self.envelope(), NOW, ledger_unchanged=True)
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+
     def test_the_document_is_redacted(self):
         token = "ghp_" + "a" * 36
         doc = make_doc(findings=[make_finding(fid="a", title=f"leaked {token}")])
@@ -17363,6 +17374,27 @@ class TestReportStore(HarnessTestCase):
             ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[])
         self.assertNotIn("ledger_document", normal)
         self.assertIs(normal["ledger_held_open"], False)
+
+    def test_a_held_open_run_whose_store_write_fails_keeps_the_memory(self):
+        """Held open, the run only commented; the record from before still
+        describes the body exactly, so the next run keeps trusting it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        gap["resolved_because"] = resolved_for(previous)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn("report store write", self.err)
+        stored = self.stored()
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["ledger_body"], previous)
+
+    def test_a_findings_run_whose_store_write_fails_drops_the_memory(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
 
     def run_finish_unseeded(self, doc):
         """`finish` with no store the harness wrote on the test's behalf: the

@@ -1119,6 +1119,20 @@ class TestSubprocessFailures(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("could not run kubectl", err)
 
+    def test_the_pod_s_own_error_text_is_scrubbed_on_the_one_shot_path(self):
+        # The exec's stderr and a non-JSON stdout are the pod's words; the
+        # one-shot error path prints them to the operator's terminal, so an
+        # OSC 52 clipboard write in either must arrive defused.
+        osc52 = "\x1b]52;c;cm0gLXJm\x07"
+        for fake in (
+            FakeKubectl(exec_rc=1, exec_stderr=f"boom {osc52}"),
+            FakeKubectl(exec_stdout=f"not json {osc52}"),
+        ):
+            rc, _, err = run_main(["--roster", NO_ROSTER], fake)
+            self.assertEqual(rc, 2)
+            self.assertNotIn("\x1b", err)
+            self.assertNotIn("\x07", err)
+
     def test_a_timeout_does_not_send_the_view_probing_other_contexts(self):
         # "I could not ask" is not "nothing is here": the twelve-context sweep
         # is for the second, and running it after a timeout turns one stalled

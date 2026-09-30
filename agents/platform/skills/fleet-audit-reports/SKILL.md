@@ -168,8 +168,8 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
 ## Red lines
 
 - **Never report an absent, unreadable, `never` or `died` stream as a clean fleet.** "I could not
-  look" and "nothing is wrong" are different answers; pass `error` and `liveness` through to the
-  user.
+  look" and "nothing is wrong" are different answers; pass `error`, `liveness` and any
+  `stream_error` through to the user.
 - **Never read `document` or `ledger_body` whole** to answer a question a subcommand answers.
 - **Never run, publish, or remediate from here.** Dispatching a stream, rewriting a ledger and
   opening remediation pull requests belong to `fleet-audit`

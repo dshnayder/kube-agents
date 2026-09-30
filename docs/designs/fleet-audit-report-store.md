@@ -59,7 +59,8 @@ ids.
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
-quote it as current. An absent store is unknowable, and every reader handles that; a stale one
+quote it as current. A held-open clean run is the exception: it only comments, so the body is the
+one the file describes, and a failed write keeps the file rather than cost the next run its memory. An absent store is unknowable, and every reader handles that; a stale one
 passes the issue and repository checks, and only the comparison against the live block in §4 tells
 it from a fresh one. For the same reason `finish` deletes `latest.json` just before each call that
 rewrites the ledger: the findings rewrite and the coverage issue a clean run opens. A run killed

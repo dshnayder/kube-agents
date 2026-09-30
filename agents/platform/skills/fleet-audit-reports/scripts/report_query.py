@@ -138,7 +138,7 @@ def _require_stream(root: str, audit_id: str) -> None:
             f"no reports for stream {audit_id!r} under {root}",
             root=root,
             streams=_stream_ids(root),
-            liveness=_liveness(root, audit_id),
+            **_liveness(root, audit_id),
         )
 
 
@@ -163,17 +163,17 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
         if repo.lower() not in repos:
             raise QueryError(
                 f"no reports for {audit_id} in {repo}", repos=repos,
-                liveness=_liveness(root, audit_id),
+                **_liveness(root, audit_id),
             )
         return repo.lower()
     if len(repos) == 1:
         return repos[0]
     if not repos:
         raise QueryError(
-            f"{audit_id} has no latest.json: the store holds no record of a run "
-            "for it. That means unknown, not clean — say so and read the ledger "
-            "issue.",
-            liveness=_liveness(root, audit_id),
+            f"{audit_id} has no repository directory under {root}: the store "
+            "holds no record of a run for it. That means unknown, not clean — "
+            "say so and read the ledger issue.",
+            **_liveness(root, audit_id),
         )
     raise QueryError(
         f"{audit_id} publishes to {len(repos)} repositories; name one with --repo",
@@ -203,8 +203,12 @@ def _stream_state(root: str, audit_id: str) -> tuple[str, str | None]:
     return stream["liveness"], stream.get("error")
 
 
-def _liveness(root: str, audit_id: str) -> str:
-    return _stream_state(root, audit_id)[0]
+def _liveness(root: str, audit_id: str) -> dict:
+    """The liveness fields a refusal carries: `liveness`, and `stream_error`
+    beside it whenever the stream has one, so an `error` never arrives
+    without its reason."""
+    liveness, error = _stream_state(root, audit_id)
+    return {"liveness": liveness, **({"stream_error": error} if error else {})}
 
 
 def _run_name(run: str | None) -> str:
@@ -222,11 +226,11 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
     name = _run_name(run)
     try:
         if name == "latest.json":
-            envelope, latest_missing = report_status.load_last(root, audit_id, repo)
-            if latest_missing:
+            envelope, loaded = report_status.load_last_named(root, audit_id, repo)
+            if loaded not in (None, name):
                 # A run after the newest ring entry failed: answer from the
                 # entry, and say the ledger may have moved on since.
-                name = _ring(root, audit_id, repo)[-1]
+                name = loaded
                 envelope = {**envelope, "latest_missing": True} if envelope else None
         else:
             envelope = report_status.load_run(root, audit_id, repo, name)
@@ -245,7 +249,7 @@ def load_envelope(root: str, audit_id: str, repo: str, run: str | None) -> tuple
                 f"{audit_id} has no run stored for {repo}: the store holds no "
                 "record of it. That means unknown, not clean — say so and read "
                 "the ledger issue.",
-                liveness=_liveness(root, audit_id),
+                **_liveness(root, audit_id),
                 runs=_ring(root, audit_id, repo),
             )
         raise QueryError(

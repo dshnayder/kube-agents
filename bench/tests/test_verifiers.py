@@ -2715,7 +2715,8 @@ def test_the_past_run_safeguard_lets_reads_through(command):
 
 
 _PAST_RUN_ENVELOPE_SAFEGUARD = "the-envelope-was-not-read-whole"
-_STORE = "/opt/data/fleet-audit-reports/fleet-wide-cost-analysis/acme/fleet"
+# The store root audit_report.REPORTS_DIR defaults to.
+_STORE = "/opt/data/fleet-audit/reports/fleet-wide-cost-analysis/acme/fleet"
 # Each prints a whole envelope: the findings document and the ledger body.
 _WHOLE_ENVELOPE_READS = [
     f"cat {_STORE}/latest.json",

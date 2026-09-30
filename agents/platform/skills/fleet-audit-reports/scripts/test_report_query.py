@@ -461,6 +461,24 @@ class TestUnknownIsNotClean(StoreTestCase):
         self.assertEqual(row["liveness"], "completed")
         self.assertTrue(row["latest_missing"])
 
+    def test_the_run_named_is_the_run_read_when_a_finish_lands_between(self):
+        """The ring entry the fallback answers from is named from the same
+        listing that picked it: a `finish` writing a newer entry mid-query
+        must not pair the new stamp with the older entry's content."""
+        self.write_run(AUDIT, "20260826T063100.000000Z", [finding("a")])
+        os.unlink(Path(self.root) / AUDIT / REPO / "latest.json")
+        real = report_query.report_status.list_runs
+
+        def then_a_finish_lands(*args):
+            names = real(*args)
+            self.write_run(AUDIT, "20260902T063100.000000Z", [], latest=False)
+            return names
+
+        with patch.object(report_query.report_status, "list_runs", then_a_finish_lands):
+            payload = self.ok("findings", AUDIT)
+        self.assertEqual(payload["run"], "20260826T063100.000000Z.json")
+        self.assertTrue(payload["latest_missing"])
+
 
 class TestFindings(StoreTestCase):
     def setUp(self):
@@ -768,6 +786,24 @@ class TestRuns(StoreTestCase):
         row = self.query("streams")[1]["streams"][0]
         self.assertEqual(row["error"], payload["error"])
 
+
+    def test_a_refusal_with_an_error_liveness_carries_the_reason(self):
+        # A stream directory holding only a stray mixed-case repository has
+        # no repository the reader can answer from; the refusal says that,
+        # and its `error` liveness arrives with the stream's reason.
+        (Path(self.root) / AUDIT / "Acme" / "Fleet").mkdir(parents=True)
+        payload = self.refused("show", AUDIT)
+        self.assertIn("no repository directory", payload["error"])
+        self.assertEqual(payload["liveness"], "error")
+        self.assertTrue(payload["stream_error"])
+        row = self.query("streams")[1]["streams"][0]
+        self.assertEqual(row["error"], payload["stream_error"])
+
+    def test_a_refusal_without_a_stream_error_carries_none(self):
+        self.stream_dir(AUDIT)
+        payload = self.refused("show", AUDIT)
+        self.assertEqual(payload["liveness"], "never")
+        self.assertNotIn("stream_error", payload)
 
 class TestUnusableLeaseTimestamps(StoreTestCase):
     """A lease note's `started_at` is whatever the writer left. One out of
