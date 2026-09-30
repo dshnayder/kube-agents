@@ -15519,6 +15519,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn("did not see the whole fleet", partial[0])
         self.assertNotIn("reads the whole fleet", partial[0])
 
+    def test_a_guarded_lost_store_answers_an_unflagged_remediate_with_the_lost_record(self):
+        """The collector still flags b, so the gap is the guarded one; a
+        request for a, which it does not flag, gets the lost-record answer."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.LOST_MEMORY_GAP, self.stdout_json()["coverage_gaps"])
+        answers = [b for b in self.harness.bodies_for("issue", "comment") if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answers[0])
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, answers[0])
+        self.assertNotIn("no longer reproduces", answers[0])
+
     def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
         """A marker under another identity scheme is not a lost memory: the
         stored body keeps its own stamp and is re-spelled on read, so the
@@ -17733,6 +17751,42 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertFalse([c for c in self.harness.gh_calls("issue", "view") if "body" in c])
         self.assertTrue(json.loads(self.out.strip())["carried"])
+
+
+
+class TestLostRecordWayOut(unittest.TestCase):
+    """Beside a lost record, the comment and the /remediate answer name the
+    same way out, whatever coverage gap stands with it."""
+
+    NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    COVERAGE_GAP = "dr-west: control plane unreachable"
+
+    def test_a_mixed_gap_comment_gives_the_lost_record_way_out(self):
+        comment_body = audit_report.render_clean_comment(
+            "compliance-audit",
+            {"scope": {"clusters": [{"name": "prod-us-east"}]}, "findings": []},
+            self.NOW,
+            gaps=[audit_report.LOST_MEMORY_UNGUARDED_GAP, self.COVERAGE_GAP],
+        )
+        self.assertIn("did not see the whole fleet", comment_body)
+        self.assertNotIn("closes on the next run that reads the whole fleet", comment_body)
+        self.assertIn("a run that reads the whole fleet will not close it either", comment_body)
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, comment_body)
+
+    def test_a_partial_lost_record_answer_names_both(self):
+        answer = audit_report.render_clean_remediate_answer(
+            "compliance-audit",
+            {"author": "dev", "targets": ["x"], "comment_id": "IC_1"},
+            self.NOW,
+            closing=False,
+            lost_memory=True,
+            partial=True,
+        )
+        self.assertIn(
+            audit_report.LOST_RECORD_WAY_OUT + " This run also did not see the whole fleet.",
+            answer,
+        )
+        self.assertNotIn("could not see the whole fleet", answer)
 
 
 if __name__ == "__main__":

@@ -134,9 +134,12 @@ a lost memory, and the store is not re-seeded from the issue. One consequence is
 public edit that changes the block's id set makes the memory lost. That fails safe — no delta claim,
 and a clean run holds the ledger open rather than closing it — and it lasts, because a held-open
 clean run stores `issue_number: null`, until a findings run rewrites the body. While it lasts, a
-clean run's comment and its answer to a standing `/remediate` say the store lost its record of the
-ledger, not that the run missed part of the fleet: coverage may be complete, and better coverage is
-not the way out.
+clean run's comment gives the lost-record way out — a findings run or a maintainer, since coverage
+may be complete and better coverage does not close it — and its heading says the store lost its
+record unless a coverage gap stands beside it. With a manifest, the run answers a standing
+`/remediate` the same way, except on a target the collector flags or holds, a posture withheld for
+want of a declared-intent search, or one a declaration covers, which get their deferral or refusal
+instead.
 
 The identity scheme is not a trust condition. The stored body carries its own `audit-id-scheme`
 stamp, and the readers that join against it re-spell a previous scheme's rows exactly as they did

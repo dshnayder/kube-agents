@@ -8044,8 +8044,16 @@ def render_clean_comment(
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
             "nothing has been reported as resolved and no remediation pull request "
-            "has been closed. The ledger closes on the next run that reads the "
-            "whole fleet and still finds nothing.",
+            "has been closed. "
+            + (
+                # Beside a lost record, complete coverage no longer closes it:
+                # the way out is the one the /remediate answer names too.
+                f"Also, {LOST_RECORD}, so a run that reads the whole fleet will "
+                "not close it either. " + LOST_RECORD_WAY_OUT
+                if any(gap in LOST_MEMORY_GAPS for gap in gaps)
+                else "The ledger closes on the next run that reads the whole fleet "
+                "and still finds nothing."
+            ),
             "",
             f"Not covered by this run ({len(gaps)}):",
             "",
@@ -11909,7 +11917,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
-                f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
+                f"mean it cannot vouch for the ledger's state; issue #{existing_issue} stays "
                 "open and no remediation pull request was closed."
             )
         elif existing_issue and unaccounted:

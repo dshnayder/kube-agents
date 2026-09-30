@@ -336,6 +336,26 @@ class TestStreams(StoreTestCase):
         # The per-stream subcommands give the same answer.
         self.assertEqual(self.query("show", AUDIT)[1]["error"], payload["error"])
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root searches a mode-0644 directory")
+    def test_a_listable_but_unsearchable_root_says_the_stream_is_unreadable(self):
+        """Mode 0644 lists the stream but refuses the stat of its directory:
+        the per-stream answer is the unreadable one `streams` gives, never
+        "no reports for stream"."""
+        self.write_run(AUDIT, "20260826T063100.000000Z", [])
+        os.chmod(self.root, 0o644)
+        self.addCleanup(os.chmod, self.root, 0o700)
+        streams = self.query("streams")[1]
+        self.assertIn("streams that could not be read", streams["error"])
+        self.assertIn(AUDIT, streams["error"])
+        code, payload = self.query("show", AUDIT)
+        self.assertEqual(code, 2)
+        self.assertIn(f"streams that could not be read: {AUDIT}", payload["error"])
+        self.assertIn("unknown, not clean", payload["error"])
+        self.assertNotIn("no reports for stream", payload["error"])
+        self.assertEqual(payload["liveness"], "error")
+        row = next(row for row in streams["streams"] if row["audit_id"] == AUDIT)
+        self.assertEqual(payload["stream_error"], row["error"])
+
     def test_an_unsearchable_directory_root_is_unreadable_for_a_stream(self):
         """A mode-denied root passes `isdir`; the per-stream answer must be the
         unreadable-store one `streams` gives, not an absent stream."""

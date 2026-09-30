@@ -427,8 +427,10 @@ nothing to re-run until that run's `finish`.
 
 ### Partial coverage
 
-`partial` is `true` exactly when the run could not speak for the whole fleet. Four sources are in
-the document: any entry in `scope.skipped`, any cluster carrying a `limitations`
+`partial` is `true` when the run cannot vouch for the ledger's state, including when it missed part
+of the fleet, a collector manifest was waived, or the report store lost its record of the ledger.
+Four sources are in the
+document: any entry in `scope.skipped`, any cluster carrying a `limitations`
 note, any cluster whose `checks_run` is short of the checks that _apply_ to it, or — on a stream
 with a declared-intent step — posture checks that ran without a complete search record
 ([`declared_intent_searched`](#declared_intent_searched)). The rest belong to the run rather than
@@ -446,7 +448,8 @@ pull request is ever cleaned up.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
-about what the run may conclude changes. Coverage is the only thing `partial` tracks.
+about what the run may conclude changes. `partial` tracks coverage and a lost store record, never
+the body's length.
 
 A gap changes what the run is _allowed to conclude_, because a finding's absence from an unread
 cluster is not evidence that it was fixed. Over a partial run the harness:
@@ -456,8 +459,9 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
-  nor prevents (see [The clean run](#the-clean-run)). The stream self-heals the day the fleet is
-  fully readable again.
+  nor prevents (see [The clean run](#the-clean-run)). A coverage gap self-heals the day the fleet
+  is fully readable again; a lost store record does not, and clears only on a run that reports
+  findings or when a maintainer who has checked them closes the ledger.
 
 A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
 and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.

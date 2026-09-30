@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -148,8 +149,12 @@ def _store_error(root: str, reason: str | None) -> str:
 def _require_stream(root: str, audit_id: str) -> None:
     """Absent store and absent stream are different answers, so they are
     different messages — one is "I could not look", the other "nothing to look
-    at". The root's listing is tried first: a directory the process cannot
-    search passes `isdir` and would otherwise read as an absent stream."""
+    at". The root's listing is tried first, since a root that exists but
+    cannot be listed passes `isdir` and would otherwise read as an absent
+    stream; so a root that can be searched but not listed refuses every
+    per-stream answer rather than guessing. A stream directory that cannot be
+    stat'd (a root that can be listed but not searched) is unreadable, as
+    `streams` reports it, not absent."""
     _inside_store(audit_id, "stream")
     reason = report_status.store_root_error(root)
     if reason or not os.path.isdir(root):
@@ -159,7 +164,24 @@ def _require_stream(root: str, audit_id: str) -> None:
             root_exists=False,
             root_error=reason,
         )
-    if not os.path.isdir(os.path.join(root, audit_id)):
+    try:
+        is_stream = stat.S_ISDIR(os.stat(os.path.join(root, audit_id)).st_mode)
+    except FileNotFoundError:
+        is_stream = False
+    except OSError as exc:
+        reason = report_status.os_reason(exc)
+        # The same projection `streams` reads, so `stream_error` is that
+        # stream's row `error`, verbatim; the stat's reason only if the
+        # projection, run a moment later, read the stream after all.
+        fields = _liveness(root, audit_id)
+        raise QueryError(
+            f"streams that could not be read: {audit_id} ({reason}). This is "
+            "unknown, not clean.",
+            root=root,
+            liveness="error",
+            stream_error=fields.get("stream_error") or reason,
+        ) from exc
+    if not is_stream:
         raise QueryError(
             f"no reports for stream {audit_id!r} under {root}",
             root=root,

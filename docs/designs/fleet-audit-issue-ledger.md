@@ -476,7 +476,9 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
    `/remediate` gets exactly one answer" cannot have the clean run as its exception: this is the one
    morning the issue disappears, taking with it the thread the requester would have re-asked on, so
    it is the one morning silence costs the most. The answer says the finding no longer reproduces,
-   and whether the ledger is closing or staying open on partial coverage. Authorization is not
+   and whether the ledger is closing or staying open on partial coverage — except on a held close,
+   where it says the run did not account for the findings the ledger carries, and, with a manifest,
+   over a lost store record, where it says the run cannot tell whether the target was among them. Authorization is not
    consulted — nothing is being acted on for anybody, and the answer is equally true and equally
    useful to a commenter without write access.
 
