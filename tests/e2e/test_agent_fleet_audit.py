@@ -490,9 +490,9 @@ def test_audit_report_github_api_lifecycle_mocked(
 ) -> None:
     """Verifies that each audit watchdog executes the exact expected GitHub API lifecycle.
 
-    Uses an in-memory execution seam to simulate the GitHub CLI/API and assert:
+    Uses an in-memory seam in place of the broker's forge verbs and asserts:
     1. It ensures the standard audit and severity labels exist on the repo.
-    2. It searches GitHub for existing ledger issues (gh issue list --label audit:<audit_id>).
+    2. It searches for existing ledger issues (issue-list labelled audit:<audit_id>).
     3. It fetches previous issue body and comments to check for active findings and /remediate commands.
     4. It updates the ledger issue title and body with the rendered capacity audit tables.
     5. It strictly does NOT create unexpected pull requests without explicit authorization.
@@ -530,35 +530,36 @@ def test_audit_report_github_api_lifecycle_mocked(
     # left alone it is the agent's volume on whatever host runs this.
     original_reports_dir = os.environ.get("FLEET_AUDIT_REPORTS_DIR")
 
+    import vcs_client
+
+    original_forge = vcs_client.forge
     calls: list[list[str]] = []
+    forge_calls: list[tuple[str, dict]] = []
+    ledger_body = "<!-- audit-findings: [] -->"
 
     def mock_run_cmd(cmd, **kwargs):
         cmd_list = list(cmd)
         calls.append(cmd_list)
-        joined = " ".join(cmd_list)
         if cmd_list[:2] == ["git", "clone"]:
             dest = pathlib.Path(cmd_list[-1])
             (dest / ".git").mkdir(parents=True, exist_ok=True)
-            return type("CompletedProcess", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-        if "gh issue list" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps([{"number": 42, "url": f"https://github.com/test-org-kube-agent/agents-repo/issues/42"}]),
-                "stderr": "",
-            })()
-        if "gh issue view" in joined and "--json body" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps({"body": "<!-- audit-findings: [] -->"}),
-                "stderr": "",
-            })()
-        if "gh issue view" in joined and "--json comments" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps({"comments": []}),
-                "stderr": "",
-            })()
         return type("CompletedProcess", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def mock_forge(verb, payload, repository=None):
+        forge_calls.append((verb, dict(payload)))
+        if verb == "issue-list":
+            url = "https://github.com/test-org-kube-agent/agents-repo/issues/42"
+            return {"issues": [{"number": 42, "url": url, "body": ledger_body}], "count": 1, "truncated": False}
+        if verb == "issue-view":
+            answer = {"issue": {"number": 42, "body": ledger_body}}
+            if payload.get("comments"):
+                answer.update(comments=[], commentCount=0, commentsTruncated=False)
+            return answer
+        if verb == "proposal-list":
+            return {"proposals": [], "count": 0, "truncated": False}
+        if verb == "identity":
+            return {"identity": {"login": "audit-bot", "subject": "audit-bot", "canWrite": None}}
+        return {}
 
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
@@ -566,6 +567,7 @@ def test_audit_report_github_api_lifecycle_mocked(
         os.environ["FLEET_AUDIT_REPORTS_DIR"] = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
+        vcs_client.forge = mock_forge
         audit_report.refresh_credentials = lambda *args, **kwargs: None
         audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
@@ -617,30 +619,35 @@ def test_audit_report_github_api_lifecycle_mocked(
         )
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
-        all_commands = [" ".join(c) for c in calls]
+        def called(verb, **fields):
+            return [p for v, p in forge_calls if v == verb and all(
+                (want in p.get(k, ())) if isinstance(p.get(k), list) else str(want) in str(p.get(k, ""))
+                for k, want in fields.items()
+            )]
 
         # 1. Assert label verification calls
-        assert any("gh label create" in c and f"audit:{audit_id}" in c for c in all_commands), (
+        assert called("label-ensure", name=f"audit:{audit_id}"), (
             f"Expected GitHub call to ensure 'audit:{audit_id}' label exists."
         )
 
         # 2. Assert ledger lookup
-        assert any("gh issue list" in c and f"audit:{audit_id}" in c for c in all_commands), (
+        assert called("issue-list", labels=f"audit:{audit_id}"), (
             f"Expected GitHub call to list existing ledger issue for '{audit_id}'."
         )
 
         # 3. Assert ledger issue update
-        assert any("gh issue edit 42" in c and f"[audit] {human_name}" in c for c in all_commands), (
+        assert called("issue-update", number=42, title=f"[audit] {human_name}"), (
             f"Expected GitHub call to edit issue #42 with updated '{human_name}' title."
         )
 
         # 4. Assert NO unauthorized PR creation
-        assert not any("gh pr create" in c for c in all_commands), (
+        assert not called("proposal-create"), (
             "SECURITY/SAFETY VIOLATION: Audit unexpectedly attempted to create a pull request!"
         )
 
     finally:
         audit_report.run_cmd = original_run_cmd
+        vcs_client.forge = original_forge
         audit_report.refresh_credentials = original_refresh
         audit_report.resolve_repo = original_resolve
         audit_report.repo_root = original_repo_root
