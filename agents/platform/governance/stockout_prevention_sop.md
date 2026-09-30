@@ -28,7 +28,7 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 - `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file.
 - `start` creates and resets no branch. There is no report branch.
 
-The helper owns every `git`/`gh` operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `gh issue create`, `gh pr create`, or `gh issue comment` yourself.**
+The helper owns every git and forge operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `vcs.py issue create`, `vcs.py proposal create`, or `vcs.py issue comment` yourself, and do none of it any other way.**
 
 **Never comment on the ledger yourself.** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit: an agent that posts it is authorizing its own pull request.
 
@@ -265,7 +265,7 @@ What to report in each case:
 ## Red Lines
 
 - **Read-only against every cluster.** No `apply`, `patch`, `edit`, `delete`, `scale`, `drain`, `cordon`, or eviction.
-- **No hand-written issue or PR bodies, and no direct git/gh calls.** `audit_report.py` owns the ledger issue, the remediation branches, the commits, and every body it renders.
+- **No hand-written issue or PR bodies, and no direct git or forge calls.** `audit_report.py` owns the ledger issue, the remediation branches, the commits, and every body it renders.
 - **No credentials in evidence.** A Secret's `data:` block, a token, or a private key never enters an excerpt; re-read with a projection that omits it.
 - **A finding you cannot reproduce is dropped, not softened.** `evidence.command` is the literal command you executed; if the confirm read fails or the condition has cleared, the finding does not ship.
 - **No fabricated numbers.** Resource quantities and machine families are either read off the live object or left to a human.

@@ -21,13 +21,14 @@ not a report, so it carries a real diff a reviewer can read in one screen.
 minting, label creation, issue creation and rewriting, branch handling, staging, committing,
 pushing, pull-request creation, closing, the run-over-run delta, and every timestamp. **Your job is
 to inspect the fleet read-only and emit a `findings.json`.** You never hand-write an issue body or a
-PR body, never invent a timestamp, and never call `gh issue create` or `gh pr create` yourself —
+PR body, never invent a timestamp, and never open an issue or pull request yourself — not with
+`vcs.py issue create` or `vcs.py proposal create`, and not any other way —
 that is precisely why every ledger looks the same and why the delta between runs is computable.
 
 ## Audit streams
 
-Only these registered audit ids may own a ledger. Any other id is rejected before a single git or gh
-command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
+Only these registered audit ids may own a ledger. Any other id is rejected before a single git or forge
+operation runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
 
@@ -391,7 +392,7 @@ absent on every other run:
   result; report it as [The clean run](#the-clean-run) says.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
-to stdout with **zero** git or gh side effects. It applies the same grouping and the same
+to stdout with **zero** git or forge side effects. It applies the same grouping and the same
 degradation as the real run, so the branch names it names are the branch names it would create. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
@@ -1037,7 +1038,7 @@ named after one of them gets renamed the day that finding resolves — orphaning
 and opening a duplicate against the same file.
 
 The branch name is the only join key. There is no state file: `finish` reconstructs the entire
-finding-to-pull-request mapping from one `gh pr list` call.
+finding-to-pull-request mapping from one listing of the stream's pull requests.
 
 ## Size
 
@@ -1175,7 +1176,7 @@ be a day stale until a run can read it; report the gap as you would any other pa
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
   is a real file inside the workspace.
-- **Never open a second ledger issue for a stream.** Do not call `gh issue create`. If the stream
+- **Never open a second ledger issue for a stream.** Do not run `vcs.py issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.
 - **Never reopen a merged remediation pull request.** A persisting finding gets a comment and a
