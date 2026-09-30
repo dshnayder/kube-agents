@@ -6449,6 +6449,19 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
         self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
         self._assert_single_line_records("git lease refused")
 
+    def test_a_forge_cli_the_broker_runs_is_refused_on_exec(self):
+        # The broker runs `gh` for its own verbs, so it is on ALLOWED_EXECUTABLES.
+        # A sandbox caller that posts its own argv must still not reach it: the
+        # sandbox reaches a forge only through the verbs.
+        allowed = (*CommandExecutor.ALLOWED_EXECUTABLES, "gh")
+        with mock.patch.object(CommandExecutor, "ALLOWED_EXECUTABLES", allowed):
+            self._post({"requestId": "ok", "argv": ["gh", "pr", "create"], "cwd": "/tmp"})
+        self.assertTrue(
+            any("executable blocked" in m and "executable=gh" in m for m in self.records),
+            self.records,
+        )
+        self.assertNotIn("gh", credential_proxy.EXEC_ROUTE_EXECUTABLES)
+
 
 class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
     """The two ways the audit trail breaks that a str-only capture cannot see.

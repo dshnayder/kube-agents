@@ -872,10 +872,6 @@ BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH
 MAX_PR_PAGE = 1000
 # One page of a forge listing: the most the broker returns per request.
 MAX_PAGE = 100
-# How many open issues on an audit's label the ledger lookup asks for. There is
-# one ledger, so anything past a handful is duplicates; the broker pages past
-# the remediation pull requests that share the label to fill it.
-LEDGER_LIST_LIMIT = 20
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -8877,7 +8873,12 @@ def read_comments(
         }
         if standing and not bot:
             key = _login_key(login)
-            if key not in standing_of:
+            if not key:
+                # A deleted account: nobody, so not a writer. A settled answer,
+                # unlike an outage, and reading it as one would leave this
+                # conversation unreadable for as long as the comment exists.
+                standing_of[key] = False
+            elif key not in standing_of:
                 asked = try_forge("identity", repo, {"login": login})
                 standing_of[key] = (
                     None if asked is None else (asked.get("identity") or {}).get("canWrite")
@@ -9152,7 +9153,9 @@ def find_existing_issue(
         answer = forge(
             "issue-list",
             repo,
-            {"labels": [f"audit:{audit_id}"], "state": "open", "limit": LEDGER_LIST_LIMIT},
+            # A full page, so the broker's paging past the remediation pull
+            # requests on the same label reaches as far as `MAX_PR_PAGE`.
+            {"labels": [f"audit:{audit_id}"], "state": "open", "limit": MAX_PAGE},
         )
     except ForgeError as exc:
         raise GitHubLookupError(
@@ -9615,6 +9618,21 @@ def open_remediation_pr(
     highest = next(
         (s for s in SEVERITIES if severity_counts(group)[s]), SEVERITIES[-1]
     )
+    if not (existing and str(existing.get("state", "")).upper() == "OPEN"):
+        try:
+            created = forge(
+                "proposal-create",
+                repo,
+                {"source": branch, "target": base, "title": title, "body": body},
+            ).get("proposal") or {}
+        except ForgeError:
+            # The forge refuses a second pull request from one branch. One is
+            # already open there when an earlier run created it and then failed
+            # to label it: unlabelled, the listing above never finds it, and
+            # without this every later run is refused the same way. Adopt it.
+            existing = open_proposal_on(repo, branch)
+            if existing is None:
+                raise
     if existing and str(existing.get("state", "")).upper() == "OPEN":
         number = str(existing["number"])
         forge(
@@ -9624,11 +9642,6 @@ def open_remediation_pr(
         )
         sync_remediation_labels(repo, number, audit_id, highest)
         return str(existing.get("url") or "")
-    created = forge(
-        "proposal-create",
-        repo,
-        {"source": branch, "target": base, "title": title, "body": body},
-    ).get("proposal") or {}
     # Labelled in a second call because creating a proposal takes none; `gh pr
     # create --label` made the same two requests. Not best-effort: an unlabelled
     # remediation pull request is invisible to `list_remediation_prs`, so the
@@ -9641,6 +9654,17 @@ def open_remediation_pr(
             {"number": int(number), "labelsAdd": remediation_labels(audit_id, highest)},
         )
     return str(created.get("url") or "") or None
+
+
+def open_proposal_on(repo: str, branch: str) -> dict | None:
+    """The open pull request from `branch`, labelled or not; None if none."""
+    answer = try_forge(
+        "proposal-list", repo, {"source": branch, "state": "open", "limit": 1}
+    )
+    found = [
+        pr_record(p) for p in (answer or {}).get("proposals") or [] if isinstance(p, dict)
+    ]
+    return found[0] if found else None
 
 
 def close_stale_remediation_prs(

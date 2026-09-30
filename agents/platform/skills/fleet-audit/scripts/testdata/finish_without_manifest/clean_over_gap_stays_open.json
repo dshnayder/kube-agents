@@ -140,7 +140,7 @@
    "labels": [
     "audit:compliance-audit"
    ],
-   "limit": 20,
+   "limit": 100,
    "repository": "acme/fleet",
    "state": "open"
   },

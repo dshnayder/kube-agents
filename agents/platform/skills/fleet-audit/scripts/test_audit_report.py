@@ -9154,6 +9154,26 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertEqual(self.harness.forge_calls("proposal-reopen"), [])
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
 
+    def test_an_unlabelled_pr_on_the_branch_is_adopted_when_create_is_refused(self):
+        # A run whose label step failed left its pull request open but
+        # unlabelled, so the labelled listing never hands it back as `existing`
+        # and the forge refuses a second one from the same branch. Look it up
+        # by branch and bring it current instead of failing every later run.
+        self.harness.failures = {"proposal-create": 1}
+        self.harness.replies = {
+            f"proposal-list source={self.branch}": proposals_view([pr(8, self.branch)]),
+        }
+        url = self.open_it()
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
+        refresh = self.harness.forge_calls("proposal-update", number=8)
+        self.assertTrue(any(call.get("title") for call in refresh))
+        self.assertIn("agent:audit", self.label_values("labelsAdd"))
+
+    def test_a_refused_create_with_no_pr_on_the_branch_still_fails(self):
+        self.harness.failures = {"proposal-create": 1}
+        with self.assertRaises(audit_report.ForgeError):
+            self.open_it()
+
 
 class TestOpenRefreshIsUnreachable(BaseTestCase):
     """Why `sync_remediation_labels` alone could not have fixed anything.
@@ -12046,6 +12066,35 @@ class TestFindExistingIssue(HarnessTestCase):
             self.find()
 
 
+class TestReadCommentsAuthorship(HarnessTestCase):
+    def read(self, comments, *, standing=False):
+        self.harness.replies = {"issue-view comments": comments_view({"comments": comments})}
+        return audit_report.read_comments("issue-view", "acme/fleet", 42, standing=standing)
+
+    def test_a_user_token_install_recognises_its_own_comments(self):
+        # Under an operator's own token the install's comments are a person's,
+        # not a bot's, so only `identity` can say which ones it wrote.
+        self.harness.VIEWER = "Ops-Person"
+        records = self.read(
+            [comment("mine", login="ops-person"), comment("theirs", login="dev", node_id="IC_2")]
+        )
+        self.assertEqual([r["viewerDidAuthor"] for r in records], [True, False])
+        self.assertFalse(records[0]["author"]["is_bot"])
+
+    def test_a_deleted_author_is_not_a_writer_and_the_rest_stays_readable(self):
+        # A deleted account arrives with no login. The broker cannot answer for
+        # nobody, and reading that as an outage would leave the conversation
+        # unreadable, and every /remediate on it ignored, for good.
+        ghost = comment("/remediate a", login="")
+        del ghost["authorAssociation"]
+        records = self.read([ghost, comment("/remediate b", node_id="IC_2")], standing=True)
+        self.assertIsNotNone(records)
+        self.assertEqual(
+            [r["authorAssociation"] for r in records], ["NONE", "COLLABORATOR"]
+        )
+        self.assertEqual(self.harness.forge_calls("identity", login=""), [])
+
+
 class TestRemediationPrPaging(HarnessTestCase):
     def test_a_full_page_raises_rather_than_being_silently_truncated(self):
         # A truncated page reads as "no pull request", so the harness would
@@ -13270,7 +13319,7 @@ class ContentModeTestCase(BaseTestCase):
         # rather than before it.
         self.assertEqual(set(self.verbs), {"open"})
 
-    def test_the_pull_request_body_still_travels_on_stdin(self):
+    def test_the_pull_request_body_reaches_proposal_create(self):
         self.start()
         self.write_manifest(
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
@@ -17356,9 +17405,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
-    stderr line but the per-call `forge ...` trace are what `gh` produced. Two
-    calls are new — `identity`, which reads who wrote a comment, and the
-    `proposal-update` that labels a pull request `proposal-create` cannot.
+    stderr line but the per-call `forge ...` trace are what `gh` produced. One
+    call is new — the `proposal-update` that labels a pull request
+    `proposal-create` cannot. `identity`, which reads who wrote a comment, is
+    asked only of a conversation that has comments, and none of these
+    transcripts reads one.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

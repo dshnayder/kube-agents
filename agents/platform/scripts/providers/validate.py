@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The eight validators every forge's verbs run on their arguments.
+"""The validators every forge's verbs run on their arguments.
 
 Shared rather than per-forge because the thing being validated is the caller's
 request, not the forge's API. `limit` bounds a page because a listing nobody

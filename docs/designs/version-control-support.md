@@ -454,8 +454,8 @@ Four `SKILL.md` files instructed the model in `gh` spellings and called the arte
 `fleet-audit`, `pr-conversation` and `submit-suggestion` under `agents/platform/skills/`, and
 `gke-stockout-investigator` under `agentplugins/`, which reaches an install through the
 `AgentPlugin` CRD rather than through the agent image and so is easy to miss. These want the command
-behind a wrapper and the noun taken from configuration. Three are done; `fleet-audit` is the one
-still written in `gh`, and it travels with `audit_report.py` for the reason the banner gives.
+behind a wrapper and the noun taken from configuration. `fleet-audit` travels with
+`audit_report.py`, because the helper is what writes the ledger its prose describes.
 
 The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
 owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
@@ -1519,10 +1519,10 @@ and no issue resolution, no audit ledger, and no way to open a change.
 Migrating those three onto the provider is the step that makes a forge a class rather than four
 rewrites. It was anticipated rather than planned:
 [`pr-comment-conversation.md`](pr-comment-conversation.md) §7 names `resolver.py` as the module's
-obvious next consumer while holding the migration itself out of scope. Two of the three have since
-made the move, onto the verbs rather than onto `forge.py` — which is the same destination, since
-`forge.py`'s operations are verbs now. `audit_report.py` is the one left, and until it moves the
-ledger is the one forge surface a second forge would not serve.
+obvious next consumer while holding the migration itself out of scope. All three move onto the
+verbs rather than onto `forge.py` — which is the same destination, since `forge.py`'s operations are
+verbs now — and with `audit_report.py` among them the ledger is a forge surface a second forge
+serves like any other.
 
 The protocol grows to the union of what the four need. Beyond the existing seven, that is opening a
 change (branch plus pull request), editing and reading one back, listing and commenting on issues,

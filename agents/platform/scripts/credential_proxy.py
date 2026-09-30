@@ -3368,6 +3368,15 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
+# What `/v1/exec` runs for the sandbox, enforced here because the client is
+# only a convenience: anything holding the sandbox's token can post its own
+# argv. No forge CLI is on it -- a forge is reached through the verbs, which
+# the broker runs on its own behalf. `git` stays for the leased directory-mode
+# workspace, where every write is fenced to a lease; the sandbox's own client
+# no longer asks for it.
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl", "git")
+
+
 def broker_executables() -> tuple[str, ...]:
     """What the credentialed process may run at all.
 
@@ -3379,11 +3388,10 @@ def broker_executables() -> tuple[str, ...]:
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
     runs them. `git` and any forge CLI are here for the broker's own use -- it
-    issues them on its own behalf for the verbs -- and the sandbox image ships
-    no client that asks for them: its `git` is a local binary and it has no
-    forge CLI. `/v1/exec` still checks against this list, not the sandbox's,
-    so a caller holding a sandbox token that composes its own request can
-    still reach them, under the same argument policy as before. What this list
+    issues them on its own behalf for the verbs. `/v1/exec` refuses every
+    forge CLI (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its
+    own request cannot reach one; `git` is still admitted there, under the
+    lease gate, for the leased directory-mode workspace. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary
@@ -5845,7 +5853,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the same two labels, and a refused executable is counted as `other`
         # rather than under its own name.
         tool_label, subcommand_label = _tool_labels(argv)
-        if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
+        if (
+            argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES
+            or argv[0] not in EXEC_ROUTE_EXECUTABLES
+        ):
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
