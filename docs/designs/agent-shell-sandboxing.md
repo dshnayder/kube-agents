@@ -107,7 +107,7 @@ version-control abstraction lands.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`. **Unset everywhere in this repo** → `local`                                                                                                                                                                                               |
+| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`: `ssh`, pinned in the operator's managed scope and copied into each profile's `.env` by `deploy/shared/terminal_env_pin.py`                                                                                                                |
 | The agent's Hermes config      | [`agents/platform/config.yaml`](../../agents/platform/config.yaml)                                                                                                                                                                                                                    |
 | The pod that hosts the shell   | a `<agent>-shell` StatefulSet, one per `PlatformAgent`, reconciled by the operator — [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)                                                                                                |
 | The image it runs              | [`deploy/sandbox/`](../../deploy/sandbox/) — first-party, `sshd` plus the credential-proxy wrappers                                                                                                                                                                                   |
@@ -1089,6 +1089,15 @@ helpers which shell into the sandbox read the sandbox's layout from one place
 instead of each hard-coding it, which is the same reason `sandbox_exec.py` reads
 `ssh_host` from the managed config rather than re-deriving the Service name.
 
+Scheduled runs and kanban wake turns do not read this block. Hermes builds their terminal with
+`tools/terminal_scope.build_profile_terminal_scope`, from the profile's own `.env` and
+`config.yaml` only, so `deploy/shared/terminal_env_pin.py` copies the block's
+Hermes keys into each profile's `.env` and asks Hermes to confirm they resolve: at
+start-up (entrypoint step 4b; [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)
+says which failures stop the container) and when `cluster_agent_profile.py` scaffolds a profile. The image build's
+`--build-check` fails when a Hermes bump breaks the copy, and warns once Hermes
+resolves the managed backend without it.
+
 #### Two sharp edges left
 
 - **Rotation is ordered.** Write the Secret, restart the sandbox, then restart the
@@ -1793,8 +1802,8 @@ mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verb
 `ssh` forwards both remote stdout and the remote exit code, so verbatim delivery
 survives the hop. There is just nothing left to wrap. Every one of the five is bound to
 the agent pod: `profile_cron_tick.py` and `cluster_agent_reconcile.py` drive `hermes`
-against profile state on the PVC; `bootstrap_scan_gate.py` shells
-`/opt/hermes/.venv/bin/hermes profile list`; and `bootstrap_delivery.py` and
+against profile state on the PVC; `bootstrap_scan_gate.py` reads each profile's
+`config.yaml` on the PVC; and it, `bootstrap_delivery.py` and
 `github_scan_gate.py` import Hermes' own Python namespace — `from cron.jobs import
 remove_job` and `from hermes_cli.kanban import run_slash`, which no amount of packaging
 reproduces in the sandbox. Moving them would make both of the deferred problems below
@@ -1993,7 +2002,9 @@ to that. What is left in the agent pod is trusted code: the MCP server, the cron
 the gateway. The point of the proxy is that raw credentials never reach the agent, not
 that no process can invoke a command, so this is the property that matters. What settles
 the rest of it is per-caller authentication: the broker is in a pod of its own, its
-callers reach it over a Service, and none gets in without a bearer token.
+callers reach it over a Service, and none reaches the credentialed listener without a
+bearer token; the one other TCP listener in that pod serves Prometheus counters and
+nothing else ([credential isolation](../credential-isolation-design.md#architecture)).
 
 The kubeconfig entanglement that used to argue for a shared volume is gone. `gcloud
 container clusters get-credentials` writes a kubeconfig, and the broker used to validate
@@ -2331,8 +2342,8 @@ dial the Service by name.
 
 What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
 token: one hour, presented as a bearer header and verified with a `TokenReview` against the
-API server. Every path except `/healthz` requires it, and an unidentified caller gets an
-undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
+API server. Every path on the credentialed listener except `/healthz` requires it, and an
+unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, and, once the operator renders it, the A2A gateway's. The operator grants

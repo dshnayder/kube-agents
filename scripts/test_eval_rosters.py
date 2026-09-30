@@ -135,6 +135,8 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
 ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
+    "bootstrap-discovery-fanout",  # the onboarding discovery fan-out, PR #2085
+    "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
 ]
 
 # Admitted after the split, each by a pull request that cited the record
