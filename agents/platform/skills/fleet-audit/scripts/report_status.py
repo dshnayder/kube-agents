@@ -51,14 +51,15 @@ INFLIGHT_SUFFIX = ".json"
 # segment of the `owner/name` a store directory is keyed on, never `.`/`..`.
 REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
+# The stored record of the newest run, and the ring of runs beside it.
+LATEST_NAME = "latest.json"
+RUNS_DIR = "runs"
+
 # Always present on a projected `latest`, null when the envelope lacks them, so
 # a reader never has to tell an absent key from a null one. Everything else the
 # envelope carries except the keys below rides along untouched
 # (`_project_latest`), so a key added to the envelope later reaches a reader
 # without an edit here.
-# The stored record of the newest run, and the ring of runs beside it.
-LATEST_NAME = "latest.json"
-RUNS_DIR = "runs"
 LATEST_KEYS = (
     "audit_id",
     "repo",

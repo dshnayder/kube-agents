@@ -112,7 +112,8 @@ def started(age_s=300.0):
 class FakeKubectl:
     """The subprocess boundary, recorded and canned. `get pods` answers with
     one `<pod> <containers>` line per pod, `config` with the kubeconfig
-    probes, `exec` with the projection."""
+    probes, `exec` with the projection. `containers` is one string for every
+    pod, or a mapping from pod to its own."""
 
     def __init__(
         self,
@@ -145,7 +146,10 @@ class FakeKubectl:
             answer = self.current if "current-context" in cmd else "\n".join(self.contexts)
             return CompletedProcess(cmd, 0, answer, "")
         if "get" in cmd:
-            listing = "".join(f"{pod} {self.containers}\n" for pod in self.pods)
+            listing = "".join(
+                f"{pod} {self.containers[pod] if isinstance(self.containers, dict) else self.containers}\n"
+                for pod in self.pods
+            )
             return CompletedProcess(cmd, self.get_rc, listing, self.get_stderr)
         return CompletedProcess(cmd, self.exec_rc, self.exec_stdout, self.exec_stderr)
 
@@ -342,6 +346,35 @@ class TestFlags(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             parser.parse_args(["--timezone", "Mars/Olympus_Mons"])
         self.assertIn("unknown time zone", err.getvalue())
+
+    def test_the_timezone_flag_reaches_stale_through_main(self):
+        # The parser and flags_for are pinned above; this is the join between
+        # them: `--timezone` on the command line decides STALE in the output.
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return NOW if tz is None else NOW.astimezone(tz)
+
+        ran = latest(finished_at=datetime(2026, 8, 25, 13, 25, tzinfo=timezone.utc).isoformat())
+        fake = FakeKubectl(
+            exec_stdout=json.dumps(projection({"cost-audit": stream(last=ran)}))
+        )
+        with TemporaryDirectory() as tmp:
+            roster = Path(tmp) / "jobs.json"
+            job = {
+                "id": "cost-audit", "enabled": True, "skills": ["fleet-audit"],
+                "schedule": {"expr": self.JOB["expr"]},
+            }
+            roster.write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+            with mock.patch.object(view, "datetime", Frozen):
+                _, utc_out, _ = run_main(["--roster", str(roster), "--color", "never"], fake)
+                _, la_out, _ = run_main(
+                    ["--roster", str(roster), "--color", "never",
+                     "--timezone", "America/Los_Angeles"],
+                    fake,
+                )
+        self.assertIn("STALE", utc_out)
+        self.assertNotIn("STALE", la_out)
 
     def test_a_stream_still_running_is_late_not_stale(self):
         # The lease says it is not silent; the STATUS cell carries its age.
@@ -675,6 +708,17 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("3 streams", out)
         self.assertIn("across 2 run streams", out)
 
+    def test_a_stream_on_two_repositories_counts_once_in_the_gap_count(self):
+        streams = {"cost-audit": stream(last=latest(audit_id="cost-audit", coverage_gaps=["a: b"]))}
+        streams["cost-audit"]["repos"]["acme/other"] = {
+            "latest": latest(audit_id="cost-audit", repo="acme/other", coverage_gaps=["a: b"]),
+            "runs": [],
+            "error": None,
+        }
+        out = self.render(streams)
+        self.assertIn("2 coverage gaps in 1 stream;", out)
+        self.assertNotIn("in 2 streams", out)
+
     def test_the_table_is_drawn_with_box_borders(self):
         out = self.render(self.two())
         self.assertIn("┌", out)
@@ -990,21 +1034,14 @@ class TestProjectionRead(unittest.TestCase):
         sandbox's when there is one; the gateway's /opt/data is a different
         volume that never holds it."""
 
-        class Both(FakeKubectl):
-            def __call__(self, cmd, **kwargs):
-                if "get" in cmd:
-                    self.calls.append({"cmd": list(cmd), "input": None, "timeout": None})
-                    return CompletedProcess(
-                        cmd,
-                        0,
-                        "agent-gateway platform-agent fluent-bit\n"
-                        "agent-proxy envoy-credential-proxy\n"
-                        "agent-shell-0 shell\n",
-                        "",
-                    )
-                return super().__call__(cmd, **kwargs)
-
-        fake = Both()
+        fake = FakeKubectl(
+            pods=("agent-gateway", "agent-proxy", "agent-shell-0"),
+            containers={
+                "agent-gateway": "platform-agent fluent-bit",
+                "agent-proxy": "envoy-credential-proxy",
+                "agent-shell-0": "shell",
+            },
+        )
         rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 0)
         cmd = fake.exec_call["cmd"]
@@ -1041,15 +1078,10 @@ class TestProjectionRead(unittest.TestCase):
     def test_a_container_alone_picks_the_pod_that_has_it(self):
         # The sandbox pod sorts first and has only `shell`; asking for the
         # gateway's container must read the gateway, not fail on the sandbox.
-        class Both(FakeKubectl):
-            def __call__(self, cmd, **kwargs):
-                if "get" in cmd:
-                    self.calls.append({"cmd": list(cmd), "input": None, "timeout": None})
-                    listing = "agent-gateway platform-agent fluent-bit\nagent-shell-0 shell\n"
-                    return CompletedProcess(cmd, 0, listing, "")
-                return super().__call__(cmd, **kwargs)
-
-        fake = Both()
+        fake = FakeKubectl(
+            pods=("agent-gateway", "agent-shell-0"),
+            containers={"agent-gateway": "platform-agent fluent-bit", "agent-shell-0": "shell"},
+        )
         rc, _, _ = run_main(["--roster", NO_ROSTER, "--container", "platform-agent"], fake)
         self.assertEqual(rc, 0)
         cmd = fake.exec_call["cmd"]

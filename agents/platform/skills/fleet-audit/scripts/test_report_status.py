@@ -255,6 +255,22 @@ class TestLiveness(ReportStatusTestCase):
                     audit_report._in_flight_since(Path(path)),
                 )
 
+    def test_an_out_of_range_started_at_counts_from_the_mtime(self):
+        # A millisecond epoch, JSON's inf and NaN are numbers `datetime`
+        # refuses; the note is a claim read from its mtime, and the projection
+        # of every other stream survives it.
+        mtime = NOW.timestamp() - 10
+        for value in (NOW.timestamp() * 1000, float("inf"), float("nan")):
+            with self.subTest(started_at=value):
+                path = self.write_note(text=json.dumps({"started_at": value}))
+                os.utime(path, (mtime, mtime))
+                self.assertEqual(report_status.in_flight_since(str(self.scratch), AUDIT), mtime)
+                self.assertEqual(
+                    report_status.in_flight_since(str(self.scratch), AUDIT),
+                    audit_report._in_flight_since(Path(path)),
+                )
+                self.assertEqual(self.project()["streams"][AUDIT]["liveness"], "running")
+
     def test_the_lock_file_is_not_a_stream(self):
         (self.scratch / f"inflight_{AUDIT}.json.lock").write_text("")
         (self.scratch / "inflight_.json").write_text("{}")

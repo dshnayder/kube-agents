@@ -989,13 +989,15 @@ def render(
             )
         )
 
+    # The row label names the table's rows; the count, like the header, counts
+    # distinct streams, so a stream on two repositories is one stream.
     gaps = [
-        (entry["id"], gap_parts(scrub(gap)))
+        (entry["id"], entry["audit_id"], gap_parts(scrub(gap)))
         for entry in shown
         for gap in entry["latest"].get("coverage_gaps") or []
     ]
     if gaps:
-        streams_with = len({audit_id for audit_id, _ in gaps})
+        streams_with = len({audit_id for _, audit_id, _ in gaps})
         count = "%d coverage gap%s in %d stream%s" % (
             len(gaps), "" if len(gaps) == 1 else "s",
             streams_with, "" if streams_with == 1 else "s",
@@ -1008,8 +1010,8 @@ def render(
             out += render_table(
                 GAP_COLUMNS,
                 [
-                    [(audit_id, "dim"), (scope, "yellow"), (clip_gap(text),)]
-                    for audit_id, (scope, text) in gaps
+                    [(label, "dim"), (scope, "yellow"), (clip_gap(text),)]
+                    for label, _, (scope, text) in gaps
                 ],
                 palette, width if width else UNBOUNDED, box, separator="blank",
             )
