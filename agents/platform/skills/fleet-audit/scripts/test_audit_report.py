@@ -780,6 +780,8 @@ class BaseTestCase(unittest.TestCase):
         # directory-mode one would look like the fallback failing.
         audit_report.set_content_mode(False)
         self.addCleanup(audit_report.set_content_mode, False)
+        audit_report._VIEWER_LOGINS.clear()
+        self.addCleanup(audit_report._VIEWER_LOGINS.clear)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
         # CREDENTIAL_PROXY_URL is emptied, not left alone: it is what decides
@@ -5449,7 +5451,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         for fid in withheld:
             self.assertNotIn(fid, audit_report.parse_delta_block(body))
-            self.assertNotIn(fid, " ".join(" ".join(c) for c in self.harness.forge_calls("proposal-*")))
+            self.assertNotIn(fid, json.dumps(self.harness.forge_calls("proposal-*")))
         for check in FAULT_CHECKS:
             self.assertIn(f"`{check}`", body)
         self.assertNotIn("### Major (", body.split("### Declared intent not searched")[0])
@@ -5869,7 +5871,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         # opened for the deferred posture.
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         self.assertNotIn(
-            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.forge_calls("proposal-create"))
+            "checkout-gateway", json.dumps(self.harness.forge_calls("proposal-create"))
         )
 
     def test_a_deferred_request_is_answered_once_per_hold(self):
@@ -7396,7 +7398,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
             self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
         self.assertNotIn(
-            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.forge_calls("proposal-create"))
+            "checkout-gateway", json.dumps(self.harness.forge_calls("proposal-create"))
         )
 
     def test_a_clean_run_refuses_a_request_for_a_declared_posture(self):
@@ -9286,8 +9288,8 @@ class TestSyncOpenRemediationLabels(HarnessTestCase):
         self.assertEqual([c for c in self.harness.calls if c[0] == "git"], [])
         self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         edit = self.harness.forge_calls("proposal-update")[0]
-        self.assertNotIn("--body-file", edit)
-        self.assertNotIn("--title", edit)
+        self.assertNotIn("body", edit)
+        self.assertNotIn("title", edit)
 
     def test_a_group_is_labelled_once_not_once_per_finding(self):
         # Every finding in a group resolves to the same pull request. One forge
@@ -12034,6 +12036,15 @@ class TestFindExistingIssue(HarnessTestCase):
         with self.assertRaises(audit_report.GitHubLookupError):
             self.find()
 
+    def test_a_truncated_listing_with_no_issue_raises_rather_than_reporting_no_ledger(self):
+        # The broker gave up paging past remediation pull requests on the same
+        # label before reaching an issue. The ledger is the oldest item on the
+        # label, so it may be just past them: reading this as "none" opens a
+        # duplicate ledger.
+        self.harness.replies = {"issue-list": {"issues": [], "count": 0, "truncated": True}}
+        with self.assertRaises(audit_report.GitHubLookupError):
+            self.find()
+
 
 class TestRemediationPrPaging(HarnessTestCase):
     def test_a_full_page_raises_rather_than_being_silently_truncated(self):
@@ -12054,6 +12065,23 @@ class TestRemediationPrPaging(HarnessTestCase):
     def test_a_short_page_is_returned(self):
         self.harness.replies = {"proposal-list": proposals_view([pr(1, "b")])}
         self.assertEqual(len(audit_report.list_remediation_prs("acme/fleet", AUDIT)), 1)
+
+    def test_a_truncated_page_is_followed_to_the_next(self):
+        # Past the first page is where a stream with more than a page of
+        # remediation pull requests keeps the rest; dropping it reads them as
+        # "no pull request" and re-opens them.
+        prs = [pr(i, f"platform-agent/fix-{AUDIT}-{i}") for i in range(1, 131)]
+        page = audit_report.MAX_PAGE
+        self.harness.replies = {
+            "proposal-list page=1": proposals_view(prs[:page], truncated=True),
+            "proposal-list page=2": proposals_view(prs[page:]),
+        }
+        listed = audit_report.list_remediation_prs("acme/fleet", AUDIT)
+        self.assertEqual(
+            [c["page"] for c in self.harness.forge_calls("proposal-list")], [1, 2]
+        )
+        self.assertEqual(len(listed), len(prs))
+        self.assertEqual(len({p["number"] for p in listed}), len(prs))
 
 
 # --------------------------------------------------------------------------- #
@@ -15178,7 +15206,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
         # b, corroborated and critical, is promoted; the held a is not swept.
-        opened = [" ".join(c) for c in self.harness.forge_calls("proposal-create")]
+        opened = [json.dumps(c) for c in self.harness.forge_calls("proposal-create")]
         self.assertEqual(len(opened), 1)
         self.assertNotIn("Alpha finding", opened[0])
         self.assertIn("HELD:", self.err)
@@ -15277,7 +15305,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         for body in posted:
             self.assertNotIn(audit_report.refused_marker("IC_1"), body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
-        opened = " ".join(" ".join(c) for c in self.harness.forge_calls("proposal-create"))
+        opened = json.dumps(self.harness.forge_calls("proposal-create"))
         self.assertNotIn("Alpha finding", opened)
 
     def test_a_remediate_on_a_held_finding_is_deferred_on_a_clean_run_too(self):
@@ -17316,11 +17344,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     roster growing from eleven checks to sixteen is recorded the same way: the
     Scope table's `n/n` column and the unrun-check prose count the roster.
     The report store is the other: the previous body is read from the store
-    rather than from `gh issue view --json body`, so that one call is gone
-    from every transcript that had an open ledger, and the `gh issue list`
-    that finds the ledger asks for `number,url,body` rather than
-    `number,url`, the body being what the store's record is checked against
-    and, where the store never held the ledger, what seeds it. One line of
+    rather than from a separate body read, so that call is gone from every
+    transcript that had an open ledger, and the `forge issue-list` that finds
+    the ledger carries each issue's body, the body being what the store's
+    record is checked against and, where the store never held the ledger,
+    what seeds it. One line of
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run

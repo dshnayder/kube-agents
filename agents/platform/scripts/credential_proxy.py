@@ -3378,9 +3378,12 @@ def broker_executables() -> tuple[str, ...]:
     read as one decision and was two.
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them, and the sandbox may ask for nothing else. `git` is here only --
-    the broker issues it on its own behalf for the verbs, and the sandbox's
-    `git` is a local binary that never reaches this process. What this list
+    runs them. `git` and any forge CLI are here for the broker's own use -- it
+    issues them on its own behalf for the verbs -- and the sandbox image ships
+    no client that asks for them: its `git` is a local binary and it has no
+    forge CLI. `/v1/exec` still checks against this list, not the sandbox's,
+    so a caller holding a sandbox token that composes its own request can
+    still reach them, under the same argument policy as before. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary

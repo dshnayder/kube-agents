@@ -872,6 +872,10 @@ BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH
 MAX_PR_PAGE = 1000
 # One page of a forge listing: the most the broker returns per request.
 MAX_PAGE = 100
+# How many open issues on an audit's label the ledger lookup asks for. There is
+# one ledger, so anything past a handful is duplicates; the broker pages past
+# the remediation pull requests that share the label to fill it.
+LEDGER_LIST_LIMIT = 20
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -5823,9 +5827,9 @@ def _promotable_hint(promotable: set[str]) -> str:
     return f". Promotable ids here: {shown}."
 
 
-# The suffix GitHub appends to the login of an App installation. REST-shaped
-# comment data carries it; the GraphQL struct `fetch_issue_comments` returns
-# strips it, which is why `is_machine_author` does not rest on this alone.
+# The suffix GitHub appends to the login of an App installation. The broker's
+# comment logins may or may not carry it depending on the forge and endpoint,
+# which is why `is_machine_author` does not rest on this alone.
 BOT_LOGIN_SUFFIX = "[bot]"
 
 
@@ -6584,11 +6588,12 @@ def marker_from_harness(
     could only ever have come from someone editing it — the arm was forgery
     surface and nothing else, and it is gone.
 
-    `viewerDidAuthor` is GitHub answering "did the caller write this", which is
-    exactly the question, and it holds whether the audit runs as an App or
-    under an operator's own token. `is_machine_author` is the fallback for a
-    comment struct that arrived without it: an App's login carries the `[bot]`
-    suffix on the REST path.
+    `viewerDidAuthor` answers "did the caller write this", which is exactly the
+    question: `read_comments` sets it by comparing each author with the login
+    the broker's `identity` verb reports for the install's own credential, so
+    it holds whether the audit runs as an App or under an operator's own token.
+    `is_machine_author` is the fallback for when that answer is missing: an
+    App's comment carries the `bot` flag, and its login the `[bot]` suffix.
     """
     return any(
         (bool(c.get("viewerDidAuthor")) or is_machine_author(c))
@@ -8796,6 +8801,24 @@ def _login_key(login: str) -> str:
     return login[: -len(BOT_LOGIN_SUFFIX)] if login.endswith(BOT_LOGIN_SUFFIX) else login
 
 
+# The login `identity` names for this install's credential, per repository.
+# It cannot change within a run, and every conversation read needs it.
+_VIEWER_LOGINS: dict[str, str] = {}
+
+
+def viewer_login(repo: str) -> str | None:
+    """This install's own login on `repo`, normalised; None when unanswerable.
+
+    Only an answer is remembered, so an outage is asked about again.
+    """
+    if repo not in _VIEWER_LOGINS:
+        who = try_forge("identity", repo, {})
+        if who is None:
+            return None
+        _VIEWER_LOGINS[repo] = _login_key(str((who.get("identity") or {}).get("login") or ""))
+    return _VIEWER_LOGINS[repo]
+
+
 def read_comments(
     verb: str, repo: str, number: int, *, standing: bool
 ) -> list[dict] | None:
@@ -8830,15 +8853,19 @@ def read_comments(
             "markers past that point cannot be seen, so none is trusted."
         )
         return None
-    who = try_forge("identity", repo, {})
-    if who is None:
+    items = [
+        item
+        for item in answer.get("comments") or []
+        if isinstance(item, dict) and item.get("kind", "issue") == "issue"
+    ]
+    if not items:
+        return []
+    viewer = viewer_login(repo)
+    if viewer is None:
         return None
-    viewer = _login_key(str((who.get("identity") or {}).get("login") or ""))
     standing_of: dict[str, bool | None] = {}
     records: list[dict] = []
-    for item in answer.get("comments") or []:
-        if not isinstance(item, dict) or item.get("kind", "issue") != "issue":
-            continue
+    for item in items:
         login = str(item.get("author") or "")
         bot = bool(item.get("bot"))
         record = {
@@ -9125,7 +9152,7 @@ def find_existing_issue(
         answer = forge(
             "issue-list",
             repo,
-            {"labels": [f"audit:{audit_id}"], "state": "open", "limit": 20},
+            {"labels": [f"audit:{audit_id}"], "state": "open", "limit": LEDGER_LIST_LIMIT},
         )
     except ForgeError as exc:
         raise GitHubLookupError(
@@ -9138,6 +9165,14 @@ def find_existing_issue(
             f"issue list for audit:{audit_id} in {repo} carried no issues field"
         )
     issues = [i for i in answer["issues"] if isinstance(i, dict)]
+    if not issues and answer.get("truncated"):
+        # The broker stopped paging before it found an issue: every page it read
+        # was remediation pull requests on the same label. The ledger, the
+        # oldest item on the label, may be past them, so this is not "none".
+        raise GitHubLookupError(
+            f"issue list for audit:{audit_id} in {repo} was truncated before any "
+            "issue was found; merge or close the remediation backlog on this label"
+        )
     if not issues:
         return None, None, None
     issues.sort(key=lambda p: int(p.get("number", 0)))
@@ -9159,13 +9194,10 @@ def fetch_issue_body(repo: str, number: int) -> str | None:
 
     None and "" are different answers. An unreadable body means the delta is
     unknowable; treating it as empty would announce every live finding as new.
+    The caller logs what it does instead.
     """
     answer = try_forge("issue-view", repo, {"number": number})
     if answer is None or not isinstance(answer.get("issue"), dict):
-        log(
-            f"WARNING: could not read issue #{number}; skipping the delta comment "
-            "rather than reporting every finding as new."
-        )
         return None
     return str(answer["issue"].get("body") or "")
 

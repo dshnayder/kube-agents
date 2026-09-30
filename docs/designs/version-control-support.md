@@ -132,9 +132,9 @@ The coupling runs through five layers, each with a different owner and a differe
    broker's content-workspace route, which clones on the credential side and honours `--depth`.
    (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.) Five of the six are now on the verbs, and `forge.py` with them — it holds typed
-   values and three policy rules and no forge implementation. `audit_report.py` is the sixth and
-   has not moved. `inspect_repository.py` will not move: see the status banner.
+   layer 3.) All six go through the verbs, and `forge.py` with them — it holds typed values and
+   three policy rules and no forge implementation. `inspect_repository.py` does not move: see the
+   status banner.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Each language now runs its assertions through
@@ -643,8 +643,8 @@ So `git` and `gh` come off the sandbox's shim set, leaving `gcloud` and
 `kubectl`, which keep theirs because neither has a credential-free equivalent
 and neither has anything local to read. `SUPPORTED_EXECUTABLES` in
 `credential_proxy_client.py` and the shim symlinks in `deploy/sandbox/Dockerfile`
-are the two places that say so, and the image's smoke test asserts the two
-missing names by absence rather than by which path wins.
+are the two places that say so. The image's smoke test asserts `gh` by absence
+and `git` by what the name resolves to, rather than by which PATH entry wins.
 
 The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in the
 two places a sandbox session's PATH comes from. The `SANDBOX_PATH` line in

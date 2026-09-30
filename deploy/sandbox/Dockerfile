@@ -407,10 +407,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          a forge module answers it, so it imports vcs_client
 #                          rather than anything that speaks HTTP
 #   pr_triggers.py         imported by pr_conversation, imports forge
-#   github_token_refresh.py  named by SOUL.md as the token refresher the agent
-#                          runs by hand (`python3 ./scripts/github_token_refresh.py
-#                          <owner>/<repo>`), and imported for its `log` by
-#                          submit_suggestion
+#   github_token_refresh.py  imported for its `log` by submit_suggestion
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves
@@ -422,10 +419,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          that read a whole tree — inspect-repository and
 #                          fleet-upgrade-verification's api_deprecation_scan, both
 #                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
-#                          audit_report, which also proposes from it. That last one
-#                          is the consumer this migration does not move; every
-#                          other working copy that *proposes* a change is
-#                          `vcs_client`'s now
+#                          audit_report, whose directory-mode fallback still
+#                          reaches for it; the content mode it runs in does not.
+#                          Every working copy that *proposes* a change goes
+#                          through `vcs_client`
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by
