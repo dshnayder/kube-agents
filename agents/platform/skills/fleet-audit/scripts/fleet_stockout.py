@@ -148,6 +148,10 @@ AUTOPILOT_ZONE_SPAN = 2
 # names node pools, an accelerator or nothing where a machine would go.
 CCC_SPAN_UNREAD = "zone-span"
 CCC_MACHINE_UNNAMED = "machine-unnamed"
+# ... or a priority's `machineType` is one whose vCPU count is not parsed.
+CCC_SIZE_UNKNOWN = "size-unknown"
+# The field `gcloud compute regions describe --format json(quotas)` answers with.
+QUOTAS_FIELD = "quotas"
 
 # §3.8's ">20%", as a fraction, against the mean of the daily preemption
 # rates the API returns.
@@ -839,10 +843,23 @@ def _priority_family(p: dict) -> str:
 
 def _priority_size_class(p: dict) -> str:
     """A coarse vCPU-count bucket, used only to detect that priorities vary
-    *some* size dimension -- not the precise count §3.3 reasons about."""
-    mt = p.get("machineType") or ""
-    m = re.search(r"-(\d+)$", mt)
-    return m.group(1) if m else ""
+    *some* size dimension -- not the precise count §3.3 reasons about.
+
+    The vCPU count comes from the cost collector's parser. A trailing-number
+    read took `n2-custom-4-8192`'s memory in MB for its size, so two custom
+    shapes differing only in memory varied size and two differing in vCPUs
+    did not. "" for a priority naming no `machineType`, and for one whose
+    count the parser does not know (`_priority_size_unknown`)."""
+    from fleet_waste import _machine_type_vcpus  # shared with fleet-wide-cost-analysis's own vCPU parser
+
+    vcpus = _machine_type_vcpus(p.get("machineType") or "")
+    return str(vcpus) if vcpus else ""
+
+
+def _priority_size_unknown(p: dict) -> bool:
+    """A `machineType` whose vCPU count is not parsed: an accelerator or
+    shared-core shape. Its size is unknown, not absent."""
+    return bool(p.get("machineType")) and not _priority_size_class(p)
 
 
 def _priority_zones(p: dict) -> tuple[str, ...]:
@@ -970,10 +987,14 @@ def check_ccc_missing_fallbacks(cc: dict, cluster_zones: int | None = None) -> d
         "object": f"ComputeClass/{cc['metadata']['name']}",
         "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
     }
+    # What the unread inputs could still add: one dimension each, the size
+    # only where two priorities could differ in it and do not already.
+    size_could_vary = len(priorities) > 1 and len(sizes) <= 1 and any(_priority_size_unknown(p) for p in priorities)
+    span_could_help = unzoned and cluster_zones is None and not multi_zone
     if any(_priority_names_no_machine(p) for p in priorities):
         hit["unevaluated"] = CCC_MACHINE_UNNAMED
-    elif unzoned and cluster_zones is None and not multi_zone and dimensions_varied == 1:
-        hit["unevaluated"] = CCC_SPAN_UNREAD
+    elif dimensions_varied + int(size_could_vary) + int(span_could_help) >= 2:
+        hit["unevaluated"] = CCC_SIZE_UNKNOWN if size_could_vary else CCC_SPAN_UNREAD
     return hit
 
 
@@ -1859,6 +1880,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     cluster_zones = cluster_zone_span(cluster, node_pools, pools_readable)
     span_decides: list[str] = []
     machine_unnamed: list[str] = []
+    size_unknown: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
@@ -1866,6 +1888,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         for hit in [check_ccc_missing_fallbacks(cc, cluster_zones)]:
             if hit and hit.get("unevaluated") == CCC_MACHINE_UNNAMED:
                 machine_unnamed.append(hit["object"])
+            elif hit and hit.get("unevaluated") == CCC_SIZE_UNKNOWN:
+                size_unknown.append(hit["object"])
             elif hit and hit.get("unevaluated"):
                 span_decides.append(hit["object"])
             elif hit:
@@ -1999,6 +2023,20 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"ccc-missing-fallbacks could not be judged for {', '.join(machine_unnamed)}: "
             f"a priority names node pools, an accelerator or nothing in place of a machine "
             f"family, and the collector does not read the machines those resolve to"
+        )
+    if size_unknown:
+        # A size the parser cannot read could be the dimension the chain is
+        # one short of, so its verdict is not established either way.
+        reason = (
+            f"{', '.join(size_unknown)} vary one dimension short of two, and a priority's "
+            f"machineType has a vCPU count the collector does not parse, so its size is unknown"
+        )
+        prior = unevaluated.get("ccc-missing-fallbacks")
+        unevaluated["ccc-missing-fallbacks"] = f"{prior}; {reason}" if prior else reason
+        commands.pop("ccc-missing-fallbacks", None)
+        limitations.append(
+            f"ccc-missing-fallbacks could not be judged for {', '.join(size_unknown)}: "
+            f"a priority's machine type has a vCPU count the collector does not parse"
         )
 
     # §3.11. One read per cluster, and it is recorded whether or not it found
@@ -2258,13 +2296,19 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
     for region in sorted(cluster_regions):
         q_argv = ["gcloud", "compute", "regions", "describe", region, "--project", project, "--format", "json(quotas)"]
         parsed, result = run_and_gate(q_argv, run=run)
-        if not isinstance(parsed, dict):
+        # A real region always answers with its `quotas` list, so an object
+        # without one (`{}`, a relay's `{"error": ...}`) did not answer, and
+        # recording it would publish the region's quotas as clean.
+        if not isinstance(parsed, dict) or not isinstance(parsed.get(QUOTAS_FIELD), list):
+            detail = (
+                "no parseable output" if not isinstance(parsed, dict) else f"returned no {QUOTAS_FIELD} list"
+            )
             failed_regions.append(
-                f"{region} (rc={result.rc}: {result.stderr.strip()[:STDERR_EXCERPT_CHARS] or 'no parseable output'})"
+                f"{region} (rc={result.rc}: {result.stderr.strip()[:STDERR_EXCERPT_CHARS] or detail})"
             )
             continue
         quota_records[region] = _record(shlex.join(q_argv), result)
-        for quota in parsed.get("quotas") or []:
+        for quota in parsed[QUOTAS_FIELD]:
             for hit in [check_quota(quota, region)]:
                 if hit:
                     hit["command"] = shlex.join(q_argv)

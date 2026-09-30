@@ -924,6 +924,15 @@ class IdleNodepoolTest(unittest.TestCase):
         hits = fw.check_idle_nodepool(context, pools, now=NOW)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_an_extended_memory_custom_pool_is_major(self):
+        """`n2-custom-8-65536-ext` is an 8-vCPU machine; an unparsed `-ext`
+        suffix used to leave it unsized and grade the idle pool `minor`."""
+        nodes = [self.node("n1", "pool")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("pool", machine_type="n2-custom-8-65536-ext"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
     def test_small_machine_few_nodes_is_minor(self):
         nodes = [self.node("n1", "pool", cpu_alloc="2", mem_alloc="4Gi")]
         context = {"nodes": nodes, "pods": []}
@@ -1319,6 +1328,12 @@ class MachineTypeVcpusTest(unittest.TestCase):
 
     def test_custom(self):
         self.assertEqual(fw._machine_type_vcpus("custom-4-16384"), 4)
+
+    def test_extended_memory_custom(self):
+        self.assertEqual(fw._machine_type_vcpus("n2-custom-8-65536-ext"), 8)
+
+    def test_shared_core_custom_names_no_vcpu_count(self):
+        self.assertIsNone(fw._machine_type_vcpus("e2-custom-medium-4096"))
 
     def test_hypermem(self):
         # M2's hypermem shapes are the largest non-accelerator machines, so

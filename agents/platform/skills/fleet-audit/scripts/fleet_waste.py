@@ -735,7 +735,10 @@ ORPHAN_PV_UNCLAIMED_DAYS = 30
 # Spans a deploy/rollback cycle and two runs of this weekly audit (SOP §3.3).
 UNCONSUMED_PVC_MIN_AGE_DAYS = 14
 MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem|hypermem)-(\d+)(?:-\w+)?$")
-CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
+# `-ext` is GCE's extended-memory custom form, `n2-custom-8-65536-ext`, and the
+# only suffix a custom type takes. Shared-core custom E2 types
+# (`e2-custom-medium-4096`) name no vCPU count and are left unparsed.
+CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+(?:-ext)?$")
 # `a2-highgpu-1g`, `a2-ultragpu-8g`, `a3-megagpu-8g`, `ct5lp-hightpu-4t`. The
 # trailing number on an accelerator machine type counts GPUs or TPU chips, not
 # vCPUs, so the family cannot go in the pattern above: `highgpu` sat in it and

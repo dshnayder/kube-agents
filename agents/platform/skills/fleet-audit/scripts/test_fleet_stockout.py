@@ -371,6 +371,29 @@ class CccMissingFallbacksTest(unittest.TestCase):
         cc = compute_class("cc1", [{"machineFamily": "c3"}, {"nodepools": ["a"]}])
         self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], fs.CCC_MACHINE_UNNAMED)
 
+    def test_custom_shapes_size_by_vcpus_not_memory(self):
+        """`n2-custom-4-8192` ends in its memory in MB; reading the trailing
+        number as the size made two 4-vCPU shapes of different memory vary
+        size, and a 4- and an 8-vCPU shape of equal memory not vary it."""
+        varied = compute_class("cc1", [{"machineType": "n2-custom-4-8192", "spot": False}, {"machineType": "n2d-custom-8-8192", "spot": False}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(varied, 1))
+        # Only memory differs, on a one-zone cluster: no dimension varies.
+        same = compute_class("cc1", [{"machineType": "n2-custom-4-8192"}, {"machineType": "n2-custom-4-16384"}])
+        hit = fs.check_ccc_missing_fallbacks(same, 1)
+        self.assertIsNotNone(hit)
+        self.assertIn("vary 0/4", hit["excerpt"])
+        self.assertIn("sizes=['4']", hit["excerpt"])
+
+    def test_standard_shapes_keep_their_size_classes(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-4", "spot": False}, {"machineType": "n2-standard-8", "spot": True}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc, 1))
+
+    def test_an_unparsed_size_one_dimension_short_is_unevaluated(self):
+        """An accelerator shape names no vCPU count, so the chain's size may
+        be the second dimension it is short of."""
+        cc = compute_class("cc1", [{"machineType": "a2-highgpu-1g", "spot": False}, {"machineType": "a2-highgpu-2g", "spot": True}])
+        self.assertEqual(fs.check_ccc_missing_fallbacks(cc, 1)["unevaluated"], fs.CCC_SIZE_UNKNOWN)
+
 
 class ClusterZoneSpanTest(unittest.TestCase):
     def test_the_node_pools_locations_decide(self):
@@ -475,6 +498,12 @@ class CccLargeVmScarcityTest(unittest.TestCase):
         cc = compute_class("cc1", [{"machineFamily": "m1", "machineType": "m1-ultramem-160"}])
         hits = fs.check_ccc_large_vm_scarcity(cc)
         self.assertEqual(len(hits), 1)
+
+    def test_flags_a_large_extended_memory_custom_shape(self):
+        cc = compute_class("cc1", [{"machineFamily": "n2", "machineType": "n2-custom-48-393216-ext"}])
+        hits = fs.check_ccc_large_vm_scarcity(cc)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("48 vCPU", hits[0]["excerpt"])
 
     def test_does_not_flag_with_multiple_families(self):
         cc = compute_class("cc1", [{"machineFamily": "m1", "machineType": "m1-ultramem-160"}, {"machineFamily": "n4", "machineType": "n4-standard-4"}])
@@ -1490,6 +1519,22 @@ class CollectClusterTest(unittest.TestCase):
             with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
                 entry = fs.collect_cluster(self.CLUSTER, run=run)
         self.assertEqual(entry["outcome"], "unreachable")
+
+    def test_a_get_credentials_failure_is_one_the_sop_retries(self):
+        """A running cluster whose credentials failed is `unreachable`, as the
+        cost collector files it, but not for its state -- so the SOP must not
+        send it to `scope.skipped` the way it sends a DEGRADED cluster."""
+        def run(argv, **kwargs):
+            return run_of(1, "", "denied") if "get-credentials" in argv else run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertTrue(entry["error"].startswith("get-credentials rc=1"))
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        outcome_line = next(line for line in sop.read_text().splitlines() if '`"unreachable"` means' in line)
+        self.assertIn("Any other `\"unreachable\"` entry — a `get-credentials` failure on a running cluster — is worth one", outcome_line)
 
     def test_dump_failure_is_gate_failed(self):
         def run(argv, **kwargs):
@@ -2869,6 +2914,25 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("answered: us-central1", unevaluated["reason"])
         self.assertIn("europe-west1", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_a_region_answer_without_a_quotas_list_is_unevaluated(self):
+        """rc 0 and a JSON object is not a region: a real one always carries
+        `quotas`, so `{}` or a relay's error object did not answer."""
+        for label, stdout in (("empty object", "{}"), ("error object", json.dumps({"error": "shim"}))):
+            with self.subTest(label):
+                def run(argv, **kwargs):
+                    if argv[:3] == ["gcloud", "compute", "reservations"]:
+                        return run_of(0, "[]")
+                    if argv[:4] == ["gcloud", "compute", "regions", "describe"] and argv[4] == "europe-west1":
+                        return run_of(0, stdout)
+                    return run_of(0, json.dumps({"quotas": []}))
+
+                entry = fs.collect_project("acme", {"us-central1", "europe-west1"}, run=run)
+                self.assertNotIn("quota-exhaustion-risk", {c["check"] for c in entry["commands"]})
+                [unevaluated] = entry["checks_unevaluated"]
+                self.assertEqual(unevaluated["check"], "quota-exhaustion-risk")
+                self.assertIn("europe-west1 (rc=0: returned no quotas list)", unevaluated["reason"])
+                self.assertIn("answered: us-central1", unevaluated["reason"])
 
     def test_the_answered_region_s_findings_survive_another_region_failing(self):
         def run(argv, **kwargs):
