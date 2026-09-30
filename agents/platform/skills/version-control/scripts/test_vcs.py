@@ -764,6 +764,16 @@ class CollaborationTest(VcsTestCase):
         self.assertNotIn("source", payload)
         self.assertNotIn("target", payload)
 
+    def test_proposal_list_filters_by_labels_at_the_forge(self):
+        code, _ = self.run_vcs("proposal", "list", "--labels", "audit:a1", "audit:remediation")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.broker.payload("proposal-list")["labels"], ["audit:a1", "audit:remediation"]
+        )
+        code, _ = self.run_vcs("proposal", "list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("labels", self.broker.payload("proposal-list"))
+
     def test_identity_says_when_the_login_is_an_automations(self):
         code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
         self.assertEqual(code, 0)

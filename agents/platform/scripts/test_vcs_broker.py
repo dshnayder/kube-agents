@@ -1784,6 +1784,56 @@ class CollaborationTest(unittest.TestCase):
         # answer for this repository's proposal.
         self.assertIn("head=acme%3Aplatform-agent%2Ffix", asked)
 
+    def test_proposal_list_by_label_reads_the_issues_endpoint_not_search(self):
+        # Search lags a write: a sweep that opened a proposal a second ago and
+        # lists again must find it, or it opens a second one.
+        def pull(number, branch, base="main", owner="acme"):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": branch, "sha": "abc", "repo": {"full_name": f"{owner}/infra"}},
+                "base": {"ref": base},
+                "closed_at": None,
+            }
+
+        page = [
+            {"number": 3, "pull_request": {}},
+            {"number": 4},  # an issue carrying the same labels
+            {"number": 5, "pull_request": {}},
+        ]
+        broker, recorder = self.broker(page, pull(3, "fix"), pull(5, "fix", owner="fork"))
+        answer = broker.proposal_list(
+            {
+                "repository": "acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+                "source": "fix",
+            }
+        )
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/acme/infra/issues?"))
+        self.assertIn("labels=audit:a1,audit:remediation", asked)
+        self.assertIn("state=all", asked)
+        self.assertNotIn("head=", asked)
+        # Each pull request is read back for its head; the issue is not.
+        self.assertEqual(
+            [c[4] for c in recorder.calls[1:]],
+            ["repos/acme/infra/pulls/3", "repos/acme/infra/pulls/5"],
+        )
+        # The fork's branch of the same name is not this repository's proposal.
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3])
+        self.assertEqual(answer["proposals"][0]["closed"], "")
+
+    def test_a_labelled_listing_is_truncated_on_what_the_forge_sent(self):
+        # A full page that filters down to fewer proposals still has a next page.
+        broker, _ = self.broker([{"number": 4}, {"number": 6}])
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual(answer["proposals"], [])
+        self.assertTrue(answer["truncated"])
+
     def test_issue_list_with_a_query_goes_through_search(self):
         broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})
         answer = broker.issue_list({"repository": "acme/infra", "query": "drift", "labels": ["kind/bug"]})

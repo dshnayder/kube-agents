@@ -263,8 +263,51 @@ class GitHubForge(Forge):
         target = payload.get("target")
         if target is not None:
             params["base"] = validate_branch(target, "target")
+        labels = validate_labels(payload.get("labels"))
+        if labels:
+            return self._proposals_labelled(api, repo, params, labels)
         nodes = api("GET", f"repos/{repo}/pulls", params=params)
         return listing([translate.proposal(node) for node in nodes], limit, "proposals")
+
+    def _proposals_labelled(
+        self, api: Callable, repo: str, params: dict[str, Any], labels: list[str]
+    ) -> dict[str, Any]:
+        """The proposals carrying every one of `labels`, a page at a time.
+
+        `/pulls` takes no label filter. The issues endpoint does, and on GitHub
+        a pull request is an issue, so the filter is asked there -- not of the
+        search API, whose index lags a write by seconds: a sweep that opens a
+        proposal and lists again would not find it and open a second one. The
+        issue shape carries no head, so each hit is read back as a pull
+        request. `head` and `base` are not issue filters and are matched on
+        what comes back.
+        """
+        query: dict[str, Any] = {
+            "state": params["state"],
+            "per_page": params["per_page"],
+            "labels": ",".join(labels),
+        }
+        if "page" in params:
+            query["page"] = params["page"]
+        nodes = api("GET", f"repos/{repo}/issues", params=query)
+        proposals = [
+            translate.proposal(api("GET", f"repos/{repo}/pulls/{node['number']}"))
+            for node in nodes
+            if "pull_request" in node
+        ]
+        if "head" in params:
+            owner, _, branch = params["head"].partition(":")
+            proposals = [
+                item
+                for item in proposals
+                if item["source"] == branch
+                and item["sourceRepo"].split("/")[0] == owner
+            ]
+        if "base" in params:
+            proposals = [item for item in proposals if item["target"] == params["base"]]
+        # Judged on what the forge sent, as `issue-list` is: a full page of
+        # issues filtered down to its pull requests is still a page.
+        return listing(proposals, params["per_page"], "proposals", returned=len(nodes))
 
     def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

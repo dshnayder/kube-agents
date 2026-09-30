@@ -65,6 +65,10 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     a property of the read rather than of the proposal: the question it
     answers -- did anything land here after the request I am replying to -- is
     only sound against a tip re-read at the moment of asking.
+
+    `closed` is when it closed or merged, `""` while it is open: a caller
+    weighing a person's later instruction against a close needs a time on both
+    sides.
     """
     if node.get("merged_at"):
         state = "merged"
@@ -89,6 +93,7 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "url": node.get("html_url") or "",
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
+        "closed": node.get("closed_at") or "",
         "body": node.get("body") or "",
     }
 

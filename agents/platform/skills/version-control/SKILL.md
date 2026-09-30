@@ -237,7 +237,7 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `publish`              | Send the revisions made since `clone` to the shared repository                                                                               |
 | `discard`              | Remove the local copy; `--branch` when the repository is cloned once per branch                                                              |
 | `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                                               |
-| `proposal list`        | Open proposals; `--state open\|closed\|all`, `--source`/`--target` to ask about one branch, `--page` for the next page                       |
+| `proposal list`        | Open proposals; `--state open\|closed\|all`, `--source`/`--target` to ask about one branch, `--labels` for all of these, `--page` for the next page |
 | `proposal view`        | One proposal; `--comments` for the discussion, `--diff` for the patch                                                                        |
 | `proposal comment`     | Reply on a proposal                                                                                                                          |
 | `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |

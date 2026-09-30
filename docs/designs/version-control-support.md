@@ -2084,6 +2084,7 @@ side of each.
 | `ref` (comment)     | `"note-{id}"`                     | one notes endpoint, so the kind is constant                    |
 | `url`               | `web_url`                         |                                                                |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                  |
+| `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open    |
 | `body`              | `description`                     | GitLab's name for it                                           |
 | `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                  |
 
