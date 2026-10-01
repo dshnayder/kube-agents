@@ -570,9 +570,9 @@ _KCC_COMMAND_TRUNCATED = " …(truncated)"
 # the SOP describes the command, and only code produces it.
 #
 # The DNS endpoint is a second path with a second command, because authorized
-# networks do not gate it. `kube-agents-host` has both open and its published
-# note carried one command, so acting on that finding would have left the
-# cluster answering `gke-<hash>.us-east4.gke.goog` from anywhere. They stay two
+# networks do not gate it. A cluster with both open once published a note that
+# carried one command, so acting on that finding would have left the cluster
+# answering `gke-<hash>.<region>.gke.goog` from anywhere. They stay two
 # invocations rather than one: gcloud parses all four flags together, but SOP
 # 2.10 prescribes a command per path and the second one closes an endpoint for
 # every caller, which is a decision a reader should be able to decline by not
@@ -10959,7 +10959,8 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
     named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
     parts = [
-        f"{len(unwritten)} finding(s) the sweep would open a pull request for have no fix written."
+        f"{len(unwritten)} finding(s) the sweep would open a pull request for, had "
+        "their fix been written, have none."
     ]
     if named:
         parts.append(
@@ -11002,7 +11003,7 @@ def mark_unwritten_refused(audit_id: str) -> bool:
         return False
     data[RUN_RECORD_UNWRITTEN_REFUSED_KEY] = True
     try:
-        path.write_text(json.dumps(data), encoding="utf-8")
+        _atomic_write(path, json.dumps(data))
     except OSError:
         return False
     return True
@@ -11194,8 +11195,13 @@ def unwritten_sweep_fixes(
     Two shapes of the same shortcut. A `manifest` remediation whose file was
     never written, which `degrade_missing_remediations` has already turned into
     `manual` (`degraded`, with the path it named in `promised`). And a
-    `manual` remediation on a finding whose collector candidate carries a
-    `declaration`: the collector found the file and the worker did not use it.
+    `manual` remediation on a finding `collector_vouched_findings` clears for
+    the `major` sweep whose collector candidate carries a `declaration`: the
+    collector found the file and the worker did not use it. Only those, because
+    elsewhere `manual` is often the SOP's own answer -- a privileged container
+    or a cluster-admin binding is `critical`, declared, and `manual` until its
+    owner confirms -- and a refusal there argues the worker into a pull request
+    the SOP withheld.
     At fleet scale a worker that meets a hundred candidates writes the same
     boilerplate `manual` line for every one, and each is a finding the sweep
     was built to fix that the ledger instead hands back to a person.
@@ -11239,7 +11245,7 @@ def unwritten_sweep_fixes(
             continue
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
-        if remediation.get("kind") == "manual" and declared:
+        if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
 

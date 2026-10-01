@@ -15259,6 +15259,19 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with self.subTest(name):
                 self.assertEqual(self.unwritten(findings, manifest), {})
 
+    def test_a_declared_manual_fix_off_the_major_list_is_the_sops_to_make(self):
+        """`critical` reaches the sweep on any check, but a declared `manual`
+        fix there is usually the SOP's own answer -- a privileged container
+        stays `manual` until its owner confirms -- so only the checks cleared
+        for the `major` sweep are refused."""
+        self.assertEqual(
+            self.unwritten(
+                [self.manual(severity="critical", check="privileged-container")],
+                self.manifest(check="privileged-container", severity="critical"),
+            ),
+            {},
+        )
+
     def test_a_promised_fix_a_pull_request_already_answers_is_not_refused(self):
         """Joined on the branch the promised path names, as the sweep joins it:
         open, merged, or closed by a person all leave the finding out."""
@@ -15305,7 +15318,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         # `make_doc`'s finding is critical and names a manifest nobody wrote.
         self.assertEqual(self.run_finish(make_doc()), 2)
-        self.assertIn("have no fix written", self.err)
+        self.assertIn("had their fix been written, have none", self.err)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
         self.assertFalse(self.harness.matching("issue", "create"))
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
@@ -15315,7 +15328,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
     def test_without_a_run_record_nothing_remembers_the_refusal_so_none_is_made(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        self.assertNotIn("have no fix written", self.err)
+        self.assertNotIn("had their fix been written, have none", self.err)
 
 
 class TestTriageMarkedFindings(BaseTestCase):

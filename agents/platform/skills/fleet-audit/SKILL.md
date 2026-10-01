@@ -943,7 +943,7 @@ to put in a diff otherwise. Three paths lead there:
 
 - **Auto-promotion.** A finding graded `critical` — or `major` on one of the checks in
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
-  collector's candidate is `major` too — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
+  collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
   `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
   automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
@@ -1234,8 +1234,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
   directory. For a finding the sweep would open, the first `finish` of the run exits 2 listing each
-  one whose file is missing, at the path it named, and each `manual` one whose candidate carries a
-  `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
+  one whose file is missing, at the path it named, and each `manual` one on a check cleared for the
+  `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
   as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
   `kind: manifest` and `path`, and run `finish` again. A finding the SOP itself makes `manual`, or
   one a pull request already carries, stays `manual` with the reason in its `note`: the refusal
