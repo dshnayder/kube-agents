@@ -578,8 +578,12 @@ GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitop
 # under $HERMES_HOME is written in one place and looked for in another.
 # Overridable for the suite on the same reasoning as SCRATCH_DIR.
 REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or "/opt/data/fleet-audit/reports"
-# Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
-# body ceiling that bounds the store near 1 MB per stream.
+# Two weeks of a daily stream, a quarter of a weekly one. Each envelope holds
+# the ledger body, which its ceiling (MAX_BODY_CHARS) keeps near 1 MB across
+# the ring, and the run's findings document, stored whole and unclipped (with
+# the document the body rendered beside it when a held-open run carries one
+# forward). Nothing bounds the documents, so the store per stream and
+# repository is that 1 MB plus fourteen of them.
 REPORT_HISTORY = 14
 # The ring's filename: a UTC stamp that sorts lexically in time order, to the
 # microsecond so two runs finishing in one second do not replace each other.

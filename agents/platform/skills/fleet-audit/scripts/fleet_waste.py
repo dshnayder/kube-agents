@@ -92,6 +92,10 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
+# The exit status a `Run` reports for a command `subprocess.run` killed on
+# its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
+# and patch_readiness.py report, so a timeout reads the same in every manifest.
+TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
@@ -363,6 +367,13 @@ NON_JSON_BODY = "HTTP 200 with a body that is not a JSON object"
 NOT_AN_OBJECT_LIST = "returned no JSON list of objects"
 # Also the manifest's `started_at` / `finished_at` form: both are UTC to the second.
 MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+SECONDS_PER_HOUR = 3600
+# The precision the usage reads round to before they are digested into the
+# manifest's stdout stand-in: fine enough that a real change in usage moves
+# the digest, coarse enough that float noise between two identical answers
+# does not. vCPU to a tenth of a millicore, memory to a tenth of a MiB.
+USAGE_DIGEST_CPU_DIGITS = 4
+USAGE_DIGEST_MEM_DIGITS = 1
 POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
 # `--oauth2-bearer`, not an `Authorization: Bearer` header: `finish` redacts
 # whatever follows `Bearer`, which cut the published command in half.
@@ -918,7 +929,7 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
         # notwithstanding, and every consumer of `Run` searches and slices it as
         # str. `collect.py`'s `_text` does the same.
-        return Run(argv, 124, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
+        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -1319,7 +1330,7 @@ def _pod_series_params(
         "aggregation.perSeriesAligner": primary,
         "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
-        "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
+        "secondaryAggregation.alignmentPeriod": f"{window_hours * SECONDS_PER_HOUR}s",
         "secondaryAggregation.perSeriesAligner": secondary,
     }
 
@@ -1490,7 +1501,7 @@ def fetch_usage_peaks(
     # so a digest tracks a real change in usage rather than float noise.
     rendered = json.dumps(
         sorted(
-            (ns, pod, None if cpu is None else round(cpu, 4), None if mem is None else round(mem, 1))
+            (ns, pod, None if cpu is None else round(cpu, USAGE_DIGEST_CPU_DIGITS), None if mem is None else round(mem, USAGE_DIGEST_MEM_DIGITS))
             for (ns, pod), (cpu, mem) in merged.items()
         )
     )
@@ -1548,7 +1559,7 @@ def fetch_memory_means(
     if not means:
         return fail(0, f'no time series for cluster_name="{cluster}" over the trailing {window_hours}h')
 
-    rendered = json.dumps(sorted((ns, pod, round(mem, 1)) for (ns, pod), mem in means.items()))
+    rendered = json.dumps(sorted((ns, pod, round(mem, USAGE_DIGEST_MEM_DIGITS)) for (ns, pod), mem in means.items()))
     return means, True, Run([label], 0, rendered, "", time.monotonic() - started)
 
 
@@ -2560,7 +2571,9 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     both, as the autoscaler checks the annotation before either rule; one whose
     `safe-to-evict-local-volumes` lists every local volume is exempt from the
     second. DaemonSet and mirror pods are exempt from both -- they go with the
-    node.
+    node. The caller passes only Running pods no DaemonSet owns (the
+    `pods_by_node` index in `check_idle_nodepool`), so the one exemption
+    tested here is the mirror pod, which that index keeps.
 
     Two more rules pin a node whatever the namespace: a pod annotated
     `safe-to-evict: "false"`, and a bare pod no controller would recreate.
@@ -2590,8 +2603,8 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
         elif _blocking_local_storage(pod):
             blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
-        elif not _is_system_namespace(ns) or _pod_daemonset_owned(pod) or (pod.get("status") or {}).get("phase") in POD_TERMINAL_PHASES:
-            continue  # §3.8's to report, or nothing the autoscaler waits for
+        elif not _is_system_namespace(ns):
+            continue  # §3.8's to report
         elif _safe_to_evict(annotations) is False:
             blockers.append(f'{ns}/{name} (system namespace, safe-to-evict "false")')
         elif not meta.get("ownerReferences"):

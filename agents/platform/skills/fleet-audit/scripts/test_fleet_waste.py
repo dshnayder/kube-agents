@@ -2572,13 +2572,17 @@ class OverrequestResizeIsANoOpTest(unittest.TestCase):
 
 
 class IdleWorkloadTest(unittest.TestCase):
-    """§3.13 -- the population §3.1 measures correctly and then cannot act on.
+    """§3.13 -- the population §3.1 measures correctly and then will not act on.
 
     Every fixture here is a controller `check_overrequest` sees, agrees is
-    idle, and drops because `ceil(peak x 2)` clamps up to the 50m/64Mi it
-    already declares. `test_the_partition_with_overrequest_is_exact` is the
-    load-bearing one: the two checks must never both fire on an object, or the
-    report asks a reader to shrink and delete the same Deployment.
+    idle, and proposes no resize for, on one of three arms: the floor-bound
+    arm, where `ceil(peak x 2)` clamps up to the 50m/64Mi (or LimitRange
+    default) it already declares; the materiality arm, where the only
+    dimension it could shrink would save less than 100m/128Mi; and the
+    `Guaranteed` arm, where §3.1 declines to turn a week of idleness into a
+    limit. `test_the_partition_with_overrequest_is_exact` is the load-bearing
+    one: the two checks must never both fire on an object, or the report asks
+    a reader to shrink and delete the same Deployment.
     """
 
     NS = "hello-world"
@@ -3422,12 +3426,13 @@ class UnderrequestTest(unittest.TestCase):
         under its bare name and does not.
         """
         pods = [
-            self.pod(ns="tenant-a", name="redis-0", owner_name="redis"),
-            self.pod(ns="tenant-b", name="redis-0", owner_name="redis"),
+            self.pod(ns="tenant-a", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
+            self.pod(ns="tenant-b", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
         ]
         means = {("tenant-a", "redis-0"): 900.0, ("tenant-b", "redis-0"): 900.0}
         hits = self.check(pods, means)
         self.assertEqual(sorted(h["namespace"] for h in hits), ["tenant-a", "tenant-b"])
+        self.assertEqual({h["object"] for h in hits}, {"StatefulSet/redis"})
         # Each finding measures only its own namespace's replica: one pod at
         # 900 MiB against one 512Mi request, not two summed to 1800.
         for hit in hits:
