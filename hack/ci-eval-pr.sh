@@ -2811,11 +2811,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # (EVAL_STREAM_REPO), so a sibling job's pull request on the same audit in
   # another pool repository is not this one's. A case with no
   # `ledger_issue_contains` audit key has no stream and gets none of them.
+  # The repository takes the deploy's precedence, as the inject lane's does:
+  # a developer's EVAL_GITOPS_REPO is where the agent was told to write.
   if [ -n "${audit_id}" ]; then
-    local window="${STATE_DIR}/stream-${audit_id}.window"
+    local window="${STATE_DIR}/stream-${audit_id}.window" stream_repo="${EVAL_LEDGER_REPO:-}"
+    if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+      stream_repo="${EVAL_GITOPS_REPO}"
+    fi
     [ -s "${window}" ] || date -u +%s > "${window}"
     EVAL_STREAM_STARTED_AT="$(cat "${window}")"
-    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}" EVAL_STREAM_REPO="${EVAL_LEDGER_REPO:-}"
+    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}" EVAL_STREAM_REPO="${stream_repo}"
   else
     unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM EVAL_STREAM_REPO
   fi

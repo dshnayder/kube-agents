@@ -330,7 +330,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertEqual(len({inject for _, _, inject in seen}), 3)
         self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
 
-    def stamps(self, audit_id: str) -> list[str]:
+    def stamps(self, audit_id: str, gitops_override: str = "") -> list[str]:
         """EVAL_STREAM_STARTED_AT, EVAL_AUDIT_STREAM and EVAL_STREAM_REPO as each of case-y's
         reps, then case-x's, sees them (`-` for unset).
         `date` ticks per call here, so a stamp taken per unit would differ."""
@@ -342,6 +342,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
                 f'ledger_audit_id_for_task() {{ echo "{audit_id}"; }}',
                 'reset_audit_ledgers() { :; }',
                 'EVAL_LEDGER_REPO=gke-agentic/kube-agents-evals-4-infra',
+                f'EVAL_GITOPS_REPO="{gitops_override}"',
                 f'uv() {{ echo "STAMP ${{EVAL_CASE_ID}} ${{EVAL_STREAM_STARTED_AT:--}} ${{EVAL_AUDIT_STREAM:--}} ${{EVAL_STREAM_REPO:--}}" >> "{record}"; '
                 'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }',
                 'for rep in 1 2 3; do run_one_unit ./tasks/y/task.yaml case-y "${rep}" "" "" "$((rep + 3))"; done',
@@ -359,6 +360,18 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             self.stamps("obtainability-audit"),
             ["case-y 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3
             + ["case-x 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3,
+        )
+
+    def test_a_developers_gitops_repo_is_the_streams_repository(self):
+        """The deploy told the agent to write to EVAL_GITOPS_REPO, so its pull
+        requests are there; `none` is the opt-out, not a repository."""
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "me/infra")},
+            {"me/infra"},
+        )
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "none")},
+            {"gke-agentic/kube-agents-evals-4-infra"},
         )
 
     def test_a_case_with_no_stream_gets_no_stream_window(self):
