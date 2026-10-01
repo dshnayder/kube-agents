@@ -372,12 +372,15 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   named in the ledger's _Awaiting `/remediate`_ section under a paragraph that says to read it
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
-  (today, `service-fronted`). The collector stands behind the finding; the _fix_ has a consequence
+  (`service-fronted`, `new-computeclass`, `autopilot-bumped`). The collector stands behind the
+  finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector.
 
-Both are computed after every other test the sweep already applies, so they name only what the sweep
-would otherwise have opened — in the ledger and on the JSON line alike, which carry the same list.
+Both are computed after every other test the sweep already applies except the severity floor, which
+comes last — in the ledger and on the JSON line alike, which carry the same list. A finding below the
+floor that is also uncorroborated or triage-marked is therefore named here rather than as below the
+floor: the reason a human has to read before asking for it is the one worth printing.
 
 ### 3.5 Disclosure — `unpublished_candidates`, `wholly_unpublished_checks`
 

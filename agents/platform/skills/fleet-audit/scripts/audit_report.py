@@ -1082,6 +1082,27 @@ MAX_PR_PAGE = 1000
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
 
+# The least-severe grade the automatic sweep will open a pull request for
+# unasked. Inclusive: a finding *at* the floor promotes. Compare it by rank
+# through `SEVERITY_RANK`, never by equality -- an `==` test is
+# indistinguishable from this one only while the floor is the top severity,
+# and silently stops promoting `critical` the moment it is not.
+#
+# It was `critical`. The findings graded `critical` are mostly exposure
+# problems closed with `gcloud`, and the ones attracting a declarative fix are
+# graded lower, so the floor and the `manifest` test selected nearly disjoint
+# sets. Measured across the live streams on 2026-09-06: 3 `critical` manifest
+# remediations, all of them opened, and 26 more permanently withheld behind a
+# filter that never clears, 5 of them `major`.
+#
+# `major` rather than `minor` because the 21 that remain are `minor`, 15 of
+# them on one stream, which would sit at `AUTO_PROMOTION_CAP` for three
+# consecutive runs; a `minor` is defence in depth the ledger can go on
+# offering to `/remediate`. At `major` every stream's sweep fits inside the cap
+# in one run. What the floor passes over is named on the ledger
+# (`_render_withheld`), because unlike the cap it does not clear on its own.
+AUTO_PROMOTION_FLOOR = "major"
+
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
 # unused on a run without it.
@@ -1171,9 +1192,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # `needs_triage` markers whose findings the automatic sweep will not promote,
 # whatever their grade. A filter that is not about the finding's strength:
 # these are findings a collector fully corroborated whose *fix* has a failure
-# mode the collector cannot rule out.
+# mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Two markers. A cost collector sets `service-fronted` on an idle
+# Three markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -1189,7 +1210,15 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # two files, where a finding carries one `remediation.path`, so the sweep's
 # pull request would land a class nothing selects. `/remediate` opens the same
 # one-file pull request, for a person who knows to add the selector to it.
-NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass"})
+#
+# The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
+# whose `major` grade the Autopilot bump supplied rather than its magnitude.
+# The bump orders the ledger -- Autopilot bills on requests -- and was written
+# when the sweep promoted `critical` alone, on the explicit premise that it
+# could never open a pull request. `AUTO_PROMOTION_FLOOR` at `major` would
+# break that premise for every unsized workload on an Autopilot cluster;
+# this keeps it.
+NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass", "autopilot-bumped"})
 
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
@@ -7017,6 +7046,11 @@ class PromotionPlan(NamedTuple):
     # the object, and here it flagged it and stands behind it. See
     # `NO_SWEEP_TRIAGE`.
     needs_triage: list[str] = []
+    # Manifest findings the sweep passed over for severity alone, graded below
+    # `AUTO_PROMOTION_FLOOR`. Not `withheld`: the cap clears itself on the next
+    # run and this does not, so it is reported apart. Empty when `auto_promote`
+    # is off, because the `remediate` subcommand runs no sweep to be blocked by.
+    below_floor: list[str] = []
 
 
 def promotion_candidates(
@@ -7031,8 +7065,9 @@ def promotion_candidates(
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
-    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no
-    live pull request on its branch — and capped, so one bad night cannot bury
+    Auto-promotion is deliberately narrow — graded at or above
+    `AUTO_PROMOTION_FLOOR`, `manifest`, and no live pull request on its
+    branch — and capped, so one bad night cannot bury
     the repository in generated pull requests. An explicit `/remediate` bypasses
     the cap: a human asked for that one by name.
 
@@ -7066,6 +7101,11 @@ def promotion_candidates(
 
     The cap counts findings, and a group of findings sharing a path collapses to
     one pull request, so the number of PRs opened is at most `cap`.
+
+    `below_floor` is what the severity test alone refused — a manifest fix, on
+    a finding carrying no live pull request, that neither collector filter
+    stopped, graded under `AUTO_PROMOTION_FLOOR`. It is returned so the ledger
+    can name it: unlike the cap, the floor never clears on its own.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -7104,13 +7144,13 @@ def promotion_candidates(
     auto: list[str] = []
     unbacked: list[str] = []
     triaged: list[str] = []
+    below_floor: list[str] = []
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     uncorroborated_set = uncorroborated or set()
     triage_set = triage_marked or set()
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
-            continue
-        if finding.get("severity") != "critical":
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
@@ -7130,10 +7170,29 @@ def promotion_candidates(
         if fid in uncorroborated_set:
             unbacked.append(fid)
             continue
+        # Severity last of all, so `below_floor` holds only the floor's own
+        # refusals. Tested earlier, a `gcloud` fix or a finding with a live
+        # pull request would land there too and the ledger would invite
+        # `/remediate` on work that is already open or has no manifest to
+        # open; and a triage-marked or uncorroborated finding would lose the
+        # block that says why it needs reading. By rank, so `critical` passes
+        # a `major` floor. An unknown grade ranks below every known one.
+        severity = str(finding.get("severity", ""))
+        if SEVERITY_RANK.get(severity, len(SEVERITIES)) > floor_rank:
+            below_floor.append(fid)
+            continue
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return PromotionPlan(promote, auto[cap:], already_open, superseded, unbacked, triaged)
+    return PromotionPlan(
+        promote=promote,
+        withheld=auto[cap:],
+        already_open=already_open,
+        superseded=superseded,
+        uncorroborated=unbacked,
+        needs_triage=triaged,
+        below_floor=below_floor,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -8129,14 +8188,17 @@ def _render_withheld(
     findings: list[dict],
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    below_floor: list[str] | None = None,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
     A filter that silently drops work reads as "nothing more to do". Naming
     what it dropped, with the command to ask for one, is what keeps it honest.
 
-    Three filters, each in its own block, because the answer to them differs.
-    The cap clears itself on the next run. The other two come from the
+    Four filters, each in its own block, because the answer to them differs.
+    The cap clears itself on the next run; the severity floor
+    (`AUTO_PROMOTION_FLOOR`) never does, and a reader who assumes the sweep
+    will get to a finding eventually does not comment. The other two come from the
     collector manifest and are not invitations at all, and they are not the
     same refusal: a finding the collector ran the check for and declined to
     flag is one to read before asking for anything — see
@@ -8147,7 +8209,8 @@ def _render_withheld(
     """
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
-    if not withheld and not unbacked and not triaged:
+    floor = list(below_floor or [])
+    if not withheld and not unbacked and not triaged and not floor:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
 
@@ -8194,6 +8257,18 @@ def _render_withheld(
             "`/remediate <finding-id>` opens them normally:",
             "",
             *rows(triaged),
+        ]
+    if floor:
+        out += [
+            "",
+            f"{len(floor)} finding(s) carry a manifest remediation graded below "
+            f"`{AUTO_PROMOTION_FLOOR}`, which is what the automatic sweep requires. "
+            "Unlike the cap this does not clear on its own — the sweep will pass "
+            "over these again every run until someone asks. Comment "
+            "`/remediate <finding-id>` to open any of them — an explicit request "
+            "is not held to the floor:",
+            "",
+            *rows(floor),
         ]
     return out
 
@@ -8393,6 +8468,7 @@ def render_issue_body(
     gaps: list[str] | None = None,
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    below_floor: list[str] | None = None,
     held: list[dict] | None = None,
     held_overflow: int = 0,
     held_preview: bool = False,
@@ -8441,6 +8517,7 @@ def render_issue_body(
         findings,
         uncorroborated=list(uncorroborated or []),
         needs_triage=list(needs_triage or []),
+        below_floor=list(below_floor or []),
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -9089,8 +9166,9 @@ def render_stale_close_comment(
             out.append("")
     out += [
         # Say what actually happens on return, not what would be nicest. Only a
-        # `critical` finding with a manifest fix is re-proposed without being
-        # asked, and only `AUTO_PROMOTION_CAP` of those per run — so promising
+        # manifest fix graded at or above `AUTO_PROMOTION_FLOOR`, that neither
+        # collector filter holds back, is re-proposed without being asked, and
+        # only `AUTO_PROMOTION_CAP` of those per run — so promising
         # every reader a fresh pull request writes a cheque the harness does not
         # cash, and the ones it silently fails are precisely the low-severity
         # findings nobody is watching for.
@@ -9098,10 +9176,11 @@ def render_stale_close_comment(
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
-        "If the finding comes back: a `critical` finding with a manifest "
-        f"remediation is re-proposed automatically on this same branch (at most "
-        f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
-        "as awaiting `/remediate <finding-id>`, which re-opens it on request.",
+        f"If the finding comes back: a finding graded `{AUTO_PROMOTION_FLOOR}` or "
+        "above with a manifest remediation is normally re-proposed automatically "
+        f"on this same branch (at most {AUTO_PROMOTION_CAP} per run). Anything "
+        "else is listed on the ledger as awaiting `/remediate <finding-id>`, "
+        "which re-opens it on request.",
         "",
         stale_closed_marker(pr_number),
     ]
@@ -11651,6 +11730,11 @@ def _handle_finish_dry_run(
             "THE COLLECTOR MARKED THESE FIXES AS NEEDING A READER'S JUDGEMENT "
             f"({len(plan.needs_triage)}): {', '.join(plan.needs_triage)}"
         )
+    if plan.below_floor:
+        log(
+            f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR "
+            f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
+        )
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -11658,6 +11742,7 @@ def _handle_finish_dry_run(
         gaps=gaps,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
+        below_floor=plan.below_floor,
         held=preview_held,
         held_preview=True,
         states=states,
@@ -12916,6 +13001,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         withheld=plan.withheld,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
+        below_floor=plan.below_floor,
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
@@ -13083,6 +13169,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 withheld=plan.withheld,
                 uncorroborated=plan.uncorroborated,
                 needs_triage=plan.needs_triage,
+                below_floor=plan.below_floor,
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,

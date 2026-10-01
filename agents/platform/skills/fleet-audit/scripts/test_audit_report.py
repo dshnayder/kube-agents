@@ -3029,13 +3029,14 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.touch("clusters/stage-eu/psp.yaml")
         # Nothing here is auto-promotable — the manifest findings are below
-        # `critical` and the one critical is a `gcloud` remediation, which has
-        # no file to put in a pull request. That isolates the reporting path,
-        # which is what this test is about; auto-promotion has its own.
+        # `AUTO_PROMOTION_FLOOR` and the one critical is a `gcloud`
+        # remediation, which has no file to put in a pull request. That
+        # isolates the reporting path, which is what this test is about;
+        # auto-promotion has its own.
         doc = make_doc(
             findings=[
-                make_finding(fid="a", severity="major"),
-                make_finding(fid="b", severity="major"),  # duplicate path
+                make_finding(fid="a", severity="minor"),
+                make_finding(fid="b", severity="minor"),  # duplicate path
                 make_finding(
                     fid="c",
                     severity="minor",
@@ -3079,6 +3080,31 @@ class TestFinishWithFindings(HarnessTestCase):
         # a fix is already in flight.
         for verb in ("create", "edit", "close", "comment"):
             self.assertEqual(self.harness.gh_calls("pr", verb), [], verb)
+
+    def test_the_ledger_names_what_the_floor_passed_over(self):
+        """`finish` hands the sweep's `below_floor` to the renderer, so the
+        published body names the `minor` manifest fixes it did not open."""
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(make_doc(findings=[make_finding(fid="a", severity="minor")]))
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn(f"graded below `{audit_report.AUTO_PROMOTION_FLOOR}`", body)
+        self.assertIn(f"`{derived_id(fid='a')}` —", body)
+
+    def test_the_dry_run_logs_what_the_floor_passed_over(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(
+            make_doc(findings=[make_finding(fid="a", severity="minor")]), ["--dry-run"]
+        )
+        self.assertIn(
+            f"BELOW THE `{audit_report.AUTO_PROMOTION_FLOOR}` FLOOR (1): "
+            f"{derived_id(fid='a')}",
+            self.err,
+        )
 
     def test_opened_status_json(self):
         self.harness.replies = {
@@ -8197,10 +8223,11 @@ class TestFindingState(BaseTestCase):
 
 
 class TestPromotion(BaseTestCase):
-    def test_only_critical_manifest_findings_auto_promote(self):
+    def test_only_manifest_findings_at_or_above_the_floor_auto_promote(self):
         findings = [
             manifest_finding("crit", "a.yaml", severity="critical"),
             manifest_finding("maj", "b.yaml", severity="major"),
+            manifest_finding("min", "c.yaml", severity="minor"),
             make_finding(
                 fid="crit-gcloud",
                 severity="critical",
@@ -8208,8 +8235,51 @@ class TestPromotion(BaseTestCase):
             ),
         ]
         plan = audit_report.promotion_candidates(findings, {})
-        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_floor_is_major(self):
+        self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
+
+    def test_a_critical_finding_still_promotes_under_a_lower_floor(self):
+        """The floor is compared by rank. An equality test would pass every
+        case above while the floor was `critical` and stop promoting
+        `critical` the moment it was lowered."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("crit", "a.yaml", severity="critical")], {}
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_a_minor_finding_lands_below_the_floor(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")], {}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_an_unknown_grade_lands_below_the_floor(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("odd", "a.yaml", severity="urgent")], {}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.below_floor, ["odd"])
+
+    def test_an_autopilot_bumped_major_is_held_for_triage_not_promoted(self):
+        """The cost collector's Autopilot bump raises a sizing finding to
+        `major`, which clears the floor. Its marker is in `NO_SWEEP_TRIAGE`, so
+        the grade orders the ledger without opening a pull request."""
+        self.assertIn("autopilot-bumped", audit_report.NO_SWEEP_TRIAGE)
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("bumped", "a.yaml", severity="major")],
+            {},
+            triage_marked={"bumped"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.needs_triage, ["bumped"])
+        self.assertEqual(plan.below_floor, [])
 
     def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
         # Every PR state, because "already has a PR" is not one condition. Only
@@ -8341,6 +8411,135 @@ def harness_comment(body, node_id="IC_9"):
         "createdAt": "2026-07-01T00:00:00Z",
         "viewerDidAuthor": True,
     }
+
+
+class TestBelowFloorDisclosure(BaseTestCase):
+    """What the severity floor passes over is named, not dropped.
+
+    `_render_withheld` names what each sweep filter held back on the stated
+    principle that a filter which silently drops work reads as "nothing more
+    to do". The floor refuses permanently -- unlike the cap it never clears on
+    the next run -- so a ledger that did not name its refusals would offer a
+    reader declarative fixes, no pull requests, and no sentence saying one
+    comment opens any of them.
+    """
+
+    def test_a_manifest_fix_under_the_floor_is_reported_not_dropped(self):
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("crit", "a.yaml", severity="critical"),
+                manifest_finding("maj", "b.yaml", severity="major"),
+                manifest_finding("min", "c.yaml", severity="minor"),
+            ],
+            {},
+        )
+        self.assertEqual(plan.promote, ["crit", "maj"])
+        self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_floor_report_excludes_what_the_earlier_filters_refused(self):
+        """Severity is tested last, so `below_floor` holds only its own refusals.
+
+        Tested first it would also collect the findings with no manifest to
+        open, the ones whose pull request is already live, and the ones a
+        collector held back for a reason of its own -- and the ledger would
+        invite `/remediate` on all of them.
+        """
+        findings = [
+            make_finding(
+                fid="min-gcloud",
+                severity="minor",
+                remediation={"kind": "gcloud", "note": "g"},
+            ),
+            make_finding(
+                fid="min-manual",
+                severity="minor",
+                remediation={"kind": "manual", "note": "m"},
+            ),
+            manifest_finding("min-open-pr", "d.yaml", severity="minor"),
+            manifest_finding("min-triaged", "f.yaml", severity="minor"),
+            manifest_finding("min-unbacked", "g.yaml", severity="minor"),
+            manifest_finding("min-real", "e.yaml", severity="minor"),
+        ]
+        plan = audit_report.promotion_candidates(
+            findings,
+            {"min-open-pr": {"state": "OPEN"}},
+            triage_marked={"min-triaged"},
+            uncorroborated={"min-unbacked"},
+        )
+        self.assertEqual(plan.below_floor, ["min-real"])
+        self.assertEqual(plan.needs_triage, ["min-triaged"])
+        self.assertEqual(plan.uncorroborated, ["min-unbacked"])
+
+    def test_a_harness_withdrawn_pr_does_not_hide_a_floor_refusal(self):
+        # `withdrawn` is treated as no pull request at all everywhere else, so
+        # a finding whose fix the harness closed as stale is still awaiting a
+        # `/remediate` and still has to be named as one.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {"min": stale_closed_pr()},
+        )
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_a_requested_finding_is_promoted_rather_than_reported(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            requested=["min"],
+        )
+        self.assertEqual(plan.promote, ["min"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_the_remediate_subcommand_reports_no_floor_refusals(self):
+        # `auto_promote=False` runs no sweep, so there is nothing for the floor
+        # to have refused. Reporting one would put an "Awaiting /remediate"
+        # section on the answer to a `/remediate` that just ran.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            auto_promote=False,
+        )
+        self.assertEqual(plan.below_floor, [])
+
+    def floor_doc(self):
+        return make_doc(
+            findings=[
+                make_finding(),
+                make_finding(
+                    fid="wide-rbac",
+                    severity="minor",
+                    title="Wildcard RBAC verb",
+                    check="wildcard-rbac",
+                ),
+            ]
+        )
+
+    def test_the_ledger_names_the_floor_refusals_and_how_to_open_them(self):
+        body = render_body(self.floor_doc(), generated_at=NOW, below_floor=["wide-rbac"])
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn("`wide-rbac`", body)
+        self.assertIn("Wildcard RBAC verb", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTION_FLOOR}`", body)
+        self.assertIn("/remediate <finding-id>", body)
+        # The distinction that makes the block worth separating from the cap's:
+        # a reader who thinks the sweep will get to it next run does not comment.
+        self.assertIn("does not clear on its own", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+    def test_the_cap_and_the_floor_are_named_as_separate_reasons(self):
+        body = render_body(
+            self.floor_doc(),
+            generated_at=NOW,
+            withheld=["no-network-policy"],
+            below_floor=["wide-rbac"],
+        )
+        self.assertEqual(body.count("## Awaiting `/remediate`"), 1)
+        self.assertIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        self.assertIn("does not clear on its own", body)
+
+    def test_nothing_refused_renders_no_section(self):
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertNotIn("Awaiting `/remediate`", body)
 
 
 class TestRemediateCommands(BaseTestCase):
@@ -11972,7 +12171,9 @@ class TestAcknowledgements(HarnessTestCase):
 class TestRemediationOutcomes(unittest.TestCase):
     def plan(self, **kw):
         return audit_report.PromotionPlan(
-            kw.get("promote", []), kw.get("withheld", []), kw.get("already_open", [])
+            promote=kw.get("promote", []),
+            withheld=kw.get("withheld", []),
+            already_open=kw.get("already_open", []),
         )
 
     def requests(self, targets):
@@ -14301,21 +14502,33 @@ class TestUncorroboratedFindings(BaseTestCase):
         self.assertEqual(plan.uncorroborated, [])
 
     def test_a_finding_the_sweep_would_not_open_anyway_is_not_named(self):
-        """The two lists name only what the sweep would otherwise have opened:
-        a `major` finding, a `gcloud` fix, or one with a live pull request
-        drops out on the earlier tests and must not land in a block that
-        invites `/remediate` on it."""
+        """The two lists name only manifest fixes with no live pull request:
+        a `gcloud` fix, or one with a live pull request, drops out on the
+        earlier tests and must not land in a block that invites `/remediate`
+        on it."""
         plan = audit_report.promotion_candidates(
             [
-                manifest_finding("minor", "a.yaml", severity="major"),
                 make_finding(fid="cli", remediation={"kind": "gcloud", "note": "x"}),
                 manifest_finding("open", "c.yaml"),
             ],
             {"open": {"number": 9, "state": "OPEN", "labels": []}},
-            uncorroborated={"minor", "cli", "open"},
+            uncorroborated={"cli", "open"},
         )
         self.assertEqual(plan.promote, [])
         self.assertEqual(plan.uncorroborated, [])
+
+    def test_an_unbacked_finding_below_the_floor_is_named_as_unbacked(self):
+        """Severity is tested after corroboration, so a `minor` finding the
+        collector declined to flag lands in the block that says to read it
+        first, not in `below_floor`'s plain invitation to `/remediate`."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("minor", "a.yaml", severity="minor")],
+            {},
+            uncorroborated={"minor"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.uncorroborated, ["minor"])
+        self.assertEqual(plan.below_floor, [])
 
     def test_without_a_sweep_nothing_is_named(self):
         plan = audit_report.promotion_candidates(
@@ -15101,11 +15314,18 @@ class TestFinishManifestFlag(HarnessTestCase):
 
     def test_the_json_line_and_the_ledger_name_the_same_uncorroborated_findings(self):
         """One set under one name: what the sweep would otherwise have opened.
-        A `major` finding the collector did not flag is uncorroborated too, but
-        the sweep would not have opened it, so neither surface names it."""
+        A `gcloud` finding the collector did not flag is uncorroborated too,
+        but the sweep would not have opened it, so neither surface names it."""
         self.promotion_replies()
         doc = make_doc(
-            findings=[make_finding(), make_finding(fid="m", severity="major", title="Major one")]
+            findings=[
+                make_finding(),
+                make_finding(
+                    fid="m",
+                    title="Major one",
+                    remediation={"kind": "gcloud", "note": "gcloud x"},
+                ),
+            ]
         )
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
@@ -18029,7 +18249,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run
-    partial, and the line now covers both causes. Nothing else moved.
+    partial, and the line now covers both causes. And `AUTO_PROMOTION_FLOOR`
+    moving from `critical` to `major` promotes the `major` manifest finding in
+    `two_findings`, so the findings path and the dry run each open a second
+    pull request (the recorded reply gives both the same URL). Nothing else
+    moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

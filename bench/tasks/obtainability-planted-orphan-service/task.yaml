@@ -20,8 +20,9 @@
 #
 # Isolation class: namespace-scoped plant on the host cluster, read-only
 # fleet sweep, GitOps-repo write (the ledger, on the same throwaway-repo terms
-# as every audit). The finding is `major` for a ClusterIP, below the
-# `critical` auto-promotion floor, so the run opens no remediation pull
+# as every audit). The finding is `major` for a ClusterIP, which is at the
+# auto-promotion floor, but the plant is not declared in the GitOps repo, so
+# its remediation is `manual` (SOP 3.16) and the run opens no remediation pull
 # request.
 #
 # Expected cost bracket: the full-audit shape, 600-1300s a repetition, as

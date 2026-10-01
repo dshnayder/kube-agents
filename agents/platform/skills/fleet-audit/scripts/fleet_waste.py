@@ -536,6 +536,16 @@ IDLE_WORKLOAD_MIN_AGE_DAYS = 14
 # the two files carry it separately because neither imports the other.
 IDLE_SERVICE_TRIAGE = "service-fronted"
 
+# The `needs_triage` marker on a sizing finding whose `major` grade the
+# Autopilot bump supplied: an overrequest that is `minor` by magnitude, and
+# every unsized workload on an Autopilot cluster. The bump moves a finding up
+# the ledger because Autopilot bills on requests; it says nothing about
+# whether the resize is safe to merge unread, and the automatic sweep promotes
+# from `major` (`AUTO_PROMOTION_FLOOR` in audit_report.py). Without the marker
+# a platform attribute would open pull requests by itself. Same contract as
+# `IDLE_SERVICE_TRIAGE`: `NO_SWEEP_TRIAGE` names it, `/remediate` still opens it.
+AUTOPILOT_BUMP_TRIAGE = "autopilot-bumped"
+
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
 # quantity doing the harm: it is what the scheduler failed to book on the node,
@@ -3493,7 +3503,11 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
         severity = "major" if delta_cpu >= NODE_WORTH_VCPU or delta_mem_gib >= NODE_WORTH_GIB else "minor"
-        if autopilot and severity == "minor":
+        # Recorded, not just applied: a grade the bump supplied is held out of
+        # the automatic sweep (`AUTOPILOT_BUMP_TRIAGE`), and one the delta
+        # earned on its own is not.
+        bumped = autopilot and severity == "minor"
+        if bumped:
             severity = "major"
 
         # Name the over-requested dimensions in the excerpt. The remediation
@@ -3615,6 +3629,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 "excerpt": excerpt,
                 "severity": severity,
                 "_guaranteed": guaranteed,
+                "_autopilot_bumped": bumped,
             }
         )
     return hits
@@ -4195,8 +4210,9 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # container, so a pod pairing a limited sidecar with an unlimited main
         # container -- every default Istio injection -- has a `mem_lim_total`
         # binding neither. Grading against it published `critical` off the
-        # sidecar's 1Gi while the unlimited container held the memory, and
-        # `critical` + `manifest` is what `finish` promotes unattended.
+        # sidecar's 1Gi while the unlimited container held the memory, and a
+        # `manifest` fix graded at or above `AUTO_PROMOTION_FLOOR` is what
+        # `finish` promotes unattended.
         limited = all(
             parse_mem_mib(str(lim.get("memory", "0")))
             for pod in entry["pods"]
@@ -4400,11 +4416,11 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # severity ceiling reserves `critical` for a drain blocker or a
         # last-copy deletion, neither of which a missing request is.
         #
-        # The ceiling is also what keeps this out of the automatic sweep,
-        # which promotes `critical` findings only (`promotion_candidates` in
-        # audit_report.py): a bumped `major` still waits for `/remediate`, so
-        # a *platform* attribute moves this finding up the ledger and never
-        # opens a pull request by itself.
+        # The bumped `major` clears the automatic sweep's floor
+        # (`AUTO_PROMOTION_FLOOR` in audit_report.py), so the hit says the bump
+        # supplied it and the candidate carries `AUTOPILOT_BUMP_TRIAGE`: it
+        # still waits for `/remediate`, and a *platform* attribute moves this
+        # finding up the ledger without opening a pull request by itself.
         severity = "major" if autopilot else "minor"
         # §3.1's units are vCPU and GiB, and this check does not use them. The
         # workloads it finds are small by construction -- nobody forgets a
@@ -4456,6 +4472,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
                 "object": f"{kind}/{name}",
                 "excerpt": excerpt,
                 "severity": severity,
+                "_autopilot_bumped": autopilot,
             }
         )
     return hits
@@ -5201,15 +5218,21 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         commands["unsized-workload"] = usage_record
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
             emitted = emit("overrequest", hit)
+            # `guaranteed-qos` wins over the bump marker: §3.1 has that
+            # finding published as `manual`, which the sweep never opens, and
+            # the model needs the marker to know to write it that way.
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
+            elif hit.get("_autopilot_bumped"):
+                emitted["needs_triage"] = AUTOPILOT_BUMP_TRIAGE
             candidates.append(emitted)
         # Same peak read, the complementary population: 3.1 sizes the
         # controllers that declared a request, 3.12 the ones that did not.
-        candidates += [
-            emit("unsized-workload", h)
-            for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
-        ]
+        for hit in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
+            emitted = emit("unsized-workload", hit)
+            if hit.get("_autopilot_bumped"):
+                emitted["needs_triage"] = AUTOPILOT_BUMP_TRIAGE
+            candidates.append(emitted)
         # Same peak read again, and the population 3.1 drops: a controller
         # whose resize would change nothing because nothing is using it, or
         # one whose resize 3.1 refuses to make because it is `Guaranteed`.

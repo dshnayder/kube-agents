@@ -2219,6 +2219,25 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=True)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
+        self.assertTrue(hits[0]["_autopilot_bumped"])
+
+    def test_a_major_the_delta_earned_is_not_marked_as_bumped(self):
+        """Only a grade the bump supplied is held out of the sweep. A delta
+        worth a node is `major` on any cluster and promotes on its own."""
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (0.9, 3072.0)}
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=autopilot)
+                self.assertEqual(hit["severity"], "major")
+                self.assertFalse(hit["_autopilot_bumped"])
+
+    def test_a_minor_off_autopilot_is_not_marked_as_bumped(self):
+        pod = self.deployment_pod(cpu_req="3", mem_req="6Gi")
+        peaks = {("default", "api-1"): (0.1, 100.0)}
+        [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_the_excerpt_names_the_window_it_rests_on(self):
         pod = self.deployment_pod()
@@ -4083,7 +4102,11 @@ class UnsizedWorkloadTest(unittest.TestCase):
         manifest declares none, so the number is being paid for either way."""
         pod = self.pod()
         peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
-        self.assertEqual(self.check([pod], peaks, autopilot=True)[0]["severity"], "major")
+        [hit] = self.check([pod], peaks, autopilot=True)
+        self.assertEqual(hit["severity"], "major")
+        self.assertTrue(hit["_autopilot_bumped"])
+        [hit] = self.check([pod], peaks, autopilot=False)
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_it_never_reaches_critical(self):
         """§3 caps a manifest remediation below `critical`, which opens a
@@ -5124,6 +5147,46 @@ class CollectClusterTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertIn("ingress", seen[0][2].split(","))
+
+    def bump_candidates(self, autopilot):
+        unsized = UnsizedWorkloadTest().pod()
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi")
+        session = usage_session(
+            ("argocd", "argocd-repo-server-1", 0.01, 64.0),
+            ("default", "api-1", 0.1, 100.0),
+        )
+        entry, _ = self.run_with(
+            dump_items=[unsized, over],
+            session=session,
+            cluster={**self.CLUSTER, "autopilot": autopilot},
+        )
+        return {c["check"]: c for c in entry["candidates"]}
+
+    def test_an_autopilot_bumped_sizing_finding_is_marked_for_triage(self):
+        """The bump lifts both §3.1 and §3.12 to `major`, which clears the
+        sweep's floor. The marker is what keeps a platform attribute from
+        opening a pull request by itself."""
+        candidates = self.bump_candidates(autopilot=True)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "major")
+                self.assertEqual(candidates[check]["needs_triage"], fw.AUTOPILOT_BUMP_TRIAGE)
+
+    def test_the_same_findings_off_autopilot_carry_no_marker(self):
+        candidates = self.bump_candidates(autopilot=False)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "minor")
+                self.assertIsNone(candidates[check]["needs_triage"])
+
+    def test_the_bump_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift here would mark
+        the finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(fw.AUTOPILOT_BUMP_TRIAGE, "autopilot-bumped")
+        self.assertIn(fw.AUTOPILOT_BUMP_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertIn(fw.IDLE_SERVICE_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
 
     def test_every_outcome_publishes_the_mode(self):
         # The mode is a cluster property `enumerate_clusters` already resolved,
