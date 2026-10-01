@@ -64,9 +64,9 @@ When you are delegated a task or kanban card to execute an audit stream followin
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
   it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED` line; there is
   no document to fix). If it refuses, say the stream is already running and stop; there is no override
-  for you, and the refusal is not a problem to work around. A `START REFUSED` line that names
-  `the broker at` instead of a run is a different refusal: nothing is in flight, the credential proxy
-  did not confirm it can publish, and the answer is to check the credential-proxy pod and re-run. One refusal is your own: the note does not
+  for you, and the refusal is not a problem to work around. A `BROKER UNAVAILABLE` line is a different
+  refusal: the credential proxy did not answer, so check the credential-proxy pod and re-run the same
+  command once it answers (see "Exit codes" for what a refused `finish` leaves in flight). One refusal is your own: the note does not
   know sessions, so if your `start` for that stream already succeeded in this session, a second `start`
   is refused like anyone's and your first run is untouched — do not run `start` again; continue the
   sweep from the first `start`'s output to `finish`. That holds only while no `finish` for that stream
@@ -426,11 +426,13 @@ this run's `start` opened reaches exit 2 too: the collector writes to a fixed pa
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
 against nothing. Re-run the collector. Exit 1 is fatal and means
-something else broke. One exit 2 is not a document to fix: a `START REFUSED` line from `start`. When
-it names a run, the stream's in-flight guard held (see "Running a stream on demand"); there is nothing
-to edit and nothing to re-run until that run's `finish`. When it names `the broker at` an address,
-nothing is in flight: the credential proxy did not confirm its content-workspace routes, so check the
-credential-proxy pod and re-run once it answers.
+something else broke. Two exit 2s are not a document to fix. A `START REFUSED` line from `start`
+means the stream's in-flight guard held (see "Running a stream on demand"); there is nothing to edit
+and nothing to re-run until that run's `finish`. A `BROKER UNAVAILABLE` line, from any command, names
+`the broker at` an address: the credential proxy is down, unreachable, refusing this sandbox's token or
+on an older build, so check the credential-proxy pod and re-run the same command once it answers.
+From `start`, nothing is in flight. From `finish`, the run is still in flight and its document is
+untouched: re-run `finish`, never `start`.
 
 ### Partial coverage
 

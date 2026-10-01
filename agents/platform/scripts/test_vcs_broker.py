@@ -2286,7 +2286,6 @@ class CollaborationTest(unittest.TestCase):
                 "repository": "acme/infra",
                 "state": "all",
                 "labels": ["audit:a1", "audit:remediation"],
-                "source": "fix",
             }
         )
         asked = urllib.parse.unquote(recorder.calls[0][4])
@@ -2299,27 +2298,47 @@ class CollaborationTest(unittest.TestCase):
         scan = urllib.parse.unquote(recorder.calls[1][4])
         self.assertTrue(scan.startswith("repos/acme/infra/pulls?"))
         self.assertIn("state=all", scan)
-        # The fork's branch of the same name is not this repository's proposal.
-        self.assertEqual([p["number"] for p in answer["proposals"]], [3])
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3, 5])
         self.assertEqual(answer["proposals"][0]["closed"], "")
 
-    def test_a_labelled_source_filter_matches_the_owner_in_any_case(self):
-        # Review finding: GitHub logins are case-insensitive and `head=` treats
-        # them so, but the labelled path compared the typed owner with the
-        # forge's canonical spelling and answered "no proposal on this branch".
-        page = [{"number": 3, "pull_request": {}}]
-        pull = {
-            "number": 3,
-            "state": "open",
-            "user": {"login": "u"},
-            "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
-            "base": {"ref": "main"},
-            "closed_at": None,
-        }
-        broker, _ = self.broker(page, pull)
-        answer = broker.proposal_list(
-            {"repository": "Acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix"}
+    def test_a_labelled_source_filter_asks_for_the_branch_and_matches_labels_here(self):
+        # Review finding: with labels, the branch was matched against one page
+        # of the label's newest hits, so on a label with more carriers than
+        # the limit an older branch's proposal answered as absent. The branch
+        # is the narrower question: ask `/pulls` for it exactly, as the
+        # unlabelled path does, and match the labels on what comes back.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        broker, recorder = self.broker(
+            [pull(9, ["other"]), pull(3, ["Audit:A1", "audit:remediation"])]
         )
+        answer = broker.proposal_list(
+            {
+                "repository": "Acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+                "source": "fix",
+                "limit": 1,
+            }
+        )
+        self.assertEqual(len(recorder.calls), 1)
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/Acme/infra/pulls?"), asked)
+        self.assertIn("head=Acme:fix", asked)
+        # A full page, cut to the limit after the labels are matched: a limit
+        # of one asked of the forge would return only the unlabelled newer one.
+        self.assertIn("per_page=100", asked)
+        # GitHub matches label names without regard to case, as the issues
+        # filter this stands in for does.
         self.assertEqual([p["number"] for p in answer["proposals"]], [3])
 
     @staticmethod

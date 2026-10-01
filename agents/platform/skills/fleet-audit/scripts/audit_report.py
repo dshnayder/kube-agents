@@ -1094,6 +1094,17 @@ class StartRefused(ValidationError):
     """
 
 
+class BrokerUnavailable(ValidationError):
+    """The credential proxy did not answer, so this command could not publish.
+
+    Apart from `StartRefused` because it is not about the stream: any command
+    that reaches the broker can raise it, and what it leaves in flight is
+    whatever the command found. A refused `start` holds no note; a refused
+    `finish` keeps its run open for the next `finish`. Exit 2 again, since the
+    answer is the same command once the broker is back, not a fix to the file.
+    """
+
+
 class BodyTooLargeError(ValidationError):
     """A rendered body that still exceeds GitHub's limit after budgeting.
 
@@ -9143,7 +9154,7 @@ def detect_content_mode() -> bool:
     command, later and with a `git` error that names nothing. A broker that is
     down, unreachable, token-less, or not yet rolled to a build serving the
     workspace routes (`workspaces_available` answers False for all of those)
-    refuses the run here instead, with a message naming the broker.
+    refuses the command here instead, with a message naming the broker.
     """
     endpoint = proxy_endpoint()
     if not endpoint:
@@ -9158,11 +9169,11 @@ def detect_content_mode() -> bool:
         why = ""
     if armed:
         return True
-    raise StartRefused(
+    raise BrokerUnavailable(
         f"the broker at {endpoint} did not confirm its content-workspace routes{why}. "
         "It may be down, unreachable, refusing this sandbox's token, or on a build "
-        "older than this skill. This sandbox has no other way to publish, so the "
-        "audit did not start; check the credential-proxy pod and re-run."
+        "older than this skill. This sandbox has no other way to publish; check the "
+        "credential-proxy pod and re-run this command."
     )
 
 
@@ -9174,10 +9185,26 @@ def refresh_credentials(repo: str | None = None) -> None:
     running `git config --get remote.origin.url` in the *current* directory, and
     on this path there is no clone in the current directory yet — establishing
     one is what the token is for.
+
+    With a broker configured the refresh is a call to it, made before the
+    content-mode probe, so a broker that is down fails here first. That is the
+    same condition the probe names, and it gets the same refusal rather than a
+    `FATAL` the skill reads as something else having broken.
     """
     from github_token_refresh import refresh_git_credentials
 
-    refresh_git_credentials(repo)
+    endpoint = proxy_endpoint()
+    if not endpoint:
+        refresh_git_credentials(repo)
+        return
+    try:
+        refresh_git_credentials(repo)
+    except Exception as exc:  # noqa: BLE001 — named in the refusal below
+        raise BrokerUnavailable(
+            f"the broker at {endpoint} could not refresh repository credentials: {exc}. "
+            "This sandbox has no other way to publish; check the credential-proxy pod "
+            "and re-run this command."
+        ) from exc
 
 
 def resolve_repo(
@@ -13102,6 +13129,9 @@ def main(argv: list[str] | None = None) -> int:
             handle_remediate(args)
         else:
             handle_finish(args)
+    except BrokerUnavailable as exc:
+        log(f"BROKER UNAVAILABLE: {exc}")
+        return 2
     except StartRefused as exc:
         # Exit 2 like a rejected document, labelled apart from one: there
         # is no document here to fix and re-run.

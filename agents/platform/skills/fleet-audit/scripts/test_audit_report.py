@@ -12916,9 +12916,10 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("operator's action", section)
         self.assertIn("one `start`-`finish` pair", section)
         self.assertIn("taken between repositories", section)
-        # The exit-code paragraph tells a `START REFUSED` apart from a
-        # rejected document: there is nothing to fix and nothing to re-run.
-        self.assertIn("One exit 2 is not a document to fix", text)
+        # The exit-code paragraph tells a `START REFUSED` and a
+        # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
+        # file to fix.
+        self.assertIn("Two exit 2s are not a document to fix", text)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
@@ -12956,6 +12957,9 @@ class TestReadCommandsInDirectoryMode(HarnessTestCase):
             self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed"]), 2
         )
         self.assertIn("directory mode", self.err)
+
+
+_REAL_REFRESH_CREDENTIALS = audit_report.refresh_credentials
 
 
 class ContentModeTestCase(BaseTestCase):
@@ -13475,10 +13479,53 @@ class ContentModeTestCase(BaseTestCase):
         self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("http://127.0.0.1:8765", self.err)
-        self.assertIn("did not start", self.err)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertEqual(
             [c for c in self.harness.calls if c[:2] == ["git", "clone"]], []
         )
+
+    def broker_down_for_refresh(self):
+        # The refresh is the first call a command makes to the broker, ahead
+        # of the content-mode probe, and this is how it fails on a closed port.
+        import github_token_refresh
+
+        def refused(repo=None, **_):
+            raise RuntimeError(
+                "Credential sidecar failed to refresh GitHub auth: "
+                "<urlopen error [Errno 111] Connection refused>"
+            )
+
+        self.patch_attr("refresh_credentials", _REAL_REFRESH_CREDENTIALS)
+        patcher = patch.object(github_token_refresh, "refresh_git_credentials", refused)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_broker_that_is_down_refuses_start_naming_it_not_fatal(self):
+        """Review finding: the refresh reaches the broker before the probe, so
+        a broker that is down exited 1 `FATAL` with no `the broker at` line,
+        and the skill read exit 1 as something else having broken."""
+        self.broker_down_for_refresh()
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("BROKER UNAVAILABLE: the broker at http://127.0.0.1:8765", self.err)
+        self.assertIn("Connection refused", self.err)
+        self.assertNotIn("FATAL", self.err)
+        # A refused `start` holds no note: the re-run is not refused for it.
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.patch_attr("refresh_credentials", lambda repo=None: None)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+
+    def test_a_broker_that_is_down_at_finish_keeps_the_run_in_flight(self):
+        """The skill tells a `finish` refused this way to re-run `finish`, not
+        `start`; that holds only while the note does."""
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.broker_down_for_refresh()
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE: the broker at http://127.0.0.1:8765", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
 
 
 # --------------------------------------------------------------------------- #
@@ -18502,33 +18549,38 @@ class TestDetectContentMode(BaseTestCase):
 
     def test_a_broker_that_does_not_say_yes_refuses_the_run(self):
         self.probe(False)
-        with self.assertRaises(audit_report.StartRefused) as raised:
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
             audit_report.detect_content_mode()
         self.assertIn(self.ENDPOINT, str(raised.exception))
-        self.assertIn("did not start", str(raised.exception))
+        self.assertIn("re-run this command", str(raised.exception))
 
     def test_a_probe_that_raises_refuses_the_run_and_says_why(self):
         self.probe(OSError("connection reset"))
-        with self.assertRaises(audit_report.StartRefused) as raised:
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
             audit_report.detect_content_mode()
         self.assertIn("connection reset", str(raised.exception))
 
     def test_the_skill_tells_this_refusal_from_the_in_flight_guard(self):
-        """Review finding: both refusals print `START REFUSED`, and the skill
-        read every one as the in-flight guard -- "say the stream is already
-        running and stop" -- when this one holds no note and wants a re-run
-        once the broker answers. The skill keys on the wording this raises."""
+        """Review findings: this refusal printed `START REFUSED` like the
+        in-flight guard, and then the skill said it meant nothing was in
+        flight -- false after `finish`, which keeps its note. It now has its
+        own label, and the skill says which command to re-run."""
         self.probe(False)
-        with self.assertRaises(audit_report.StartRefused) as raised:
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
             audit_report.detect_content_mode()
+        self.assertNotIsInstance(raised.exception, audit_report.StartRefused)
         self.assertIn("the broker at", str(raised.exception))
         skill = Path(__file__).resolve().parents[1] / "SKILL.md"
         text = skill.read_text(encoding="utf-8")
         on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
-        exit_codes = text.split("One exit 2 is not a document to fix", 1)[1].split("\n### ", 1)[0]
-        for section in (on_demand, exit_codes):
-            self.assertIn("`the broker at`", section)
-            self.assertIn("check the credential-proxy pod and re-run", " ".join(section.split()))
+        exit_codes = " ".join(
+            text.split("Two exit 2s are not a document to fix", 1)[1].split("\n### ", 1)[0].split()
+        )
+        for section in (" ".join(on_demand.split()), exit_codes):
+            self.assertIn("`BROKER UNAVAILABLE`", section)
+            self.assertIn("check the credential-proxy pod and re-run the same command", section)
+        self.assertIn("From `finish`, the run is still in flight", exit_codes)
+        self.assertIn("re-run `finish`, never `start`", exit_codes)
 
 
 if __name__ == "__main__":

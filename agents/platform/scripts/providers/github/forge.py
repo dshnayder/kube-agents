@@ -293,6 +293,24 @@ class GitHubForge(Forge):
         if target is not None:
             params["base"] = validate_branch(target, "target")
         labels = validate_labels(payload.get("labels"))
+        if labels and "head" in params:
+            # The branch is the narrower question, and `/pulls` answers it
+            # exactly; the label filter below reads only the label's newest
+            # hits. So ask for the branch and match the labels here, a full
+            # page at a time so the limit counts matches, not candidates.
+            # GitHub compares label names without regard to case.
+            nodes = api("GET", f"repos/{repo}/pulls", params={**params, "per_page": MAX_PAGE_SIZE})
+            wanted = {label.casefold() for label in labels}
+            proposals = [
+                item
+                for item in (translate.proposal(node) for node in nodes)
+                if wanted <= {label.casefold() for label in item["labels"]}
+            ]
+            return {
+                "proposals": proposals[:limit],
+                "count": len(proposals[:limit]),
+                "truncated": len(proposals) > limit or len(nodes) >= MAX_PAGE_SIZE,
+            }
         if labels:
             return self._proposals_labelled(api, repo, params, labels)
         nodes = api("GET", f"repos/{repo}/pulls", params=params)
@@ -308,8 +326,8 @@ class GitHubForge(Forge):
         search API, whose index lags a write by seconds: a sweep that opens a
         proposal and lists again would not find it and open a second one. The
         issue shape carries no head, so each hit is read back as a pull
-        request. `head` and `base` are not issue filters and are matched on
-        what comes back.
+        request. `base` is not an issue filter and is matched on what comes
+        back; a `head` never reaches here (see `proposal_list`).
 
         Read back from the newest pages of `/pulls` rather than one request per
         hit, because a label shared by every proposal a stream ever opened
@@ -326,16 +344,6 @@ class GitHubForge(Forge):
         wanted = [node["number"] for node in nodes if "pull_request" in node]
         pulls = self._pulls_by_number(api, repo, params["state"], wanted)
         proposals = [translate.proposal(pulls[number]) for number in wanted]
-        if "head" in params:
-            # GitHub logins are case-insensitive, and so is the `head=` filter
-            # this stands in for; `sourceRepo` is the owner's canonical spelling.
-            owner, _, branch = params["head"].partition(":")
-            proposals = [
-                item
-                for item in proposals
-                if item["source"] == branch
-                and item["sourceRepo"].split("/")[0].casefold() == owner.casefold()
-            ]
         if "base" in params:
             proposals = [item for item in proposals if item["target"] == params["base"]]
         # Judged on what the forge sent, as `issue-list` is: a full page of
