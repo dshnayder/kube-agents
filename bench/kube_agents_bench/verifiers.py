@@ -1384,7 +1384,9 @@ def _stream_started() -> datetime | None:
 
 @VERIFIERS.register("pull_request_opened")
 class PullRequestOpenedVerifier(BaseVerifier):
-    """A remediation pull request THIS run opened, resolved through GitHub.
+    """A remediation pull request THIS run opened (or, with
+    ``accepts_stream_pull_request``, one an earlier run on its audit stream
+    opened), resolved through GitHub.
 
     WHY THIS EXISTS. The remediation cases used to grade on a
     ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
@@ -1417,16 +1419,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
     clauses measure instead from when the first unit on the case's audit
     stream began (``EVAL_STREAM_STARTED_AT``, which ``hack/ci-eval-pr.sh``
     exports), so a pull request an earlier unit on the stream opened passes
-    when the reply names it. That is for a fleet audit's remediation case:
-    ``finish`` names the branch after the files the fix touches, so every
+    when the reply names it. That is for a case whose later runs meet a pull
+    request an earlier run left open on the same branch, as a fleet audit's
+    remediation case does: ``finish`` names the branch after the files the
+    fix touches, so every
     later run of the audit on the stream -- this case's later repetitions, or
     another case auditing the same fleet -- finds the pull request open on it,
     leaves it, and pushes nothing. The presubmit holds no credential to close
     it between units (docs/ci-pool-projects.md 5.3), so without the option
     only the first unit on the stream could pass. A leftover from before the
     stream's first unit -- an earlier job on the pool project -- predates the
-    stamp and is still rejected; inside the window the pull request may be
-    another case's, opened by the same audit for the same finding. Run
+    stamp and is still rejected. Inside the window nothing ties the pull
+    request to this case's defect: it may be another case's, and a later
+    repetition passes by naming the one repetition 1 opened. Run
     through ``devops-bench`` directly, without the variable, the clauses
     measure from the run as they otherwise do.
 
@@ -1970,8 +1975,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return done(
             False,
-            "none of the pull request URLs the report names is one this run opened: "
-            + "; ".join(rejected),
+            "none of the pull request URLs the report names was opened or "
+            f"pushed to since {since_what}: " + "; ".join(rejected),
         )
 
 

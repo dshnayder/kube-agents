@@ -2270,6 +2270,34 @@ def test_this_runs_own_pull_request_still_reads_as_this_runs_with_the_option(
     assert "during this run" in res.reason
 
 
+def test_a_stream_stamp_later_than_the_run_never_narrows_the_window(
+    token, github, monkeypatch
+):
+    """A stale window file or clock skew can put the stamp after the run began;
+    the option widens the window and must never shrink it below the run."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "during this run" in res.reason
+
+
+def test_a_rejection_with_the_option_says_what_the_window_was(
+    token, github, monkeypatch
+):
+    """The summary line must not tell a triager the check wanted this run's own pull request."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:30:00Z"))
+    _pr_head_routes(github, "2026-08-21T07:29:50Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "this run opened" not in res.reason
+    assert "this audit stream's first run began" in res.reason
+
+
 @pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
 def test_without_a_readable_stream_stamp_the_option_measures_from_the_run(
     token, github, monkeypatch, raw

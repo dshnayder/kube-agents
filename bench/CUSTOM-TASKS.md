@@ -553,17 +553,18 @@ answer did not carry one, lists `/pulls?state=closed&head={owner}:{branch}`, the
 check gets by with. Any non-200 answer in this clause is an error rather than a fail, and names that
 permission.
 
-`accepts_stream_pull_request: true` is for a fleet audit's remediation case. The audit's
-`finish` names the branch after the files the fix touches, so every later run of the audit on the
+`accepts_stream_pull_request: true` is for a case whose later runs meet a pull request an earlier
+run left open on the same branch, as a fleet audit's remediation case does. The audit's `finish`
+names the branch after the files the fix touches, so every later run of the audit on the
 same stream, whether this case's next repetition or another case auditing the same fleet, finds
 the pull request open on that branch, leaves it, and pushes nothing. The presubmit holds no
-credential to close it between runs ([`ci-pool-projects.md`](../docs/ci-pool-projects.md) section
-5.3), so without the option only the first run on the stream could pass. With it, the two "since
+credential to close it between runs ([`ci-pool-projects.md`](../docs/ci-pool-projects.md#53-what-actually-bounds-where-a-run-can-write)), so without the option only the first run on the stream could pass. With it, the two "since
 the run started" clauses (written to, head commit) measure from `EVAL_STREAM_STARTED_AT` instead:
 the moment the first unit on the case's audit stream began, which `hack/ci-eval-pr.sh` exports (for
 a case that writes no ledger, its own first repetition). A leftover from an earlier job on the pool
-project predates that and is still rejected; inside the window the pull request may be another
-case's, opened by the same audit for the same finding. The reply must still name the pull request,
+project predates that and is still rejected. Inside the window nothing ties the pull request to
+this case's defect: it may be another case's, and a later repetition passes by naming the one
+repetition 1 opened. The reply must still name the pull request,
 and every other clause still applies. Run `devops-bench` directly, without the variable set, and
 the clauses measure from the run as before.
 
