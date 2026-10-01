@@ -397,6 +397,7 @@ LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 # `accepts_stream_pull_request`.
 STREAM_STARTED_ENV_VAR = "EVAL_STREAM_STARTED_AT"
 STREAM_AUDIT_ENV_VAR = "EVAL_AUDIT_STREAM"
+STREAM_REPO_ENV_VAR = "EVAL_STREAM_REPO"
 
 # The head branch every remediation pull request a fleet audit opens sits on is
 # this, the audit id, a dash, then the fix's slug and digest
@@ -1385,6 +1386,11 @@ def _stream_audit() -> str:
     return os.environ.get(STREAM_AUDIT_ENV_VAR, "").strip()
 
 
+def _stream_repo() -> str:
+    """The ``owner/name`` the stream's pull requests land in, from STREAM_REPO_ENV_VAR, lowercased; "" if unset."""
+    return os.environ.get(STREAM_REPO_ENV_VAR, "").strip().lower()
+
+
 def _stream_started() -> datetime | None:
     """When the case's audit stream first ran, from STREAM_STARTED_ENV_VAR; None if unset or unreadable."""
     raw = os.environ.get(STREAM_STARTED_ENV_VAR, "").strip()
@@ -1434,7 +1440,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
     exports with the audit id in ``EVAL_AUDIT_STREAM``), so a pull request an
     earlier unit on the stream opened passes when the reply names it -- and
     only if its head branch is one that audit's ``finish`` names
-    (``platform-agent/fix-<audit>-``). The stamp bounds when; the branch is
+    (``platform-agent/fix-<audit>-``) and it is in the job's GitOps repository
+    (``EVAL_STREAM_REPO``; without it the window is not widened). The stamp bounds when; the branch is
     what says the pull request is the stream's and not another case's in the
     same repository. That is for a case whose later runs meet a pull
     request an earlier run left open on the same branch, as a fleet audit's
@@ -1858,6 +1865,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 "audit stream only through a `ledger_issue_contains` check with "
                 "an `audit` key)"
             )
+        elif self.accepts_stream_pull_request and not _stream_repo():
+            # Without the job's repository a sibling job's pull request on the
+            # same audit's branch in another pool repository would pass.
+            since_what = (
+                "this run started (`accepts_stream_pull_request` is set and the "
+                f"case is on an audit stream, but {STREAM_REPO_ENV_VAR} is not: "
+                "without the job's GitOps repository the widened window cannot "
+                "tell this job's pull request from a sibling job's)"
+            )
         elif self.accepts_stream_pull_request:
             stream_started = _stream_started()
             if stream_started is not None and stream_started < started:
@@ -1959,6 +1975,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 (started - touched).total_seconds() > skew
                 or (pushed and (started - pushed).total_seconds() > skew)
             ):
+                if f"{owner}/{repo}".lower() != _stream_repo():
+                    rejected.append(
+                        f"{slug}: last written or pushed to before this run "
+                        f"started, in a repository other than this job's "
+                        f"({_stream_repo()}) — another job's pull request on "
+                        "the same audit stream, not this one's"
+                    )
+                    continue
                 head = str(((pull or payload).get("head") or {}).get("ref") or "")
                 if not head.startswith(stream_branch):
                     rejected.append(

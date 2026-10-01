@@ -2219,9 +2219,10 @@ _STREAM_BRANCH = f"platform-agent/fix-{_STREAM_AUDIT}-checkout-gateway-0123abcd"
 
 @pytest.fixture
 def stream(monkeypatch):
-    """The two variables hack/ci-eval-pr.sh exports for a unit on an audit stream."""
+    """The three variables hack/ci-eval-pr.sh exports for a unit on an audit stream."""
     monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
     monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, f"gke-agentic/{_PR_REPO}")
 
 
 def test_a_pull_request_an_earlier_run_on_the_stream_opened_passes_with_the_option(
@@ -2381,6 +2382,35 @@ def test_the_option_off_a_stream_says_it_was_dropped(token, github, monkeypatch)
     res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
     assert res.status == "fail"
     assert "`accepts_stream_pull_request` is set" in res.reason
+
+
+def test_a_sibling_jobs_pull_request_in_another_repository_fails(
+    token, github, stream, monkeypatch
+):
+    """Two presubmit jobs on different pool projects run the same audit, so
+    both open pull requests on `platform-agent/fix-<audit>-` branches. The
+    branch and the stamp both admit the other job's; the repository does not."""
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, "gke-agentic/kube-agents-evals-9-infra")
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "in a repository other than this job's" in res.reason
+
+
+def test_a_stream_without_the_jobs_repository_measures_from_the_run(
+    token, github, stream, monkeypatch
+):
+    """A lease whose GitOps repository did not resolve exports none; the
+    window must not widen to every pool repository."""
+    monkeypatch.delenv(verifiers.STREAM_REPO_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert f"{verifiers.STREAM_REPO_ENV_VAR} is not" in res.reason
 
 
 def test_the_remediation_branch_prefix_matches_group_branch_for():

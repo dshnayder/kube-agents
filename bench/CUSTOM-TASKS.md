@@ -561,15 +561,17 @@ the pull request open on that branch, leaves it, and pushes nothing. The presubm
 credential to close it between runs ([`ci-pool-projects.md`](../docs/ci-pool-projects.md#53-what-actually-bounds-where-a-run-can-write)), so without the option only the first run on the stream could pass. With it, the two "since
 the run started" clauses (written to, head commit) measure from `EVAL_STREAM_STARTED_AT` instead:
 the moment the first unit on the case's audit stream began, which `hack/ci-eval-pr.sh` exports
-with the audit id in `EVAL_AUDIT_STREAM`. The `audit` key of the case's `ledger_issue_contains`
-check is what puts it on a stream; a case without one gets neither, and the option then only
+with the audit id in `EVAL_AUDIT_STREAM` and the job's GitOps repository in `EVAL_STREAM_REPO`. The `audit` key of the case's `ledger_issue_contains`
+check is what puts it on a stream; a case without one gets none of them, and the option then only
 adds that to its rejection. A pull request only that window admits must also sit on a branch the audit's `finish`
-names, `platform-agent/fix-<audit>-…`: the stamp bounds when, and the branch is what makes it the
-stream's rather than another case's in the same repository. A leftover from an earlier job on the
+names, `platform-agent/fix-<audit>-…`, in the job's repository: the stamp bounds when, the branch
+is what makes it the stream's rather than another case's in the same repository, and the repository
+keeps out a sibling job's pull request on the same audit in another pool project. Without
+`EVAL_STREAM_REPO` the window is not widened. A leftover from an earlier job on the
 pool project predates the stamp and is still rejected. The branch ties the pull request to the
 audit, not to this case's defect: another case on the same stream opens on the same prefix, and a
 later repetition passes by naming the one repetition 1 opened. The reply must still name the pull
-request, and every other clause still applies. Run `devops-bench` directly, without either variable
+request, and every other clause still applies. Run `devops-bench` directly, without these variables
 set, and the clauses measure from the run as before.
 
 ##### Guarding GitHub writes

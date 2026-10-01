@@ -2807,15 +2807,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
   # here, under the stream lock that serializes them; a pull request older
   # than it is not this job's, and one the stamp admits must sit on the
-  # audit's remediation branch. A case with no `ledger_issue_contains` audit
-  # key has no stream and gets neither.
+  # audit's remediation branch in this job's GitOps repository
+  # (EVAL_STREAM_REPO), so a sibling job's pull request on the same audit in
+  # another pool repository is not this one's. A case with no
+  # `ledger_issue_contains` audit key has no stream and gets none of them.
   if [ -n "${audit_id}" ]; then
     local window="${STATE_DIR}/stream-${audit_id}.window"
     [ -s "${window}" ] || date -u +%s > "${window}"
     EVAL_STREAM_STARTED_AT="$(cat "${window}")"
-    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}"
+    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}" EVAL_STREAM_REPO="${EVAL_LEDGER_REPO:-}"
   else
-    unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM
+    unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM EVAL_STREAM_REPO
   fi
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
