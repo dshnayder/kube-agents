@@ -1143,7 +1143,8 @@ unchanged. As shipped it is **346**. New cases:
   labelled `agent:audit` + `audit:<id>`; zero findings with complete coverage and no ledger opens
   nothing.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
-- Promotion eligibility: critical+manifest and major+manifest auto; critical+gcloud not;
+- Promotion eligibility: critical+manifest auto, and major+manifest auto only on a
+  `MAJOR_SWEEP_CHECKS` check a `major` candidate backs; critical+gcloud not;
   minor+manifest only on request and named in the ledger as below the floor; the floor is compared
   by rank, so lowering it never stops a `critical` promoting; already-has-PR is a no-op in every
   state; the sixth eligible finding in a run is withheld and named in the ledger, while six explicit
