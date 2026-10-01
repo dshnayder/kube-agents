@@ -296,20 +296,25 @@ class GitHubForge(Forge):
         if labels and "head" in params:
             # The branch is the narrower question, and `/pulls` answers it
             # exactly; the label filter below reads only the label's newest
-            # hits. So ask for the branch and match the labels here, a full
-            # page at a time so the limit counts matches, not candidates.
-            # GitHub compares label names without regard to case.
-            nodes = api("GET", f"repos/{repo}/pulls", params={**params, "per_page": MAX_PAGE_SIZE})
+            # hits. So ask for the branch's newest hundred and match the
+            # labels here; the caller's page and limit then count matches,
+            # not candidates, so a page is a slice of them rather than a page
+            # of the forge's. GitHub compares label names without regard to
+            # case.
+            query = {key: value for key, value in params.items() if key != "page"}
+            nodes = api("GET", f"repos/{repo}/pulls", params={**query, "per_page": MAX_PAGE_SIZE})
             wanted = {label.casefold() for label in labels}
-            proposals = [
+            matches = [
                 item
                 for item in (translate.proposal(node) for node in nodes)
                 if wanted <= {label.casefold() for label in item["labels"]}
             ]
+            start = (page - 1) * limit
+            proposals = matches[start : start + limit]
             return {
-                "proposals": proposals[:limit],
-                "count": len(proposals[:limit]),
-                "truncated": len(proposals) > limit or len(nodes) >= MAX_PAGE_SIZE,
+                "proposals": proposals,
+                "count": len(proposals),
+                "truncated": len(matches) > start + limit or len(nodes) >= MAX_PAGE_SIZE,
             }
         if labels:
             return self._proposals_labelled(api, repo, params, labels)

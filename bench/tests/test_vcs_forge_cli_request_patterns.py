@@ -75,11 +75,31 @@ def test_every_forge_write_is_flagged_by_path_and_by_shorthand():
             assert _flagged(command), command
 
 
-def test_a_gh_api_write_is_flagged():
+def test_a_gh_write_is_flagged():
+    # Every `gh` verb that is not a read, and `gh api` with a method that
+    # writes or a field, which makes gh POST without `-X`.
     for command in (
         "gh api -X POST repos/acme/infra/issues -f title=t",
         "gh api --method PATCH repos/acme/infra/pulls/3 -f title=t",
         "gh api -X DELETE repos/acme/infra/git/refs/heads/fix",
+        "gh api repos/acme/infra/issues -f title=t",
+        "gh api repos/acme/infra/issues -F title=t",
+        "gh api repos/acme/infra/issues --input body.json",
+        "gh api repos/acme/infra/labels --raw-field name=x",
+        "gh api graphql -f query='mutation { addComment(input: {}) { clientMutationId } }'",
+        "gh pr create --title t --body b",
+        "gh pr review 3 --approve",
+        "gh pr ready 3",
+        "gh pr reopen 3",
+        "gh pr merge 3",
+        "gh issue reopen 4",
+        "gh issue delete 4",
+        "gh issue pin 4",
+        "gh label create audit:a1",
+        "gh release create v1",
+        "gh repo edit --description x",
+        "gh workflow run ci.yaml",
+        "cd /x && gh issue comment 4 --body hi",
     ):
         assert _flagged(command), command
 
@@ -92,5 +112,19 @@ def test_the_reads_a_passing_worker_issues_are_not_flagged():
         "gh pr list --repo acme/infra --state all --limit 1000",
         "gh api repos/acme/infra/pulls?state=all",
         "gh api graphql -f query='{ viewer { login } }'",
+        "gh api graphql -f query='query { viewer { login } }'",
+        "gh pr view 3 --comments",
+        "gh pr diff 3",
+        "gh pr checks 3",
+        "gh pr status",
+        "gh issue list --state all",
+        "gh issue view 4",
+        "gh label list",
+        "gh release list",
+        "gh repo view acme/infra",
+        "gh workflow list",
+        "gh run list",
+        "gh auth status",
+        "gh --version",
     ):
         assert not _flagged(command), command

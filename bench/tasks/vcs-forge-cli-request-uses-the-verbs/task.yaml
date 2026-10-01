@@ -77,13 +77,18 @@ verification_spec:
     check:
       type: worker_commands
       # Every verb vcs.py serves that changes the forge, aliases included,
-      # matched by path or through `$V` like the required pattern; and a `gh`
-      # write, through its subcommands or `gh api` with a writing method.
-      # bench/tests/test_vcs_forge_cli_request_patterns.py pins the list.
+      # matched by path or through `$V` like the required pattern. For `gh`,
+      # whose write verbs are too many to list, the reads are listed instead:
+      # any other verb on a resource is a write. `gh api` writes with a writing
+      # method, or with a field or `--input`, which make it POST without `-X`;
+      # a GraphQL query posts its fields too, so there only a mutation counts.
+      # bench/tests/test_vcs_forge_cli_request_patterns.py pins all of it.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
-        - '(^|&&|;|\|)\s*gh\s+(pr|issue)\s+(create|edit|close|merge|comment)\b'
+        - '(^|&&|;|\|)\s*gh\s+(pr|issue|label|release|repo|workflow|run|gist|secret|variable|ruleset|cache|project)\s+(?!(list|view|status|diff|checks)\b)[a-z]'
         - '(^|&&|;|\|)\s*gh\s+api\b.*\s(-X|--method)[\s=]*(POST|PATCH|PUT|DELETE)\b'
+        - '(^|&&|;|\|)\s*gh\s+api\s+(?!graphql\b)\S.*\s(-f|-F|--field|--raw-field|--input)\b'
+        - '(^|&&|;|\|)\s*gh\s+api\s+graphql\b.*\bmutation\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+(publish|push)\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+(proposal|pr|mr|issue)\s+(create|open|comment|update|edit|close|acknowledge|ack)\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+label\s+(ensure|create)\b'

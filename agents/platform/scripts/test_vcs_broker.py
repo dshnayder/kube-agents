@@ -2341,6 +2341,37 @@ class CollaborationTest(unittest.TestCase):
         # filter this stands in for does.
         self.assertEqual([p["number"] for p in answer["proposals"]], [3])
 
+    def test_a_labelled_source_filter_pages_through_the_matches(self):
+        # Review finding: the caller's page went to the forge with a page size
+        # of a hundred, so page 2 was the branch's proposals 101-200 and the
+        # matches between the limit and a hundred were unreachable.
+        def pull(number):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": "audit:a1"}],
+            }
+
+        nodes = [pull(n) for n in range(10, 0, -1)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 4}
+        first, recorder = self.broker(nodes)
+        answer = first.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [10, 9, 8, 7])
+        self.assertTrue(answer["truncated"])
+        second, recorder = self.broker(nodes)
+        answer = second.proposal_list({**query, "page": 2})
+        self.assertNotRegex(urllib.parse.unquote(recorder.calls[0][4]), r"[?&]page=")
+        self.assertEqual([p["number"] for p in answer["proposals"]], [6, 5, 4, 3])
+        self.assertTrue(answer["truncated"])
+        third, _ = self.broker(nodes)
+        answer = third.proposal_list({**query, "page": 3})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [2, 1])
+        self.assertFalse(answer["truncated"])
+
     @staticmethod
     def labelled(numbers):
         return [{"number": n, "pull_request": {}} for n in numbers]
