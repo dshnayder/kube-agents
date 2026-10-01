@@ -196,8 +196,14 @@ BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK
 # `release_declarations` reads Argo CD Applications from anywhere in the tree,
 # for any destination, so such a file can hide a release for every cluster;
 # the marker makes that index, and `namespace_directories` which leans on it,
-# answer nothing rather than part. Not YAML, so no index opens it.
-MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
+# answer nothing rather than part. Under `.git/`, which git will not track, so
+# no repository can carry one into a clone and switch the indexes off there;
+# not YAML, and the indexes skip `.git/`, so none opens it.
+MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
+# Beside it: the clusters whose `clusters/<name>/` tree a withheld file took out
+# of the mirror, one per line. `namespace_directories` answers nothing for
+# them, because the sibling arm that would have won there reads that tree.
+MIRROR_CLUSTERS_WITHHELD_MARKER = ".git/collect-clusters-withheld"
 
 # `release_declarations` indexes the objects that render a workload a GitOps
 # repo holds no manifest for -- an Argo CD `Application`, from either a chart
@@ -8203,9 +8209,13 @@ def namespace_directories(
     release index, and without it a directory inside an overlay reads as a
     plain `sibling`, which is the never-rendering pull request above; and the
     missing file may be the AppProject that withdraws the `cluster` arm.
+    Nor does anything for a cluster MIRROR_CLUSTERS_WITHHELD_MARKER names: its
+    tree left the mirror, so the sibling arm that would have won there cannot,
+    and an overlay elsewhere would answer in its place.
     """
     if root is not None and (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
         return {}
+    withheld = _withheld_clusters(root)
     resolved: dict[tuple[str, str], dict] = {}
     directories: dict[tuple[str, str], set[str]] = {}
     per_cluster: dict[str, set[str]] = {}
@@ -8244,7 +8254,17 @@ def namespace_directories(
                 "path": next(iter(applied)),
                 "source": NAMESPACE_DIRECTORY_CLUSTER,
             }
-    return resolved
+    return {key: entry for key, entry in resolved.items() if key[0] not in withheld}
+
+
+def _withheld_clusters(root: Path | None) -> set[str]:
+    """The clusters MIRROR_CLUSTERS_WITHHELD_MARKER names under `root`."""
+    if root is None:
+        return set()
+    try:
+        return set((root / MIRROR_CLUSTERS_WITHHELD_MARKER).read_text().split())
+    except OSError:
+        return set()
 
 
 def collect_cluster(
@@ -8701,10 +8721,14 @@ def _import_platform_script(name: str):
     """
     import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
 
-    for directory in (
-        *PLATFORM_SCRIPT_DIRS,
-        str(Path(__file__).resolve().parents[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts"),
-    ):
+    checkout = Path(__file__).resolve().parents
+    # A copy run from three or fewer directories below `/` has no checkout.
+    beside = (
+        [str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts")]
+        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
+        else []
+    )
+    for directory in (*PLATFORM_SCRIPT_DIRS, *beside):
         if directory not in sys.path:
             sys.path.append(directory)
     try:
@@ -8953,8 +8977,19 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                         if e.get("reason") not in BROKER_WITHHOLDING_SKIPS
                         and e.get("reason") != BROKER_SKIP_REQUEST_BUDGET
                     ]
-                    if refused or (retry and not got):
-                        first = (refused or retry)[0]
+                    if retry and not got and not refused:
+                        # A file larger than one request's budget stalls every
+                        # round that starts with it; a single `read` has only
+                        # the per-file limit, so ask for it alone.
+                        stalled = str(retry[0].get("path") or "")
+                        try:
+                            files[stalled] = workspace.read(stalled)
+                        except Exception:  # noqa: BLE001 -- reported below as the stall it is
+                            refused = retry[:1]
+                        else:
+                            retry = retry[1:]
+                    if refused:
+                        first = refused[0]
                         log(
                             f"WARNING: the broker did not send {first.get('path')} from {repo} "
                             f"({first.get('reason')}); no candidate will carry a declaration"
@@ -8990,7 +9025,10 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         region = _cluster_tree(path)
         costs = []
         if region:
-            costs.append(f"no candidate on cluster {region} will carry a declaration")
+            # Its tree goes, so its `namespace_directory` too, unless every
+            # cluster's already does.
+            also = "" if path in releasing else " or namespace_directory"
+            costs.append(f"no candidate on cluster {region} will carry a declaration{also}")
         if path in releasing:
             costs.append("no candidate will carry a release_declaration or namespace_directory")
         knob = f"; raise {BROKER_MAX_FILE_BYTES_ENV} on the broker to mirror it" if reason == BROKER_SKIP_TOO_LARGE else ""
@@ -9002,7 +9040,11 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
     try:
         if releasing:
+            (dest / MIRROR_RELEASES_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
+        if clusters:
+            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
+            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).write_text("".join(f"{c}\n" for c in sorted(clusters)))
         for path, content in files.items():
             target = dest / Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)

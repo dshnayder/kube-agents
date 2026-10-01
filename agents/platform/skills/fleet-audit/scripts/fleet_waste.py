@@ -269,7 +269,7 @@ RELEASE_KEY_NAMESPACE = "namespace"
 # What `collect.broker_mirror` leaves in a content-mode mirror a file that could
 # hold a release was withheld from; `release_declarations` then answers nothing
 # rather than part.
-MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
+MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
 # Where a values override goes, per reconciler. Argo CD accepts both a YAML
 # string (`values`) and a structured block (`valuesObject`); this names the one
 # already in the file, and `valuesObject` when neither is, because a structured

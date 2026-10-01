@@ -16,7 +16,7 @@ import shlex
 import sys
 import textwrap
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -9659,6 +9659,9 @@ class _FakeBrokerWorkspace:
         self.greps = []
         self.grep_error = None
         self.grep_binary = set()
+        self.stall = set()
+        self.single_reads = []
+        self.read_error = None
 
     def open(self, endpoint, repo, depth=None):
         if self.fail_open:
@@ -9687,8 +9690,14 @@ class _FakeBrokerWorkspace:
     def read_many(self, paths):
         self.reads.append(list(paths))
         got, skipped = {}, []
+        exhausted = False
         for i, path in enumerate(paths):
-            if path in self.refuse:
+            # The broker defers a file over one request's budget, and every
+            # path after it, even when nothing was sent before it.
+            exhausted = exhausted or path in self.stall
+            if exhausted:
+                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
+            elif path in self.refuse:
                 skipped.append({"path": path, "reason": self.refuse[path]})
             elif self.budget is not None and i >= self.budget:
                 skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
@@ -9696,6 +9705,12 @@ class _FakeBrokerWorkspace:
                 got[path] = self.files[path]
         got.update(self.extra)
         return got, skipped
+
+    def read(self, path):
+        self.single_reads.append(path)
+        if self.read_error:
+            raise self.read_error
+        return self.files[path]
 
     def grep(self, pattern, prefix=None, regex=False, ignore_case=False):
         self.greps.append((pattern, prefix, regex))
@@ -9788,6 +9803,37 @@ class TestBrokerMirror(unittest.TestCase):
             [pattern for pattern, _prefix, _regex in broker.greps],
             [collect.RELEASE_DECLARING_PATTERN, collect.ANY_LINE_PATTERN],
         )
+
+    def test_a_dropped_tree_names_its_cluster_to_the_namespace_index(self):
+        """With `clusters/other/` gone, an overlay elsewhere rendering into
+        `other` would answer where the sibling arm would have won."""
+        broker = _FakeBrokerWorkspace(
+            self.two_clusters(),
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+        )
+        releases = {
+            (cluster, collect.RELEASE_KEY_NAMESPACE, "payments"): {
+                "chart": f"overlays/{cluster}/payments",
+                "path": "apps/payments.yaml",
+            }
+            for cluster in ("other", "spot-capacity-test")
+        }
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+            directories = collect.namespace_directories(index, releases, Path(tmp))
+        self.assertNotIn(("other", "payments"), directories)
+        self.assertEqual(
+            directories[("spot-capacity-test", "payments")]["source"],
+            collect.NAMESPACE_DIRECTORY_OVERLAY,
+        )
+        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration or namespace_directory;")
+
+    def test_the_markers_live_where_no_repository_can_commit_them(self):
+        """A clone is walked as it stands, so a marker a repository could carry
+        would switch its indexes off with no WARNING saying why."""
+        for marker in (collect.MIRROR_RELEASES_WITHHELD_MARKER, collect.MIRROR_CLUSTERS_WITHHELD_MARKER):
+            self.assertEqual(PurePosixPath(marker).parts[0], collect.GIT_DIR_NAME)
 
     def test_a_large_file_git_will_not_search_withholds_the_release_index(self):
         """`git grep -I` answers "no match" for a file marked binary."""
@@ -9938,9 +9984,35 @@ class TestBrokerMirror(unittest.TestCase):
             (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": "other-org/apps"}))
             self.assertEqual(collect.broker_repo(scratch), self.REPO)
 
-    def test_a_broker_that_never_relents_abandons_the_mirror(self):
-        """Every path deferred as `requestBudget`, round after round: stop, do not spin."""
+    def test_a_file_over_one_requests_budget_is_read_alone(self):
+        """Above the request budget but under the per-file limit, a file stalls
+        every batch that starts with it; a single read has no request budget."""
+        broker = _FakeBrokerWorkspace(self.files(), page_size=10)
+        broker.stall = {"clusters/spot-capacity-test/workloads/fixture.yaml"}
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+        self.assertEqual(broker.single_reads, ["clusters/spot-capacity-test/workloads/fixture.yaml"])
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+
+    def test_batches_that_never_relent_end_in_single_reads(self):
         broker = _FakeBrokerWorkspace(self.files(), budget=0)
+        with TemporaryDirectory() as tmp:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+        self.assertEqual(len(broker.single_reads), len([p for p in self.files() if collect._mirrored(p)]))
+
+    def test_a_copy_run_near_the_root_imports_without_a_checkout(self):
+        """`parents[3]` does not exist for `/x/collect.py`."""
+        with patch.object(collect, "__file__", "/x/collect.py"), \
+                patch.object(collect, "PLATFORM_SCRIPT_DIRS", ()), \
+                patch.object(sys, "path", list(sys.path)):
+            self.assertIsNone(collect._import_platform_script("no_such_platform_script"))
+
+    def test_a_broker_that_never_relents_abandons_the_mirror(self):
+        """Every path deferred as `requestBudget`, round after round, and the
+        single read refused too: stop, do not spin."""
+        broker = _FakeBrokerWorkspace(self.files(), budget=0)
+        broker.read_error = RuntimeError("503")
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
             self.assertEqual(list(Path(tmp).iterdir()), [])
