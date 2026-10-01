@@ -1232,10 +1232,13 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
 - **Never hand-write a body, title, commit message, or timestamp.** They are generated so that the
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
-  directory. A path that is not on disk does not fail the run — that one finding degrades to
-  `manual`, keeps its evidence and recommendation, and says in the ledger that the fix was named but
-  not written. The report still publishes. Do not rely on this: a degraded finding is a fix a human
-  now has to apply by hand.
+  directory. For a finding the sweep would open, the first `finish` of the run exits 2 listing each
+  one whose file is missing, and each `manual` one whose candidate carries a `declaration`, with the
+  path to write: write them, set `kind: manifest` and `path`, and run `finish` again. Anything
+  still missing on that second call does not fail the run — that one finding degrades to `manual`,
+  keeps its evidence and recommendation, and says in the ledger that the fix was named but not
+  written. The report still publishes. Do not rely on this: a degraded finding is a fix a human now
+  has to apply by hand.
 - **Never publish a `gcloud` fix against a field a Config Connector declaration holds.** Write the
   declaration's file as a `manifest` instead. Where `finish` finds a `ContainerCluster` or
   `ContainerNodePool` whose `spec` carries the field the command's flag writes, in the GitOps repo

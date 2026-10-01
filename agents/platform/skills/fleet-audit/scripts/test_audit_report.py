@@ -3847,6 +3847,9 @@ class TestFinishClean(HarnessTestCase):
     def test_the_findings_branch_reports_the_declared_count_too(self):
         self.harness.replies = {"issue list": "[]"}
         self.record_run()
+        # Its finding's fix is unwritten; the once-per-run refusal is spent so
+        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
+        audit_report.mark_unwritten_refused(DECLARING_AUDIT)
         doc = searched_doc(findings=[make_finding(check="no-pdb")])
         doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
         self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
@@ -4637,6 +4640,9 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
         self.assertIn("scope.clusters", self.err)
         self.assertTrue(note.is_file())
+        # Its finding's fix is unwritten; the once-per-run refusal is spent so
+        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
+        audit_report.mark_unwritten_refused(AUDIT)
         self.harness.failures = {"issue create": 1}
         self.assertEqual(self.run_finish(make_doc()), 1, self.err)
         self.assertFalse(note.is_file())
@@ -4700,6 +4706,9 @@ class TestStart(HarnessTestCase):
         audit_report.release_in_flight(AUDIT)
         self.assertFalse(note.is_file())
         # And `finish` is what releases it on the happy path.
+        # Its finding's fix is unwritten; the once-per-run refusal is spent so
+        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
+        audit_report.mark_unwritten_refused(AUDIT)
         Path(audit_report.inflight_path_for(AUDIT)).write_text(
             json.dumps({"audit": AUDIT, "started_at": time.time()})
         )
@@ -15195,6 +15204,78 @@ class TestUncorroboratedFindings(BaseTestCase):
                     ),
                     set(),
                 )
+
+
+class TestUnwrittenSweepFixes(HarnessTestCase):
+    """`finish` refuses, once per run, a fix the sweep would open and nobody wrote."""
+
+    def manifest(self, check="no-pdb", severity="major", declaration="apps/a/deploy.yaml"):
+        candidate = {**_cand(check, "c1", "Deployment/a"), "severity": severity}
+        if declaration:
+            candidate["declaration"] = {"path": declaration, "directory": "apps/a"}
+        return {"clusters": [_ran("c1", check, candidates=[candidate])]}
+
+    def manual(self, severity="major", check="no-pdb"):
+        finding = _pub("a", check, "c1", "Deployment/a")
+        finding["severity"] = severity
+        finding["remediation"] = {"kind": "manual", "note": "Review and remediate."}
+        return finding
+
+    def unwritten(self, findings, manifest, promised=None, degraded=(), prs=None):
+        return audit_report.unwritten_sweep_fixes(
+            findings, manifest, promised or {}, list(degraded), prs or {}
+        )
+
+    def test_a_manual_fix_whose_declaration_the_collector_found_is_unwritten(self):
+        self.assertEqual(
+            self.unwritten([self.manual()], self.manifest()), {"a": "apps/a/deploy.yaml"}
+        )
+
+    def test_a_promised_file_the_degrade_caught_is_unwritten_at_the_path_promised(self):
+        finding = self.manual()
+        self.assertEqual(
+            self.unwritten([finding], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"]),
+            {"a": "apps/a/pdb.yaml"},
+        )
+
+    def test_a_manual_fix_with_no_declaration_is_the_workers_to_make(self):
+        self.assertEqual(self.unwritten([self.manual()], self.manifest(declaration="")), {})
+
+    def test_a_finding_the_sweep_would_not_open_is_not_refused(self):
+        # Under the floor, off the major list, or already carried by a live PR.
+        cases = {
+            "minor": ([self.manual(severity="minor")], self.manifest(severity="minor"), {}),
+            "unvouched major": (
+                [self.manual(check="cronjob-runs-overlap")],
+                self.manifest(check="cronjob-runs-overlap"),
+                {},
+            ),
+            "open pull request": (
+                [self.manual()],
+                self.manifest(),
+                {"a": {"state": "OPEN", "url": "https://github.com/acme/fleet/pull/7"}},
+            ),
+        }
+        for name, (findings, manifest, prs) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.unwritten(findings, manifest, prs=prs), {})
+
+    def test_the_first_finish_refuses_and_publishes_nothing_and_the_retry_publishes(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        # `make_doc`'s finding is critical and names a manifest nobody wrote.
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("have no fix written", self.err)
+        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "create"))
+        self.assertIn("published with a manual remediation instead", self.err)
+
+    def test_without_a_run_record_nothing_remembers_the_refusal_so_none_is_made(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("have no fix written", self.err)
 
 
 class TestTriageMarkedFindings(BaseTestCase):

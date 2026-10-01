@@ -1077,6 +1077,9 @@ RUN_RECORD_SOURCES_KEY = "sources"
 # finds last week's manifest at the same fixed path and publishes against it.
 # Comparing the manifest's `finished_at` with this is what makes that loud.
 RUN_RECORD_STARTED_KEY = "started_at"
+# Set by the first `finish` on a run that refused unwritten sweep fixes
+# (`unwritten_sweep_fixes`), so the retry publishes rather than refusing again.
+RUN_RECORD_UNWRITTEN_REFUSED_KEY = "unwritten_fixes_refused"
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -10931,6 +10934,37 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
+def mark_unwritten_refused(audit_id: str) -> bool:
+    """Note on the run record that `finish` refused unwritten fixes once.
+
+    False when there is no record to write to, and then the caller does not
+    refuse: a refusal nothing remembers would refuse every retry, and the
+    stream would publish nothing.
+    """
+    path = Path(run_record_path_for(audit_id))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return False
+    data[RUN_RECORD_UNWRITTEN_REFUSED_KEY] = True
+    try:
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def unwritten_already_refused(audit_id: str) -> bool:
+    """Whether this run's first `finish` already refused its unwritten fixes."""
+    try:
+        data = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get(RUN_RECORD_UNWRITTEN_REFUSED_KEY) is True
+
+
 def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     """The record `start` wrote for this stream, or None when there is none usable.
 
@@ -11078,6 +11112,63 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
         )
         degraded.append(fid)
     return degraded
+
+
+def unwritten_sweep_fixes(
+    findings: list[dict],
+    manifest: dict | None,
+    promised: dict[str, str],
+    degraded: list[str],
+    pr_by_finding: dict[str, dict | None],
+) -> dict[str, str]:
+    """Finding id to the file its fix belongs in, for each fix the sweep would
+    open if only it had been written.
+
+    Two shapes of the same shortcut. A `manifest` remediation whose file was
+    never written, which `degrade_missing_remediations` has already turned into
+    `manual` (`degraded`, with the path it named in `promised`). And a
+    `manual` remediation on a finding whose collector candidate carries a
+    `declaration`: the collector found the file and the worker did not use it.
+    At fleet scale a worker that meets a hundred candidates writes the same
+    boilerplate `manual` line for every one, and each is a finding the sweep
+    was built to fix that the ledger instead hands back to a person.
+
+    Only findings the sweep would open count, by the tests `promotion_candidates`
+    applies: graded at the floor that applies to them (`collector_vouched_findings`),
+    corroborated, not marked for triage, and with no live pull request already
+    carrying the fix.
+    """
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
+    vouched = collector_vouched_findings(findings, manifest)
+    excluded = uncorroborated_findings(findings, manifest) | set(triage_markers(findings, manifest))
+    declared_at = {
+        _candidate_identity(entry, candidate): str(
+            (candidate.get("declaration") or {}).get("path") or ""
+        )
+        for entry, candidate in _candidates(manifest)
+        if isinstance(candidate.get("declaration"), dict)
+    }
+    degraded_set = set(degraded)
+    unwritten: dict[str, str] = {}
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid in excluded:
+            continue
+        pr = pr_by_finding.get(fid) or {}
+        if str(pr.get("state", "") or "").upper() == "OPEN":
+            continue
+        rank = SEVERITY_RANK.get(str(finding.get("severity") or ""), len(SEVERITIES))
+        if rank > (floor_rank if fid in vouched else unvouched_rank):
+            continue
+        if fid in degraded_set and promised.get(fid):
+            unwritten[fid] = promised[fid]
+            continue
+        remediation = finding.get("remediation") or {}
+        declared = declared_at.get(derive_finding_id(finding), "")
+        if remediation.get("kind") == "manual" and declared:
+            unwritten[fid] = declared
+    return unwritten
 
 
 class KccDeclaration(NamedTuple):
@@ -12956,8 +13047,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     ensure_labels(repo, audit_id)
 
     # A fix the audit promised but did not write degrades that one finding to
-    # `manual`; it never suppresses the report.
-    for fid in degrade_missing_remediations(findings, root):
+    # `manual`; it never suppresses the report. What each promised is kept for
+    # `unwritten_sweep_fixes`, since the degrade blanks the path.
+    promised = {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
+    degraded = degrade_missing_remediations(findings, root)
+    for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
@@ -13215,6 +13313,27 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
+    # The last point before anything is published. A fix the sweep would open
+    # and the worker did not write is refused once, so the worker writes it and
+    # re-runs; the retry publishes whatever is still unwritten as `manual`,
+    # because one missing file must never suppress the stream.
+    if findings and not unwritten_already_refused(audit_id):
+        unwritten = unwritten_sweep_fixes(
+            findings,
+            manifest,
+            promised,
+            degraded,
+            reconcile_remediation_prs(audit_id, findings, remediation_prs)[0],
+        )
+        if unwritten and mark_unwritten_refused(audit_id):
+            listed = "; ".join(f"{fid} -> {path}" for fid, path in sorted(unwritten.items()))
+            raise ValidationError(
+                f"{len(unwritten)} finding(s) the sweep would open a pull request for "
+                "have no fix written. For each, write the complete manifest at the "
+                "path named, set the finding's remediation to `kind: manifest` with "
+                f"that `path`, and run `finish` again: {listed}. A second `finish` "
+                "on this run publishes any still unwritten as manual."
+            )
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
