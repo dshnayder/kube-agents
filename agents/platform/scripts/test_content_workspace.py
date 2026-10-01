@@ -1586,6 +1586,7 @@ class ReadVerbCeilingTest(unittest.TestCase):
         (tree / "manifests" / "1a.yaml").symlink_to(outside)
         (tree / "manifests" / "9.yaml").symlink_to(tree / "manifests" / "0.yaml")
         (tree / "linked-dir").symlink_to(tree / "manifests", target_is_directory=True)
+        (tree / "rel-dir").symlink_to("manifests", target_is_directory=True)
         (tree / "manifests" / "8.yaml").symlink_to(tree / "gone.yaml")
         with mock.patch.object(content_workspace, "max_entries", lambda: 2):
             pages, cursor = [], None
@@ -1605,7 +1606,7 @@ class ReadVerbCeilingTest(unittest.TestCase):
         # the walk does not enter a link to a directory, but names it once.
         self.assertFalse(any(p.startswith("linked-dir") for p in listed))
         self.assertEqual(
-            [{"path": "linked-dir", "target": str(tree / "manifests")}],
+            [{"path": "linked-dir", "target": ""}, {"path": "rel-dir", "target": "manifests"}],
             [link for page in pages for link in page["symlinkedDirectories"]],
         )
 

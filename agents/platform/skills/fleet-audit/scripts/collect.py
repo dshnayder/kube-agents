@@ -9001,7 +9001,21 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                     for link in getattr(listing, "symlinks", ())
                     if _mirrored(str(link))
                 )
-                directory_links.extend(getattr(listing, "symlinked_directories", ()))
+                for link in getattr(listing, "symlinked_directories", ()):
+                    path = str(link.get("path") or "") if isinstance(link, dict) else ""
+                    if _safe_relative(path) is None:
+                        log(
+                            f"WARNING: the broker listed the directory link {link!r} in {repo}, "
+                            "which is not a path inside the repository; no candidate will carry a declaration"
+                        )
+                        return False
+                    directory_links.append(link)
+                if len(directory_links) > MIRROR_MAX_FILES:
+                    log(
+                        f"WARNING: {repo} holds more directory links than the collector mirrors "
+                        f"({MIRROR_MAX_FILES}); no candidate will carry a declaration"
+                    )
+                    return False
                 for entry in listing:
                     path = str(entry.get("path") or "")
                     if not _mirrored(path):
@@ -9112,13 +9126,12 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         links: dict[str, Path] = {}
         unheld: dict[str, str] = {}
         for link in directory_links:
-            entry = link if isinstance(link, dict) else {}
-            path, target = str(entry.get("path") or ""), str(entry.get("target") or "")
-            if path and _cluster_tree(path) in clusters:
+            path, target = str(link["path"]), str(link.get("target") or "")
+            if _cluster_tree(path) in clusters:
                 continue
             made = _mirror_directory_link(dest, path, target) if path not in links else None
             if made is None:
-                unheld[path or repr(link)] = target
+                unheld[path] = target
             else:
                 links[path] = made
         unheld.update(_links_inside(dest, links))
@@ -9126,8 +9139,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
             # The overlay check resolves a path through the link in a clone,
             # and here it would find nothing.
             releasing.add(path)
+            named = repr(target) if target else "an absolute target, or none"
             log(
-                f"WARNING: the directory link {path} in {repo} names {target!r}, which "
+                f"WARNING: the directory link {path} in {repo} names {named}, which "
                 "the mirror cannot hold; no candidate will carry a release_declaration or namespace_directory"
             )
         if releasing:

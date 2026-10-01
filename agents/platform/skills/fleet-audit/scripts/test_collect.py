@@ -9992,6 +9992,24 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertEqual(linked, [])
                 self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
 
+    def test_a_directory_link_named_outside_the_repository_fails_the_mirror(self):
+        """The broker should never send such a name, as for a file entry."""
+        for link in ({"path": "../up", "target": "."}, {"path": ".git/x", "target": "."}, "bare"):
+            with self.subTest(link=link):
+                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=[link])
+                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+                self.assertIn("not a path inside the repository", err.getvalue())
+
+    def test_more_directory_links_than_the_cap_fails_the_mirror(self):
+        links = [{"path": f"links/{n}", "target": "."} for n in range(3)]
+        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err, patch.object(
+            collect, "MIRROR_MAX_FILES", 2
+        ):
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+        self.assertIn("more directory links than the collector mirrors", err.getvalue())
+
     def test_directory_links_together_cannot_reach_out_of_the_mirror(self):
         """Each link stays inside alone. In the first set `z` turns `a/f`, made
         before it, into a climb one above the mirror; in the second `a/f`

@@ -1258,8 +1258,9 @@ class ContentWorkspaceStore:
         range it sorts into. A clone's walk follows it, so a caller rebuilding
         the tree from entries alone would hold less than the clone and could
         not tell. A link to a directory is named in `symlinkedDirectories` the
-        same way, with the target it names: the walk here does not enter it,
-        and neither does a clone's, but a clone resolves a path through it.
+        same way, with the relative target it names ("" for an absolute one):
+        the walk here does not enter it, and neither does a clone's, but a
+        clone resolves a path through it.
         """
         with self._use(handle) as workspace:
             under = repo_relative(prefix).parts if prefix else ()
@@ -1283,7 +1284,13 @@ class ContentWorkspaceStore:
                     if path.is_file():
                         links.append(str(PurePosixPath(*parts)))
                     elif path.is_dir():
-                        directory_links[str(PurePosixPath(*parts))] = os.readlink(path)
+                        # An absolute target names this host's filesystem,
+                        # which no response carries; "" says only that it is
+                        # one, and no mirror can hold it either way.
+                        target = os.readlink(path)
+                        directory_links[str(PurePosixPath(*parts))] = (
+                            "" if os.path.isabs(target) else target
+                        )
                     continue
                 names.append(str(PurePosixPath(*parts)))
             # Sorted on the name this answers with rather than on the `Path`,
