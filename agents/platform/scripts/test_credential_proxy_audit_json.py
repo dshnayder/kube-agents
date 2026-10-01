@@ -299,6 +299,35 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
             ("blocked", "executable.allowlist", "git"),
         )
 
+    def _route_git(self):
+        # Put git back on the exec route to reach the gates behind the
+        # allowlist: they are what stands if it is ever admitted there again.
+        patcher = mock.patch.object(
+            credential_proxy, "EXEC_ROUTE_EXECUTABLES", (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_refused_git_argument(self):
+        self._route_git()
+        status, body = self.post(["git", "-c", "core.hooksPath=/x", "status"], request_id="req-g2")
+        self.assertEqual((403, "git.argument.refused"), (status, body["rule"]))
+        record = self._last_audit("req-g2")
+        self.assertEqual(
+            (record["status"], record["rule"], record["tool"]),
+            ("blocked", "git.argument.refused", "git"),
+        )
+
+    def test_a_refused_git_lease(self):
+        self._route_git()
+        status, body = self.post(["git", "commit", "-m", "x"], request_id="req-l1")
+        self.assertEqual((403, "git.workspace.lease"), (status, body["rule"]))
+        record = self._last_audit("req-l1")
+        self.assertEqual(
+            (record["status"], record["rule"], record["tool"], record["subcommand"]),
+            ("blocked", "git.workspace.lease", "git", "commit"),
+        )
+
     def test_a_rejected_request(self):
         request = urllib.request.Request(
             self.endpoint + "/v1/exec",
@@ -365,11 +394,22 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
         self.assertEqual(["started", "blocked"], statuses)
         self.assertEqual([], [r["message"] for r in self.records() if r["severity"] == "ERROR"])
 
+    def test_a_routed_git_request_with_a_cwd_no_path_can_hold(self):
+        # With git admitted, the NUL reaches the git gate's path resolution;
+        # it must still end as a rejection, never a fault.
+        self._route_git()
+        status = self._post_raw("req-n2", ["git", "status"], "/opt/data/\u0000")
+        self.assertEqual(400, status)
+        statuses = [a["status"] for a in self.audits() if a["request_id"] == "req-n2"]
+        self.assertEqual(["started", "rejected"], statuses)
+        self.assertEqual([], [r["message"] for r in self.records() if r["severity"] == "ERROR"])
+
     def test_a_git_request_with_a_cwd_the_broker_cannot_read(self):
         # Under a directory the broker may not stat, the gate's alias lookup
         # raises PermissionError on interpreters up to 3.12; on 3.13, or as
         # root, the lookup reads through and the lease refusal answers. Either
         # way: a response, a terminal record, no fault.
+        self._route_git()
         unreadable = Path(self.temp_dir.name) / "unreadable"
         unreadable.mkdir(mode=0o000)
         self.addCleanup(unreadable.chmod, 0o700)
