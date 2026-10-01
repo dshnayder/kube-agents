@@ -1275,8 +1275,9 @@ class ContentWorkspaceStore:
                 if under and parts[: len(under)] != under:
                     continue
                 if linked:
-                    # A link to a directory is not a file a clone's walk reads.
-                    if not path.is_dir():
+                    # Only a link that resolves to a file is one a clone's walk
+                    # reads: not a link to a directory, and not a dangling one.
+                    if path.is_file():
                         links.append(str(PurePosixPath(*parts)))
                     continue
                 names.append(str(PurePosixPath(*parts)))
