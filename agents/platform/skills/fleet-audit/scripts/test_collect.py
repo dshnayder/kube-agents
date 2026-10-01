@@ -7548,6 +7548,30 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("netpol-missing", slugs)
         self.assertIn("workload-identity-off", slugs)
 
+    def test_only_netpol_missing_is_marked_default_deny(self):
+        """Its fix writes a default-deny policy, which can cut off callers
+        nobody listed; the marker keeps the sweep from opening it unasked.
+        Every other check's candidates stay unmarked."""
+        privileged_pod = compliance_pod("bad")
+        privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        result = self.run_with(
+            workload_items=[privileged_pod],
+            netpol_items=[namespace("default")],
+            describe={"workloadIdentityConfig": {}},
+        )
+        marks = {c["check"]: c["needs_triage"] for c in result["candidates"]}
+        self.assertEqual(marks.pop("netpol-missing"), collect.NETPOL_DEFAULT_DENY_TRIAGE)
+        self.assertTrue(marks)
+        self.assertEqual(set(marks.values()), {None})
+
+    def test_the_default_deny_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift would mark the
+        finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(collect.NETPOL_DEFAULT_DENY_TRIAGE, "default-deny")
+        self.assertIn(collect.NETPOL_DEFAULT_DENY_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
     def test_a_gate_failure_on_one_source_fails_the_whole_cluster(self):
         def run(argv, **kwargs):
             if "get-credentials" in argv:

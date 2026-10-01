@@ -14626,9 +14626,39 @@ class TestTriageMarkedFindings(BaseTestCase):
         self.assertEqual(
             audit_report.triage_marked_findings(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")],
-                self.marked(marker="guaranteed-qos"),
+                self.marked(marker="model-only-cue"),
             ),
             set(),
+        )
+
+    def test_the_disruptive_fix_markers_are_the_sweeps(self):
+        """A stand-down to zero, a resize of a Guaranteed pod and a
+        default-deny NetworkPolicy each break something by construction once
+        the floor reaches `major`, so each is a gate marker, not a cue."""
+        for marker in ("scale-to-zero", "guaranteed-qos", "default-deny"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
+                self.assertEqual(
+                    audit_report.triage_marked_findings(
+                        [_pub("f1", "idle-workload", "c1", "Deployment/a")],
+                        self.marked(marker=marker),
+                    ),
+                    {"f1"},
+                )
+
+    def test_every_gate_marker_has_a_reason_to_print(self):
+        self.assertEqual(audit_report.NO_SWEEP_TRIAGE, frozenset(audit_report.TRIAGE_REASONS))
+        for marker, reason in audit_report.TRIAGE_REASONS.items():
+            with self.subTest(marker=marker):
+                self.assertTrue(reason.strip())
+
+    def test_triage_markers_names_the_marker_per_finding(self):
+        self.assertEqual(
+            audit_report.triage_markers(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")],
+                self.marked(marker="scale-to-zero"),
+            ),
+            {"f1": "scale-to-zero"},
         )
 
     def test_a_marked_candidate_on_another_object_does_not_reach_this_finding(self):
@@ -14717,12 +14747,52 @@ class TestTriageMarkedFindings(BaseTestCase):
         )
         self.assertIn("`fronted` — A stand-down", body)
         self.assertIn("its fix is what needs a decision", body)
+        # No reasons passed: the row carries no marker clause.
+        self.assertIn("- `fronted` — A stand-down\n", body + "\n")
         # The two blocks say opposite things about the collector, so the
         # `unbacked` sentence must not be the one covering `fronted`.
         self.assertLess(
             body.index("Read these before asking"),
             body.index("its fix is what needs a decision"),
         )
+
+
+class TestTriageReasonsInTheLedger(BaseTestCase):
+    """The withheld block names why the sweep passed over each marked fix."""
+
+    def test_each_row_carries_its_markers_reason(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                [],
+                [_titled("netpol", "No NetworkPolicy"), _titled("idle", "Idle web")],
+                needs_triage=["netpol", "idle"],
+                triage_reasons={"netpol": "default-deny", "idle": "scale-to-zero"},
+            )
+        )
+        self.assertIn(
+            "- `netpol` — No NetworkPolicy (`default-deny`: the fix makes the "
+            "namespace deny ingress by default)",
+            body,
+        )
+        self.assertIn(
+            "- `idle` — Idle web (`scale-to-zero`: the fix scales the controller "
+            "to zero replicas)",
+            body,
+        )
+
+    def test_the_issue_body_passes_the_reasons_through(self):
+        data = {
+            "audit": "compliance-audit",
+            "scope": {"clusters": []},
+            "findings": [_titled("netpol", "No NetworkPolicy")],
+        }
+        rendered = audit_report.render_issue_body(
+            data,
+            generated_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            needs_triage=["netpol"],
+            triage_reasons={"netpol": "default-deny"},
+        )
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", rendered.body)
 
 
 class TestScopedCoverage(unittest.TestCase):
@@ -17101,6 +17171,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("its fix is what needs a decision", body)
         self.assertNotIn("Read these before asking", body)
         self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
+
+    def test_a_default_deny_netpol_fix_is_withheld_with_its_reason(self):
+        """`netpol-missing` is the check the compliance collector marks
+        `default-deny`; the ledger row and the run log both say why."""
+        self.promotion_replies()
+        manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="default-deny")])
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", body)
+        self.assertIn("marked the fix `default-deny`", self.err)
+
+    def test_the_dry_run_names_the_reason_for_a_marked_fix(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="default-deny")])
+        rc = self.run_finish(make_doc(), ["--dry-run", "--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"{derived_id()} (default-deny)", self.err)
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", self.out)
 
     def test_the_dry_run_names_what_the_sweep_would_pass_over(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")

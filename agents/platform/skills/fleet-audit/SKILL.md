@@ -942,7 +942,9 @@ to put in a diff otherwise. Three paths lead there:
 - **Auto-promotion.** A finding graded `critical` or `major` that is a `manifest`, has no live
   pull request on its branch — and, on a run that passed `--manifest-file`, is neither
   uncorroborated nor triage-marked by the collector — is promoted automatically by `finish` —
-  **at most five per run**. The surplus is named in the ledger as awaiting `/remediate`, and so is
+  **at most five per run**. The collector marks a fix that scales a controller to zero, writes a
+  default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, or owes its
+  `major` to the Autopilot bump; the ledger names each with its marker and reason. The surplus is named in the ledger as awaiting `/remediate`, and so is
   every `minor` manifest finding, as below the floor, so nothing is silently dropped. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).

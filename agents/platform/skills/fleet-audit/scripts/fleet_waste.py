@@ -557,6 +557,19 @@ IDLE_SERVICE_TRIAGE = "service-fronted"
 # `IDLE_SERVICE_TRIAGE`: `NO_SWEEP_TRIAGE` names it, `/remediate` still opens it.
 AUTOPILOT_BUMP_TRIAGE = "autopilot-bumped"
 
+# The `needs_triage` marker on every §3.13 stand-down a Service does not
+# select (one it does carries `IDLE_SERVICE_TRIAGE`, the more specific
+# reason). The fix is `spec.replicas: 0`, and CPU and memory near zero for a
+# week is not evidence nothing needs the workload; at a `major` floor the
+# `Guaranteed` arm would otherwise open that pull request unread.
+IDLE_STANDDOWN_TRIAGE = "scale-to-zero"
+
+# The `needs_triage` marker on a §3.1 overrequest of a `Guaranteed` pod. The
+# SOP has the model publish it as `manual`, which the sweep never opens; the
+# marker is also in `NO_SWEEP_TRIAGE`, so a `manifest` written anyway stays
+# out of the sweep rather than resting on that instruction alone.
+GUARANTEED_QOS_TRIAGE = "guaranteed-qos"
+
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
 # quantity doing the harm: it is what the scheduler failed to book on the node,
@@ -5232,10 +5245,10 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
             emitted = emit("overrequest", hit)
             # `guaranteed-qos` wins over the bump marker: §3.1 has that
-            # finding published as `manual`, which the sweep never opens, and
-            # the model needs the marker to know to write it that way.
+            # finding published as `manual`, and the model needs the marker
+            # to know to write it that way. Both keep it out of the sweep.
             if hit.get("_guaranteed"):
-                emitted["needs_triage"] = "guaranteed-qos"
+                emitted["needs_triage"] = GUARANTEED_QOS_TRIAGE
             elif hit.get("_autopilot_bumped"):
                 emitted["needs_triage"] = AUTOPILOT_BUMP_TRIAGE
             candidates.append(emitted)
@@ -5277,15 +5290,18 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             # publishing "a workload nobody is calling" forever with the constant
             # above corrected.
             emitted["impact_authoritative"] = True
-            # The one shape of this finding whose pull request can take a
-            # serving system down, held out of the automatic sweep. Everything
-            # else here reclaims a reservation; a Service-backed stand-down
-            # removes the endpoints behind a name something may still be
-            # calling, and this check has no way to know whether anything is.
-            # `/remediate` still opens it, which is the point -- the judgement
-            # the collector cannot supply is a reader's to supply by name.
+            # Every stand-down is held out of the automatic sweep, under the
+            # more specific of two reasons. A Service-backed one removes the
+            # endpoints behind a name something may still be calling, and this
+            # check has no way to know whether anything is; any other one still
+            # takes the workload to zero on an idle reading
+            # (`IDLE_STANDDOWN_TRIAGE`). `/remediate` still opens either, which
+            # is the point -- the judgement the collector cannot supply is a
+            # reader's to supply by name.
             if hit.get("_selected_by"):
                 emitted["needs_triage"] = IDLE_SERVICE_TRIAGE
+            else:
+                emitted["needs_triage"] = IDLE_STANDDOWN_TRIAGE
             candidates.append(emitted)
     elif metrics_ok:
         missing, present = missing_dimension

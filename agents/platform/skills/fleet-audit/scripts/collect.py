@@ -11,10 +11,13 @@ twenty-three-check roster (§3.1–§3.23 of `governance/obtainability_audit_sop
 `compliance-audit`'s sixteen-check roster (§2.1–§2.16 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
-three SOPs define is mechanical — none needed a `needs_triage` judgment call,
-including ai-security's §3.4, whose severity forks on whether the same
-container also trips §3.2, a fact both checks compute from the same dump — so
-nothing was left on the SOP side to skip. Other streams have their own
+three SOPs define is mechanical — none needed a `needs_triage` judgment call
+to *find*, including ai-security's §3.4, whose severity forks on whether the
+same container also trips §3.2, a fact both checks compute from the same dump —
+so nothing was left on the SOP side to skip. One check's *fix* does need a
+reader: `netpol-missing`'s remedy is a default-deny NetworkPolicy, so its
+candidates carry the `default-deny` marker that keeps the automatic sweep from
+opening it (`NETPOL_DEFAULT_DENY_TRIAGE`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
@@ -48,8 +51,8 @@ What this file does for the checks it covers:
      and every candidate finding.
 
 The agent's job on a covered check shrinks to: run this script, read the
-manifest, and — because every check converted so far is fully mechanical,
-needing no `needs_triage` judgment — copy each candidate into `findings.json`
+manifest, and — because every check converted so far is fully mechanical —
+copy each candidate into `findings.json`
 with the recommendation prose the validator requires. Nothing here writes to
 a cluster; every subprocess this module runs is `gcloud`/`kubectl` read
 verbs, in the same register `command_policy.py` already allows an agent's
@@ -102,6 +105,15 @@ MAX_WORKERS = 8
 # "Config Connector is not installed on this cluster" about the one cluster in
 # the fleet that runs Config Connector, on the strength of its own timeout.
 TIMEOUT_RC = 124
+
+# The one judgement this collector hands the sweep (`audit_report.py`'s
+# `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
+# writes a default-deny NetworkPolicy, and a namespace that has been serving
+# traffic with no policy at all can lose callers nobody listed the moment it
+# lands. The finding is still mechanical; whether to cut that traffic off is
+# not, so the sweep withholds it and `/remediate <id>` opens it by name.
+NETPOL_MISSING_SLUG = "netpol-missing"
+NETPOL_DEFAULT_DENY_TRIAGE = "default-deny"
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -8235,7 +8247,7 @@ def collect_cluster(
             "severity": severity,
             "excerpt": excerpt,
             "impact": impact,
-            "needs_triage": None,
+            "needs_triage": NETPOL_DEFAULT_DENY_TRIAGE if spec.slug == NETPOL_MISSING_SLUG else None,
         }
         if arm_specific:
             emitted["impact_authoritative"] = True

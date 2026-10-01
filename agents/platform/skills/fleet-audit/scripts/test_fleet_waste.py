@@ -5192,6 +5192,38 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(fw.AUTOPILOT_BUMP_TRIAGE, "autopilot-bumped")
         self.assertIn(fw.AUTOPILOT_BUMP_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
         self.assertIn(fw.IDLE_SERVICE_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.IDLE_STANDDOWN_TRIAGE, "scale-to-zero")
+        self.assertIn(fw.IDLE_STANDDOWN_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.GUARANTEED_QOS_TRIAGE, "guaranteed-qos")
+        self.assertIn(fw.GUARANTEED_QOS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_a_stand_down_no_service_selects_is_marked_scale_to_zero(self):
+        """No Service means no `service-fronted` marker, but the fix still
+        takes the controller to zero on an idle reading, which is a judgement
+        the sweep must not make for a reader."""
+        idle = IdleWorkloadTest()
+        entry, _ = self.run_with(
+            dump_items=[idle.pod(), obj("Deployment", "hello-world", ns=idle.NS, **{"spec.replicas": 1})],
+            session=usage_session((idle.NS, idle.POD, 0.0021, 6.0)),
+        )
+        found = [c for c in entry["candidates"] if c["check"] == "idle-workload"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["needs_triage"], fw.IDLE_STANDDOWN_TRIAGE)
+
+    def test_a_guaranteed_overrequest_is_marked_guaranteed_qos(self):
+        """Wins over the bump marker on Autopilot, too: the model needs it to
+        publish the fix as `manual`, and both keep it out of the sweep."""
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi", cpu_lim="3", mem_lim="6Gi")
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                entry, _ = self.run_with(
+                    dump_items=[over],
+                    session=usage_session(("default", "api-1", 0.1, 100.0)),
+                    cluster={**self.CLUSTER, "autopilot": autopilot},
+                )
+                found = [c for c in entry["candidates"] if c["check"] == "overrequest"]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0]["needs_triage"], fw.GUARANTEED_QOS_TRIAGE)
 
     def test_every_outcome_publishes_the_mode(self):
         # The mode is a cluster property `enumerate_clusters` already resolved,

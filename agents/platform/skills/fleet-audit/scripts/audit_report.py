@@ -1198,7 +1198,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Three markers. A cost collector sets `service-fronted` on an idle
+# Six markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -1222,7 +1222,32 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # could never open a pull request. `AUTO_PROMOTION_FLOOR` at `major` would
 # break that premise for every unsized workload on an Autopilot cluster;
 # this keeps it.
-NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass", "autopilot-bumped"})
+#
+# The other three mark a fix that is disruptive by construction, whatever
+# the collector measured, now that the floor reaches `major`. The cost
+# collector sets `scale-to-zero` on every other §3.13 stand-down (a
+# Service-selected one keeps the more specific `service-fronted`): the fix is
+# `spec.replicas: 0`, and an idle reading is not proof nothing needs the
+# workload. It sets `guaranteed-qos` on a §3.1 resize of a `Guaranteed` pod,
+# whose request is its limit, so a number sized from an idle week becomes an
+# enforcement ceiling; the SOP has that finding published as `manual`, and the
+# marker keeps a `manifest` the model wrote anyway out of the sweep. The
+# compliance collector sets `default-deny` on every §2.6 finding: each arm's
+# fix leaves the namespace denying ingress by default, which drops every
+# connection no allow rule names until the team writes those rules.
+#
+# The text beside each marker is what the ledger prints after the finding's
+# title in the "fix needs a decision" block, so a reader sees why the sweep
+# passed over that one without opening it. Keep it a clause about the fix.
+TRIAGE_REASONS = {
+    "service-fronted": "stands down a controller a Service routes to",
+    "new-computeclass": "needs a new ComputeClass and a workload that selects it",
+    "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
+    "scale-to-zero": "scales the controller to zero replicas",
+    "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
+    "default-deny": "makes the namespace deny ingress by default",
+}
+NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
@@ -4804,6 +4829,17 @@ def triage_marked_findings(
     markers: frozenset[str] = NO_SWEEP_TRIAGE,
 ) -> set[str]:
     """Findings whose candidate carries a `needs_triage` marker in `markers`.
+    The ids of `triage_markers`, for the callers that only gate on them.
+    """
+    return set(triage_markers(findings, manifest, markers))
+
+
+def triage_markers(
+    findings: list[dict],
+    manifest: dict | None,
+    markers: frozenset[str] = NO_SWEEP_TRIAGE,
+) -> dict[str, str]:
+    """Finding id to the `needs_triage` marker in `markers` its candidate carries.
 
     The one thing that stops the sweep without being a doubt about the
     finding. `uncorroborated_findings` catches a finding the collector
@@ -4817,12 +4853,12 @@ def triage_marked_findings(
     Which also means this is silent on a stream that ran without a collector.
     """
     marked = {
-        _candidate_identity(entry, candidate)
+        _candidate_identity(entry, candidate): str(candidate.get("needs_triage") or "")
         for entry, candidate in _candidates(manifest)
         if str(candidate.get("needs_triage") or "") in markers
     }
     return {
-        str(finding.get("id") or "")
+        str(finding.get("id") or ""): marked[derive_finding_id(finding)]
         for finding in findings
         if derive_finding_id(finding) in marked
     }
@@ -8193,6 +8229,7 @@ def _render_withheld(
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
     below_floor: list[str] | None = None,
+    triage_reasons: dict[str, str] | None = None,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
@@ -8210,6 +8247,8 @@ def _render_withheld(
     finding it flagged and marked `needs_triage` is the opposite case: the
     observation is sound and the *fix* is what nobody has judged. See
     `NO_SWEEP_TRIAGE` for the markers, and the three findings that cost.
+    `triage_reasons` (finding id to marker, from `triage_markers`) gives each
+    row of that block the clause `TRIAGE_REASONS` holds for its marker.
     """
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
@@ -8218,11 +8257,17 @@ def _render_withheld(
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
 
-    def rows(ids: list[str]) -> list[str]:
-        return [
-            f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
-            for fid in ids
-        ]
+    reasons = triage_reasons or {}
+
+    def rows(ids: list[str], why: dict[str, str] | None = None) -> list[str]:
+        out = []
+        for fid in ids:
+            row = f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
+            marker = (why or {}).get(fid, "")
+            if marker:
+                row += f" (`{marker}`: the fix {TRIAGE_REASONS.get(marker, 'needs a decision')})"
+            out.append(row)
+        return out
 
     out = ["", "## Awaiting `/remediate`"]
     if withheld:
@@ -8260,7 +8305,7 @@ def _render_withheld(
             "for each one, is in the finding's own evidence and recommendation. "
             "`/remediate <finding-id>` opens them normally:",
             "",
-            *rows(triaged),
+            *rows(triaged, reasons),
         ]
     if floor:
         out += [
@@ -8473,6 +8518,7 @@ def render_issue_body(
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
     below_floor: list[str] | None = None,
+    triage_reasons: dict[str, str] | None = None,
     held: list[dict] | None = None,
     held_overflow: int = 0,
     held_preview: bool = False,
@@ -8522,6 +8568,7 @@ def render_issue_body(
         uncorroborated=list(uncorroborated or []),
         needs_triage=list(needs_triage or []),
         below_floor=list(below_floor or []),
+        triage_reasons=triage_reasons,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -11693,11 +11740,12 @@ def _handle_finish_dry_run(
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
+    triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
         findings,
         {},
         uncorroborated=uncorroborated_findings(findings, manifest),
-        triage_marked=triage_marked_findings(findings, manifest),
+        triage_marked=set(triage_reasons),
     )
 
     # Groups over the whole finding set, filtered to those holding a promoted
@@ -11732,7 +11780,8 @@ def _handle_finish_dry_run(
     if plan.needs_triage:
         log(
             "THE COLLECTOR MARKED THESE FIXES AS NEEDING A READER'S JUDGEMENT "
-            f"({len(plan.needs_triage)}): {', '.join(plan.needs_triage)}"
+            f"({len(plan.needs_triage)}): "
+            + ", ".join(f"{fid} ({triage_reasons.get(fid, '?')})" for fid in plan.needs_triage)
         )
     if plan.below_floor:
         log(
@@ -11747,6 +11796,7 @@ def _handle_finish_dry_run(
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
+        triage_reasons=triage_reasons,
         held=preview_held,
         held_preview=True,
         states=states,
@@ -12962,13 +13012,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         collector_held=held_ids,
         collector_flagged=candidate_only,
     )
+    triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
         findings,
         pr_by_finding,
         requests.targets,
         requested_at=requests.requested_at,
         uncorroborated=uncorroborated_findings(findings, manifest),
-        triage_marked=triage_marked_findings(findings, manifest),
+        triage_marked=set(triage_reasons),
     )
     for fid in plan.uncorroborated:
         log(
@@ -12979,7 +13030,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
-            "the fix as needing a judgement it could not make, so the sweep will "
+            f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
             f"not open a pull request on it. Comment `/remediate {fid}` once you "
             "have decided."
         )
@@ -13006,6 +13057,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
+        triage_reasons=triage_reasons,
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
@@ -13174,6 +13226,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 uncorroborated=plan.uncorroborated,
                 needs_triage=plan.needs_triage,
                 below_floor=plan.below_floor,
+                triage_reasons=triage_reasons,
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
