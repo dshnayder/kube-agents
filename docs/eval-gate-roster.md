@@ -188,7 +188,7 @@ they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
 it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
 repetitions, and says which; `pull_request_opened`'s `accepts_stream_pull_request` is a
-fourth answer, accepting the sibling's pull request when the reply names it. The roster edit (step 4, an eval-crew approval) takes
+fourth answer, accepting the sibling's pull request on the audit's remediation branch when the reply names it. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
 beside fleet-audits.
 
