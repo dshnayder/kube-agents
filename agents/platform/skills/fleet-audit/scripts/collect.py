@@ -180,7 +180,8 @@ MIRROR_BATCH_PATHS = 100
 MIRROR_BATCH_BYTES = 6 << 20
 # Bounds on one repository, so a repository nobody sized cannot fill the
 # sandbox's disk. Hitting either abandons the mirror rather than indexing part
-# of the tree: see `broker_mirror` for why a partial index is worse than none.
+# of the tree: a capped listing cannot say which regions it missed, and
+# `broker_mirror` says why a partial region is worse than none.
 MIRROR_MAX_FILES = 5000
 MIRROR_MAX_BYTES = 64 << 20
 # `Workspace.read_many`'s "ask again for the rest" reason.
@@ -194,7 +195,8 @@ BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK
 # Left in a mirror some file was withheld from. `release_declarations` reads
 # Argo CD Applications from anywhere in the tree, for any destination, so a
 # missing file can hide a release for every cluster; the marker makes that
-# index answer nothing rather than part. Not YAML, so no index opens it.
+# index, and `namespace_directories` which leans on it, answer nothing rather
+# than part. Not YAML, so no index opens it.
 MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
 
 # `release_declarations` indexes the objects that render a workload a GitOps
@@ -7809,7 +7811,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     `declaration_for` refuses. A fleet installing charts through an
     ApplicationSet keeps the `manual` verdict it has today.
 
-    Returns `{}` when PyYAML is absent or the clone is unreadable, which is the
+    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
+    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER, which is the
     behaviour that shipped before this existed.
     """
     if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
@@ -8028,9 +8031,6 @@ def _projects_restrict_namespaces(root: Path | None) -> bool:
     """
     if root is None:
         return False
-    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
-        # A file the mirror could not hold may be the restrictive project.
-        return True
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
     except ImportError:
@@ -8176,7 +8176,15 @@ def namespace_directories(
     `declaration_for` refuses, and is refused here for the same reason: naming
     one would name the wrong one about half the time. Absent means unresolved,
     never "nowhere" — the SOP's grep is still the answer then.
+
+    Nothing resolves from a mirror carrying MIRROR_RELEASES_WITHHELD_MARKER.
+    Every arm leans on what that marker withholds: `_kustomize_roots` reads the
+    release index, and without it a directory inside an overlay reads as a
+    plain `sibling`, which is the never-rendering pull request above; and the
+    missing file may be the AppProject that withdraws the `cluster` arm.
     """
+    if root is not None and (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        return {}
     resolved: dict[tuple[str, str], dict] = {}
     directories: dict[tuple[str, str], set[str]] = {}
     per_cluster: dict[str, set[str]] = {}
@@ -8807,8 +8815,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     file under `clusters/<c>/` drops that cluster's whole tree from the
     mirror, because `workload_declarations` keys by that path. Any withheld
     file, wherever it sits, leaves MIRROR_RELEASES_WITHHELD_MARKER, because an
-    Argo CD Application can live anywhere and target any cluster. The other
-    clusters keep their declarations, and each withheld region is logged.
+    Argo CD Application can live anywhere and target any cluster: no candidate
+    then carries `release_declaration` or `namespace_directory`. The other
+    clusters keep their `declaration`, and each withheld file is logged.
     """
     if open_workspace is None:
         client = _import_platform_script("credential_proxy_client")
@@ -8904,7 +8913,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         log(
             f"WARNING: the broker will not send {path} from {repo} ({reason}); "
             + (f"no candidate on cluster {region} will carry a declaration, and " if region else "")
-            + "no candidate will carry a release_declaration"
+            + "no candidate will carry a release_declaration or namespace_directory"
         )
     files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
     try:
@@ -8931,8 +8940,8 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
     repository's YAML is mirrored into a private directory for the duration,
     and None -- nothing indexed -- when the mirror fails: the scratch
     workspace itself is never walked, because after an `audit_report.py
-    fetch` it holds part of the tree, which `broker_mirror` says is worse than
-    none. `fleet_waste.py` uses this too, so the two collectors cannot
+    fetch` it holds an arbitrary part of the tree, and `broker_mirror` says
+    why a partial region is worse than none. `fleet_waste.py` uses this too, so the two collectors cannot
     disagree about which tree they read.
     """
     repo = broker_repo(workspace) if workspace is not None else None

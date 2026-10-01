@@ -4673,7 +4673,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     which holds the full reasoning, the three key shapes, and why `ApplicationSet`
     is deliberately not indexed.
 
-    Returns `{}` when PyYAML is absent or the clone is unreadable.
+    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
+    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER.
     """
     if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
         return {}

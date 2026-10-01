@@ -891,7 +891,8 @@ class Listing(list):
     A plain list, so every existing caller keeps working, carrying the two
     fields that say whether it is the whole answer. A listing that stops at the
     broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw.
+    for a path it inferred rather than one it saw. `symlinks` names the files
+    in the page's range that `read` refuses and so are never entries.
     """
 
     def __init__(
@@ -1022,7 +1023,9 @@ class Workspace:
         """One page of tracked names. `after` is the last path of the page before.
 
         `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false.
+        a caller pages until `truncated` is false. `symlinks` on the result
+        names the symlinked files the page's range holds, each once across the
+        pages; a caller rebuilding the tree needs them to know what it lacks.
         """
         payload = {"handle": self.handle}
         if prefix:

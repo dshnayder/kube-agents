@@ -9765,7 +9765,7 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertTrue(withheld)
         self.assertEqual(releases, {})
 
-    def test_a_withheld_file_outside_the_cluster_trees_withholds_only_releases(self):
+    def test_a_withheld_file_outside_the_cluster_trees_keeps_every_declaration(self):
         broker = _FakeBrokerWorkspace(
             self.two_clusters(),
             refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE},
@@ -9773,11 +9773,14 @@ class TestBrokerMirror(unittest.TestCase):
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
             index = collect.workload_declarations(Path(tmp))
-            restricted = collect._projects_restrict_namespaces(Path(tmp))
+            directories = collect.namespace_directories(
+                index, collect.release_declarations(Path(tmp)), Path(tmp)
+            )
         self.assertRegex(err.getvalue(), r"provisioning/cluster.yml from .* \(tooLarge\); no candidate will carry a release_declaration")
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
-        # The withheld file may be the AppProject that restricts namespaces.
-        self.assertTrue(restricted)
+        # Without the release index a directory inside an overlay would read as
+        # a plain sibling, and the withheld file may be a restrictive AppProject.
+        self.assertEqual(directories, {})
 
     def test_a_listed_symlink_withholds_its_cluster(self):
         """`read` refuses a symlink, so `list` names it apart; a clone's walk
