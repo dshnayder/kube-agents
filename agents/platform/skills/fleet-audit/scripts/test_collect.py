@@ -9640,7 +9640,8 @@ class _FakeBrokerWorkspace:
     `refuse` maps a path to the reason the broker will never send it; `symlinks`
     are names the listing reports apart from its entries, all on the first page.
     `grep` searches `files`, refused or not, as the broker searches its checkout;
-    `grep_error` makes it raise instead.
+    `grep_error` makes it raise instead, and a path in `grep_binary` matches
+    nothing, as `git grep -I` answers for a file git treats as binary.
     """
 
     def __init__(
@@ -9657,6 +9658,7 @@ class _FakeBrokerWorkspace:
         self.extra = {}
         self.greps = []
         self.grep_error = None
+        self.grep_binary = set()
 
     def open(self, endpoint, repo, depth=None):
         if self.fail_open:
@@ -9703,7 +9705,7 @@ class _FakeBrokerWorkspace:
         matches = [
             {"path": path, "line": number, "text": line}
             for path, content in sorted(self.files.items())
-            if prefix is None or path == prefix
+            if (prefix is None or path == prefix) and path not in self.grep_binary
             for number, line in enumerate(content.decode().splitlines(), 1)
             if expression.search(line)
         ]
@@ -9783,9 +9785,33 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
         self.assertFalse(withheld)
         self.assertEqual(
-            broker.greps,
-            [(collect.RELEASE_DECLARING_PATTERN, "clusters/other/apps/vendored.yaml", True)],
+            [pattern for pattern, _prefix, _regex in broker.greps],
+            [collect.RELEASE_DECLARING_PATTERN, collect.ANY_LINE_PATTERN],
         )
+
+    def test_a_large_file_git_will_not_search_withholds_the_release_index(self):
+        """`git grep -I` answers "no match" for a file marked binary."""
+        broker = _FakeBrokerWorkspace(
+            self.two_clusters(),
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+        )
+        broker.grep_binary = {"clusters/other/apps/vendored.yaml"}
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+
+    def test_a_release_in_the_dropped_tree_withholds_the_release_index(self):
+        """The withheld file names no release, but its cluster's tree goes with
+        it, and that tree held a hub's Application for another cluster."""
+        files = self.two_clusters()
+        files["clusters/other/apps/spoke.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
+        broker = _FakeBrokerWorkspace(
+            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+        self.assertRegex(err.getvalue(), r"vendored.yaml from .* no candidate will carry a release_declaration")
 
     def test_a_large_file_naming_a_release_kind_withholds_the_release_index(self):
         """An Application can live in any file and target any cluster."""

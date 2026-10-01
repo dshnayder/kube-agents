@@ -284,6 +284,11 @@ RELEASE_DECLARING_PATTERN = "|".join(
         ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
     ]
 )
+# Matches any line of text. The broker's `git grep -I` skips a file git
+# treats as binary (a `binary` or `-diff` attribute) and answers "no match",
+# so a file that matches no release kind is searched for this too: no line at
+# all means the search never read it.
+ANY_LINE_PATTERN = "."
 # The broker's per-file limit, named in the WARNING for a `tooLarge` file so
 # whoever reads it knows which knob returns the file to the mirror.
 BROKER_MAX_FILE_BYTES_ENV = "CREDENTIAL_PROXY_WORKSPACE_MAX_FILE_BYTES"
@@ -8801,9 +8806,23 @@ def _may_declare_release(workspace, path: str) -> bool:
     if not isinstance(found, dict):
         return True
     try:
-        return int(found.get("total", 1)) > 0
-    except (TypeError, ValueError):
+        if int(found.get("total", 1)) > 0:
+            return True
+        probe = workspace.grep(ANY_LINE_PATTERN, prefix=path, regex=True)
+        return not isinstance(probe, dict) or int(probe.get("total", 0)) == 0
+    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
         return True
+
+
+def _sent_file_declares_release(path: str, content: bytes) -> bool:
+    """`_may_declare_release` for a file the broker did send.
+
+    A withheld file under `clusters/<c>/` drops that whole tree from the mirror,
+    and the dropped files the broker sent may hold an Application for another
+    cluster, an AppProject, or a Kustomization an Application renders."""
+    if Path(path).name in KUSTOMIZATION_FILE_NAMES:
+        return True
+    return re.search(RELEASE_DECLARING_PATTERN.encode(), content) is not None
 
 
 def _batches(
@@ -8858,8 +8877,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     anywhere and target any cluster: no candidate then carries
     `release_declaration` or `namespace_directory`. A symlink and a
     Kustomization file always could; a `tooLarge` file could unless the
-    broker's search finds none of the kinds the release index reads in it
-    (`_may_declare_release`). The other clusters keep their `declaration`, and
+    broker's search reads it and finds none of the kinds the release index
+    reads (`_may_declare_release`), and the rest of its cluster's tree, which
+    goes with it, holds none either. The other clusters keep their `declaration`, and
     each withheld file is logged with what it cost.
     """
     if open_workspace is None:
@@ -8958,6 +8978,14 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
         return False
     clusters = {_cluster_tree(path) for path in withheld} - {None}
+    # A cluster's tree goes with the file withheld from it, so whatever release
+    # the rest of that tree held is lost too, and the file is charged for it.
+    releasing_trees = {
+        _cluster_tree(path)
+        for path, content in files.items()
+        if _cluster_tree(path) in clusters and _sent_file_declares_release(path, content)
+    }
+    releasing |= {path for path in withheld if _cluster_tree(path) in releasing_trees}
     for path, reason in sorted(withheld.items()):
         region = _cluster_tree(path)
         costs = []
