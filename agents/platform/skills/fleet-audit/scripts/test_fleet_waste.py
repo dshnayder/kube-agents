@@ -7791,5 +7791,53 @@ class RefusedProjectIdTest(unittest.TestCase):
                 self.assertEqual(fw.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
 
+
+class ContentModeWorkspaceTest(unittest.TestCase):
+    """In content mode `--workspace` is an empty scratch directory; the repository is in the broker.
+
+    `fleet_waste.py` borrows `collect.py`'s mirror rather than walking the
+    empty directory, so the cost stream's candidates carry `declaration` there
+    as the other streams' do.
+    """
+
+    def test_main_indexes_the_broker_mirror_not_the_scratch_directory(self):
+        import collect
+
+        seen = {}
+
+        def fake_collect_fleet(project, workspace=None):
+            seen["workspace"] = workspace
+            seen["files"] = sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*.yaml"))
+            return {"clusters": []}
+
+        def fake_mirror(repo, dest):
+            seen["repo"] = repo
+            (dest / "clusters" / "a").mkdir(parents=True)
+            (dest / "clusters" / "a" / "w.yaml").write_text("kind: Deployment\n")
+            return True
+
+        with TemporaryDirectory() as tmp:
+            scratch = Path(tmp) / "scratch"
+            scratch.mkdir()
+            with patch.object(fw, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(collect, "broker_repo", return_value="example-org/infra"), \
+                    patch.object(collect, "broker_mirror", side_effect=fake_mirror), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(scratch)])
+            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
+        self.assertEqual(seen["repo"], "example-org/infra")
+        self.assertNotEqual(seen["workspace"], scratch)
+        self.assertEqual(seen["files"], ["clusters/a/w.yaml"])
+
+    def test_a_clone_is_walked_directly(self):
+        seen = {}
+        with TemporaryDirectory() as tmp:
+            clone = Path(tmp)
+            (clone / fw.GIT_DIR_NAME).mkdir()
+            with patch.object(fw, "collect_fleet", side_effect=lambda p, workspace=None: seen.update(w=workspace) or {"clusters": []}), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(clone)])
+        self.assertEqual(seen["w"], clone)
+
 if __name__ == "__main__":
     unittest.main()

@@ -8672,10 +8672,19 @@ def broker_repo(workspace: Path) -> str | None:
         return None
     gitops_workspace = _import_platform_script("gitops_workspace")
     if gitops_workspace is None:
+        log(
+            f"WARNING: {workspace} is not a clone and the lease helper is not importable; "
+            "no candidate will carry a declaration"
+        )
         return None
     holder = gitops_workspace.lease_holder(workspace)
     record = gitops_workspace.read_lease(holder) if holder is not None else None
     repo = str((record or {}).get("repo") or "").strip()
+    if not repo:
+        log(
+            f"WARNING: {workspace} is not a clone and no lease marker above it names a "
+            "repository; no candidate will carry a declaration"
+        )
     return repo or None
 
 
@@ -8702,6 +8711,24 @@ def _safe_relative(path: str) -> Path | None:
     return relative
 
 
+def _batches(wanted: list[tuple[str, int]]) -> list[list[str]]:
+    """Split `(path, size)` pairs under both per-request batch limits."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for path, size in wanted:
+        if current and (
+            len(current) >= MIRROR_BATCH_PATHS or current_bytes + size > MIRROR_BATCH_BYTES
+        ):
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(path)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
 def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None) -> bool:
     """Copy `repo`'s YAML out of the credential broker into `dest`.
 
@@ -8710,8 +8737,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     content-mode run hands them an empty scratch directory and no candidate
     carries `declaration` or `namespace_directory`, so the model falls back to
     its own search and a fix the collector could have placed becomes
-    `kind: manual`. `audit_report.kcc_declarations_via_broker` is the same
-    move for Config Connector resources at `finish`.
+    `kind: manual`.
 
     `dest` is a private temporary directory, never the remediation workspace:
     `finish` publishes every file in that, and a mirrored manifest written there
@@ -8732,12 +8758,13 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         open_workspace = client.Workspace.open
     endpoint = os.environ.get(CREDENTIAL_PROXY_URL_ENV, "").strip()
     if not endpoint:
+        log(f"WARNING: {CREDENTIAL_PROXY_URL_ENV} is unset, so {repo} cannot be read; no candidate will carry a declaration")
         return False
     files: dict[str, bytes] = {}
     total_bytes = 0
     try:
         with open_workspace(endpoint, repo, depth=1) as workspace:
-            wanted: list[str] = []
+            wanted: list[tuple[str, int]] = []
             cursor: str | None = None
             while True:
                 listing = workspace.list(after=cursor)
@@ -8745,8 +8772,15 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                     path = str(entry.get("path") or "")
                     if not _mirrored(path):
                         continue
-                    total_bytes += int(entry.get("size", 0) or 0)
-                    wanted.append(path)
+                    if _safe_relative(path) is None:
+                        log(
+                            f"WARNING: the broker listed {path!r} in {repo}, which is not a path "
+                            "inside the repository; no candidate will carry a declaration"
+                        )
+                        return False
+                    size = int(entry.get("size", 0) or 0)
+                    total_bytes += size
+                    wanted.append((path, size))
                     if len(wanted) > MIRROR_MAX_FILES or total_bytes > MIRROR_MAX_BYTES:
                         log(
                             f"WARNING: {repo} holds more YAML than the collector mirrors "
@@ -8757,8 +8791,8 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                 if not listing or not listing.truncated:
                     break
                 cursor = str(listing[-1].get("path") or "")
-            for start in range(0, len(wanted), MIRROR_BATCH_PATHS):
-                pending = wanted[start : start + MIRROR_BATCH_PATHS]
+            for batch in _batches(wanted):
+                pending = batch
                 # `requestBudget` means ask again for the rest; stop when a
                 # round returns nothing, so a broker that never relents cannot
                 # spin this.
@@ -8777,16 +8811,17 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
         log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
         return False
-    written = 0
+    # Listed names were checked above; this catches a name `read_many`
+    # returned that the listing did not, before anything is written.
+    unsafe = sorted(path for path in files if _safe_relative(path) is None)
+    if unsafe:
+        log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
+        return False
     for path, content in files.items():
-        relative = _safe_relative(path)
-        if relative is None:
-            continue
-        target = dest / relative
+        target = dest / Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-        written += 1
-    log(f"mirrored {written} YAML file(s) of {repo} from the broker")
+    log(f"mirrored {len(files)} YAML file(s) of {repo} from the broker")
     return True
 
 
@@ -8803,9 +8838,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workspace",
         help=(
-            "the GitOps clone `audit_report.py start` made, so each candidate "
-            "carries where the repository declares its object; omit and no "
-            "candidate is annotated"
+            "the GitOps workspace `audit_report.py start` made -- a clone, or in "
+            "content mode the scratch directory, whose repository is then read "
+            "through the broker -- so each candidate carries where the "
+            "repository declares its object; omit and no candidate is annotated"
         ),
     )
     args = parser.parse_args(argv)

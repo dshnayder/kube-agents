@@ -9746,15 +9746,22 @@ class TestBrokerMirror(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
 
-    def test_a_name_outside_the_tree_is_not_written(self):
-        files = {"../escape.yaml": b"kind: X\n", ".git/config.yaml": b"kind: X\n", **self.files()}
-        broker = _FakeBrokerWorkspace(files)
-        with TemporaryDirectory() as tmp:
-            mirror = Path(tmp) / "mirror"
-            mirror.mkdir()
-            self.assertTrue(collect.broker_mirror(self.REPO, mirror, broker.open))
-            self.assertFalse((Path(tmp) / "escape.yaml").exists())
-            self.assertFalse((mirror / ".git").exists())
+    def test_a_name_outside_the_tree_abandons_the_mirror(self):
+        for name in ("../escape.yaml", ".git/config.yaml"):
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                broker = _FakeBrokerWorkspace({name: b"kind: X\n", **self.files()})
+                mirror = Path(tmp) / "mirror"
+                mirror.mkdir()
+                self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
+                self.assertFalse((Path(tmp) / "escape.yaml").exists())
+                self.assertEqual(list(mirror.iterdir()), [])
+
+    def test_reads_are_batched_under_the_byte_limit(self):
+        batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
+        self.assertEqual(len(batches), 1)
+        with patch.object(collect, "MIRROR_BATCH_BYTES", 8):
+            batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
+        self.assertEqual(batches, [["a.yaml", "b.yaml"], ["c.yaml"]])
 
     def test_the_repository_comes_from_the_lease_marker(self):
         with TemporaryDirectory() as tmp:

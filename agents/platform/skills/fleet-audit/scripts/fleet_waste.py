@@ -6429,7 +6429,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workspace",
         help=(
-            "the GitOps clone `audit_report.py start` made, so each candidate "
+            "the GitOps workspace `audit_report.py start` made -- a clone, or in "
+            "content mode the scratch directory, whose repository is then read "
+            "through the broker -- so each candidate "
             "carries where the repository declares its object -- or, for a "
             "workload a chart renders, where it declares that chart release; "
             "omit and no candidate is annotated"
@@ -6447,7 +6449,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         workspace = None
-    manifest = collect_fleet(args.project, workspace=workspace)
+    if workspace is None or (workspace / GIT_DIR_NAME).exists():
+        manifest = collect_fleet(args.project, workspace=workspace)
+    else:
+        # Content mode: no clone, so the repository is read through the broker
+        # into a private directory, exactly as `collect.py` does. Imported here
+        # rather than at the top so a directory-mode run stays standalone.
+        import tempfile  # noqa: PLC0415
+
+        import collect  # noqa: PLC0415
+
+        repo = collect.broker_repo(workspace)
+        if repo is None:
+            manifest = collect_fleet(args.project, workspace=workspace)
+        else:
+            with tempfile.TemporaryDirectory(prefix=collect.MIRROR_DIR_PREFIX) as mirror:
+                collect.broker_mirror(repo, Path(mirror))
+                manifest = collect_fleet(args.project, workspace=Path(mirror))
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 
