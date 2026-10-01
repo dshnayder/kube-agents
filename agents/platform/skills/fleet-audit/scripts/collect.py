@@ -167,6 +167,9 @@ PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 PLATFORM_SCRIPT_DIR_DEPTH = 3
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
+# What `broker_repo` returns for a content-mode workspace it cannot resolve to a
+# repository: distinct from None, which means "not content mode, walk it".
+UNRESOLVED_REPO = ""
 MIRROR_DIR_PREFIX = "collect-gitops-mirror-"
 # The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
 # extension-less spelling Kustomize also accepts.
@@ -8646,9 +8649,9 @@ def collect_fleet(
 def _import_platform_script(name: str):
     """Import one of the platform scripts the broker path needs, or None.
 
-    Lazy, and only on the content-mode path: this module otherwise runs
-    standalone (the module docstring), and a directory-mode run must not start
-    depending on the platform scripts being importable.
+    Lazy, and only on the content-mode path: a directory-mode run needs
+    nothing outside this skill's own scripts, and must not start depending on
+    the platform scripts being importable.
     """
     import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
 
@@ -8669,8 +8672,9 @@ def broker_repo(workspace: Path) -> str | None:
 
     None for a clone -- it carries `.git` and the indexes walk it directly --
     and for a directory no lease holds, which is walked as it is (a local run,
-    an exported tree). A directory a lease holds but names no repository for
-    is the content-mode case gone wrong, and says so.
+    an exported tree). `UNRESOLVED_REPO` where it cannot tell which
+    repository, or whether a lease holds the directory at all: the content-mode
+    case gone wrong, which says so and annotates nothing.
     """
     if (workspace / GIT_DIR_NAME).exists():
         return None
@@ -8678,9 +8682,9 @@ def broker_repo(workspace: Path) -> str | None:
     if gitops_workspace is None:
         log(
             f"WARNING: {workspace} is not a clone and the lease helper is not importable, "
-            "so a content-mode workspace cannot be read through the broker; walking it as it is"
+            "so it cannot be read through the broker; no candidate will carry a declaration"
         )
-        return None
+        return UNRESOLVED_REPO
     holder = gitops_workspace.lease_holder(workspace)
     if holder is None:
         return None
@@ -8701,7 +8705,7 @@ def broker_repo(workspace: Path) -> str | None:
             f"WARNING: {workspace} is leased but neither its directory nor the lease "
             "marker names a repository; no candidate will carry a declaration"
         )
-        return None
+        return UNRESOLVED_REPO
     return repo
 
 
@@ -8876,9 +8880,22 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
     if repo is None:
         yield workspace
         return
+    if repo == UNRESOLVED_REPO:
+        yield None
+        return
     import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
 
-    with tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX) as mirror:
+    try:
+        holder = tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX)
+    except OSError as exc:
+        # The annotation is optional; the run is not.
+        log(
+            f"WARNING: cannot make a directory to mirror {repo} into ({exc}); "
+            "no candidate will carry a declaration"
+        )
+        yield None
+        return
+    with holder as mirror:
         yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
 
 

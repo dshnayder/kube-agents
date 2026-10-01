@@ -9846,6 +9846,34 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertEqual(indexed, Path(tmp))
         self.assertEqual(err.getvalue(), "")
 
+    def test_a_leased_directory_naming_no_repository_is_never_walked(self):
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "scratch"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x"}))
+            (scratch / "partial.yaml").write_text("kind: Deployment\n")
+            with collect.indexed_workspace(scratch) as indexed:
+                self.assertIsNone(indexed)
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_without_the_lease_helper_the_scratch_is_never_walked(self):
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "_import_platform_script", return_value=None), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            with collect.indexed_workspace(Path(tmp)) as indexed:
+                self.assertIsNone(indexed)
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_no_room_for_the_mirror_annotates_nothing_and_still_runs(self):
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "broker_repo", return_value=self.REPO), \
+                patch("tempfile.TemporaryDirectory", side_effect=OSError("read-only")), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            with collect.indexed_workspace(Path(tmp)) as indexed:
+                self.assertIsNone(indexed)
+        self.assertIn("WARNING", err.getvalue())
+
     def test_main_indexes_the_mirror_in_content_mode(self):
         """End to end through `main`: the scratch path in, the mirror's tree indexed."""
         seen = {}
