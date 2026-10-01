@@ -340,8 +340,10 @@ The collectors do not need them. Handed the scratch workspace as `--workspace`, 
 `fleet_waste.py` copy the repository's YAML out of the broker into a private directory and index that,
 so candidates carry `declaration` and `release_declaration` (and, from `collect.py` alone,
 `namespace_directory`) in content mode as they do from a clone. When a collector cannot read the
-whole tree it logs a `WARNING` naming why and attaches none of those fields; the declaration rule's
-own search is the answer then.
+tree it logs a `WARNING` naming why and attaches none of those fields. A single file the broker will
+not send (over its size limit, or a symlink) costs only what it could declare: no
+`release_declaration` anywhere, and no `declaration` on a cluster whose `clusters/<name>/` tree
+holds it. Either way the declaration rule's own search is the answer for what is missing.
 
 All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
 side to ask, and the declared-intent record (`declared_intent_searched`, below) names each repository

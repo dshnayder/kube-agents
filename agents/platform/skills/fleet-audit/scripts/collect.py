@@ -72,7 +72,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, NamedTuple
 
 MANIFEST_VERSION = 1
@@ -185,6 +185,17 @@ MIRROR_MAX_FILES = 5000
 MIRROR_MAX_BYTES = 64 << 20
 # `Workspace.read_many`'s "ask again for the rest" reason.
 BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
+# The skips that are final for one file: the broker will never send it, but
+# the rest of the tree is whole. A clone's walk reads both, so each withholds
+# the region of the mirror the file could have declared into (`broker_mirror`).
+BROKER_SKIP_TOO_LARGE = "tooLarge"
+BROKER_SKIP_SYMLINK = "symlink"
+BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK})
+# Left in a mirror some file was withheld from. `release_declarations` reads
+# Argo CD Applications from anywhere in the tree, for any destination, so a
+# missing file can hide a release for every cluster; the marker makes that
+# index answer nothing rather than part. Not YAML, so no index opens it.
+MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
 
 # `release_declarations` indexes the objects that render a workload a GitOps
 # repo holds no manifest for -- an Argo CD `Application`, from either a chart
@@ -7801,6 +7812,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     Returns `{}` when PyYAML is absent or the clone is unreadable, which is the
     behaviour that shipped before this existed.
     """
+    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        return {}
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
     except ImportError:
@@ -8015,6 +8028,9 @@ def _projects_restrict_namespaces(root: Path | None) -> bool:
     """
     if root is None:
         return False
+    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        # A file the mirror could not hold may be the restrictive project.
+        return True
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
     except ImportError:
@@ -8733,6 +8749,16 @@ def _safe_relative(path: str) -> Path | None:
     return relative
 
 
+def _cluster_tree(path: str) -> str | None:
+    """The cluster whose `clusters/<name>/` tree holds `path`, or None.
+
+    The same convention `workload_declarations` reads a cluster off."""
+    parts = PurePosixPath(path).parts
+    if len(parts) > GITOPS_CLUSTER_TREE_DEPTH and parts[0] == GITOPS_CLUSTER_TREE_ROOT:
+        return parts[1]
+    return None
+
+
 def _batches(
     wanted: list[tuple[str, int]], max_paths: int = MIRROR_BATCH_PATHS
 ) -> list[list[str]]:
@@ -8767,16 +8793,22 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     `finish` publishes every file in that, and a mirrored manifest written there
     would be proposed as a fix.
 
-    All or nothing. A tree missing files would index an object declared twice
-    as declared once, and `declaration_for` would then name one of the two
-    files instead of refusing -- a wrong path, which is worse than the absent
-    one the SOPs already handle. So a capped listing, a file the broker will
-    not send, any broker failure, or a failed write returns False, the caller
-    does not index `dest`, and the run proceeds as it did before this existed.
-    That includes a single file over the broker's per-file limit (`tooLarge`):
-    a vendored install bundle that size is rarely a workload's declaration,
-    but a rendered multi-document file can be, and skipping it would bring
-    back the wrong-path case this rule exists to prevent.
+    Every region it indexes is whole. A region missing files would index an
+    object declared twice as declared once, and `declaration_for` would then
+    name one of the two files instead of refusing -- a wrong path, which is
+    worse than the absent one the SOPs already handle. So a capped listing,
+    an unknown skip, any broker failure, or a failed write returns False, the
+    caller does not index `dest`, and the run proceeds as it did before this
+    existed.
+
+    One file the broker will never send -- over its per-file limit
+    (`tooLarge`), or a symlink, which `read` refuses and `list` names apart
+    from its entries -- withholds only what it could have declared into. A
+    file under `clusters/<c>/` drops that cluster's whole tree from the
+    mirror, because `workload_declarations` keys by that path. Any withheld
+    file, wherever it sits, leaves MIRROR_RELEASES_WITHHELD_MARKER, because an
+    Argo CD Application can live anywhere and target any cluster. The other
+    clusters keep their declarations, and each withheld region is logged.
     """
     if open_workspace is None:
         client = _import_platform_script("credential_proxy_client")
@@ -8789,6 +8821,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         log(f"WARNING: {CREDENTIAL_PROXY_URL_ENV} is unset, so {repo} cannot be read; no candidate will carry a declaration")
         return False
     files: dict[str, bytes] = {}
+    withheld: dict[str, str] = {}
     total_bytes = 0
     try:
         with open_workspace(endpoint, repo, depth=1) as workspace:
@@ -8802,6 +8835,11 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                 listing = workspace.list(after=cursor)
                 if listing.truncated and listing:
                     max_paths = min(max_paths, len(listing))
+                withheld.update(
+                    (str(link), BROKER_SKIP_SYMLINK)
+                    for link in getattr(listing, "symlinks", ())
+                    if _mirrored(str(link))
+                )
                 for entry in listing:
                     path = str(entry.get("path") or "")
                     if not _mirrored(path):
@@ -8833,15 +8871,24 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                 while pending:
                     got, skipped = workspace.read_many(pending)
                     files.update(got)
-                    refused = [e for e in skipped if e.get("reason") != BROKER_SKIP_REQUEST_BUDGET]
-                    if refused or (skipped and not got):
-                        first = (refused or skipped)[0]
+                    for entry in skipped:
+                        if entry.get("reason") in BROKER_WITHHOLDING_SKIPS:
+                            withheld[str(entry.get("path") or "")] = str(entry.get("reason"))
+                    retry = [e for e in skipped if e.get("reason") == BROKER_SKIP_REQUEST_BUDGET]
+                    refused = [
+                        e
+                        for e in skipped
+                        if e.get("reason") not in BROKER_WITHHOLDING_SKIPS
+                        and e.get("reason") != BROKER_SKIP_REQUEST_BUDGET
+                    ]
+                    if refused or (retry and not got):
+                        first = (refused or retry)[0]
                         log(
                             f"WARNING: the broker did not send {first.get('path')} from {repo} "
                             f"({first.get('reason')}); no candidate will carry a declaration"
                         )
                         return False
-                    pending = [str(e.get("path") or "") for e in skipped]
+                    pending = [str(e.get("path") or "") for e in retry]
     except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
         log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
         return False
@@ -8851,7 +8898,18 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     if unsafe:
         log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
         return False
+    clusters = {_cluster_tree(path) for path in withheld} - {None}
+    for path, reason in sorted(withheld.items()):
+        region = _cluster_tree(path)
+        log(
+            f"WARNING: the broker will not send {path} from {repo} ({reason}); "
+            + (f"no candidate on cluster {region} will carry a declaration, and " if region else "")
+            + "no candidate will carry a release_declaration"
+        )
+    files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
     try:
+        if withheld:
+            (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
         for path, content in files.items():
             target = dest / Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)

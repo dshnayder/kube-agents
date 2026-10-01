@@ -894,10 +894,15 @@ class Listing(list):
     for a path it inferred rather than one it saw.
     """
 
-    def __init__(self, entries, total: int = 0, truncated: bool = False) -> None:
+    def __init__(
+        self, entries, total: int = 0, truncated: bool = False, symlinks=()
+    ) -> None:
         super().__init__(entries)
         self.total = total or len(self)
         self.truncated = truncated
+        # Symlinked files in this page's range, which `read` refuses and so
+        # are never entries; a broker older than the field reports none.
+        self.symlinks = list(symlinks)
 
 
 def default_caller_label() -> str:
@@ -1029,6 +1034,7 @@ class Workspace:
             result.get("entries", []),
             total=result.get("total", 0),
             truncated=bool(result.get("truncated")),
+            symlinks=result.get("symlinks") or [],
         )
 
     def grep(

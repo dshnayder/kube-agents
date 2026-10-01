@@ -9626,9 +9626,10 @@ class TestWorkloadDeclarations(unittest.TestCase):
 
 
 class _FakeListing(list):
-    def __init__(self, entries, truncated=False):
+    def __init__(self, entries, truncated=False, symlinks=()):
         super().__init__(entries)
         self.truncated = truncated
+        self.symlinks = list(symlinks)
 
 
 class _FakeBrokerWorkspace:
@@ -9636,11 +9637,15 @@ class _FakeBrokerWorkspace:
 
     `pages` is the listing the broker returns page by page; `budget` is how many
     paths one `read_many` answers before deferring the rest as `requestBudget`;
-    `refuse` maps a path to the reason the broker will never send it.
+    `refuse` maps a path to the reason the broker will never send it; `symlinks`
+    are names the listing reports apart from its entries, all on the first page.
     """
 
-    def __init__(self, files, page_size=2, budget=None, refuse=None, fail_open=None):
+    def __init__(
+        self, files, page_size=2, budget=None, refuse=None, fail_open=None, symlinks=()
+    ):
         self.files = files
+        self.symlinks = list(symlinks)
         self.page_size = page_size
         self.budget = budget
         self.refuse = refuse or {}
@@ -9667,7 +9672,11 @@ class _FakeBrokerWorkspace:
             names = [n for n in names if n > after]
         page = names[: self.page_size]
         entries = [{"path": n, "size": len(self.files[n])} for n in page]
-        return _FakeListing(entries, truncated=len(names) > self.page_size)
+        return _FakeListing(
+            entries,
+            truncated=len(names) > self.page_size,
+            symlinks=self.symlinks if after is None else (),
+        )
 
     def read_many(self, paths):
         self.reads.append(list(paths))
@@ -9730,10 +9739,67 @@ class TestBrokerMirror(unittest.TestCase):
         )
         self.assertEqual(broker.opened, [(self.ENDPOINT, self.REPO)])
 
-    def test_a_file_the_broker_will_not_send_abandons_the_mirror(self):
-        """A missing file can hide a second declaration, so no index beats a wrong one."""
+    def two_clusters(self):
+        other = self.DEPLOYMENT.replace("waste-unsized", "other-app")
+        return {
+            **self.files(),
+            "clusters/other/apps/other.yaml": other.encode(),
+            "clusters/other/apps/vendored.yaml": b"kind: List\n",
+        }
+
+    def test_a_file_the_broker_will_not_send_withholds_only_its_cluster(self):
+        """A missing file can hide a second declaration in its own cluster's
+        tree, so that tree goes; the other clusters' trees are whole and stay.
+        It could also be an Application for any cluster, so releases go too."""
         broker = _FakeBrokerWorkspace(
-            self.files(), refuse={"provisioning/cluster.yml": "tooLarge"}
+            self.two_clusters(),
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            releases = collect.release_declarations(Path(tmp))
+        self.assertRegex(err.getvalue(), r"clusters/other/apps/vendored.yaml from .* \(tooLarge\); no candidate on cluster other")
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+        self.assertTrue(withheld)
+        self.assertEqual(releases, {})
+
+    def test_a_withheld_file_outside_the_cluster_trees_withholds_only_releases(self):
+        broker = _FakeBrokerWorkspace(
+            self.two_clusters(),
+            refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE},
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+            restricted = collect._projects_restrict_namespaces(Path(tmp))
+        self.assertRegex(err.getvalue(), r"provisioning/cluster.yml from .* \(tooLarge\); no candidate will carry a release_declaration")
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+        # The withheld file may be the AppProject that restricts namespaces.
+        self.assertTrue(restricted)
+
+    def test_a_listed_symlink_withholds_its_cluster(self):
+        """`read` refuses a symlink, so `list` names it apart; a clone's walk
+        would have read it, so its cluster's tree is incomplete."""
+        broker = _FakeBrokerWorkspace(
+            self.two_clusters(), symlinks=["clusters/other/apps/linked.yaml", "docs/link.md"]
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+        self.assertRegex(err.getvalue(), r"linked.yaml from .* \(symlink\)")
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+
+    def test_a_symlink_that_is_not_yaml_withholds_nothing(self):
+        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinks=["docs/link.md"])
+        with TemporaryDirectory() as tmp:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertFalse((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+
+    def test_an_unknown_skip_still_abandons_the_mirror(self):
+        broker = _FakeBrokerWorkspace(
+            self.files(), refuse={"provisioning/cluster.yml": "somethingNew"}
         )
         with TemporaryDirectory() as tmp:
             self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))

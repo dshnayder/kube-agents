@@ -7287,6 +7287,7 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             "GITOPS_CLUSTER_TREE_ROOT",
             "GITOPS_CLUSTER_TREE_DEPTH",
             "GIT_DIR_NAME",
+            "MIRROR_RELEASES_WITHHELD_MARKER",
             "KCC_API_GROUP_SUFFIX",
             "_HELM_RELEASE_ANNOTATION",
             "_HELM_NAMESPACE_ANNOTATION",

@@ -1577,6 +1577,32 @@ class ReadVerbCeilingTest(unittest.TestCase):
             ),
         )
 
+    def test_a_listing_names_symlinked_files_once_across_pages(self):
+        """`read` refuses a symlink, so it is never an entry; a caller rebuilding
+        the tree from entries alone would hold less than a clone and not know."""
+        tree = self.workspace.tree
+        outside = self.base / "outside.yaml"
+        outside.write_text("kind: Secret\n")
+        (tree / "manifests" / "1a.yaml").symlink_to(outside)
+        (tree / "manifests" / "9.yaml").symlink_to(tree / "manifests" / "0.yaml")
+        (tree / "linked-dir").symlink_to(tree / "manifests", target_is_directory=True)
+        with mock.patch.object(content_workspace, "max_entries", lambda: 2):
+            pages, cursor = [], None
+            while True:
+                page = self.store.list(self.handle(), after=cursor)
+                pages.append(page)
+                if not page["truncated"]:
+                    break
+                cursor = page["entries"][-1]["path"]
+        self.assertEqual(
+            [[], ["manifests/1a.yaml"], ["manifests/9.yaml"]],
+            [page["symlinks"] for page in pages],
+        )
+        listed = [e["path"] for page in pages for e in page["entries"]]
+        self.assertNotIn("manifests/1a.yaml", listed)
+        # A link to a directory is not a file, and the walk does not enter it.
+        self.assertFalse(any(p.startswith("linked-dir") for p in listed))
+
     def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
         with mock.patch.object(content_workspace, "max_entries", lambda: 2):
             first = self.store.list(self.handle())

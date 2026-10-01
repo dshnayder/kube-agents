@@ -1252,19 +1252,32 @@ class ContentWorkspaceStore:
         a listing that stopped at the ceiling says so instead of looking
         complete — a caller that cannot tell the difference goes on to `read`
         paths it invented.
+
+        A symlinked file is never an entry, because `read` refuses it, but it
+        is named in `symlinks` -- each once across the pages, on the page whose
+        range it sorts into. A clone's walk follows it, so a caller rebuilding
+        the tree from entries alone would hold less than the clone and could
+        not tell.
         """
         with self._use(handle) as workspace:
             under = repo_relative(prefix).parts if prefix else ()
             cursor = str(repo_relative(after)) if after else ""
             names: list[str] = []
+            links: list[str] = []
             for path in workspace.tree.rglob("*"):
-                if not path.is_file() or path.is_symlink():
+                linked = path.is_symlink()
+                if not linked and not path.is_file():
                     continue
                 relative = path.relative_to(workspace.tree)
                 parts = relative.parts
                 if any(_looks_like_dot_git(part) for part in parts):
                     continue
                 if under and parts[: len(under)] != under:
+                    continue
+                if linked:
+                    # A link to a directory is not a file a clone's walk reads.
+                    if not path.is_dir():
+                        links.append(str(PurePosixPath(*parts)))
                     continue
                 names.append(str(PurePosixPath(*parts)))
             # Sorted on the name this answers with rather than on the `Path`,
@@ -1284,10 +1297,17 @@ class ContentWorkspaceStore:
                 for name in page
             ]
             total = len(names) - start
+            truncated = total > len(entries)
+            last = page[-1] if truncated and page else None
             return {
                 "entries": entries,
+                "symlinks": sorted(
+                    link
+                    for link in links
+                    if (not cursor or link > cursor) and (last is None or link <= last)
+                ),
                 "total": total,
-                "truncated": total > len(entries),
+                "truncated": truncated,
             }
 
     def grep(
