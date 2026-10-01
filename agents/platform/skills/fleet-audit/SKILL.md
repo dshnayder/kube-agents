@@ -1167,8 +1167,9 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
   nothing" and "I could not look" must not arrive as the same silence.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
-  carrying. "I found nothing" and "I did not write it down" must not arrive as the same silence
-  either.
+  carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
+  for an answer. "I found nothing" and "I did not write it down" must not arrive as the same
+  silence either.
 - **A dropped collector candidate** — on a stream that passes `--manifest-file`, the collector
   flagged something the document did not carry. The check reads as having run and found nothing;
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.

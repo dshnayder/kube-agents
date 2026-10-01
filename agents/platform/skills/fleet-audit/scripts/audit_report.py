@@ -8995,6 +8995,10 @@ def read_comments(
       reads its standing, so it carries none, and a bystander the forge could
       not answer for does not cost every request on the thread its run.
 
+    A read without `standing` survives an `identity` outage for the viewer:
+    every comment is then not this install's, and the `bot` flag is left to
+    recognise an App's own.
+
     Only the conversation tab: on a pull request that is where every marker
     this harness writes is, and where `gh pr view --json comments` read.
     """
@@ -9018,7 +9022,17 @@ def read_comments(
         return []
     viewer = viewer_login(repo)
     if viewer is None:
-        return None
+        if standing:
+            return None
+        # A marker read: authorship is the only thing the viewer answers, and
+        # `marker_from_harness` falls back to the `bot` flag without it. An
+        # App install still sees its own markers through an `identity` outage,
+        # rather than reading none and posting every once-only comment again.
+        log(
+            f"WARNING: could not ask the forge who this install is on {repo}; "
+            f"reading #{number}'s markers by the bot flag alone."
+        )
+        viewer = ""
     standing_of: dict[str, bool | None] = {}
     records: list[dict] = []
     for item in items:
@@ -12385,7 +12399,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # better and is the best news this audit ever delivers, and
             # a gap means it could not look rather than found nothing.
             "silent_ok": not (
-                clean_resolved or gaps or prs_closed or unaccounted or collector_speaks
+                clean_resolved
+                or gaps
+                or prs_closed
+                or unaccounted
+                or held_unread
+                or collector_speaks
             ),
             "partial": bool(gaps),
             "coverage_gaps": gaps,
@@ -12413,7 +12432,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
         # next run's trust check fails as a lost memory should.
-        body_untouched = bool(existing_issue) and bool(gaps or unaccounted)
+        body_untouched = bool(existing_issue) and bool(gaps or unaccounted or held_unread)
         # `document` stays this run's: it is what a reader asking "what did the
         # last run check, which clusters did it skip" is answered from. The
         # document the untouched body renders rides alongside as
@@ -12450,7 +12469,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 issue_number=stored_issue,
                 ledger_body=stored_body,
                 new_ids=[],
-                resolved_ids=[] if (gaps or unaccounted) else previous_ids,
+                resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
                 rendered_ids=stored_ids,
                 ledger_document=ledger_document,
                 ledger_held_open=body_untouched,

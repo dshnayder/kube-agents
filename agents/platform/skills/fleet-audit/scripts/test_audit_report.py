@@ -9813,6 +9813,20 @@ class TestRemediateOnACleanRun(HarnessTestCase):
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertIn("stays open", self.err)
 
+    def test_a_held_unread_ledger_keeps_its_memory_and_is_reported(self):
+        # The hold is only as good as what the store says next run: a record
+        # naming no issue is a lost memory, and a lost memory never closes.
+        self.seed_report("prior")
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"identity login=operator": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, "prior"))
+        self.assertIs(stored["ledger_held_open"], True)
+        self.assertEqual(stored["resolved_ids"], [])
+        # A held close is something the operator hears about.
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
     def test_a_standing_request_is_answered_before_the_ledger_closes(self):
         self.harness.replies = self.replies([self.comment()])
 
@@ -11964,6 +11978,17 @@ class TestStaleCloseLabelling(HarnessTestCase):
         self.assertEqual(len(self.harness.forge_calls("proposal-close")), 1)
         self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
         self.assertIn("retrying the close", self.err)
+
+    def test_an_identity_outage_does_not_re_announce_an_apps_close(self):
+        # The viewer answer is what marks a comment as this install's; without
+        # it an App's marker is still its own by the bot flag, and reading the
+        # conversation as empty would post the notice again on every run.
+        prior = harness_comment(audit_report.stale_closed_marker(8))
+        self.harness.replies = {"*-view comments": comments_view({"comments": [prior]})}
+        self.harness.failures = {"identity": 1}
+        self.close_it([self.stale_pr()])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
+        self.assertIn("by the bot flag alone", self.err)
 
     def test_the_marker_is_only_believed_from_this_harness(self):
         # The harness only ever writes this marker into a comment it posts, so
