@@ -1257,13 +1257,16 @@ class ContentWorkspaceStore:
         is named in `symlinks` -- each once across the pages, on the page whose
         range it sorts into. A clone's walk follows it, so a caller rebuilding
         the tree from entries alone would hold less than the clone and could
-        not tell.
+        not tell. A link to a directory is named in `symlinkedDirectories` the
+        same way, with the target it names: the walk here does not enter it,
+        and neither does a clone's, but a clone resolves a path through it.
         """
         with self._use(handle) as workspace:
             under = repo_relative(prefix).parts if prefix else ()
             cursor = str(repo_relative(after)) if after else ""
             names: list[str] = []
             links: list[str] = []
+            directory_links: dict[str, str] = {}
             for path in workspace.tree.rglob("*"):
                 linked = path.is_symlink()
                 if not linked and not path.is_file():
@@ -1276,9 +1279,11 @@ class ContentWorkspaceStore:
                     continue
                 if linked:
                     # Only a link that resolves to a file is one a clone's walk
-                    # reads: not a link to a directory, and not a dangling one.
+                    # reads; a dangling one is nothing a clone could read.
                     if path.is_file():
                         links.append(str(PurePosixPath(*parts)))
+                    elif path.is_dir():
+                        directory_links[str(PurePosixPath(*parts))] = os.readlink(path)
                     continue
                 names.append(str(PurePosixPath(*parts)))
             # Sorted on the name this answers with rather than on the `Path`,
@@ -1300,13 +1305,21 @@ class ContentWorkspaceStore:
             total = len(names) - start
             truncated = total > len(entries)
             last = page[-1] if truncated and page else None
+
+            def in_range(names: list[str]) -> list[str]:
+                return sorted(
+                    name
+                    for name in names
+                    if (not cursor or name > cursor) and (last is None or name <= last)
+                )
+
             return {
                 "entries": entries,
-                "symlinks": sorted(
-                    link
-                    for link in links
-                    if (not cursor or link > cursor) and (last is None or link <= last)
-                ),
+                "symlinks": in_range(links),
+                "symlinkedDirectories": [
+                    {"path": name, "target": directory_links[name]}
+                    for name in in_range(list(directory_links))
+                ],
                 "total": total,
                 "truncated": truncated,
             }

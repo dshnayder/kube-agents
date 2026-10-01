@@ -1602,8 +1602,12 @@ class ReadVerbCeilingTest(unittest.TestCase):
         listed = [e["path"] for page in pages for e in page["entries"]]
         self.assertNotIn("manifests/1a.yaml", listed)
         # A dangling link is no file a clone could read, so it is not named;
-        # a link to a directory is not a file, and the walk does not enter it.
+        # the walk does not enter a link to a directory, but names it once.
         self.assertFalse(any(p.startswith("linked-dir") for p in listed))
+        self.assertEqual(
+            [{"path": "linked-dir", "target": str(tree / "manifests")}],
+            [link for page in pages for link in page["symlinkedDirectories"]],
+        )
 
     def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
         with mock.patch.object(content_workspace, "max_entries", lambda: 2):

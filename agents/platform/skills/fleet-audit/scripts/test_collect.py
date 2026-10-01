@@ -9626,10 +9626,11 @@ class TestWorkloadDeclarations(unittest.TestCase):
 
 
 class _FakeListing(list):
-    def __init__(self, entries, truncated=False, symlinks=()):
+    def __init__(self, entries, truncated=False, symlinks=(), symlinked_directories=()):
         super().__init__(entries)
         self.truncated = truncated
         self.symlinks = list(symlinks)
+        self.symlinked_directories = list(symlinked_directories)
 
 
 class _FakeBrokerWorkspace:
@@ -9638,17 +9639,26 @@ class _FakeBrokerWorkspace:
     `pages` is the listing the broker returns page by page; `budget` is how many
     paths one `read_many` answers before deferring the rest as `requestBudget`;
     `refuse` maps a path to the reason the broker will never send it; `symlinks`
-    are names the listing reports apart from its entries, all on the first page.
+    and `symlinked_directories` are names the listing reports apart from its
+    entries, all on the first page.
     `grep` searches `files`, refused or not, as the broker searches its checkout;
     `grep_error` makes it raise instead, and a path in `grep_binary` matches
     nothing, as `git grep -I` answers for a file git treats as binary.
     """
 
     def __init__(
-        self, files, page_size=2, budget=None, refuse=None, fail_open=None, symlinks=()
+        self,
+        files,
+        page_size=2,
+        budget=None,
+        refuse=None,
+        fail_open=None,
+        symlinks=(),
+        symlinked_directories=(),
     ):
         self.files = files
         self.symlinks = list(symlinks)
+        self.symlinked_directories = list(symlinked_directories)
         self.page_size = page_size
         self.budget = budget
         self.refuse = refuse or {}
@@ -9685,6 +9695,7 @@ class _FakeBrokerWorkspace:
             entries,
             truncated=len(names) > self.page_size,
             symlinks=self.symlinks if after is None else (),
+            symlinked_directories=self.symlinked_directories if after is None else (),
         )
 
     def read_many(self, paths):
@@ -9929,6 +9940,89 @@ class TestBrokerMirror(unittest.TestCase):
             index = collect.workload_declarations(Path(tmp))
         self.assertRegex(err.getvalue(), r"linked.yaml from .* \(symlink\)")
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+
+    def test_the_release_marker_alone_empties_the_release_index(self):
+        """The hub's Application is outside every cluster tree, so it is copied
+        and indexable; only the marker the withheld symlink sets hides it."""
+        files = self.two_clusters()
+        files["apps/hub.yaml"] = TestReleaseDeclarations.APPLICATION.encode()
+        broker = _FakeBrokerWorkspace(files, symlinks=["clusters/other/apps/linked.yaml"])
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            marked = collect.release_declarations(Path(tmp))
+            (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).unlink()
+            unmarked = collect.release_declarations(Path(tmp))
+        self.assertEqual(marked, {})
+        self.assertNotEqual(unmarked, {})
+
+    def test_a_directory_link_is_recreated_so_an_overlay_through_it_resolves(self):
+        """Neither walk enters the link, but the overlay check resolves the
+        Application's path through it in a clone, so the mirror holds it too."""
+        overlay = TestKustomizeOverlayDeclarations
+        files = {
+            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
+            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
+        }
+        broker = _FakeBrokerWorkspace(
+            files,
+            symlinked_directories=[{"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}],
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            found = collect.release_declaration_for(
+                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
+            )
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertFalse(withheld)
+        self.assertEqual(found, overlay.EXPECTED)
+
+    def test_a_directory_link_the_mirror_cannot_hold_withholds_the_release_index(self):
+        for target in ("/etc", "../../..", "../.git", ""):
+            with self.subTest(target=target):
+                links = [{"path": "overlays/x", "target": target}]
+                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
+                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+                    linked = [p for p in Path(tmp).rglob("*") if p.is_symlink()]
+                    index = collect.workload_declarations(Path(tmp))
+                self.assertRegex(err.getvalue(), r"directory link .* cannot hold; no candidate will carry a release_declaration")
+                self.assertTrue(withheld)
+                self.assertEqual(linked, [])
+                self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_directory_links_together_cannot_reach_out_of_the_mirror(self):
+        """Each link stays inside alone. In the first set `z` turns `a/f`, made
+        before it, into a climb one above the mirror; in the second `a/f`
+        climbs from the start, and `a/f/g/h` would create `g` up there."""
+        sets = {
+            "redirected": [
+                {"path": "a/f", "target": "../z/.."},
+                {"path": "z", "target": "."},
+            ],
+            "through": [
+                {"path": "0", "target": "."},
+                {"path": "a/f", "target": "../0/.."},
+                {"path": "a/f/g/h", "target": "."},
+            ],
+        }
+        for name, links in sets.items():
+            with self.subTest(name), TemporaryDirectory() as outer:
+                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
+                tmp = Path(outer) / "mirror"
+                tmp.mkdir()
+                with patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.assertTrue(collect.broker_mirror(self.REPO, tmp, broker.open))
+                root = tmp.resolve()
+                escaped = [
+                    p for p in tmp.rglob("*")
+                    if p.is_symlink() and root not in (p.resolve(), *p.resolve().parents)
+                ]
+                self.assertEqual(escaped, [])
+                self.assertEqual(sorted(p.name for p in Path(outer).iterdir()), ["mirror"])
+                self.assertTrue((tmp / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+                self.assertIn("directory link a/f ", err.getvalue())
 
     def test_a_symlink_that_is_not_yaml_withholds_nothing(self):
         broker = _FakeBrokerWorkspace(self.two_clusters(), symlinks=["docs/link.md"])

@@ -66,6 +66,7 @@ import ipaddress
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -8803,6 +8804,64 @@ def _safe_relative(path: str) -> Path | None:
     return relative
 
 
+def _mirror_directory_link(dest: Path, path: str, target: str) -> Path | None:
+    """Recreate the repository's directory link `path` -> `target` in `dest`.
+
+    Neither a clone's walk nor the mirror's enters a directory link, but the
+    Kustomize overlay check resolves an Application's path through one, so the
+    mirror holds the same link the clone does. None, and no link, for a target
+    that is absolute or climbs out of the repository, and for a path that runs
+    through another link -- the broker's walk never lists one, and creating
+    its parent there would follow that link. `_links_inside` checks where the
+    links resolve once all of them exist, since a later one can redirect an
+    earlier one.
+    """
+    relative = _safe_relative(path)
+    if relative is None or not target or PurePosixPath(target).is_absolute():
+        return None
+    landing = posixpath.normpath(posixpath.join(relative.parent.as_posix(), target))
+    if landing == ".." or landing.startswith("../"):
+        return None
+    if any((dest / parent).is_symlink() for parent in relative.parents):
+        return None
+    link = dest / relative
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return None
+    return link
+
+
+def _links_inside(dest: Path, links: dict[str, Path]) -> dict[str, str]:
+    """Remove each link in `links` that resolves outside `dest` or into `.git`.
+
+    Repeated until none is removed, because removing one changes where a link
+    through it resolves. Answers each removed path with its target, and
+    drops it from `links`. A loop is left in place: it resolves nowhere, in a clone too.
+    """
+    root = dest.resolve()
+    removed: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for path, link in list(links.items()):
+            try:
+                resolved = link.resolve()
+            except (OSError, RuntimeError):  # a loop, which older Pythons raise as RuntimeError
+                continue
+            if root in (resolved, *resolved.parents) and (root / GIT_DIR_NAME) not in (
+                resolved,
+                *resolved.parents,
+            ):
+                continue
+            removed[path] = os.readlink(link)
+            link.unlink()
+            del links[path]
+            changed = True
+    return removed
+
+
 def _cluster_tree(path: str) -> str | None:
     """The cluster whose `clusters/<name>/` tree holds `path`, or None.
 
@@ -8906,6 +8965,10 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     reads (`_may_declare_release`), and the rest of its cluster's tree, which
     goes with it, holds none either. The other clusters keep their `declaration`, and
     each withheld file is logged with what it cost.
+
+    A link to a directory, which `list` names with its target, is recreated
+    in the mirror (`_mirror_directory_link`); one whose target the mirror
+    cannot hold leaves the marker instead.
     """
     if open_workspace is None:
         client = _import_platform_script("credential_proxy_client")
@@ -8919,6 +8982,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         return False
     files: dict[str, bytes] = {}
     withheld: dict[str, str] = {}
+    directory_links: list[dict] = []
     total_bytes = 0
     try:
         with open_workspace(endpoint, repo, depth=1) as workspace:
@@ -8937,6 +9001,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                     for link in getattr(listing, "symlinks", ())
                     if _mirrored(str(link))
                 )
+                directory_links.extend(getattr(listing, "symlinked_directories", ()))
                 for entry in listing:
                     path = str(entry.get("path") or "")
                     if not _mirrored(path):
@@ -9040,6 +9105,31 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         )
     files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
     try:
+        for path, content in files.items():
+            target = dest / Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        links: dict[str, Path] = {}
+        unheld: dict[str, str] = {}
+        for link in directory_links:
+            entry = link if isinstance(link, dict) else {}
+            path, target = str(entry.get("path") or ""), str(entry.get("target") or "")
+            if path and _cluster_tree(path) in clusters:
+                continue
+            made = _mirror_directory_link(dest, path, target) if path not in links else None
+            if made is None:
+                unheld[path or repr(link)] = target
+            else:
+                links[path] = made
+        unheld.update(_links_inside(dest, links))
+        for path, target in sorted(unheld.items()):
+            # The overlay check resolves a path through the link in a clone,
+            # and here it would find nothing.
+            releasing.add(path)
+            log(
+                f"WARNING: the directory link {path} in {repo} names {target!r}, which "
+                "the mirror cannot hold; no candidate will carry a release_declaration or namespace_directory"
+            )
         if releasing:
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
@@ -9048,10 +9138,6 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
             (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).write_text(
                 "".join(f"{c}\n" for c in sorted(clusters)), encoding="utf-8"
             )
-        for path, content in files.items():
-            target = dest / Path(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
     except OSError as exc:
         # `dest` now holds part of the tree; False tells the caller not to index it.
         log(f"WARNING: could not write {repo}'s mirror ({exc}); no candidate will carry a declaration")
