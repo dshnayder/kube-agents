@@ -8262,7 +8262,8 @@ def _withheld_clusters(root: Path | None) -> set[str]:
     if root is None:
         return set()
     try:
-        return set((root / MIRROR_CLUSTERS_WITHHELD_MARKER).read_text().split())
+        # One name per line: a directory name may hold a space.
+        return set((root / MIRROR_CLUSTERS_WITHHELD_MARKER).read_text(encoding="utf-8").splitlines())
     except OSError:
         return set()
 
@@ -8984,8 +8985,8 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                         stalled = str(retry[0].get("path") or "")
                         try:
                             files[stalled] = workspace.read(stalled)
-                        except Exception:  # noqa: BLE001 -- reported below as the stall it is
-                            refused = retry[:1]
+                        except Exception as exc:  # noqa: BLE001 -- reported below with its cause
+                            refused = [{"path": stalled, "reason": f"{BROKER_SKIP_REQUEST_BUDGET}, then {exc}"}]
                         else:
                             retry = retry[1:]
                     if refused:
@@ -9044,7 +9045,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
         if clusters:
             (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
-            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).write_text("".join(f"{c}\n" for c in sorted(clusters)))
+            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).write_text(
+                "".join(f"{c}\n" for c in sorted(clusters)), encoding="utf-8"
+            )
         for path, content in files.items():
             target = dest / Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)

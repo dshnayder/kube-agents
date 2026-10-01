@@ -9829,6 +9829,13 @@ class TestBrokerMirror(unittest.TestCase):
         )
         self.assertRegex(err.getvalue(), r"cluster other will carry a declaration or namespace_directory;")
 
+    def test_a_withheld_cluster_name_with_a_space_reads_back_whole(self):
+        with TemporaryDirectory() as tmp:
+            marker = Path(tmp) / collect.MIRROR_CLUSTERS_WITHHELD_MARKER
+            marker.parent.mkdir()
+            marker.write_text("my cluster\nother\n", encoding="utf-8")
+            self.assertEqual(collect._withheld_clusters(Path(tmp)), {"my cluster", "other"})
+
     def test_the_markers_live_where_no_repository_can_commit_them(self):
         """A clone is walked as it stands, so a marker a repository could carry
         would switch its indexes off with no WARNING saying why."""
@@ -10016,7 +10023,7 @@ class TestBrokerMirror(unittest.TestCase):
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
             self.assertEqual(list(Path(tmp).iterdir()), [])
-        self.assertIn(collect.BROKER_SKIP_REQUEST_BUDGET, err.getvalue())
+        self.assertIn(f"{collect.BROKER_SKIP_REQUEST_BUDGET}, then 503", err.getvalue())
 
     def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
         broker = _FakeBrokerWorkspace(self.files())
