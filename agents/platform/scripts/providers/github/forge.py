@@ -558,21 +558,17 @@ class GitHubForge(Forge):
             )
             nodes = (found or {}).get("items") or []
             issues = [node for node in nodes if "pull_request" not in node]
-            returned = len(nodes)
+            truncated = len(nodes) >= limit
         else:
-            issues, returned = self._issue_pages(api, repo, params, limit)
-        return listing(
-            [translate.issue(node) for node in issues[:limit]],
-            limit,
-            "issues",
-            returned=returned,
-        )
+            issues, truncated = self._issue_pages(api, repo, params, limit)
+        kept = [translate.issue(node) for node in issues[:limit]]
+        return {"issues": kept, "count": len(kept), "truncated": truncated}
 
     @staticmethod
     def _issue_pages(
         api: Callable, repo: str, params: dict[str, Any], limit: int
-    ) -> tuple[list[dict], int]:
-        """Up to `limit` issues from `/issues`, and how many the forge held back.
+    ) -> tuple[list[dict], bool]:
+        """Up to `limit` issues from `/issues`, and whether the forge held more back.
 
         GitHub's issues endpoint returns pull requests too -- a PR *is* an
         issue there. Nowhere else models it that way, and a caller that asked
@@ -583,8 +579,9 @@ class GitHubForge(Forge):
         concludes an issue it is looking for does not exist, so this reads on
         until it has `limit` issues or the forge runs out, within a bound.
 
-        The count is what `listing` judges `truncated` on: `limit` when the last
-        page was full (the forge may hold more), otherwise what survived.
+        Truncated when the last page read was full (the forge may hold more)
+        or more than `limit` issues survived. A short last page means the forge
+        ran out, so `limit` issues read there is the whole answer.
         """
         issues: list[dict] = []
         for page in range(1, MAX_ISSUE_PAGES + 1):
@@ -593,7 +590,7 @@ class GitHubForge(Forge):
             full = len(nodes) >= limit
             if len(issues) >= limit or not full:
                 break
-        return issues, (limit if full else len(issues))
+        return issues, full or len(issues) > limit
 
     def issue_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

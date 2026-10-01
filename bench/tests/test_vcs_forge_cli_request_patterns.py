@@ -112,6 +112,8 @@ def test_the_reads_a_passing_worker_issues_are_not_flagged():
         "gh pr list --repo acme/infra --state all --limit 1000",
         "gh api repos/acme/infra/pulls?state=all",
         "gh api graphql -f query='{ viewer { login } }'",
+        "gh api -X GET repos/acme/infra/pulls -f state=all",
+        "gh api --method=GET search/issues -f q=repo:acme/infra",
         "gh api graphql -f query='query { viewer { login } }'",
         "gh pr view 3 --comments",
         "gh pr diff 3",

@@ -1973,6 +1973,19 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(len(recorder.calls), 2)
         self.assertIn("page=2", urllib.parse.unquote(recorder.calls[1][4]))
 
+    def test_issue_list_that_runs_out_on_the_limit_is_not_truncated(self):
+        # Review finding: the forge ran out on a short second page with exactly
+        # `limit` issues read, and that was reported as a page with more behind
+        # it, which a verb that takes no page cannot act on.
+        broker, _ = self.broker(
+            [{"number": 9, "pull_request": {"url": "..."}}, {"number": 8}], [{"number": 3}]
+        )
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [8, 3])
+        self.assertFalse(answer["truncated"])
+
     def test_a_conversation_is_read_past_one_page(self):
         # A long-lived ledger passes a hundred comments; the markers that stop
         # a reply going out twice are on the later pages, so one page is not
