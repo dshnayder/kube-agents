@@ -551,17 +551,18 @@ IDLE_SERVICE_TRIAGE = "service-fronted"
 # Autopilot bump supplied: an overrequest that is `minor` by magnitude, and
 # every unsized workload on an Autopilot cluster. The bump moves a finding up
 # the ledger because Autopilot bills on requests; it says nothing about
-# whether the resize is safe to merge unread, and the automatic sweep promotes
-# from `major` (`AUTO_PROMOTION_FLOOR` in audit_report.py). Without the marker
-# a platform attribute would open pull requests by itself. Same contract as
+# whether the resize is safe to merge unread. Neither check is on
+# `MAJOR_SWEEP_CHECKS` in audit_report.py, so a `major` waits regardless; the
+# marker names the reason in the ledger, and keeps a platform attribute from
+# opening pull requests by itself if either check ever joins that list. Same contract as
 # `IDLE_SERVICE_TRIAGE`: `NO_SWEEP_TRIAGE` names it, `/remediate` still opens it.
 AUTOPILOT_BUMP_TRIAGE = "autopilot-bumped"
 
 # The `needs_triage` marker on every §3.13 stand-down a Service does not
 # select (one it does carries `IDLE_SERVICE_TRIAGE`, the more specific
 # reason). The fix is `spec.replicas: 0`, and CPU and memory near zero for a
-# week is not evidence nothing needs the workload; at a `major` floor the
-# `Guaranteed` arm would otherwise open that pull request unread.
+# week is not evidence nothing needs the workload, so the marker keeps that
+# pull request out of the sweep at any grade.
 IDLE_STANDDOWN_TRIAGE = "scale-to-zero"
 
 # The `needs_triage` marker on a §3.1 overrequest of a `Guaranteed` pod. The

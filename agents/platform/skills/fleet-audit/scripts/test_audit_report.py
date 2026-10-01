@@ -8974,6 +8974,23 @@ class TestBelowFloorDisclosure(BaseTestCase):
         self.assertIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
         self.assertIn("does not clear on its own", body)
 
+    def test_a_long_floor_list_is_capped_and_the_body_still_publishes(self):
+        # Every minor manifest fix a stream files lands here, and the section
+        # is charged before the findings are; uncapped, 300 of them put the
+        # body over GitHub's limit and nothing was published.
+        ids = [f"minor-{n:03d}" for n in range(300)]
+        doc = make_doc(
+            findings=[
+                make_finding(fid=fid, severity="minor", title=f"Minor {fid}", check="wildcard-rbac")
+                for fid in ids
+            ]
+        )
+        body = render_body(doc, generated_at=NOW, below_floor=ids)
+        self.assertIn("300 finding(s) carry a manifest remediation graded below", body)
+        self.assertIn(f"`{ids[audit_report.MAX_WITHHELD_ROWS - 1]}` —", body)
+        self.assertNotIn(f"`{ids[audit_report.MAX_WITHHELD_ROWS]}` —", body)
+        self.assertIn(f"…and {300 - audit_report.MAX_WITHHELD_ROWS} more", body)
+
     def test_nothing_refused_renders_no_section(self):
         body = render_body(make_doc(), generated_at=NOW)
         self.assertNotIn("Awaiting `/remediate`", body)
@@ -15224,12 +15241,28 @@ class TestTriageMarkedFindings(BaseTestCase):
             {},
         )
 
-    def graded(self, check, severity, obj="Deployment/a"):
+    def graded(self, check, severity, obj="Deployment/a", **ran):
         return {
             "clusters": [
-                _ran("c1", check, candidates=[{**_cand(check, "c1", obj), "severity": severity}])
+                _ran(
+                    "c1",
+                    check,
+                    candidates=[{**_cand(check, "c1", obj), "severity": severity}],
+                    **ran,
+                )
             ]
         }
+
+    def test_a_candidate_from_a_failed_read_does_not_vouch(self):
+        findings = [_pub("a", "no-pdb", "c1", "Deployment/a")]
+        for ran in ({"outcome": "gate-failed"}, {"rc": 1}):
+            with self.subTest(**ran):
+                self.assertEqual(
+                    audit_report.collector_vouched_findings(
+                        findings, self.graded("no-pdb", "major", **ran)
+                    ),
+                    set(),
+                )
 
     def test_a_major_candidate_on_a_cleared_check_vouches_for_its_finding(self):
         findings = [
@@ -15974,9 +16007,10 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(len(loud["unpublished_candidates"]), 1)
 
     def test_the_json_line_and_the_ledger_name_the_same_uncorroborated_findings(self):
-        """One set under one name: what the sweep would otherwise have opened.
-        A `gcloud` finding the collector did not flag is uncorroborated too,
-        but the sweep would not have opened it, so neither surface names it."""
+        """One set under one name: manifest fixes, at any grade, the collector
+        did not stand behind. A `gcloud` finding the collector did not flag is
+        uncorroborated too, but there is no pull request to open for it, so
+        neither surface names it."""
         self.promotion_replies()
         doc = make_doc(
             findings=[
@@ -18626,6 +18660,29 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
             "--enable-master-authorized-networks --no-enable-google-cloud-access` to restrict access.",
         )
 
+    def test_a_backticked_flag_in_prose_is_not_a_command(self):
+        note = (
+            "Enabling `--enable-master-authorized-networks` alone does not close it; "
+            "add `--no-enable-google-cloud-access` too."
+        )
+        self.assertEqual(self.repaired(note=note)["remediation"]["note"], note)
+
+    def test_a_bare_sentence_naming_the_flag_is_left_alone(self):
+        note = "Set --enable-master-authorized-networks on the cluster."
+        self.assertEqual(self.repaired(note=note)["remediation"]["note"], note)
+
+    def test_a_command_in_the_second_code_span_is_repaired(self):
+        note = (
+            "Pick the `<CIDR>` list, then run `gcloud container clusters update c "
+            "--location=us-east4 --project=p --enable-master-authorized-networks`."
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "Pick the `<CIDR>` list, then run `gcloud container clusters update c "
+            "--location=us-east4 --project=p --enable-master-authorized-networks "
+            "--no-enable-google-cloud-access`.",
+        )
+
     def test_both_flag_spellings_are_read(self):
         for form in ("--location=us-east4 --project=p", "--location us-east4 --project p"):
             with self.subTest(form=form):
@@ -18669,7 +18726,8 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
                 "--project=p --enable-master-authorized-networks "
                 "--master-authorized-networks=<CIDR>`.",
                 "rationale": "r",
-                "risk": "Confirm with the same --enable-master-authorized-networks run.",
+                "risk": "Rerunning `gcloud container clusters update c --location=us-east4 "
+                "--project=p --enable-master-authorized-networks` replaces the list.",
             }
         )
         for field in ("action", "risk"):

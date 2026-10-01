@@ -578,6 +578,11 @@ _KCC_COMMAND_TRUNCATED = " …(truncated)"
 # every caller, which is a decision a reader should be able to decline by not
 # running that line.
 PUBLIC_CONTROL_PLANE_CHECK = "public-control-plane"
+# What `append_gcloud_flag` reads as a command: an inline code span, or text
+# starting with the gcloud binary, optionally behind a shell prompt.
+INLINE_CODE_SPAN = re.compile(r"`([^`\n]*)`")
+GCLOUD_COMMAND_PREFIX = "gcloud "
+SHELL_PROMPT = "$ "
 AUTHORIZED_NETWORKS_FLAG = "--enable-master-authorized-networks"
 GOOGLE_CLOUD_ACCESS_FLAG = "--no-enable-google-cloud-access"
 DNS_ACCESS_FLAG = "--no-enable-dns-access"
@@ -990,6 +995,13 @@ MAX_DECLARED_ROWS = 50
 # required: the repository and path a reviewer opens, and the lines that pin
 # the flagged property so the claim can be read off the row.
 DECLARATION_FIELDS = ("repo", "path", "excerpt")
+# Rows in each block of the ledger's "Awaiting /remediate" section. The
+# section is charged against the body before the findings are, and the
+# below-floor block grows with every minor manifest fix a stream files, so an
+# uncapped list squeezes findings out of the body and, past a few hundred,
+# makes it too large to publish at all. The count stays exact; the run's log
+# line names every id.
+MAX_WITHHELD_ROWS = 20
 # The document's record of the declared-intent search (the obtainability SOP's
 # §4a): one `owner/name@sha` per repository the run searched. `finish` compares
 # the slugs against the run record `start` wrote, and a run that performed a
@@ -1303,12 +1315,14 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # whose `major` grade the Autopilot bump supplied rather than its magnitude.
 # The bump orders the ledger -- Autopilot bills on requests -- and was written
 # when the sweep promoted `critical` alone, on the explicit premise that it
-# could never open a pull request. `AUTO_PROMOTION_FLOOR` at `major` would
-# break that premise for every unsized workload on an Autopilot cluster;
-# this keeps it.
+# could never open a pull request. Neither check is on `MAJOR_SWEEP_CHECKS`,
+# so the premise holds without the marker today; the marker names the reason
+# in the ledger, and keeps the premise if either check joins that list.
 #
 # The next three mark a fix that is disruptive by construction, whatever
-# the collector measured, now that the floor reaches `major`. The cost
+# the collector measured. Most of these checks are off `MAJOR_SWEEP_CHECKS`
+# anyway; the marker is what holds a `critical` one, and what tells the
+# ledger's reader why the fix waits. The cost
 # collector sets `scale-to-zero` on every other §3.13 stand-down (a
 # Service-selected one keeps the more specific `service-fronted`): the fix is
 # `spec.replicas: 0`, and an idle reading is not proof nothing needs the
@@ -3829,38 +3843,57 @@ def _logical_command_spans(lines: list[str]) -> list[tuple[int, int, str]]:
 
 
 def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
-    """Put `flag` on every command in `text` that carries `anchor` and not it.
+    """Put `flag` on every gcloud command in `text` that carries `anchor` and not it.
 
     Appended rather than inserted at a fixed position, because gcloud does not
     care and a reader diffing the note against last week's should see one token
     arrive rather than the whole line reflow.
 
-    Text carrying no command at all falls through the loop untouched, so prose
-    needs no guard ahead of it.
+    Only a command is touched, and a command is one of two shapes: a backticked
+    span whose text starts `gcloud `, wherever it falls on the line, or a whole
+    logical line that starts `gcloud ` -- a fenced block, where a caveat follows
+    as a `#` comment the flag must land ahead of. Prose that names a flag in
+    backticks, or a sentence that mentions one bare, is neither, and is left
+    as written.
     """
     lines = text.split("\n")
+
+    def inline(match: re.Match) -> str:
+        span = match.group(1)
+        if _is_gcloud_command(span) and _mentions_flag(span, anchor) and not _mentions_flag(
+            span, flag
+        ):
+            span = span.rstrip() + " " + flag
+        return f"`{span}`"
+
     for first, last, _joined in _logical_command_spans(lines):
-        code = [_command_part(line) for line in lines[first : last + 1]]
+        if any("`" in line for line in lines[first : last + 1]):
+            for index in range(first, last + 1):
+                lines[index] = INLINE_CODE_SPAN.sub(inline, lines[index])
+            continue
+        code = [_comment_free(line) for line in lines[first : last + 1]]
         joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
-        if _mentions_flag(joined, anchor) and not _mentions_flag(joined, flag):
+        if (
+            _is_gcloud_command(joined)
+            and _mentions_flag(joined, anchor)
+            and not _mentions_flag(joined, flag)
+        ):
             end = len(code[-1].rstrip())
             lines[last] = lines[last][:end] + " " + flag + lines[last][end:]
     return "\n".join(lines)
 
 
-def _command_part(line: str) -> str:
-    """`line` up to where its command ends: a closing backtick or a `#` comment.
+def _is_gcloud_command(text: str) -> bool:
+    """True where `text` is a gcloud invocation, a `$ ` prompt allowed."""
+    return text.strip().removeprefix(SHELL_PROMPT).startswith(GCLOUD_COMMAND_PREFIX)
 
-    A note writes a command either fenced, where a caveat follows as a `#`
-    comment, or inline in prose between backticks. A flag appended past either
-    lands where the shell never reads it -- in the comment, or after the
-    backtick a reader stops copying at -- and the presence test then finds it
-    there and reports the command fixed.
+
+def _comment_free(line: str) -> str:
+    """`line` up to an unquoted `#` comment.
+
+    A flag appended past the comment lands where the shell never reads it, and
+    the presence test then finds it there and reports the command fixed.
     """
-    tick = line.find("`")
-    if tick != -1:
-        close = line.find("`", tick + 1)
-        return line[: close if close != -1 else len(line)]
     quote = ""
     for index, char in enumerate(line):
         if quote:
@@ -4971,11 +5004,23 @@ def collector_vouched_findings(
     `needs_triage` marker lives on it, so a finding without one is a finding
     nothing could have marked; its grade has to vouch because otherwise the
     model's re-grade of a `minor` candidate, not the collector, decides that a
-    pull request opens. Empty on a run without a manifest.
+    pull request opens. Only a candidate whose check ran to `rc == 0` on a
+    `collected` target vouches, the line `uncorroborated_findings` draws: a
+    `gate-failed` target, or a command that failed, produced no reading the
+    sweep can stand behind. Empty on a run without a manifest.
     """
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     graded: dict[str, int] = {}
     for entry, candidate in _candidates(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        ran = {
+            str(command.get("check") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0
+        }
+        if str(candidate.get("check") or "") not in ran:
+            continue
         identity = _candidate_identity(entry, candidate)
         rank = SEVERITY_RANK.get(str(candidate.get("severity") or ""), len(SEVERITIES))
         graded[identity] = min(rank, graded.get(identity, len(SEVERITIES)))
@@ -7359,10 +7404,11 @@ def promotion_candidates(
         pr = pr_by_finding.get(fid)
         if pr is not None and not pr_closed_by_harness(pr):
             continue
-        # Last, after every test the sweep already applied, so these two lists
-        # name only what the sweep would otherwise have opened: a `gcloud` fix
-        # or a finding with a live pull request must not land in a block that
-        # invites `/remediate` on it. Triage ahead of corroboration because the
+        # After the manifest and live-PR tests, so a `gcloud` fix or a finding
+        # with a live pull request never lands in a block that invites
+        # `/remediate` on it; ahead of severity, so these two lists hold every
+        # grade, a `minor` finding included, and say why it needs reading
+        # rather than only that it is below the floor. Triage ahead of corroboration because the
         # two cannot both be true of one finding — a marker only exists on a
         # candidate, and a candidate is exactly what an uncorroborated finding
         # lacks — and testing it first keeps that readable rather than relied on.
@@ -8424,12 +8470,14 @@ def _render_withheld(
 
     def rows(ids: list[str], why: dict[str, str] | None = None) -> list[str]:
         out = []
-        for fid in ids:
+        for fid in ids[:MAX_WITHHELD_ROWS]:
             row = f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
             marker = (why or {}).get(fid, "")
             if marker:
                 row += f" (`{marker}`: the fix {TRIAGE_REASONS.get(marker, 'needs a decision')})"
             out.append(row)
+        if len(ids) > MAX_WITHHELD_ROWS:
+            out.append(f"- _…and {len(ids) - MAX_WITHHELD_ROWS} more_")
         return out
 
     out = ["", "## Awaiting `/remediate`"]
@@ -11311,7 +11359,9 @@ def degrade_reverted_gcloud_remediations(
 
     Returns the ids that were degraded, for the caller to log.
     """
-    if not findings or not (roots or prebuilt):
+    # No `gcloud` fix on a cluster or node pool, no tree walk: the clones are
+    # read only to answer a question some finding asks.
+    if not any(_kcc_candidate(finding) for finding in findings) or not (roots or prebuilt):
         return []
     # The GitOps repository first, so its declaration wins a name both carry;
     # in content mode that is the broker's index, handed in as `prebuilt`.

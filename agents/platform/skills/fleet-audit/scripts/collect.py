@@ -106,7 +106,7 @@ MAX_WORKERS = 8
 # the fleet that runs Config Connector, on the strength of its own timeout.
 TIMEOUT_RC = 124
 
-# The one judgement this collector hands the sweep (`audit_report.py`'s
+# A judgement this collector hands the sweep (`audit_report.py`'s
 # `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
 # writes a default-deny NetworkPolicy, and a namespace that has been serving
 # traffic with no policy at all can lose callers nobody listed the moment it
@@ -121,8 +121,9 @@ NETPOL_DEFAULT_DENY_TRIAGE = "default-deny"
 # call the API server. `service-selects-nothing`'s fix rewrites the selector
 # or deletes the Service, a choice the SOP calls a judgement. And
 # `spread-not-achieved`'s fix is a `DoNotSchedule` spread, which leaves a
-# replica Pending when the pool shrinks. Each is `major`, so each became
-# sweepable when `AUTO_PROMOTION_FLOOR` moved to `major`.
+# replica Pending when the pool shrinks. None is on `MAJOR_SWEEP_CHECKS`, so a
+# `major` one waits regardless; the marker is what holds a `critical` one (a
+# §3.16 Service behind a load balancer) and what names the reason in the ledger.
 SA_TOKEN_TRIAGE = "namespace-token"
 SERVICE_SELECTOR_TRIAGE = "service-selector"
 HARD_SPREAD_TRIAGE = "hard-spread"

@@ -2052,9 +2052,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # dimensions and name no zone, so they may pass if the cluster spans
         # several zones and fail if it spans one. Filed like single-zone-nodepool on the
         # same failed read -- unevaluated, the other classes' findings still
-        # filing -- because a `manifest` candidate graded at or above
-        # AUTO_PROMOTION_FLOOR is what the automatic sweep opens a pull
-        # request for, and a caveat in its excerpt stops nothing.
+        # filing -- because a `critical` `manifest` candidate is what the
+        # automatic sweep opens a pull request for, and a caveat in its
+        # excerpt stops nothing.
         span_gap = pools_failure or "the node pools list names no zone"
         span_gap = f"the cluster lists no node locations, and {span_gap}"
         unevaluated["ccc-missing-fallbacks"] = (
