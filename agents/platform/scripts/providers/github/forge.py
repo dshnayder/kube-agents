@@ -327,12 +327,14 @@ class GitHubForge(Forge):
         pulls = self._pulls_by_number(api, repo, params["state"], wanted)
         proposals = [translate.proposal(pulls[number]) for number in wanted]
         if "head" in params:
+            # GitHub logins are case-insensitive, and so is the `head=` filter
+            # this stands in for; `sourceRepo` is the owner's canonical spelling.
             owner, _, branch = params["head"].partition(":")
             proposals = [
                 item
                 for item in proposals
                 if item["source"] == branch
-                and item["sourceRepo"].split("/")[0] == owner
+                and item["sourceRepo"].split("/")[0].casefold() == owner.casefold()
             ]
         if "base" in params:
             proposals = [item for item in proposals if item["target"] == params["base"]]

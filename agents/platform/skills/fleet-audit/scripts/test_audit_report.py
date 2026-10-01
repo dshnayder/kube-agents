@@ -18513,6 +18513,23 @@ class TestDetectContentMode(BaseTestCase):
             audit_report.detect_content_mode()
         self.assertIn("connection reset", str(raised.exception))
 
+    def test_the_skill_tells_this_refusal_from_the_in_flight_guard(self):
+        """Review finding: both refusals print `START REFUSED`, and the skill
+        read every one as the in-flight guard -- "say the stream is already
+        running and stop" -- when this one holds no note and wants a re-run
+        once the broker answers. The skill keys on the wording this raises."""
+        self.probe(False)
+        with self.assertRaises(audit_report.StartRefused) as raised:
+            audit_report.detect_content_mode()
+        self.assertIn("the broker at", str(raised.exception))
+        skill = Path(__file__).resolve().parents[1] / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
+        exit_codes = text.split("One exit 2 is not a document to fix", 1)[1].split("\n### ", 1)[0]
+        for section in (on_demand, exit_codes):
+            self.assertIn("`the broker at`", section)
+            self.assertIn("check the credential-proxy pod and re-run", " ".join(section.split()))
+
 
 if __name__ == "__main__":
     unittest.main()

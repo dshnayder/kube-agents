@@ -2303,6 +2303,25 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual([p["number"] for p in answer["proposals"]], [3])
         self.assertEqual(answer["proposals"][0]["closed"], "")
 
+    def test_a_labelled_source_filter_matches_the_owner_in_any_case(self):
+        # Review finding: GitHub logins are case-insensitive and `head=` treats
+        # them so, but the labelled path compared the typed owner with the
+        # forge's canonical spelling and answered "no proposal on this branch".
+        page = [{"number": 3, "pull_request": {}}]
+        pull = {
+            "number": 3,
+            "state": "open",
+            "user": {"login": "u"},
+            "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+            "base": {"ref": "main"},
+            "closed_at": None,
+        }
+        broker, _ = self.broker(page, pull)
+        answer = broker.proposal_list(
+            {"repository": "Acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix"}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3])
+
     @staticmethod
     def labelled(numbers):
         return [{"number": n, "pull_request": {}} for n in numbers]
