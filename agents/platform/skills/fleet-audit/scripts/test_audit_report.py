@@ -3127,6 +3127,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "new": 1,
                 "resolved": 0,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3188,6 +3189,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "new": 1,
                 "resolved": 1,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3884,6 +3886,7 @@ class TestFinishClean(HarnessTestCase):
                 "new": 0,
                 "resolved": 2,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3918,6 +3921,7 @@ class TestFinishClean(HarnessTestCase):
                 "new": 0,
                 "resolved": 0,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": True,
                 "partial": False,
@@ -9448,6 +9452,34 @@ def pr(number, branch, state="OPEN", merged_at=None, body="", url=None):
     }
 
 
+class TestStillOpenPrUrls(BaseTestCase):
+    def test_a_shared_pull_request_is_listed_once(self):
+        shared = pr(5, "b")
+        self.assertEqual(
+            audit_report.still_open_pr_urls({"a": shared, "b": shared}, []),
+            [shared["url"]],
+        )
+
+    def test_one_this_run_opened_is_not_listed_again(self):
+        fresh = pr(8, "b")
+        self.assertEqual(
+            audit_report.still_open_pr_urls({"a": fresh}, [fresh["url"]]), []
+        )
+
+    def test_only_open_ones_with_a_url_count(self):
+        self.assertEqual(
+            audit_report.still_open_pr_urls(
+                {
+                    "closed": pr(1, "x", state="CLOSED"),
+                    "none": None,
+                    "nourl": {"state": "OPEN", "url": ""},
+                },
+                [],
+            ),
+            [],
+        )
+
+
 class TestSelectPrByHead(BaseTestCase):
     def test_highest_number_wins(self):
         # A branch reused after its first PR merged must report the live one.
@@ -10157,6 +10189,35 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         out = self.stdout_json()
         self.assertEqual(out["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(out["prs_still_open"], [])
+
+    def test_a_fix_already_open_is_reported_rather_than_reopened(self):
+        # The second run over the same finding: the sweep passes over it
+        # because its branch carries a live pull request, and `prs_opened` is
+        # empty. Without `prs_still_open` the report could not tell that from
+        # a run that proposed nothing.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["pr list"] = json.dumps([pr(5, branch)])
+        self.assertEqual(self.run_finish(doc), 0)
+        out = self.stdout_json()
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual(out["prs_still_open"], ["https://github.com/acme/fleet/pull/5"])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+
+    def test_a_closed_or_unrelated_pull_request_is_not_reported_open(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["pr list"] = json.dumps(
+            [
+                pr(5, branch, state="MERGED", merged_at="2026-07-01T00:00:00Z"),
+                pr(6, "platform-agent/fix-someone-else"),
+            ]
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.stdout_json()["prs_still_open"], [])
 
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
@@ -19057,8 +19118,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     partial, and the line now covers both causes. And `AUTO_PROMOTION_FLOOR`
     moving from `critical` to `major` promotes the `major` manifest finding in
     `two_findings`, so the findings path and the dry run each open a second
-    pull request (the recorded reply gives both the same URL). Nothing else
-    moved.
+    pull request (the recorded reply gives both the same URL). And the JSON
+    line carries `prs_still_open`, the remediation pull requests already open
+    on findings the run still carries, empty in every scenario here. Nothing
+    else moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

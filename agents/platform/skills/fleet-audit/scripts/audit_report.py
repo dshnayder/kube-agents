@@ -2281,6 +2281,7 @@ def report_envelope(
         UNCORROBORATED_FINDINGS_KEY: list(payload.get(UNCORROBORATED_FINDINGS_KEY) or []),
         # URL lists, not counts: a count cannot be clicked.
         "prs_opened": list(payload.get("prs_opened") or []),
+        "prs_still_open": list(payload.get("prs_still_open") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
         "ledger_held_open": ledger_held_open,
@@ -10207,6 +10208,30 @@ def reconcile_remediation_prs(
     return pr_by_finding, url_by_finding
 
 
+def still_open_pr_urls(
+    pr_by_finding: dict[str, dict | None], opened: list[str]
+) -> list[str]:
+    """The open remediation pull requests on this run's findings it did not open.
+
+    The sweep passes over a finding whose branch already carries a live pull
+    request, and `prs_opened` lists only what this run created, so a run that
+    found the fix already waiting for review used to report no pull request at
+    all. A reader cannot tell that from "no fix was proposed". One URL per pull
+    request, since a group of findings shares one.
+    """
+    seen = set(opened)
+    urls: list[str] = []
+    for fid in sorted(pr_by_finding):
+        pr = pr_by_finding[fid] or {}
+        url = str(pr.get("url", "") or "")
+        if str(pr.get("state", "") or "").upper() != "OPEN" or not url:
+            continue
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
 def snapshot_paths(root: Path, paths: list[str]) -> dict[str, bytes]:
     """Read the remediation files before any branch switch touches them.
 
@@ -13496,6 +13521,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "new": 0,
             "resolved": clean_resolved,
             "prs_opened": [],
+            "prs_still_open": [],
             "prs_closed": prs_closed,
             # Same rule as the findings branch below — see the long note
             # there. A clean run is the *usual* silent one, but not
@@ -13903,6 +13929,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         "new": reported_new,
         "resolved": reported_resolved,
         "prs_opened": prs_opened,
+        # Already open before this run, on findings it still carries. Listed
+        # so the report can name the fix that is waiting for review; it moves
+        # nothing, so it plays no part in `silent_ok`.
+        "prs_still_open": still_open_pr_urls(pr_by_finding, prs_opened),
         "prs_closed": prs_closed,
         # The `[SILENT]` verdict, computed rather than re-derived.
         #
