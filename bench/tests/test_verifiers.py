@@ -2209,6 +2209,68 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
     assert "BEFORE this run started" in res.reason
 
 
+# An hour before _RUN_START: the job leased its project, and rep 1 ran then.
+_LEASE_START = datetime(2026, 8, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+
+
+def test_a_pull_request_an_earlier_rep_of_this_lease_opened_passes_with_the_option(
+    token, github, monkeypatch
+):
+    """#2228: a fleet audit's `finish` finds rep 1's pull request open on its
+    branch and pushes nothing, and the presubmit cannot close it between reps.
+    Opened and pushed after the lease began, it is this job's work."""
+    monkeypatch.setenv(verifiers.LEASE_STARTED_ENV_VAR, str(_LEASE_START))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z")
+    res = _pr_check(accepts_lease_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "earlier in this lease" in res.reason
+    # Without the option the same pull request is the leftover #1755 guards.
+    assert _pr_check().verify(5.0).status == "fail"
+
+
+def test_a_pull_request_from_before_the_lease_fails_with_the_option(
+    token, github, monkeypatch
+):
+    monkeypatch.setenv(verifiers.LEASE_STARTED_ENV_VAR, str(_LEASE_START))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check(accepts_lease_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this lease began" in res.reason
+
+
+def test_a_head_commit_from_before_the_lease_fails_with_the_option(
+    token, github, monkeypatch
+):
+    """Written to during the lease, but the fix itself was pushed before it."""
+    monkeypatch.setenv(verifiers.LEASE_STARTED_ENV_VAR, str(_LEASE_START))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T08:30:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-20T09:00:20Z")
+    res = _pr_check(accepts_lease_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "before this lease began" in res.reason
+
+
+@pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
+def test_without_a_readable_lease_the_option_measures_from_the_run(
+    token, github, monkeypatch, raw
+):
+    """A local run exports no lease, and an unreadable one is not a licence."""
+    monkeypatch.setenv(verifiers.LEASE_STARTED_ENV_VAR, raw)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z")
+    res = _pr_check(accepts_lease_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+
+
 def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
     """submit_suggestion.py derives the branch from the change, so rep 2 pushes
     onto rep 1's branch, `gh pr create` answers "already exists", and the skill

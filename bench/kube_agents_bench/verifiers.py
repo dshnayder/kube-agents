@@ -391,6 +391,11 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# When the eval job leased its project, in epoch seconds; hack/ci-eval-pr.sh
+# exports it before the lease's ledger reset. Read only by
+# PullRequestOpenedVerifier's `accepts_lease_pull_request`.
+LEASE_STARTED_ENV_VAR = "EVAL_LEASE_STARTED_AT"
+
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
 # scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
@@ -503,6 +508,16 @@ _NO_PR_RUN_CLOCK_REASON = (
     "is unset), so this check cannot tell a pull request this run opened from "
     "one left behind by a previous run, and refuses to grade it"
 )
+
+def _lease_started() -> datetime | None:
+    """When the job leased its project, from LEASE_STARTED_ENV_VAR; None if unset or unreadable."""
+    raw = os.environ.get(LEASE_STARTED_ENV_VAR, "").strip()
+    try:
+        stamp = float(raw)
+        return datetime.fromtimestamp(stamp, tz=timezone.utc) if stamp > 0 else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
 
 _NO_PR_URL_REASON = (
     "the run's report names no github.com pull request URL, so no fix was "
@@ -1397,6 +1412,18 @@ class PullRequestOpenedVerifier(BaseVerifier):
     run, that the candidate does not contain that one's head revision, and
     that the report names that one too.
 
+    With ``accepts_lease_pull_request`` the two "since this run started"
+    clauses measure from the lease instead (``EVAL_LEASE_STARTED_AT``, which
+    ``hack/ci-eval-pr.sh`` exports), so a pull request an earlier repetition
+    of this job opened passes when the reply names it. That is for a fleet
+    audit, whose ``finish`` reports the pull request already open on its branch
+    and pushes nothing: the presubmit holds no credential to close it between
+    repetitions (docs/ci-pool-projects.md 5.3), and without the option
+    repetitions 2 and 3 can only fail. The pool sweep closes whatever a lease
+    leaves behind, so anything created since the lease began is this job's.
+    With the variable unset -- a local run -- the clauses measure from the run
+    as they otherwise do.
+
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
     credential is known to reach (``issues: read`` — see
@@ -1432,6 +1459,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
     # needs `pull_requests: read`.
     reuses_spent_branch: bool = False
+    # Measure "written since" and "head commit since" from the lease rather
+    # than the run, so a later repetition passes on the pull request an earlier
+    # one opened and this one found already open. See the docstring.
+    accepts_lease_pull_request: bool = False
 
     def _spent_before(
         self,
@@ -1784,6 +1815,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        # The floor every "since" clause below measures from: the run, or with
+        # accepts_lease_pull_request the lease, when the job exported one.
+        since, since_what = started, "this run started"
+        if self.accepts_lease_pull_request:
+            leased = _lease_started()
+            if leased is not None and leased < started:
+                since, since_what = leased, "this lease began"
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
@@ -1839,11 +1877,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # the reason names both readings.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
-            age = (started - touched).total_seconds()
+            age = (since - touched).total_seconds()
             if age > self.max_clock_skew_sec:
                 rejected.append(
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
-                    f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                    f"BEFORE {since_what} ({since.isoformat()}) — a leftover "
                     "an earlier run opened, which this run either quoted or "
                     "resubmitted unchanged"
                 )
@@ -1866,10 +1904,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
                 continue
-            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+            if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
                 rejected.append(
                     f"{slug}: its head commit dates from {pushed.isoformat()}, "
-                    f"before this run started ({started.isoformat()}) — this run "
+                    f"before {since_what} ({since.isoformat()}) — this run "
                     "wrote to a pull request an earlier one pushed the fix to"
                 )
                 continue
@@ -1889,10 +1927,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 if rejection:
                     rejected.append(rejection)
                     continue
+            during = (
+                "during this run" if touched >= started
+                else f"earlier in this lease (found already open; {since_what} at "
+                f"{since.isoformat()})"
+            )
             return done(
                 True,
                 f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, during this run, and carries "
+                f"{touched.isoformat()}, {during}, and carries "
                 f"{changed if changed is not None else 'an unreported number of'} "
                 "changed file(s)"
                 + (", on a branch this run's closed pull request had used"

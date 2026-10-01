@@ -1447,6 +1447,15 @@ release_inflight_note() { # <label> <audit-id>
   return 0
 }
 
+# When this job's lease began, for pull_request_opened's
+# accepts_lease_pull_request (bench/kube_agents_bench/verifiers.py): a fleet
+# audit's later repetition finds the remediation pull request an earlier one
+# opened and pushes nothing, and nothing here may close it between repetitions
+# (docs/ci-pool-projects.md 5.3). Taken before the reset, so every repetition
+# starts after it.
+EVAL_LEASE_STARTED_AT="$(date -u +%s)"
+export EVAL_LEASE_STARTED_AT
+
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 reset_audit_ledgers "lease"
 
