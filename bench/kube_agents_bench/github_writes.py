@@ -57,13 +57,30 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from kube_agents_bench.forges import (
+    FORGE_ENV_VAR,
+    FORGE_GITLAB,
+    FORGES,
+    GITHUB_API_ROOT,
+    GITLAB_AGENT_LOGIN_ENV_VAR,
+    GITLAB_DEFAULT_HOST,
+    GITLAB_HOST_ENV_VAR,
+    UnknownForge,
+    forge_name,
+    gitlab_agent_login,
+    gitlab_host,
+    gitlab_project_path,
+    is_gitlab_token_bot,
+    proposal_refs,
+    token_env_vars,
+)
 
 __all__ = [
     "AGENT_BRANCH_PREFIX",
@@ -86,6 +103,7 @@ __all__ = [
     "parse_github_time",
     "proposal_numbers_named",
     "token_env_vars",
+    "UnknownForge",
 ]
 
 #: Where the run learns the case's GitOps repository, ``owner/name``.
@@ -115,37 +133,6 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: The ``ref`` prefix the refs listing returns.
 REFS_HEADS_PREFIX = "refs/heads/"
 
-GITHUB_API_ROOT = "https://api.github.com"
-
-#: Which forge the case's GitOps repository is on: ``github`` (the default,
-#: and every pool project today) or ``gitlab``. Set beside
-#: ``BENCH_GITOPS_REPO``; a GitLab repository is its full project path,
-#: ``group/subgroup/project``, nested as deep as the group is.
-FORGE_ENV_VAR = "BENCH_FORGE"
-FORGE_GITHUB = "github"
-FORGE_GITLAB = "gitlab"
-FORGES = (FORGE_GITHUB, FORGE_GITLAB)
-#: The GitLab instance, ``gitlab.com`` unless a self-managed one is named.
-GITLAB_HOST_ENV_VAR = "BENCH_GITLAB_HOST"
-GITLAB_DEFAULT_HOST = "gitlab.com"
-#: The agent's GitLab username, for an install whose credential is not a
-#: token bot. A GitLab project or group access token writes as a bot user
-#: (``project_<id>_bot_<hex>``, ``group_<id>_bot_<hex>``), which the
-#: ownership test recognises on its own, as it does a GitHub ``[bot]``. On
-#: gitlab.com Free there are no such tokens, and the agent writes as an
-#: ordinary account holding a personal access token -- nothing marks it, so
-#: the run names it here. Unset with no token bot, nothing counts as the
-#: agent's, and the check reports no pull requests rather than every
-#: person's.
-GITLAB_AGENT_LOGIN_ENV_VAR = "BENCH_GITLAB_AGENT_LOGIN"
-#: A GitLab project or group access token's bot username. Must match
-#: ``_TOKEN_BOT_RE`` in ``agents/platform/scripts/providers/gitlab/translate.py``,
-#: the broker's own reading of the same marking.
-_GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+)?$")
-#: The grading credential per forge, first set wins. GitLab's is a group or
-#: project access token with ``read_api``; nothing is minted for it.
-GITHUB_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
-GITLAB_TOKEN_ENV_VARS = ("BENCH_GITLAB_TOKEN",)
 #: GitHub's page cap, and a bound on pages walked. The listing is read newest
 #: update first and stops at the first entry older than the window, so a pool
 #: repository with dozens of leftovers costs one page; the bound is for a
@@ -484,10 +471,7 @@ class GitLabClient:
         """``(status, decoded body)`` for one API path under the root."""
         return self._transport(self._root + path, self._token, self._timeout)
 
-    @staticmethod
-    def project_path(repo: str) -> str:
-        """``/projects/<encoded full path>``, the prefix of every project read."""
-        return "/projects/" + urllib.parse.quote(repo, safe="")
+    project_path = staticmethod(gitlab_project_path)
 
     @staticmethod
     def pull_fields(pull: dict[str, Any], repo: str) -> PullFields:
@@ -638,35 +622,6 @@ class GitLabClient:
             )
 
 
-def is_gitlab_token_bot(user: dict[str, Any]) -> bool:
-    """Whether a GitLab user object is an automation: ``bot: true`` where the
-    API includes it, else a token bot's username."""
-    if user.get("bot") is True:
-        return True
-    return bool(_GITLAB_TOKEN_BOT_RE.match(str(user.get("username") or "")))
-
-
-def forge_name(environ: dict[str, str] | None = None) -> str:
-    """The case's forge from ``BENCH_FORGE``, ``github`` when unset.
-
-    Raises :class:`GitHubUnreadable` for a value it does not know: grading a
-    GitLab project against GitHub would read an unrelated repository, or none.
-    """
-    env = os.environ if environ is None else environ
-    name = (env.get(FORGE_ENV_VAR) or FORGE_GITHUB).strip().lower()
-    if name not in FORGES:
-        raise GitHubUnreadable(
-            f"{FORGE_ENV_VAR}={name!r} is not a forge this check reads "
-            f"({', '.join(FORGES)}); this check could not be evaluated"
-        )
-    return name
-
-
-def token_env_vars(forge: str) -> tuple[str, ...]:
-    """The environment variables the grading credential is read from, first set wins."""
-    return GITLAB_TOKEN_ENV_VARS if forge == FORGE_GITLAB else GITHUB_TOKEN_ENV_VARS
-
-
 def client_for(
     forge: str,
     token: str,
@@ -676,28 +631,8 @@ def client_for(
 ) -> GitHubClient | GitLabClient:
     """The client for ``forge``; a GitLab one on ``BENCH_GITLAB_HOST`` when set."""
     if forge == FORGE_GITLAB:
-        env = os.environ if environ is None else environ
-        host = (env.get(GITLAB_HOST_ENV_VAR) or GITLAB_DEFAULT_HOST).strip()
-        login = (env.get(GITLAB_AGENT_LOGIN_ENV_VAR) or "").strip()
-        return GitLabClient(token, transport, timeout, host, agent_login=login)
+        return GitLabClient(token, transport, timeout, gitlab_host(environ), agent_login=gitlab_agent_login(environ))
     return GitHubClient(token, transport, timeout)
-
-
-_GITHUB_PULL_URL_RE = re.compile(
-    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)/pull/(\d+)",
-    re.IGNORECASE,
-)
-
-
-def _gitlab_merge_request_url_re(host: str) -> re.Pattern[str]:
-    """A merge request's web URL on ``host``: the project's full path, nested
-    as deep as its groups, then ``/-/merge_requests/<iid>``."""
-    return re.compile(
-        rf"https://{re.escape(host)}/([A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.][A-Za-z0-9_.-]*)+)"
-        r"/-/merge_requests/(\d+)",
-        re.IGNORECASE,
-    )
-
 
 def proposal_numbers_named(
     text: str, repo: str, forge: str, environ: dict[str, str] | None = None
@@ -705,14 +640,7 @@ def proposal_numbers_named(
     """The numbers of every pull request (GitLab: merge request) of ``repo``
     whose web URL ``text`` carries in full. A URL of another repository, or
     of the other forge, names nothing here."""
-    if forge == FORGE_GITLAB:
-        env = os.environ if environ is None else environ
-        host = (env.get(GITLAB_HOST_ENV_VAR) or GITLAB_DEFAULT_HOST).strip()
-        pattern = _gitlab_merge_request_url_re(host)
-    else:
-        pattern = _GITHUB_PULL_URL_RE
-    return {int(n) for path, n in pattern.findall(text) if path.lower() == repo.lower()}
-
+    return {n for path, n in proposal_refs(text, forge, environ) if path.lower() == repo.lower()}
 
 def parse_github_time(value: Any) -> datetime | None:
     """A GitHub API timestamp (``2026-09-25T17:32:18Z``) as an aware datetime, or None."""
@@ -884,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         forge = args.forge or forge_name()
-    except GitHubUnreadable as exc:
+    except UnknownForge as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREADABLE
     names = token_env_vars(forge)

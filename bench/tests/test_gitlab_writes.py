@@ -160,7 +160,7 @@ def test_the_forge_defaults_to_github():
 
 
 def test_an_unknown_forge_is_refused():
-    with pytest.raises(github_writes.GitHubUnreadable, match="bitbucket"):
+    with pytest.raises(github_writes.UnknownForge, match="bitbucket"):
         github_writes.forge_name({github_writes.FORGE_ENV_VAR: "bitbucket"})
 
 
