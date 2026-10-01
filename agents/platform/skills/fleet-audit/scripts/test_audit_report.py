@@ -9225,8 +9225,8 @@ class TestLabelDescriptions(HarnessTestCase):
     """Every label `ensure_labels` creates has to be creatable.
 
     GitHub caps a label description at 100 characters and answers `422` past
-    it. `gh label create` runs with `check=False`, so the failure is silent and
-    the label simply never exists — which for `audit:stale-closed` means every
+    it. `ensure_labels` creates each label best-effort, so the failure is silent
+    and the label simply never exists — which for `audit:stale-closed` means every
     harness close reads as a human rejection and no finding is re-proposed.
     """
 
@@ -9355,8 +9355,8 @@ class TestRemediationBaseBranch(HarnessTestCase):
     Hardcoding `main` did not degrade on a repository that uses something else,
     it aborted: `git fetch origin main` fails, and the remediation half of the
     run dies after the findings have already been written and the ledger
-    updated. So these assert the fetch, the checkout *and* the `--base` handed
-    to `gh pr create` — all three have to agree, and a fix that only changed
+    updated. So these assert the fetch, the checkout *and* the `target` handed
+    to `proposal-create` — all three have to agree, and a fix that only changed
     the fetch would open pull requests against a branch they were never cut
     from.
     """
@@ -9749,6 +9749,16 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertEqual(self.stdout_json()["prs_opened"], [])
         self.assertIn("could not publish the fix", self.err)
 
+    def test_a_failed_label_after_create_does_not_fail_the_run(self):
+        # The pull request exists but carries no label to be found by, so it
+        # is not reported as opened; the next run's refused create adopts it.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.failures = {"proposal-update labelsAdd=agent:audit": 1}
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertIn("could not publish the fix", self.err)
+
 
 class TestRemediateOnACleanRun(HarnessTestCase):
     """A command standing on a ledger the morning the fleet comes back clean.
@@ -9777,6 +9787,17 @@ class TestRemediateOnACleanRun(HarnessTestCase):
 
     def issue_comments(self):
         return self.harness.forge_calls("issue-comment")
+
+    def test_a_requester_the_forge_cannot_answer_for_gets_no_reply(self):
+        # An outage, not a refusal: nothing is written to a maintainer on it.
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"identity login=operator": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        bodies = self.harness.bodies_for("issue-comment")
+        self.assertEqual(
+            [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
+        )
+        self.assertIn("could not tell whether @operator may write", self.err)
 
     def test_a_standing_request_is_answered_before_the_ledger_closes(self):
         self.harness.replies = self.replies([self.comment()])
@@ -12069,7 +12090,13 @@ class TestFindExistingIssue(HarnessTestCase):
 class TestReadCommentsAuthorship(HarnessTestCase):
     def read(self, comments, *, standing=False):
         self.harness.replies = {"issue-view comments": comments_view({"comments": comments})}
-        return audit_report.read_comments("issue-view", "acme/fleet", 42, standing=standing)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            records = audit_report.read_comments(
+                "issue-view", "acme/fleet", 42, standing=standing
+            )
+        self.err = err.getvalue()
+        return records
 
     def test_a_user_token_install_recognises_its_own_comments(self):
         # Under an operator's own token the install's comments are a person's,
@@ -12093,6 +12120,32 @@ class TestReadCommentsAuthorship(HarnessTestCase):
             [r["authorAssociation"] for r in records], ["NONE", "COLLABORATOR"]
         )
         self.assertEqual(self.harness.forge_calls("identity", login=""), [])
+
+    def test_a_requester_the_forge_cannot_answer_for_leaves_it_unreadable(self):
+        # Not a refusal: a refusal is a public reply and a permanent marker,
+        # and an outage must not write one to a maintainer.
+        self.harness.failures = {"identity login=dev": 1}
+        self.assertIsNone(self.read([comment("/remediate a")], standing=True))
+        self.assertIn("could not tell whether @dev may write", self.err)
+
+    def test_only_the_authors_of_requests_are_asked_about(self):
+        # Nothing reads a bystander's standing, so their outage must not cost
+        # the request on the same thread its run, and each costs a round trip.
+        self.harness.failures = {"identity login=alice": 1}
+        records = self.read(
+            [
+                comment("looks right to me", login="alice"),
+                comment("/remediate a", login="bob", node_id="IC_2"),
+                comment("thanks", login="carol", node_id="IC_3"),
+            ],
+            standing=True,
+        )
+        self.assertIsNotNone(records)
+        self.assertEqual(records[1]["authorAssociation"], "COLLABORATOR")
+        self.assertEqual(
+            [call["login"] for call in self.harness.forge_calls("identity", login=...)],
+            ["bob"],
+        )
 
 
 class TestRemediationPrPaging(HarnessTestCase):

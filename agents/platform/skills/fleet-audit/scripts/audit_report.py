@@ -8830,7 +8830,10 @@ def read_comments(
       makes the whole read unreadable, not a refusal: that answer is a public
       reply and a permanent marker, and a five-second outage must not write one
       to a maintainer. An automation's comment is never asked about, because
-      `is_machine_author` sets it aside whatever its standing.
+      `is_machine_author` sets it aside whatever its standing. Nor is a comment
+      that names no `/remediate` and was not written by this install: nothing
+      reads its standing, so it carries none, and a bystander the forge could
+      not answer for does not cost every request on the thread its run.
 
     Only the conversation tab: on a pull request that is where every marker
     this harness writes is, and where `gh pr view --json comments` read.
@@ -8868,7 +8871,8 @@ def read_comments(
             "author": {"login": login, "is_bot": bot},
             "viewerDidAuthor": bool(viewer) and _login_key(login) == viewer,
         }
-        if standing and not bot:
+        needs_standing = record["viewerDidAuthor"] or "/remediate" in record["body"]
+        if standing and not bot and needs_standing:
             key = _login_key(login)
             if not key:
                 # A deleted account: nobody, so not a writer. A settled answer,

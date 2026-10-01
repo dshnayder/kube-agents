@@ -661,9 +661,10 @@ directory's own profile.d entry always has. A missed prepend is a
 `git: not found` on the first call rather than a silent forward, which is the
 other thing deleting the shim buys.
 
-The wrapper applies to the agent's own `git` what `vcs.py` applies to its calls:
-`core.hooksPath` pointed at an empty, root-owned directory, `core.fsmonitor`
-off, `protocol.ext.allow=never`, and no system config. `-c` outranks every
+The wrapper gives the agent's own `git` `core.hooksPath` pointed at an empty,
+root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`, and no
+system config — the hooks, `ext` and system-config settings `vcs.py` gives its
+own calls, plus `fsmonitor`. `-c` outranks every
 config file, so a working copy that sets its own `core.hooksPath` — the step an
 injected `CONTRIBUTING.md` asked for — still gets the empty one. It is not a
 boundary, and does not claim to be. A repository-local `filter.<name>.clean`

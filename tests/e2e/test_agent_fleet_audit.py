@@ -73,7 +73,7 @@ def test_github_token_minting_and_connectivity(
     Step 1 is the only thing that mints on a fresh install: nothing at startup writes the
     proxy's gh credentials, so a probe that skips it passes or fails on whether some earlier
     task happened to mint. The probe therefore fails when the refresh client cannot be found
-    or the refresh fails, instead of falling through to `gh`.
+    or the refresh fails, instead of carrying on to steps 2 and 3 on whatever is cached.
     """
     if not gke_cluster_name or not github_repo:
         pytest.fail("GKE cluster name and GITHUB_REPO are required for live GitHub connectivity probe.")

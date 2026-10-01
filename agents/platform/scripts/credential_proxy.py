@@ -5849,8 +5849,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             _sanitize_for_logging(argv[0]),
         )
         # Decided once, before any gate: every outcome below is counted under
-        # the same two labels, and a refused executable is counted as `other`
-        # rather than under its own name.
+        # the same two labels. An executable outside the image's allowlist is
+        # counted as `other`; one the image has but this route refuses (git)
+        # is counted under its own name.
         tool_label, subcommand_label = _tool_labels(argv)
         if (
             argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES
