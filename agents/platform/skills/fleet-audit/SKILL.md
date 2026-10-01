@@ -338,8 +338,8 @@ that file has to end up; fetch it, edit it in place, and name the same path in t
 
 The collectors do not need them. Handed the scratch workspace as `--workspace`, `collect.py` and
 `fleet_waste.py` copy the repository's YAML out of the broker into a private directory and index that,
-so candidates carry `declaration`, `release_declaration` and `namespace_directory` in content mode as
-they do from a clone. When it cannot read the whole tree it logs a `WARNING` naming why and annotates nothing; the
+so candidates carry `declaration` and `release_declaration` (and, from `collect.py` alone,
+`namespace_directory`) in content mode as they do from a clone. When it cannot read the whole tree it logs a `WARNING` naming why and annotates nothing; the
 declaration rule's own search is the answer then.
 
 All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this

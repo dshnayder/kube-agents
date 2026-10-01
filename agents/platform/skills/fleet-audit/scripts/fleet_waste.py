@@ -227,7 +227,8 @@ NO_TARGET_REASON = (
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
 # Copied from `collect.py` rather than imported: every collector in this
-# directory runs standalone under `python3 <file>`, and each one that has
+# directory runs standalone under `python3 <file>` (`main` imports `collect`
+# for a workspace that is not a clone, and only then), and each one that has
 # needed a constant a sibling also declares has duplicated it (`SYSTEM_NAMESPACES`
 # is the same value in three of them). Keep these three in step with
 # `collect.py`'s if the repository layout moves.
@@ -6452,22 +6453,13 @@ def main(argv: list[str] | None = None) -> int:
     if workspace is None or (workspace / GIT_DIR_NAME).exists():
         manifest = collect_fleet(args.project, workspace=workspace)
     else:
-        # Content mode: no clone, so the repository is read through the broker
-        # into a private directory, exactly as `collect.py` does. Imported here
-        # rather than at the top so a directory-mode run stays standalone.
-        import tempfile  # noqa: PLC0415
-
+        # Possibly content mode: no clone, so `collect.py`'s mirror decides
+        # which tree to index. Imported here rather than at the top so a run
+        # without one stays standalone.
         import collect  # noqa: PLC0415
 
-        repo = collect.broker_repo(workspace)
-        if repo is None:
-            manifest = collect_fleet(args.project, workspace=workspace)
-        else:
-            with tempfile.TemporaryDirectory(prefix=collect.MIRROR_DIR_PREFIX) as mirror:
-                mirrored = collect.broker_mirror(repo, Path(mirror))
-                manifest = collect_fleet(
-                    args.project, workspace=Path(mirror) if mirrored else workspace
-                )
+        with collect.indexed_workspace(workspace) as indexed:
+            manifest = collect_fleet(args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 

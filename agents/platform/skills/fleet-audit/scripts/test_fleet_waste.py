@@ -7855,7 +7855,7 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                     patch.object(collect, "broker_mirror", side_effect=partial_mirror), \
                     patch("sys.stdout"):
                 fw.main(["--workspace", str(scratch)])
-        self.assertEqual(seen["w"], scratch)
+        self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
 
 if __name__ == "__main__":
     unittest.main()

@@ -9646,6 +9646,8 @@ class _FakeBrokerWorkspace:
         self.refuse = refuse or {}
         self.fail_open = fail_open
         self.opened = []
+        self.reads = []
+        self.extra = {}
 
     def open(self, endpoint, repo, depth=None):
         if self.fail_open:
@@ -9668,6 +9670,7 @@ class _FakeBrokerWorkspace:
         return _FakeListing(entries, truncated=len(names) > self.page_size)
 
     def read_many(self, paths):
+        self.reads.append(list(paths))
         got, skipped = {}, []
         for i, path in enumerate(paths):
             if path in self.refuse:
@@ -9676,6 +9679,7 @@ class _FakeBrokerWorkspace:
                 skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
             else:
                 got[path] = self.files[path]
+        got.update(self.extra)
         return got, skipped
 
 
@@ -9816,6 +9820,32 @@ class TestBrokerMirror(unittest.TestCase):
                 patch("sys.stderr", new_callable=io.StringIO):
             self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
 
+    def test_reads_stay_under_the_brokers_page_length(self):
+        """A broker configured below MIRROR_BATCH_PATHS refuses a larger read whole."""
+        broker = _FakeBrokerWorkspace(self.files(), page_size=2)
+        with TemporaryDirectory() as tmp:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+        self.assertTrue(broker.reads)
+        self.assertLessEqual(max(len(r) for r in broker.reads), 2)
+
+    def test_a_name_the_listing_did_not_carry_abandons_the_mirror(self):
+        broker = _FakeBrokerWorkspace(self.files())
+        broker.extra = {"../escape.yaml": b"kind: X\n"}
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            mirror = Path(tmp) / "mirror"
+            mirror.mkdir()
+            self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
+            self.assertEqual(list(mirror.iterdir()), [])
+            self.assertFalse((Path(tmp) / "escape.yaml").exists())
+
+    def test_a_directory_no_lease_holds_is_walked_quietly(self):
+        """A local run or an exported tree: no broker, no warning, the tree itself."""
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertIsNone(collect.broker_repo(Path(tmp)))
+            with collect.indexed_workspace(Path(tmp)) as indexed:
+                self.assertEqual(indexed, Path(tmp))
+        self.assertEqual(err.getvalue(), "")
+
     def test_main_indexes_the_mirror_in_content_mode(self):
         """End to end through `main`: the scratch path in, the mirror's tree indexed."""
         seen = {}
@@ -9864,7 +9894,7 @@ class TestBrokerMirror(unittest.TestCase):
                     patch("sys.stdout", new_callable=io.StringIO), \
                     patch("sys.stderr", new_callable=io.StringIO):
                 collect.main(["obtainability-audit", "--workspace", str(scratch)])
-        self.assertEqual(seen["workspace"], scratch)
+        self.assertIsNone(seen["workspace"], "a failed mirror indexes nothing, not the scratch")
 
 class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
     """The annotation has to reach the candidate, or the model never sees it.

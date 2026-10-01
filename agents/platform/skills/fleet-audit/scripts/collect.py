@@ -59,6 +59,7 @@ own shell to run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import ipaddress
@@ -72,7 +73,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, Iterator, NamedTuple
 
 MANIFEST_VERSION = 1
 
@@ -8667,40 +8668,41 @@ def broker_repo(workspace: Path) -> str | None:
     """The repository a content-mode scratch workspace stands in for, or None.
 
     None for a clone -- it carries `.git` and the indexes walk it directly --
-    and for anything the lease marker does not name a repository for, which
-    leaves the walk of the directory as the answer, as before.
+    and for a directory no lease holds, which is walked as it is (a local run,
+    an exported tree). A directory a lease holds but names no repository for
+    is the content-mode case gone wrong, and says so.
     """
     if (workspace / GIT_DIR_NAME).exists():
         return None
     gitops_workspace = _import_platform_script("gitops_workspace")
     if gitops_workspace is None:
         log(
-            f"WARNING: {workspace} is not a clone and the lease helper is not importable; "
-            "no candidate will carry a declaration"
+            f"WARNING: {workspace} is not a clone and the lease helper is not importable, "
+            "so a content-mode workspace cannot be read through the broker; walking it as it is"
         )
         return None
     holder = gitops_workspace.lease_holder(workspace)
-    repo = ""
-    if holder is not None:
-        # The `owner__name` directory under the holder first, as
-        # `gitops_workspace.resolve_repo` reads it: one holder can lease more
-        # than one repository, and the marker names whichever was leased last.
-        try:
-            parts = workspace.resolve().relative_to(holder.resolve()).parts
-        except ValueError:
-            parts = ()
-        owner, _, name = parts[0].partition(REPO_DIR_SEPARATOR) if parts else ("", "", "")
-        if owner and name:
-            repo = f"{owner}/{name}"
-        else:
-            record = gitops_workspace.read_lease(holder)
-            repo = str((record or {}).get("repo") or "").strip()
+    if holder is None:
+        return None
+    # The `owner__name` directory under the holder first, as
+    # `gitops_workspace.resolve_repo` reads it: one holder can lease more
+    # than one repository, and the marker names whichever was leased last.
+    try:
+        parts = workspace.resolve().relative_to(holder.resolve()).parts
+    except ValueError:
+        parts = ()
+    owner, _, name = parts[0].partition(REPO_DIR_SEPARATOR) if parts else ("", "", "")
+    if owner and name:
+        return f"{owner}/{name}"
+    record = gitops_workspace.read_lease(holder)
+    repo = str((record or {}).get("repo") or "").strip()
     if not repo:
         log(
-            f"WARNING: {workspace} is not a clone and no lease marker above it names a "
-            "repository; no candidate will carry a declaration"
+            f"WARNING: {workspace} is leased but neither its directory nor the lease "
+            "marker names a repository; no candidate will carry a declaration"
         )
-    return repo or None
+        return None
+    return repo
 
 
 def _mirrored(path: str) -> bool:
@@ -8726,14 +8728,16 @@ def _safe_relative(path: str) -> Path | None:
     return relative
 
 
-def _batches(wanted: list[tuple[str, int]]) -> list[list[str]]:
+def _batches(
+    wanted: list[tuple[str, int]], max_paths: int = MIRROR_BATCH_PATHS
+) -> list[list[str]]:
     """Split `(path, size)` pairs under both per-request batch limits."""
     batches: list[list[str]] = []
     current: list[str] = []
     current_bytes = 0
     for path, size in wanted:
         if current and (
-            len(current) >= MIRROR_BATCH_PATHS or current_bytes + size > MIRROR_BATCH_BYTES
+            len(current) >= max_paths or current_bytes + size > MIRROR_BATCH_BYTES
         ):
             batches.append(current)
             current, current_bytes = [], 0
@@ -8785,8 +8789,14 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         with open_workspace(endpoint, repo, depth=1) as workspace:
             wanted: list[tuple[str, int]] = []
             cursor: str | None = None
+            # A truncated page is as long as the broker lets one request be,
+            # and that limit is configurable below MIRROR_BATCH_PATHS; a read
+            # over it fails whole.
+            max_paths = MIRROR_BATCH_PATHS
             while True:
                 listing = workspace.list(after=cursor)
+                if listing.truncated and listing:
+                    max_paths = min(max_paths, len(listing))
                 for entry in listing:
                     path = str(entry.get("path") or "")
                     if not _mirrored(path):
@@ -8810,7 +8820,7 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                 if not listing or not listing.truncated:
                     break
                 cursor = str(listing[-1].get("path") or "")
-            for batch in _batches(wanted):
+            for batch in _batches(wanted, max_paths):
                 pending = batch
                 # `requestBudget` means ask again for the rest; stop when a
                 # round returns nothing, so a broker that never relents cannot
@@ -8849,6 +8859,29 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     return True
 
 
+@contextlib.contextmanager
+def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
+    """The directory the declaration indexes walk for `--workspace`.
+
+    A clone, or a directory no lease holds, as it is. A content-mode scratch
+    workspace stands in for a repository the broker holds, so that
+    repository's YAML is mirrored into a private directory for the duration,
+    and None -- nothing indexed -- when the mirror fails: the scratch
+    workspace itself is never walked, because after an `audit_report.py
+    fetch` it holds part of the tree, which `broker_mirror` says is worse than
+    none. `fleet_waste.py` uses this too, so the two collectors cannot
+    disagree about which tree they read.
+    """
+    repo = broker_repo(workspace) if workspace is not None else None
+    if repo is None:
+        yield workspace
+        return
+    import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
+
+    with tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX) as mirror:
+        yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
@@ -8880,17 +8913,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         workspace = None
-    repo = broker_repo(workspace) if workspace is not None else None
-    if repo is None:
-        manifest = collect_fleet(args.audit, args.project, workspace=workspace)
-    else:
-        import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
-
-        with tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX) as mirror:
-            # A failed mirror may have written part of the tree, so it is not
-            # indexed; the empty scratch workspace is, exactly as before.
-            indexed = Path(mirror) if broker_mirror(repo, Path(mirror)) else workspace
-            manifest = collect_fleet(args.audit, args.project, workspace=indexed)
+    with indexed_workspace(workspace) as indexed:
+        manifest = collect_fleet(args.audit, args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):
