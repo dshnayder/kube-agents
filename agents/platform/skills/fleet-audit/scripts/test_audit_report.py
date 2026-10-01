@@ -3277,6 +3277,301 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestRevertedGcloudRemediations(HarnessTestCase):
+    """A `gcloud` fix Config Connector will undo is not a fix.
+
+    On 2026-09-05 the drift ledger carried two. `drift-peer-std-4`'s declaration
+    sets `loggingService: none` and the finding said to run
+    `--logging=SYSTEM,WORKLOAD`; `drift-peer-std-9`'s sets `releaseChannel`
+    against a `--release-channel=regular`. Both commands work when pasted and
+    are reverted by the next reconcile, so the finding returns every week having
+    been fixed every week. This is the backstop for the model getting it wrong.
+    """
+
+    CLUSTER = "Cluster/drift-peer-std-4"
+
+    def declare(self, relative, name, spec, kind="ContainerCluster", tree=None):
+        """Write a Config Connector declaration into a clone."""
+        target = (tree or self.workspace) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = [
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1",
+            f"kind: {kind}",
+            "metadata:",
+            f"  name: {name}",
+            "  namespace: kubeagents-system",
+            "spec:",
+        ] + [f"  {line}" for line in spec]
+        target.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return target
+
+    def gcloud_finding(self, note, obj=CLUSTER, fid="drift"):
+        return make_finding(
+            fid=fid,
+            obj=obj,
+            check="workload-identity-off",
+            remediation={"kind": "gcloud", "note": note},
+        )
+
+    def degrade(self, findings, roots=None):
+        return audit_report.degrade_reverted_gcloud_remediations(
+            findings, roots if roots is not None else [("", self.workspace)]
+        )
+
+    def test_a_declared_field_degrades_and_names_the_file(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+        remediation = findings[0]["remediation"]
+        self.assertEqual(remediation["kind"], "manual")
+        # The file is named above the command, and the command stays readable
+        # once the note renders as prose.
+        note = remediation["note"]
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", note)
+        self.assertIn("`loggingService`", note)
+        self.assertLess(note.index("gcp/drift-peer-std-4.yaml"), note.index("```bash"))
+        self.assertIn("```bash\ngcloud container clusters update x --logging=SYSTEM,WORKLOAD\n```", note)
+
+    def test_a_declared_cluster_without_the_field_keeps_its_gcloud_fix(self):
+        # `adam-new-cluster` is declared, but its spec omits
+        # `masterAuthorizedNetworksConfig`. Config Connector holds only the
+        # fields its spec names, so the command sticks; degrading it would
+        # replace a working fix with prose.
+        self.declare(
+            "gcp/adam-new-cluster.yaml",
+            "adam-new-cluster",
+            ["location: us-central1", "releaseChannel:", "  channel: REGULAR"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container clusters update adam-new-cluster "
+                "--enable-master-authorized-networks --master-authorized-networks=10.0.0.0/8",
+                obj="Cluster/adam-new-cluster",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_undeclared_cluster_leaves_gcloud_alone(self):
+        self.declare("gcp/someone-else.yaml", "someone-else", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_name_in_a_label_is_not_a_declaration(self):
+        # `grep "name: <object>"` matches label lines; the index parses.
+        target = self.workspace / "clusters/x/workload.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+            "  name: something-else\n  labels:\n"
+            "    app.kubernetes.io/name: drift-peer-std-4\n"
+            "    tracked-by: container.cnrm.cloud.google.com\n"
+            "spec:\n  loggingService: none\n",
+            encoding="utf-8",
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_prefix_sharing_cluster_is_not_a_declaration(self):
+        self.declare("gcp/drift-peer-std-40.yaml", "drift-peer-std-40", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_resource_id_wins_over_metadata_name(self):
+        self.declare(
+            "gcp/cr.yaml",
+            "some-kcc-object-name",
+            ["resourceID: drift-peer-std-4", "releaseChannel:", "  channel: RAPID"],
+        )
+        findings = [self.gcloud_finding("gcloud ... --release-channel=regular")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_flag_prefix_does_not_match_a_longer_flag(self):
+        # `--logging-variant` writes a node-pool field this table does not claim.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging-variant=MAX_THROUGHPUT")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_the_negated_spelling_of_an_enable_flag_writes_the_same_field(self):
+        self.declare(
+            "gcp/pool.yaml", "spot-pool", ["management:", "  autoUpgrade: true"], kind="ContainerNodePool"
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update spot-pool --no-enable-autoupgrade",
+                obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_manifest_remediation_is_untouched(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [
+            make_finding(
+                obj=self.CLUSTER,
+                remediation={"kind": "manifest", "path": "gcp/drift-peer-std-4.yaml", "note": "--logging=SYSTEM"},
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+
+    def test_a_node_pool_matches_only_a_node_pool_declaration(self):
+        self.declare("gcp/pool.yaml", "spot-pool", ["management:", "  autoUpgrade: false"], kind="ContainerNodePool")
+        pool = self.gcloud_finding(
+            "gcloud container node-pools update spot-pool --enable-autoupgrade", obj="NodePool/spot-pool"
+        )
+        cluster = self.gcloud_finding(
+            "gcloud container clusters update spot-pool --enable-autoupgrade", obj="Cluster/spot-pool", fid="c"
+        )
+        self.assertEqual(self.degrade([pool, cluster]), [pool["id"]])
+        self.assertEqual(cluster["remediation"]["kind"], "gcloud")
+
+    def test_an_unparseable_yaml_file_does_not_stop_the_sweep(self):
+        bad = self.workspace / "gcp/broken.yaml"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\n  bad: [indent\n",
+            encoding="utf-8",
+        )
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_without_pyyaml_the_check_is_off_and_the_fix_stands(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        with patch.dict(sys.modules, {"yaml": None}):
+            self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_unreadable_clone_is_no_declaration(self):
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings, [("", self.tmp_path / "nowhere")]), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def context_checkout(self, slug="acme/platform-infra"):
+        """The leased checkout `start`'s declared-intent search leaves on disk."""
+        owner, _, name = slug.partition("/")
+        tree = self.gitops_root / f"{AUDIT}{audit_report.CLONE_LEASE_SUFFIX}" / f"{owner}__{name}"
+        (tree / ".git").mkdir(parents=True)
+        return tree
+
+    def test_a_context_repository_declaration_is_found_and_named(self):
+        tree = self.context_checkout()
+        self.declare("kcc/clusters.yaml", "drift-peer-std-4", ["loggingService: none"], tree=tree)
+        record = {"repo": "acme/fleet", "context_repos": ["acme/fleet", "acme/platform-infra"]}
+        roots = audit_report.kcc_declaration_roots(AUDIT, self.workspace, record)
+        self.assertEqual(roots, [("", self.workspace), ("acme/platform-infra", tree)])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings, roots), [findings[0]["id"]])
+        self.assertIn(
+            "in the context repository `acme/platform-infra` at `kcc/clusters.yaml`",
+            findings[0]["remediation"]["note"],
+        )
+
+    def test_the_gitops_declaration_wins_a_name_both_repositories_carry(self):
+        tree = self.context_checkout()
+        self.declare("kcc/clusters.yaml", "drift-peer-std-4", ["loggingService: none"], tree=tree)
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        roots = audit_report.kcc_declaration_roots(
+            AUDIT, self.workspace, {"repo": "acme/fleet", "context_repos": ["acme/platform-infra"]}
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.degrade(findings, roots)
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", findings[0]["remediation"]["note"])
+
+    def test_only_checkouts_are_roots(self):
+        # In content mode the GitOps path is a scratch directory of this run's
+        # own manifests, and a context repository `start` never checked out
+        # (or whose lease was reaped) is not on disk.
+        scratch = self.tmp_path / "scratch-tree"
+        scratch.mkdir()
+        record = {"repo": "acme/fleet", "context_repos": ["acme/never-cloned"]}
+        self.assertEqual(audit_report.kcc_declaration_roots(AUDIT, scratch, record), [])
+        self.assertEqual(audit_report.kcc_declaration_roots(AUDIT, None, None), [])
+
+    def test_finish_publishes_the_degraded_fix(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        doc = make_doc(findings=[self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertIn("Config Connector declaration holds", self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
+
+    def broker_scan(self, files, rounds):
+        """`kcc_declarations_via_broker` against a broker answering `rounds` in turn.
+
+        Each round is the `skipped` list one `read_many` returns; every path
+        not skipped in that round comes back.
+        """
+        answers = iter(rounds)
+
+        class FakeWorkspace:
+            def grep(self, pattern, **_):
+                return {
+                    "matches": [{"path": path, "line": 1, "text": pattern} for path in files],
+                    "total": len(files),
+                    "truncated": False,
+                }
+
+            def read_many(self, paths):
+                skipped = next(answers)
+                held = {entry["path"] for entry in skipped}
+                return {p: files[p].encode() for p in paths if p not in held}, skipped
+
+        @contextlib.contextmanager
+        def opened(*_, **__):
+            yield FakeWorkspace()
+
+        with patch.object(credential_proxy_client.Workspace, "open", opened):
+            return audit_report.kcc_declarations_via_broker("acme/fleet")
+
+    KCC_TEXT = (
+        "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\n"
+        "metadata:\n  name: {name}\nspec:\n  loggingService: none\n"
+    )
+
+    def test_a_request_budget_skip_is_asked_for_again(self):
+        files = {
+            "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
+            "gcp/b.yaml": self.KCC_TEXT.format(name="b"),
+        }
+        scan = self.broker_scan(files, [[{"path": "gcp/b.yaml", "reason": "requestBudget"}], []])
+        self.assertFalse(scan.truncated)
+        self.assertEqual(
+            sorted(scan.declarations), [("ContainerCluster", "a"), ("ContainerCluster", "b")]
+        )
+        self.assertEqual(scan.declarations[("ContainerCluster", "b")].path, "gcp/b.yaml")
+
+    def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
+        files = {
+            "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
+            "gcp/big.yaml": self.KCC_TEXT.format(name="big"),
+        }
+        scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
+        self.assertTrue(scan.truncated)
+        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a")])
+
+    def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
+        files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
+        stuck = [{"path": "gcp/a.yaml", "reason": "requestBudget"}]
+        scan = self.broker_scan(files, [stuck, stuck, stuck])
+        self.assertTrue(scan.truncated)
+        self.assertEqual(scan.declarations, {})
+
+    def test_the_dry_run_previews_the_degraded_fix(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        doc = make_doc(findings=[self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")])
+        self.assertEqual(self.run_finish(doc, argv_extra=("--dry-run",)), 0, self.err)
+        self.assertIn("DRY RUN: ", self.err)
+        self.assertIn("degrades to manual, naming the file", self.err)
+        self.assertIn("gcp/drift-peer-std-4.yaml", self.out)
+
+
 class TestPublishedBodies(HarnessTestCase):
     """What reaches GitHub, read back off the body each `gh` call carried.
 
@@ -13327,6 +13622,103 @@ class ContentModeTestCase(BaseTestCase):
         self.assertTrue(
             [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
         )
+
+    # -- the Config Connector backstop, read through the broker ------------ #
+
+    KCC_CLUSTER = "Cluster/drift-peer-std-4"
+    KCC_FIX = "gcloud container clusters update x --logging=SYSTEM,WORKLOAD"
+
+    def seed_kcc(self, relative, name, spec_line="loggingService: none"):
+        """Commit a Config Connector declaration to origin, through the seed clone."""
+        seed = self.tmp_path / "seed"
+        target = seed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\n"
+            f"kind: ContainerCluster\nmetadata:\n  name: {name}\n"
+            f"spec:\n  {spec_line}\n",
+            encoding="utf-8",
+        )
+        for argv in (
+            ["add", relative],
+            ["commit", "--quiet", "-m", f"declare {name}"],
+            ["push", "--quiet", "origin", "main"],
+        ):
+            subprocess.run(["git", *argv], cwd=str(seed), check=True, capture_output=True)
+
+    def finish_kcc(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        finding = make_finding(
+            fid="drift",
+            obj=self.KCC_CLUSTER,
+            check="workload-identity-off",
+            remediation={"kind": "gcloud", "note": self.KCC_FIX},
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[finding])), 0, self.err)
+        return self.harness.bodies_for("issue", "create")[0]
+
+    def test_the_kcc_backstop_reads_the_repository_through_the_broker(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        body = self.finish_kcc()
+        # Named exactly as directory mode names it.
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
+        self.assertIn("Config Connector declaration holds", self.err)
+        self.assertIn("grep", self.verbs)
+        # Read, not copied: nothing lands in the tree `finish` publishes, and
+        # no git ran here to read it.
+        self.assertFalse((self.workspace / "gcp").exists())
+        self.assertEqual([c for c in self.harness.calls if c[0] == "git"], [])
+
+    def test_a_run_with_no_candidate_fix_never_asks(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("grep", self.verbs)
+
+    def test_a_truncated_scan_degrades_what_it_found_and_says_so(self):
+        # Two declarations against a one-match ceiling: the broker answers
+        # with the first and `truncated`. The fix it found still degrades;
+        # the run says the index was incomplete rather than implying the rest
+        # of the repository declares nothing.
+        self.seed_kcc("gcp/a-drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.seed_kcc("gcp/b-other.yaml", "other")
+        cap = patch.dict(os.environ, {"CREDENTIAL_PROXY_MAX_MATCHES": "1"})
+        cap.start()
+        self.addCleanup(cap.stop)
+        self.start()
+        body = self.finish_kcc()
+        self.assertIn("`gcp/a-drift-peer-std-4.yaml`", body)
+        self.assertIn("truncated the Config Connector scan", self.err)
+
+    def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        live = credential_proxy_client._workspace_call
+
+        def failing_grep(endpoint, verb, payload):
+            if verb == "grep":
+                raise credential_proxy_client.WorkspaceRequestError(500, {"status": "error"})
+            return live(endpoint, verb, payload)
+
+        patcher = patch.object(credential_proxy_client, "_workspace_call", failing_grep)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        body = self.finish_kcc()
+        self.assertNotIn("Config Connector holds that field", body)
+        self.assertIn(self.KCC_FIX, body)
+        self.assertIn("could not read acme/fleet through the broker", self.err)
 
 
 # --------------------------------------------------------------------------- #

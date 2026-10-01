@@ -1231,6 +1231,12 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   `manual`, keeps its evidence and recommendation, and says in the ledger that the fix was named but
   not written. The report still publishes. Do not rely on this: a degraded finding is a fix a human
   now has to apply by hand.
+- **Never publish a `gcloud` fix against a field a Config Connector declaration holds.** Write the
+  declaration's file as a `manifest` instead. Where `finish` finds a `ContainerCluster` or
+  `ContainerNodePool` whose `spec` carries the field the command's flag writes, in the GitOps repo
+  (its clone, or through the broker in content mode) or in a context repo `start` still has checked
+  out, it degrades the finding to `manual`, naming the file above the fenced command — because the
+  command would be reverted on the next reconcile. A content-mode `--dry-run` does not preview it.
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.

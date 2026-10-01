@@ -65,7 +65,7 @@ import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # The shared scripts dir holds github_token_refresh and gitops_workspace (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
@@ -494,6 +494,57 @@ _GCLOUD_ENUM_FLAG_RE = re.compile(
 # spellings need no guard in the other direction -- `--no-enable-x` does not
 # contain `--enable-x`, the second hyphen breaks it.
 _GCLOUD_FLAG_BOUNDARY = r"(?![A-Za-z0-9-])"
+
+# The Config Connector spec field each gcloud flag writes. A fleet whose
+# clusters are declared as KCC `ContainerCluster`/`ContainerNodePool` resources
+# reconciles that spec continuously, so a `kind: gcloud` remediation against a
+# field the declaration carries is undone minutes after the operator pastes it,
+# and the finding returns next run having been "fixed" every week. On
+# 2026-09-05 the drift stream shipped two: `--logging` against a declared
+# `loggingService` and `--release-channel` against a declared `releaseChannel`.
+#
+# Only flags whose KCC field is unambiguous are listed. `--logging` and
+# `--monitoring` each name two fields because the CRD accepts the legacy scalar
+# and the component-config block, and a declaration carrying either owns the
+# setting. A flag absent from this table is not checked: guessing a field name
+# would degrade a correct `gcloud` fix, the more expensive of the two errors.
+# An `--enable-` flag also matches its `--no-enable-` spelling, which writes
+# the same field.
+KCC_SPEC_FIELD_FOR_GCLOUD_FLAG: dict[str, tuple[str, ...]] = {
+    "--release-channel": ("releaseChannel",),
+    "--logging": ("loggingService", "loggingConfig"),
+    "--monitoring": ("monitoringService", "monitoringConfig"),
+    "--enable-managed-prometheus": ("monitoringConfig",),
+    "--disable-managed-prometheus": ("monitoringConfig",),
+    "--binauthz-evaluation-mode": ("binaryAuthorization",),
+    "--enable-intra-node-visibility": ("networkingMode", "enableIntranodeVisibility"),
+    "--enable-master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--enable-network-policy": ("networkPolicy",),
+    "--enable-shielded-nodes": ("enableShieldedNodes",),
+    "--database-encryption-key": ("databaseEncryption",),
+    "--workload-pool": ("workloadIdentityConfig",),
+    "--enable-autoupgrade": ("management",),
+    "--enable-autorepair": ("management",),
+    "--maintenance-window-start": ("maintenancePolicy",),
+    "--maintenance-window-end": ("maintenancePolicy",),
+    "--maintenance-window-recurrence": ("maintenancePolicy",),
+}
+_GCLOUD_ENABLE_PREFIX = "--enable-"
+_GCLOUD_NEGATED_ENABLE_PREFIX = "--no-enable-"
+
+# The apiGroup suffix every Config Connector CRD shares, and the `object`
+# prefixes naming a control-plane resource KCC can declare. A finding on
+# anything else -- a Deployment, a Namespace -- is out of scope even where a
+# name collides.
+KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+_KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
+    "Cluster": ("ContainerCluster",),
+    "NodePool": ("ContainerNodePool",),
+}
+_YAML_SUFFIXES = ("*.yaml", "*.yml")
+# The same two, as `str.endswith` wants them for a path the broker reports.
+_KCC_YAML_EXTENSIONS = (".yaml", ".yml")
 
 # `public-control-plane`'s remediation and the flags without which it does not
 # clear `public-control-plane`.
@@ -1050,6 +1101,8 @@ SKIPPED_TREE_DIRS = frozenset({".git"})
 # (`tooLarge`, `requestBudget`) withholds a file the harness would have read,
 # and such a file under the searched paths is a note it may have missed.
 BROKER_SKIP_NOT_A_FILE_REASONS = frozenset({"symlink", "notAFile"})
+# The one `skipped` reason that means "ask again for the rest".
+BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
 # The copies come from the sibling skill's script, which works in both broker
 # modes and prints `sha` and `complete`; resolved from this file so the staged
 # and the source layouts both find it. Shallow, because the read is of one
@@ -9643,6 +9696,17 @@ def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
     because this is a laptop and not the pod), fall back rather than fail: a
     command that is safe to run anywhere has to run anywhere.
     """
+    return derived_workspace(audit_id, repo=repo) or repo_root_best_effort()
+
+
+def derived_workspace(audit_id: str, repo: str | None = None) -> Path | None:
+    """The stream's GitOps tree if it is on disk, found without any side effect.
+
+    `None` where `dry_run_repo_root` falls back. The fallback is right for
+    resolving remediation paths and wrong for anything that reads the tree as
+    the repository, since it is the working directory or whatever checkout
+    holds it.
+    """
     try:
         import gitops_workspace
 
@@ -9650,8 +9714,8 @@ def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
             resolve_repo(audit_id=audit_id, repo=repo), GITOPS_WORKSPACE, lease=audit_id
         )
     except Exception:
-        return repo_root_best_effort()
-    return target if target.is_dir() else repo_root_best_effort()
+        return None
+    return target if target.is_dir() else None
 
 
 def current_branch() -> str:
@@ -10829,6 +10893,302 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     return degraded
 
 
+class KccDeclaration(NamedTuple):
+    """Where a Config Connector resource is declared, and what its spec sets.
+
+    `repo` is empty for the GitOps repository and the slug for a context
+    repository; `fields` is the set of top-level `spec` keys, the only part of
+    the declaration Config Connector holds against out-of-band changes.
+    """
+
+    repo: str
+    path: str
+    fields: frozenset[str]
+
+
+def kcc_declarations(root: Path, repo: str = "") -> dict[tuple[str, str], KccDeclaration]:
+    """Index the Config Connector resources a clone declares, by `(kind, name)`.
+
+    The key set of each `spec` is the point: Config Connector holds the fields
+    its spec *names* and leaves the rest to whoever set them, so a declaration
+    is evidence that a gcloud change will be reverted only when it carries the
+    field being changed.
+
+    Parsed rather than grepped. Every SOP in this skill warns that
+    `grep "name: <object>"` is kind-blind and unanchored -- it matches
+    `app.kubernetes.io/name:` label lines and names sharing a prefix -- and a
+    false hit here turns a correct `gcloud` fix into a `manual` one that sends
+    the operator to a file governing nothing.
+
+    `{}` when PyYAML is absent or the clone is unreadable. That is the safe
+    direction: the check stops and every `gcloud` fix publishes as written,
+    which is what shipped before it existed. Failing the run over a missing
+    parser would trade two wrong remediations for no report at all.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        return {}
+    index: dict[tuple[str, str], KccDeclaration] = {}
+    try:
+        paths = [path for pattern in _YAML_SUFFIXES for path in sorted(root.rglob(pattern))]
+    except OSError:
+        return {}
+    for path in paths:
+        # `.git` holds objects, not manifests, and rglob walks into it.
+        if ".git" in path.relative_to(root).parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        _index_kcc_text(index, yaml, text, repo, path.relative_to(root).as_posix())
+    return index
+
+
+def _index_kcc_text(
+    index: dict[tuple[str, str], KccDeclaration], yaml: Any, text: str, repo: str, path: str
+) -> None:
+    """Add the Config Connector resources one manifest declares to `index`.
+
+    Shared by the clone walk and the broker read, so a file is named and
+    parsed the same way whichever mode found it. First declaration wins.
+    """
+    if KCC_API_GROUP_SUFFIX not in text:
+        return
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except (yaml.YAMLError, ValueError, RecursionError):
+        # A file this audit cannot parse is one it can make no claim
+        # about; skipping leaves the finding's `gcloud` kind alone.
+        return
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        api = str(doc.get("apiVersion") or "")
+        kind = str(doc.get("kind") or "")
+        meta = doc.get("metadata")
+        if KCC_API_GROUP_SUFFIX not in api or not kind or not isinstance(meta, dict):
+            continue
+        spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+        # `resourceID` overrides `metadata.name` as the GCP resource's real
+        # name, and the fleet's clusters are matched by the name GKE reports.
+        name = str(spec.get("resourceID") or meta.get("name") or "")
+        if not name:
+            continue
+        index.setdefault(
+            (kind, name), KccDeclaration(repo, path, frozenset(str(k) for k in spec))
+        )
+
+
+class KccBrokerScan(NamedTuple):
+    """The declarations a content-mode read found, and whether it saw everything.
+
+    `truncated` is true when the broker's search stopped at its match ceiling
+    or withheld a matching file. The index is then a floor, not the answer: it
+    still degrades what it found, and a fix it did not catch says nothing about
+    whether the repository declares that object.
+    """
+
+    declarations: dict[tuple[str, str], KccDeclaration]
+    truncated: bool
+
+
+def kcc_declarations_via_broker(repo: str) -> KccBrokerScan:
+    """Index the GitOps repository's Config Connector resources through the broker.
+
+    Content mode's counterpart of `kcc_declarations`: there is no clone at
+    `finish`, so the broker searches its own tree for the API group and only
+    the matching YAML files are read. They are parsed in memory, never written
+    anywhere -- in particular not into the remediation workspace, whose every
+    file `finish` publishes. Paths are the repository-relative names the broker
+    reports, the same names the clone walk produces.
+
+    Any broker failure returns an empty, untruncated scan, which disables the
+    check exactly as an unreadable clone does; the run never fails over it.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        return KccBrokerScan({}, False)
+    index: dict[tuple[str, str], KccDeclaration] = {}
+    try:
+        import credential_proxy_client
+
+        with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+            result = workspace.grep(KCC_API_GROUP_SUFFIX)
+            truncated = bool(result.get("truncated"))
+            wanted = sorted(
+                {
+                    str(match.get("path") or "")
+                    for match in result.get("matches") or []
+                    if str(match.get("path") or "").endswith(_KCC_YAML_EXTENSIONS)
+                }
+            )
+            texts: dict[str, bytes] = {}
+            # `requestBudget` means ask again for the rest; stop when a round
+            # returns nothing, so a broker that never relents cannot spin this.
+            while wanted:
+                files, skipped = workspace.read_many(wanted)
+                texts.update(files)
+                retry = [
+                    str(entry.get("path") or "")
+                    for entry in skipped
+                    if entry.get("reason") == BROKER_SKIP_REQUEST_BUDGET
+                ]
+                if any(entry.get("reason") != BROKER_SKIP_REQUEST_BUDGET for entry in skipped):
+                    truncated = True
+                if retry and not files:
+                    truncated = True
+                    break
+                wanted = retry
+    except Exception as exc:  # noqa: BLE001 -- the backstop is optional; the run is not
+        log(
+            f"WARNING: the Config Connector scan could not read {repo} through "
+            f"the broker ({exc}); gcloud fixes publish as written"
+        )
+        return KccBrokerScan({}, False)
+    for path in sorted(texts):
+        _index_kcc_text(index, yaml, texts[path].decode("utf-8", errors="replace"), "", path)
+    return KccBrokerScan(index, truncated)
+
+
+def kcc_declaration_roots(
+    audit_id: str, root: Path | None, record: dict | None
+) -> list[tuple[str, Path]]:
+    """The clones `finish` already has on disk to look for KCC declarations in.
+
+    The GitOps repository's tree first, then the context repositories `start`
+    checked out for the declared-intent search, as `(repo, path)` with `repo`
+    empty for the GitOps one. Only git checkouts count: in content mode the
+    GitOps path is a scratch directory holding the manifests this run wrote, not
+    the repository (`finish` reads the repository through the broker instead,
+    `kcc_declarations_via_broker`), and the context copies were removed when
+    `start` finished with them. Nothing is cloned here -- a context checkout exists only for a
+    stream with a declared-intent step, on a directory-mode install, and until
+    its lease is reaped -- so an empty list is common and disables the check.
+    """
+    roots: list[tuple[str, Path]] = []
+    if root is not None and (root / ".git").exists():
+        roots.append(("", root))
+    gitops = str((record or {}).get("repo", "")).strip().lower()
+    try:
+        import gitops_workspace
+
+        lease = gitops_workspace.sanitize_lease(f"{audit_id}{CLONE_LEASE_SUFFIX}")
+        for slug in (record or {}).get("context_repos") or []:
+            text = str(slug).strip()
+            if not text or text.lower() == gitops:
+                continue
+            tree = gitops_workspace.workspace_path(text, GITOPS_WORKSPACE, lease=lease)
+            if (tree / ".git").exists():
+                roots.append((text, tree))
+    except Exception:  # noqa: BLE001 -- a context root is optional; the GitOps one stands
+        pass
+    return roots
+
+
+def _gcloud_flag_pattern(flag: str) -> str:
+    """The regex that finds `flag` as a whole token, `--no-enable-` included."""
+    if flag.startswith(_GCLOUD_ENABLE_PREFIX):
+        rest = re.escape(flag[len(_GCLOUD_ENABLE_PREFIX):])
+        head = f"(?:{re.escape(_GCLOUD_ENABLE_PREFIX)}|{re.escape(_GCLOUD_NEGATED_ENABLE_PREFIX)})"
+        return f"{head}{rest}{_GCLOUD_FLAG_BOUNDARY}"
+    return f"{re.escape(flag)}{_GCLOUD_FLAG_BOUNDARY}"
+
+
+def _kcc_candidate(finding: dict) -> bool:
+    """Whether `finding` is a `gcloud` fix on an object a KCC declaration could hold."""
+    remediation = finding.get("remediation") or {}
+    prefix = str(finding.get("object") or "").partition("/")[0]
+    return remediation.get("kind") == "gcloud" and prefix in _KCC_OBJECT_KINDS
+
+
+def reverted_gcloud_problem(
+    finding: dict, declarations: dict[tuple[str, str], KccDeclaration]
+) -> tuple[KccDeclaration, str] | None:
+    """`None` if this `gcloud` fix survives its next reconcile; else the declaration and field.
+
+    Split from the rewrite for the reason `remediation_file_problem` is: a
+    caller can ask without rewriting the document.
+    """
+    remediation = finding.get("remediation") or {}
+    if remediation.get("kind") != "gcloud":
+        return None
+    prefix, _, name = str(finding.get("object") or "").partition("/")
+    kinds = _KCC_OBJECT_KINDS.get(prefix)
+    note = str(remediation.get("note") or "")
+    if not kinds or not name or not note:
+        return None
+    for kind in kinds:
+        entry = declarations.get((kind, name))
+        if entry is None:
+            continue
+        for flag, fields in KCC_SPEC_FIELD_FOR_GCLOUD_FLAG.items():
+            if not re.search(_gcloud_flag_pattern(flag), note):
+                continue
+            held = [field for field in fields if field in entry.fields]
+            if held:
+                return entry, held[0]
+    return None
+
+
+def degrade_reverted_gcloud_remediations(
+    findings: list[dict],
+    roots: list[tuple[str, Path]],
+    prebuilt: dict[tuple[str, str], KccDeclaration] | None = None,
+) -> list[str]:
+    """Rewrite `gcloud` fixes Config Connector would undo to `manual`, and report them.
+
+    `manual` rather than `manifest`: promoting would claim a file this run
+    never wrote, and `remediation.path` must name a real file when `finish`
+    stages it. The finding, its evidence and its recommendation survive; the
+    ledger stops printing a command whose effect is reverted minutes later and
+    names the file the change belongs in. The SOPs tell the model to write the
+    manifest up front; this is the backstop, in the shape of
+    `degrade_missing_remediations`, and it never fails a run.
+
+    Returns the ids that were degraded, for the caller to log.
+    """
+    if not findings or not (roots or prebuilt):
+        return []
+    # The GitOps repository first, so its declaration wins a name both carry;
+    # in content mode that is the broker's index, handed in as `prebuilt`.
+    declarations: dict[tuple[str, str], KccDeclaration] = dict(prebuilt or {})
+    for repo, tree in roots:
+        for key, entry in kcc_declarations(tree, repo).items():
+            declarations.setdefault(key, entry)
+    if not declarations:
+        return []
+    degraded: list[str] = []
+    for finding in findings:
+        problem = reverted_gcloud_problem(finding, declarations)
+        if problem is None:
+            continue
+        entry, field = problem
+        remediation = finding["remediation"]
+        note = str(remediation.get("note", "")).strip()
+        where = (
+            f"in the context repository `{entry.repo}` at `{entry.path}`"
+            if entry.repo
+            else f"in the GitOps repository at `{entry.path}`"
+        )
+        remediation["kind"] = "manual"
+        # A `gcloud` note renders inside a bash fence and a `manual` one as
+        # prose, so the command is fenced here to stay pasteable: it still
+        # states the end state, and an operator who has already changed the
+        # file may want it to close the gap before the next sync.
+        remediation["note"] = (
+            f"This object is declared {where}, whose spec sets `{field}`. Config "
+            "Connector holds that field against out-of-band changes, so the "
+            "command below is reverted on the next reconcile and this finding "
+            "returns on the next run. Make the change in that file instead."
+            f"\n\n```bash\n{note}\n```"
+        )
+        degraded.append(str(finding.get("id", "")))
+    return degraded
+
+
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
@@ -11634,6 +11994,7 @@ def _handle_finish_dry_run(
     repo: str | None = None,
     manifest: dict | None = None,
     waiver: str = "",
+    record: dict | None = None,
 ) -> None:
     findings = list(data["findings"])
 
@@ -11650,6 +12011,17 @@ def _handle_finish_dry_run(
         log(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
             f"{root}; it degrades to a manual remediation and opens no pull request."
+        )
+    # Only against the stream's own tree, never `dry_run_repo_root`'s fallback,
+    # which is whatever checkout holds the working directory. Directory mode
+    # only: the dry run never opens a broker session, and starting one here
+    # would make the preview the first thing in the run to need the broker.
+    # A content-mode dry run therefore previews no Config Connector degrade.
+    kcc_roots = kcc_declaration_roots(audit_id, derived_workspace(audit_id, repo=repo), record)
+    for fid in degrade_reverted_gcloud_remediations(findings, kcc_roots):
+        log(
+            f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
+            "Connector declaration holds; it degrades to manual, naming the file."
         )
     paths = manifest_paths(findings)
 
@@ -12329,7 +12701,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     if args.dry_run:
         _handle_finish_dry_run(
-            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver
+            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver, record=record
         )
         return
 
@@ -12344,6 +12716,28 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
+        )
+    # Every stream, not only drift: any `gcloud` fix against a declared field
+    # is reverted the same way. Directory mode reads the clone; content mode
+    # has none and asks the broker, and only when a finding could match, so
+    # a run with no such fix costs no round trip.
+    kcc_prebuilt: dict[tuple[str, str], KccDeclaration] = {}
+    if content_mode() and any(_kcc_candidate(finding) for finding in findings):
+        scan = kcc_declarations_via_broker(repo)
+        kcc_prebuilt = scan.declarations
+        if scan.truncated:
+            log(
+                "WARNING: the broker truncated the Config Connector scan of "
+                f"{repo}; gcloud fixes against declarations it did not return "
+                "publish as written, so their absence here proves nothing."
+            )
+    for fid in degrade_reverted_gcloud_remediations(
+        findings, kcc_declaration_roots(audit_id, root, record), prebuilt=kcc_prebuilt
+    ):
+        log(
+            f"WARNING: {fid}'s gcloud remediation changes a field a Config "
+            "Connector declaration holds, so it would be reverted on the next "
+            "reconcile; it is published as manual, naming the file to change."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually
