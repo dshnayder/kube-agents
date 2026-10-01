@@ -7839,5 +7839,23 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                 fw.main(["--workspace", str(clone)])
         self.assertEqual(seen["w"], clone)
 
+    def test_a_failed_mirror_is_not_indexed(self):
+        import collect
+
+        seen = {}
+
+        def partial_mirror(repo, dest):
+            (dest / "half.yaml").write_text("kind: Deployment\n")
+            return False
+
+        with TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            with patch.object(fw, "collect_fleet", side_effect=lambda p, workspace=None: seen.update(w=workspace) or {"clusters": []}), \
+                    patch.object(collect, "broker_repo", return_value="example-org/infra"), \
+                    patch.object(collect, "broker_mirror", side_effect=partial_mirror), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(scratch)])
+        self.assertEqual(seen["w"], scratch)
+
 if __name__ == "__main__":
     unittest.main()

@@ -9773,6 +9773,49 @@ class TestBrokerMirror(unittest.TestCase):
             (scratch / ".git").mkdir()
             self.assertIsNone(collect.broker_repo(scratch), "a clone is walked directly")
 
+    def test_the_workspace_directory_names_the_repository_before_the_marker(self):
+        """The marker names the holder's last lease; the `owner__name` segment names this one."""
+        with TemporaryDirectory() as tmp:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "example-org__infra"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": "other-org/apps"}))
+            self.assertEqual(collect.broker_repo(scratch), self.REPO)
+
+    def test_a_broker_that_never_relents_abandons_the_mirror(self):
+        """Every path deferred as `requestBudget`, round after round: stop, do not spin."""
+        broker = _FakeBrokerWorkspace(self.files(), budget=0)
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+        self.assertIn(collect.BROKER_SKIP_REQUEST_BUDGET, err.getvalue())
+
+    def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
+        broker = _FakeBrokerWorkspace(self.files())
+        with TemporaryDirectory() as tmp, \
+                patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: ""}), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+        self.assertEqual(broker.opened, [])
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_a_failed_write_abandons_the_mirror(self):
+        """A write that fails halfway leaves part of the tree; the caller must not index it."""
+        broker = _FakeBrokerWorkspace(self.files())
+        real_write = Path.write_bytes
+        calls = []
+
+        def write_once(path, data):
+            calls.append(path)
+            if len(calls) > 1:
+                raise OSError("disk full")
+            return real_write(path, data)
+
+        with TemporaryDirectory() as tmp, \
+                patch.object(Path, "write_bytes", write_once), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+
     def test_main_indexes_the_mirror_in_content_mode(self):
         """End to end through `main`: the scratch path in, the mirror's tree indexed."""
         seen = {}
@@ -9804,6 +9847,24 @@ class TestBrokerMirror(unittest.TestCase):
             seen["declarations"],
         )
 
+
+    def test_main_does_not_index_a_failed_mirror(self):
+        seen = {}
+
+        def fake_collect_fleet(audit, project, workspace=None):
+            seen["workspace"] = workspace
+            return {"clusters": []}
+
+        with TemporaryDirectory() as tmp:
+            scratch = Path(tmp) / "lease" / "example-org__infra"
+            scratch.mkdir(parents=True)
+            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(collect, "broker_repo", return_value=self.REPO), \
+                    patch.object(collect, "broker_mirror", return_value=False), \
+                    patch("sys.stdout", new_callable=io.StringIO), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                collect.main(["obtainability-audit", "--workspace", str(scratch)])
+        self.assertEqual(seen["workspace"], scratch)
 
 class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
     """The annotation has to reach the candidate, or the model never sees it.

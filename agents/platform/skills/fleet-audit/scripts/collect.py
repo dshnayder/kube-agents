@@ -164,6 +164,8 @@ CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
 # the repository checkout this file sits in (for tests and local runs).
 PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 PLATFORM_SCRIPT_DIR_DEPTH = 3
+# How a leased workspace directory names its repository: `owner__name`.
+REPO_DIR_SEPARATOR = "__"
 MIRROR_DIR_PREFIX = "collect-gitops-mirror-"
 # The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
 # extension-less spelling Kustomize also accepts.
@@ -8678,8 +8680,21 @@ def broker_repo(workspace: Path) -> str | None:
         )
         return None
     holder = gitops_workspace.lease_holder(workspace)
-    record = gitops_workspace.read_lease(holder) if holder is not None else None
-    repo = str((record or {}).get("repo") or "").strip()
+    repo = ""
+    if holder is not None:
+        # The `owner__name` directory under the holder first, as
+        # `gitops_workspace.resolve_repo` reads it: one holder can lease more
+        # than one repository, and the marker names whichever was leased last.
+        try:
+            parts = workspace.resolve().relative_to(holder.resolve()).parts
+        except ValueError:
+            parts = ()
+        owner, _, name = parts[0].partition(REPO_DIR_SEPARATOR) if parts else ("", "", "")
+        if owner and name:
+            repo = f"{owner}/{name}"
+        else:
+            record = gitops_workspace.read_lease(holder)
+            repo = str((record or {}).get("repo") or "").strip()
     if not repo:
         log(
             f"WARNING: {workspace} is not a clone and no lease marker above it names a "
@@ -8747,8 +8762,12 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     as declared once, and `declaration_for` would then name one of the two
     files instead of refusing -- a wrong path, which is worse than the absent
     one the SOPs already handle. So a capped listing, a file the broker will
-    not send, or any broker failure returns False, `dest` is ignored, and the
-    run proceeds as it did before this existed.
+    not send, any broker failure, or a failed write returns False, the caller
+    does not index `dest`, and the run proceeds as it did before this existed.
+    That includes a single file over the broker's per-file limit (`tooLarge`):
+    a vendored install bundle that size is rarely a workload's declaration,
+    but a rendered multi-document file can be, and skipping it would bring
+    back the wrong-path case this rule exists to prevent.
     """
     if open_workspace is None:
         client = _import_platform_script("credential_proxy_client")
@@ -8817,10 +8836,15 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     if unsafe:
         log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
         return False
-    for path, content in files.items():
-        target = dest / Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+    try:
+        for path, content in files.items():
+            target = dest / Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+    except OSError as exc:
+        # `dest` now holds part of the tree; False tells the caller not to index it.
+        log(f"WARNING: could not write {repo}'s mirror ({exc}); no candidate will carry a declaration")
+        return False
     log(f"mirrored {len(files)} YAML file(s) of {repo} from the broker")
     return True
 
@@ -8863,10 +8887,10 @@ def main(argv: list[str] | None = None) -> int:
         import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
 
         with tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX) as mirror:
-            # A failed mirror leaves an empty directory, which indexes exactly
-            # as the empty scratch workspace did.
-            broker_mirror(repo, Path(mirror))
-            manifest = collect_fleet(args.audit, args.project, workspace=Path(mirror))
+            # A failed mirror may have written part of the tree, so it is not
+            # indexed; the empty scratch workspace is, exactly as before.
+            indexed = Path(mirror) if broker_mirror(repo, Path(mirror)) else workspace
+            manifest = collect_fleet(args.audit, args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):

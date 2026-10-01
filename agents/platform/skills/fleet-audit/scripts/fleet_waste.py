@@ -6464,8 +6464,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest = collect_fleet(args.project, workspace=workspace)
         else:
             with tempfile.TemporaryDirectory(prefix=collect.MIRROR_DIR_PREFIX) as mirror:
-                collect.broker_mirror(repo, Path(mirror))
-                manifest = collect_fleet(args.project, workspace=Path(mirror))
+                mirrored = collect.broker_mirror(repo, Path(mirror))
+                manifest = collect_fleet(
+                    args.project, workspace=Path(mirror) if mirrored else workspace
+                )
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 
