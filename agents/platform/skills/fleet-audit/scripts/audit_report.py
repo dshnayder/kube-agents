@@ -872,6 +872,12 @@ BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH
 MAX_PR_PAGE = 1000
 # One page of a forge listing: the most the broker returns per request.
 MAX_PAGE = 100
+# Enough for any conversation this harness keeps up with, and the most one read
+# of it returns (the broker pages to it). A ledger or pull request whose
+# conversation fills it is read as unreadable rather than whole: the markers
+# that stop a reply going out twice may be past the ceiling, and a reply posted
+# again every morning is worse than one run that answers nothing.
+MAX_COMMENTS_READ = 1000
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -8778,15 +8784,6 @@ def try_forge(verb: str, repo: str, payload: dict) -> dict | None:
         return None
 
 
-# Enough for any conversation this harness keeps up with, and the most one read
-# of it returns (the broker pages to it). A ledger or pull request whose
-# conversation fills it is read
-# as unreadable rather than whole: the markers that stop a reply going out
-# twice may be past the ceiling, and a reply posted again every morning is
-# worse than one run that answers nothing.
-MAX_COMMENTS_READ = 1000
-
-
 def _login_key(login: str) -> str:
     """Logins compared case-insensitively and without an App's `[bot]` suffix.
 
@@ -11893,7 +11890,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
     # body untouched, so the stored memory stays exactly true until it lands,
-    # and a failure on that path (a transient `gh issue close`, a terminal
+    # and a failure on that path (a transient `issue-close`, a terminal
     # timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---

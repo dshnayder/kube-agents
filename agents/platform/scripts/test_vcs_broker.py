@@ -2261,7 +2261,8 @@ class CollaborationTest(unittest.TestCase):
             {"number": 4},  # an issue carrying the same labels
             {"number": 5, "pull_request": {}},
         ]
-        broker, recorder = self.broker(page, pull(3, "fix"), pull(5, "fix", owner="fork"))
+        newest = [pull(5, "fix", owner="fork"), pull(3, "fix")]
+        broker, recorder = self.broker(page, newest)
         answer = broker.proposal_list(
             {
                 "repository": "acme/infra",
@@ -2275,14 +2276,56 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("labels=audit:a1,audit:remediation", asked)
         self.assertIn("state=all", asked)
         self.assertNotIn("head=", asked)
-        # Each pull request is read back for its head; the issue is not.
-        self.assertEqual(
-            [c[4] for c in recorder.calls[1:]],
-            ["repos/acme/infra/pulls/3", "repos/acme/infra/pulls/5"],
-        )
+        # The pull requests are read back for their heads; the issue is not.
+        self.assertEqual(len(recorder.calls), 2)
+        scan = urllib.parse.unquote(recorder.calls[1][4])
+        self.assertTrue(scan.startswith("repos/acme/infra/pulls?"))
+        self.assertIn("state=all", scan)
         # The fork's branch of the same name is not this repository's proposal.
         self.assertEqual([p["number"] for p in answer["proposals"]], [3])
         self.assertEqual(answer["proposals"][0]["closed"], "")
+
+    @staticmethod
+    def labelled(numbers):
+        return [{"number": n, "pull_request": {}} for n in numbers]
+
+    @staticmethod
+    def pulls(numbers):
+        return [
+            {"number": n, "state": "closed", "head": {"ref": f"b{n}"}, "base": {"ref": "main"}}
+            for n in numbers
+        ]
+
+    def test_a_label_a_stream_has_used_for_years_costs_pages_not_proposals(self):
+        # A hundred hits on the label, all among the newest hundred and fifty
+        # pull requests: two pages of `/pulls`, not a hundred reads.
+        hits = list(range(250, 150, -1))
+        broker, recorder = self.broker(
+            self.labelled(hits), self.pulls(range(250, 150, -1)), self.pulls(range(150, 100, -1))
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "limit": 100}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], hits)
+        self.assertEqual(len(recorder.calls), 2)
+
+    def test_a_few_old_hits_in_a_busy_repository_are_read_one_at_a_time(self):
+        # Two hits far back: one page of `/pulls` is all the scan is allowed,
+        # and what it did not find is read directly.
+        broker, recorder = self.broker(
+            self.labelled([40, 12]),
+            self.pulls(range(900, 800, -1)),
+            self.pulls([40])[0],
+            self.pulls([12])[0],
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"]}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], [40, 12])
+        self.assertEqual(
+            [c[4] for c in recorder.calls[2:]],
+            ["repos/acme/infra/pulls/40", "repos/acme/infra/pulls/12"],
+        )
 
     def test_a_labelled_listing_is_truncated_on_what_the_forge_sent(self):
         # A full page that filters down to fewer proposals still has a next page.

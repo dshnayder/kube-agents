@@ -3370,11 +3370,11 @@ def forge_registry() -> providers.Registry:
 
 # What `/v1/exec` runs for the sandbox, enforced here because the client is
 # only a convenience: anything holding the sandbox's token can post its own
-# argv. No forge CLI is on it -- a forge is reached through the verbs, which
-# the broker runs on its own behalf. `git` stays for the leased directory-mode
-# workspace, where every write is fenced to a lease; the sandbox's own client
-# no longer asks for it.
-EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl", "git")
+# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# reached through the verbs, which run them on the broker's own behalf. `git`
+# here would run under the broker's credential helper, and a read such as
+# `ls-remote` is no write for a lease to fence.
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
 
 
 def broker_executables() -> tuple[str, ...]:
@@ -3388,10 +3388,9 @@ def broker_executables() -> tuple[str, ...]:
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
     runs them. `git` and any forge CLI are here for the broker's own use -- it
-    issues them on its own behalf for the verbs. `/v1/exec` refuses every
-    forge CLI (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its
-    own request cannot reach one; `git` is still admitted there, under the
-    lease gate, for the leased directory-mode workspace. What this list
+    issues them on its own behalf for the verbs. `/v1/exec` refuses both
+    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
+    request reaches neither. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary

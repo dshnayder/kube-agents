@@ -308,6 +308,10 @@ class GitHubForge(Forge):
         issue shape carries no head, so each hit is read back as a pull
         request. `head` and `base` are not issue filters and are matched on
         what comes back.
+
+        Read back from the newest pages of `/pulls` rather than one request per
+        hit, because a label shared by every proposal a stream ever opened
+        names hundreds of them and a page of `/pulls` carries a hundred.
         """
         query: dict[str, Any] = {
             "state": params["state"],
@@ -317,11 +321,9 @@ class GitHubForge(Forge):
         if "page" in params:
             query["page"] = params["page"]
         nodes = api("GET", f"repos/{repo}/issues", params=query)
-        proposals = [
-            translate.proposal(api("GET", f"repos/{repo}/pulls/{node['number']}"))
-            for node in nodes
-            if "pull_request" in node
-        ]
+        wanted = [node["number"] for node in nodes if "pull_request" in node]
+        pulls = self._pulls_by_number(api, repo, params["state"], wanted)
+        proposals = [translate.proposal(pulls[number]) for number in wanted]
         if "head" in params:
             owner, _, branch = params["head"].partition(":")
             proposals = [
@@ -335,6 +337,47 @@ class GitHubForge(Forge):
         # Judged on what the forge sent, as `issue-list` is: a full page of
         # issues filtered down to its pull requests is still a page.
         return listing(proposals, params["per_page"], "proposals", returned=len(nodes))
+
+    def _pulls_by_number(
+        self, api: Callable, repo: str, state: str, numbers: list[int]
+    ) -> dict[int, dict]:
+        """The pull requests numbered `numbers`, read as few requests as it can.
+
+        Newest first through `/pulls`, stopping once every number is found or
+        the pages run older than the oldest one wanted. A label on a few old
+        proposals in a busy repository would have that scan wade through every
+        newer one, so it gets half as many pages as there are numbers left to
+        find, and whatever it has not found by then is read one at a time:
+        never much more than reading each one, and on a stream's own label a
+        page or two instead of hundreds.
+        """
+        found: dict[int, dict] = {}
+        left = set(numbers)
+        page = 1
+        while left and page <= len(left) // 2:
+            batch = api(
+                "GET",
+                f"repos/{repo}/pulls",
+                params={
+                    "state": state,
+                    "sort": "created",
+                    "direction": "desc",
+                    "per_page": MAX_PAGE_SIZE,
+                    "page": page,
+                },
+            ) or []
+            for node in batch:
+                if node.get("number") in left:
+                    found[node["number"]] = node
+                    left.discard(node["number"])
+            if len(batch) < MAX_PAGE_SIZE or (
+                left and batch[-1].get("number", 0) < min(left)
+            ):
+                break
+            page += 1
+        for number in sorted(left, reverse=True):
+            found[number] = api("GET", f"repos/{repo}/pulls/{number}")
+        return found
 
     def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

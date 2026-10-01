@@ -457,12 +457,12 @@ Four `SKILL.md` files instructed the model in `gh` spellings and called the arte
 behind a wrapper and the noun taken from configuration. `fleet-audit` travels with
 `audit_report.py`, because the helper is what writes the ledger its prose describes.
 
-The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
-owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
-no command to wrap, so the SOP work is smaller and different: the nouns ("pull request", "PR body")
-come from configuration, and the prohibitions get reworded once the helper they defer to is a
-provider rather than `gh`. [The consumer migration](#the-protocol-past-its-first-feature) moves that
-helper; this step only follows it.
+The seven governance SOPs named `gh` only to forbid it, because `audit_report.py` owns their write
+path. A prohibition has no command to wrap, so the SOP work is smaller and different: the nouns
+("pull request", "PR body") come from configuration, and the prohibitions say to publish through the
+helper and the version-control verbs rather than naming a forge CLI.
+[The consumer migration](#the-protocol-past-its-first-feature) moves that helper; this step only
+follows it.
 
 `github-issue-resolver`, the skill a reader would expect on the first list, is not on it: its prompt
 names no forge command — only its own `resolver.py` subcommands — and its coupling is entirely in

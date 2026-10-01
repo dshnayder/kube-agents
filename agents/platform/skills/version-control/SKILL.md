@@ -278,11 +278,11 @@ a real answer and means ask again, more narrowly. `proposal list` and
 
 `proposal view --comments` and `issue view --comments` say the same thing about
 the conversation they read, as `commentCount` and `commentsTruncated`. Take
-`commentsTruncated: true` seriously before you reply to anything: it means you
-are looking at the oldest page of a longer thread, so the most recent word on
-the subject — including an answer somebody already gave — is not in front of
-you. There is no way to read the rest from here: `-n` can only make the page
-smaller, and it is the same oldest page either way. Say that you could not read
-the whole thread, and do not answer anything that turns on what the rest of it
-says. It is the one truncation where carrying on quietly
+`commentsTruncated: true` seriously before you reply to anything: it means the
+thread is longer than the `-n` you asked for and you are looking at its oldest
+comments, so the most recent word on the subject — including an answer somebody
+already gave — is not in front of you. Ask again with a larger `-n`; a read
+takes up to 1,000 comments. If it is still truncated at 1,000, say that you
+could not read the whole thread, and do not answer anything that turns on what
+the rest of it says. It is the one truncation where carrying on quietly
 produces a confidently wrong answer rather than an incomplete one.

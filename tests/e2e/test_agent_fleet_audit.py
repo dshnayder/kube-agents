@@ -30,14 +30,15 @@ _REFRESH_SCRIPT_CANDIDATES = (
     f"/opt/defaults/scripts/{_REFRESH_SCRIPT_NAME}",
 )
 _REFRESH_CONFIRMATION = "Refreshed GitHub credentials via"
-# The version-control client the agent reaches the forge through. There is no
-# `gh` in the sandbox; this is what the audit helper itself calls.
+# The version-control CLI the agent reaches the forge through. There is no `gh`
+# in the sandbox; the audit helper takes the same broker route, through the
+# client library this CLI wraps.
 _VCS_CANDIDATES = (
     "/opt/data/skills/version-control/scripts/vcs.py",
     "/opt/defaults/skills/version-control/scripts/vcs.py",
 )
 # The exec budget covers the refresh (its client waits up to 60s on the proxy)
-# plus the forge call, with room for a slow broker.
+# plus the two forge calls, with room for a slow broker.
 _PROBE_TIMEOUT_SECONDS = 180
 
 # All Registered Audit Streams and their human titles
@@ -64,8 +65,9 @@ def test_github_token_minting_and_connectivity(
     Executes a genuinely 100% read-only probe inside the agent's shell sandbox pod, or the
     legacy gateway pod on an install that has no sandbox:
     1. Triggers token refresh through the credential proxy and GitHub Token Minter (Cloud KMS).
-    2. Executes `gh api repos/<target_repo>` from the shared workspace root.
-    3. Verifies repository access and permissions over the network.
+    2. Asks the broker who this install is (`vcs.py identity`).
+    3. Reads the target repository's issues through the broker (`vcs.py issue list`), which
+       fails unless the broker can actually read that repository.
     Does NOT invoke `audit_report.py start`, preventing workspace reset, lease scrubbing, or label writes.
 
     Step 1 is the only thing that mints on a fresh install: nothing at startup writes the
@@ -179,6 +181,17 @@ login = (json.loads(res_vcs.stdout).get("identity") or {{}}).get("login")
 if not login:
     print(f"No identity for '{github_repo}': {{res_vcs.stdout}}", file=sys.stderr)
     sys.exit(1)
+
+# 3. A read of the repository itself. `identity` names no repository, so it
+# passes on any token the broker holds; this one fails unless that token can
+# read this repository.
+res_read = subprocess.run(
+    ['python3', vcs[0], 'issue', 'list', '--repo', '{github_repo}', '-n', '1'],
+    cwd='/opt/data', capture_output=True, text=True,
+)
+if res_read.returncode != 0 or "issues" not in json.loads(res_read.stdout or "{{}}"):
+    print(f"Repository read failed: {{res_read.stdout}}{{res_read.stderr}}", file=sys.stderr)
+    sys.exit(res_read.returncode or 1)
 
 print(f"Successfully authenticated and queried repository: {github_repo} as {{login}}")
 """
