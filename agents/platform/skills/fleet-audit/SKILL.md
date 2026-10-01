@@ -939,13 +939,17 @@ the record, and `finish` reports the count as `declared`.
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Three paths lead there:
 
-- **Auto-promotion.** A finding graded `critical` or `major` that is a `manifest`, has no live
-  pull request on its branch — and, on a run that passed `--manifest-file`, is neither
-  uncorroborated nor triage-marked by the collector — is promoted automatically by `finish` —
-  **at most five per run**. The collector marks a fix that scales a controller to zero, writes a
-  default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, or owes its
-  `major` to the Autopilot bump; the ledger names each with its marker and reason. The surplus is named in the ledger as awaiting `/remediate`, and so is
-  every `minor` manifest finding, as below the floor, so nothing is silently dropped. "Live" excludes a pull
+- **Auto-promotion.** A finding graded `critical`, or `major` with a collector candidate behind
+  it, that is a `manifest`, has no live pull request on its branch — and, on a run that passed
+  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
+  automatically by `finish` — **at most five per run**. A `major` finding no candidate backs (no
+  manifest, or a check the collector skipped or failed) needs `critical`, because the markers
+  live on candidates. The collector marks a fix that scales a controller to zero, writes a
+  default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
+  `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
+  or deletes a Service, or enforces spreading; the ledger names each with its marker and reason.
+  The surplus is named in the ledger as awaiting `/remediate`, and so is every manifest finding
+  the floor passed over, as below the floor, so nothing is silently dropped. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write

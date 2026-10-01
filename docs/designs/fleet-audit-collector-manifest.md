@@ -360,7 +360,7 @@ repositories (`Disk/<zone>:<name>` and the like, since each name is unique only 
 leave the ledger unheld on the bump run and are not in the warning's count. That residual is the cost of a
 bump, which is rare and operator-initiated.
 
-### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_marked_findings`
+### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_markers`
 
 Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>` ignores both.
 
@@ -373,13 +373,17 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
   (`service-fronted`, `new-computeclass`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
-  `default-deny`). The collector stands behind the finding; the _fix_ has a consequence
+  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`). The collector stands behind the finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because
   the two say opposite things about the collector, each row followed by the marker and the
   consequence it stands for (`TRIAGE_REASONS`).
 
-Both are computed after every other test the sweep already applies except the severity floor, which
-comes last — in the ledger and on the JSON line alike, which carry the same list. A finding below the
+A marker only exists on a candidate, so the severity floor depends on one too: a finding some
+candidate stands behind (`collector_vouched_findings`) is held to `AUTO_PROMOTION_FLOOR` (`major`),
+and every other finding to `UNVOUCHED_PROMOTION_FLOOR` (`critical`).
+
+Both sets are computed after every other test the sweep already applies except the severity floor,
+which comes last. The ledger names all three; the JSON line carries only `uncorroborated_findings`. A finding below the
 floor that is also uncorroborated or triage-marked is therefore named here rather than as below the
 floor: the reason a human has to read before asking for it is the one worth printing.
 

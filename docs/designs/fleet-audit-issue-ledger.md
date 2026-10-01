@@ -121,7 +121,8 @@ Recorded with rationale so a later reader does not re-litigate them.
 
 A remediation PR opens automatically **iff** the finding satisfies all of:
 
-1. `severity` ranks at or above `AUTO_PROMOTION_FLOOR` (`major`), and
+1. `severity` ranks at or above `AUTO_PROMOTION_FLOOR` (`major`) where a collector candidate stands
+   behind the finding, and at or above `UNVOUCHED_PROMOTION_FLOOR` (`critical`) where none does, and
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
@@ -131,8 +132,8 @@ Every other finding stays prose in the ledger until a human asks for it. Rationa
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
 streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
 named in the ledger, in the same section that names what a collector manifest withholds from the
-sweep ([collector design §3.4](fleet-audit-collector-manifest.md)). A `minor` finding is named there
-too, as below the floor; `/remediate` reaches it, because an explicit request is not held to the
+sweep ([collector design §3.4](fleet-audit-collector-manifest.md)). A finding the floor
+passes over is named there too, as below the floor; `/remediate` reaches it, because an explicit request is not held to the
 floor.
 
 **Condition 1 is a rank comparison, not an equality**, and the distinction only shows up once the
@@ -143,11 +144,18 @@ severity the harness does not recognise ranks below every real one.
 The floor was `critical`, which selected almost nothing on a real fleet — the `critical` findings
 were exposure problems closed with `gcloud`, and the ones attracting a declarative fix were graded
 `major` and `minor`, so the two conditions were nearly disjoint and the sweep opened nothing while
-the ledger showed twenty manifest remediations waiting. It is now `major`. Measured across the nine
+the ledger showed twenty-six manifest remediations waiting. It is now `major`. Measured across the nine
 live streams on 2026-09-06: 3 `critical` and 5 `major` manifest remediations promote, 21 `minor` are
 withheld, and the cap held back nothing. `minor` is left below the floor deliberately — it is
 defence-in-depth work a reader may reasonably never ask for, and 15 of the 21 sit on one stream,
 which at a `minor` floor would sit at the cap for three consecutive runs.
+
+The `major` floor holds only for a finding a collector candidate stands behind. What keeps a
+disruptive `major` fix out of the sweep is the collector's `needs_triage` marker
+([collector design §3.4](fleet-audit-collector-manifest.md)), and a marker exists only on a
+candidate. A finding without one — a run with no manifest, a check the collector skipped or ran to
+a non-zero `rc`, a target it did not collect — has nothing that could mark it, so it is held to
+`critical`, the floor the markers were written against.
 
 "Live" rather than "in any state" is condition 3's whole point, and the distinction is between two
 kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,
@@ -267,7 +275,7 @@ supplies the finding — and says nothing rather than print an empty code fence.
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
-  if the finding returns: a manifest finding graded at or above the auto-promotion floor is
+  if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
   re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
   `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
