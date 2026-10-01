@@ -1849,7 +1849,16 @@ class PullRequestOpenedVerifier(BaseVerifier):
         # exported one.
         since, since_what = started, "this run started"
         stream_branch = ""
-        if self.accepts_stream_pull_request and _stream_audit():
+        if self.accepts_stream_pull_request and not _stream_audit():
+            # The option does nothing off a stream, and a rejection that only
+            # said "before this run started" would hide that it was dropped.
+            since_what = (
+                "this run started (`accepts_stream_pull_request` is set, but "
+                f"{STREAM_AUDIT_ENV_VAR} is not: the harness puts a case on an "
+                "audit stream only through a `ledger_issue_contains` check with "
+                "an `audit` key)"
+            )
+        elif self.accepts_stream_pull_request:
             stream_started = _stream_started()
             if stream_started is not None and stream_started < started:
                 since, since_what = stream_started, "this audit stream's first run began"
@@ -1953,7 +1962,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 head = str(((pull or payload).get("head") or {}).get("ref") or "")
                 if not head.startswith(stream_branch):
                     rejected.append(
-                        f"{slug}: written before this run started, on branch "
+                        f"{slug}: last written or pushed to before this run "
+                        f"started, on branch "
                         f"{head or '(unreadable)'!r}, which is not one this audit "
                         f"stream's `finish` names ({stream_branch}*) — another "
                         "case's pull request, not the stream's"

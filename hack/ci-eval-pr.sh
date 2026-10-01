@@ -2805,10 +2805,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # pull request once and later runs on the stream find it open and leave it,
   # whichever case they are, and nothing here may close it between units
   # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
-  # here, under the stream lock (the task lock, streamless) that serializes
-  # them; a pull request older than it is not this job's, and one the stamp
-  # admits must sit on the audit's remediation branch. A case writing no
-  # ledger has no stream and gets neither.
+  # here, under the stream lock that serializes them; a pull request older
+  # than it is not this job's, and one the stamp admits must sit on the
+  # audit's remediation branch. A case with no `ledger_issue_contains` audit
+  # key has no stream and gets neither.
   if [ -n "${audit_id}" ]; then
     local window="${STATE_DIR}/stream-${audit_id}.window"
     [ -s "${window}" ] || date -u +%s > "${window}"

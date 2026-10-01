@@ -2354,6 +2354,47 @@ def test_a_stamp_without_an_audit_stream_measures_from_the_run(
     assert "BEFORE this run started" in res.reason
 
 
+def test_a_recent_write_over_an_old_push_still_needs_the_stream_branch(
+    token, github, stream
+):
+    """A comment or label during this run moves `updated_at` but not the head
+    commit, which an earlier run pushed: the widened window is what admits
+    that commit, so the branch must still be the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-21T08:20:00Z", "2026-08-21T09:04:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_the_option_off_a_stream_says_it_was_dropped(token, github, monkeypatch):
+    """A case without a ledger `audit` key gets no stream, so the option does
+    nothing; the rejection must say so rather than read as the plain #1755 fail."""
+    monkeypatch.delenv(verifiers.STREAM_STARTED_ENV_VAR, raising=False)
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "`accepts_stream_pull_request` is set" in res.reason
+
+
+def test_the_remediation_branch_prefix_matches_group_branch_for():
+    """REMEDIATION_BRANCH_PREFIX copies the literal in audit_report.py's
+    `group_branch_for`, which cannot be imported here; a drift would grade every
+    stream pull request `fail` with nothing red in this suite."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (prefix,) = set(re.findall(r'f"(platform-agent/[a-z-]+)\{audit_id\}-', script.read_text()))
+    assert prefix == verifiers.REMEDIATION_BRANCH_PREFIX
+
+
 @pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
 def test_without_a_readable_stream_stamp_the_option_measures_from_the_run(
     token, github, monkeypatch, raw
