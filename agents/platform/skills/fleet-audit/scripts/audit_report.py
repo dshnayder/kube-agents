@@ -517,7 +517,7 @@ KCC_SPEC_FIELD_FOR_GCLOUD_FLAG: dict[str, tuple[str, ...]] = {
     "--enable-managed-prometheus": ("monitoringConfig",),
     "--disable-managed-prometheus": ("monitoringConfig",),
     "--binauthz-evaluation-mode": ("binaryAuthorization",),
-    "--enable-intra-node-visibility": ("networkingMode", "enableIntranodeVisibility"),
+    "--enable-intra-node-visibility": ("enableIntranodeVisibility",),
     "--enable-master-authorized-networks": ("masterAuthorizedNetworksConfig",),
     "--master-authorized-networks": ("masterAuthorizedNetworksConfig",),
     "--enable-network-policy": ("networkPolicy",),
@@ -583,6 +583,7 @@ GOOGLE_CLOUD_ACCESS_FLAG = "--no-enable-google-cloud-access"
 DNS_ACCESS_FLAG = "--no-enable-dns-access"
 GCLOUD_LOCATION_FLAG = "--location"
 GCLOUD_PROJECT_FLAG = "--project"
+GCLOUD_LOCATION_FLAGS = (GCLOUD_LOCATION_FLAG, "--region", "--zone")
 CLUSTERS_UPDATE_PREFIX = "gcloud container clusters update"
 # What `collect._external_control_plane_paths` writes into the excerpt when the
 # DNS endpoint answers external traffic, and the only way this module can tell
@@ -1177,6 +1178,18 @@ AUTO_PROMOTION_FLOOR = "major"
 # the only filter left. That was `critical` when the markers were written, and
 # it stays `critical` here.
 UNVOUCHED_PROMOTION_FLOOR = "critical"
+# The checks whose fix the sweep opens unasked at `AUTO_PROMOTION_FLOOR`; every
+# other check needs `UNVOUCHED_PROMOTION_FLOOR`. An allowlist because the SOPs
+# grade on how bad the finding is, not on whether its fix is safe to open with
+# nobody asking: a `major` memory limit, `Recreate` strategy, CronJob
+# concurrency policy, Binary Authorization or release-channel enrolment is a
+# change whose owner has to choose, and a denylist of markers missed each of
+# them in turn. Each entry here is additive and reads whole in one screen: a
+# PodDisruptionBudget (`no-pdb`), turning the token off for a ServiceAccount
+# nothing has granted (`unbound-sa-automount`), and an On-Demand fallback at
+# the bottom of a ComputeClass (`ccc-no-ondemand-floor`). A new check is held
+# to `critical` until someone argues it onto this list.
+MAJOR_SWEEP_CHECKS = frozenset({"no-pdb", "unbound-sa-automount", "ccc-no-ondemand-floor"})
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -3759,8 +3772,11 @@ def quote_gcloud_format_projections(text: str) -> str:
         # Inside a double-quoted string -- `"$(gcloud ... --format=value(x))"`
         # -- the shell does not read `(` as a subshell, and single quotes added
         # there reach gcloud as part of the expression, which it rejects.
+        # Inside a single-quoted wrapper -- `bash -c '... --format=value(x)'`
+        # -- the `(` is already quoted, and a quote added there closes the
+        # wrapper instead.
         line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
-        if (line.count('"') - line.count('\\"')) % 2:
+        if (line.count('"') - line.count('\\"')) % 2 or line.count("'") % 2:
             return match.group(0)
         return f"{match.group('flag')}{match.group('sep')}'{match.group('proj')}'"
 
@@ -3823,17 +3839,46 @@ def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
     needs no guard ahead of it.
     """
     lines = text.split("\n")
-    for _first, last, joined in _logical_command_spans(lines):
+    for first, last, _joined in _logical_command_spans(lines):
+        code = [_command_part(line) for line in lines[first : last + 1]]
+        joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
         if _mentions_flag(joined, anchor) and not _mentions_flag(joined, flag):
-            lines[last] = lines[last].rstrip() + " " + flag
+            end = len(code[-1].rstrip())
+            lines[last] = lines[last][:end] + " " + flag + lines[last][end:]
     return "\n".join(lines)
+
+
+def _command_part(line: str) -> str:
+    """`line` up to where its command ends: a closing backtick or a `#` comment.
+
+    A note writes a command either fenced, where a caveat follows as a `#`
+    comment, or inline in prose between backticks. A flag appended past either
+    lands where the shell never reads it -- in the comment, or after the
+    backtick a reader stops copying at -- and the presence test then finds it
+    there and reports the command fixed.
+    """
+    tick = line.find("`")
+    if tick != -1:
+        close = line.find("`", tick + 1)
+        return line[: close if close != -1 else len(line)]
+    quote = ""
+    for index, char in enumerate(line):
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
 
 
 def _parse_update_target(command: str) -> tuple[str, str, str] | None:
     """`(name, location, project)` off one `clusters update` invocation.
 
-    `None` where any of the three is absent: this builds a command out of what
-    is there and never invents an argument. Both flag spellings are read
+    `None` where the name or location is absent: this builds a command out of
+    what is there and never invents an argument. `--region` and `--zone` read
+    as the location they are, and an absent `--project` comes back empty, so
+    the second command falls back on the same default project the first did. Both flag spellings are read
     because the model writes both -- the 2026-09-06 run published
     `--location us-east4` on one cluster and `--location=us-east4` on the next.
     """
@@ -3854,9 +3899,9 @@ def _parse_update_target(command: str) -> tuple[str, str, str] | None:
         elif not positional:
             positional = token
         index += 1
-    location = flags.get(GCLOUD_LOCATION_FLAG, "")
+    location = next((flags[f] for f in GCLOUD_LOCATION_FLAGS if flags.get(f)), "")
     project = flags.get(GCLOUD_PROJECT_FLAG, "")
-    return (positional, location, project) if positional and location and project else None
+    return (positional, location, project) if positional and location else None
 
 
 def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] | None:
@@ -3900,7 +3945,8 @@ def add_dns_access_command(text: str) -> str:
     return text.rstrip("\n") + (
         "\n" + DNS_ACCESS_COMMENT.format(location=location) + "\n"
         f"{CLUSTERS_UPDATE_PREFIX} {name} {GCLOUD_LOCATION_FLAG}={location} "
-        f"{GCLOUD_PROJECT_FLAG}={project} {DNS_ACCESS_FLAG}"
+        + (f"{GCLOUD_PROJECT_FLAG}={project} " if project else "")
+        + DNS_ACCESS_FLAG
     )
 
 
@@ -4906,19 +4952,38 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
     }
 
 
-def collector_vouched_findings(findings: list[dict], manifest: dict | None) -> set[str]:
-    """Findings a collector candidate in `manifest` stands behind.
+def _sweep_checks_text() -> str:
+    """`MAJOR_SWEEP_CHECKS` as the ledger and the log spell it."""
+    return ", ".join(f"`{check}`" for check in sorted(MAJOR_SWEEP_CHECKS))
 
-    The sweep holds these to `AUTO_PROMOTION_FLOOR` and every other finding to
-    `UNVOUCHED_PROMOTION_FLOOR`: a `needs_triage` marker lives on a candidate,
-    so a finding without one is a finding nothing could have marked. Empty on
-    a run without a manifest.
+
+def collector_vouched_findings(
+    findings: list[dict],
+    manifest: dict | None,
+    checks: frozenset[str] = MAJOR_SWEEP_CHECKS,
+) -> set[str]:
+    """Findings the sweep may open at `AUTO_PROMOTION_FLOOR`.
+
+    Three conditions, all of them: the check is in `checks`, a collector
+    candidate in `manifest` stands behind the finding, and that candidate is
+    itself graded at or above the floor. The sweep holds every other finding to
+    `UNVOUCHED_PROMOTION_FLOOR`. The candidate has to vouch because a
+    `needs_triage` marker lives on it, so a finding without one is a finding
+    nothing could have marked; its grade has to vouch because otherwise the
+    model's re-grade of a `minor` candidate, not the collector, decides that a
+    pull request opens. Empty on a run without a manifest.
     """
-    flagged = _flagged_identities(manifest)
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    graded: dict[str, int] = {}
+    for entry, candidate in _candidates(manifest):
+        identity = _candidate_identity(entry, candidate)
+        rank = SEVERITY_RANK.get(str(candidate.get("severity") or ""), len(SEVERITIES))
+        graded[identity] = min(rank, graded.get(identity, len(SEVERITIES)))
     return {
         str(finding.get("id") or "")
         for finding in findings
-        if derive_finding_id(finding) in flagged
+        if str(finding.get("check") or "") in checks
+        and graded.get(derive_finding_id(finding), len(SEVERITIES)) <= floor_rank
     }
 
 
@@ -7236,11 +7301,11 @@ def promotion_candidates(
     stopped, graded under the floor that applied to it. It is returned so the ledger
     can name it: unlike the cap, the floor never clears on its own.
 
-    `vouched` is the finding ids a collector candidate stands behind
-    (`collector_vouched_findings`). Only those are held to
+    `vouched` is the finding ids `collector_vouched_findings` clears for the
+    lower floor: a check in `MAJOR_SWEEP_CHECKS`, with a collector candidate
+    graded at least as high behind it. Only those are held to
     `AUTO_PROMOTION_FLOOR`; every other finding is held to
-    `UNVOUCHED_PROMOTION_FLOOR`, because the markers that keep a disruptive
-    fix out of the sweep exist only on a candidate. Absent means none.
+    `UNVOUCHED_PROMOTION_FLOOR`. Absent means none.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -8410,8 +8475,8 @@ def _render_withheld(
             "",
             f"{len(floor)} finding(s) carry a manifest remediation graded below "
             "what the automatic sweep requires: "
-            f"`{AUTO_PROMOTION_FLOOR}` where the collector flagged the finding, "
-            f"`{UNVOUCHED_PROMOTION_FLOOR}` where it did not. "
+            f"`{UNVOUCHED_PROMOTION_FLOOR}`, or `{AUTO_PROMOTION_FLOOR}` for "
+            f"{_sweep_checks_text()} where the collector graded it so. "
             "Unlike the cap this does not clear on its own — the sweep will pass "
             "over these again every run until someone asks. Comment "
             "`/remediate <finding-id>` to open any of them — an explicit request "
@@ -9328,7 +9393,8 @@ def render_stale_close_comment(
         "read as a rejection of the fix.",
         "",
         f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
-        f"or `{AUTO_PROMOTION_FLOOR}` where the collector flagged it, with a manifest "
+        f"or `{AUTO_PROMOTION_FLOOR}` for {_sweep_checks_text()} where the collector "
+        "graded it so, with a manifest "
         "remediation is normally re-proposed automatically "
         f"on this same branch (at most {AUTO_PROMOTION_CAP} per run). Anything "
         "else is listed on the ledger as awaiting `/remediate <finding-id>`, "
@@ -12260,8 +12326,8 @@ def _handle_finish_dry_run(
         )
     if plan.below_floor:
         log(
-            f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR, OR `{UNVOUCHED_PROMOTION_FLOOR}` "
-            "WITHOUT A COLLECTOR CANDIDATE "
+            f"BELOW THE `{UNVOUCHED_PROMOTION_FLOOR}` FLOOR, OR `{AUTO_PROMOTION_FLOOR}` "
+            f"FOR {_sweep_checks_text()} "
             f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
         )
     rendered = render_issue_body(

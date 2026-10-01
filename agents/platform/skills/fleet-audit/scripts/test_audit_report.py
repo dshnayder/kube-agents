@@ -3093,7 +3093,8 @@ class TestFinishWithFindings(HarnessTestCase):
         body = self.harness.bodies_for("issue", "create")[0]
         self.assertIn("## Awaiting `/remediate`", body)
         self.assertIn(
-            f"`{audit_report.AUTO_PROMOTION_FLOOR}` where the collector flagged the finding",
+            f"`{audit_report.AUTO_PROMOTION_FLOOR}` for `ccc-no-ondemand-floor`, `no-pdb`, "
+            "`unbound-sa-automount` where the collector graded it so",
             body,
         )
         self.assertIn(f"`{derived_id(fid='a')}` —", body)
@@ -3104,8 +3105,9 @@ class TestFinishWithFindings(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a", severity="minor")]), ["--dry-run"]
         )
         self.assertIn(
-            f"BELOW THE `{audit_report.AUTO_PROMOTION_FLOOR}` FLOOR, OR "
-            f"`{audit_report.UNVOUCHED_PROMOTION_FLOOR}` WITHOUT A COLLECTOR CANDIDATE (1): "
+            f"BELOW THE `{audit_report.UNVOUCHED_PROMOTION_FLOOR}` FLOOR, OR "
+            f"`{audit_report.AUTO_PROMOTION_FLOOR}` FOR `ccc-no-ondemand-floor`, `no-pdb`, "
+            "`unbound-sa-automount` (1): "
             f"{derived_id(fid='a')}",
             self.err,
         )
@@ -15222,14 +15224,47 @@ class TestTriageMarkedFindings(BaseTestCase):
             {},
         )
 
-    def test_a_candidate_vouches_for_its_finding_marked_or_not(self):
-        m = {"clusters": [_ran("c1", "idle-workload", candidates=[_cand("idle-workload", "c1", "Deployment/a")])]}
+    def graded(self, check, severity, obj="Deployment/a"):
+        return {
+            "clusters": [
+                _ran("c1", check, candidates=[{**_cand(check, "c1", obj), "severity": severity}])
+            ]
+        }
+
+    def test_a_major_candidate_on_a_cleared_check_vouches_for_its_finding(self):
         findings = [
-            _pub("a", "idle-workload", "c1", "Deployment/a"),
-            _pub("b", "idle-workload", "c1", "Deployment/b"),
+            _pub("a", "no-pdb", "c1", "Deployment/a"),
+            _pub("b", "no-pdb", "c1", "Deployment/b"),
         ]
-        self.assertEqual(audit_report.collector_vouched_findings(findings, m), {"a"})
-        self.assertEqual(audit_report.collector_vouched_findings(findings, self.marked()), {"a"})
+        self.assertEqual(
+            audit_report.collector_vouched_findings(findings, self.graded("no-pdb", "major")),
+            {"a"},
+        )
+
+    def test_a_check_off_the_list_is_never_vouched(self):
+        # `cronjob-runs-overlap` is `major` and collector-flagged, and its fix
+        # is a concurrency policy the owner has to choose.
+        findings = [_pub("a", "cronjob-runs-overlap", "c1", "CronJob/a")]
+        self.assertEqual(
+            audit_report.collector_vouched_findings(
+                findings, self.graded("cronjob-runs-overlap", "major", "CronJob/a")
+            ),
+            set(),
+        )
+
+    def test_a_minor_candidate_does_not_vouch_for_a_major_regrade(self):
+        findings = [_pub("a", "no-pdb", "c1", "Deployment/a")]
+        self.assertEqual(
+            audit_report.collector_vouched_findings(findings, self.graded("no-pdb", "minor")),
+            set(),
+        )
+
+    def test_every_cleared_check_is_one_a_collector_emits(self):
+        import collect
+        import fleet_stockout
+        emitted = {spec.slug for spec in collect.OBTAINABILITY_CHECKS + collect.COMPLIANCE_CHECKS}
+        emitted |= set(fleet_stockout.SEVERITY)
+        self.assertLessEqual(audit_report.MAJOR_SWEEP_CHECKS, emitted)
 
     def test_no_manifest_vouches_for_nothing(self):
         self.assertEqual(
@@ -18533,13 +18568,63 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
         out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
         self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
 
-    def test_an_update_command_missing_the_project_yields_no_second_command(self):
+    def test_an_update_command_missing_the_project_keeps_the_default_project(self):
         note = (
             "gcloud container clusters update c --location=us-east4 "
             "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
         )
         out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
-        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+        self.assertTrue(
+            out.endswith("gcloud container clusters update c --location=us-east4 --no-enable-dns-access"),
+            out,
+        )
+
+    def test_a_region_flag_reads_as_the_location(self):
+        note = (
+            "gcloud container clusters update c --region us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--no-enable-dns-access",
+            out,
+        )
+
+    def test_the_flag_goes_before_a_trailing_comment(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>  # list every CIDR"
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR> "
+            "--no-enable-google-cloud-access  # list every CIDR",
+        )
+
+    def test_a_flag_inside_the_comment_does_not_count(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks  # then --no-enable-google-cloud-access"
+        )
+        self.assertTrue(
+            self.repaired(note=note)["remediation"]["note"].startswith(
+                "gcloud container clusters update c --location=us-east4 --project=p "
+                "--enable-master-authorized-networks --no-enable-google-cloud-access  #"
+            )
+        )
+
+    def test_the_flag_goes_inside_an_inline_backticked_command(self):
+        note = (
+            "Run `gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks` to restrict access."
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "Run `gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --no-enable-google-cloud-access` to restrict access.",
+        )
 
     def test_both_flag_spellings_are_read(self):
         for form in ("--location=us-east4 --project=p", "--location us-east4 --project p"):
@@ -18828,6 +18913,10 @@ class TestGcloudFormatQuoting(unittest.TestCase):
         # The shell reads no subshell inside double quotes, so quotes added
         # there would reach gcloud as part of the expression.
         note = 'ep="$(gcloud x describe c --format=value(endpoint))"'
+        self.assertEqual(self.quote(note), note)
+
+    def test_an_expression_inside_a_single_quoted_wrapper_is_untouched(self):
+        note = "watch 'gcloud x describe c --format=value(status)'"
         self.assertEqual(self.quote(note), note)
 
     def test_a_closed_double_quoted_string_earlier_on_the_line_does_not_stop_it(self):
