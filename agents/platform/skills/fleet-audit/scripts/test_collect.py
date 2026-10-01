@@ -9639,6 +9639,8 @@ class _FakeBrokerWorkspace:
     paths one `read_many` answers before deferring the rest as `requestBudget`;
     `refuse` maps a path to the reason the broker will never send it; `symlinks`
     are names the listing reports apart from its entries, all on the first page.
+    `grep` searches `files`, refused or not, as the broker searches its checkout;
+    `grep_error` makes it raise instead.
     """
 
     def __init__(
@@ -9653,6 +9655,8 @@ class _FakeBrokerWorkspace:
         self.opened = []
         self.reads = []
         self.extra = {}
+        self.greps = []
+        self.grep_error = None
 
     def open(self, endpoint, repo, depth=None):
         if self.fail_open:
@@ -9690,6 +9694,20 @@ class _FakeBrokerWorkspace:
                 got[path] = self.files[path]
         got.update(self.extra)
         return got, skipped
+
+    def grep(self, pattern, prefix=None, regex=False, ignore_case=False):
+        self.greps.append((pattern, prefix, regex))
+        if self.grep_error:
+            raise self.grep_error
+        expression = re.compile(pattern if regex else re.escape(pattern))
+        matches = [
+            {"path": path, "line": number, "text": line}
+            for path, content in sorted(self.files.items())
+            if prefix is None or path == prefix
+            for number, line in enumerate(content.decode().splitlines(), 1)
+            if expression.search(line)
+        ]
+        return {"matches": matches, "total": len(matches), "truncated": False}
 
 
 class TestBrokerMirror(unittest.TestCase):
@@ -9750,7 +9768,7 @@ class TestBrokerMirror(unittest.TestCase):
     def test_a_file_the_broker_will_not_send_withholds_only_its_cluster(self):
         """A missing file can hide a second declaration in its own cluster's
         tree, so that tree goes; the other clusters' trees are whole and stay.
-        It could also be an Application for any cluster, so releases go too."""
+        The broker's search finds no release kind in it, so releases stay."""
         broker = _FakeBrokerWorkspace(
             self.two_clusters(),
             refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
@@ -9759,16 +9777,55 @@ class TestBrokerMirror(unittest.TestCase):
             self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
             index = collect.workload_declarations(Path(tmp))
             withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            releases = collect.release_declarations(Path(tmp))
         self.assertRegex(err.getvalue(), r"clusters/other/apps/vendored.yaml from .* \(tooLarge\); no candidate on cluster other")
+        self.assertNotIn("release_declaration", err.getvalue())
+        self.assertIn(collect.BROKER_MAX_FILE_BYTES_ENV, err.getvalue())
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+        self.assertFalse(withheld)
+        self.assertEqual(
+            broker.greps,
+            [(collect.RELEASE_DECLARING_PATTERN, "clusters/other/apps/vendored.yaml", True)],
+        )
+
+    def test_a_large_file_naming_a_release_kind_withholds_the_release_index(self):
+        """An Application can live in any file and target any cluster."""
+        files = self.two_clusters()
+        files["clusters/other/apps/vendored.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
+        broker = _FakeBrokerWorkspace(
+            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            releases = collect.release_declarations(Path(tmp))
+        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration, and no candidate will carry a release_declaration")
         self.assertTrue(withheld)
         self.assertEqual(releases, {})
 
-    def test_a_withheld_file_outside_the_cluster_trees_keeps_every_declaration(self):
+    def test_a_large_file_the_broker_cannot_search_withholds_the_release_index(self):
         broker = _FakeBrokerWorkspace(
             self.two_clusters(),
-            refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE},
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+        )
+        broker.grep_error = RuntimeError("unknown op grep")
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+
+    def test_a_large_kustomization_withholds_the_release_index_unsearched(self):
+        """`namespace_directories` reads a Kustomization file by its name."""
+        name = "clusters/spot-capacity-test/workloads/kustomization.yaml"
+        broker = _FakeBrokerWorkspace(self.files(), refuse={name: collect.BROKER_SKIP_TOO_LARGE})
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+        self.assertEqual(broker.greps, [])
+
+    def test_a_withheld_file_outside_the_cluster_trees_keeps_every_declaration(self):
+        files = self.two_clusters()
+        files["provisioning/cluster.yml"] = b"kind: AppProject\n"
+        broker = _FakeBrokerWorkspace(
+            files, refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE}
         )
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))

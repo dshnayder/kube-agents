@@ -266,8 +266,9 @@ RELEASE_KEY_RELEASE = "release"
 # because `release_declarations` is a copy of `collect.py`'s and the copy is
 # kept identical, not trimmed to what one stream happens to use.
 RELEASE_KEY_NAMESPACE = "namespace"
-# What `collect.broker_mirror` leaves in a content-mode mirror some file was
-# withheld from; `release_declarations` then answers nothing rather than part.
+# What `collect.broker_mirror` leaves in a content-mode mirror a file that could
+# hold a release was withheld from; `release_declarations` then answers nothing
+# rather than part.
 MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
 # Where a values override goes, per reconciler. Argo CD accepts both a YAML
 # string (`values`) and a structured block (`valuesObject`); this names the one

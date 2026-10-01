@@ -192,11 +192,11 @@ BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
 BROKER_SKIP_TOO_LARGE = "tooLarge"
 BROKER_SKIP_SYMLINK = "symlink"
 BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK})
-# Left in a mirror some file was withheld from. `release_declarations` reads
-# Argo CD Applications from anywhere in the tree, for any destination, so a
-# missing file can hide a release for every cluster; the marker makes that
-# index, and `namespace_directories` which leans on it, answer nothing rather
-# than part. Not YAML, so no index opens it.
+# Left in a mirror a file that could hold a release was withheld from.
+# `release_declarations` reads Argo CD Applications from anywhere in the tree,
+# for any destination, so such a file can hide a release for every cluster;
+# the marker makes that index, and `namespace_directories` which leans on it,
+# answer nothing rather than part. Not YAML, so no index opens it.
 MIRROR_RELEASES_WITHHELD_MARKER = ".collect-releases-withheld"
 
 # `release_declarations` indexes the objects that render a workload a GitOps
@@ -271,6 +271,22 @@ RENDERER_KUSTOMIZE = "kustomize"
 # build` still accepts, and a repo that uses one is exactly as unresolvable
 # without this as one that uses the first.
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# What `release_declarations` reads, as a `git grep -E` expression the broker
+# runs over one withheld file: a `tooLarge` file that names none of these
+# cannot hide a release, so it costs only its cluster's tree. Written out
+# rather than `re.escape`d, which escapes `-` in a way ERE does not need.
+RELEASE_DECLARING_PATTERN = "|".join(
+    [
+        ARGOCD_APPLICATION_KIND,
+        FLUX_HELM_RELEASE_KIND,
+        FLUX_HELM_REPOSITORY_KIND,
+        ARGOCD_APPPROJECT_KIND,
+        ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
+    ]
+)
+# The broker's per-file limit, named in the WARNING for a `tooLarge` file so
+# whoever reads it knows which knob returns the file to the mirror.
+BROKER_MAX_FILE_BYTES_ENV = "CREDENTIAL_PROXY_WORKSPACE_MAX_FILE_BYTES"
 # Spelled the same way `audit_report.KCC_API_GROUP_SUFFIX` spells it, and
 # copied rather than imported for the reason `SYSTEM_NAMESPACES` is below.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
@@ -8767,6 +8783,29 @@ def _cluster_tree(path: str) -> str | None:
     return None
 
 
+def _may_declare_release(workspace, path: str) -> bool:
+    """Whether withheld `path` could hold something the release index reads.
+
+    The broker searches a file it will not send, so a vendored CRD bundle over
+    its size limit need not cost every cluster its `release_declaration`. A
+    Kustomization file feeds `namespace_directories` by name, and a search that
+    fails or answers in a shape this does not know, could not rule the file
+    out, so each of those still counts as declaring.
+    """
+    if Path(path).name in KUSTOMIZATION_FILE_NAMES:
+        return True
+    try:
+        found = workspace.grep(RELEASE_DECLARING_PATTERN, prefix=path, regex=True)
+    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
+        return True
+    if not isinstance(found, dict):
+        return True
+    try:
+        return int(found.get("total", 1)) > 0
+    except (TypeError, ValueError):
+        return True
+
+
 def _batches(
     wanted: list[tuple[str, int]], max_paths: int = MIRROR_BATCH_PATHS
 ) -> list[list[str]]:
@@ -8814,10 +8853,14 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     from its entries -- withholds only what it could have declared into. A
     file under `clusters/<c>/` drops that cluster's whole tree from the
     mirror, because `workload_declarations` keys by that path. Any withheld
-    file, wherever it sits, leaves MIRROR_RELEASES_WITHHELD_MARKER, because an
-    Argo CD Application can live anywhere and target any cluster: no candidate
-    then carries `release_declaration` or `namespace_directory`. The other
-    clusters keep their `declaration`, and each withheld file is logged.
+    file that could hold a release, wherever it sits, leaves
+    MIRROR_RELEASES_WITHHELD_MARKER, because an Argo CD Application can live
+    anywhere and target any cluster: no candidate then carries
+    `release_declaration` or `namespace_directory`. A symlink and a
+    Kustomization file always could; a `tooLarge` file could unless the
+    broker's search finds none of the kinds the release index reads in it
+    (`_may_declare_release`). The other clusters keep their `declaration`, and
+    each withheld file is logged with what it cost.
     """
     if open_workspace is None:
         client = _import_platform_script("credential_proxy_client")
@@ -8898,6 +8941,13 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
                         )
                         return False
                     pending = [str(e.get("path") or "") for e in retry]
+            # A symlink's blob is its target's name, so the broker cannot
+            # search what it points at; only a `tooLarge` file is ruled out.
+            releasing = {
+                path
+                for path, reason in withheld.items()
+                if reason != BROKER_SKIP_TOO_LARGE or _may_declare_release(workspace, path)
+            }
     except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
         log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
         return False
@@ -8910,14 +8960,20 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     clusters = {_cluster_tree(path) for path in withheld} - {None}
     for path, reason in sorted(withheld.items()):
         region = _cluster_tree(path)
+        costs = []
+        if region:
+            costs.append(f"no candidate on cluster {region} will carry a declaration")
+        if path in releasing:
+            costs.append("no candidate will carry a release_declaration or namespace_directory")
+        knob = f"; raise {BROKER_MAX_FILE_BYTES_ENV} on the broker to mirror it" if reason == BROKER_SKIP_TOO_LARGE else ""
         log(
             f"WARNING: the broker will not send {path} from {repo} ({reason}); "
-            + (f"no candidate on cluster {region} will carry a declaration, and " if region else "")
-            + "no candidate will carry a release_declaration or namespace_directory"
+            + (", and ".join(costs) or "it declares nothing the indexes read")
+            + knob
         )
     files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
     try:
-        if withheld:
+        if releasing:
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
         for path, content in files.items():
             target = dest / Path(path)
