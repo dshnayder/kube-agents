@@ -15223,42 +15223,82 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     def unwritten(self, findings, manifest, promised=None, degraded=(), prs=None):
         return audit_report.unwritten_sweep_fixes(
-            findings, manifest, promised or {}, list(degraded), prs or {}
+            findings, manifest, promised or {}, list(degraded), AUDIT, prs or []
         )
+
+    def pr_on(self, path, **fields):
+        """A remediation pull request on the branch the sweep names for `path`."""
+        as_written = {"id": "a", "remediation": {"kind": "manifest", "path": path}}
+        return {"headRefName": audit_report.group_branch_for(AUDIT, [as_written]), **fields}
 
     def test_a_manual_fix_whose_declaration_the_collector_found_is_unwritten(self):
         self.assertEqual(
-            self.unwritten([self.manual()], self.manifest()), {"a": "apps/a/deploy.yaml"}
+            self.unwritten([self.manual()], self.manifest()),
+            {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
         )
 
     def test_a_promised_file_the_degrade_caught_is_unwritten_at_the_path_promised(self):
-        finding = self.manual()
         self.assertEqual(
-            self.unwritten([finding], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"]),
-            {"a": "apps/a/pdb.yaml"},
+            self.unwritten([self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"]),
+            {"a": audit_report.UnwrittenFix("apps/a/pdb.yaml", declared=False)},
         )
 
     def test_a_manual_fix_with_no_declaration_is_the_workers_to_make(self):
         self.assertEqual(self.unwritten([self.manual()], self.manifest(declaration="")), {})
 
     def test_a_finding_the_sweep_would_not_open_is_not_refused(self):
-        # Under the floor, off the major list, or already carried by a live PR.
+        # Under the floor, or off the major list.
         cases = {
-            "minor": ([self.manual(severity="minor")], self.manifest(severity="minor"), {}),
+            "minor": ([self.manual(severity="minor")], self.manifest(severity="minor")),
             "unvouched major": (
                 [self.manual(check="cronjob-runs-overlap")],
                 self.manifest(check="cronjob-runs-overlap"),
-                {},
-            ),
-            "open pull request": (
-                [self.manual()],
-                self.manifest(),
-                {"a": {"state": "OPEN", "url": "https://github.com/acme/fleet/pull/7"}},
             ),
         }
-        for name, (findings, manifest, prs) in cases.items():
+        for name, (findings, manifest) in cases.items():
             with self.subTest(name):
-                self.assertEqual(self.unwritten(findings, manifest, prs=prs), {})
+                self.assertEqual(self.unwritten(findings, manifest), {})
+
+    def test_a_promised_fix_a_pull_request_already_answers_is_not_refused(self):
+        """Joined on the branch the promised path names, as the sweep joins it:
+        open, merged, or closed by a person all leave the finding out."""
+        answered = {
+            "open": {"state": "OPEN"},
+            "merged": {"state": "MERGED", "mergedAt": "2026-09-30T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-09-30T00:00:00Z"},
+        }
+        for name, fields in answered.items():
+            with self.subTest(name):
+                prs = [self.pr_on("apps/a/pdb.yaml", **fields)]
+                self.assertEqual(
+                    self.unwritten(
+                        [self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"], prs
+                    ),
+                    {},
+                )
+
+    def test_a_pull_request_on_another_path_does_not_answer_a_promised_fix(self):
+        prs = [self.pr_on("apps/b/pdb.yaml", state="OPEN")]
+        self.assertIn(
+            "a",
+            self.unwritten([self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"], prs),
+        )
+
+    def test_the_refusal_never_tells_the_worker_to_write_over_the_declaration(self):
+        """A declared `manual` fix names the object's own file, so the message
+        has to say a new object goes beside it: a worker told only "write at
+        this path" writes the PodDisruptionBudget over the Deployment."""
+        message = audit_report.unwritten_refusal_message(
+            {
+                "a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True),
+                "b": audit_report.UnwrittenFix("apps/b/pdb.yaml", declared=False),
+            }
+        )
+        self.assertIn("a declared at apps/a/deploy.yaml", message)
+        self.assertIn("never over the file itself", message)
+        self.assertIn("b -> apps/b/pdb.yaml", message)
+        self.assertNotIn("a -> apps/a/deploy.yaml", message)
+        self.assertIn("run `finish` again unchanged", message)
 
     def test_the_first_finish_refuses_and_publishes_nothing_and_the_retry_publishes(self):
         self.harness.replies = {"issue list": "[]"}
@@ -18654,6 +18694,21 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
         # And it names the address a reader can check the finding against.
         self.assertIn("gke-<hash>.us-east4.gke.goog", note)
 
+    def test_a_prompted_command_gains_the_second_command_too(self):
+        # `_is_gcloud_command` allows a `$ ` prompt, so the flag lands on it;
+        # the DNS half has to find the same command or it is silently dropped.
+        prompted = "$ " + self.NOTE.split("\n")[1]
+        note = self.repaired(note=prompted, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("--no-enable-dns-access", note)
+
+    def test_a_manual_note_gains_no_second_command(self):
+        # A `manual` note renders inline, not in a code block, so the comment
+        # line above the second command would publish as a heading.
+        finding = self.finding(excerpt=self.DNS_EXCERPT)
+        finding["remediation"]["kind"] = "manual"
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertNotIn("--no-enable-dns-access", finding["remediation"]["note"])
+
     def test_the_ip_only_arm_gains_no_dns_command(self):
         # The check fires on either endpoint. Closing the DNS one on a cluster
         # that never opened it is a change the finding does not justify.
@@ -19081,6 +19136,16 @@ class TestGcloudFormatQuoting(unittest.TestCase):
 
     def quote(self, text):
         return audit_report.quote_gcloud_format_projections(text)
+
+    def test_an_apostrophe_in_the_prose_before_the_span_is_not_a_quote(self):
+        self.assertEqual(
+            self.quote(
+                "Confirm the cluster's channel with "
+                "`gcloud container clusters describe c --format=value(releaseChannel)`"
+            ),
+            "Confirm the cluster's channel with "
+            "`gcloud container clusters describe c --format='value(releaseChannel)'`",
+        )
 
     def test_the_live_defect_is_corrected(self):
         # 2026-09-04 compliance-audit shipped this in `recommendation.risk` on

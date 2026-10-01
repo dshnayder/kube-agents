@@ -418,8 +418,9 @@ the message names and re-run; never delete the finding that tripped it. What rea
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, `--no-collector-manifest` was given a blank reason, or a collector stream was given
-neither. A manifest that finished before
+empty path, `--no-collector-manifest` was given a blank reason, a collector stream was given
+neither, or, on the run's first `finish` only, a fix the sweep would open was not written (see
+"Write every `manifest` remediation file" below). A manifest that finished before
 this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
@@ -1233,8 +1234,12 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
   directory. For a finding the sweep would open, the first `finish` of the run exits 2 listing each
-  one whose file is missing, and each `manual` one whose candidate carries a `declaration`, with the
-  path to write: write them, set `kind: manifest` and `path`, and run `finish` again. Anything
+  one whose file is missing, at the path it named, and each `manual` one whose candidate carries a
+  `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
+  as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
+  `kind: manifest` and `path`, and run `finish` again. A finding the SOP itself makes `manual`, or
+  one a pull request already carries, stays `manual` with the reason in its `note`: the refusal
+  happens once per run, and a `--dry-run` neither makes it nor uses it up. Anything
   still missing on that second call does not fail the run — that one finding degrades to `manual`,
   keeps its evidence and recommendation, and says in the ledger that the fix was named but not
   written. The report still publishes. Do not rely on this: a degraded finding is a fix a human now

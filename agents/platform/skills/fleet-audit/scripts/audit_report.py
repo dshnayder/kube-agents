@@ -999,8 +999,8 @@ DECLARATION_FIELDS = ("repo", "path", "excerpt")
 # section is charged against the body before the findings are, and the
 # below-floor block grows with every minor manifest fix a stream files, so an
 # uncapped list squeezes findings out of the body and, past a few hundred,
-# makes it too large to publish at all. The count stays exact; the run's log
-# line names every id.
+# makes it too large to publish at all. The count stays exact, and
+# `finish --dry-run` logs every id in both blocks.
 MAX_WITHHELD_ROWS = 20
 # The document's record of the declared-intent search (the obtainability SOP's
 # §4a): one `owner/name@sha` per repository the run searched. `finish` compares
@@ -1181,8 +1181,10 @@ AUTO_PROMOTION_CAP = 5
 # `major` rather than `minor` because the 21 that remain are `minor`, 15 of
 # them on one stream, which would sit at `AUTO_PROMOTION_CAP` for three
 # consecutive runs; a `minor` is defence in depth the ledger can go on
-# offering to `/remediate`. At `major` every stream's sweep fits inside the cap
-# in one run. What the floor passes over is named on the ledger
+# offering to `/remediate`. `major` holds only for a check in
+# `MAJOR_SWEEP_CHECKS` a collector candidate vouches for
+# (`collector_vouched_findings`); every other finding is held to
+# `UNVOUCHED_PROMOTION_FLOOR`. What the floor passes over is named on the ledger
 # (`_render_withheld`), because unlike the cap it does not clear on its own.
 AUTO_PROMOTION_FLOOR = "major"
 # The floor for a finding no collector candidate stands behind: one on a run
@@ -3794,6 +3796,10 @@ def quote_gcloud_format_projections(text: str) -> str:
         # -- the `(` is already quoted, and a quote added there closes the
         # wrapper instead.
         line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+        # Inside an inline code span, only the span is shell: an apostrophe in
+        # the prose before it ("the cluster's channel") is not a quote.
+        if line.count("`") % 2:
+            line = line[line.rfind("`") + 1 :]
         if (line.count('"') - line.count('\\"')) % 2 or line.count("'") % 2:
             return match.group(0)
         return f"{match.group('flag')}{match.group('sep')}'{match.group('proj')}'"
@@ -3954,6 +3960,9 @@ def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] 
     """
     fallback = None
     for _first, _last, joined in reversed(_logical_command_spans(text.split("\n"))):
+        # The same `$ ` prompt `_is_gcloud_command` allows, or the flag repair
+        # extends a command this one cannot find.
+        joined = joined.strip().removeprefix(SHELL_PROMPT)
         if not joined.startswith(CLUSTERS_UPDATE_PREFIX):
             continue
         target = _parse_update_target(joined)
@@ -4018,7 +4027,9 @@ def repair_public_control_plane_commands(finding: dict) -> None:
     remediation = finding.get("remediation")
     if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
         note = fix(remediation["note"])
-        if dns_open:
+        # Only a `gcloud` note renders in a code block; in a `manual` one the
+        # comment line above the second command would read as a heading.
+        if dns_open and remediation.get("kind") == "gcloud":
             note = add_dns_access_command(note)
         remediation["note"] = note
 
@@ -10934,6 +10945,47 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
+def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
+    """What the refusal tells the worker, one list per shape of the shortcut.
+
+    The declared list names the object's own file, and says in so many words
+    that a new object goes beside it: a worker told only "write the manifest at
+    this path" writes a PodDisruptionBudget over the Deployment it protects, and
+    the sweep opens that pull request unasked. It also leaves the worker a way
+    out that does not need a second refusal -- a finding the SOP itself makes
+    `manual`, or one a pull request already carries, is answered by running
+    `finish` again unchanged.
+    """
+    named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
+    declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
+    parts = [
+        f"{len(unwritten)} finding(s) the sweep would open a pull request for have no fix written."
+    ]
+    if named:
+        parts.append(
+            "Write the manifest each of these names, at that path: "
+            + "; ".join(f"{fid} -> {path}" for fid, path in named)
+            + "."
+        )
+    if declared:
+        parts.append(
+            "Each of these is `manual`, but the collector found where its object is "
+            "declared: "
+            + "; ".join(f"{fid} declared at {path}" for fid, path in declared)
+            + ". Write the fix your SOP prescribes as a `kind: manifest` remediation: "
+            "an edit to the object goes in that file; a new object, such as a "
+            "PodDisruptionBudget, goes in a new file in that file's directory, never "
+            "over the file itself."
+        )
+    parts.append(
+        "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
+        "pull request already carries its fix, leave it `manual`, say why in its "
+        "`note`, and run `finish` again unchanged: this refusal happens once per run, "
+        "and the second `finish` publishes what is written."
+    )
+    return " ".join(parts)
+
+
 def mark_unwritten_refused(audit_id: str) -> bool:
     """Note on the run record that `finish` refused unwritten fixes once.
 
@@ -11114,14 +11166,29 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     return degraded
 
 
+class UnwrittenFix(NamedTuple):
+    """A fix the sweep would open had it been written, and where to look.
+
+    `declared` says which of the two shapes it is. False: the worker named
+    `path` as its `manifest` file and never wrote it, so `path` is where the fix
+    goes. True: the worker wrote `manual` although the collector found the
+    object declared at `path` -- the object's own file, which an edit goes in
+    and a new object (a PodDisruptionBudget, say) goes beside, never over.
+    """
+
+    path: str
+    declared: bool
+
+
 def unwritten_sweep_fixes(
     findings: list[dict],
     manifest: dict | None,
     promised: dict[str, str],
     degraded: list[str],
-    pr_by_finding: dict[str, dict | None],
-) -> dict[str, str]:
-    """Finding id to the file its fix belongs in, for each fix the sweep would
+    audit_id: str,
+    prs: list[dict],
+) -> dict[str, UnwrittenFix]:
+    """Finding id to where its fix belongs, for each fix the sweep would
     open if only it had been written.
 
     Two shapes of the same shortcut. A `manifest` remediation whose file was
@@ -11135,8 +11202,14 @@ def unwritten_sweep_fixes(
 
     Only findings the sweep would open count, by the tests `promotion_candidates`
     applies: graded at the floor that applies to them (`collector_vouched_findings`),
-    corroborated, not marked for triage, and with no live pull request already
-    carrying the fix.
+    corroborated, and not marked for triage. The pull-request test is the one
+    that cannot be applied the same way, because the branch is named after the
+    fix's path and neither shape has one in its remediation any more. For a
+    degraded fix the path it promised names the branch, and any pull request
+    there that the harness did not close as stale -- open, merged, or closed by
+    a person -- leaves it out, as it would leave the sweep. A declared `manual`
+    fix has no path to join on at all, so a pull request already carrying it is
+    invisible here; the refusal tells the worker what to do about that.
     """
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
@@ -11150,24 +11223,24 @@ def unwritten_sweep_fixes(
         if isinstance(candidate.get("declaration"), dict)
     }
     degraded_set = set(degraded)
-    unwritten: dict[str, str] = {}
+    unwritten: dict[str, UnwrittenFix] = {}
     for finding in findings:
         fid = str(finding.get("id", ""))
         if fid in excluded:
-            continue
-        pr = pr_by_finding.get(fid) or {}
-        if str(pr.get("state", "") or "").upper() == "OPEN":
             continue
         rank = SEVERITY_RANK.get(str(finding.get("severity") or ""), len(SEVERITIES))
         if rank > (floor_rank if fid in vouched else unvouched_rank):
             continue
         if fid in degraded_set and promised.get(fid):
-            unwritten[fid] = promised[fid]
+            as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
+            pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+            if pr is None or pr_closed_by_harness(pr):
+                unwritten[fid] = UnwrittenFix(promised[fid], declared=False)
             continue
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
         if remediation.get("kind") == "manual" and declared:
-            unwritten[fid] = declared
+            unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
 
 
@@ -13319,21 +13392,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # because one missing file must never suppress the stream.
     if findings and not unwritten_already_refused(audit_id):
         unwritten = unwritten_sweep_fixes(
-            findings,
-            manifest,
-            promised,
-            degraded,
-            reconcile_remediation_prs(audit_id, findings, remediation_prs)[0],
+            findings, manifest, promised, degraded, audit_id, remediation_prs
         )
         if unwritten and mark_unwritten_refused(audit_id):
-            listed = "; ".join(f"{fid} -> {path}" for fid, path in sorted(unwritten.items()))
-            raise ValidationError(
-                f"{len(unwritten)} finding(s) the sweep would open a pull request for "
-                "have no fix written. For each, write the complete manifest at the "
-                "path named, set the finding's remediation to `kind: manifest` with "
-                f"that `path`, and run `finish` again: {listed}. A second `finish` "
-                "on this run publishes any still unwritten as manual."
-            )
+            raise ValidationError(unwritten_refusal_message(unwritten))
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
