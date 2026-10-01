@@ -14,10 +14,10 @@ roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
 to *find*, including ai-security's §3.4, whose severity forks on whether the
 same container also trips §3.2, a fact both checks compute from the same dump —
-so nothing was left on the SOP side to skip. One check's *fix* does need a
-reader: `netpol-missing`'s remedy is a default-deny NetworkPolicy, so its
-candidates carry the `default-deny` marker that keeps the automatic sweep from
-opening it (`NETPOL_DEFAULT_DENY_TRIAGE`). Other streams have their own
+so nothing was left on the SOP side to skip. Four checks' *fixes* do need a
+reader -- `netpol-missing`'s remedy is a default-deny NetworkPolicy, for one --
+so their candidates carry a marker that keeps the automatic sweep from
+opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
@@ -114,6 +114,24 @@ TIMEOUT_RC = 124
 # not, so the sweep withholds it and `/remediate <id>` opens it by name.
 NETPOL_MISSING_SLUG = "netpol-missing"
 NETPOL_DEFAULT_DENY_TRIAGE = "default-deny"
+# The other checks whose fix a reader has to judge, for the same reason: the
+# finding is mechanical and the remedy can break what the check never read.
+# `default-sa-automount`'s fix turns the token off for every pod on the
+# namespace's default ServiceAccount, and the check cannot see which of them
+# call the API server. `service-selects-nothing`'s fix rewrites the selector
+# or deletes the Service, a choice the SOP calls a judgement. And
+# `spread-not-achieved`'s fix is a `DoNotSchedule` spread, which leaves a
+# replica Pending when the pool shrinks. Each is `major`, so each became
+# sweepable when `AUTO_PROMOTION_FLOOR` moved to `major`.
+SA_TOKEN_TRIAGE = "namespace-token"
+SERVICE_SELECTOR_TRIAGE = "service-selector"
+HARD_SPREAD_TRIAGE = "hard-spread"
+TRIAGE_BY_SLUG = {
+    NETPOL_MISSING_SLUG: NETPOL_DEFAULT_DENY_TRIAGE,
+    "default-sa-automount": SA_TOKEN_TRIAGE,
+    "service-selects-nothing": SERVICE_SELECTOR_TRIAGE,
+    "spread-not-achieved": HARD_SPREAD_TRIAGE,
+}
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -8247,7 +8265,7 @@ def collect_cluster(
             "severity": severity,
             "excerpt": excerpt,
             "impact": impact,
-            "needs_triage": NETPOL_DEFAULT_DENY_TRIAGE if spec.slug == NETPOL_MISSING_SLUG else None,
+            "needs_triage": TRIAGE_BY_SLUG.get(spec.slug),
         }
         if arm_specific:
             emitted["impact_authoritative"] = True

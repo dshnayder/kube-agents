@@ -7551,7 +7551,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
     def test_only_netpol_missing_is_marked_default_deny(self):
         """Its fix writes a default-deny policy, which can cut off callers
         nobody listed; the marker keeps the sweep from opening it unasked.
-        Every other check's candidates stay unmarked."""
+        Every check outside `TRIAGE_BY_SLUG` stays unmarked."""
         privileged_pod = compliance_pod("bad")
         privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
         result = self.run_with(
@@ -7561,6 +7561,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         marks = {c["check"]: c["needs_triage"] for c in result["candidates"]}
         self.assertEqual(marks.pop("netpol-missing"), collect.NETPOL_DEFAULT_DENY_TRIAGE)
+        for slug in collect.TRIAGE_BY_SLUG:
+            marks.pop(slug, None)
         self.assertTrue(marks)
         self.assertEqual(set(marks.values()), {None})
 
@@ -7571,6 +7573,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         self.assertEqual(collect.NETPOL_DEFAULT_DENY_TRIAGE, "default-deny")
         self.assertIn(collect.NETPOL_DEFAULT_DENY_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_every_fix_marker_is_one_the_sweep_withholds(self):
+        import audit_report
+
+        for slug, marker in collect.TRIAGE_BY_SLUG.items():
+            with self.subTest(slug=slug):
+                self.assertIn(slug, {spec.slug for spec in collect.OBTAINABILITY_CHECKS + collect.COMPLIANCE_CHECKS})
+                self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
 
     def test_a_gate_failure_on_one_source_fails_the_whole_cluster(self):
         def run(argv, **kwargs):

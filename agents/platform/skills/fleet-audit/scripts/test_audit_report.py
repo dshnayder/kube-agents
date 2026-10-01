@@ -3092,7 +3092,10 @@ class TestFinishWithFindings(HarnessTestCase):
         self.run_finish(make_doc(findings=[make_finding(fid="a", severity="minor")]))
         body = self.harness.bodies_for("issue", "create")[0]
         self.assertIn("## Awaiting `/remediate`", body)
-        self.assertIn(f"graded below `{audit_report.AUTO_PROMOTION_FLOOR}`", body)
+        self.assertIn(
+            f"`{audit_report.AUTO_PROMOTION_FLOOR}` where the collector flagged the finding",
+            body,
+        )
         self.assertIn(f"`{derived_id(fid='a')}` —", body)
 
     def test_the_dry_run_logs_what_the_floor_passed_over(self):
@@ -3101,7 +3104,8 @@ class TestFinishWithFindings(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a", severity="minor")]), ["--dry-run"]
         )
         self.assertIn(
-            f"BELOW THE `{audit_report.AUTO_PROMOTION_FLOOR}` FLOOR (1): "
+            f"BELOW THE `{audit_report.AUTO_PROMOTION_FLOOR}` FLOOR, OR "
+            f"`{audit_report.UNVOUCHED_PROMOTION_FLOOR}` WITHOUT A COLLECTOR CANDIDATE (1): "
             f"{derived_id(fid='a')}",
             self.err,
         )
@@ -3305,10 +3309,16 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         target.write_text("\n".join(body) + "\n", encoding="utf-8")
         return target
 
-    def gcloud_finding(self, note, obj=CLUSTER, fid="drift"):
+    def gcloud_finding(self, note, obj=CLUSTER, fid="drift", cluster=None):
+        # A cluster finding's cluster is the cluster itself; a node pool's
+        # defaults to `prod-us-east`.
+        if cluster is None:
+            prefix, _, name = obj.partition("/")
+            cluster = name if prefix == "Cluster" else "prod-us-east"
         return make_finding(
             fid=fid,
             obj=obj,
+            cluster=cluster,
             check="workload-identity-off",
             remediation={"kind": "gcloud", "note": note},
         )
@@ -3331,6 +3341,19 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         self.assertIn("`loggingService`", note)
         self.assertLess(note.index("gcp/drift-peer-std-4.yaml"), note.index("```bash"))
         self.assertIn("```bash\ngcloud container clusters update x --logging=SYSTEM,WORKLOAD\n```", note)
+
+    def test_a_long_command_is_clipped_inside_its_fence(self):
+        """A `gcloud` note may run to `MAX_COMMAND_CHARS`; with the prose in
+        front it would pass `MAX_NOTE_CHARS`, and the renderer's clip would
+        cut the closing fence off."""
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        command = "gcloud container clusters update x --logging=SYSTEM,WORKLOAD " + "x" * 2100
+        findings = [self.gcloud_finding(command)]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+        note = findings[0]["remediation"]["note"]
+        self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+        self.assertTrue(note.endswith("…(truncated)\n```"), note[-40:])
+        self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note)
 
     def test_a_declared_cluster_without_the_field_keeps_its_gcloud_fix(self):
         # `adam-new-cluster` is declared, but its spec omits
@@ -3394,12 +3417,95 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
 
     def test_the_negated_spelling_of_an_enable_flag_writes_the_same_field(self):
         self.declare(
+            "gcp/pool.yaml",
+            "spot-pool",
+            ["clusterRef:", "  name: prod-us-east", "management:", "  autoUpgrade: true"],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update spot-pool --no-enable-autoupgrade",
+                obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_another_clusters_node_pool_of_the_same_name_is_not_a_declaration(self):
+        """Every cluster has a `default-pool`. cluster-b's declaration says
+        nothing about cluster-a's pool, whose `gcloud` fix is the right one."""
+        self.declare(
+            "clusters/b/pool.yaml",
+            "default-pool",
+            ["clusterRef:", "  name: cluster-b", "management:", "  autoUpgrade: true"],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update default-pool --cluster=cluster-a --enable-autoupgrade",
+                obj="NodePool/default-pool",
+                cluster="acme/us-central1/cluster-a",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_external_cluster_ref_matches_on_its_last_segment(self):
+        self.declare(
+            "clusters/a/pool.yaml",
+            "default-pool",
+            [
+                "clusterRef:",
+                "  external: projects/acme/locations/us-central1/clusters/cluster-a",
+                "management:",
+                "  autoUpgrade: true",
+            ],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update default-pool --enable-autoupgrade",
+                obj="NodePool/default-pool",
+                cluster="acme/us-central1/cluster-a",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_node_pool_without_a_cluster_ref_is_not_indexed(self):
+        self.declare(
             "gcp/pool.yaml", "spot-pool", ["management:", "  autoUpgrade: true"], kind="ContainerNodePool"
         )
         findings = [
             self.gcloud_finding(
                 "gcloud container node-pools update spot-pool --no-enable-autoupgrade",
                 obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_same_named_cluster_in_another_location_is_not_a_declaration(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml",
+            "drift-peer-std-4",
+            ["location: europe-west1", "loggingService: none"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud ... --logging=SYSTEM,WORKLOAD",
+                cluster="acme/us-central1/drift-peer-std-4",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_declaration_in_the_findings_location_degrades(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml",
+            "drift-peer-std-4",
+            ["location: us-central1", "loggingService: none"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud ... --logging=SYSTEM,WORKLOAD",
+                cluster="acme/us-central1/drift-peer-std-4",
             )
         ]
         self.assertEqual(self.degrade(findings), [findings[0]["id"]])
@@ -3416,7 +3522,12 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
     def test_a_node_pool_matches_only_a_node_pool_declaration(self):
-        self.declare("gcp/pool.yaml", "spot-pool", ["management:", "  autoUpgrade: false"], kind="ContainerNodePool")
+        self.declare(
+            "gcp/pool.yaml",
+            "spot-pool",
+            ["clusterRef:", "  name: prod-us-east", "management:", "  autoUpgrade: false"],
+            kind="ContainerNodePool",
+        )
         pool = self.gcloud_finding(
             "gcloud container node-pools update spot-pool --enable-autoupgrade", obj="NodePool/spot-pool"
         )
@@ -3543,9 +3654,10 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         scan = self.broker_scan(files, [[{"path": "gcp/b.yaml", "reason": "requestBudget"}], []])
         self.assertFalse(scan.truncated)
         self.assertEqual(
-            sorted(scan.declarations), [("ContainerCluster", "a"), ("ContainerCluster", "b")]
+            sorted(scan.declarations),
+            [("ContainerCluster", "a", "a", ""), ("ContainerCluster", "b", "b", "")],
         )
-        self.assertEqual(scan.declarations[("ContainerCluster", "b")].path, "gcp/b.yaml")
+        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "")].path, "gcp/b.yaml")
 
     def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
         files = {
@@ -3554,7 +3666,7 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         }
         scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
         self.assertTrue(scan.truncated)
-        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a")])
+        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "")])
 
     def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
         files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
@@ -8529,13 +8641,40 @@ class TestPromotion(BaseTestCase):
                 remediation={"kind": "gcloud", "note": "g"},
             ),
         ]
-        plan = audit_report.promotion_candidates(findings, {})
+        plan = audit_report.promotion_candidates(
+            findings, {}, vouched={"crit", "maj", "min", "crit-gcloud"}
+        )
         self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
         self.assertEqual(plan.below_floor, ["min"])
 
     def test_the_floor_is_major(self):
         self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
+
+    def test_the_unvouched_floor_is_critical(self):
+        self.assertEqual(audit_report.UNVOUCHED_PROMOTION_FLOOR, "critical")
+
+    def test_a_major_finding_no_candidate_backs_stays_below_the_floor(self):
+        """The 2026-09-07 shape on a waiver run: a `major` idle-workload
+        finding whose fix is `spec.replicas: 0`. With no manifest there is no
+        candidate to carry `scale-to-zero`, so only the floor can hold it."""
+        findings = [manifest_finding("idle", "a.yaml", severity="major")]
+        plan = audit_report.promotion_candidates(
+            findings,
+            {},
+            uncorroborated=audit_report.uncorroborated_findings(findings, None),
+            triage_marked=set(audit_report.triage_markers(findings, None)),
+            vouched=audit_report.collector_vouched_findings(findings, None),
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.below_floor, ["idle"])
+
+    def test_an_unvouched_critical_finding_still_promotes(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("crit", "a.yaml", severity="critical")], {}, vouched=set()
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.below_floor, [])
 
     def test_a_critical_finding_still_promotes_under_a_lower_floor(self):
         """The floor is compared by rank. An equality test would pass every
@@ -8727,6 +8866,7 @@ class TestBelowFloorDisclosure(BaseTestCase):
                 manifest_finding("min", "c.yaml", severity="minor"),
             ],
             {},
+            vouched={"crit", "maj", "min"},
         )
         self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
@@ -13654,6 +13794,7 @@ class ContentModeTestCase(BaseTestCase):
         finding = make_finding(
             fid="drift",
             obj=self.KCC_CLUSTER,
+            cluster=self.KCC_CLUSTER.partition("/")[2],
             check="workload-identity-off",
             remediation={"kind": "gcloud", "note": self.KCC_FIX},
         )
@@ -14997,45 +15138,51 @@ class TestTriageMarkedFindings(BaseTestCase):
 
     def test_a_marked_candidate_marks_its_finding(self):
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            set(audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], self.marked()
-            ),
+            )),
             {"f1"},
         )
 
     def test_an_unmarked_candidate_does_not(self):
         m = {"clusters": [_ran("c1", "idle-workload", candidates=[_cand("idle-workload", "c1", "Deployment/a")])]}
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], m
             ),
-            set(),
+            {},
         )
 
     def test_a_marker_this_gate_does_not_own_is_ignored(self):
         """Other markers are the model's triage cue, not the sweep's. Only what
         `NO_SWEEP_TRIAGE` names stops a pull request."""
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")],
                 self.marked(marker="model-only-cue"),
             ),
-            set(),
+            {},
         )
 
     def test_the_disruptive_fix_markers_are_the_sweeps(self):
-        """A stand-down to zero, a resize of a Guaranteed pod and a
-        default-deny NetworkPolicy each break something by construction once
-        the floor reaches `major`, so each is a gate marker, not a cue."""
-        for marker in ("scale-to-zero", "guaranteed-qos", "default-deny"):
+        """Each of these fixes can break something the collector never read
+        once the floor reaches `major`, so each is a gate marker, not a cue."""
+        for marker in (
+            "scale-to-zero",
+            "guaranteed-qos",
+            "default-deny",
+            "namespace-token",
+            "service-selector",
+            "hard-spread",
+        ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
                 self.assertEqual(
-                    audit_report.triage_marked_findings(
+                    audit_report.triage_markers(
                         [_pub("f1", "idle-workload", "c1", "Deployment/a")],
                         self.marked(marker=marker),
                     ),
-                    {"f1"},
+                    {"f1": marker},
                 )
 
     def test_every_gate_marker_has_a_reason_to_print(self):
@@ -15057,19 +15204,36 @@ class TestTriageMarkedFindings(BaseTestCase):
         m = self.marked()
         m["clusters"][0]["candidates"].append(_cand("idle-workload", "c1", "Deployment/b"))
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [
                     _pub("a", "idle-workload", "c1", "Deployment/a"),
                     _pub("b", "idle-workload", "c1", "Deployment/b"),
                 ],
                 m,
             ),
-            {"a"},
+            {"a": "service-fronted"},
         )
 
     def test_no_manifest_marks_nothing(self):
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
+            ),
+            {},
+        )
+
+    def test_a_candidate_vouches_for_its_finding_marked_or_not(self):
+        m = {"clusters": [_ran("c1", "idle-workload", candidates=[_cand("idle-workload", "c1", "Deployment/a")])]}
+        findings = [
+            _pub("a", "idle-workload", "c1", "Deployment/a"),
+            _pub("b", "idle-workload", "c1", "Deployment/b"),
+        ]
+        self.assertEqual(audit_report.collector_vouched_findings(findings, m), {"a"})
+        self.assertEqual(audit_report.collector_vouched_findings(findings, self.marked()), {"a"})
+
+    def test_no_manifest_vouches_for_nothing(self):
+        self.assertEqual(
+            audit_report.collector_vouched_findings(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
             ),
             set(),
@@ -15102,7 +15266,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
         ]
         plan = audit_report.promotion_candidates(
-            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+            findings, {}, triage_marked=audit_report.triage_markers(findings, manifest)
         )
         self.assertEqual(plan.promote, ["edit"])
         self.assertEqual(plan.needs_triage, ["create"])
@@ -18659,6 +18823,18 @@ class TestGcloudFormatQuoting(unittest.TestCase):
         # in the other direction, so the rewrite has to see the quote.
         note = "gcloud x --format 'json(a,b)'"
         self.assertEqual(self.quote(note), note)
+
+    def test_an_expression_inside_a_double_quoted_substitution_is_untouched(self):
+        # The shell reads no subshell inside double quotes, so quotes added
+        # there would reach gcloud as part of the expression.
+        note = 'ep="$(gcloud x describe c --format=value(endpoint))"'
+        self.assertEqual(self.quote(note), note)
+
+    def test_a_closed_double_quoted_string_earlier_on_the_line_does_not_stop_it(self):
+        self.assertEqual(
+            self.quote('echo "x"; gcloud x --format=value(name)'),
+            "echo \"x\"; gcloud x --format='value(name)'",
+        )
 
     def test_an_already_double_quoted_expression_is_untouched(self):
         note = 'gcloud x --format="json(a,b)"'

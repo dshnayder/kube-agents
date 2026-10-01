@@ -538,6 +538,11 @@ _GCLOUD_NEGATED_ENABLE_PREFIX = "--no-enable-"
 # anything else -- a Deployment, a Namespace -- is out of scope even where a
 # name collides.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+# The group both indexed kinds live in, and what the broker searches for. The
+# bare suffix also matches every `cnrm.cloud.google.com/project-id`
+# annotation, which fills the broker's match ceiling with files that declare
+# nothing this check reads.
+KCC_CONTAINER_API_GROUP = f"container.{KCC_API_GROUP_SUFFIX}"
 _KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
     "Cluster": ("ContainerCluster",),
     "NodePool": ("ContainerNodePool",),
@@ -545,6 +550,11 @@ _KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
 _YAML_SUFFIXES = ("*.yaml", "*.yml")
 # The same two, as `str.endswith` wants them for a path the broker reports.
 _KCC_YAML_EXTENSIONS = (".yaml", ".yml")
+# What `degrade_reverted_gcloud_remediations` wraps the command in, counted
+# against `MAX_NOTE_CHARS`.
+_KCC_NOTE_FENCE_OVERHEAD = "\n\n```bash\n\n```"
+# `clip_text`'s marker, so a command clipped here reads like any other.
+_KCC_COMMAND_TRUNCATED = " …(truncated)"
 
 # `public-control-plane`'s remediation and the flags without which it does not
 # clear `public-control-plane`.
@@ -1159,6 +1169,14 @@ AUTO_PROMOTION_CAP = 5
 # in one run. What the floor passes over is named on the ledger
 # (`_render_withheld`), because unlike the cap it does not clear on its own.
 AUTO_PROMOTION_FLOOR = "major"
+# The floor for a finding no collector candidate stands behind: one on a run
+# with no `--manifest-file`, or under a check the collector skipped, ran to a
+# non-zero `rc`, or ran against a target it did not collect. The
+# `NO_SWEEP_TRIAGE` markers are what keep a disruptive `major` fix out of the
+# sweep, and a marker only exists on a candidate, so without one the floor is
+# the only filter left. That was `critical` when the markers were written, and
+# it stays `critical` here.
+UNVOUCHED_PROMOTION_FLOOR = "critical"
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -1251,7 +1269,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Six markers. A cost collector sets `service-fronted` on an idle
+# Nine markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -1276,7 +1294,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # break that premise for every unsized workload on an Autopilot cluster;
 # this keeps it.
 #
-# The other three mark a fix that is disruptive by construction, whatever
+# The next three mark a fix that is disruptive by construction, whatever
 # the collector measured, now that the floor reaches `major`. The cost
 # collector sets `scale-to-zero` on every other §3.13 stand-down (a
 # Service-selected one keeps the more specific `service-fronted`): the fix is
@@ -1287,7 +1305,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
-# connection no allow rule names until the team writes those rules.
+# connection no allow rule names until the team writes those rules. The
+# other three are set by `collect.py` for the same reason, on §2.7,
+# §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
 #
 # The text beside each marker is what the ledger prints after the finding's
 # title in the "fix needs a decision" block, so a reader sees why the sweep
@@ -1299,6 +1319,9 @@ TRIAGE_REASONS = {
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
     "default-deny": "makes the namespace deny ingress by default",
+    "namespace-token": "turns the API token off for every pod on the namespace's default ServiceAccount",
+    "service-selector": "rewrites or deletes a Service on a judgement about its backend",
+    "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
@@ -3732,9 +3755,16 @@ def quote_gcloud_format_projections(text: str) -> str:
     field the finding told them to check, so the command is not merely
     inelegant, it does not run.
     """
-    return _GCLOUD_BARE_FORMAT_RE.sub(
-        lambda m: f"{m.group('flag')}{m.group('sep')}'{m.group('proj')}'", text
-    )
+    def rewrite(match: re.Match[str]) -> str:
+        # Inside a double-quoted string -- `"$(gcloud ... --format=value(x))"`
+        # -- the shell does not read `(` as a subshell, and single quotes added
+        # there reach gcloud as part of the expression, which it rejects.
+        line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+        if (line.count('"') - line.count('\\"')) % 2:
+            return match.group(0)
+        return f"{match.group('flag')}{match.group('sep')}'{match.group('proj')}'"
+
+    return _GCLOUD_BARE_FORMAT_RE.sub(rewrite, text)
 
 
 def _evidence_excerpt(finding: dict) -> str:
@@ -4504,8 +4534,8 @@ def _candidate_identity(entry: dict, candidate: dict) -> str:
     Two spellings of one identity are in play here, and each join below says
     which it uses. This is the *full* one, and it matches
     `derive_finding_id(finding)` on a document finding: `adopt_collector_evidence`,
-    `adopt_arm_impact`, `uncorroborated_findings` and `triage_marked_findings`
-    join full-to-full. The ledger spells a finding by `published_id`, clipped
+    `adopt_arm_impact`, `uncorroborated_findings`, `triage_markers` and
+    `collector_vouched_findings` join full-to-full. The ledger spells a finding by `published_id`, clipped
     at `MAX_FINDING_ID`, and anything compared against ledger ids or printed
     beside them — `collector_flagged_ids`, the held entries, the candidate
     rows on the JSON line — is clipped the same way, or a long-named object
@@ -4876,15 +4906,20 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
     }
 
 
-def triage_marked_findings(
-    findings: list[dict],
-    manifest: dict | None,
-    markers: frozenset[str] = NO_SWEEP_TRIAGE,
-) -> set[str]:
-    """Findings whose candidate carries a `needs_triage` marker in `markers`.
-    The ids of `triage_markers`, for the callers that only gate on them.
+def collector_vouched_findings(findings: list[dict], manifest: dict | None) -> set[str]:
+    """Findings a collector candidate in `manifest` stands behind.
+
+    The sweep holds these to `AUTO_PROMOTION_FLOOR` and every other finding to
+    `UNVOUCHED_PROMOTION_FLOOR`: a `needs_triage` marker lives on a candidate,
+    so a finding without one is a finding nothing could have marked. Empty on
+    a run without a manifest.
     """
-    return set(triage_markers(findings, manifest, markers))
+    flagged = _flagged_identities(manifest)
+    return {
+        str(finding.get("id") or "")
+        for finding in findings
+        if derive_finding_id(finding) in flagged
+    }
 
 
 def triage_markers(
@@ -7155,11 +7190,12 @@ def promotion_candidates(
     auto_promote: bool = True,
     uncorroborated: set[str] | None = None,
     triage_marked: set[str] | None = None,
+    vouched: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
     Auto-promotion is deliberately narrow — graded at or above
-    `AUTO_PROMOTION_FLOOR`, `manifest`, and no live pull request on its
+    the floor (see `vouched`), `manifest`, and no live pull request on its
     branch — and capped, so one bad night cannot bury
     the repository in generated pull requests. An explicit `/remediate` bypasses
     the cap: a human asked for that one by name.
@@ -7169,7 +7205,7 @@ def promotion_candidates(
     opening unattended; those ask whether a deterministic collector agreed the
     problem exists, and whether it vouched for the fix — the only grounds on
     which opening one unattended is defensible at all. `uncorroborated_findings`
-    and `triage_marked_findings` compute the sets and give the Deployments they
+    and `triage_markers` compute the sets and give the Deployments they
     were written for. Both gate the sweep and nothing else: an explicit
     `/remediate` is handled in the loop above and never consults them. Both are
     empty on a run without a collector manifest.
@@ -7197,8 +7233,14 @@ def promotion_candidates(
 
     `below_floor` is what the severity test alone refused — a manifest fix, on
     a finding carrying no live pull request, that neither collector filter
-    stopped, graded under `AUTO_PROMOTION_FLOOR`. It is returned so the ledger
+    stopped, graded under the floor that applied to it. It is returned so the ledger
     can name it: unlike the cap, the floor never clears on its own.
+
+    `vouched` is the finding ids a collector candidate stands behind
+    (`collector_vouched_findings`). Only those are held to
+    `AUTO_PROMOTION_FLOOR`; every other finding is held to
+    `UNVOUCHED_PROMOTION_FLOOR`, because the markers that keep a disruptive
+    fix out of the sweep exist only on a candidate. Absent means none.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -7239,6 +7281,8 @@ def promotion_candidates(
     triaged: list[str] = []
     below_floor: list[str] = []
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
+    vouched_set = vouched or set()
     uncorroborated_set = uncorroborated or set()
     triage_set = triage_marked or set()
     for finding in sort_findings(findings) if auto_promote else []:
@@ -7271,7 +7315,8 @@ def promotion_candidates(
         # block that says why it needs reading. By rank, so `critical` passes
         # a `major` floor. An unknown grade ranks below every known one.
         severity = str(finding.get("severity", ""))
-        if SEVERITY_RANK.get(severity, len(SEVERITIES)) > floor_rank:
+        rank = floor_rank if fid in vouched_set else unvouched_rank
+        if SEVERITY_RANK.get(severity, len(SEVERITIES)) > rank:
             below_floor.append(fid)
             continue
         auto.append(fid)
@@ -8364,7 +8409,9 @@ def _render_withheld(
         out += [
             "",
             f"{len(floor)} finding(s) carry a manifest remediation graded below "
-            f"`{AUTO_PROMOTION_FLOOR}`, which is what the automatic sweep requires. "
+            "what the automatic sweep requires: "
+            f"`{AUTO_PROMOTION_FLOOR}` where the collector flagged the finding, "
+            f"`{UNVOUCHED_PROMOTION_FLOOR}` where it did not. "
             "Unlike the cap this does not clear on its own — the sweep will pass "
             "over these again every run until someone asks. Comment "
             "`/remediate <finding-id>` to open any of them — an explicit request "
@@ -9280,8 +9327,9 @@ def render_stale_close_comment(
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
-        f"If the finding comes back: a finding graded `{AUTO_PROMOTION_FLOOR}` or "
-        "above with a manifest remediation is normally re-proposed automatically "
+        f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
+        f"or `{AUTO_PROMOTION_FLOOR}` where the collector flagged it, with a manifest "
+        "remediation is normally re-proposed automatically "
         f"on this same branch (at most {AUTO_PROMOTION_CAP} per run). Anything "
         "else is listed on the ledger as awaiting `/remediate <finding-id>`, "
         "which re-opens it on request.",
@@ -10906,8 +10954,17 @@ class KccDeclaration(NamedTuple):
     fields: frozenset[str]
 
 
-def kcc_declarations(root: Path, repo: str = "") -> dict[tuple[str, str], KccDeclaration]:
-    """Index the Config Connector resources a clone declares, by `(kind, name)`.
+# `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
+# belongs to (its own name for a `ContainerCluster`, the `clusterRef` for a
+# `ContainerNodePool`) and `location` is `spec.location`, empty when the spec
+# omits it. A node pool's name alone is not an identity -- every cluster has a
+# `default-pool` -- and a match on it alone sends one cluster's correct fix to
+# another cluster's file.
+KccKey = tuple[str, str, str, str]
+
+
+def kcc_declarations(root: Path, repo: str = "") -> dict[KccKey, KccDeclaration]:
+    """Index the Config Connector resources a clone declares, by `KccKey`.
 
     The key set of each `spec` is the point: Config Connector holds the fields
     its spec *names* and leaves the rest to whoever set them, so a declaration
@@ -10929,7 +10986,7 @@ def kcc_declarations(root: Path, repo: str = "") -> dict[tuple[str, str], KccDec
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
     except ImportError:
         return {}
-    index: dict[tuple[str, str], KccDeclaration] = {}
+    index: dict[KccKey, KccDeclaration] = {}
     try:
         paths = [path for pattern in _YAML_SUFFIXES for path in sorted(root.rglob(pattern))]
     except OSError:
@@ -10946,8 +11003,21 @@ def kcc_declarations(root: Path, repo: str = "") -> dict[tuple[str, str], KccDec
     return index
 
 
+def _kcc_cluster_ref(spec: dict) -> str:
+    """The bare cluster name a `ContainerNodePool`'s `clusterRef` points at.
+
+    `name` is the referenced `ContainerCluster`'s `metadata.name`, which is the
+    GKE name unless that resource sets `resourceID`; `external` is a GKE
+    resource path or a bare name, and its last segment is the name either way.
+    """
+    ref = spec.get("clusterRef")
+    if not isinstance(ref, dict):
+        return ""
+    return str(ref.get("name") or ref.get("external") or "").rstrip("/").rpartition("/")[2]
+
+
 def _index_kcc_text(
-    index: dict[tuple[str, str], KccDeclaration], yaml: Any, text: str, repo: str, path: str
+    index: dict[KccKey, KccDeclaration], yaml: Any, text: str, repo: str, path: str
 ) -> None:
     """Add the Config Connector resources one manifest declares to `index`.
 
@@ -10974,10 +11044,13 @@ def _index_kcc_text(
         # `resourceID` overrides `metadata.name` as the GCP resource's real
         # name, and the fleet's clusters are matched by the name GKE reports.
         name = str(spec.get("resourceID") or meta.get("name") or "")
-        if not name:
+        cluster = _kcc_cluster_ref(spec) if kind in _KCC_OBJECT_KINDS["NodePool"] else name
+        if not name or not cluster:
             continue
+        location = str(spec.get("location") or "")
         index.setdefault(
-            (kind, name), KccDeclaration(repo, path, frozenset(str(k) for k in spec))
+            (kind, name, cluster, location),
+            KccDeclaration(repo, path, frozenset(str(k) for k in spec)),
         )
 
 
@@ -10990,7 +11063,7 @@ class KccBrokerScan(NamedTuple):
     whether the repository declares that object.
     """
 
-    declarations: dict[tuple[str, str], KccDeclaration]
+    declarations: dict[KccKey, KccDeclaration]
     truncated: bool
 
 
@@ -11011,12 +11084,12 @@ def kcc_declarations_via_broker(repo: str) -> KccBrokerScan:
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
     except ImportError:
         return KccBrokerScan({}, False)
-    index: dict[tuple[str, str], KccDeclaration] = {}
+    index: dict[KccKey, KccDeclaration] = {}
     try:
         import credential_proxy_client
 
         with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
-            result = workspace.grep(KCC_API_GROUP_SUFFIX)
+            result = workspace.grep(KCC_CONTAINER_API_GROUP)
             truncated = bool(result.get("truncated"))
             wanted = sorted(
                 {
@@ -11105,12 +11178,19 @@ def _kcc_candidate(finding: dict) -> bool:
 
 
 def reverted_gcloud_problem(
-    finding: dict, declarations: dict[tuple[str, str], KccDeclaration]
+    finding: dict, declarations: dict[KccKey, KccDeclaration]
 ) -> tuple[KccDeclaration, str] | None:
     """`None` if this `gcloud` fix survives its next reconcile; else the declaration and field.
 
     Split from the rewrite for the reason `remediation_file_problem` is: a
     caller can ask without rewriting the document.
+
+    A declaration matches on the finding's cluster as well as its object: the
+    bare name from the `<project>/<location>/<name>` the finding carries, and
+    its location where both sides state one. Project is not compared -- a KCC
+    resource names its project in an annotation or its namespace's, which this
+    parse does not resolve -- so same-named clusters in one location of two
+    projects still share a declaration.
     """
     remediation = finding.get("remediation") or {}
     if remediation.get("kind") != "gcloud":
@@ -11120,8 +11200,23 @@ def reverted_gcloud_problem(
     note = str(remediation.get("note") or "")
     if not kinds or not name or not note:
         return None
+    parts = str(finding.get("cluster") or "").split("/")
+    cluster = parts[-1]
+    location = parts[-2] if len(parts) > 2 else ""
     for kind in kinds:
-        entry = declarations.get((kind, name))
+        entry = declarations.get((kind, name, cluster, location)) if location else None
+        entry = entry or declarations.get((kind, name, cluster, ""))
+        if entry is None and not location:
+            # A finding naming its cluster bare cannot say which location's
+            # declaration it means; any one of them holds the field.
+            entry = next(
+                (
+                    value
+                    for key, value in declarations.items()
+                    if key[:3] == (kind, name, cluster)
+                ),
+                None,
+            )
         if entry is None:
             continue
         for flag, fields in KCC_SPEC_FIELD_FOR_GCLOUD_FLAG.items():
@@ -11136,7 +11231,7 @@ def reverted_gcloud_problem(
 def degrade_reverted_gcloud_remediations(
     findings: list[dict],
     roots: list[tuple[str, Path]],
-    prebuilt: dict[tuple[str, str], KccDeclaration] | None = None,
+    prebuilt: dict[KccKey, KccDeclaration] | None = None,
 ) -> list[str]:
     """Rewrite `gcloud` fixes Config Connector would undo to `manual`, and report them.
 
@@ -11154,7 +11249,7 @@ def degrade_reverted_gcloud_remediations(
         return []
     # The GitOps repository first, so its declaration wins a name both carry;
     # in content mode that is the broker's index, handed in as `prebuilt`.
-    declarations: dict[tuple[str, str], KccDeclaration] = dict(prebuilt or {})
+    declarations: dict[KccKey, KccDeclaration] = dict(prebuilt or {})
     for repo, tree in roots:
         for key, entry in kcc_declarations(tree, repo).items():
             declarations.setdefault(key, entry)
@@ -11178,13 +11273,20 @@ def degrade_reverted_gcloud_remediations(
         # prose, so the command is fenced here to stay pasteable: it still
         # states the end state, and an operator who has already changed the
         # file may want it to close the gap before the next sync.
-        remediation["note"] = (
+        prose = (
             f"This object is declared {where}, whose spec sets `{field}`. Config "
             "Connector holds that field against out-of-band changes, so the "
             "command below is reverted on the next reconcile and this finding "
             "returns on the next run. Make the change in that file instead."
-            f"\n\n```bash\n{note}\n```"
         )
+        # The renderer clips a note at `MAX_NOTE_CHARS`, and a `gcloud` note
+        # may already be that long. Clipped there, the closing fence goes and
+        # the rest of the ledger renders as code, so the command is clipped
+        # here instead, inside the fence.
+        budget = MAX_NOTE_CHARS - len(prose) - len(_KCC_NOTE_FENCE_OVERHEAD)
+        if len(note) > budget:
+            note = note[: max(budget - len(_KCC_COMMAND_TRUNCATED), 0)].rstrip() + _KCC_COMMAND_TRUNCATED
+        remediation["note"] = f"{prose}\n\n```bash\n{note}\n```"
         degraded.append(str(finding.get("id", "")))
     return degraded
 
@@ -12118,6 +12220,7 @@ def _handle_finish_dry_run(
         {},
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
+        vouched=collector_vouched_findings(findings, manifest),
     )
 
     # Groups over the whole finding set, filtered to those holding a promoted
@@ -12157,7 +12260,8 @@ def _handle_finish_dry_run(
         )
     if plan.below_floor:
         log(
-            f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR "
+            f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR, OR `{UNVOUCHED_PROMOTION_FLOOR}` "
+            "WITHOUT A COLLECTOR CANDIDATE "
             f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
         )
     rendered = render_issue_body(
@@ -12721,7 +12825,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # is reverted the same way. Directory mode reads the clone; content mode
     # has none and asks the broker, and only when a finding could match, so
     # a run with no such fix costs no round trip.
-    kcc_prebuilt: dict[tuple[str, str], KccDeclaration] = {}
+    kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
         scan = kcc_declarations_via_broker(repo)
         kcc_prebuilt = scan.declarations
@@ -13414,6 +13518,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         requested_at=requests.requested_at,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
+        vouched=collector_vouched_findings(findings, manifest),
     )
     for fid in plan.uncorroborated:
         log(

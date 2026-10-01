@@ -542,7 +542,7 @@ IDLE_WORKLOAD_UTILISATION = 0.2
 IDLE_WORKLOAD_MIN_AGE_DAYS = 14
 
 # The `needs_triage` marker on an idle controller a Service selects. Read by
-# `triage_marked_findings` in audit_report.py, which withholds these from the
+# `triage_markers` in audit_report.py, which withholds these from the
 # automatic sweep -- so the string has to match the one that file names, and
 # the two files carry it separately because neither imports the other.
 IDLE_SERVICE_TRIAGE = "service-fronted"
