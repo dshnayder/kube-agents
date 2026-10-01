@@ -330,24 +330,36 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertEqual(len({inject for _, _, inject in seen}), 3)
         self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
 
-    def test_every_repetition_sees_when_the_case_began(self):
-        """pull_request_opened's accepts_earlier_repetition_pull_request measures
-        from EVAL_CASE_STARTED_AT, so rep 3 must see rep 1's start, not its own.
-        `date` ticks per call here, so a stamp taken per rep would differ."""
+    def stamps(self, audit_id: str) -> list[str]:
+        """EVAL_STREAM_STARTED_AT as each of case-y's reps, then case-x's, sees it.
+        `date` ticks per call here, so a stamp taken per unit would differ."""
         with tempfile.TemporaryDirectory() as tmp:
             record = pathlib.Path(tmp) / "stamps"
-            extra = (
+            extra = "\n".join([
                 'tick=1000; date() { if [ "$*" = "-u +%s" ]; then tick=$((tick + 1)); echo "${tick}"; '
-                'else command date "$@"; fi; }\n'
-                f'uv() {{ echo "STAMP rep=${{rep}} ${{EVAL_CASE_STARTED_AT}}" >> "{record}"; '
-                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }'
-            )
+                'else command date "$@"; fi; }',
+                f'ledger_audit_id_for_task() {{ echo "{audit_id}"; }}',
+                'reset_audit_ledgers() { :; }',
+                f'uv() {{ echo "STAMP ${{EVAL_CASE_ID}} ${{EVAL_STREAM_STARTED_AT}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }',
+                'for rep in 1 2 3; do run_one_unit ./tasks/y/task.yaml case-y "${rep}" "" "" "$((rep + 3))"; done',
+            ])
             result = self.run_reps(extra)
             self.assertEqual(result.returncode, 0, result.stderr)
             recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        return re.findall(r"^STAMP (\S+ \S+)$", recorded, re.MULTILINE)
+
+    def test_every_unit_on_a_stream_sees_when_the_stream_began(self):
+        """pull_request_opened's accepts_stream_pull_request measures from
+        EVAL_STREAM_STARTED_AT: the pull request case-y's rep 1 opened is the
+        one case-x's reps find open, so all six must see case-y's rep 1 start."""
         self.assertEqual(
-            re.findall(r"^STAMP rep=\d (\S+)$", recorded, re.MULTILINE), ["1001"] * 3, recorded
+            self.stamps("obtainability-audit"),
+            ["case-y 1001"] * 3 + ["case-x 1001"] * 3,
         )
+
+    def test_a_case_with_no_stream_measures_from_its_own_first_repetition(self):
+        self.assertEqual(self.stamps(""), ["case-y 1001"] * 3 + ["case-x 1002"] * 3)
 
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")

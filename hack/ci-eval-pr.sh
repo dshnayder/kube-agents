@@ -2799,16 +2799,19 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
-  # When this case's first repetition began, for pull_request_opened's
-  # accepts_earlier_repetition_pull_request (bench/kube_agents_bench/verifiers.py):
-  # a fleet audit's later repetition finds the remediation pull request an
-  # earlier one opened and pushes nothing, and nothing here may close it
-  # between repetitions (docs/ci-pool-projects.md 5.3). Written once, by
-  # whichever repetition runs first, under the task lock that serializes
-  # them; a pull request older than it is not this case's.
-  [ -s "${STATE_DIR}/${name}.window" ] || date -u +%s > "${STATE_DIR}/${name}.window"
-  EVAL_CASE_STARTED_AT="$(cat "${STATE_DIR}/${name}.window")"
-  export EVAL_CASE_STARTED_AT
+  # When the first unit on this case's audit stream began -- or, for a case
+  # that writes no ledger, this case's first repetition -- for
+  # pull_request_opened's accepts_stream_pull_request
+  # (bench/kube_agents_bench/verifiers.py). A fleet audit opens its remediation
+  # pull request once and later runs on the stream find it open and leave it,
+  # whichever case they are, and nothing here may close it between units
+  # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
+  # here, under the stream lock (the task lock, streamless) that serializes
+  # them; a pull request older than it is not this job's.
+  local window="${STATE_DIR}/${audit_id:+stream-}${audit_id:-${name}}.window"
+  [ -s "${window}" ] || date -u +%s > "${window}"
+  EVAL_STREAM_STARTED_AT="$(cat "${window}")"
+  export EVAL_STREAM_STARTED_AT
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
