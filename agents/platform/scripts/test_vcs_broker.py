@@ -2372,6 +2372,34 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual([p["number"] for p in answer["proposals"]], [2, 1])
         self.assertFalse(answer["truncated"])
 
+    def test_a_labelled_source_filter_reads_past_the_branchs_newest_hundred(self):
+        # Review finding: one request of the branch's newest hundred left the
+        # older matches unreachable, and every page answered truncated, so a
+        # caller reading until truncated is false never stopped.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        newest = [pull(n, ["audit:a1"] if n == 150 else []) for n in range(150, 50, -1)]
+        older = [pull(n, ["audit:a1"]) for n in (40, 30)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 2}
+        broker, recorder = self.broker(newest, older)
+        answer = broker.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [150, 40])
+        self.assertTrue(answer["truncated"])
+        self.assertRegex(urllib.parse.unquote(recorder.calls[1][4]), r"[?&]page=2(&|$)")
+        broker, _ = self.broker(newest, older)
+        answer = broker.proposal_list({**query, "page": 2})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [30])
+        self.assertFalse(answer["truncated"])
+
     @staticmethod
     def labelled(numbers):
         return [{"number": n, "pull_request": {}} for n in numbers]

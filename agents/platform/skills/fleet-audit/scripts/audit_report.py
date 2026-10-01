@@ -9034,7 +9034,7 @@ def viewer_login(repo: str) -> str | None:
 
 
 def read_comments(
-    verb: str, repo: str, number: int, *, standing: bool
+    verb: str, repo: str, number: int, *, standing: bool, requesters: bool = True
 ) -> list[dict] | None:
     """A conversation, as the comment records the rest of this module reads.
 
@@ -9059,6 +9059,10 @@ def read_comments(
       that names no `/remediate` and was not written by this install: nothing
       reads its standing, so it carries none, and a bystander the forge could
       not answer for does not cost every request on the thread its run.
+      With `requesters` false, a request this install did not write is not
+      asked about either: a reader that acts on nobody's command reads only
+      `is_machine_author`'s own-comment arm, and a requester the forge could
+      not answer for would otherwise hold that run for an answer it ignores.
 
     A read without `standing` survives an `identity` outage for the viewer:
     every comment is then not this install's, and the `bot` flag is left to
@@ -9114,7 +9118,9 @@ def read_comments(
             and _login_key(login) == viewer
             and bot == viewer_is_app,
         }
-        needs_standing = record["viewerDidAuthor"] or "/remediate" in record["body"]
+        needs_standing = record["viewerDidAuthor"] or (
+            requesters and "/remediate" in record["body"]
+        )
         if standing and not bot and needs_standing:
             key = _login_key(login)
             if not key:
@@ -12266,8 +12272,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # empty one here. Closing over it would take an unanswered request
             # with it, so the ledger is held open below and the next run reads
             # it again.
+            # Standing is asked only of this install's own comments: nothing
+            # here is acted on for anybody, so a requester's standing is never
+            # read (see `unanswered_remediate_comments`).
             clean_comments = read_comments(
-                "issue-view", repo, existing_issue, standing=True
+                "issue-view", repo, existing_issue, standing=True, requesters=False
             )
             if clean_comments is None:
                 conversation_unread = True

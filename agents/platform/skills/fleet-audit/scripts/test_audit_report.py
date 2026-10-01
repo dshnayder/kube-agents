@@ -9830,21 +9830,19 @@ class TestRemediateOnACleanRun(HarnessTestCase):
     def issue_comments(self):
         return self.harness.forge_calls("issue-comment")
 
-    def test_a_requester_the_forge_cannot_answer_for_gets_no_reply(self):
-        # An outage, not a refusal: nothing is written to a maintainer on it.
+    def test_a_requesters_standing_is_not_asked_and_an_outage_does_not_hold(self):
+        # Review finding: nothing on a clean run is acted on for anybody, so a
+        # requester's standing is never read; asking it cost a round trip per
+        # requester, and an outage on it held the ledger for nothing.
         self.harness.replies = self.replies([self.comment()])
         self.harness.failures = {"identity login=operator": 1}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("identity", login="operator"), [])
         bodies = self.harness.bodies_for("issue-comment")
         self.assertEqual(
-            [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
+            len([b for b in bodies if audit_report.acked_marker("IC_1") in b]), 1
         )
-        self.assertIn("could not tell whether @operator may write", self.err)
-        # Held open: closing would leave the request no thread to be
-        # answered on next run.
-        self.assertEqual(self.harness.forge_calls("issue-close"), [])
-        self.assertEqual(self.stdout_json()["status"], "HELD")
-        self.assertEqual(self.stdout_json()["resolved"], 0)
+        self.assertTrue(self.harness.forge_calls("issue-close"))
 
     def test_an_unreadable_conversation_holds_the_ledger_open(self):
         self.harness.replies = self.replies([self.comment()])
@@ -9873,7 +9871,7 @@ class TestRemediateOnACleanRun(HarnessTestCase):
         # naming no issue is a lost memory, and a lost memory never closes.
         self.seed_report("prior")
         self.harness.replies = self.replies([self.comment()])
-        self.harness.failures = {"identity login=operator": 1}
+        self.harness.failures = {"*-view comments": 1}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         stored = json.loads((self.store_dir() / "latest.json").read_text())
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, "prior"))
@@ -12182,12 +12180,12 @@ class TestFindExistingIssue(HarnessTestCase):
 
 
 class TestReadCommentsAuthorship(HarnessTestCase):
-    def read(self, comments, *, standing=False):
+    def read(self, comments, *, standing=False, requesters=True):
         self.harness.replies = {"issue-view comments": comments_view({"comments": comments})}
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             records = audit_report.read_comments(
-                "issue-view", "acme/fleet", 42, standing=standing
+                "issue-view", "acme/fleet", 42, standing=standing, requesters=requesters
             )
         self.err = err.getvalue()
         return records
@@ -12238,6 +12236,28 @@ class TestReadCommentsAuthorship(HarnessTestCase):
         self.harness.failures = {"identity login=dev": 1}
         self.assertIsNone(self.read([comment("/remediate a")], standing=True))
         self.assertIn("could not tell whether @dev may write", self.err)
+
+    def test_without_requesters_only_this_installs_own_comments_are_asked_about(self):
+        # A reader that acts on nobody's command reads standing only through
+        # `is_machine_author`'s own-comment arm; a requester's outage must not
+        # make it unreadable.
+        self.harness.VIEWER = "Ops-Person"
+        self.harness.failures = {"identity login=dev": 1}
+        records = self.read(
+            [
+                comment("/remediate a", login="dev"),
+                comment("/remediate all", login="ops-person", node_id="IC_2"),
+            ],
+            standing=True,
+            requesters=False,
+        )
+        self.assertIsNotNone(records)
+        self.assertNotIn("authorAssociation", records[0])
+        self.assertEqual(records[1]["authorAssociation"], "COLLABORATOR")
+        self.assertEqual(
+            [call["login"] for call in self.harness.forge_calls("identity", login=...)],
+            ["ops-person"],
+        )
 
     def test_only_the_authors_of_requests_are_asked_about(self):
         # Nothing reads a bystander's standing, so their outage must not cost

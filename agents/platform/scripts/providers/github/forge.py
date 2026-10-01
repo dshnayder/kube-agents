@@ -296,25 +296,36 @@ class GitHubForge(Forge):
         if labels and "head" in params:
             # The branch is the narrower question, and `/pulls` answers it
             # exactly; the label filter below reads only the label's newest
-            # hits. So ask for the branch's newest hundred and match the
-            # labels here; the caller's page and limit then count matches,
-            # not candidates, so a page is a slice of them rather than a page
-            # of the forge's. GitHub compares label names without regard to
-            # case.
+            # hits. So read the branch's proposals a full page at a time and
+            # match the labels here, stopping once there is one match past the
+            # caller's page or the forge runs out; the caller's page and limit
+            # then count matches, not candidates. GitHub compares label names
+            # without regard to case.
             query = {key: value for key, value in params.items() if key != "page"}
-            nodes = api("GET", f"repos/{repo}/pulls", params={**query, "per_page": MAX_PAGE_SIZE})
+            query["per_page"] = MAX_PAGE_SIZE
             wanted = {label.casefold() for label in labels}
-            matches = [
-                item
-                for item in (translate.proposal(node) for node in nodes)
-                if wanted <= {label.casefold() for label in item["labels"]}
-            ]
             start = (page - 1) * limit
+            matches: list[dict[str, Any]] = []
+            forge_page = 1
+            while True:
+                nodes = api(
+                    "GET",
+                    f"repos/{repo}/pulls",
+                    params={**query, "page": forge_page} if forge_page > 1 else query,
+                )
+                matches += [
+                    item
+                    for item in (translate.proposal(node) for node in nodes)
+                    if wanted <= {label.casefold() for label in item["labels"]}
+                ]
+                if len(matches) > start + limit or len(nodes) < MAX_PAGE_SIZE:
+                    break
+                forge_page += 1
             proposals = matches[start : start + limit]
             return {
                 "proposals": proposals,
                 "count": len(proposals),
-                "truncated": len(matches) > start + limit or len(nodes) >= MAX_PAGE_SIZE,
+                "truncated": len(matches) > start + limit,
             }
         if labels:
             return self._proposals_labelled(api, repo, params, labels)
