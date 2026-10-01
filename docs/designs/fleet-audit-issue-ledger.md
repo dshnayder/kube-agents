@@ -156,7 +156,7 @@ So `major` is an allowlist. `MAJOR_SWEEP_CHECKS` names the checks whose fix is a
 whole in one screen — a PodDisruptionBudget, turning off a token for a ServiceAccount nothing has
 granted, an On-Demand fallback at the bottom of a ComputeClass — and only those open at `major`.
 The collector has to stand behind the grade: its candidate must exist, so a `needs_triage` marker
-could have been set on it, and must itself be `major`, so the model's re-grade of a `minor`
+could have been set on it, and must itself be at least `major`, so the model's re-grade of a `minor`
 candidate does not decide that a pull request opens. Everything else is held to `critical`. `minor`
 stays below both floors — defence-in-depth work a reader may reasonably never ask for.
 
@@ -586,6 +586,12 @@ error**. That finding degrades to `kind: manual`, keeps its evidence and recomme
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
 security report because one of the nine manifests was not written is the wrong shape of failure: it
 throws away eight findings to punish one.
+
+The run's first `finish` does refuse once, before that degrade can publish, when a finding the
+sweep would open has no fix written: a promised file that is missing, or a `manual` remediation on
+a finding the collector clears for the `major` sweep whose candidate carries a `declaration`. It
+exits 2 naming each, records the refusal on the run record, and the next `finish` publishes what is
+written. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
@@ -1144,7 +1150,7 @@ unchanged. As shipped it is **346**. New cases:
   nothing.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
 - Promotion eligibility: critical+manifest auto, and major+manifest auto only on a
-  `MAJOR_SWEEP_CHECKS` check a `major` candidate backs; critical+gcloud not;
+  `MAJOR_SWEEP_CHECKS` check an at-least-`major` candidate backs; critical+gcloud not;
   minor+manifest only on request and named in the ledger as below the floor; the floor is compared
   by rank, so lowering it never stops a `critical` promoting; already-has-PR is a no-op in every
   state; the sixth eligible finding in a run is withheld and named in the ledger, while six explicit

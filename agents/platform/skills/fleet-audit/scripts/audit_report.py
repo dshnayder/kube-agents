@@ -10959,8 +10959,8 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
     named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
     parts = [
-        f"{len(unwritten)} finding(s) the sweep would open a pull request for, had "
-        "their fix been written, have none."
+        f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
+        "their fix is not written."
     ]
     if named:
         parts.append(

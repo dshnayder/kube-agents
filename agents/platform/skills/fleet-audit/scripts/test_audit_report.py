@@ -15318,7 +15318,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         # `make_doc`'s finding is critical and names a manifest nobody wrote.
         self.assertEqual(self.run_finish(make_doc()), 2)
-        self.assertIn("had their fix been written, have none", self.err)
+        self.assertIn("their fix is not written", self.err)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
         self.assertFalse(self.harness.matching("issue", "create"))
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
@@ -15328,7 +15328,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
     def test_without_a_run_record_nothing_remembers_the_refusal_so_none_is_made(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        self.assertNotIn("had their fix been written, have none", self.err)
+        self.assertNotIn("their fix is not written", self.err)
 
 
 class TestTriageMarkedFindings(BaseTestCase):

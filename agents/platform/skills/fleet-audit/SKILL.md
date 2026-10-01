@@ -1234,8 +1234,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
   directory. For a finding the sweep would open, the first `finish` of the run exits 2 listing each
-  one whose file is missing, at the path it named, and each `manual` one on a check cleared for the
-  `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
+  one whose file is missing, at the path it named, and each `manual` one the collector clears for
+  the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
   as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
   `kind: manifest` and `path`, and run `finish` again. A finding the SOP itself makes `manual`, or
   one a pull request already carries, stays `manual` with the reason in its `note`: the refusal
