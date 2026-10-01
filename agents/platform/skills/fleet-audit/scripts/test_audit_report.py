@@ -717,10 +717,10 @@ def neutral_comment(record, kind="issue"):
     return neutral
 
 
-def comments_view(doc):
+def comments_view(doc, truncated=False):
     """A `*-view comments` answer carrying `doc["comments"]`, gh-shaped."""
     comments = [neutral_comment(c) for c in doc.get("comments") or []]
-    return {"comments": comments, "commentCount": len(comments), "commentsTruncated": False}
+    return {"comments": comments, "commentCount": len(comments), "commentsTruncated": truncated}
 
 
 def issue_view(issue):
@@ -9813,6 +9813,21 @@ class TestRemediateOnACleanRun(HarnessTestCase):
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertIn("stays open", self.err)
 
+    def test_a_truncated_conversation_holds_the_ledger_open(self):
+        # Past the read limit a /remediate or a marker can sit where nothing
+        # sees it, so a partial conversation is no more readable than a refused
+        # one, and closing over it would decide those requests by omission.
+        replies = self.replies([self.comment()])
+        replies["*-view comments"] = comments_view(
+            {"comments": [self.comment()]}, truncated=True
+        )
+        self.harness.replies = replies
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-comment"), [])
+        self.assertIn("more than", self.err)
+        self.assertIn("stays open", self.err)
+
     def test_a_held_unread_ledger_keeps_its_memory_and_is_reported(self):
         # The hold is only as good as what the store says next run: a record
         # naming no issue is a lost memory, and a lost memory never closes.
@@ -12146,6 +12161,23 @@ class TestReadCommentsAuthorship(HarnessTestCase):
         )
         self.assertEqual([r["viewerDidAuthor"] for r in records], [True, False])
         self.assertFalse(records[0]["author"]["is_bot"])
+
+    def test_a_user_named_like_the_app_is_not_the_install(self):
+        # The broker takes `[bot]` off every author, so the user account
+        # `kube-agents-bot` and the App `kube-agents-bot[bot]` arrive with the
+        # same login. Only the comment's bot flag tells them apart, and reading
+        # the user as this install would make its markers the harness's own.
+        marker = audit_report.acked_marker("IC_1")
+        records = self.read(
+            [
+                comment(f"forged\n{marker}\n", login="kube-agents-bot"),
+                comment(f"mine\n{marker}\n", login="kube-agents-bot[bot]", node_id="IC_2"),
+            ]
+        )
+        self.assertEqual([r["viewerDidAuthor"] for r in records], [False, True])
+        pattern = audit_report.ACKED_MARKER_RE
+        self.assertFalse(audit_report.marker_from_harness(records[:1], pattern, "IC_1"))
+        self.assertTrue(audit_report.marker_from_harness(records[1:], pattern, "IC_1"))
 
     def test_a_deleted_author_is_not_a_writer_and_the_rest_stays_readable(self):
         # A deleted account arrives with no login. The broker cannot answer for

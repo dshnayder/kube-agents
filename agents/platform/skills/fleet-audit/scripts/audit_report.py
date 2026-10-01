@@ -8960,15 +8960,18 @@ _VIEWER_LOGINS: dict[str, str] = {}
 
 
 def viewer_login(repo: str) -> str | None:
-    """This install's own login on `repo`, normalised; None when unanswerable.
+    """This install's own login on `repo`, lowercased; None when unanswerable.
 
-    Only an answer is remembered, so an outage is asked about again.
+    The App's `[bot]` suffix is kept: it is the one thing that tells the App
+    from a user account registered under the same name, and `read_comments`
+    needs it for exactly that. Only an answer is remembered, so an outage is
+    asked about again.
     """
     if repo not in _VIEWER_LOGINS:
         who = try_forge("identity", repo, {})
         if who is None:
             return None
-        _VIEWER_LOGINS[repo] = _login_key(str((who.get("identity") or {}).get("login") or ""))
+        _VIEWER_LOGINS[repo] = str((who.get("identity") or {}).get("login") or "").strip().lower()
     return _VIEWER_LOGINS[repo]
 
 
@@ -8983,7 +8986,11 @@ def read_comments(
     of those are not in the neutral comment and are answered here:
 
     - `viewerDidAuthor` compares the author with the login the broker's
-      `identity` names for this install's credential.
+      `identity` names for this install's credential, and requires the
+      comment's `bot` flag to agree with whether that login is an App's. The
+      broker strips `[bot]` off every author, so without the flag a user
+      account registered under the App's slug would read as this install, and
+      its markers as the harness's own.
     - `authorAssociation`, which only `standing` reads ask for, is the answer
       to `identity`'s `canWrite` for that author: `COLLABORATOR` when it may
       write, `NONE` when it may not. An author the forge could not answer for
@@ -9020,7 +9027,9 @@ def read_comments(
     ]
     if not items:
         return []
-    viewer = viewer_login(repo)
+    viewer_raw = viewer_login(repo)
+    viewer = None if viewer_raw is None else _login_key(viewer_raw)
+    viewer_is_app = bool(viewer_raw) and viewer_raw.endswith(BOT_LOGIN_SUFFIX)
     if viewer is None:
         if standing:
             return None
@@ -9043,7 +9052,9 @@ def read_comments(
             "body": str(item.get("body") or ""),
             "createdAt": str(item.get("created") or ""),
             "author": {"login": login, "is_bot": bot},
-            "viewerDidAuthor": bool(viewer) and _login_key(login) == viewer,
+            "viewerDidAuthor": bool(viewer)
+            and _login_key(login) == viewer
+            and bot == viewer_is_app,
         }
         needs_standing = record["viewerDidAuthor"] or "/remediate" in record["body"]
         if standing and not bot and needs_standing:
