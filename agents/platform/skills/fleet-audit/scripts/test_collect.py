@@ -9625,6 +9625,179 @@ class TestWorkloadDeclarations(unittest.TestCase):
         self.assertEqual(collect.workload_declarations(Path("/nonexistent-clone")), {})
 
 
+class _FakeListing(list):
+    def __init__(self, entries, truncated=False):
+        super().__init__(entries)
+        self.truncated = truncated
+
+
+class _FakeBrokerWorkspace:
+    """The slice of `credential_proxy_client.Workspace` the mirror calls.
+
+    `pages` is the listing the broker returns page by page; `budget` is how many
+    paths one `read_many` answers before deferring the rest as `requestBudget`;
+    `refuse` maps a path to the reason the broker will never send it.
+    """
+
+    def __init__(self, files, page_size=2, budget=None, refuse=None, fail_open=None):
+        self.files = files
+        self.page_size = page_size
+        self.budget = budget
+        self.refuse = refuse or {}
+        self.fail_open = fail_open
+        self.opened = []
+
+    def open(self, endpoint, repo, depth=None):
+        if self.fail_open:
+            raise self.fail_open
+        self.opened.append((endpoint, repo))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def list(self, after=None):
+        names = sorted(self.files)
+        if after is not None:
+            names = [n for n in names if n > after]
+        page = names[: self.page_size]
+        entries = [{"path": n, "size": len(self.files[n])} for n in page]
+        return _FakeListing(entries, truncated=len(names) > self.page_size)
+
+    def read_many(self, paths):
+        got, skipped = {}, []
+        for i, path in enumerate(paths):
+            if path in self.refuse:
+                skipped.append({"path": path, "reason": self.refuse[path]})
+            elif self.budget is not None and i >= self.budget:
+                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
+            else:
+                got[path] = self.files[path]
+        return got, skipped
+
+
+class TestBrokerMirror(unittest.TestCase):
+    """Content mode makes no clone, so the indexes need the tree from the broker.
+
+    On 2026-10-01 a content-mode install ran the obtainability audit against a
+    repository declaring `seeded-reliability/checkout-gateway` under
+    `clusters/fa2-seeded-a/`. `--workspace` was the empty scratch directory,
+    no candidate carried `declaration` or `namespace_directory`, and the model
+    filed the `no-pdb` finding as `kind: manual` with no pull request.
+    """
+
+    DEPLOYMENT = TestWorkloadDeclarations.DEPLOYMENT
+    ENDPOINT = "http://broker.test"
+    REPO = "example-org/infra"
+
+    def setUp(self):
+        env = patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: self.ENDPOINT})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def files(self):
+        return {
+            "clusters/spot-capacity-test/workloads/fixture.yaml": self.DEPLOYMENT.encode(),
+            "clusters/spot-capacity-test/workloads/kustomization.yaml": b"resources: []\n",
+            "README.md": b"# not a manifest\n",
+            "provisioning/cluster.yml": b"kind: ConfigMap\n",
+        }
+
+    def test_the_mirror_resolves_what_a_clone_would(self):
+        broker = _FakeBrokerWorkspace(self.files(), page_size=2, budget=1)
+        with TemporaryDirectory() as tmp:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            index = collect.workload_declarations(Path(tmp))
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+            written = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob("*") if p.is_file())
+        self.assertEqual(found["path"], "clusters/spot-capacity-test/workloads/fixture.yaml")
+        self.assertEqual(
+            written,
+            [
+                "clusters/spot-capacity-test/workloads/fixture.yaml",
+                "clusters/spot-capacity-test/workloads/kustomization.yaml",
+                "provisioning/cluster.yml",
+            ],
+        )
+        self.assertEqual(broker.opened, [(self.ENDPOINT, self.REPO)])
+
+    def test_a_file_the_broker_will_not_send_abandons_the_mirror(self):
+        """A missing file can hide a second declaration, so no index beats a wrong one."""
+        broker = _FakeBrokerWorkspace(
+            self.files(), refuse={"provisioning/cluster.yml": "tooLarge"}
+        )
+        with TemporaryDirectory() as tmp:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_a_repository_over_the_cap_abandons_the_mirror(self):
+        broker = _FakeBrokerWorkspace(self.files())
+        with TemporaryDirectory() as tmp, patch.object(collect, "MIRROR_MAX_FILES", 1):
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_a_broker_failure_abandons_the_mirror(self):
+        broker = _FakeBrokerWorkspace(self.files(), fail_open=RuntimeError("503"))
+        with TemporaryDirectory() as tmp:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+
+    def test_a_name_outside_the_tree_is_not_written(self):
+        files = {"../escape.yaml": b"kind: X\n", ".git/config.yaml": b"kind: X\n", **self.files()}
+        broker = _FakeBrokerWorkspace(files)
+        with TemporaryDirectory() as tmp:
+            mirror = Path(tmp) / "mirror"
+            mirror.mkdir()
+            self.assertTrue(collect.broker_mirror(self.REPO, mirror, broker.open))
+            self.assertFalse((Path(tmp) / "escape.yaml").exists())
+            self.assertFalse((mirror / ".git").exists())
+
+    def test_the_repository_comes_from_the_lease_marker(self):
+        with TemporaryDirectory() as tmp:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "example-org" / "infra"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
+            self.assertEqual(collect.broker_repo(scratch), self.REPO)
+            (scratch / ".git").mkdir()
+            self.assertIsNone(collect.broker_repo(scratch), "a clone is walked directly")
+
+    def test_main_indexes_the_mirror_in_content_mode(self):
+        """End to end through `main`: the scratch path in, the mirror's tree indexed."""
+        seen = {}
+
+        def fake_collect_fleet(audit, project, workspace=None):
+            seen["declarations"] = collect.workload_declarations(workspace)
+            return {"clusters": []}
+
+        broker = _FakeBrokerWorkspace(self.files())
+        client = type("Client", (), {"Workspace": type("W", (), {"open": staticmethod(broker.open)})})
+        with TemporaryDirectory() as tmp:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "example-org" / "infra"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
+            real_import = collect._import_platform_script
+            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(
+                        collect,
+                        "_import_platform_script",
+                        side_effect=lambda n: client if n == "credential_proxy_client" else real_import(n),
+                    ), \
+                    patch("sys.stdout", new_callable=io.StringIO), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                collect.main(["obtainability-audit", "--workspace", str(scratch)])
+            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
+        self.assertIn(
+            ("spot-capacity-test", "Deployment", "waste-canary", "waste-unsized"),
+            seen["declarations"],
+        )
+
+
 class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
     """The annotation has to reach the candidate, or the model never sees it.
 

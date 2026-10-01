@@ -152,6 +152,34 @@ GITOPS_CLUSTER_TREE_ROOT = "clusters"
 GITOPS_CLUSTER_TREE_DEPTH = 2
 GIT_DIR_NAME = ".git"
 
+# In content mode `audit_report.py start` makes no clone: `--workspace` is an
+# empty scratch directory and the repository lives in the credential broker.
+# `broker_mirror` copies the repository's YAML out of the broker into a private
+# directory so the three indexes below read the same tree a clone would give
+# them. The lease marker above the workspace names the repository; the broker
+# endpoint is the one every other content-mode call uses.
+CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
+# Where the platform scripts the broker client lives in are found, in the order
+# `audit_report.py` appends them: the image's defaults, the volume's copy, then
+# the repository checkout this file sits in (for tests and local runs).
+PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+PLATFORM_SCRIPT_DIR_DEPTH = 3
+MIRROR_DIR_PREFIX = "collect-gitops-mirror-"
+# The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
+# extension-less spelling Kustomize also accepts.
+MIRROR_SUFFIXES = (".yaml", ".yml")
+# Under the broker's per-request ceilings (256 paths, 8 MiB), the same numbers
+# `api_deprecation_scan.py` and `inspect_repository.py` batch with.
+MIRROR_BATCH_PATHS = 100
+MIRROR_BATCH_BYTES = 6 << 20
+# Bounds on one repository, so a repository nobody sized cannot fill the
+# sandbox's disk. Hitting either abandons the mirror rather than indexing part
+# of the tree: see `broker_mirror` for why a partial index is worse than none.
+MIRROR_MAX_FILES = 5000
+MIRROR_MAX_BYTES = 64 << 20
+# `Workspace.read_many`'s "ask again for the rest" reason.
+BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
+
 # `release_declarations` indexes the objects that render a workload a GitOps
 # repo holds no manifest for -- an Argo CD `Application`, from either a chart
 # or a Kustomize overlay, and a Flux `HelmRelease` -- plus the two it needs to
@@ -8612,6 +8640,156 @@ def collect_fleet(
     return manifest
 
 
+def _import_platform_script(name: str):
+    """Import one of the platform scripts the broker path needs, or None.
+
+    Lazy, and only on the content-mode path: this module otherwise runs
+    standalone (the module docstring), and a directory-mode run must not start
+    depending on the platform scripts being importable.
+    """
+    import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
+
+    for directory in (
+        *PLATFORM_SCRIPT_DIRS,
+        str(Path(__file__).resolve().parents[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts"),
+    ):
+        if directory not in sys.path:
+            sys.path.append(directory)
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+def broker_repo(workspace: Path) -> str | None:
+    """The repository a content-mode scratch workspace stands in for, or None.
+
+    None for a clone -- it carries `.git` and the indexes walk it directly --
+    and for anything the lease marker does not name a repository for, which
+    leaves the walk of the directory as the answer, as before.
+    """
+    if (workspace / GIT_DIR_NAME).exists():
+        return None
+    gitops_workspace = _import_platform_script("gitops_workspace")
+    if gitops_workspace is None:
+        return None
+    holder = gitops_workspace.lease_holder(workspace)
+    record = gitops_workspace.read_lease(holder) if holder is not None else None
+    repo = str((record or {}).get("repo") or "").strip()
+    return repo or None
+
+
+def _mirrored(path: str) -> bool:
+    name = Path(path).name
+    return name.endswith(MIRROR_SUFFIXES) or name in KUSTOMIZATION_FILE_NAMES
+
+
+def _safe_relative(path: str) -> Path | None:
+    """`path` as a relative path inside the mirror, or None if it is not one.
+
+    The broker's names are repository-relative already; this is the check that
+    a name it should never send -- absolute, climbing out, or inside `.git` --
+    is dropped rather than written outside the mirror.
+    """
+    relative = Path(path)
+    if (
+        not path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or GIT_DIR_NAME in relative.parts
+    ):
+        return None
+    return relative
+
+
+def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None) -> bool:
+    """Copy `repo`'s YAML out of the credential broker into `dest`.
+
+    Content mode's counterpart of the clone `workload_declarations`,
+    `release_declarations` and `namespace_directories` walk. Without it, a
+    content-mode run hands them an empty scratch directory and no candidate
+    carries `declaration` or `namespace_directory`, so the model falls back to
+    its own search and a fix the collector could have placed becomes
+    `kind: manual`. `audit_report.kcc_declarations_via_broker` is the same
+    move for Config Connector resources at `finish`.
+
+    `dest` is a private temporary directory, never the remediation workspace:
+    `finish` publishes every file in that, and a mirrored manifest written there
+    would be proposed as a fix.
+
+    All or nothing. A tree missing files would index an object declared twice
+    as declared once, and `declaration_for` would then name one of the two
+    files instead of refusing -- a wrong path, which is worse than the absent
+    one the SOPs already handle. So a capped listing, a file the broker will
+    not send, or any broker failure returns False, `dest` is ignored, and the
+    run proceeds as it did before this existed.
+    """
+    if open_workspace is None:
+        client = _import_platform_script("credential_proxy_client")
+        if client is None:
+            log(f"WARNING: no broker client to read {repo} with; no candidate will carry a declaration")
+            return False
+        open_workspace = client.Workspace.open
+    endpoint = os.environ.get(CREDENTIAL_PROXY_URL_ENV, "").strip()
+    if not endpoint:
+        return False
+    files: dict[str, bytes] = {}
+    total_bytes = 0
+    try:
+        with open_workspace(endpoint, repo, depth=1) as workspace:
+            wanted: list[str] = []
+            cursor: str | None = None
+            while True:
+                listing = workspace.list(after=cursor)
+                for entry in listing:
+                    path = str(entry.get("path") or "")
+                    if not _mirrored(path):
+                        continue
+                    total_bytes += int(entry.get("size", 0) or 0)
+                    wanted.append(path)
+                    if len(wanted) > MIRROR_MAX_FILES or total_bytes > MIRROR_MAX_BYTES:
+                        log(
+                            f"WARNING: {repo} holds more YAML than the collector mirrors "
+                            f"({MIRROR_MAX_FILES} files, {MIRROR_MAX_BYTES} bytes); "
+                            "no candidate will carry a declaration"
+                        )
+                        return False
+                if not listing or not listing.truncated:
+                    break
+                cursor = str(listing[-1].get("path") or "")
+            for start in range(0, len(wanted), MIRROR_BATCH_PATHS):
+                pending = wanted[start : start + MIRROR_BATCH_PATHS]
+                # `requestBudget` means ask again for the rest; stop when a
+                # round returns nothing, so a broker that never relents cannot
+                # spin this.
+                while pending:
+                    got, skipped = workspace.read_many(pending)
+                    files.update(got)
+                    refused = [e for e in skipped if e.get("reason") != BROKER_SKIP_REQUEST_BUDGET]
+                    if refused or (skipped and not got):
+                        first = (refused or skipped)[0]
+                        log(
+                            f"WARNING: the broker did not send {first.get('path')} from {repo} "
+                            f"({first.get('reason')}); no candidate will carry a declaration"
+                        )
+                        return False
+                    pending = [str(e.get("path") or "") for e in skipped]
+    except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
+        log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
+        return False
+    written = 0
+    for path, content in files.items():
+        relative = _safe_relative(path)
+        if relative is None:
+            continue
+        target = dest / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        written += 1
+    log(f"mirrored {written} YAML file(s) of {repo} from the broker")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
@@ -8642,7 +8820,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         workspace = None
-    manifest = collect_fleet(args.audit, args.project, workspace=workspace)
+    repo = broker_repo(workspace) if workspace is not None else None
+    if repo is None:
+        manifest = collect_fleet(args.audit, args.project, workspace=workspace)
+    else:
+        import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
+
+        with tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX) as mirror:
+            # A failed mirror leaves an empty directory, which indexes exactly
+            # as the empty scratch workspace did.
+            broker_mirror(repo, Path(mirror))
+            manifest = collect_fleet(args.audit, args.project, workspace=Path(mirror))
     print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):
