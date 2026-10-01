@@ -391,10 +391,10 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
-# When the eval job leased its project, in epoch seconds; hack/ci-eval-pr.sh
-# exports it before the lease's ledger reset. Read only by
-# PullRequestOpenedVerifier's `accepts_lease_pull_request`.
-LEASE_STARTED_ENV_VAR = "EVAL_LEASE_STARTED_AT"
+# When this case's first repetition began, in epoch seconds; hack/ci-eval-pr.sh
+# exports it to every repetition of the case. Read only by
+# PullRequestOpenedVerifier's `accepts_earlier_repetition_pull_request`.
+CASE_STARTED_ENV_VAR = "EVAL_CASE_STARTED_AT"
 
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
@@ -509,9 +509,9 @@ _NO_PR_RUN_CLOCK_REASON = (
     "one left behind by a previous run, and refuses to grade it"
 )
 
-def _lease_started() -> datetime | None:
-    """When the job leased its project, from LEASE_STARTED_ENV_VAR; None if unset or unreadable."""
-    raw = os.environ.get(LEASE_STARTED_ENV_VAR, "").strip()
+def _case_started() -> datetime | None:
+    """When this case's first repetition began, from CASE_STARTED_ENV_VAR; None if unset or unreadable."""
+    raw = os.environ.get(CASE_STARTED_ENV_VAR, "").strip()
     try:
         stamp = float(raw)
         return datetime.fromtimestamp(stamp, tz=timezone.utc) if stamp > 0 else None
@@ -1412,17 +1412,21 @@ class PullRequestOpenedVerifier(BaseVerifier):
     run, that the candidate does not contain that one's head revision, and
     that the report names that one too.
 
-    With ``accepts_lease_pull_request`` the two "since this run started"
-    clauses measure from the lease instead (``EVAL_LEASE_STARTED_AT``, which
-    ``hack/ci-eval-pr.sh`` exports), so a pull request an earlier repetition
-    of this job opened passes when the reply names it. That is for a fleet
-    audit, whose ``finish`` reports the pull request already open on its branch
-    and pushes nothing: the presubmit holds no credential to close it between
+    With ``accepts_earlier_repetition_pull_request`` the two "since this run
+    started" clauses measure from the case's first repetition instead
+    (``EVAL_CASE_STARTED_AT``, which ``hack/ci-eval-pr.sh`` exports to every
+    repetition), so a pull request an earlier repetition of this case opened
+    passes when the reply names it. That is for a fleet audit, whose
+    ``finish`` reports the pull request already open on its branch and pushes
+    nothing: the presubmit holds no credential to close it between
     repetitions (docs/ci-pool-projects.md 5.3), and without the option
-    repetitions 2 and 3 can only fail. The pool sweep closes whatever a lease
-    leaves behind, so anything created since the lease began is this job's.
-    With the variable unset -- a local run -- the clauses measure from the run
-    as they otherwise do.
+    repetitions 2 and 3 can only fail. A leftover from before the case's first
+    repetition -- an earlier job on the pool project, or a case that ran before
+    this one -- predates the stamp and is still rejected. What it does not
+    rule out: another case writing the same stream opening the same finding's
+    pull request between this case's repetitions, which a later repetition
+    would then accept. Run through ``devops-bench`` directly, without the
+    variable, the clauses measure from the run as they otherwise do.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1459,10 +1463,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
     # needs `pull_requests: read`.
     reuses_spent_branch: bool = False
-    # Measure "written since" and "head commit since" from the lease rather
-    # than the run, so a later repetition passes on the pull request an earlier
-    # one opened and this one found already open. See the docstring.
-    accepts_lease_pull_request: bool = False
+    # Measure "written since" and "head commit since" from the case's first
+    # repetition rather than the run, so a later repetition passes on the pull
+    # request an earlier one opened and this one found already open. See the
+    # docstring.
+    accepts_earlier_repetition_pull_request: bool = False
 
     def _spent_before(
         self,
@@ -1816,12 +1821,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         # The floor every "since" clause below measures from: the run, or with
-        # accepts_lease_pull_request the lease, when the job exported one.
+        # accepts_earlier_repetition_pull_request the case's first repetition,
+        # when the harness exported one.
         since, since_what = started, "this run started"
-        if self.accepts_lease_pull_request:
-            leased = _lease_started()
-            if leased is not None and leased < started:
-                since, since_what = leased, "this lease began"
+        if self.accepts_earlier_repetition_pull_request:
+            case_started = _case_started()
+            if case_started is not None and case_started < started:
+                since, since_what = case_started, "this case's first repetition began"
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
@@ -1927,10 +1933,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 if rejection:
                     rejected.append(rejection)
                     continue
+            # Within the skew allowance a pull request a hair older than the
+            # run is still this run's; "an earlier repetition" only when the
+            # widened window is what admitted it.
             during = (
-                "during this run" if touched >= started
-                else f"earlier in this lease (found already open; {since_what} at "
-                f"{since.isoformat()})"
+                "during this run"
+                if since == started or (started - touched).total_seconds() <= self.max_clock_skew_sec
+                else f"by an earlier repetition of this case (found already open; "
+                f"{since_what} at {since.isoformat()})"
             )
             return done(
                 True,

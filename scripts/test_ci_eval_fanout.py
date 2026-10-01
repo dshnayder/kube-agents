@@ -330,6 +330,25 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertEqual(len({inject for _, _, inject in seen}), 3)
         self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
 
+    def test_every_repetition_sees_when_the_case_began(self):
+        """pull_request_opened's accepts_earlier_repetition_pull_request measures
+        from EVAL_CASE_STARTED_AT, so rep 3 must see rep 1's start, not its own.
+        `date` ticks per call here, so a stamp taken per rep would differ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "stamps"
+            extra = (
+                'tick=1000; date() { if [ "$*" = "-u +%s" ]; then tick=$((tick + 1)); echo "${tick}"; '
+                'else command date "$@"; fi; }\n'
+                f'uv() {{ echo "STAMP rep=${{rep}} ${{EVAL_CASE_STARTED_AT}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }'
+            )
+            result = self.run_reps(extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        self.assertEqual(
+            re.findall(r"^STAMP rep=\d (\S+)$", recorded, re.MULTILINE), ["1001"] * 3, recorded
+        )
+
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")
         written = unit.index('> "${STATE_DIR}/${name}.rep${rep}.end"')

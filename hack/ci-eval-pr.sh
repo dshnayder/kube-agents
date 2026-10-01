@@ -1447,15 +1447,6 @@ release_inflight_note() { # <label> <audit-id>
   return 0
 }
 
-# When this job's lease began, for pull_request_opened's
-# accepts_lease_pull_request (bench/kube_agents_bench/verifiers.py): a fleet
-# audit's later repetition finds the remediation pull request an earlier one
-# opened and pushes nothing, and nothing here may close it between repetitions
-# (docs/ci-pool-projects.md 5.3). Taken before the reset, so every repetition
-# starts after it.
-EVAL_LEASE_STARTED_AT="$(date -u +%s)"
-export EVAL_LEASE_STARTED_AT
-
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 reset_audit_ledgers "lease"
 
@@ -2808,6 +2799,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
+  # When this case's first repetition began, for pull_request_opened's
+  # accepts_earlier_repetition_pull_request (bench/kube_agents_bench/verifiers.py):
+  # a fleet audit's later repetition finds the remediation pull request an
+  # earlier one opened and pushes nothing, and nothing here may close it
+  # between repetitions (docs/ci-pool-projects.md 5.3). Written once, by
+  # whichever repetition runs first, under the task lock that serializes
+  # them; a pull request older than it is not this case's.
+  [ -s "${STATE_DIR}/${name}.window" ] || date -u +%s > "${STATE_DIR}/${name}.window"
+  EVAL_CASE_STARTED_AT="$(cat "${STATE_DIR}/${name}.window")"
+  export EVAL_CASE_STARTED_AT
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
