@@ -8275,8 +8275,9 @@ def collect_cluster(
             emitted["impact_authoritative"] = True
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
-        # without `--workspace`, and the SOP's own grep is still the answer
-        # then. See `workload_declarations`.
+        # without `--workspace` or when content mode could not copy the whole
+        # repository, and the SOP's own grep is still the answer then. See
+        # `workload_declarations` and `indexed_workspace`.
         if declarations:
             declaration = declaration_for(declarations, name, emitted["namespace"], hit["object"])
             if declaration:
