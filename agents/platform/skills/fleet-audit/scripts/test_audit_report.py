@@ -13458,9 +13458,11 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(len(bodies), 1)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
 
-    def test_an_unreachable_broker_falls_back_to_the_leased_clone(self):
-        # The probe is the only question in the run that answers "carry on the
-        # old way" when it cannot be answered. Everything else fails loudly.
+    def test_an_unarmed_broker_refuses_start_instead_of_cloning(self):
+        # The leased clone cannot publish from the sandbox any more: its `git`
+        # has no transport and no credential. A broker that does not answer yes
+        # stops the run here, naming the broker, rather than failing later on
+        # a `git` transport error.
         def unavailable(endpoint, verb, payload):
             raise credential_proxy_client.WorkspaceUnavailable("not enabled")
 
@@ -13470,10 +13472,12 @@ class ContentModeTestCase(BaseTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        payload = self.start()
-        self.assertEqual(payload["mode"], "directory")
-        self.assertTrue(
-            [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("http://127.0.0.1:8765", self.err)
+        self.assertIn("did not start", self.err)
+        self.assertEqual(
+            [c for c in self.harness.calls if c[:2] == ["git", "clone"]], []
         )
 
 
@@ -18460,6 +18464,54 @@ class TestLostRecordWayOut(unittest.TestCase):
             answer,
         )
         self.assertNotIn("could not see the whole fleet", answer)
+
+
+class TestDetectContentMode(BaseTestCase):
+    """With a broker configured, an unclear probe refuses `start`.
+
+    The sandbox's `git` has no transport and no credential, so the leased
+    clone the old fallback chose would fail on its first remote command, later
+    and naming nothing. Only an install with no broker at all reaches it.
+    """
+
+    ENDPOINT = "http://127.0.0.1:8765"
+
+    def probe(self, answer):
+        import credential_proxy_client
+
+        def workspaces_available(endpoint):
+            self.assertEqual(endpoint, self.ENDPOINT)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        patcher = patch.object(credential_proxy_client, "workspaces_available", workspaces_available)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": self.ENDPOINT})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_no_broker_configured_is_directory_mode(self):
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
+            self.assertFalse(audit_report.detect_content_mode())
+
+    def test_an_armed_broker_is_content_mode(self):
+        self.probe(True)
+        self.assertTrue(audit_report.detect_content_mode())
+
+    def test_a_broker_that_does_not_say_yes_refuses_the_run(self):
+        self.probe(False)
+        with self.assertRaises(audit_report.StartRefused) as raised:
+            audit_report.detect_content_mode()
+        self.assertIn(self.ENDPOINT, str(raised.exception))
+        self.assertIn("did not start", str(raised.exception))
+
+    def test_a_probe_that_raises_refuses_the_run_and_says_why(self):
+        self.probe(OSError("connection reset"))
+        with self.assertRaises(audit_report.StartRefused) as raised:
+            audit_report.detect_content_mode()
+        self.assertIn("connection reset", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -36,9 +36,12 @@ an alias, a hook path. `list` and `fetch` are the read half — the names of the
 files in the broker's checkout, and the bytes of the ones a fix has to start
 from.
 
-**Directory mode**, which is what ran before and still runs when the broker has
-not been armed: a leased clone on the shared volume, and `checkout`, `add`,
-`commit`, `push` run in it through the shim.
+**Directory mode** is what ran before: a leased clone on the shared volume, and
+`checkout`, `add`, `commit`, `push` run in it. The sandbox's `git` has no network
+transport and no credential, so it cannot run there any more. It is taken only
+when no broker is configured at all (`CREDENTIAL_PROXY_URL` unset), and with a
+broker configured a probe that does not answer yes refuses `start` rather than
+fall back to it.
 
 `start` reports which one it took as the `mode` field of its JSON line, and the
 mode is resolved once per process so a single run cannot take both forks.
@@ -9110,11 +9113,11 @@ def pr_record(proposal: dict) -> dict:
 # is what ran before: a leased clone on a volume both containers mount, with the
 # agent running `checkout`, `add`, `commit` and `push` in it through the shim.
 #
-# The two are live at once while the fleet migrates, and the switch is not a
-# flag in this container. The broker either has the routes armed or it does not,
-# so the answer is asked of the broker once per process and remembered — every
-# later branch in the run has to take the same fork, and a second probe could
-# answer differently if the sidecar restarted mid-run.
+# The switch is not a flag in this container. The answer is asked of the broker
+# once per process and remembered — every later branch in the run has to take
+# the same fork, and a second probe could answer differently if the sidecar
+# restarted mid-run. Directory mode is reached only with no broker configured;
+# see `detect_content_mode`.
 _CONTENT_MODE: bool = False
 
 
@@ -9132,13 +9135,15 @@ def set_content_mode(enabled: bool) -> None:
 
 
 def detect_content_mode() -> bool:
-    """Ask the broker whether it takes content. False on anything unclear.
+    """Ask the broker whether it takes content; refuse `start` if it will not say yes.
 
-    Falling back to the directory path on an unreachable broker is right for
-    this one question and wrong as a general habit: the fallback publishes the
-    audit through the mechanism that has been shipping for months, whereas
-    refusing would drop the whole run over a probe. Every *other* call in the
-    run still goes through the proxy and still fails loudly if it is down.
+    False only when no broker is configured at all. With one configured,
+    directory mode is no fallback: the sandbox's `git` has no network transport
+    and no credential, so the leased clone would fail on its first remote
+    command, later and with a `git` error that names nothing. A broker that is
+    down, unreachable, token-less, or not yet rolled to a build serving the
+    workspace routes (`workspaces_available` answers False for all of those)
+    refuses the run here instead, with a message naming the broker.
     """
     endpoint = proxy_endpoint()
     if not endpoint:
@@ -9146,11 +9151,19 @@ def detect_content_mode() -> bool:
     import credential_proxy_client
 
     try:
-        return credential_proxy_client.workspaces_available(endpoint)
-    except Exception as exc:  # noqa: BLE001 — a probe must not end the run
-        log(f"could not ask the broker about content workspaces ({exc}); "
-            "publishing through the leased clone instead")
-        return False
+        armed = credential_proxy_client.workspaces_available(endpoint)
+    except Exception as exc:  # noqa: BLE001 — named in the refusal below
+        armed, why = False, f": {exc}"
+    else:
+        why = ""
+    if armed:
+        return True
+    raise StartRefused(
+        f"the broker at {endpoint} did not confirm its content-workspace routes{why}. "
+        "It may be down, unreachable, refusing this sandbox's token, or on a build "
+        "older than this skill. This sandbox has no other way to publish, so the "
+        "audit did not start; check the credential-proxy pod and re-run."
+    )
 
 
 def refresh_credentials(repo: str | None = None) -> None:
