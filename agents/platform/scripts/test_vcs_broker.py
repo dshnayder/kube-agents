@@ -1992,6 +1992,24 @@ class CollaborationTest(unittest.TestCase):
         self.assertFalse(answer["commentsTruncated"])
         self.assertIn("page=2", urllib.parse.unquote(recorder.calls[2][4]))
 
+    def test_a_short_last_page_past_the_limit_is_truncation(self):
+        # A limit that is not a multiple of the page size: the second page is
+        # short, so it does not look full, but it carries more than the limit
+        # keeps. What is cut there is as unseen as an unread page.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, _ = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 160)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 150}
+        )
+        self.assertEqual(answer["commentCount"], 150)
+        self.assertTrue(answer["commentsTruncated"])
+
     def test_a_listing_says_when_it_is_a_page(self):
         broker, _ = self.broker([{"number": n} for n in range(3)])
         answer = broker.issue_list({"repository": "acme/infra", "limit": 3})

@@ -12133,6 +12133,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now
             )
         )
+        conversation_unread = False
         if existing_issue and answers_remediate:
             # A command standing on the ledger is answered *before* anything
             # closes. "Every /remediate gets exactly one answer" cannot have a
@@ -12152,7 +12153,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # be one the lost record carried, so it is not "no longer
             # reproduces" and not a coverage wait either.
             lost_gaps = [gap for gap in gaps if gap in LOST_MEMORY_GAPS]
-            clean_comments = fetch_issue_comments(repo, existing_issue)
+            # Read rather than fetched: an unreadable conversation is not an
+            # empty one here. Closing over it would take an unanswered request
+            # with it, so the ledger is held open below and the next run reads
+            # it again.
+            clean_comments = read_comments(
+                "issue-view", repo, existing_issue, standing=True
+            )
+            if clean_comments is None:
+                conversation_unread = True
+                clean_comments = []
             for request in unanswered_remediate_comments(clean_comments):
                 targets = request.get("targets") or []
                 held = [t for t in targets if t in withheld_ids]
@@ -12220,7 +12230,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
         opened_issue: int | None = None
         opened_body = ""
-        if existing_issue and gaps:
+        held_unread = bool(existing_issue and conversation_unread)
+        if held_unread and not gaps and not unaccounted:
+            # A clean run that could not read the ledger's conversation cannot
+            # tell whether a `/remediate` stands on it, and closing would leave
+            # that request no thread to be answered on. Nothing is posted: the
+            # all-clear goes out with the close, on the run that can read it.
+            log(
+                f"Audit {audit_id} is clean, but issue #{existing_issue}'s comments "
+                "could not be read; it stays open so a standing /remediate is "
+                "answered on the next run rather than closed over."
+            )
+        elif existing_issue and gaps:
             # Zero findings over incomplete coverage is not an all-clear. The
             # ledger stays open and says why, so the stream self-heals the day
             # the unreadable clusters come back. Over a held finding the held
@@ -12346,13 +12367,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # about is gone whatever it was called. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
-        clean_resolved = 0 if (gaps or unaccounted) else len(previous_ids)
+        clean_resolved = 0 if (gaps or unaccounted or held_unread) else len(previous_ids)
         payload = {
             # HELD is CLEAN refused its close: the same zero findings,
             # with the ledger left open over findings the run did not
             # account for. A distinct word because the worker relays
             # this line, and "clean" is the one thing it is not.
-            "status": "HELD" if unaccounted else "CLEAN",
+            "status": "HELD" if unaccounted or held_unread else "CLEAN",
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,

@@ -9800,6 +9800,18 @@ class TestRemediateOnACleanRun(HarnessTestCase):
             [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
         )
         self.assertIn("could not tell whether @operator may write", self.err)
+        # Held open: closing would leave the request no thread to be
+        # answered on next run.
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+
+    def test_an_unreadable_conversation_holds_the_ledger_open(self):
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"*-view comments": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertIn("stays open", self.err)
 
     def test_a_standing_request_is_answered_before_the_ledger_closes(self):
         self.harness.replies = self.replies([self.comment()])

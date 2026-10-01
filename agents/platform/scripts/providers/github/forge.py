@@ -149,7 +149,9 @@ class GitHubForge(Forge):
             nodes += batch
             full = len(batch) >= per_page
             if not full or len(nodes) >= limit:
-                return nodes[:limit], full
+                # A short last page can still overshoot a limit that is not a
+                # multiple of the page size; what is cut here is truncation too.
+                return nodes[:limit], full or len(nodes) > limit
             page += 1
 
     def _proposal_comments(
