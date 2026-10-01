@@ -121,8 +121,9 @@ Recorded with rationale so a later reader does not re-litigate them.
 
 A remediation PR opens automatically **iff** the finding satisfies all of:
 
-1. `severity` ranks at or above `AUTO_PROMOTION_FLOOR` (`major`) where a collector candidate stands
-   behind the finding, and at or above `UNVOUCHED_PROMOTION_FLOOR` (`critical`) where none does, and
+1. `severity` ranks at or above `UNVOUCHED_PROMOTION_FLOOR` (`critical`), or at or above
+   `AUTO_PROMOTION_FLOOR` (`major`) on a check in `MAJOR_SWEEP_CHECKS` whose collector candidate is
+   graded that high too, and
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
@@ -144,18 +145,20 @@ severity the harness does not recognise ranks below every real one.
 The floor was `critical`, which selected almost nothing on a real fleet — the `critical` findings
 were exposure problems closed with `gcloud`, and the ones attracting a declarative fix were graded
 `major` and `minor`, so the two conditions were nearly disjoint and the sweep opened nothing while
-the ledger showed twenty-six manifest remediations waiting. It is now `major`. Measured across the nine
-live streams on 2026-09-06: 3 `critical` and 5 `major` manifest remediations promote, 21 `minor` are
-withheld, and the cap held back nothing. `minor` is left below the floor deliberately — it is
-defence-in-depth work a reader may reasonably never ask for, and 15 of the 21 sit on one stream,
-which at a `minor` floor would sit at the cap for three consecutive runs.
+the ledger showed twenty-six manifest remediations waiting. Lowering it to `major` across the
+board was tried and does not hold: a SOP grades how bad a finding is, not whether its fix is safe to
+open unasked, and the `major` manifests include a memory limit, a rollout strategy, a CronJob
+concurrency policy, Binary Authorization enforcement and release-channel enrolment — each a change
+its owner has to choose. Marking those one at a time with `needs_triage` is a denylist that every
+new check has to remember to join.
 
-The `major` floor holds only for a finding a collector candidate stands behind. What keeps a
-disruptive `major` fix out of the sweep is the collector's `needs_triage` marker
-([collector design §3.4](fleet-audit-collector-manifest.md)), and a marker exists only on a
-candidate. A finding without one — a run with no manifest, a check the collector skipped or ran to
-a non-zero `rc`, a target it did not collect — has nothing that could mark it, so it is held to
-`critical`, the floor the markers were written against.
+So `major` is an allowlist. `MAJOR_SWEEP_CHECKS` names the checks whose fix is additive and reads
+whole in one screen — a PodDisruptionBudget, turning off a token for a ServiceAccount nothing has
+granted, an On-Demand fallback at the bottom of a ComputeClass — and only those open at `major`.
+The collector has to stand behind the grade: its candidate must exist, so a `needs_triage` marker
+could have been set on it, and must itself be `major`, so the model's re-grade of a `minor`
+candidate does not decide that a pull request opens. Everything else is held to `critical`. `minor`
+stays below both floors — defence-in-depth work a reader may reasonably never ask for.
 
 "Live" rather than "in any state" is condition 3's whole point, and the distinction is between two
 kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,

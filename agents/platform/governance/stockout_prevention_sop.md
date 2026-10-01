@@ -276,7 +276,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 - Edit the manifest directly in `<workspace>`, adding the necessary fallback machine families, zones, or quota adjustments.
 - **Mandatory Remediation Comments**: For every modified line in YAML, append an inline `# Remediation: <reason>` comment.
 - Set `remediation.path` to the repo-relative file path, with `kind: manifest`.
-- `finish` opens a pull request unasked for a manifest finding graded `critical`, or `major` where the collector flagged it, unless the collector marked it `needs_triage` — so `ccc-no-ondemand-floor` at `major` and its inference escalation at `critical` arrive as pull requests where the repo declares the class, and a new-ComputeClass fix does not.
+- `finish` opens a pull request unasked for a manifest finding graded `critical`, or `major` on `ccc-no-ondemand-floor` where the collector's candidate is `major` too, unless the collector marked it `needs_triage` — so a missing On-Demand floor (at `major`, or `critical` for an inference workload) arrives as a pull request where the repo declares the class, and a new-ComputeClass fix does not. Every other `major` manifest here — a smaller replica shape, a Spot fallback, a raised zonal ceiling — waits for `/remediate`: each changes what the workload costs or where it runs.
 - Reviewers may comment `/remediate <finding-id>` or `/remediate all` on the ledger issue to promote findings into PRs.
 
 ### 5. Emit findings.json

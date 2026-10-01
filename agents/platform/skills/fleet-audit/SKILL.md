@@ -939,12 +939,12 @@ the record, and `finish` reports the count as `declared`.
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Three paths lead there:
 
-- **Auto-promotion.** A finding graded `critical`, or `major` with a collector candidate behind
-  it, that is a `manifest`, has no live pull request on its branch — and, on a run that passed
+- **Auto-promotion.** A finding graded `critical` — or `major` on one of the checks in
+  `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
+  collector's candidate is `major` too — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
   `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
-  automatically by `finish` — **at most five per run**. A `major` finding no candidate backs (no
-  manifest, or a check the collector skipped or failed) needs `critical`, because the markers
-  live on candidates. The collector marks a fix that scales a controller to zero, writes a
+  automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
+  a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
   default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
   or deletes a Service, or enforces spreading; the ledger names each with its marker and reason.
