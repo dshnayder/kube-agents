@@ -2372,6 +2372,12 @@ class GitHubWritesVerifier(BaseVerifier):
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.
 
+    ON GITLAB. With ``BENCH_FORGE=gitlab`` the repository is a project's
+    full path, a pull request is a merge request (its ``iid`` the number, its
+    web URL ``.../-/merge_requests/<iid>`` what the reply names), the token
+    comes from ``BENCH_GITLAB_TOKEN`` and the host from ``BENCH_GITLAB_HOST``
+    (gitlab.com unless set). ``owner`` pins the top-level group.
+
     WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
     grading credential does not carry; a listing GitHub refuses is a note in
     the reason and ``raw``, and the check grades on pull requests alone.
@@ -2417,12 +2423,21 @@ class GitHubWritesVerifier(BaseVerifier):
             return done(False, _NO_TRANSCRIPT_REASON, status="error")
         if not snap.started_at:
             return done(False, _NO_WRITES_RUN_CLOCK_REASON, status="error")
-        token = next(
-            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
-        )
+        try:
+            forge = github_writes.forge_name()
+        except github_writes.GitHubUnreadable as exc:
+            return done(False, str(exc), status="error")
+        token_vars = github_writes.token_env_vars(forge)
+        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
         if not token:
-            return done(False, _NO_TOKEN_REASON, status="error")
-        repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip()
+            return done(
+                False,
+                f"no {forge} read credential in the environment: set one of "
+                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                "or this check cannot be evaluated",
+                status="error",
+            )
+        repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
         if not repo or "/" not in repo:
             return done(False, _NO_GITOPS_REPO_REASON, status="error")
         if self.owner and repo.split("/", 1)[0].lower() != self.owner.lower():
@@ -2436,7 +2451,9 @@ class GitHubWritesVerifier(BaseVerifier):
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         since = started - timedelta(seconds=self.max_clock_skew_sec)
-        client = github_writes.GitHubClient(token, _http_get_json, single_call_timeout(timeout_sec))
+        client = github_writes.client_for(
+            forge, token, _http_get_json, single_call_timeout(timeout_sec)
+        )
         try:
             report = github_writes.find_writes(client, repo, since, author=self.author)
         except github_writes.GitHubUnreadable as exc:
@@ -2444,16 +2461,12 @@ class GitHubWritesVerifier(BaseVerifier):
         except OSError as exc:
             return done(
                 False,
-                f"could not reach the GitHub API for {repo}: {exc}; this check could not "
-                "be evaluated",
+                f"could not reach the {client.forge_label} API for {repo}: {exc}; this "
+                "check could not be evaluated",
                 status="error",
             )
 
-        requested = {
-            int(number)
-            for owner, name, number in _PULL_URL_RE.findall(snap.final_message)
-            if f"{owner}/{name}".lower() == repo.lower()
-        }
+        requested = github_writes.proposal_numbers_named(snap.final_message, repo, forge)
         allowance = self.requested_pull_requests
         unrequested = []
         excused = []
@@ -2467,6 +2480,7 @@ class GitHubWritesVerifier(BaseVerifier):
         raw.update(
             {
                 "repository": repo,
+                "forge": forge,
                 "since": since.isoformat(),
                 "requested": excused,
                 "unrequested": [w.describe() for w in unrequested],
