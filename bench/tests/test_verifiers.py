@@ -2145,6 +2145,7 @@ def _pr_head_routes(
     *,
     changed_files: int = 3,
     repo: str = _PR_REPO,
+    head_ref: str = "platform-agent/fix",
 ) -> None:
     """Route the reads `_head_push` makes: the pulls payload for the file count
     and the page of the commit listing the head sits on."""
@@ -2155,7 +2156,7 @@ def _pr_head_routes(
             "number": 7,
             "changed_files": changed_files,
             "commits": 1,
-            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+            "head": {"ref": head_ref, "sha": _PR_HEAD_SHA},
         },
     )
     github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
@@ -2211,18 +2212,28 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
 
 # An hour before _RUN_START: the first unit on this case's audit stream began then.
 _STREAM_START = datetime(2026, 8, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+_STREAM_AUDIT = "obtainability-audit"
+# A branch the audit's `finish` names: platform-agent/fix-<audit>-<slug>-<digest>.
+_STREAM_BRANCH = f"platform-agent/fix-{_STREAM_AUDIT}-checkout-gateway-0123abcd"
+
+
+@pytest.fixture
+def stream(monkeypatch):
+    """The two variables hack/ci-eval-pr.sh exports for a unit on an audit stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
 
 
 def test_a_pull_request_an_earlier_run_on_the_stream_opened_passes_with_the_option(
-    token, github, monkeypatch
+    token, github, stream
 ):
     """#2228: a fleet audit's `finish` finds rep 1's pull request open on its
     branch and pushes nothing, and the presubmit cannot close it between reps.
-    Opened and pushed after the stream's first unit began, it is this job's work."""
-    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    Opened and pushed after the stream's first unit began, on the audit's
+    branch, it is this job's work."""
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
-    _pr_head_routes(github, "2026-08-21T08:19:50Z")
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
     res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
     assert res.status == "pass", res.reason
     assert "earlier run on this audit stream" in res.reason
@@ -2231,9 +2242,8 @@ def test_a_pull_request_an_earlier_run_on_the_stream_opened_passes_with_the_opti
 
 
 def test_a_pull_request_from_before_the_stream_fails_with_the_option(
-    token, github, monkeypatch
+    token, github, stream
 ):
-    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
@@ -2242,10 +2252,9 @@ def test_a_pull_request_from_before_the_stream_fails_with_the_option(
 
 
 def test_a_head_commit_from_before_the_stream_fails_with_the_option(
-    token, github, monkeypatch
+    token, github, stream
 ):
     """Written to during the stream, but the fix itself was pushed before it."""
-    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
     _stash_pr_report()
     github.routes[_pr_api()] = (
         200,
@@ -2258,10 +2267,9 @@ def test_a_head_commit_from_before_the_stream_fails_with_the_option(
 
 
 def test_this_runs_own_pull_request_still_reads_as_this_runs_with_the_option(
-    token, github, monkeypatch
+    token, github, stream
 ):
     """Rep 1 opens its own pull request; the widened window must not relabel it."""
-    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
     _pr_head_routes(github, "2026-08-21T09:00:20Z")
@@ -2276,6 +2284,7 @@ def test_a_stream_stamp_later_than_the_run_never_narrows_the_window(
     """A stale window file or clock skew can put the stamp after the run began;
     the option widens the window and must never shrink it below the run."""
     monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
     _pr_head_routes(github, "2026-08-21T09:00:20Z")
@@ -2285,10 +2294,9 @@ def test_a_stream_stamp_later_than_the_run_never_narrows_the_window(
 
 
 def test_a_rejection_with_the_option_says_what_the_window_was(
-    token, github, monkeypatch
+    token, github, stream
 ):
     """The summary line must not tell a triager the check wanted this run's own pull request."""
-    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:30:00Z"))
     _pr_head_routes(github, "2026-08-21T07:29:50Z")
@@ -2298,12 +2306,61 @@ def test_a_rejection_with_the_option_says_what_the_window_was(
     assert "this audit stream's first run began" in res.reason
 
 
+def test_another_cases_pull_request_in_the_window_fails_with_the_option(
+    token, github, stream
+):
+    """Another case in the job opens its pull request in the same repository
+    during the stream's window. The stamp alone would admit it; its branch is
+    not one the audit's `finish` names, so it is not the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_another_audits_branch_is_not_this_streams(token, github, stream):
+    """`platform-agent/fix-` alone is every audit's; the audit id is the tie."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(
+        github,
+        "2026-08-21T08:19:50Z",
+        head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
+    )
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "fail"
+
+
+def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
+    """The branch only gates what the widened window admits."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z", head_ref="rca-fix-crashloop")
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "pass"
+
+
+def test_a_stamp_without_an_audit_stream_measures_from_the_run(
+    token, github, monkeypatch
+):
+    """With no audit id nothing could tie an older pull request to the stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+
+
 @pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
 def test_without_a_readable_stream_stamp_the_option_measures_from_the_run(
     token, github, monkeypatch, raw
 ):
     """A direct devops-bench run exports no stamp, and an unreadable one is not a licence."""
     monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, raw)
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
     _pr_head_routes(github, "2026-08-21T08:19:50Z")

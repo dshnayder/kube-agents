@@ -391,11 +391,19 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
-# When the first unit on the case's audit stream began (for a case writing no
-# ledger, the case's first repetition), in epoch seconds; hack/ci-eval-pr.sh
-# exports it. Read only by PullRequestOpenedVerifier's
+# When the first unit on the case's audit stream began, in epoch seconds, and
+# which audit that stream is; hack/ci-eval-pr.sh exports both for a case that
+# writes a ledger. Read only by PullRequestOpenedVerifier's
 # `accepts_stream_pull_request`.
 STREAM_STARTED_ENV_VAR = "EVAL_STREAM_STARTED_AT"
+STREAM_AUDIT_ENV_VAR = "EVAL_AUDIT_STREAM"
+
+# The head branch every remediation pull request a fleet audit opens sits on is
+# this, the audit id, a dash, then the fix's slug and digest
+# (agents/platform/skills/fleet-audit/scripts/audit_report.py,
+# `group_branch_for`). What ties a pull request older than the run to the
+# stream rather than to whichever case wrote it.
+REMEDIATION_BRANCH_PREFIX = "platform-agent/fix-"
 
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
@@ -1372,6 +1380,11 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         )
 
 
+def _stream_audit() -> str:
+    """The audit id of the case's stream, from STREAM_AUDIT_ENV_VAR; "" if unset."""
+    return os.environ.get(STREAM_AUDIT_ENV_VAR, "").strip()
+
+
 def _stream_started() -> datetime | None:
     """When the case's audit stream first ran, from STREAM_STARTED_ENV_VAR; None if unset or unreadable."""
     raw = os.environ.get(STREAM_STARTED_ENV_VAR, "").strip()
@@ -1418,8 +1431,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
     With ``accepts_stream_pull_request`` the two "since this run started"
     clauses measure instead from when the first unit on the case's audit
     stream began (``EVAL_STREAM_STARTED_AT``, which ``hack/ci-eval-pr.sh``
-    exports), so a pull request an earlier unit on the stream opened passes
-    when the reply names it. That is for a case whose later runs meet a pull
+    exports with the audit id in ``EVAL_AUDIT_STREAM``), so a pull request an
+    earlier unit on the stream opened passes when the reply names it -- and
+    only if its head branch is one that audit's ``finish`` names
+    (``platform-agent/fix-<audit>-``). The stamp bounds when; the branch is
+    what says the pull request is the stream's and not another case's in the
+    same repository. That is for a case whose later runs meet a pull
     request an earlier run left open on the same branch, as a fleet audit's
     remediation case does: ``finish`` names the branch after the files the
     fix touches, so every
@@ -1429,11 +1446,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
     it between units (docs/ci-pool-projects.md 5.3), so without the option
     only the first unit on the stream could pass. A leftover from before the
     stream's first unit -- an earlier job on the pool project -- predates the
-    stamp and is still rejected. Inside the window nothing ties the pull
-    request to this case's defect: it may be another case's, and a later
-    repetition passes by naming the one repetition 1 opened. Run
-    through ``devops-bench`` directly, without the variable, the clauses
-    measure from the run as they otherwise do.
+    stamp and is still rejected. The branch ties the pull request to the
+    audit, not to this case's defect: another case on the same stream opens
+    on the same branch prefix, and a later repetition passes by naming the
+    one repetition 1 opened. Run through ``devops-bench`` directly, without
+    both variables, the clauses measure from the run as they otherwise do.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1831,10 +1848,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         # accepts_stream_pull_request the stream's first unit, when the harness
         # exported one.
         since, since_what = started, "this run started"
-        if self.accepts_stream_pull_request:
+        stream_branch = ""
+        if self.accepts_stream_pull_request and _stream_audit():
             stream_started = _stream_started()
             if stream_started is not None and stream_started < started:
                 since, since_what = stream_started, "this audit stream's first run began"
+                stream_branch = f"{REMEDIATION_BRANCH_PREFIX}{_stream_audit()}-"
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
@@ -1924,6 +1943,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "wrote to a pull request an earlier one pushed the fix to"
                 )
                 continue
+            # Only the widened window needs the branch: a pull request this
+            # run wrote and pushed to is this run's whatever it is called.
+            skew = self.max_clock_skew_sec
+            if stream_branch and (
+                (started - touched).total_seconds() > skew
+                or (pushed and (started - pushed).total_seconds() > skew)
+            ):
+                head = str(((pull or payload).get("head") or {}).get("ref") or "")
+                if not head.startswith(stream_branch):
+                    rejected.append(
+                        f"{slug}: written before this run started, on branch "
+                        f"{head or '(unreadable)'!r}, which is not one this audit "
+                        f"stream's `finish` names ({stream_branch}*) — another "
+                        "case's pull request, not the stream's"
+                    )
+                    continue
             if self.reuses_spent_branch:
                 try:
                     rejection, unevaluable = self._spent_before(

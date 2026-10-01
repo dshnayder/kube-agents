@@ -2799,19 +2799,24 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
-  # When the first unit on this case's audit stream began -- or, for a case
-  # that writes no ledger, this case's first repetition -- for
-  # pull_request_opened's accepts_stream_pull_request
+  # When the first unit on this case's audit stream began, and which audit it
+  # is, for pull_request_opened's accepts_stream_pull_request
   # (bench/kube_agents_bench/verifiers.py). A fleet audit opens its remediation
   # pull request once and later runs on the stream find it open and leave it,
   # whichever case they are, and nothing here may close it between units
   # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
   # here, under the stream lock (the task lock, streamless) that serializes
-  # them; a pull request older than it is not this job's.
-  local window="${STATE_DIR}/${audit_id:+stream-}${audit_id:-${name}}.window"
-  [ -s "${window}" ] || date -u +%s > "${window}"
-  EVAL_STREAM_STARTED_AT="$(cat "${window}")"
-  export EVAL_STREAM_STARTED_AT
+  # them; a pull request older than it is not this job's, and one the stamp
+  # admits must sit on the audit's remediation branch. A case writing no
+  # ledger has no stream and gets neither.
+  if [ -n "${audit_id}" ]; then
+    local window="${STATE_DIR}/stream-${audit_id}.window"
+    [ -s "${window}" ] || date -u +%s > "${window}"
+    EVAL_STREAM_STARTED_AT="$(cat "${window}")"
+    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}"
+  else
+    unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM
+  fi
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
