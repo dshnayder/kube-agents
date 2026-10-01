@@ -1879,6 +1879,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if stream_started is not None and stream_started < started:
                 since, since_what = stream_started, "this audit stream's first run began"
                 stream_branch = f"{REMEDIATION_BRANCH_PREFIX}{_stream_audit()}-"
+            elif stream_started is None:
+                since_what = (
+                    "this run started (`accepts_stream_pull_request` is set and the "
+                    f"case is on an audit stream, but {STREAM_STARTED_ENV_VAR} is "
+                    "missing or unreadable, so the window was not widened)"
+                )
+            else:
+                # Never narrowed below the run: a late stamp is a stale window
+                # file or a clock step, not a later start.
+                since_what = (
+                    "this run started (`accepts_stream_pull_request` is set, but "
+                    f"{STREAM_STARTED_ENV_VAR} ({stream_started.isoformat()}) is not "
+                    "before this run, so the window was not widened)"
+                )
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
