@@ -4443,9 +4443,10 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # severity ceiling reserves `critical` for a drain blocker or a
         # last-copy deletion, neither of which a missing request is.
         #
-        # The bumped `major` clears the automatic sweep's floor
-        # (`AUTO_PROMOTION_FLOOR` in audit_report.py), so the hit says the bump
-        # supplied it and the candidate carries `AUTOPILOT_BUMP_TRIAGE`: it
+        # The bumped `major` is the grade the automatic sweep opens on the
+        # checks it clears for `major` (`MAJOR_SWEEP_CHECKS` in audit_report.py),
+        # so the hit says the bump supplied it and the candidate carries
+        # `AUTOPILOT_BUMP_TRIAGE` whichever floor applies: it
         # still waits for `/remediate`, and a *platform* attribute moves this
         # finding up the ledger without opening a pull request by itself.
         severity = "major" if autopilot else "minor"

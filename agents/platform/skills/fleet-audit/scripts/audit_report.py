@@ -51,6 +51,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import fcntl
 import hashlib
@@ -1092,6 +1093,14 @@ GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
 # new file in one renders only if its `resources:` lists it.
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# A YAML line whose `name:` key is one name, as both Python's `re` (with
+# `re.M`) and the broker's `git grep -E` read it: the key at any indent or
+# after a `-`, the value bare or quoted, nothing after it but a comment.
+PDB_NAME_LINE = "^[ \t-]*name:[ \t]*['\"]?{name}['\"]?[ \t]*(#.*)?$"
+# The GitOps layout's per-cluster tree, `clusters/<name>/`, as the collector
+# reads it: a PDB name collides only inside its own cluster's tree.
+CLUSTER_TREE_ROOT = "clusters"
+CLUSTER_TREE_DEPTH = 2
 # The selector keys `policy/v1` takes, and nothing else.
 LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
@@ -10244,8 +10253,23 @@ def reconcile_remediation_prs(
     return pr_by_finding, url_by_finding
 
 
+def carrying_prs(prs: list[dict], findings: list[dict]) -> list[dict]:
+    """The open remediation pull requests whose delta block names one of `findings`.
+
+    A finding left `manual` because such a pull request answers it has no
+    branch of its own, so `pr_by_finding` never maps it; this is how its pull
+    request still reaches `prs_still_open`.
+    """
+    ids = {str(f.get("id", "")) for f in findings}
+    return [
+        pr
+        for pr in prs
+        if str(pr.get("state", "") or "").upper() == "OPEN" and ids & set(parse_delta_block(pr.get("body")))
+    ]
+
+
 def still_open_pr_urls(
-    pr_by_finding: dict[str, dict | None], opened: list[str]
+    pr_by_finding: dict[str, dict | None], opened: list[str], carrying: Iterable[dict] = ()
 ) -> list[str]:
     """The open remediation pull requests on this run's findings it did not open.
 
@@ -10257,8 +10281,7 @@ def still_open_pr_urls(
     """
     seen = set(opened)
     urls: list[str] = []
-    for fid in sorted(pr_by_finding):
-        pr = pr_by_finding[fid] or {}
+    for pr in [*(pr_by_finding[fid] or {} for fid in sorted(pr_by_finding)), *carrying]:
         url = str(pr.get("url", "") or "")
         if str(pr.get("state", "") or "").upper() != "OPEN" or not url:
             continue
@@ -11059,10 +11082,12 @@ class _RepositoryProbe:
         self._workspace = None
         # Why the broker could not be asked, once it could not.
         self.unavailable = ""
-        # The clone's YAML, read once for every `mentions` in directory mode.
-        self._texts: list[str] | None = None
+        # The clone's YAML, read once for every `mentions` in directory mode,
+        # and whether any of it could not be read, which answers every search.
+        self._texts: list[tuple[str, str]] | None = None
+        self._unreadable = False
 
-    def _broker(self):
+    def broker(self):
         if self._workspace is None and not self.unavailable:
             try:
                 import credential_proxy_client  # noqa: PLC0415 -- the content-mode client
@@ -11077,7 +11102,7 @@ class _RepositoryProbe:
     def has_path(self, path: str) -> bool:
         if not content_mode():
             return (self.root / path).exists()
-        workspace = self._broker()
+        workspace = self.broker()
         if workspace is None:
             return True
         try:
@@ -11088,25 +11113,38 @@ class _RepositoryProbe:
             return True
         return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
 
-    def mentions(self, text: str) -> bool:
-        """Whether any tracked YAML holds `text`, as a fixed string."""
+    def mentions(self, name: str, prefix: str = "") -> bool:
+        """Whether a tracked YAML file under `prefix` has a line whose `name:` is `name`.
+
+        Anchored to the line and the whole value, quoted or not, so a label
+        (`app.kubernetes.io/name:`), a comment or a longer name sharing the
+        prefix is not a collision. `prefix` is the declaration's cluster tree,
+        since a name is unique only within one cluster's namespace. A file that
+        could not be read answers yes."""
+        # The names reaching here are DNS-1123, so a dot is the one character
+        # either regex dialect would read as more than itself.
+        expression = PDB_NAME_LINE.format(name=name.replace(".", r"\."))
         if not content_mode():
             if self._texts is None:
                 self._texts = []
                 for candidate in self.root.rglob("*"):
-                    if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in candidate.relative_to(self.root).parts:
+                    relative = candidate.relative_to(self.root)
+                    if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in relative.parts:
                         continue
                     if candidate.is_file():
                         try:
-                            self._texts.append(candidate.read_text(encoding="utf-8", errors="replace"))
+                            self._texts.append((relative.as_posix(), candidate.read_text(encoding="utf-8", errors="replace")))
                         except OSError:
-                            self._texts.append(text)
-            return any(text in body for body in self._texts)
-        workspace = self._broker()
+                            self._unreadable = True
+            pattern = re.compile(expression, re.M)
+            return self._unreadable or any(
+                pattern.search(body) for path, body in self._texts if path.startswith(prefix)
+            )
+        workspace = self.broker()
         if workspace is None:
             return True
         try:
-            found = workspace.grep(text)
+            found = workspace.grep(expression, prefix=prefix or None, regex=True)
         except Exception:  # noqa: BLE001 -- an unanswered search cannot rule it out
             return True
         return not isinstance(found, dict) or int(found.get("total", 1)) > 0
@@ -11148,7 +11186,7 @@ def plan_generated_fixes(
     Nothing is written here, so a run that is refused for another fix leaves
     nothing behind.
     """
-    candidates = {_candidate_identity(entry, candidate): candidate for entry, candidate in _candidates(manifest)}
+    candidates = {_candidate_identity(entry, candidate): (entry, candidate) for entry, candidate in _candidates(manifest)}
     carried: dict[str, list[dict]] = {}
     for pr in prs:
         if not pr_closed_by_harness(pr):
@@ -11159,13 +11197,13 @@ def plan_generated_fixes(
     # Two workloads of one name planned into one directory, or into one
     # namespace, would otherwise take the same file or the same object name.
     taken_paths: set[str] = set()
-    taken_names: set[tuple[str, str]] = set()
+    taken_names: set[tuple[str, str, str]] = set()
     for finding in findings:
         fid = str(finding.get("id", ""))
         fix = unwritten.get(fid)
         if fix is None or not fix.declared or fid in declines:
             continue
-        candidate = candidates.get(derive_finding_id(finding)) or {}
+        entry, candidate = candidates.get(derive_finding_id(finding)) or ({}, {})
         if candidate.get("check") != GENERATED_FIX_CHECK:
             continue
         built = _pdb_manifest(candidate, fid)
@@ -11188,9 +11226,14 @@ def plan_generated_fixes(
         # The same bytes are this run's own earlier write, kept by a `finish`
         # that failed after it.
         ours = target.is_file() and target.read_text(encoding="utf-8", errors="replace") == text
+        # A name is unique per namespace per cluster; the cluster comes from the
+        # entry where the candidate carries none, as in `_candidate_identity`.
+        cluster = str(candidate.get("cluster") or entry.get("name") or "")
         namespace = str(candidate.get("namespace") or "")
+        tree = PurePosixPath(*PurePosixPath(fix.path).parts[:CLUSTER_TREE_DEPTH])
+        scope = f"{tree}/" if PurePosixPath(fix.path).parts[:1] == (CLUSTER_TREE_ROOT,) else ""
         reason = None
-        if path in taken_paths or (namespace, name) in taken_names:
+        if path in taken_paths or (cluster, namespace, name) in taken_names:
             reason = f"another fix this run writes already takes {path} or the name {name}"
         elif name in (candidate.get("namespace_pdbs") or []):
             reason = f"the namespace already has a PodDisruptionBudget named {name}"
@@ -11198,8 +11241,8 @@ def plan_generated_fixes(
             reason = f"{path} already exists"
         elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
             reason = f"{directory} is inside a Kustomize root, where a new file renders only if listed"
-        elif not ours and probe.mentions(f"name: {name}"):
-            reason = f"the repository already names an object {name}"
+        elif not ours and probe.mentions(name, scope):
+            reason = f"{scope or 'the repository'} already names an object {name}"
         if reason and probe.unavailable:
             reason = f"the repository could not be checked ({probe.unavailable})"
         if reason:
@@ -11207,7 +11250,7 @@ def plan_generated_fixes(
             continue
         planned[fid] = (path, text)
         taken_paths.add(path)
-        taken_names.add((namespace, name))
+        taken_names.add((cluster, namespace, name))
     return planned, answered
 
 
@@ -11487,6 +11530,11 @@ def unwritten_sweep_fixes(
         if isinstance(candidate.get("declaration"), dict)
     }
     degraded_set = set(degraded)
+    # A declared `manual` fix a pull request the harness did not close already
+    # carries -- open, merged, or closed by a person -- is answered; the
+    # generated check is left to `plan_generated_fixes`, which tells its own
+    # pull request from another.
+    carried = {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
     unwritten: dict[str, UnwrittenFix] = {}
     for finding in findings:
         fid = str(finding.get("id", ""))
@@ -11503,6 +11551,8 @@ def unwritten_sweep_fixes(
             continue
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
+        if fid in carried and str(finding.get("check") or "") != GENERATED_FIX_CHECK:
+            continue
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
@@ -11634,7 +11684,7 @@ class KccBrokerScan(NamedTuple):
     truncated: bool
 
 
-def kcc_declarations_via_broker(repo: str) -> KccBrokerScan:
+def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
     """Index the GitOps repository's Config Connector resources through the broker.
 
     Content mode's counterpart of `kcc_declarations`: there is no clone at
@@ -11646,6 +11696,8 @@ def kcc_declarations_via_broker(repo: str) -> KccBrokerScan:
 
     Any broker failure returns an empty, untruncated scan, which disables the
     check exactly as an unreadable clone does; the run never fails over it.
+    `session` is a broker workspace already open on `repo` (`_RepositoryProbe`),
+    so one `finish` clones the repository once.
     """
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
@@ -11655,7 +11707,12 @@ def kcc_declarations_via_broker(repo: str) -> KccBrokerScan:
     try:
         import credential_proxy_client
 
-        with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+        opened = (
+            contextlib.nullcontext(session)
+            if session is not None
+            else credential_proxy_client.Workspace.open(proxy_endpoint(), repo)
+        )
+        with opened as workspace:
             result = workspace.grep(KCC_CONTAINER_API_GROUP)
             truncated = bool(result.get("truncated"))
             wanted = sorted(
@@ -13402,8 +13459,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # has none and asks the broker, and only when a finding could match, so
     # a run with no such fix costs no round trip.
     kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
+    # One broker session for the run's repository questions; closed after the
+    # generated fixes are planned below.
+    probe = _RepositoryProbe(repo, root)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
-        scan = kcc_declarations_via_broker(repo)
+        scan = kcc_declarations_via_broker(repo, probe.broker())
         kcc_prebuilt = scan.declarations
         if scan.truncated:
             log(
@@ -13663,7 +13723,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     # A fix `finish` can derive is written rather than refused, but only once
     # the run is past the refusal, so a refused run leaves no file behind.
-    probe = _RepositoryProbe(repo, root)
     try:
         planned, answered = plan_generated_fixes(
             findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id
@@ -14398,7 +14457,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # nothing, so it plays no part in `silent_ok`.
         # A pull request this run closed as stale is not still open, though
         # the listing taken before the close says so.
-        "prs_still_open": [url for url in still_open_pr_urls(pr_by_finding, prs_opened) if url not in prs_closed],
+        "prs_still_open": [
+            url
+            for url in still_open_pr_urls(pr_by_finding, prs_opened, carrying_prs(remediation_prs, findings))
+            if url not in prs_closed
+        ],
         "prs_closed": prs_closed,
         # The `[SILENT]` verdict, computed rather than re-derived.
         #

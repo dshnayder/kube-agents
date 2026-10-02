@@ -190,7 +190,8 @@ no other controller's pods in the dump. Where the model left a declared finding 
 PodDisruptionBudget the obtainability SOP prescribes from it, `maxUnavailable: 1` in a new file
 beside the declaration, rather than refusing. It writes nothing for an empty or unusable selector,
 a name the namespace or repository already uses, a path that holds a file, a declaration inside a
-Kustomize root, or a finding a pull request already carries.
+Kustomize root, or a finding another pull request already carries; its own open pull request, on
+the branch the generated file names, gets the file written again for the sweep to find.
 
 ### 3.3 Resolution — `still_flagged_ids`, `collector_held_entries`
 

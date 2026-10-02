@@ -27,10 +27,10 @@
 # provisioning/ (a `declares:` note there is §4a declared intent and silences
 # the finding), must be the only file declaring into seeded-reliability (two
 # directories send the SOP's fallback search to `manual`), and must sit in a
-# repository nothing reconciles. In content mode the collector copies the
-# repository's YAML out of the broker and attaches `declaration` from that
-# copy; where it cannot copy all of it, it attaches none and the agent falls
-# back to the SOP's `audit_report.py grep`.
+# repository nothing reconciles. In content mode a declaration needs the
+# collector to copy the repository's YAML out of the broker and index that
+# copy (#2233); without it no candidate carries `declaration` there, nothing
+# is refused or generated, and the case stays red on a content-mode install.
 #
 # REPETITIONS 2 AND 3 share repetition 1's repository and meet its OPEN pull
 # request on the same branch (group_branch_for keys on the path set). The

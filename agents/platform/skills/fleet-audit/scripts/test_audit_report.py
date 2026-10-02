@@ -15387,6 +15387,76 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(self.generate()[0], expected)
                 self.assertEqual(module.Workspace.open.call_count, 1)
 
+    def test_two_clusters_each_get_their_own_budget_of_one_name(self):
+        """A PodDisruptionBudget's name is unique per namespace per cluster, and
+        another cluster's tree declaring it is no collision."""
+        manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[]), _ran("c2", "no-pdb", candidates=[])]}
+        findings = []
+        for index, cluster in enumerate(("c1", "c2")):
+            candidate = {**_cand("no-pdb", cluster, "Deployment/api", namespace="web"), "severity": "major"}
+            candidate.update(
+                {
+                    "declaration": {"path": f"clusters/{cluster}/web/deploy.yaml", "directory": f"clusters/{cluster}/web"},
+                    "pod_selector": self.SELECTOR,
+                }
+            )
+            manifest["clusters"][index]["candidates"].append(candidate)
+            finding = _pub(f"api-{cluster}", "no-pdb", cluster, "Deployment/api", namespace="web")
+            finding["severity"] = "major"
+            finding["remediation"] = {"kind": "manual", "note": ""}
+            findings.append(finding)
+        (self.workspace / "clusters/c2/web").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "clusters/c2/web/old.yaml").write_text("metadata:\n  name: api-pdb\n")
+        (self.workspace / "clusters/c3/web").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "clusters/c3/web/pdb.yaml").write_text("metadata:\n  name: api-pdb\n")
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            planned, _ = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+        # c1 is planned despite c3 declaring the name; c2's own tree has it.
+        self.assertEqual(sorted(planned), ["api-c1"])
+        self.assertIn("clusters/c2/ already names an object api-pdb", err.getvalue())
+
+    def test_the_name_search_matches_a_declared_name_and_nothing_else(self):
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        cases = {
+            "metadata:\n  name: a-pdb\n": True,
+            "metadata:\n  name: \"a-pdb\"  # budget\n": True,
+            "metadata:\n  labels:\n    app.kubernetes.io/name: a-pdb\n": False,
+            "metadata:\n  name: a-pdb-canary\n": False,
+            "# name: a-pdb\n": False,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.unclone()
+                self.workspace.mkdir(parents=True)
+                (self.workspace / "x.yaml").write_text(text)
+                probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+                self.assertIs(probe.mentions("a-pdb"), expected)
+
+    def test_an_unreadable_file_answers_every_name_search(self):
+        (self.workspace / "x.yaml").write_text("metadata:\n  name: other\n")
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        original = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "x.yaml":
+                raise OSError("unreadable")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertTrue(probe.mentions("a-pdb"))
+        self.assertTrue(probe.mentions("b-pdb"))
+
+    def test_the_config_connector_scan_reuses_the_probes_broker_session(self):
+        session = mock.MagicMock()
+        session.grep.return_value = {"matches": [], "total": 0, "truncated": False}
+        module = mock.MagicMock()
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            audit_report.kcc_declarations_via_broker("acme/fleet", session)
+        module.Workspace.open.assert_not_called()
+        session.grep.assert_called_once()
+
     def test_two_fixes_never_take_one_file_or_one_name(self):
         manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[])]}
         findings = []
@@ -15489,6 +15559,29 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             ),
             {},
         )
+
+    def test_a_declared_manual_fix_a_pull_request_carries_is_answered_on_any_cleared_check(self):
+        """A person closing the pull request is an answer too; refusing on
+        every later run would make the worker decline it forever."""
+        check = "unbound-sa-automount"
+        for name, fields in {
+            "open": {"state": "OPEN"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            with self.subTest(name):
+                carrying = {**fields, "headRefName": "x", "body": audit_report.delta_block(["a"])}
+                self.assertEqual(
+                    self.unwritten([self.manual(check=check)], self.manifest(check=check), prs=[carrying]), {}
+                )
+        self.assertIn("a", self.unwritten([self.manual(check=check)], self.manifest(check=check)))
+
+    def test_prs_still_open_names_a_pull_request_that_answers_a_manual_finding(self):
+        finding = {"id": "a"}
+        carrying = {"state": "OPEN", "url": "https://x/pull/9", "body": audit_report.delta_block(["a"])}
+        closed = {"state": "CLOSED", "url": "https://x/pull/8", "body": audit_report.delta_block(["a"])}
+        other = {"state": "OPEN", "url": "https://x/pull/7", "body": audit_report.delta_block(["b"])}
+        prs = audit_report.carrying_prs([carrying, closed, other], [finding])
+        self.assertEqual(audit_report.still_open_pr_urls({}, [], prs), ["https://x/pull/9"])
 
     def test_a_promised_fix_a_pull_request_already_answers_is_not_refused(self):
         """Joined on the branch the promised path names, as the sweep joins it:
@@ -19537,10 +19630,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run
-    partial, and the line now covers both causes. And `AUTO_PROMOTION_FLOOR`
-    moving from `critical` to `major` promotes the `major` manifest finding in
-    `two_findings`, so the findings path and the dry run each open a second
-    pull request (the recorded reply gives both the same URL). And the JSON
+    partial, and the line now covers both causes. The `major` sweep opens a
+    `major` manifest only on `MAJOR_SWEEP_CHECKS`, and `two_findings`' `major`
+    finding is on none of them, so no transcript gains a pull request. And the JSON
     line carries `prs_still_open`, the remediation pull requests already open
     on findings the run still carries, empty in every scenario here. Nothing
     else moved.
