@@ -288,10 +288,12 @@ KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomiz
 # block scalar, a comment, the next line), a `? kind` key, and a JSON
 # `"kind":` that ends its line, match whatever the value. Flow and JSON forms
 # with the value on the line can put `kind` anywhere, so they match there.
-# What it misses is either what an indented CRD block looks like line by line
-# (a whole document indented, a flow mapping spread over indented lines) or
-# rarer still: a flow `kind` with a tag or anchor, a merge key, an escaped
-# scalar, and line breaks git does not split on (a bare CR, NEL, U+2028).
+# It over-charges a flow or JSON CRD `names:` block (`{kind: Application, …}`)
+# it cannot tell from a flow release. It misses an indented release document
+# beside a column-0 one (a file with no column-0 `kind` at all is caught by
+# COLUMN_ZERO_KIND_PATTERN), and rarer still: a flow `kind` with a tag or
+# anchor, a merge key, an escaped scalar, and line breaks git does not split
+# on (a bare CR, NEL, U+2028). A file the broker sent is parsed instead.
 # Written for both ERE and Python's `re` (with `re.MULTILINE`): no POSIX
 # classes, a literal tab.
 RELEASE_KIND_ALTERNATION = "(" + "|".join(
@@ -316,11 +318,17 @@ RELEASE_DECLARING_PATTERN = "|".join(
         ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
     ]
 )
-# Matches any line of text. The broker's `git grep -I` skips a file git
-# treats as binary (a `binary` or `-diff` attribute) and answers "no match",
-# so a file that matches no release kind is searched for this too: no line at
-# all means the search never read it.
-ANY_LINE_PATTERN = "."
+# A column-0 `kind` key of any value. A CRD bundle has one on every document
+# (`kind: CustomResourceDefinition`), so a withheld file with none at all is
+# not that case: written indented or as JSON, it counts as declaring. A file
+# git treats as binary (a `binary` or `-diff` attribute) answers "no match"
+# to `git grep -I` too, so a search that never read the file lands here.
+COLUMN_ZERO_KIND_PATTERN = _LINE_START + _KIND_KEY + "[ \t]*:"
+# What `release_declarations` reads, as a document's own `kind`; a Secret
+# counts only with the cluster-registration label.
+RELEASE_KINDS = frozenset(
+    {ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND}
+)
 # The broker's per-file limit, named in the WARNING for a `tooLarge` file so
 # whoever reads it knows which knob returns the file to the mirror.
 BROKER_MAX_FILE_BYTES_ENV = "CREDENTIAL_PROXY_WORKSPACE_MAX_FILE_BYTES"
@@ -8917,7 +8925,9 @@ def _may_declare_release(workspace, path: str) -> bool:
     try:
         if int(found.get("total", 1)) > 0:
             return True
-        probe = workspace.grep(ANY_LINE_PATTERN, prefix=path, regex=True)
+        # A file with no column-0 `kind` could hold an indented release the
+        # search above cannot see, or was never read at all.
+        probe = workspace.grep(COLUMN_ZERO_KIND_PATTERN, prefix=path, regex=True)
         return not isinstance(probe, dict) or int(probe.get("total", 0)) == 0
     except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
         return True
@@ -8928,10 +8938,30 @@ def _sent_file_declares_release(path: str, content: bytes) -> bool:
 
     A withheld file under `clusters/<c>/` drops that whole tree from the mirror,
     and the dropped files the broker sent may hold an Application for another
-    cluster, an AppProject, or a Kustomization an Application renders."""
+    cluster, an AppProject, or a Kustomization an Application renders. Its
+    bytes are here, so it is read the way `release_declarations` reads it; the
+    search stands in only where PyYAML is absent or the file does not parse."""
     if Path(path).name in KUSTOMIZATION_FILE_NAMES:
         return True
-    return re.search(RELEASE_DECLARING_PATTERN.encode(), content, re.MULTILINE) is not None
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence falls back to the search
+
+        docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
+    except Exception:  # noqa: BLE001 -- unparseable or no PyYAML: search instead
+        return re.search(RELEASE_DECLARING_PATTERN.encode(), content, re.MULTILINE) is not None
+    for doc in docs:
+        # A `kind` that is not a string names no release, and `str` of an
+        # aliased tree of lists would expand it.
+        kind = doc.get("kind") if isinstance(doc, dict) else None
+        if not isinstance(kind, str):
+            continue
+        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
+        if kind in RELEASE_KINDS or (
+            kind == "Secret" and labels.get(ARGOCD_CLUSTER_SECRET_LABEL) == ARGOCD_CLUSTER_SECRET_VALUE
+        ):
+            return True
+    return False
 
 
 def _batches(
@@ -8986,8 +9016,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     anywhere and target any cluster: no candidate then carries
     `release_declaration` or `namespace_directory`. A symlink and a
     Kustomization file always could; a `tooLarge` file could unless the
-    broker's search reads it and finds none of the kinds the release index
-    reads (`_may_declare_release`), and the rest of its cluster's tree, which
+    broker's search reads it, finds none of the kinds the release index reads,
+    and finds a column-0 `kind` (`_may_declare_release`), and the rest of its
+    cluster's tree, which
     goes with it, holds none either. The other clusters keep their `declaration`, and
     each withheld file is logged with what it cost.
 
@@ -9120,11 +9151,12 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     clusters = {_cluster_tree(path) for path in withheld} - {None}
     # A cluster's tree goes with the file withheld from it, so whatever release
     # the rest of that tree held is lost too, and the file is charged for it.
-    releasing_trees = {
-        _cluster_tree(path)
-        for path, content in files.items()
-        if _cluster_tree(path) in clusters and _sent_file_declares_release(path, content)
-    }
+    releasing_trees: set[str | None] = set()
+    for path, content in files.items():
+        tree = _cluster_tree(path)
+        # Parsed, so a tree already charged is not read again.
+        if tree in clusters and tree not in releasing_trees and _sent_file_declares_release(path, content):
+            releasing_trees.add(tree)
     releasing |= {path for path in withheld if _cluster_tree(path) in releasing_trees}
     for path, reason in sorted(withheld.items()):
         region = _cluster_tree(path)

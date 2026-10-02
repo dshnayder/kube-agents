@@ -9839,7 +9839,7 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertFalse(withheld)
         self.assertEqual(
             [pattern for pattern, _prefix, _regex in broker.greps],
-            [collect.RELEASE_DECLARING_PATTERN, collect.ANY_LINE_PATTERN],
+            [collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN],
         )
 
     # A CRD bundle names release kinds under `spec.names`, indented; a release
@@ -9863,13 +9863,15 @@ class TestBrokerMirror(unittest.TestCase):
           names: {kind: ApplicationSet, listKind: ApplicationSetList}
         """
     )
+    # The search's over-charge: a flow `names:` block reads as a flow release.
+    FLOW_CRD = "kind: CustomResourceDefinition\nspec:\n  names: {kind: Application, listKind: ApplicationList}\n"
     DECLARING = {
         "block": "kind: Application\n",
         "quoted-crlf": "'kind': \"HelmRelease\"\r\n",
         "commented": "kind: AppProject  # the hub's\n",
         "flow": "{apiVersion: v1, kind: HelmRepository, metadata: {name: x}}\n",
         "json": '{\n  "apiVersion": "argoproj.io/v1alpha1",\n  "kind": "Application"\n}\n',
-        "secret": "metadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
+        "secret": "kind: Secret\nmetadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
         "bom": "\ufeffkind: Application\n",
         "next-line": "kind:\n  Application\n",
         "next-line-crlf": "kind:\r\n  Application\r\n",
@@ -9880,42 +9882,101 @@ class TestBrokerMirror(unittest.TestCase):
         "json-next-line": '{\n  "kind":\n    "Application"\n}\n',
         "comment-then-next-line": "kind: # the hub's\n  Application\n",
     }
-    # Each reads line by line as an indented CRD block does, so the search
-    # lets them through; `release_declarations` would read every one.
     # A schema's `kind` property is no document's `kind`.
     SCHEMA = '{\n  "properties": {\n    "kind": {\n      "type": "string"\n    },\n    "items": {"kind": [1]}\n  }\n}\n'
-    MISSED = {
-        "indented": "  apiVersion: argoproj.io/v1alpha1\n  kind: Application\n",
+    # Each reads line by line as an indented CRD block does, so the release
+    # search lets them through; with no column-0 `kind` beside them the
+    # withheld-file probe still charges them, and a sent file is parsed.
+    INDENTED = {
+        "indented": "  apiVersion: argoproj.io/v1alpha1\n  kind: AppProject\n",
         "flow-spread": "{\n  kind: Application,\n}\n",
     }
+    # The miss that remains: an indented release beside a column-0 document.
+    MIXED = "kind: ConfigMap\n---\n  kind: Application\n  metadata: {name: x}\n"
 
     def test_the_release_search_tells_a_release_from_a_crd_that_names_one(self):
-        """Over both readers: the broker's `git grep -E`, line by line, and
-        `_sent_file_declares_release` over a whole sent file."""
+        """The broker's `git grep -E` runs line by line over a withheld file;
+        a sent file is parsed, as `release_declarations` reads it."""
+        # name: (text, the release search matches, a sent file declares)
         cases = {
-            **{name: (text, True) for name, text in self.DECLARING.items()},
-            **{name: (text, False) for name, text in self.MISSED.items()},
-            "crd": (self.CRD_BUNDLE, False),
-            "schema": (self.SCHEMA, False),
+            **{name: (text, True, True) for name, text in self.DECLARING.items()},
+            **{name: (text, False, True) for name, text in self.INDENTED.items()},
+            "mixed": (self.MIXED, False, True),
+            "crd": (self.CRD_BUNDLE, False, False),
+            "flow-crd": (self.FLOW_CRD, True, False),
+            "schema": (self.SCHEMA, False, False),
         }
-        for name, (text, declares) in cases.items():
+        for name, (text, searched, sent) in cases.items():
             with self.subTest(name):
-                self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), declares)
+                self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), sent)
                 self.assertIs(
                     any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.split("\n")),
-                    declares,
+                    searched,
                 )
         if shutil.which("git") is None:
             self.skipTest("git is not available")
         with TemporaryDirectory() as tmp:
-            for name, (text, _) in cases.items():
+            for name, (text, _, _) in cases.items():
                 (Path(tmp) / f"{name}.yaml").write_bytes(text.encode())
             subprocess.run(["git", "init", "-q", tmp], check=True)
-            found = subprocess.run(
-                ["git", "-C", tmp, "grep", "--no-index", "-I", "-l", "-E", "-e", collect.RELEASE_DECLARING_PATTERN],
-                capture_output=True, text=True, check=False,
-            )
-        self.assertEqual(sorted(found.stdout.split()), sorted(f"{name}.yaml" for name in self.DECLARING))
+            found = {
+                pattern: subprocess.run(
+                    ["git", "-C", tmp, "grep", "--no-index", "-I", "-l", "-E", "-e", pattern],
+                    capture_output=True, text=True, check=False,
+                ).stdout.split()
+                for pattern in (collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN)
+            }
+        self.assertEqual(
+            sorted(found[collect.RELEASE_DECLARING_PATTERN]),
+            sorted(f"{name}.yaml" for name, (_, searched, _) in cases.items() if searched),
+        )
+        # Every file but the indented ones has a column-0 `kind`.
+        self.assertEqual(
+            sorted(set(f"{name}.yaml" for name in cases) - set(found[collect.COLUMN_ZERO_KIND_PATTERN])),
+            sorted(f"{name}.yaml" for name in [*self.INDENTED, "schema", "json", "json-next-line", "flow", "complex-key"]),
+        )
+
+    def test_a_sent_file_the_parser_cannot_read_falls_back_to_the_search(self):
+        not_yaml = b"kind: Application\n: : [\n"
+        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", not_yaml))
+        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"kind: ConfigMap\n: : [\n"))
+        with patch.dict("sys.modules", {"yaml": None}):
+            self.assertTrue(collect._sent_file_declares_release("a/b.yaml", b"kind: Application\n"))
+            self.assertFalse(collect._sent_file_declares_release("a/b.yaml", self.CRD_BUNDLE.encode()))
+
+    def test_a_sent_file_is_read_as_the_release_index_reads_it(self):
+        """Invalid UTF-8 decodes with replacement, as `release_declarations`
+        reads it; a Secret counts only as a cluster registration."""
+        latin1 = b"# caf\xe9\n" + self.MIXED.encode()
+        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", latin1))
+        repository = self.DECLARING["secret"].replace(": cluster", ": repository")
+        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", repository.encode()))
+        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"a: &a [1, 1]\nkind: *a\n"))
+
+    def test_an_indented_release_in_a_dropped_tree_withholds_the_release_index(self):
+        files = {**self.two_clusters(), "clusters/other/apps/projects.yaml": self.MIXED.encode()}
+        broker = _FakeBrokerWorkspace(
+            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+        self.assertTrue(withheld)
+
+    def test_a_large_indented_release_withholds_the_release_index(self):
+        """No column-0 `kind` at all: not a CRD bundle, so not ruled out."""
+        for name, text in self.INDENTED.items():
+            with self.subTest(name):
+                big = "bootstrap/projects.yaml"
+                broker = _FakeBrokerWorkspace(
+                    {**self.two_clusters(), big: text.encode()},
+                    refuse={big: collect.BROKER_SKIP_TOO_LARGE},
+                )
+                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+                self.assertTrue(withheld)
+                self.assertIn("release_declaration", err.getvalue())
 
     def test_a_large_crd_bundle_keeps_the_release_index(self):
         """What `flux bootstrap` commits under `clusters/<c>/flux-system/`,
