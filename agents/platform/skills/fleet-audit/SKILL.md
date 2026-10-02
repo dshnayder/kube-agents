@@ -224,7 +224,7 @@ says what the check _is_ and what counts as a violation, so read the whole file 
 
 `workspace` is where your manifests go. **Every `remediation.path` is resolved against it**, so a
 manifest written anywhere else is a file the harness will never find — the finding degrades to a
-manual one and no pull request opens. `start` scrubs that directory before handing it to you;
+manual one, or, for a fix the sweep would open, `finish` refuses until it is there. `start` scrubs that directory before handing it to you;
 `finish` does not, which is what lets the files you write in between survive.
 
 `mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
@@ -355,7 +355,8 @@ All three exit 2 in directory mode, where the clone already holds the file.
   --audit <audit-id> \
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
-  [--manifest-file <path> | --no-collector-manifest "<why>"]
+  [--manifest-file <path> | --no-collector-manifest "<why>"] \
+  [--decline-fix <finding-id> "<why>" ...]
 ```
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
@@ -419,7 +420,8 @@ document failed a field rule, the file named by `--findings-file` is missing or 
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
 empty path, `--no-collector-manifest` was given a blank reason, a collector stream was given
-neither, or, on a run `start` opened, a fix the sweep would open is neither written nor declined (see
+neither, a `--decline-fix` named a fix the refusal did not list, or, on a run `start` opened, a fix
+the sweep would open is neither written nor declined (see
 "Write every `manifest` remediation file" below). A manifest that finished before
 this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting

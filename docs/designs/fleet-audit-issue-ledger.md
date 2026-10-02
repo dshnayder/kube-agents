@@ -587,6 +587,10 @@ ledger that a fix was named but not written, and the report publishes. Killing a
 security report because one of the nine manifests was not written is the wrong shape of failure: it
 throws away eight findings to punish one.
 
+The refusal below does not contradict that: it publishes nothing _yet_, and the worker that wrote
+the document is still there to answer it by writing the file or declining it with a reason, so no
+finding is thrown away. Outside a run `start` opened, nothing answers it, and the degrade stands.
+
 On a run `start` opened, `finish` refuses before that degrade can publish when a finding the sweep
 would open has no fix written: a promised file that is missing, or a `manual` remediation on a
 finding the collector clears for the `major` sweep whose candidate carries a `declaration`. It exits
