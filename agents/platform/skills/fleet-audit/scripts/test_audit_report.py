@@ -15422,6 +15422,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         cases = {
             "metadata:\n  name: a-pdb\n": True,
             "metadata:\n  name: \"a-pdb\"  # budget\n": True,
+            "metadata:\r\n  name: a-pdb\r\n": True,
+            "metadata: {name: a-pdb, namespace: web}\n": True,
             "metadata:\n  labels:\n    app.kubernetes.io/name: a-pdb\n": False,
             "metadata:\n  name: a-pdb-canary\n": False,
             "# name: a-pdb\n": False,
@@ -15447,6 +15449,21 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         with mock.patch.object(Path, "read_text", read_text):
             self.assertTrue(probe.mentions("a-pdb"))
         self.assertTrue(probe.mentions("b-pdb"))
+
+    def test_the_broker_is_asked_for_a_cluster_tree_without_a_trailing_slash(self):
+        """`validate_path` refuses an empty segment, and a refused search
+        reads as a collision."""
+        inner = mock.MagicMock()
+        inner.grep.return_value = {"total": 0}
+        session = mock.MagicMock()
+        session.__enter__.return_value = inner
+        module = mock.MagicMock()
+        module.Workspace.open.return_value = session
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            self.assertFalse(probe.mentions("a-pdb", "clusters/c1/"))
+        self.assertEqual(inner.grep.call_args.kwargs["prefix"], "clusters/c1")
 
     def test_the_config_connector_scan_reuses_the_probes_broker_session(self):
         session = mock.MagicMock()

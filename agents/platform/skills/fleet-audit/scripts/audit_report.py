@@ -51,6 +51,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import copy
 import fcntl
@@ -1103,10 +1104,21 @@ GIT_DIR_NAME = ".git"
 # What marks a directory as a Kustomize root, as the collector reads it: a
 # new file in one renders only if its `resources:` lists it.
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
-# A YAML line whose `name:` key is one name, as both Python's `re` (with
-# `re.M`) and the broker's `git grep -E` read it: the key at any indent or
-# after a `-`, the value bare or quoted, nothing after it but a comment.
-PDB_NAME_LINE = "^[ \t-]*name:[ \t]*['\"]?{name}['\"]?[ \t]*(#.*)?$"
+# A YAML `name:` key holding one name, as both Python's `re` (with `re.M`)
+# and the broker's `git grep -E` read it: at any indent, after a `-`, or
+# inside a flow mapping, the value bare or quoted.
+PDB_NAME_LINE = (
+    "(^[ \t-]*|[{,][ \t]*)name:[ \t]*['\"]?{name}['\"]?[ \t]*"
+    # Then a flow mapping's next key, a comment, or the end of the line --
+    # past a CRLF line's CR, which the broker will not take in a pattern.
+    "([,}#]|[^A-Za-z0-9.-]?$)"
+)
+# Where the name goes in PDB_NAME_LINE; replaced rather than formatted, since
+# the pattern's own braces are flow-mapping characters.
+PDB_NAME_SLOT = "{name}"
+# How many times one `finish` tries to open the broker for its repository
+# questions: the Config Connector scan, then planning.
+PROBE_OPEN_ATTEMPTS = 2
 # The GitOps layout's per-cluster tree, `clusters/<name>/`, as the collector
 # reads it: a PDB name collides only inside its own cluster's tree.
 CLUSTER_TREE_ROOT = "clusters"
@@ -4080,6 +4092,10 @@ def add_dns_access_command(text: str) -> str:
     lines = text.split("\n")
     head = "\n".join(lines[: last + 1] + block)
     if len(head) > MAX_COMMAND_CHARS:
+        log(
+            "WARNING: the DNS-endpoint command does not fit before the published "
+            f"note's {MAX_COMMAND_CHARS}-character limit; the note publishes without it"
+        )
         return text
     return "\n".join(lines[: last + 1] + block + lines[last + 1 :]).rstrip("\n")
 
@@ -11139,13 +11155,18 @@ class _RepositoryProbe:
         self._workspace = None
         # Why the broker could not be asked, once it could not.
         self.unavailable = ""
+        self._attempts = 0
         # The clone's YAML, read once for every `mentions` in directory mode,
         # and whether any of it could not be read, which answers every search.
         self._texts: list[tuple[str, str]] | None = None
         self._unreadable = False
 
     def broker(self):
-        if self._workspace is None and not self.unavailable:
+        # Asked twice at most: once for the Config Connector scan and once
+        # more at planning, so one refused open does not end generation.
+        if self._workspace is None and self._attempts < PROBE_OPEN_ATTEMPTS:
+            self._attempts += 1
+            self.unavailable = ""
             try:
                 import credential_proxy_client  # noqa: PLC0415 -- the content-mode client
 
@@ -11180,7 +11201,7 @@ class _RepositoryProbe:
         could not be read answers yes."""
         # The names reaching here are DNS-1123, so a dot is the one character
         # either regex dialect would read as more than itself.
-        expression = PDB_NAME_LINE.format(name=name.replace(".", r"\."))
+        expression = PDB_NAME_LINE.replace(PDB_NAME_SLOT, name.replace(".", r"\."))
         if not content_mode():
             if self._texts is None:
                 self._texts = []
@@ -11201,15 +11222,17 @@ class _RepositoryProbe:
         if workspace is None:
             return True
         try:
-            found = workspace.grep(expression, prefix=prefix or None, regex=True)
+            # The broker refuses a path with an empty segment, so no trailing slash.
+            found = workspace.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
         except Exception:  # noqa: BLE001 -- an unanswered search cannot rule it out
             return True
         return not isinstance(found, dict) or int(found.get("total", 1)) > 0
 
     def close(self) -> None:
-        if self._session is not None:
+        session, self._session, self._workspace = self._session, None, None
+        if session is not None:
             try:
-                self._session.__exit__(None, None, None)
+                session.__exit__(None, None, None)
             except Exception:  # noqa: BLE001 -- closing a lease is best effort
                 pass
 
@@ -11572,8 +11595,9 @@ def unwritten_sweep_fixes(
     degraded fix the path it promised names the branch, and any pull request
     there that the harness did not close as stale -- open, merged, or closed by
     a person -- leaves it out, as it would leave the sweep. A declared `manual`
-    fix has no path to join on at all, so a pull request already carrying it is
-    invisible here; the refusal tells the worker what to do about that.
+    fix has no path to join on, so it is joined on the pull request's delta
+    block instead, by the same rule; the generated check is left to
+    `plan_generated_fixes`, which tells its own pull request from another.
     """
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
@@ -13519,6 +13543,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # One broker session for the run's repository questions; closed after the
     # generated fixes are planned below.
     probe = _RepositoryProbe(repo, root)
+    # Closed after planning below, and at exit if anything between raises, so
+    # a failed `finish` does not hold a broker slot until the idle reclaim.
+    atexit.register(probe.close)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
         scan = kcc_declarations_via_broker(repo, probe.broker())
         kcc_prebuilt = scan.declarations
