@@ -9955,7 +9955,9 @@ def open_remediation_pr(
             # The forge refuses a second pull request from one branch. One is
             # already open there when an earlier run created it and then failed
             # to label it: unlabelled, the listing above never finds it, and
-            # without this every later run is refused the same way. Adopt it.
+            # without this every later run is refused the same way. Adopt it --
+            # but only one this install opened: a person who opened their own
+            # pull request from the branch wrote its title and description.
             existing = open_proposal_on(repo, branch)
             if existing is None:
                 raise
@@ -9983,12 +9985,22 @@ def open_remediation_pr(
 
 
 def open_proposal_on(repo: str, branch: str) -> dict | None:
-    """The open pull request from `branch`, labelled or not; None if none."""
+    """The open pull request this install opened from `branch`; None if none.
+
+    Labelled or not. One a person opened is not returned, and neither is any
+    when the forge cannot say who this install is: adopting rewrites the title
+    and body, and those are not this harness's to overwrite on a guess.
+    """
+    viewer = viewer_login(repo)
+    if not viewer:
+        return None
     answer = try_forge(
         "proposal-list", repo, {"source": branch, "state": "open", "limit": 1}
     )
     found = [
-        pr_record(p) for p in (answer or {}).get("proposals") or [] if isinstance(p, dict)
+        pr_record(p)
+        for p in (answer or {}).get("proposals") or []
+        if isinstance(p, dict) and _login_key(str(p.get("author") or "")) == _login_key(viewer)
     ]
     return found[0] if found else None
 
@@ -11886,6 +11898,16 @@ def handle_finish(args: argparse.Namespace) -> None:
         # to hold: a tick landing in that window would otherwise pass `start`
         # and unlink the very document about to be resubmitted.
         raise
+    except Exception as exc:
+        # A lost broker that reached here raw is the same outage `forge`
+        # names, and keeps the note for the re-run the skill prescribes.
+        if broker_lost(exc):
+            raise BrokerUnavailable(
+                f"the broker at {proxy_endpoint()} did not answer: {exc}. "
+                "Check the credential-proxy pod and re-run `finish`."
+            ) from exc
+        release_in_flight(audit_id)
+        raise
     except BaseException:
         # A `finish` that died on a forge call or anything else is over; the
         # retry loads the document afresh, and the SOP's next `start --repo B`
@@ -13263,6 +13285,16 @@ def main(argv: list[str] | None = None) -> int:
         log(f"FATAL: subprocess failed with exit code {exc.returncode}")
         return 1
     except Exception as exc:  # noqa: BLE001 — one actionable line beats a traceback in cron logs
+        if broker_lost(exc):
+            # Any command's own broker calls -- `fetch`, `list` and `grep` open
+            # the content workspace directly -- surface a lost broker raw. The
+            # skill promises this line from any command, not from the ones
+            # that happen to wrap their calls.
+            log(
+                f"BROKER UNAVAILABLE: the broker at {proxy_endpoint()} did not answer: "
+                f"{exc}. Check the credential-proxy pod and re-run this command."
+            )
+            return 2
         log(f"FATAL: {exc}")
         return 1
     return 0

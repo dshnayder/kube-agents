@@ -739,6 +739,8 @@ def neutral_proposal(record):
         "body": record.get("body", ""),
         "labels": [label["name"] for label in record.get("labels") or []],
         "closed": record.get("closedAt") or record.get("mergedAt"),
+        # The broker strips an App's `[bot]`; a fixture names a person's login.
+        "author": record.get("author", "kube-agents-bot"),
     }
 
 
@@ -9211,6 +9213,18 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertTrue(any(call.get("title") for call in refresh))
         self.assertIn("agent:audit", self.label_values("labelsAdd"))
 
+    def test_a_pr_a_person_opened_on_the_branch_is_not_adopted(self):
+        # Review finding: adoption rewrote the title and body of whatever was
+        # open on the branch, including a pull request someone opened by hand.
+        self.harness.failures = {"proposal-create": 1}
+        theirs = dict(pr(8, self.branch), author="alice")
+        self.harness.replies = {
+            f"proposal-list source={self.branch}": proposals_view([theirs]),
+        }
+        with self.assertRaises(audit_report.ForgeError):
+            self.open_it()
+        self.assertEqual(self.harness.forge_calls("proposal-update", number=8), [])
+
     def test_a_refused_create_with_no_pr_on_the_branch_still_fails(self):
         self.harness.failures = {"proposal-create": 1}
         with self.assertRaises(audit_report.ForgeError):
@@ -13715,6 +13729,27 @@ class ContentModeTestCase(BaseTestCase):
                 with patch.object(credential_proxy_client.Workspace, "open", dropped):
                     self.assertEqual(self.run_finish(make_doc()), 2)
                 self.assertIn("BROKER UNAVAILABLE:", self.err)
+                self.assertNotIn("FATAL", self.err)
+
+    def test_a_broker_lost_under_a_read_command_is_the_same_refusal(self):
+        """Review finding: `fetch`, `list` and `grep` open the workspace
+        themselves, so a lost broker there exited 1 `FATAL`."""
+        import http.client
+
+        self.start()
+
+        def dropped(*_args, **_kwargs):
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        for argv in (
+            ["fetch", "--audit", AUDIT, "--path", "README.md"],
+            ["list", "--audit", AUDIT],
+            ["grep", "--audit", AUDIT, "--pattern", "seed"],
+        ):
+            with self.subTest(argv[0]):
+                with patch.object(credential_proxy_client.Workspace, "open", dropped):
+                    self.assertEqual(self.run_main(argv), 2)
+                self.assertIn("BROKER UNAVAILABLE: the broker at", self.err)
                 self.assertNotIn("FATAL", self.err)
 
     def test_a_refresh_the_broker_refused_is_not_called_an_outage(self):

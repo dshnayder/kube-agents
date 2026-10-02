@@ -319,7 +319,7 @@ Pass `--manifest-file`: it is what lets `finish` check the document against what
 - `CLEAN` with `resolved: > 0` → the fleet converged. Report the issue URL and how many drifts closed with it: a fleet that came back into line is worth a sentence, and it is the only good news this audit has to give.
 - `CLEAN` with `partial: true` → nothing diverged among the clusters you could compare, and the ledger stayed open because that is not the whole fleet. One line with the result, the `coverage_gaps`, and the issue URL.
 - `OPENED`, or `UPDATED` with a non-zero `new` or `resolved` → one line naming the audit, the `new` and `resolved` counts, the ledger issue URL, and anything in `prs_opened` / `prs_closed`.
-- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. Never work around a validation error by deleting the finding that triggered it.
+- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Never work around a validation error by deleting the finding that triggered it.
 
 ---
 
