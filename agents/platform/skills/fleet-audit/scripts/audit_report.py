@@ -8980,7 +8980,15 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
     this module's callers free of the client's exception type, which is only
     importable where the scripts directory is (the module comment on
     `sys.path`).
+
+    A broker that did not answer at all -- the connection refused, or broken
+    mid-answer -- raises `BrokerUnavailable` instead, wherever in the command it
+    happens: the same outage met at the refresh step, and owed the same exit
+    and the same note, not a `FATAL` because it landed five seconds later.
     """
+    import urllib.error
+
+    import credential_proxy_client
     import vcs_client
 
     number = payload.get("number")
@@ -8991,6 +8999,12 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
         code = f" [{exc.code}]" if exc.code else ""
         detail = f": {exc.detail}" if exc.detail else ""
         log(f"FAILED: forge {verb} {repo}{code}: {exc}{detail}")
+        lost = (urllib.error.URLError, credential_proxy_client.BrokerDisconnected)
+        if not exc.code and isinstance(exc.__cause__, lost):
+            raise BrokerUnavailable(
+                f"{verb} on {repo}: {exc} This sandbox has no other way to publish; "
+                "check the credential-proxy pod and re-run this command."
+            ) from exc
         raise ForgeError(f"{verb} on {repo} failed{code}: {exc}{detail}") from exc
 
 

@@ -13587,6 +13587,43 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("START REFUSED:", self.err)
 
+    def test_a_broker_lost_after_the_refresh_is_the_same_refusal(self):
+        """Review finding: a broker that went away after the refresh reached
+        `finish` as a forge failure, exited 1 `FATAL` and released the note,
+        the opposite of the same outage caught at the refresh."""
+        import urllib.error
+
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        answer = self.harness.forge
+
+        def unreachable(verb, payload, repository=None):
+            if verb.startswith("issue-") and verb not in ("issue-list", "issue-view"):
+                try:
+                    raise urllib.error.URLError("[Errno 111] Connection refused")
+                except urllib.error.URLError as exc:
+                    raise vcs_client.VcsError(
+                        "the broker at http://127.0.0.1:8765 could not be reached: "
+                        "[Errno 111] Connection refused. Retry shortly."
+                    ) from exc
+            return answer(verb, payload, repository=repository)
+
+        self.harness.forge = unreachable
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertIn("the broker at http://127.0.0.1:8765", self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_forge_refusal_from_a_broker_that_answered_stays_a_forge_error(self):
+        # Only a broker that did not answer is the outage; a refusal it sent is
+        # still the forge's, with the code it carried.
+        self.harness.failures = {"issue-create": 1}
+        with self.assertRaises(audit_report.ForgeError):
+            audit_report.forge("issue-create", "acme/fleet", {"title": "t"})
+
 
 # --------------------------------------------------------------------------- #
 # The collector manifest — docs/designs/fleet-audit-collector-manifest.md
