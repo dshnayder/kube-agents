@@ -9870,17 +9870,39 @@ class TestBrokerMirror(unittest.TestCase):
         "flow": "{apiVersion: v1, kind: HelmRepository, metadata: {name: x}}\n",
         "json": '{\n  "apiVersion": "argoproj.io/v1alpha1",\n  "kind": "Application"\n}\n',
         "secret": "metadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
+        "bom": "\ufeffkind: Application\n",
+        "next-line": "kind:\n  Application\n",
+        "next-line-crlf": "kind:\r\n  Application\r\n",
+        "tagged": "kind: !!str Application\n",
+        "alias": "kind: *k\n",
+        "folded": "kind: >-\n  Application\n",
+        "complex-key": "? kind\n: Application\n",
+        "json-next-line": '{\n  "kind":\n    "Application"\n}\n',
+        "comment-then-next-line": "kind: # the hub's\n  Application\n",
+    }
+    # Each reads line by line as an indented CRD block does, so the search
+    # lets them through; `release_declarations` would read every one.
+    # A schema's `kind` property is no document's `kind`.
+    SCHEMA = '{\n  "properties": {\n    "kind": {\n      "type": "string"\n    },\n    "items": {"kind": [1]}\n  }\n}\n'
+    MISSED = {
+        "indented": "  apiVersion: argoproj.io/v1alpha1\n  kind: Application\n",
+        "flow-spread": "{\n  kind: Application,\n}\n",
     }
 
     def test_the_release_search_tells_a_release_from_a_crd_that_names_one(self):
         """Over both readers: the broker's `git grep -E`, line by line, and
         `_sent_file_declares_release` over a whole sent file."""
-        cases = {**{name: (text, True) for name, text in self.DECLARING.items()}, "crd": (self.CRD_BUNDLE, False)}
+        cases = {
+            **{name: (text, True) for name, text in self.DECLARING.items()},
+            **{name: (text, False) for name, text in self.MISSED.items()},
+            "crd": (self.CRD_BUNDLE, False),
+            "schema": (self.SCHEMA, False),
+        }
         for name, (text, declares) in cases.items():
             with self.subTest(name):
                 self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), declares)
                 self.assertIs(
-                    any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.splitlines()),
+                    any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.split("\n")),
                     declares,
                 )
         if shutil.which("git") is None:

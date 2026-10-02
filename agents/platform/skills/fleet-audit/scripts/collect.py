@@ -283,23 +283,36 @@ KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomiz
 # cannot hide a release, so it costs only its cluster's tree. A release is a
 # document's own `kind`, so a block-style one sits at column 0, and a CRD
 # bundle's `spec.names.kind: Application` (Argo CD's `install.yaml`, Flux's
-# `gotk-components.yaml`) is indented and does not match; a flow-style or JSON
-# document can put its `kind` anywhere on a line, so those two forms match
-# wherever they are. Written for both ERE and Python's `re` (with
-# `re.MULTILINE`), so no POSIX classes, and the tab is a literal tab.
+# `gotk-components.yaml`) is indented and does not match. A column-0 `kind`
+# whose value this cannot read on its line (a tag, an anchor, an alias, a
+# block scalar, a comment, the next line), a `? kind` key, and a JSON
+# `"kind":` that ends its line, match whatever the value. Flow and JSON forms
+# with the value on the line can put `kind` anywhere, so they match there.
+# What it misses is either what an indented CRD block looks like line by line
+# (a whole document indented, a flow mapping spread over indented lines) or
+# rarer still: a flow `kind` with a tag or anchor, a merge key, an escaped
+# scalar, and line breaks git does not split on (a bare CR, NEL, U+2028).
+# Written for both ERE and Python's `re` (with `re.MULTILINE`): no POSIX
+# classes, a literal tab.
 RELEASE_KIND_ALTERNATION = "(" + "|".join(
     [ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND]
 ) + ")"
 _OPTIONAL_QUOTE = "['\"]?"
-_KIND_VALUE = (
-    _OPTIONAL_QUOTE + "kind" + _OPTIONAL_QUOTE + "[ \t]*:[ \t]*"
-    + _OPTIONAL_QUOTE + RELEASE_KIND_ALTERNATION + "([^A-Za-z0-9]|$)"
-)
+_LINE_START = "^(\ufeff)?"
+_KIND_KEY = _OPTIONAL_QUOTE + "kind" + _OPTIONAL_QUOTE
+_KIND_VALUE = _KIND_KEY + "[ \t]*:[ \t]*" + _OPTIONAL_QUOTE + RELEASE_KIND_ALTERNATION + "([^A-Za-z0-9]|$)"
+# Nothing on the line but a CRLF line's CR, which the broker will not take
+# in a pattern; excluding what starts a value keeps out `kind: {` and the
+# `"kind": {` of every JSON schema.
+_LINE_END = "[^{A-Za-z0-9\"'[]?$"
+_KIND_VALUE_ELSEWHERE = _KIND_KEY + "[ \t]*:[ \t]*([!&*|>#]|" + _LINE_END + ")"
 RELEASE_DECLARING_PATTERN = "|".join(
     [
-        "^" + _KIND_VALUE,
+        _LINE_START + _KIND_VALUE,
+        _LINE_START + _KIND_VALUE_ELSEWHERE,
+        _LINE_START + "\\?[ \t]*" + _KIND_KEY + "([^A-Za-z0-9]|$)",
         "[{,][ \t]*" + _KIND_VALUE,
-        '"kind"[ \t]*:[ \t]*"' + RELEASE_KIND_ALTERNATION + '"',
+        '"kind"[ \t]*:[ \t]*("' + RELEASE_KIND_ALTERNATION + '"|' + _LINE_END + ")",
         ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
     ]
 )
