@@ -1963,7 +1963,7 @@ class CollaborationTest(unittest.TestCase):
         # A label that proposals share -- every remediation pull request carries
         # its audit's label -- can fill the first page with proposals alone.
         # Reading that page as "no issues" is how a second ledger gets opened.
-        prs = [{"number": n, "pull_request": {"url": "..."}} for n in (9, 8)]
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
         broker, recorder = self.broker(prs, [{"number": 3, "title": "the ledger"}])
         answer = broker.issue_list(
             {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
@@ -1977,14 +1977,25 @@ class CollaborationTest(unittest.TestCase):
         # Review finding: the forge ran out on a short second page with exactly
         # `limit` issues read, and that was reported as a page with more behind
         # it, which a verb that takes no page cannot act on.
-        broker, _ = self.broker(
-            [{"number": 9, "pull_request": {"url": "..."}}, {"number": 8}], [{"number": 3}]
-        )
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 101, -1)]
+        broker, _ = self.broker(prs + [{"number": 8}], [{"number": 3}])
         answer = broker.issue_list(
             {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
         )
         self.assertEqual([i["number"] for i in answer["issues"]], [8, 3])
         self.assertFalse(answer["truncated"])
+
+    def test_issue_list_reaches_as_far_for_a_small_limit(self):
+        # Review finding: the scan read pages of `limit`, so a small limit
+        # reached ten times itself past the proposals and no further. Pages are
+        # read full-sized and cut to the limit afterwards.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
+        broker, recorder = self.broker(prs, [{"number": 3}, {"number": 2}])
+        answer = broker.issue_list({"repository": "acme/infra", "labels": ["audit:a1"], "limit": 1})
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertTrue(answer["truncated"])
+        for call in recorder.calls:
+            self.assertIn("per_page=100", urllib.parse.unquote(call[4]))
 
     def test_a_conversation_is_read_past_one_page(self):
         # A long-lived ledger passes a hundred comments; the markers that stop
@@ -2024,8 +2035,9 @@ class CollaborationTest(unittest.TestCase):
         self.assertTrue(answer["commentsTruncated"])
 
     def test_a_listing_says_when_it_is_a_page(self):
-        broker, _ = self.broker([{"number": n} for n in range(3)])
+        broker, _ = self.broker([{"number": n} for n in range(4)])
         answer = broker.issue_list({"repository": "acme/infra", "limit": 3})
+        self.assertEqual(answer["count"], 3)
         self.assertTrue(answer["truncated"])
 
     def test_issue_view_refuses_a_proposal_number(self):

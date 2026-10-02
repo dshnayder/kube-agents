@@ -577,17 +577,20 @@ class GitHubForge(Forge):
         the page is fetched, so a label proposals share can fill a whole page
         with nothing to return. Reading that page as the answer is how a caller
         concludes an issue it is looking for does not exist, so this reads on
-        until it has `limit` issues or the forge runs out, within a bound.
+        until it has `limit` issues or the forge runs out, within a bound. The
+        pages are full-sized whatever `limit` is, so that bound reaches as far
+        for a caller asking for five as for one asking for a hundred.
 
         Truncated when the last page read was full (the forge may hold more)
         or more than `limit` issues survived. A short last page means the forge
         ran out, so `limit` issues read there is the whole answer.
         """
         issues: list[dict] = []
+        query = {**params, "per_page": MAX_PAGE_SIZE}
         for page in range(1, MAX_ISSUE_PAGES + 1):
-            nodes = api("GET", f"repos/{repo}/issues", params={**params, "page": page}) or []
+            nodes = api("GET", f"repos/{repo}/issues", params={**query, "page": page}) or []
             issues += [node for node in nodes if "pull_request" not in node]
-            full = len(nodes) >= limit
+            full = len(nodes) >= MAX_PAGE_SIZE
             if len(issues) >= limit or not full:
                 break
         return issues, full or len(issues) > limit
