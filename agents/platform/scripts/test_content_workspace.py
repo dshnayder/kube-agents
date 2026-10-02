@@ -1832,6 +1832,16 @@ class GrepTest(unittest.TestCase):
         self.assertEqual(2, self.store.grep(handle, "kind: S.rvice", regex=True)["total"])
         self.assertEqual(2, self.store.grep(handle, "KIND: SERVICE", ignore_case=True)["total"])
 
+    def test_a_prefix_is_a_path_rather_than_a_pattern(self):
+        # Unquoted, `[prod]-crds.yaml` is a glob matching `p-crds.yaml` and
+        # not itself, so a search of that one file would answer "no match".
+        (self.tree / "[prod]-crds.yaml").write_text("kind: Service\n")
+        (self.tree / "p-crds.yaml").write_text("kind: Service\n")
+        real_git_runner(["git", "add", "-A"], self.tree)
+        real_git_runner(["git", "commit", "-m", "glob"], self.tree)
+        answer = self.store.grep(self.workspace.handle, "kind: Service", "[prod]-crds.yaml")
+        self.assertEqual(["[prod]-crds.yaml"], [m["path"] for m in answer["matches"]])
+
     def test_a_search_that_hit_the_ceiling_does_not_look_complete(self):
         handle = self.workspace.handle
         with mock.patch.object(content_workspace, "max_matches", lambda: 1):

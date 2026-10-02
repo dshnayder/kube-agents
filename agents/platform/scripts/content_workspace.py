@@ -1363,7 +1363,9 @@ class ContentWorkspaceStore:
         with self._use(handle) as workspace:
             # -I skips binary files, -n numbers the lines, -z puts a NUL after
             # the name so a file whose name carries a colon cannot be misread.
-            argv = ["grep", "--no-color", "-I", "-n", "-z"]
+            # `--literal-pathspecs`, as for `commit`, so a prefix whose name
+            # holds a glob character is that path rather than a pattern.
+            argv = ["--literal-pathspecs", "grep", "--no-color", "-I", "-n", "-z"]
             argv.append("-E" if regex else "-F")
             if ignore_case:
                 argv.append("-i")

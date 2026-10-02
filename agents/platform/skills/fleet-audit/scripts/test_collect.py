@@ -13,6 +13,8 @@ import io
 import json
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -9839,6 +9841,73 @@ class TestBrokerMirror(unittest.TestCase):
             [pattern for pattern, _prefix, _regex in broker.greps],
             [collect.RELEASE_DECLARING_PATTERN, collect.ANY_LINE_PATTERN],
         )
+
+    # A CRD bundle names release kinds under `spec.names`, indented; a release
+    # is a document's own `kind`.
+    CRD_BUNDLE = textwrap.dedent(
+        """\
+        apiVersion: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        spec:
+          names:
+            kind: HelmRelease
+            listKind: HelmReleaseList
+          versions:
+          - schema:
+              openAPIV3Schema:
+                properties:
+                  kind: {type: string}
+        ---
+        kind: CustomResourceDefinition
+        spec:
+          names: {kind: ApplicationSet, listKind: ApplicationSetList}
+        """
+    )
+    DECLARING = {
+        "block": "kind: Application\n",
+        "quoted-crlf": "'kind': \"HelmRelease\"\r\n",
+        "commented": "kind: AppProject  # the hub's\n",
+        "flow": "{apiVersion: v1, kind: HelmRepository, metadata: {name: x}}\n",
+        "json": '{\n  "apiVersion": "argoproj.io/v1alpha1",\n  "kind": "Application"\n}\n',
+        "secret": "metadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
+    }
+
+    def test_the_release_search_tells_a_release_from_a_crd_that_names_one(self):
+        """Over both readers: the broker's `git grep -E`, line by line, and
+        `_sent_file_declares_release` over a whole sent file."""
+        cases = {**{name: (text, True) for name, text in self.DECLARING.items()}, "crd": (self.CRD_BUNDLE, False)}
+        for name, (text, declares) in cases.items():
+            with self.subTest(name):
+                self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), declares)
+                self.assertIs(
+                    any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.splitlines()),
+                    declares,
+                )
+        if shutil.which("git") is None:
+            self.skipTest("git is not available")
+        with TemporaryDirectory() as tmp:
+            for name, (text, _) in cases.items():
+                (Path(tmp) / f"{name}.yaml").write_bytes(text.encode())
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            found = subprocess.run(
+                ["git", "-C", tmp, "grep", "--no-index", "-I", "-l", "-E", "-e", collect.RELEASE_DECLARING_PATTERN],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(sorted(found.stdout.split()), sorted(f"{name}.yaml" for name in self.DECLARING))
+
+    def test_a_large_crd_bundle_keeps_the_release_index(self):
+        """What `flux bootstrap` commits under `clusters/<c>/flux-system/`,
+        over the broker's per-file limit."""
+        bundle = "clusters/other/flux-system/gotk-components.yaml"
+        broker = _FakeBrokerWorkspace(
+            {**self.two_clusters(), bundle: self.CRD_BUNDLE.encode()},
+            refuse={bundle: collect.BROKER_SKIP_TOO_LARGE},
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+        self.assertNotIn("release_declaration", err.getvalue())
+        self.assertFalse(withheld)
 
     def test_a_dropped_tree_names_its_cluster_to_the_namespace_index(self):
         """With `clusters/other/` gone, an overlay elsewhere rendering into

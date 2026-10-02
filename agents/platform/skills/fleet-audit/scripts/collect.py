@@ -280,14 +280,26 @@ RENDERER_KUSTOMIZE = "kustomize"
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 # What `release_declarations` reads, as a `git grep -E` expression the broker
 # runs over one withheld file: a `tooLarge` file that names none of these
-# cannot hide a release, so it costs only its cluster's tree. Written out
-# rather than `re.escape`d, which escapes `-` in a way ERE does not need.
+# cannot hide a release, so it costs only its cluster's tree. A release is a
+# document's own `kind`, so a block-style one sits at column 0, and a CRD
+# bundle's `spec.names.kind: Application` (Argo CD's `install.yaml`, Flux's
+# `gotk-components.yaml`) is indented and does not match; a flow-style or JSON
+# document can put its `kind` anywhere on a line, so those two forms match
+# wherever they are. Written for both ERE and Python's `re` (with
+# `re.MULTILINE`), so no POSIX classes, and the tab is a literal tab.
+RELEASE_KIND_ALTERNATION = "(" + "|".join(
+    [ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND]
+) + ")"
+_OPTIONAL_QUOTE = "['\"]?"
+_KIND_VALUE = (
+    _OPTIONAL_QUOTE + "kind" + _OPTIONAL_QUOTE + "[ \t]*:[ \t]*"
+    + _OPTIONAL_QUOTE + RELEASE_KIND_ALTERNATION + "([^A-Za-z0-9]|$)"
+)
 RELEASE_DECLARING_PATTERN = "|".join(
     [
-        ARGOCD_APPLICATION_KIND,
-        FLUX_HELM_RELEASE_KIND,
-        FLUX_HELM_REPOSITORY_KIND,
-        ARGOCD_APPPROJECT_KIND,
+        "^" + _KIND_VALUE,
+        "[{,][ \t]*" + _KIND_VALUE,
+        '"kind"[ \t]*:[ \t]*"' + RELEASE_KIND_ALTERNATION + '"',
         ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
     ]
 )
@@ -8906,7 +8918,7 @@ def _sent_file_declares_release(path: str, content: bytes) -> bool:
     cluster, an AppProject, or a Kustomization an Application renders."""
     if Path(path).name in KUSTOMIZATION_FILE_NAMES:
         return True
-    return re.search(RELEASE_DECLARING_PATTERN.encode(), content) is not None
+    return re.search(RELEASE_DECLARING_PATTERN.encode(), content, re.MULTILINE) is not None
 
 
 def _batches(
