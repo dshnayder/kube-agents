@@ -487,7 +487,10 @@ GCLOUD_ENUM_FLAG_CHOICES: dict[str, tuple[str, ...]] = {
 # `--flag=value` and `--flag value` are both valid gcloud, and the drift stream
 # emits both in the same report, so the rewrite has to see each.
 _GCLOUD_ENUM_FLAG_RE = re.compile(
-    r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>[A-Za-z0-9_-]+)"
+    # A value never starts with `-`: after a valueless flag (`--quiet`,
+    # `--enable-autoupgrade`) the next token is a flag, and consuming it as the
+    # value would hide the enum flag behind it from the rewrite.
+    r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>(?!-)[A-Za-z0-9_-]+)"
 )
 
 # A flag is present when it stands as its own token: the boundary stops
@@ -608,10 +611,17 @@ DNS_ENDPOINT_MARKER = "dnsEndpointConfig.allowExternalTraffic=true"
 # the separator directly, so an already-correct `--format 'json(a,b)'` does not
 # match and is left alone rather than double-quoted.
 _GCLOUD_FORMAT_PROJECTIONS = ("value", "json", "table", "csv", "yaml", "flattened")
+# Transforms nest parentheses inside the projection -- `value(zone.basename())`,
+# `table(name,nodePools[].name.list())` -- so the group admits two levels of
+# nesting; a quote anywhere inside still refuses the match.
+_GCLOUD_PROJECTION_BODY = r"\((?:[^()'\"]|\((?:[^()'\"]|\([^()'\"]*\))*\))*\)"
 _GCLOUD_BARE_FORMAT_RE = re.compile(
-    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)\([^)'\"]*\))"
-    % "|".join(_GCLOUD_FORMAT_PROJECTIONS)
+    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)%s)"
+    % ("|".join(_GCLOUD_FORMAT_PROJECTIONS), _GCLOUD_PROJECTION_BODY)
 )
+# An apostrophe between two word characters is English ("the cluster's
+# channel"), not a shell quote, so the quote-parity test discounts it.
+_WORD_APOSTROPHE_RE = re.compile(r"(?<=\w)'(?=\w)")
 
 # The `recommendation` fields that carry a command a reader pastes. `rationale`
 # is argument, never a command, so it is not rewritten.
@@ -3826,11 +3836,18 @@ def quote_gcloud_format_projections(text: str) -> str:
         # Inside a single-quoted wrapper -- `bash -c '... --format=value(x)'`
         # -- the `(` is already quoted, and a quote added there closes the
         # wrapper instead.
-        line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+        # The logical line, not the physical one: a wrapper opened on a line
+        # that ends `\` is still open on the continuation.
+        lines = text[: match.start()].split("\n")
+        first = len(lines) - 1
+        while first > 0 and lines[first - 1].rstrip().endswith("\\"):
+            first -= 1
+        line = "\n".join(lines[first:])
         # Inside an inline code span, only the span is shell: an apostrophe in
         # the prose before it ("the cluster's channel") is not a quote.
         if line.count("`") % 2:
             line = line[line.rfind("`") + 1 :]
+        line = _WORD_APOSTROPHE_RE.sub("", line)
         if (line.count('"') - line.count('\\"')) % 2 or line.count("'") % 2:
             return match.group(0)
         return f"{match.group('flag')}{match.group('sep')}'{match.group('proj')}'"
@@ -3979,7 +3996,36 @@ def _parse_update_target(command: str) -> tuple[str, str, str] | None:
 
 
 def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] | None:
-    """`(name, location, project)` from a `clusters update` command in `text`.
+    """`(name, location, project)` from a `clusters update` command in `text`."""
+    found = _cluster_update_command(text, prefer)
+    return found[0] if found else None
+
+
+def _command_mentions_flag(text: str, flag: str) -> bool:
+    """Whether a gcloud command in `text` carries `flag`, as `append_gcloud_flag` reads one.
+
+    A backticked span that is a command, or a whole logical line that is one
+    with its `#` comment removed: a sentence or a comment naming the flag does
+    not close anything.
+    """
+    lines = text.split("\n")
+    for first, last, _joined in _logical_command_spans(lines):
+        for span in INLINE_CODE_SPAN.findall("\n".join(lines[first : last + 1])):
+            if _is_gcloud_command(span) and _mentions_flag(span, flag):
+                return True
+        code = [_comment_free(line) for line in lines[first : last + 1]]
+        joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
+        if _is_gcloud_command(joined) and _mentions_flag(joined, flag):
+            return True
+    return False
+
+
+def _cluster_update_command(text: str, prefer: str = "") -> tuple[tuple[str, str, str], int] | None:
+    """`((name, location, project), last)` for a `clusters update` command in `text`.
+
+    `last` is the physical line the command ends on. Each line is read without
+    its `#` comment, as `append_gcloud_flag` reads it: an apostrophe or a
+    `--zone` in a comment is not part of the command.
 
     Read off the command the model already wrote rather than passed in, so a
     second command built from it names the same cluster by construction,
@@ -3990,7 +4036,8 @@ def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] 
     the last, which is the note's final word on which cluster it is about.
     """
     fallback = None
-    for _first, _last, joined in reversed(_logical_command_spans(text.split("\n"))):
+    code = [_comment_free(line) for line in text.split("\n")]
+    for _first, last, joined in reversed(_logical_command_spans(code)):
         # The same `$ ` prompt `_is_gcloud_command` allows, or the flag repair
         # extends a command this one cannot find.
         joined = joined.strip().removeprefix(SHELL_PROMPT)
@@ -4000,8 +4047,8 @@ def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] 
         if target is None:
             continue
         if prefer and _mentions_flag(joined, prefer):
-            return target
-        fallback = fallback or target
+            return target, last
+        fallback = fallback or (target, last)
     return fallback
 
 
@@ -4013,18 +4060,28 @@ def add_dns_access_command(text: str) -> str:
     incomplete repair a reader can see beats a command this module guessed the
     arguments for.
     """
-    if not text or _mentions_flag(text, DNS_ACCESS_FLAG):
+    if not text or _command_mentions_flag(text, DNS_ACCESS_FLAG):
         return text
-    target = _cluster_update_target(text, prefer=AUTHORIZED_NETWORKS_FLAG)
-    if target is None:
+    found = _cluster_update_command(text, prefer=AUTHORIZED_NETWORKS_FLAG)
+    if found is None:
         return text
-    name, location, project = target
-    return text.rstrip("\n") + (
-        "\n" + DNS_ACCESS_COMMENT.format(location=location) + "\n"
+    (name, location, project), last = found
+    block = [
+        DNS_ACCESS_COMMENT.format(location=location),
         f"{CLUSTERS_UPDATE_PREFIX} {name} {GCLOUD_LOCATION_FLAG}={location} "
         + (f"{GCLOUD_PROJECT_FLAG}={project} " if project else "")
-        + DNS_ACCESS_FLAG
-    )
+        + DNS_ACCESS_FLAG,
+    ]
+    # Straight after the command it is named off, not at the end: a `gcloud`
+    # note renders through `trim_command`, which clips from the end, so prose
+    # after the first command is what goes before the second one does. Where
+    # even that cannot keep it whole, the note is left as the model wrote it
+    # rather than published with a command cut mid-flag.
+    lines = text.split("\n")
+    head = "\n".join(lines[: last + 1] + block)
+    if len(head) > MAX_COMMAND_CHARS:
+        return text
+    return "\n".join(lines[: last + 1] + block + lines[last + 1 :]).rstrip("\n")
 
 
 def repair_public_control_plane_commands(finding: dict) -> None:

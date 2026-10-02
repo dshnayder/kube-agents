@@ -18823,6 +18823,14 @@ class TestGcloudEnumCasing(unittest.TestCase):
     def normalise(self, note):
         return audit_report.normalise_gcloud_enum_values(note)
 
+    def test_an_enum_flag_after_a_valueless_flag_is_corrected(self):
+        # The valueless flag's "value" used to swallow `--release-channel`, and
+        # the substitution resumed past it.
+        self.assertEqual(
+            self.normalise("gcloud container clusters update c --enable-autoupgrade --release-channel=REGULAR"),
+            "gcloud container clusters update c --enable-autoupgrade --release-channel=regular",
+        )
+
     def test_the_live_defect_is_corrected(self):
         # 2026-09-01 fleet-consistency-drift read `.releaseChannel.channel=RAPID`
         # and shipped `--release-channel=REGULAR`, which gcloud rejects with
@@ -19191,6 +19199,36 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
             out,
         )
 
+    def test_a_comment_on_the_anchored_command_does_not_lose_the_dns_command(self):
+        """The DNS arm reads the command as the IP arm does, without its comment."""
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>  # the owner's CIDRs"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("update c --location=us-east4 --project=p --no-enable-dns-access", out)
+
+    def test_a_location_named_only_in_a_comment_is_not_read(self):
+        note = (
+            "gcloud container clusters update c --project=p --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>  # or --zone=us-east4-a"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+
+    def test_prose_naming_the_dns_flag_does_not_count_as_closing_it(self):
+        note = self.NOTE + "\n# Run --no-enable-dns-access too if the DNS endpoint is open."
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("--project=adamparco-kage --no-enable-dns-access", out)
+
+    def test_a_long_note_keeps_the_dns_command_whole_when_rendered(self):
+        """`trim_command` clips from the end, so the second command goes
+        straight after the first, ahead of the prose that follows it."""
+        prose = "\n".join("# " + "x" * 120 for _ in range(16))
+        out = self.repaired(note=self.NOTE + "\n" + prose, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        rendered = audit_report.trim_command(out)
+        self.assertIn("--project=adamparco-kage --no-enable-dns-access", rendered)
+
     def test_the_flag_goes_before_a_trailing_comment(self):
         note = (
             "gcloud container clusters update c --location=us-east4 --project=p "
@@ -19505,6 +19543,28 @@ class TestGcloudFormatQuoting(unittest.TestCase):
 
     def quote(self, text):
         return audit_report.quote_gcloud_format_projections(text)
+
+    def test_a_projection_with_a_transform_is_quoted_whole(self):
+        for projection in ("value(zone.basename())", "table(name,zone.basename())", "value(a.list().len())"):
+            with self.subTest(projection):
+                self.assertEqual(
+                    self.quote(f"gcloud container clusters describe c --format={projection}"),
+                    f"gcloud container clusters describe c --format='{projection}'",
+                )
+
+    def test_a_possessive_in_bare_prose_is_not_a_quote(self):
+        self.assertEqual(
+            self.quote("Confirm the cluster's channel: gcloud container clusters describe c --format=value(x)"),
+            "Confirm the cluster's channel: gcloud container clusters describe c --format='value(x)'",
+        )
+
+    def test_a_wrapper_continued_onto_the_next_line_is_untouched(self):
+        for note in (
+            "watch 'gcloud container clusters describe c \\\n  --format=value(status)'",
+            'S="$(gcloud container clusters describe c \\\n  --format=value(status))"',
+        ):
+            with self.subTest(note):
+                self.assertEqual(self.quote(note), note)
 
     def test_an_apostrophe_in_the_prose_before_the_span_is_not_a_quote(self):
         self.assertEqual(
