@@ -100,6 +100,13 @@ def test_a_gh_write_is_flagged():
         "gh repo edit --description x",
         "gh workflow run ci.yaml",
         "cd /x && gh issue comment 4 --body hi",
+        "gh api -f title=t repos/acme/infra/issues",
+        "gh api --input body.json repos/acme/infra/issues",
+        "timeout 60 gh pr create --title t --body b",
+        'bash -c "gh pr create --title t --body b"',
+        "URL=$(gh pr create --title t --body b)",
+        "GH_TOKEN=x gh issue comment 4 --body hi",
+        "/opt/credential-proxy/bin/gh pr merge 3",
     ):
         assert _flagged(command), command
 
@@ -128,5 +135,7 @@ def test_the_reads_a_passing_worker_issues_are_not_flagged():
         "gh run list",
         "gh auth status",
         "gh --version",
+        "timeout 60 gh pr list --state all",
+        'git commit -m "gh pr create was not used"',
     ):
         assert not _flagged(command), command

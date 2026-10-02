@@ -83,13 +83,16 @@ verification_spec:
       # method, or with a field or `--input`, which make it POST without `-X`
       # (an explicit `-X GET` keeps it a read, with the fields as a query);
       # a GraphQL query posts its fields too, so there only a mutation counts.
+      # The `gh` patterns open with vcs-spent-branch-reuse's command-position
+      # prefix, so `timeout 60 gh`, `bash -c "gh`, `$(gh`, `VAR=x gh` and a path
+      # to the binary are all `gh`; a field may come before the endpoint.
       # bench/tests/test_vcs_forge_cli_request_patterns.py pins all of it.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
-        - '(^|&&|;|\|)\s*gh\s+(pr|issue|label|release|repo|workflow|run|gist|secret|variable|ruleset|cache|project)\s+(?!(list|view|status|diff|checks)\b)[a-z]'
-        - '(^|&&|;|\|)\s*gh\s+api\b.*\s(-X|--method)[\s=]*(POST|PATCH|PUT|DELETE)\b'
-        - '(^|&&|;|\|)\s*gh\s+api(?!.*\s(-X|--method)[\s=]*GET\b)\s+(?!graphql\b)\S.*\s(-f|-F|--field|--raw-field|--input)\b'
-        - '(^|&&|;|\|)\s*gh\s+api\s+graphql\b.*\bmutation\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+(pr|issue|label|release|repo|workflow|run|gist|secret|variable|ruleset|cache|project)\s+(?!(list|view|status|diff|checks)\b)[a-z]'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\b.*\s(-X|--method)[\s=]*(POST|PATCH|PUT|DELETE)\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\b(?!.*\s(-X|--method)[\s=]*GET\b)(?!\s+graphql\b).*\s(-f|-F|--field|--raw-field|--input)\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\s+graphql\b.*\bmutation\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+(publish|push)\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+(proposal|pr|mr|issue)\s+(create|open|comment|update|edit|close|acknowledge|ack)\b'
         - '(vcs\.py|\$\{?V\}?)"?\s+label\s+(ensure|create)\b'

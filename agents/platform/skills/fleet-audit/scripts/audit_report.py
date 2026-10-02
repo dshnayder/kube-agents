@@ -8971,6 +8971,31 @@ class ForgeError(RuntimeError):
     """The broker refused a forge verb, or could not be reached to ask."""
 
 
+def broker_lost(exc: BaseException) -> bool:
+    """Did the broker not answer at all, rather than answer with a refusal?
+
+    True for a connection refused, timed out or broken mid-answer anywhere in
+    `exc`'s cause chain; False for an HTTP status, which is the broker (or
+    something in front of it) answering. Only the first is the outage
+    `BrokerUnavailable` names: a 403 for an unmanaged repository sent back to
+    "check the pod and re-run" would loop against a healthy broker.
+    """
+    import urllib.error
+
+    import credential_proxy_client
+
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, urllib.error.HTTPError):
+            return False
+        if isinstance(
+            seen, (urllib.error.URLError, credential_proxy_client.BrokerDisconnected)
+        ):
+            return True
+        seen = seen.__cause__
+    return False
+
+
 def forge(verb: str, repo: str, payload: dict) -> dict:
     """One forge verb against `repo`, through the broker. Raises ForgeError.
 
@@ -8986,9 +9011,6 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
     happens: the same outage met at the refresh step, and owed the same exit
     and the same note, not a `FATAL` because it landed five seconds later.
     """
-    import urllib.error
-
-    import credential_proxy_client
     import vcs_client
 
     number = payload.get("number")
@@ -8999,8 +9021,7 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
         code = f" [{exc.code}]" if exc.code else ""
         detail = f": {exc.detail}" if exc.detail else ""
         log(f"FAILED: forge {verb} {repo}{code}: {exc}{detail}")
-        lost = (urllib.error.URLError, credential_proxy_client.BrokerDisconnected)
-        if not exc.code and isinstance(exc.__cause__, lost):
+        if not exc.code and broker_lost(exc):
             raise BrokerUnavailable(
                 f"{verb} on {repo}: {exc} This sandbox has no other way to publish; "
                 "check the credential-proxy pod and re-run this command."
@@ -9253,7 +9274,9 @@ def refresh_credentials(repo: str | None = None) -> None:
     With a broker configured the refresh is a call to it, made before the
     content-mode probe, so a broker that is down fails here first. That is the
     same condition the probe names, and it gets the same refusal rather than a
-    `FATAL` the skill reads as something else having broken.
+    `FATAL` the skill reads as something else having broken. A refresh the
+    broker answered and refused -- a repository not on its managed list is a
+    403 -- is not that condition, and stays the error it is.
     """
     from github_token_refresh import refresh_git_credentials
 
@@ -9264,6 +9287,8 @@ def refresh_credentials(repo: str | None = None) -> None:
     try:
         refresh_git_credentials(repo)
     except Exception as exc:  # noqa: BLE001 — named in the refusal below
+        if not broker_lost(exc):
+            raise
         raise BrokerUnavailable(
             f"the broker at {endpoint} could not refresh repository credentials: {exc}. "
             "This sandbox has no other way to publish; check the credential-proxy pod "
@@ -11522,9 +11547,25 @@ def _open_promoted_prs(
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
                 )
+            except BrokerUnavailable:
+                # The broker is gone, not this group: the next group would fail
+                # the same way, and `main` labels it and `finish` keeps its note,
+                # as for the same outage anywhere else in the command.
+                raise
             except (subprocess.CalledProcessError, ForgeError, ValidationError) as exc:
                 log(f"WARNING: could not publish the fix for {fid}: {exc}")
                 continue
+            except Exception as exc:
+                # The content workspace talks to the broker directly, so its
+                # transport failures arrive unwrapped.
+                if broker_lost(exc):
+                    raise BrokerUnavailable(
+                        f"publishing the fix for {fid} on {repo}: the broker at "
+                        f"{proxy_endpoint()} did not answer: {exc}. This sandbox has "
+                        "no other way to publish; check the credential-proxy pod "
+                        "and re-run this command."
+                    ) from exc
+                raise
             if url:
                 opened.append(url)
     finally:

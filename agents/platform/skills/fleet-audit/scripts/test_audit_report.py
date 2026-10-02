@@ -13549,11 +13549,18 @@ class ContentModeTestCase(BaseTestCase):
         # of the content-mode probe, and this is how it fails on a closed port.
         import github_token_refresh
 
+        import urllib.error
+
         def refused(repo=None, **_):
-            raise RuntimeError(
-                "Credential sidecar failed to refresh GitHub auth: "
-                "<urlopen error [Errno 111] Connection refused>"
-            )
+            # Chained as `refresh_git_credentials` chains it: the cause is
+            # what tells a closed port from a broker that answered.
+            try:
+                raise urllib.error.URLError("[Errno 111] Connection refused")
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "Credential sidecar failed to refresh GitHub auth: "
+                    "<urlopen error [Errno 111] Connection refused>"
+                ) from exc
 
         self.patch_attr("refresh_credentials", _REAL_REFRESH_CREDENTIALS)
         patcher = patch.object(github_token_refresh, "refresh_git_credentials", refused)
@@ -13616,6 +13623,97 @@ class ContentModeTestCase(BaseTestCase):
         self.assertNotIn("FATAL", self.err)
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("START REFUSED:", self.err)
+
+    @staticmethod
+    def lost_broker_error():
+        import urllib.error
+
+        try:
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+        except urllib.error.URLError as exc:
+            try:
+                raise vcs_client.VcsError(
+                    "the broker at http://127.0.0.1:8765 could not be reached: "
+                    "[Errno 111] Connection refused. Retry shortly."
+                ) from exc
+            except vcs_client.VcsError as wrapped:
+                return wrapped
+
+    def test_a_broker_lost_while_opening_the_pull_request_is_not_a_skipped_group(self):
+        """Review finding: the per-group catch took `BrokerUnavailable` for a
+        group that failed to publish, so the run exited 0 having opened none."""
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        answer = self.harness.forge
+
+        def unreachable(verb, payload, repository=None):
+            # The create itself, inside the per-group catch; the listings
+            # before it sit outside and would not exercise that catch.
+            if verb == "proposal-create":
+                raise self.lost_broker_error()
+            return answer(verb, payload, repository=repository)
+
+        self.harness.forge = unreachable
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertNotIn("could not publish the fix", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_broker_lost_under_the_content_workspace_is_the_same_refusal(self):
+        # The workspace talks to the broker itself, so its transport failure
+        # arrives unwrapped rather than as a forge error.
+        import urllib.error
+
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+
+        def closed(*_args, **_kwargs):
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        with patch.object(credential_proxy_client.Workspace, "open", closed):
+            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertNotIn("FATAL", self.err)
+
+    def test_a_refresh_the_broker_refused_is_not_called_an_outage(self):
+        """Review finding: a 403 for an unmanaged repository was reported as
+        the broker being down, sending the worker to re-run against a healthy
+        broker."""
+        import urllib.error
+
+        import github_token_refresh
+
+        def forbidden(repo=None, **_):
+            try:
+                raise urllib.error.HTTPError(
+                    "http://127.0.0.1:8765/v1/github/refresh", 403, "Forbidden", {}, None
+                )
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    "Credential sidecar failed to refresh GitHub auth: HTTP 403"
+                ) from exc
+
+        self.patch_attr("refresh_credentials", _REAL_REFRESH_CREDENTIALS)
+        patcher = patch.object(github_token_refresh, "refresh_git_credentials", forbidden)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertIn("HTTP 403", self.err)
+        self.assertNotIn("BROKER UNAVAILABLE", self.err)
 
     def test_a_forge_refusal_from_a_broker_that_answered_stays_a_forge_error(self):
         # Only a broker that did not answer is the outage; a refusal it sent is

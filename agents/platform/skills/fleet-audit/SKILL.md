@@ -416,7 +416,9 @@ the directory you happen to be standing in, so "the manifest is missing" is a fi
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
-the message names and re-run; never delete the finding that tripped it. What reaches exit 2: the
+the message names and re-run; never delete the finding that tripped it. The one exception is a
+`BROKER UNAVAILABLE` line, below: the broker can go away partway through, so what the command had
+already published stands, and the re-run finishes the rest. What reaches exit 2: the
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
@@ -432,7 +434,8 @@ and nothing to re-run until that run's `finish`. A `BROKER UNAVAILABLE` line, fr
 `the broker at` an address: the credential proxy is down, unreachable, refusing this sandbox's token or
 on an older build, so check the credential-proxy pod and re-run the same command once it answers.
 From `start`, nothing is in flight. From `finish`, the run is still in flight and its document is
-untouched: re-run `finish`, never `start`.
+untouched: re-run `finish`, never `start`. Do not report that nothing reached GitHub: the ledger, a
+label or a pull request may already have landed, and the re-run picks up from them.
 
 ### Partial coverage
 
@@ -1049,7 +1052,9 @@ other targets still open — `/remediate all` expands to every **manifest-remedi
 document, and failing the batch over one unwritten file would answer a request for many fixes with
 none. Say which were refused when you acknowledge the command.
 
-Exit 2 means nothing was published — read the message before reporting why: a named id is not in
+Exit 2 means nothing was published, unless the line is `BROKER UNAVAILABLE`: then a pull request
+opened before the broker went stands, and re-running the same `remediate` once it answers adopts it
+and opens the rest. Otherwise read the message before reporting why: a named id is not in
 the document at all; a named id is held by the collector (given the same `--manifest-file` `finish`
 had, the message says so instead of "not in the document"); a named target is not a `manifest`; or
 _every_ named target was refused because its file is not readable inside the workspace. The first
