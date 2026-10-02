@@ -404,9 +404,12 @@ absent on every other run:
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 - `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding"]}`
-  — zero findings, but the ledger was **not** closed: it carried findings whose checks this run's own
-  `checks_run` says ran again, and the document neither reports nor explains them. Not a clean
-  result; report it as [The clean run](#the-clean-run) says.
+  — zero findings, but the ledger was **not** closed, for one of two reasons. Either it carried
+  findings whose checks this run's own `checks_run` says ran again, and the document neither reports
+  nor explains them (their ids are in `unaccounted`); or `unaccounted` is empty and the issue's
+  comments could not be read, so a `/remediate` may be standing unanswered there (stderr says
+  `comments could not be read`). Not a clean result; report it as
+  [The clean run](#the-clean-run) says.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
@@ -1148,6 +1151,14 @@ releases it. On 2026-09-16 a compliance run closed its ledger as clean over a li
 `checks_run` claimed to have checked; this is the guard that turns that close into a held ledger. A
 check declared `checks_not_applicable` on that cluster did not run there and holds nothing — the
 excuse is published in the evidence table, where a reviewer can weigh it.
+
+**Zero findings over a conversation the run could not read is held too.** If the ledger's comments
+cannot be read — the forge refused, it could not say which login is this install's, or the thread
+is past the read limit — the run cannot tell whether a `/remediate` is waiting there, and closing
+would leave it no thread to be answered on. Nothing is posted, the ledger stays open, and `finish`
+returns `status: "HELD"` with `unaccounted: []`; stderr says `comments could not be read`. There are
+no held ids to report and nothing to re-check in the fleet: say the ledger is held because its
+thread could not be read, and the next run closes it once it can.
 
 A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
 decide it. **`finish` decides it, and returns the answer as `silent_ok`.** Read the flag; do not

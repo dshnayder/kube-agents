@@ -13689,6 +13689,34 @@ class ContentModeTestCase(BaseTestCase):
         self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertNotIn("FATAL", self.err)
 
+    def test_a_broker_dropped_mid_answer_under_the_workspace_is_the_same_refusal(self):
+        """Review finding: a broker evicted after taking the request surfaces
+        from the response read, raw and not as a `URLError`, and exited 1."""
+        import http.client
+
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        for raised in (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            http.client.IncompleteRead(b"{", 120),
+            ConnectionResetError(104, "Connection reset by peer"),
+            TimeoutError("timed out"),
+        ):
+            with self.subTest(type(raised).__name__):
+                def dropped(*_args, raised=raised, **_kwargs):
+                    raise raised
+
+                with patch.object(credential_proxy_client.Workspace, "open", dropped):
+                    self.assertEqual(self.run_finish(make_doc()), 2)
+                self.assertIn("BROKER UNAVAILABLE:", self.err)
+                self.assertNotIn("FATAL", self.err)
+
     def test_a_refresh_the_broker_refused_is_not_called_an_outage(self):
         """Review finding: a 403 for an unmanaged repository was reported as
         the broker being down, sending the worker to re-run against a healthy

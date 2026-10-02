@@ -8976,10 +8976,14 @@ def broker_lost(exc: BaseException) -> bool:
 
     True for a connection refused, timed out or broken mid-answer anywhere in
     `exc`'s cause chain; False for an HTTP status, which is the broker (or
-    something in front of it) answering. Only the first is the outage
+    something in front of it) answering. `urlopen` turns only a failed send
+    into `URLError`: a broker that dies after taking the request surfaces from
+    the response read as `RemoteDisconnected`, `IncompleteRead`, a reset or a
+    read timeout, raw, wherever no client translated it to `BrokerDisconnected`. Only the first is the outage
     `BrokerUnavailable` names: a 403 for an unmanaged repository sent back to
     "check the pod and re-run" would loop against a healthy broker.
     """
+    import http.client
     import urllib.error
 
     import credential_proxy_client
@@ -8989,7 +8993,14 @@ def broker_lost(exc: BaseException) -> bool:
         if isinstance(seen, urllib.error.HTTPError):
             return False
         if isinstance(
-            seen, (urllib.error.URLError, credential_proxy_client.BrokerDisconnected)
+            seen,
+            (
+                urllib.error.URLError,
+                credential_proxy_client.BrokerDisconnected,
+                ConnectionError,
+                TimeoutError,
+                http.client.HTTPException,
+            ),
         ):
             return True
         seen = seen.__cause__

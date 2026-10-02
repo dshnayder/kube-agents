@@ -111,6 +111,25 @@ def test_a_gh_write_is_flagged():
         assert _flagged(command), command
 
 
+def test_a_credentialed_git_is_flagged_in_command_position():
+    # The same command-position grammar as the `gh` patterns beside it.
+    for command in (
+        "git push origin fix",
+        "cd /x && git -C /x fetch",
+        "timeout 60 git push origin fix",
+        "GIT_TERMINAL_PROMPT=0 git clone https://github.com/acme/infra",
+        'bash -c "git ls-remote origin"',
+        "/opt/vcs/bin/git push origin fix",
+    ):
+        assert _flagged(command), command
+    for command in (
+        "git status",
+        "git commit -m 'git push later'",
+        "/opt/vcs/libexec/git push origin fix",
+    ):
+        assert not _flagged(command), command
+
+
 def test_the_reads_a_passing_worker_issues_are_not_flagged():
     for verb in READS:
         for command in (f"python3 {VCS} {verb}", f"$V {verb}"):
