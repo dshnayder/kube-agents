@@ -11059,6 +11059,8 @@ class _RepositoryProbe:
         self._workspace = None
         # Why the broker could not be asked, once it could not.
         self.unavailable = ""
+        # The clone's YAML, read once for every `mentions` in directory mode.
+        self._texts: list[str] | None = None
 
     def _broker(self):
         if self._workspace is None and not self.unavailable:
@@ -11089,16 +11091,17 @@ class _RepositoryProbe:
     def mentions(self, text: str) -> bool:
         """Whether any tracked YAML holds `text`, as a fixed string."""
         if not content_mode():
-            for candidate in self.root.rglob("*"):
-                if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in candidate.relative_to(self.root).parts:
-                    continue
-                if candidate.is_file():
-                    try:
-                        if text in candidate.read_text(encoding="utf-8", errors="replace"):
-                            return True
-                    except OSError:
-                        return True
-            return False
+            if self._texts is None:
+                self._texts = []
+                for candidate in self.root.rglob("*"):
+                    if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in candidate.relative_to(self.root).parts:
+                        continue
+                    if candidate.is_file():
+                        try:
+                            self._texts.append(candidate.read_text(encoding="utf-8", errors="replace"))
+                        except OSError:
+                            self._texts.append(text)
+            return any(text in body for body in self._texts)
         workspace = self._broker()
         if workspace is None:
             return True
@@ -11124,8 +11127,16 @@ def plan_generated_fixes(
     prs: list[dict],
     root: Path,
     probe: "_RepositoryProbe",
-) -> dict[str, tuple[str, str]]:
-    """Finding id to `(path, text)` for each fix `finish` can write itself.
+    audit_id: str = "",
+) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    """`(planned, answered)`: finding id to `(path, text)` for each fix
+    `finish` can write itself, and the ids a pull request already answers.
+
+    A live pull request on the branch the generated file names is this
+    function's own from an earlier run, so the fix is planned again and the
+    sweep finds that pull request rather than a refusal. Any other pull request
+    the harness did not close -- open on another path, merged, or closed by a
+    person -- answers the finding: it is neither written nor refused.
 
     Only `GENERATED_FIX_CHECK`, only an unwritten, declared finding the worker
     did not decline, and only where the new file would render and collide with
@@ -11138,13 +11149,13 @@ def plan_generated_fixes(
     nothing behind.
     """
     candidates = {_candidate_identity(entry, candidate): candidate for entry, candidate in _candidates(manifest)}
-    carried = {
-        fid
-        for pr in prs
-        if not pr_closed_by_harness(pr)
-        for fid in parse_delta_block(pr.get("body"))
-    }
+    carried: dict[str, list[dict]] = {}
+    for pr in prs:
+        if not pr_closed_by_harness(pr):
+            for fid in parse_delta_block(pr.get("body")):
+                carried.setdefault(fid, []).append(pr)
     planned: dict[str, tuple[str, str]] = {}
+    answered: set[str] = set()
     # Two workloads of one name planned into one directory, or into one
     # namespace, would otherwise take the same file or the same object name.
     taken_paths: set[str] = set()
@@ -11152,7 +11163,7 @@ def plan_generated_fixes(
     for finding in findings:
         fid = str(finding.get("id", ""))
         fix = unwritten.get(fid)
-        if fix is None or not fix.declared or fid in declines or fid in carried:
+        if fix is None or not fix.declared or fid in declines:
             continue
         candidate = candidates.get(derive_finding_id(finding)) or {}
         if candidate.get("check") != GENERATED_FIX_CHECK:
@@ -11163,6 +11174,13 @@ def plan_generated_fixes(
         name, text = built
         directory = PurePosixPath(fix.path).parent
         path = str(directory / f"{name}{GENERATED_PDB_EXTENSION}")
+        if fid in carried:
+            own = group_branch_for(audit_id, [{"id": fid, "remediation": {"kind": "manifest", "path": path}}])
+            if not any(
+                str(pr.get("state") or "").upper() == "OPEN" and pr.get("headRefName") == own for pr in carried[fid]
+            ):
+                answered.add(fid)
+                continue
         try:
             target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
         except ValidationError:
@@ -11190,7 +11208,7 @@ def plan_generated_fixes(
         planned[fid] = (path, text)
         taken_paths.add(path)
         taken_names.add((namespace, name))
-    return planned
+    return planned, answered
 
 
 def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
@@ -13647,12 +13665,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # the run is past the refusal, so a refused run leaves no file behind.
     probe = _RepositoryProbe(repo, root)
     try:
-        planned = plan_generated_fixes(findings, manifest, unwritten, declines, remediation_prs, root, probe)
+        planned, answered = plan_generated_fixes(
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id
+        )
     finally:
         probe.close()
     decline_unwritten_fixes(findings, unwritten, declines)
     remaining = {
-        fid: fix for fid, fix in unwritten.items() if fid not in declines and fid not in planned
+        fid: fix
+        for fid, fix in unwritten.items()
+        if fid not in declines and fid not in planned and fid not in answered
     }
     if remaining and has_run_record(audit_id, repo):
         raise ValidationError(unwritten_refusal_message(remaining))
@@ -14374,7 +14396,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # Already open before this run, on findings it still carries. Listed
         # so the report can name the fix that is waiting for review; it moves
         # nothing, so it plays no part in `silent_ok`.
-        "prs_still_open": still_open_pr_urls(pr_by_finding, prs_opened),
+        # A pull request this run closed as stale is not still open, though
+        # the listing taken before the close says so.
+        "prs_still_open": [url for url in still_open_pr_urls(pr_by_finding, prs_opened) if url not in prs_closed],
         "prs_closed": prs_closed,
         # The `[SILENT]` verdict, computed rather than re-derived.
         #

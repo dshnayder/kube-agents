@@ -15264,8 +15264,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            planned = audit_report.plan_generated_fixes(
-                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe
+            planned, self.answered = audit_report.plan_generated_fixes(
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
             )
             probe.close()
             audit_report.write_generated_fixes(findings, planned, self.workspace)
@@ -15330,12 +15330,31 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(finding["remediation"]["kind"], "manual")
                 self.assertIn(said, self.generate_err)
 
-    def test_a_declined_fix_or_one_a_pull_request_carries_is_not_written(self):
+    def test_a_declined_fix_or_one_another_pull_request_carries_is_not_written(self):
         written, _ = self.generate(declines={"a": "a pull request already carries it"})
         self.assertEqual(written, [])
-        carrying = {"state": "OPEN", "body": audit_report.delta_block(["a"]), "headRefName": "x"}
-        written, _ = self.generate(prs=[carrying])
-        self.assertEqual(written, [])
+        for state, fields in {
+            "open on another path": {"state": "OPEN", "headRefName": "x"},
+            "merged": {"state": "MERGED", "headRefName": "x", "mergedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "headRefName": "x", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            with self.subTest(state):
+                carrying = {**fields, "body": audit_report.delta_block(["a"])}
+                written, _ = self.generate(prs=[carrying])
+                self.assertEqual(written, [])
+                # Answered, so `finish` does not refuse over it either.
+                self.assertEqual(self.answered, {"a"})
+
+    def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
+        """The next run's clone no longer holds the file; refusing there would
+        loop, and the sweep reports the live pull request as still open."""
+        own = audit_report.group_branch_for(
+            AUDIT, [{"id": "a", "remediation": {"kind": "manifest", "path": "apps/a/a-pdb.yaml"}}]
+        )
+        carrying = {"state": "OPEN", "headRefName": own, "body": audit_report.delta_block(["a"])}
+        written, finding = self.generate(prs=[carrying])
+        self.assertEqual(written, ["a"])
+        self.assertEqual(self.answered, set())
 
     def test_in_content_mode_a_path_the_broker_lists_or_cannot_answer_is_not_written(self):
         class Listing(list):
@@ -15384,7 +15403,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         unwritten = self.unwritten(findings, manifest)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            planned = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+            planned, _ = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
         self.assertEqual(len(unwritten), 2)
         self.assertEqual(len(planned), 1)
         self.assertIn("another fix this run writes already takes", err.getvalue())
@@ -15409,7 +15428,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         doc["findings"].append(second)
         first_id = declined(doc)[1]
         first_path = doc["findings"][0]["remediation"]["path"]
-        self.patch_attr("plan_generated_fixes", lambda *a, **k: {first_id: (first_path, "# generated\n")})
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({first_id: (first_path, "# generated\n")}, set()))
         self.assertEqual(self.run_finish(doc), 2)
         self.assertIn("ledger-netpol.yaml", self.err)
         self.assertFalse((self.workspace / first_path).exists())
@@ -15422,10 +15441,10 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         doc = make_doc()
         fid = declined(doc)[1]
         path = doc["findings"][0]["remediation"]["path"]
-        self.patch_attr("plan_generated_fixes", lambda *a, **k: {})
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({}, set()))
         self.assertEqual(self.run_finish(doc), 2)
         self.assertFalse((self.workspace / path).exists())
-        self.patch_attr("plan_generated_fixes", lambda *a, **k: {fid: (path, "# generated\n")})
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({fid: (path, "# generated\n")}, set()))
         self.assertEqual(self.run_finish(doc), 0, self.err)
         self.assertEqual((self.workspace / path).read_text(), "# generated\n")
         self.assertIn("GENERATED: " + fid, self.err)
