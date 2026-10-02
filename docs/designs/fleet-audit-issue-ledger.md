@@ -593,7 +593,9 @@ finding the collector clears for the `major` sweep whose candidate carries a `de
 2 naming each, and keeps refusing until each is written or declined by name with a reason
 (`--decline-fix <id> <why>`); a declined fix publishes as `manual` with the reason on its row.
 Refusing once was not enough: a worker re-ran `finish` unchanged and the fix reached the ledger as
-`manual`. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
+`manual`, and refused for good it declined the fix with boilerplate. So a fix `finish` can derive
+it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudget from the
+collector's `pod_selector`, in a new file beside the declaration, unless declined. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the

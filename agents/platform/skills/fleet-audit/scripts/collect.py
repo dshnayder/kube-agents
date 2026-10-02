@@ -915,6 +915,33 @@ def limitranges_by_namespace(dump: dict) -> dict[str, list[dict]]:
     return _by_namespace(dump, "LimitRange")
 
 
+def pod_templates_by_namespace(dump: dict) -> dict[str, list[dict]]:
+    """Every pod template the dump holds, by namespace: `{kind, name, labels}`.
+
+    Unfiltered, unlike `normalize_workloads`: the question it answers is which
+    pods a selector would reach, and a system or opted-out workload's pods are
+    reached all the same. A CronJob's template is its Job template's, and a Job
+    a CronJob owns is left to that CronJob. Bare pods are not in this dump.
+    """
+    out: dict[str, list[dict]] = {}
+    for item in dump.get("items", []) or []:
+        kind = item.get("kind")
+        meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
+        if kind == "CronJob":
+            spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+        elif kind == "Job":
+            if any(ref.get("kind") == "CronJob" for ref in meta.get("ownerReferences") or []):
+                continue
+        elif kind not in WORKLOAD_KINDS:
+            continue
+        labels = ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
+        out.setdefault(meta.get("namespace", ""), []).append(
+            {"kind": kind, "name": meta.get("name", ""), "labels": labels}
+        )
+    return out
+
+
 def pdbs_by_namespace(dump: dict) -> dict[str, list[dict]]:
     return _by_namespace(dump, "PodDisruptionBudget")
 
@@ -1279,6 +1306,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "claims": claims_by_key(dump),
         "limitranges": limitranges_by_namespace(dump),
         "pdbs": pdbs_by_namespace(dump),
+        "pod_templates": pod_templates_by_namespace(dump),
         "hpas": hpas_by_namespace(dump),
         "services": services_by_namespace(dump),
         "cronjobs": cronjobs_with_jobs(dump),
@@ -1601,10 +1629,26 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
         selector = (pdb.get("spec") or {}).get("selector")
         if selector is not None and selector_matches(selector, workload["pod_labels"]):
             return None
-    return {
+    hit = {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"replicas={replicas}, no PodDisruptionBudget matches this workload's pod labels",
+        # The names a new budget must not take in this namespace.
+        "namespace_pdbs": sorted(
+            str((pdb.get("metadata") or {}).get("name") or "") for pdb in context["pdbs"].get(workload["ns"], [])
+        ),
     }
+    # The fix's selector is this one verbatim (SOP §3.3), so `finish` can write
+    # the PodDisruptionBudget when the worker did not -- but only where it
+    # reaches no other controller's pods: a `maxUnavailable` budget over pods
+    # with no scale subresource behind them permits no evictions at all.
+    selector = workload["spec"].get("selector")
+    if isinstance(selector, dict) and not any(
+        (template["kind"], template["name"]) != (workload["kind"], workload["name"])
+        and selector_matches(selector, template["labels"])
+        for template in context.get("pod_templates", {}).get(workload["ns"], [])
+    ):
+        hit["pod_selector"] = selector
+    return hit
 
 
 def _hpa_targeting(workload: dict, context: dict) -> dict | None:
@@ -8270,6 +8314,10 @@ def collect_cluster(
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        if isinstance(hit.get("pod_selector"), dict):
+            emitted["pod_selector"] = hit["pod_selector"]
+        if isinstance(hit.get("namespace_pdbs"), list):
+            emitted["namespace_pdbs"] = hit["namespace_pdbs"]
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
         # without `--workspace`, and the SOP's own grep is still the answer

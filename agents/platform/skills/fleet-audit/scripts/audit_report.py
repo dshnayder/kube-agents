@@ -1078,6 +1078,27 @@ RUN_RECORD_SOURCES_KEY = "sources"
 # finds last week's manifest at the same fixed path and publishes against it.
 # Comparing the manifest's `finished_at` with this is what makes that loud.
 RUN_RECORD_STARTED_KEY = "started_at"
+# The check whose fix `finish` writes itself when the worker left a declared,
+# cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
+# the workload's selector (obtainability SOP §3.3), which the collector reads.
+GENERATED_FIX_CHECK = "no-pdb"
+# The new file `finish` writes beside the workload's declaration.
+GENERATED_PDB_SUFFIX = "-pdb"
+GENERATED_PDB_EXTENSION = ".yaml"
+# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
+KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
+# A clone's own directory, which no search of the repository's files enters.
+GIT_DIR_NAME = ".git"
+# What marks a directory as a Kustomize root, as the collector reads it: a
+# new file in one renders only if its `resources:` lists it.
+KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# The selector keys `policy/v1` takes, and nothing else.
+LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
+# What the finding's ledger row says about a fix `finish` wrote.
+GENERATED_FIX_NOTE = (
+    "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
+    "as the collector read it.)_"
+)
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
@@ -10989,6 +11010,207 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
     return " ".join(parts)
 
 
+def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
+
+    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
+    collector carries as `pod_selector`. None where that cannot be written
+    safely: no selector, an empty one (which would select every pod in the
+    namespace), keys `policy/v1` does not take, or a name Kubernetes refuses.
+    """
+    selector = candidate.get("pod_selector")
+    if not isinstance(selector, dict) or not selector or set(selector) - LABEL_SELECTOR_KEYS:
+        return None
+    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
+        return None
+    workload = str(candidate.get("object") or "").partition("/")[2]
+    name = f"{workload}{GENERATED_PDB_SUFFIX}"
+    namespace = str(candidate.get("namespace") or "")
+    if not (KUBERNETES_NAME_PATTERN.match(name) and KUBERNETES_NAME_PATTERN.match(namespace)):
+        return None
+    # JSON is YAML, so the selector is written exactly as it was read.
+    text = (
+        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
+        f"({finding_id})\n"
+        "apiVersion: policy/v1\n"
+        "kind: PodDisruptionBudget\n"
+        "metadata:\n"
+        f"  name: {name}\n"
+        f"  namespace: {namespace}\n"
+        "spec:\n"
+        "  maxUnavailable: 1\n"
+        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
+    )
+    return name, text
+
+
+class _RepositoryProbe:
+    """What the repository already holds, for the fixes `finish` writes.
+
+    Directory mode reads the clone. Content mode asks the broker over one
+    session for the whole run, and an answer it cannot give -- an error, a
+    truncated listing -- is a yes, so `finish` never writes a file it could not
+    check.
+    """
+
+    def __init__(self, repo: str, root: Path) -> None:
+        self.repo, self.root = repo, root
+        self._session = None
+        self._workspace = None
+        # Why the broker could not be asked, once it could not.
+        self.unavailable = ""
+
+    def _broker(self):
+        if self._workspace is None and not self.unavailable:
+            try:
+                import credential_proxy_client  # noqa: PLC0415 -- the content-mode client
+
+                self._session = credential_proxy_client.Workspace.open(proxy_endpoint(), self.repo)
+                self._workspace = self._session.__enter__()
+            except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
+                self.unavailable = f"{type(exc).__name__}: {exc}"
+                log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
+        return self._workspace
+
+    def has_path(self, path: str) -> bool:
+        if not content_mode():
+            return (self.root / path).exists()
+        workspace = self._broker()
+        if workspace is None:
+            return True
+        try:
+            listing = workspace.list(prefix=path)
+        except Exception:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
+            return True
+        if getattr(listing, "truncated", False):
+            return True
+        return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
+
+    def mentions(self, text: str) -> bool:
+        """Whether any tracked YAML holds `text`, as a fixed string."""
+        if not content_mode():
+            for candidate in self.root.rglob("*"):
+                if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in candidate.relative_to(self.root).parts:
+                    continue
+                if candidate.is_file():
+                    try:
+                        if text in candidate.read_text(encoding="utf-8", errors="replace"):
+                            return True
+                    except OSError:
+                        return True
+            return False
+        workspace = self._broker()
+        if workspace is None:
+            return True
+        try:
+            found = workspace.grep(text)
+        except Exception:  # noqa: BLE001 -- an unanswered search cannot rule it out
+            return True
+        return not isinstance(found, dict) or int(found.get("total", 1)) > 0
+
+    def close(self) -> None:
+        if self._session is not None:
+            try:
+                self._session.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 -- closing a lease is best effort
+                pass
+
+
+def plan_generated_fixes(
+    findings: list[dict],
+    manifest: dict | None,
+    unwritten: dict[str, "UnwrittenFix"],
+    declines: dict[str, str],
+    prs: list[dict],
+    root: Path,
+    probe: "_RepositoryProbe",
+) -> dict[str, tuple[str, str]]:
+    """Finding id to `(path, text)` for each fix `finish` can write itself.
+
+    Only `GENERATED_FIX_CHECK`, only an unwritten, declared finding the worker
+    did not decline, and only where the new file would render and collide with
+    nothing: not inside a Kustomize root (a file its `resources:` does not list
+    renders nothing), not under a name the namespace or the repository already
+    uses, not at a path that holds another file, and not for a finding a pull
+    request already carries. At fleet scale the worker converted a hundred
+    candidates with a script and this was the fix it kept leaving `manual`.
+    Nothing is written here, so a run that is refused for another fix leaves
+    nothing behind.
+    """
+    candidates = {_candidate_identity(entry, candidate): candidate for entry, candidate in _candidates(manifest)}
+    carried = {
+        fid
+        for pr in prs
+        if not pr_closed_by_harness(pr)
+        for fid in parse_delta_block(pr.get("body"))
+    }
+    planned: dict[str, tuple[str, str]] = {}
+    # Two workloads of one name planned into one directory, or into one
+    # namespace, would otherwise take the same file or the same object name.
+    taken_paths: set[str] = set()
+    taken_names: set[tuple[str, str]] = set()
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        fix = unwritten.get(fid)
+        if fix is None or not fix.declared or fid in declines or fid in carried:
+            continue
+        candidate = candidates.get(derive_finding_id(finding)) or {}
+        if candidate.get("check") != GENERATED_FIX_CHECK:
+            continue
+        built = _pdb_manifest(candidate, fid)
+        if built is None:
+            continue
+        name, text = built
+        directory = PurePosixPath(fix.path).parent
+        path = str(directory / f"{name}{GENERATED_PDB_EXTENSION}")
+        try:
+            target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
+        except ValidationError:
+            continue
+        # The same bytes are this run's own earlier write, kept by a `finish`
+        # that failed after it.
+        ours = target.is_file() and target.read_text(encoding="utf-8", errors="replace") == text
+        namespace = str(candidate.get("namespace") or "")
+        reason = None
+        if path in taken_paths or (namespace, name) in taken_names:
+            reason = f"another fix this run writes already takes {path} or the name {name}"
+        elif name in (candidate.get("namespace_pdbs") or []):
+            reason = f"the namespace already has a PodDisruptionBudget named {name}"
+        elif not ours and (target.exists() or probe.has_path(path)):
+            reason = f"{path} already exists"
+        elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
+            reason = f"{directory} is inside a Kustomize root, where a new file renders only if listed"
+        elif not ours and probe.mentions(f"name: {name}"):
+            reason = f"the repository already names an object {name}"
+        if reason and probe.unavailable:
+            reason = f"the repository could not be checked ({probe.unavailable})"
+        if reason:
+            log(f"WARNING: {fid}: `finish` does not write its PodDisruptionBudget: {reason}")
+            continue
+        planned[fid] = (path, text)
+        taken_paths.add(path)
+        taken_names.add((namespace, name))
+    return planned
+
+
+def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
+    """Write each planned fix and make it the finding's `manifest` remediation."""
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in planned:
+            continue
+        path, text = planned[fid]
+        target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        remediation = finding.setdefault("remediation", {})
+        note = str(remediation.get("note", "")).strip()
+        remediation.update(
+            {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
+        )
+        log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
+
+
 def has_run_record(audit_id: str, repo: str | None = None) -> bool:
     """Whether `start` left this stream a run record for `repo`.
 
@@ -13421,10 +13643,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         if findings
         else {}
     )
+    # A fix `finish` can derive is written rather than refused, but only once
+    # the run is past the refusal, so a refused run leaves no file behind.
+    probe = _RepositoryProbe(repo, root)
+    try:
+        planned = plan_generated_fixes(findings, manifest, unwritten, declines, remediation_prs, root, probe)
+    finally:
+        probe.close()
     decline_unwritten_fixes(findings, unwritten, declines)
-    remaining = {fid: fix for fid, fix in unwritten.items() if fid not in declines}
+    remaining = {
+        fid: fix for fid, fix in unwritten.items() if fid not in declines and fid not in planned
+    }
     if remaining and has_run_record(audit_id, repo):
         raise ValidationError(unwritten_refusal_message(remaining))
+    write_generated_fixes(findings, planned, root)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the

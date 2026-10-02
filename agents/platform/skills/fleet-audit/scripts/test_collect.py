@@ -4206,6 +4206,55 @@ class TestCollectCluster(unittest.TestCase):
             next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact,
         )
 
+    def test_a_no_pdb_candidate_carries_the_workloads_selector_verbatim(self):
+        """`finish` writes the PodDisruptionBudget from it (SOP §3.3)."""
+        workload = deployment("api")
+        workload["spec"]["selector"] = {
+            "matchLabels": {"app": "api"},
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}],
+        }
+        result, _ = self.collect([workload])
+        by_slug = {c["check"]: c for c in result["candidates"]}
+        self.assertEqual(by_slug["no-pdb"]["pod_selector"], workload["spec"]["selector"])
+        self.assertNotIn("pod_selector", by_slug["no-requests"])
+
+    def test_a_selector_that_reaches_another_controllers_pods_is_not_carried(self):
+        """A `maxUnavailable` budget over pods with no scale subresource behind
+        them permits no evictions, so `finish` must not write one."""
+        api = deployment("api")
+        api["spec"]["selector"] = {"matchLabels": {"app": "api"}}
+        other = deployment("api-canary")
+        other["spec"]["template"]["metadata"] = {"labels": {"app": "api", "track": "canary"}}
+        other["spec"]["replicas"] = 1
+        result, _ = self.collect([api, other])
+        found = next(c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api")
+        self.assertNotIn("pod_selector", found)
+        self.assertEqual(found["namespace_pdbs"], [])
+
+    def test_a_selector_that_reaches_pods_with_no_scale_behind_them_is_not_carried(self):
+        """A DaemonSet's pods, or a CronJob's Jobs': the disruption controller
+        cannot count them, so a `maxUnavailable` budget over them blocks drains."""
+        labels = {"app": "api"}
+        daemon = deployment("agent")
+        daemon["kind"] = "DaemonSet"
+        daemon["spec"]["template"]["metadata"] = {"labels": labels}
+        migration = {
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "migrate", "namespace": "default"},
+            "spec": {"schedule": "0 * * * *", "jobTemplate": {"spec": {"template": {"metadata": {"labels": labels}}}}},
+        }
+        for name, other in (("DaemonSet", daemon), ("CronJob", migration)):
+            with self.subTest(name):
+                api = deployment("api")
+                api["spec"]["selector"] = {"matchLabels": labels}
+                api["spec"]["template"]["metadata"] = {"labels": labels}
+                result, _ = self.collect([api, other])
+                found = next(
+                    c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api"
+                )
+                self.assertNotIn("pod_selector", found)
+
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
         commands = {c["command"] for c in result["commands"]}

@@ -183,6 +183,15 @@ checks are the only ones a collector should mark: there the sentence reports whi
 the model infers from an excerpt and gets wrong. Every other check's `impact` stays the model's,
 whose rewrite is usually the better sentence.
 
+A `no-pdb` candidate also carries `namespace_pdbs`, the names of the budgets already in its
+namespace, and `pod_selector`, the workload's `spec.selector`, but only where that selector reaches
+no other controller's pods in the dump. Where the model left a declared finding of that check
+`manual`, did not decline it, and the `major` sweep would open it, `finish` writes the
+PodDisruptionBudget the obtainability SOP prescribes from it, `maxUnavailable: 1` in a new file
+beside the declaration, rather than refusing. It writes nothing for an empty or unusable selector,
+a name the namespace or repository already uses, a path that holds a file, a declaration inside a
+Kustomize root, or a finding a pull request already carries.
+
 ### 3.3 Resolution — `still_flagged_ids`, `collector_held_entries`
 
 A previous finding absent from this run's document is not announced as resolved while the collector

@@ -1237,7 +1237,9 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   one whose file is missing, at the path it named, and each `manual` one the collector clears for
   the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
   as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
-  `kind: manifest` and `path`, and run `finish` again. A finding the SOP itself makes `manual`, or
+  `kind: manifest` and `path`, and run `finish` again. A declared `no-pdb` finding is the exception:
+  `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, unless
+  you pass `--decline-fix` for it on every call, as you must when your SOP keeps it `manual`. A finding the SOP itself makes `manual`, or
   one a pull request already carries, stays `manual`: pass `--decline-fix <id> "<why>"` and the
   reason is published on its ledger row. Every `finish` refuses until each listed fix is written or
   declined, so re-running it unchanged only refuses again; a `--dry-run` does not refuse. A declined

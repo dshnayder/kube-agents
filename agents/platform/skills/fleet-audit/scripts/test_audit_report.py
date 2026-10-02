@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -257,6 +258,15 @@ def published_body(doc, **kwargs):
 
 
 DECLINE_REASON = "a pull request already carries this fix"
+
+
+def pytest_yaml():
+    """PyYAML, or a skip: the generated manifest is checked by parsing it."""
+    try:
+        import yaml  # noqa: PLC0415 -- optional in this suite
+    except ImportError:
+        raise unittest.SkipTest("PyYAML is not available")
+    return yaml
 
 
 def declined(doc):
@@ -15239,6 +15249,186 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         """A remediation pull request on the branch the sweep names for `path`."""
         as_written = {"id": "a", "remediation": {"kind": "manifest", "path": path}}
         return {"headRefName": audit_report.group_branch_for(AUDIT, [as_written]), **fields}
+
+    SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
+
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=()):
+        manifest = self.manifest()
+        manifest["clusters"][0]["candidates"][0].update(
+            {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
+        )
+        finding = _pub("a", "no-pdb", "c1", "Deployment/a", namespace="web")
+        finding["remediation"] = {"kind": "manual", "note": "Review and remediate."}
+        findings = [finding]
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            planned = audit_report.plan_generated_fixes(
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe
+            )
+            probe.close()
+            audit_report.write_generated_fixes(findings, planned, self.workspace)
+        self.generate_err = err.getvalue()
+        return list(planned), finding
+
+    def test_finish_writes_the_pdb_the_sop_prescribes_beside_the_declaration(self):
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+        self.assertEqual(finding["remediation"]["path"], "apps/a/a-pdb.yaml")
+        self.assertIn("wrote this PodDisruptionBudget", finding["remediation"]["note"])
+        yaml = pytest_yaml()
+        document = yaml.safe_load((self.workspace / "apps/a/a-pdb.yaml").read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["apiVersion"], "policy/v1")
+        self.assertEqual(document["metadata"], {"name": "a-pdb", "namespace": "web"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertIsNone(audit_report.remediation_file_problem(finding, self.workspace))
+
+    def test_a_retry_adopts_its_own_earlier_write(self):
+        """A `finish` that failed after writing leaves the file; the next one
+        recognises its own bytes rather than refusing over them."""
+        self.generate()
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_finish_writes_nothing_it_cannot_derive_safely(self):
+        """No selector (the collector withholds it where other pods match), an
+        empty one, or a key `policy/v1` does not take."""
+        for name, selector in {
+            "absent": None,
+            "empty": {},
+            "empty terms": {"matchLabels": {}},
+            "unknown key": {"matchLabels": {"app": "a"}, "matchFields": []},
+        }.items():
+            with self.subTest(name):
+                written, finding = self.generate(selector=selector)
+                self.assertEqual(written, [])
+                self.assertEqual(finding["remediation"]["kind"], "manual")
+                self.assertFalse((self.workspace / "apps/a/a-pdb.yaml").exists())
+
+    def test_finish_writes_nothing_that_would_collide_or_not_render(self):
+        cases = {
+            "a file at the path": (lambda: self.touch("apps/a/a-pdb.yaml"), {}, "already exists"),
+            "a Kustomize root above": (lambda: self.touch("apps/kustomization.yaml"), {}, "Kustomize root"),
+            "the name in the namespace": (lambda: None, {"namespace_pdbs": ["a-pdb"]}, "already has"),
+            "the name in the repository": (
+                lambda: (self.workspace / "other.yaml").write_text("metadata:\n  name: a-pdb\n"),
+                {},
+                "already names",
+            ),
+        }
+        for name, (arrange, kwargs, said) in cases.items():
+            with self.subTest(name):
+                self.unclone()
+                self.workspace.mkdir(parents=True, exist_ok=True)
+                arrange()
+                written, finding = self.generate(**kwargs)
+                self.assertEqual(written, [])
+                self.assertEqual(finding["remediation"]["kind"], "manual")
+                self.assertIn(said, self.generate_err)
+
+    def test_a_declined_fix_or_one_a_pull_request_carries_is_not_written(self):
+        written, _ = self.generate(declines={"a": "a pull request already carries it"})
+        self.assertEqual(written, [])
+        carrying = {"state": "OPEN", "body": audit_report.delta_block(["a"]), "headRefName": "x"}
+        written, _ = self.generate(prs=[carrying])
+        self.assertEqual(written, [])
+
+    def test_in_content_mode_a_path_the_broker_lists_or_cannot_answer_is_not_written(self):
+        class Listing(list):
+            truncated = False
+
+        def broker(entries=(), error=None, truncated=False):
+            inner = mock.MagicMock()
+            listing = Listing(entries)
+            listing.truncated = truncated
+            inner.list.side_effect = error
+            inner.list.return_value = listing
+            inner.grep.return_value = {"total": 0}
+            session = mock.MagicMock()
+            session.__enter__.return_value = inner
+            module = mock.MagicMock()
+            module.Workspace.open.return_value = session
+            return module
+
+        self.patch_attr("content_mode", lambda: True)
+        for name, module, expected in (
+            ("listed", broker([{"path": "apps/a/a-pdb.yaml", "size": 1}]), []),
+            ("error", broker(error=RuntimeError("down")), []),
+            ("truncated", broker(truncated=True), []),
+            ("absent", broker([]), ["a"]),
+        ):
+            with self.subTest(name), mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+                target = self.workspace / "apps/a/a-pdb.yaml"
+                if target.exists():
+                    target.unlink()
+                self.assertEqual(self.generate()[0], expected)
+                self.assertEqual(module.Workspace.open.call_count, 1)
+
+    def test_two_fixes_never_take_one_file_or_one_name(self):
+        manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[])]}
+        findings = []
+        for namespace in ("web", "staging"):
+            candidate = {**_cand("no-pdb", "c1", "Deployment/api", namespace=namespace), "severity": "major"}
+            candidate.update(
+                {"declaration": {"path": "apps/api/deploy.yaml", "directory": "apps/api"}, "pod_selector": self.SELECTOR}
+            )
+            manifest["clusters"][0]["candidates"].append(candidate)
+            finding = _pub(f"api-{namespace}", "no-pdb", "c1", "Deployment/api", namespace=namespace)
+            finding["severity"] = "major"
+            finding["remediation"] = {"kind": "manual", "note": ""}
+            findings.append(finding)
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            planned = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+        self.assertEqual(len(unwritten), 2)
+        self.assertEqual(len(planned), 1)
+        self.assertIn("another fix this run writes already takes", err.getvalue())
+
+    def test_a_broker_that_cannot_be_asked_says_so(self):
+        module = mock.MagicMock()
+        module.Workspace.open.side_effect = RuntimeError("store full")
+        self.patch_attr("content_mode", lambda: True)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            written, _ = self.generate()
+        self.assertEqual(written, [])
+        self.assertIn("could not be checked (RuntimeError: store full)", self.generate_err)
+        self.assertNotIn("already exists", self.generate_err)
+
+    def test_a_run_refused_over_another_fix_writes_none_of_its_planned_ones(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        second = copy.deepcopy(doc["findings"][0])
+        second["object"] = "Namespace/ledger"
+        second["remediation"]["path"] = "clusters/prod-us-east/ledger-netpol.yaml"
+        doc["findings"].append(second)
+        first_id = declined(doc)[1]
+        first_path = doc["findings"][0]["remediation"]["path"]
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: {first_id: (first_path, "# generated\n")})
+        self.assertEqual(self.run_finish(doc), 2)
+        self.assertIn("ledger-netpol.yaml", self.err)
+        self.assertFalse((self.workspace / first_path).exists())
+
+    def test_finish_publishes_a_planned_fix_instead_of_refusing_and_a_refused_run_writes_nothing(self):
+        """The wiring in `finish`: the planner's answer is what the refusal and
+        the write act on."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        fid = declined(doc)[1]
+        path = doc["findings"][0]["remediation"]["path"]
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: {})
+        self.assertEqual(self.run_finish(doc), 2)
+        self.assertFalse((self.workspace / path).exists())
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: {fid: (path, "# generated\n")})
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual((self.workspace / path).read_text(), "# generated\n")
+        self.assertIn("GENERATED: " + fid, self.err)
 
     def test_a_manual_fix_whose_declaration_the_collector_found_is_unwritten(self):
         self.assertEqual(
