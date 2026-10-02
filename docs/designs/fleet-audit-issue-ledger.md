@@ -587,11 +587,13 @@ ledger that a fix was named but not written, and the report publishes. Killing a
 security report because one of the nine manifests was not written is the wrong shape of failure: it
 throws away eight findings to punish one.
 
-The run's first `finish` does refuse once, before that degrade can publish, when a finding the
-sweep would open has no fix written: a promised file that is missing, or a `manual` remediation on
-a finding the collector clears for the `major` sweep whose candidate carries a `declaration`. It
-exits 2 naming each, records the refusal on the run record, and the next `finish` publishes what is
-written. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
+On a run `start` opened, `finish` refuses before that degrade can publish when a finding the sweep
+would open has no fix written: a promised file that is missing, or a `manual` remediation on a
+finding the collector clears for the `major` sweep whose candidate carries a `declaration`. It exits
+2 naming each, and keeps refusing until each is written or declined by name with a reason
+(`--decline-fix <id> <why>`); a declined fix publishes as `manual` with the reason on its row.
+Refusing once was not enough: a worker re-ran `finish` unchanged and the fix reached the ledger as
+`manual`. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the

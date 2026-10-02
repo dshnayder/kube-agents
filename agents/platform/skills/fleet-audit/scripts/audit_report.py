@@ -19,6 +19,7 @@ Two-command lifecycle, plus three on-demand commands:
     audit_report.py start     --audit <audit-id>
     audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
                           [--manifest-file <path> | --no-collector-manifest <why>]
+                          [--decline-fix <id> <why> ...]
     audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
     audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
@@ -1077,9 +1078,9 @@ RUN_RECORD_SOURCES_KEY = "sources"
 # finds last week's manifest at the same fixed path and publishes against it.
 # Comparing the manifest's `finished_at` with this is what makes that loud.
 RUN_RECORD_STARTED_KEY = "started_at"
-# Set by the first `finish` on a run that refused unwritten sweep fixes
-# (`unwritten_sweep_fixes`), so the retry publishes rather than refusing again.
-RUN_RECORD_UNWRITTEN_REFUSED_KEY = "unwritten_fixes_refused"
+# What a finding's ledger row says when the worker declined the fix the sweep
+# would have opened (`finish --decline-fix`); the worker's reason follows.
+DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -10951,10 +10952,10 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
     The declared list names the object's own file, and says in so many words
     that a new object goes beside it: a worker told only "write the manifest at
     this path" writes a PodDisruptionBudget over the Deployment it protects, and
-    the sweep opens that pull request unasked. It also leaves the worker a way
-    out that does not need a second refusal -- a finding the SOP itself makes
-    `manual`, or one a pull request already carries, is answered by running
-    `finish` again unchanged.
+    the sweep opens that pull request unasked. It also names the way out for
+    a finding the SOP itself makes `manual`, or one a pull request already
+    carries: `--decline-fix` with the reason, since every `finish` refuses
+    until each listed fix is written or declined.
     """
     named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
@@ -10980,42 +10981,59 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
         )
     parts.append(
         "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
-        "pull request already carries its fix, leave it `manual`, say why in its "
-        "`note`, and run `finish` again unchanged: this refusal happens once per run, "
-        "and the second `finish` publishes what is written."
+        "pull request already carries its fix, leave it `manual` and pass "
+        "`--decline-fix <id> \"<why>\"` to the next `finish`; the reason is published "
+        "on the finding's ledger row. `finish` refuses until each of these is "
+        "written or declined."
     )
     return " ".join(parts)
 
 
-def mark_unwritten_refused(audit_id: str) -> bool:
-    """Note on the run record that `finish` refused unwritten fixes once.
+def has_run_record(audit_id: str, repo: str | None = None) -> bool:
+    """Whether `start` left this stream a run record for `repo`.
 
-    False when there is no record to write to, and then the caller does not
-    refuse: a refusal nothing remembers would refuse every retry, and the
-    stream would publish nothing.
+    The refusal is part of the run `start` opened: a `finish` with no record
+    publishes what is written, degrading the rest to `manual`, as it always has.
+    On a multi-repo loop another repository's record is no record, as in
+    `read_run_record`.
     """
-    path = Path(run_record_path_for(audit_id))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(data, dict) or data.get("audit") != audit_id:
-        return False
-    data[RUN_RECORD_UNWRITTEN_REFUSED_KEY] = True
-    try:
-        _atomic_write(path, json.dumps(data))
-    except OSError:
-        return False
-    return True
-
-
-def unwritten_already_refused(audit_id: str) -> bool:
-    """Whether this run's first `finish` already refused its unwritten fixes."""
     try:
         data = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(data, dict) and data.get(RUN_RECORD_UNWRITTEN_REFUSED_KEY) is True
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return False
+    recorded = data.get("repo")
+    return not repo or (isinstance(recorded, str) and recorded.strip().lower() == repo.strip().lower())
+
+
+def decline_unwritten_fixes(
+    findings: list[dict], unwritten: dict[str, "UnwrittenFix"], declines: dict[str, str]
+) -> None:
+    """Note each declined fix on its finding, or refuse a decline nothing asked for.
+
+    A decline naming a fix `finish` would not refuse is a worker that misread
+    the refusal or wrote the fix and kept the flag; either way it is told,
+    rather than a reason published against a finding it does not describe.
+    """
+    stray = sorted(set(declines) - set(unwritten))
+    if stray:
+        raise ValidationError(
+            "--decline-fix names " + ", ".join(stray) + ", which `finish` would not "
+            "refuse: decline only a fix the refusal listed, and drop the flag once "
+            "its fix is written."
+        )
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in declines:
+            continue
+        remediation = finding.setdefault("remediation", {})
+        note = str(remediation.get("note", "")).strip()
+        # First, so the row's clip keeps it however long the note is.
+        remediation["note"] = DECLINED_FIX_NOTE.format(reason=declines[fid]) + (
+            f" {note}" if note else ""
+        )
+        log(f"DECLINED: {fid}'s automatic fix, published as manual: {declines[fid]}")
 
 
 def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
@@ -13393,15 +13411,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     remediation_prs = list_remediation_prs(repo, audit_id)
     # The last point before anything is published. A fix the sweep would open
-    # and the worker did not write is refused once, so the worker writes it and
-    # re-runs; the retry publishes whatever is still unwritten as `manual`,
-    # because one missing file must never suppress the stream.
-    if findings and not unwritten_already_refused(audit_id):
-        unwritten = unwritten_sweep_fixes(
-            findings, manifest, promised, degraded, audit_id, remediation_prs
-        )
-        if unwritten and mark_unwritten_refused(audit_id):
-            raise ValidationError(unwritten_refusal_message(unwritten))
+    # and the worker did not write is refused until it is written or declined
+    # by name with a reason: refused once, a worker re-ran `finish` unchanged
+    # and the fix reached the ledger as `manual`. A declined fix publishes as
+    # `manual` with the reason on its row.
+    declines = dict(getattr(args, "decline_fix", None) or [])
+    unwritten = (
+        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
+        if findings
+        else {}
+    )
+    decline_unwritten_fixes(findings, unwritten, declines)
+    remaining = {fid: fix for fid, fix in unwritten.items() if fid not in declines}
+    if remaining and has_run_record(audit_id, repo):
+        raise ValidationError(unwritten_refusal_message(remaining))
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
@@ -14235,6 +14258,13 @@ def _add_read_branch_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _nonblank(value: str) -> str:
+    """An argument that says something: a blank finding id or reason is refused."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be blank")
+    return value.strip()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Deterministic audit-reporting harness for the fleet-audit skill."
@@ -14269,6 +14299,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git/gh side effects.",
+    )
+    finish_parser.add_argument(
+        "--decline-fix",
+        nargs=2,
+        action="append",
+        type=_nonblank,
+        metavar=("FINDING_ID", "REASON"),
+        help=(
+            "Leave a fix the refusal listed `manual`, for REASON: the SOP makes it "
+            "manual, or a pull request already carries it. REASON is published on "
+            "the finding's ledger row. Repeat for more than one."
+        ),
     )
     # One or the other, never both: a waiver says the collector produced no
     # manifest, and a manifest beside it would make that sentence false.

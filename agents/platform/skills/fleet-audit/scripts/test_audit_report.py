@@ -256,6 +256,17 @@ def published_body(doc, **kwargs):
 # --------------------------------------------------------------------------- #
 
 
+DECLINE_REASON = "a pull request already carries this fix"
+
+
+def declined(doc):
+    """`--decline-fix` for every finding in `doc`, under the id `finish` derives."""
+    return tuple(
+        arg
+        for finding in doc["findings"]
+        for arg in ("--decline-fix", audit_report.derive_finding_id(dict(finding)), DECLINE_REASON)
+    )
+
 def make_finding(
     fid="no-network-policy",
     severity="critical",
@@ -3847,12 +3858,11 @@ class TestFinishClean(HarnessTestCase):
     def test_the_findings_branch_reports_the_declared_count_too(self):
         self.harness.replies = {"issue list": "[]"}
         self.record_run()
-        # Its finding's fix is unwritten; the once-per-run refusal is spent so
-        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
-        audit_report.mark_unwritten_refused(DECLARING_AUDIT)
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         doc = searched_doc(findings=[make_finding(check="no-pdb")])
         doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
-        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        self.assertEqual(self.run_finish(doc, declined(doc), audit=DECLARING_AUDIT), 0)
         self.assertEqual(self.stdout_json()["declared"], 2)
 
     def test_clean_run_closes_the_open_ledger_as_completed(self):
@@ -4640,11 +4650,10 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
         self.assertIn("scope.clusters", self.err)
         self.assertTrue(note.is_file())
-        # Its finding's fix is unwritten; the once-per-run refusal is spent so
-        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
-        audit_report.mark_unwritten_refused(AUDIT)
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         self.harness.failures = {"issue create": 1}
-        self.assertEqual(self.run_finish(make_doc()), 1, self.err)
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 1, self.err)
         self.assertFalse(note.is_file())
 
     def test_a_guard_that_cannot_be_taken_refuses_rather_than_running_unguarded(self):
@@ -4706,13 +4715,12 @@ class TestStart(HarnessTestCase):
         audit_report.release_in_flight(AUDIT)
         self.assertFalse(note.is_file())
         # And `finish` is what releases it on the happy path.
-        # Its finding's fix is unwritten; the once-per-run refusal is spent so
-        # this test reaches what it is about (`TestUnwrittenSweepFixes`).
-        audit_report.mark_unwritten_refused(AUDIT)
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         Path(audit_report.inflight_path_for(AUDIT)).write_text(
             json.dumps({"audit": AUDIT, "started_at": time.time()})
         )
-        rc = self.run_finish(make_doc())
+        rc = self.run_finish(make_doc(), declined(make_doc()))
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
 
@@ -15207,7 +15215,8 @@ class TestUncorroboratedFindings(BaseTestCase):
 
 
 class TestUnwrittenSweepFixes(HarnessTestCase):
-    """`finish` refuses, once per run, a fix the sweep would open and nobody wrote."""
+    """`finish` refuses a fix the sweep would open and nobody wrote, until it is
+    written or declined."""
 
     def manifest(self, check="no-pdb", severity="major", declaration="apps/a/deploy.yaml"):
         candidate = {**_cand(check, "c1", "Deployment/a"), "severity": severity}
@@ -15311,24 +15320,69 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("never over the file itself", message)
         self.assertIn("b -> apps/b/pdb.yaml", message)
         self.assertNotIn("a -> apps/a/deploy.yaml", message)
-        self.assertIn("run `finish` again unchanged", message)
+        self.assertIn("--decline-fix", message)
 
-    def test_the_first_finish_refuses_and_publishes_nothing_and_the_retry_publishes(self):
+    def test_finish_refuses_until_the_fix_is_written_or_declined(self):
+        """Refused once, a worker re-ran `finish` unchanged and the fix reached
+        the ledger as `manual`; the refusal now holds until it is answered."""
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         # `make_doc`'s finding is critical and names a manifest nobody wrote.
-        self.assertEqual(self.run_finish(make_doc()), 2)
-        self.assertIn("their fix is not written", self.err)
-        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
-        self.assertFalse(self.harness.matching("issue", "create"))
-        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(self.run_finish(make_doc()), 2)
+                self.assertIn("their fix is not written", self.err)
+                self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
+                self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 0, self.err)
         self.assertTrue(self.harness.matching("issue", "create"))
+        self.assertIn(DECLINE_REASON, "".join(b or "" for b in self.harness.bodies))
         self.assertIn("published with a manual remediation instead", self.err)
 
-    def test_without_a_run_record_nothing_remembers_the_refusal_so_none_is_made(self):
+    def test_finish_publishes_once_the_fix_is_written(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        self.assertEqual(self.run_finish(doc), 2)
+        self.touch(doc["findings"][0]["remediation"]["path"])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertNotIn("published with a manual remediation instead", self.err)
+
+    def test_a_decline_names_only_a_fix_the_refusal_would_list(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        self.assertEqual(self.run_finish(doc, ("--decline-fix", "not-a-finding", "why")), 2)
+        self.assertIn("--decline-fix names not-a-finding", self.err)
+        self.touch(doc["findings"][0]["remediation"]["path"])
+        self.assertEqual(self.run_finish(doc, declined(doc)), 2)
+        self.assertIn("--decline-fix names " + declined(doc)[1], self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+
+    def test_a_blank_decline_reason_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_finish(make_doc(), declined(make_doc())[:2] + ("  ",))
+
+    def test_without_a_run_record_finish_does_not_refuse(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         self.assertNotIn("their fix is not written", self.err)
+
+    def test_another_repositorys_run_record_is_no_record(self):
+        """A multi-repo loop: `start --repo A` must not make B's `finish` refuse."""
+        self.harness.replies = {"issue list": "[]"}
+        self.record_run(repo="acme/other", audit=AUDIT)
+        self.assertEqual(self.run_finish(make_doc(), ("--repo", "acme/fleet")), 0, self.err)
+        self.assertNotIn("their fix is not written", self.err)
+
+    def test_a_long_note_keeps_the_declined_reason_on_the_row(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        doc["findings"][0]["remediation"]["note"] = "x" * audit_report.MAX_NOTE_CHARS
+        self.assertEqual(self.run_finish(doc, declined(doc)), 0, self.err)
+        self.assertIn(DECLINE_REASON, "".join(b or "" for b in self.harness.bodies))
+        self.assertIn("DECLINED: " + declined(doc)[1], self.err)
 
 
 class TestTriageMarkedFindings(BaseTestCase):

@@ -419,7 +419,7 @@ document failed a field rule, the file named by `--findings-file` is missing or 
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
 empty path, `--no-collector-manifest` was given a blank reason, a collector stream was given
-neither, or, on the run's first `finish` only, a fix the sweep would open was not written (see
+neither, or, on a run `start` opened, a fix the sweep would open is neither written nor declined (see
 "Write every `manifest` remediation file" below). A manifest that finished before
 this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
@@ -1233,17 +1233,17 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
 - **Never hand-write a body, title, commit message, or timestamp.** They are generated so that the
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
-  directory. For a finding the sweep would open, the first `finish` of the run exits 2 listing each
+  directory. For a finding the sweep would open, `finish` exits 2 listing each
   one whose file is missing, at the path it named, and each `manual` one the collector clears for
   the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
   as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
   `kind: manifest` and `path`, and run `finish` again. A finding the SOP itself makes `manual`, or
-  one a pull request already carries, stays `manual` with the reason in its `note`: the refusal
-  happens once per run, and a `--dry-run` neither makes it nor uses it up. Anything
-  still missing on that second call does not fail the run — that one finding degrades to `manual`,
-  keeps its evidence and recommendation, and says in the ledger that the fix was named but not
-  written. The report still publishes. Do not rely on this: a degraded finding is a fix a human now
-  has to apply by hand.
+  one a pull request already carries, stays `manual`: pass `--decline-fix <id> "<why>"` and the
+  reason is published on its ledger row. Every `finish` refuses until each listed fix is written or
+  declined, so re-running it unchanged only refuses again; a `--dry-run` does not refuse. A declined
+  fix, like a missing file on a `finish` with no run record, degrades to `manual`, keeps its
+  evidence and recommendation, and says so in the ledger. The report still publishes. Do not rely
+  on this: a declined or degraded finding is a fix a human now has to apply by hand.
 - **Never publish a `gcloud` fix against a field a Config Connector declaration holds.** Write the
   declaration's file as a `manifest` instead. Where `finish` finds a `ContainerCluster` or
   `ContainerNodePool` whose `spec` carries the field the command's flag writes, in the GitOps repo
