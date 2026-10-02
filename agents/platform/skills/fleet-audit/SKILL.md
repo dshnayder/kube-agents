@@ -343,10 +343,10 @@ so candidates carry `declaration` and `release_declaration` (and, from `collect.
 tree it logs a `WARNING` naming why and attaches none of those fields. Each file the broker will not
 send (over its size limit, or a symlink) costs less: no `declaration` or `namespace_directory` on a
 cluster whose `clusters/<name>/` tree holds it, and no `release_declaration` or `namespace_directory`
-anywhere. The exception is a too-large file that is not a Kustomization, in which the broker's
-search finds no release kind; that file loses only its cluster's tree, provided the rest of that
-tree holds no release either. Either way the declaration rule's own search is the answer for what is
-missing.
+anywhere. The exception is a too-large non-Kustomization file holding a column-0 `kind` and, by
+the broker's search, no release kind: it loses only its cluster's tree, if that tree holds no release
+and no Kustomization an Application names. Either way the declaration rule's own search is the
+answer for what is missing.
 
 All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
 side to ask, and the declared-intent record (`declared_intent_searched`, below) names each repository

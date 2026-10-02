@@ -9930,7 +9930,8 @@ class TestBrokerMirror(unittest.TestCase):
             sorted(found[collect.RELEASE_DECLARING_PATTERN]),
             sorted(f"{name}.yaml" for name, (_, searched, _) in cases.items() if searched),
         )
-        # Every file but the indented ones has a column-0 `kind`.
+        # The files with no column-0 `kind` key: the indented ones, the JSON
+        # and flow ones, and `? kind`, which the release search already caught.
         self.assertEqual(
             sorted(set(f"{name}.yaml" for name in cases) - set(found[collect.COLUMN_ZERO_KIND_PATTERN])),
             sorted(f"{name}.yaml" for name in [*self.INDENTED, "schema", "json", "json-next-line", "flow", "complex-key"]),
@@ -9978,19 +9979,65 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertTrue(withheld)
                 self.assertIn("release_declaration", err.getvalue())
 
-    def test_a_large_crd_bundle_keeps_the_release_index(self):
+    def flux_bootstrap(self):
         """What `flux bootstrap` commits under `clusters/<c>/flux-system/`,
-        over the broker's per-file limit."""
-        bundle = "clusters/other/flux-system/gotk-components.yaml"
-        broker = _FakeBrokerWorkspace(
-            {**self.two_clusters(), bundle: self.CRD_BUNDLE.encode()},
-            refuse={bundle: collect.BROKER_SKIP_TOO_LARGE},
-        )
+        with the bundle over the broker's per-file limit."""
+        root = "clusters/other/flux-system"
+        files = {
+            **self.two_clusters(),
+            f"{root}/gotk-components.yaml": self.CRD_BUNDLE.encode(),
+            f"{root}/gotk-sync.yaml": b"kind: GitRepository\n---\nkind: Kustomization\n",
+            f"{root}/kustomization.yaml": b"resources:\n- gotk-components.yaml\n- gotk-sync.yaml\n",
+        }
+        return files, {f"{root}/gotk-components.yaml": collect.BROKER_SKIP_TOO_LARGE}
+
+    def mirror_withholds(self, files, refuse, links=()):
+        broker = _FakeBrokerWorkspace(files, refuse=refuse, symlinked_directories=list(links))
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-        self.assertNotIn("release_declaration", err.getvalue())
+            return (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists(), err.getvalue()
+
+    def test_a_large_crd_bundle_keeps_the_release_index(self):
+        """The bootstrap's own Kustomization goes with the dropped tree, but
+        no Application renders it, so it costs nothing beyond that tree."""
+        withheld, err = self.mirror_withholds(*self.flux_bootstrap())
+        self.assertNotIn("release_declaration", err)
         self.assertFalse(withheld)
+
+    def test_a_dropped_kustomization_an_application_renders_withholds_the_release_index(self):
+        """The overlay check would find it on disk in a clone; the mirror
+        has no file there."""
+        files, refuse = self.flux_bootstrap()
+        application = TestKustomizeOverlayDeclarations.OVERLAY
+        for name, named, links in (
+            ("direct", "clusters/other/flux-system", ()),
+            ("through a link", "overlays/flux", [{"path": "overlays/flux", "target": "../clusters/other/flux-system"}]),
+        ):
+            with self.subTest(name):
+                apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", named).encode()}
+                withheld, _ = self.mirror_withholds({**files, **apps}, refuse, links)
+                self.assertTrue(withheld)
+        with self.subTest("unreadable Applications"), patch.dict("sys.modules", {"yaml": None}):
+            self.assertTrue(self.mirror_withholds(files, refuse)[0])
+        with self.subTest("escaped kind"):
+            escaped = application.replace("kind: Application", 'kind: "\\u0041pplication"')
+            apps = {"apps/app.yaml": escaped.replace("overlays/prod-usc1/podinfo", "clusters/other/flux-system").encode()}
+            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse)[0])
+        with self.subTest("a path that is not a string"):
+            apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", "2024").encode()}
+            links = [{"path": "2024", "target": "clusters/other/flux-system"}]
+            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse, links)[0])
+
+    def test_a_link_into_itself_is_followed_a_bounded_number_of_times(self):
+        links = [{"path": "x", "target": "x/y"}]
+        files = {"apps/app.yaml": TestKustomizeOverlayDeclarations.OVERLAY.replace("overlays/prod-usc1/podinfo", "x").encode()}
+        self.assertIsNone(collect._application_source_paths(files, links))
+
+    def test_a_kustomization_file_nothing_renders_is_still_read_for_releases(self):
+        """`release_declarations` reads every `*.yaml`, `kustomization.yaml` included."""
+        project = b"kind: AppProject\nmetadata: {name: p}\nspec: {destinations: [{namespace: a}]}\n"
+        self.assertTrue(collect._sent_file_declares_release("clusters/other/kustomization.yaml", project, set()))
+        self.assertFalse(collect._sent_file_declares_release("clusters/other/kustomization.yaml", b"resources: []\n", set()))
 
     def test_a_dropped_tree_names_its_cluster_to_the_namespace_index(self):
         """With `clusters/other/` gone, an overlay elsewhere rendering into

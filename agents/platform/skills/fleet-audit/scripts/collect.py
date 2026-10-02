@@ -324,6 +324,9 @@ RELEASE_DECLARING_PATTERN = "|".join(
 # git treats as binary (a `binary` or `-diff` attribute) answers "no match"
 # to `git grep -I` too, so a search that never read the file lands here.
 COLUMN_ZERO_KIND_PATTERN = _LINE_START + _KIND_KEY + "[ \t]*:"
+# How many directory links `_application_source_paths` follows in a chain:
+# Linux's own limit before ELOOP.
+LINK_FOLLOW_LIMIT = 40
 # What `release_declarations` reads, as a document's own `kind`; a Secret
 # counts only with the cluster-registration label.
 RELEASE_KINDS = frozenset(
@@ -8910,9 +8913,10 @@ def _may_declare_release(workspace, path: str) -> bool:
 
     The broker searches a file it will not send, so a vendored CRD bundle over
     its size limit need not cost every cluster its `release_declaration`. A
-    Kustomization file feeds `namespace_directories` by name, and a search that
-    fails or answers in a shape this does not know, could not rule the file
-    out, so each of those still counts as declaring.
+    withheld Kustomization file still counts, since which Applications name
+    its directory is not looked up for a file the broker would not send, and a
+    search that fails or answers in a shape this does not know could not rule
+    the file out, so each of those still counts as declaring.
     """
     if Path(path).name in KUSTOMIZATION_FILE_NAMES:
         return True
@@ -8933,15 +8937,78 @@ def _may_declare_release(workspace, path: str) -> bool:
         return True
 
 
-def _sent_file_declares_release(path: str, content: bytes) -> bool:
+def _application_source_paths(
+    files: dict[str, bytes], directory_links: list[dict]
+) -> set[str] | None:
+    """Every directory an Argo CD Application's source names, through links.
+
+    `_argocd_kustomize_source` resolves an Application's `path` by finding a
+    Kustomization file there on disk, so a Kustomization nothing names is read
+    by nothing. None when the Applications cannot all be read (no PyYAML, a
+    file that names one and does not parse): then any Kustomization counts.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence counts every Kustomization
+    except ImportError:
+        return None
+    named: set[str] = set()
+    for content in files.values():
+        # A backslash may escape the kind (`"\u0041pplication"`), so only a
+        # file with neither is passed over unparsed.
+        if ARGOCD_APPLICATION_KIND.encode() not in content and b"\\" not in content:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
+        except Exception:  # noqa: BLE001 -- an Application this cannot read could name anything
+            return None
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get("kind") != ARGOCD_APPLICATION_KIND:
+                continue
+            spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            sources = [spec.get("source"), *(spec.get("sources") if isinstance(spec.get("sources"), list) else [])]
+            for source in sources:
+                # Coerced as `_argocd_kustomize_source` coerces it: `path: 2024`
+                # names a directory too.
+                path = str(source.get("path") or "").strip() if isinstance(source, dict) else ""
+                if path:
+                    named.add(posixpath.normpath(path))
+    links = [
+        (str(link.get("path") or ""), str(link.get("target") or ""))
+        for link in directory_links
+        if isinstance(link, dict) and link.get("target")
+    ]
+    # A path through a directory link names the link's target too. Each pass
+    # follows one more link from the paths the last pass reached; a chain
+    # longer than the kernel would follow (a link into itself grows forever)
+    # cannot be settled, so it counts every Kustomization.
+    frontier = set(named)
+    for _ in range(LINK_FOLLOW_LIMIT):
+        reached = set()
+        for path in frontier:
+            for link, target in links:
+                if path == link or path.startswith(link + "/"):
+                    rest = path[len(link) + 1 :]
+                    reached.add(posixpath.normpath(posixpath.join(posixpath.dirname(link), target, rest)))
+        frontier = reached - named
+        if not frontier:
+            return named
+        named |= frontier
+    return None
+
+
+def _sent_file_declares_release(path: str, content: bytes, rendered: set[str] | None = None) -> bool:
     """`_may_declare_release` for a file the broker did send.
 
     A withheld file under `clusters/<c>/` drops that whole tree from the mirror,
     and the dropped files the broker sent may hold an Application for another
-    cluster, an AppProject, or a Kustomization an Application renders. Its
-    bytes are here, so it is read the way `release_declarations` reads it; the
-    search stands in only where PyYAML is absent or the file does not parse."""
-    if Path(path).name in KUSTOMIZATION_FILE_NAMES:
+    cluster, an AppProject, or a Kustomization an Application renders: one in a
+    directory `rendered` (`_application_source_paths`) names, or any when that
+    is None. Its bytes are here, so it is read the way `release_declarations`
+    reads it; the search stands in only where PyYAML is absent or the file
+    does not parse."""
+    if Path(path).name in KUSTOMIZATION_FILE_NAMES and (
+        rendered is None or posixpath.dirname(path) in rendered
+    ):
         return True
     try:
         import yaml  # noqa: PLC0415 -- optional; absence falls back to the search
@@ -9018,7 +9085,8 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     Kustomization file always could; a `tooLarge` file could unless the
     broker's search reads it, finds none of the kinds the release index reads,
     and finds a column-0 `kind` (`_may_declare_release`), and the rest of its
-    cluster's tree, which
+    cluster's tree (a Kustomization only where an Application names its
+    directory, `_application_source_paths`), which
     goes with it, holds none either. The other clusters keep their `declaration`, and
     each withheld file is logged with what it cost.
 
@@ -9152,10 +9220,15 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     # A cluster's tree goes with the file withheld from it, so whatever release
     # the rest of that tree held is lost too, and the file is charged for it.
     releasing_trees: set[str | None] = set()
+    rendered = _application_source_paths(files, directory_links) if clusters else set()
     for path, content in files.items():
         tree = _cluster_tree(path)
         # Parsed, so a tree already charged is not read again.
-        if tree in clusters and tree not in releasing_trees and _sent_file_declares_release(path, content):
+        if (
+            tree in clusters
+            and tree not in releasing_trees
+            and _sent_file_declares_release(path, content, rendered)
+        ):
             releasing_trees.add(tree)
     releasing |= {path for path in withheld if _cluster_tree(path) in releasing_trees}
     for path, reason in sorted(withheld.items()):
