@@ -9765,7 +9765,32 @@ class TestBrokerMirror(unittest.TestCase):
             "provisioning/cluster.yml": b"kind: ConfigMap\n",
         }
 
+    def indexes(self, root):
+        declarations = collect.workload_declarations(root)
+        releases = collect.release_declarations(root)
+        return declarations, releases, collect.namespace_directories(declarations, releases, root)
+
     def test_the_mirror_resolves_what_a_clone_would(self):
+        overlay = TestKustomizeOverlayDeclarations
+        files = {
+            **self.files(),
+            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
+            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
+        }
+        link = {"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}
+        broker = _FakeBrokerWorkspace(files, symlinked_directories=[link])
+        with TemporaryDirectory() as mirror, TemporaryDirectory() as clone:
+            for relative, content in files.items():
+                (Path(clone) / relative).parent.mkdir(parents=True, exist_ok=True)
+                (Path(clone) / relative).write_bytes(content)
+            (Path(clone) / link["path"]).parent.mkdir(parents=True)
+            (Path(clone) / link["path"]).symlink_to(link["target"], target_is_directory=True)
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(mirror), broker.open))
+            mirrored, cloned = self.indexes(Path(mirror)), self.indexes(Path(clone))
+        self.assertEqual(mirrored, cloned)
+        self.assertTrue(all(mirrored))
+
+    def test_the_mirror_writes_only_the_yaml(self):
         broker = _FakeBrokerWorkspace(self.files(), page_size=2, budget=1)
         with TemporaryDirectory() as tmp:
             self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
@@ -9977,6 +10002,30 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertFalse(withheld)
         self.assertEqual(found, overlay.EXPECTED)
 
+    def test_a_directory_link_in_a_dropped_tree_still_resolves_an_overlay(self):
+        """The tree's files go, but an Application elsewhere may name a path
+        through a link in it, and a clone would resolve that path."""
+        overlay = TestKustomizeOverlayDeclarations
+        through = "clusters/other/overlay"
+        files = {
+            **self.two_clusters(),
+            "apps/podinfo.yaml": overlay.OVERLAY.replace(overlay.EXPECTED["chart"], through).encode(),
+            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
+        }
+        broker = _FakeBrokerWorkspace(
+            files,
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+            symlinked_directories=[{"path": through, "target": "../../overlays/shared/podinfo"}],
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            found = collect.release_declaration_for(
+                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
+            )
+        self.assertFalse(withheld)
+        self.assertEqual(found, {**overlay.EXPECTED, "chart": through})
+
     def test_a_directory_link_the_mirror_cannot_hold_withholds_the_release_index(self):
         for target in ("/etc", "../../..", "../.git", ""):
             with self.subTest(target=target):
@@ -9991,6 +10040,19 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertTrue(withheld)
                 self.assertEqual(linked, [])
                 self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_a_directory_link_in_a_dropped_tree_the_mirror_cannot_hold_withholds_the_release_index(self):
+        """Handled like any other link: an Application may name a path through it."""
+        broker = _FakeBrokerWorkspace(
+            self.two_clusters(),
+            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
+            symlinked_directories=[{"path": "clusters/other/vendor", "target": ""}],
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
+            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+        self.assertRegex(err.getvalue(), r"directory link clusters/other/vendor .* cannot hold")
+        self.assertTrue(withheld)
 
     def test_a_directory_link_named_outside_the_repository_fails_the_mirror(self):
         """The broker should never send such a name, as for a file entry."""

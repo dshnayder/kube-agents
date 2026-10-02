@@ -9126,9 +9126,9 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
         links: dict[str, Path] = {}
         unheld: dict[str, str] = {}
         for link in directory_links:
+            # A link in a dropped tree stays: an Application elsewhere may
+            # name a path through it, and no walk enters it.
             path, target = str(link["path"]), str(link.get("target") or "")
-            if _cluster_tree(path) in clusters:
-                continue
             made = _mirror_directory_link(dest, path, target) if path not in links else None
             if made is None:
                 unheld[path] = target
