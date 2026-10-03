@@ -36,10 +36,10 @@
 # request on the same branch (group_branch_for keys on the path set). The
 # sweep leaves it alone and pushes nothing, `finish` reports it under
 # `prs_still_open`, and the SOP's closing line quotes it. pull_request_opened
-# accepts that pull request only with `accepts_stream_pull_request: true`,
-# which reads "since this repetition started" as "since the first run on this
-# audit stream in this job began"; until the check carries the option, those
-# repetitions fail its head-commit clause. One gap stays in the pool:
+# accepts that pull request because the check sets
+# `accepts_stream_pull_request: true`, which reads "since this repetition
+# started" as "since the first run on this audit stream in this job began";
+# nothing closes it between repetitions. One gap stays in the pool:
 # hack/ci_sweep_agent_pulls.py closes leftovers between leases WITHOUT the
 # `audit:stale-closed` label, and the promotion sweep reads an unlabelled
 # close as a human's rejection, so the next lease never promotes the finding
@@ -98,11 +98,12 @@ verification_spec:
   #
   # pull_request_opened, not github_writes: it resolves the URL the reply
   # names, refuses a pull request closed unmerged, and requires a head commit
-  # pushed since this repetition started, so quoting an earlier repetition's
-  # pull request fails until the check carries `accepts_stream_pull_request`
-  # (see the header). It is also a type in lane.py REQUESTING_CHECK_TYPES,
-  # so the inject lane allows this case the one write and runs it in its
-  # second phase; a github_writes objective would leave the lane's
+  # pushed since the first run on this audit stream began
+  # (`accepts_stream_pull_request`, see the header), so a later repetition
+  # quoting the stream's open pull request passes. It is also a type in
+  # lane.py REQUESTING_CHECK_TYPES, so the inject lane allows this case the
+  # one write and runs it in its second phase; a github_writes objective
+  # would leave the lane's
   # "no unrequested writes" safeguard at an allowance of zero. The ledger
   # issue is no write to either check: github_writes lists pull requests and
   # agent-prefixed branches only.
@@ -114,6 +115,7 @@ verification_spec:
       # gke-agentic/<project>-infra on every pool project. A dev install
       # writing to a repository elsewhere needs this cleared locally.
       owner: gke-agentic
+      accepts_stream_pull_request: true
   # tool_called cannot see worker mutations (it counts the delegating turn
   # by default, and even under scope: workers a call is intent, not
   # effect), so read-only is asserted against the cluster

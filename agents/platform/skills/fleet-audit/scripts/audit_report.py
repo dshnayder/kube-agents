@@ -11159,6 +11159,8 @@ class _RepositoryProbe:
         # The clone's YAML, read once for every `mentions` in directory mode,
         # and whether any of it could not be read, which answers every search.
         self._texts: list[tuple[str, str]] | None = None
+        # Content mode's answers to `has_path`, one broker call per path.
+        self._paths: dict[str, bool] = {}
         self._unreadable = False
 
     def broker(self):
@@ -11180,6 +11182,12 @@ class _RepositoryProbe:
     def has_path(self, path: str) -> bool:
         if not content_mode():
             return (self.root / path).exists()
+        # Every finding in one cluster tree asks about the same ancestors.
+        if path not in self._paths:
+            self._paths[path] = self._broker_has_path(path)
+        return self._paths[path]
+
+    def _broker_has_path(self, path: str) -> bool:
         workspace = self.broker()
         if workspace is None:
             return True
@@ -11287,18 +11295,27 @@ def plan_generated_fixes(
         if candidate.get("check") != GENERATED_FIX_CHECK:
             continue
         built = _pdb_manifest(candidate, fid)
-        if built is None:
-            continue
-        name, text = built
         directory = PurePosixPath(fix.path).parent
-        path = str(directory / f"{name}{GENERATED_PDB_EXTENSION}")
+        if built is not None:
+            name, text = built
+            path = str(directory / f"{name}{GENERATED_PDB_EXTENSION}")
+        # A pull request carrying the finding answers it, buildable or not;
+        # only a live one on the branch the generated file names is this
+        # function's own, and gets the fix planned again.
         if fid in carried:
-            own = group_branch_for(audit_id, [{"id": fid, "remediation": {"kind": "manifest", "path": path}}])
+            own = (
+                group_branch_for(audit_id, [{"id": fid, "remediation": {"kind": "manifest", "path": path}}])
+                if built is not None
+                else None
+            )
             if not any(
-                str(pr.get("state") or "").upper() == "OPEN" and pr.get("headRefName") == own for pr in carried[fid]
+                str(pr.get("state") or "").upper() == "OPEN" and own and pr.get("headRefName") == own
+                for pr in carried[fid]
             ):
                 answered.add(fid)
                 continue
+        if built is None:
+            continue
         try:
             target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
         except ValidationError:
@@ -11312,19 +11329,24 @@ def plan_generated_fixes(
         namespace = str(candidate.get("namespace") or "")
         tree = PurePosixPath(*PurePosixPath(fix.path).parts[:CLUSTER_TREE_DEPTH])
         scope = f"{tree}/" if PurePosixPath(fix.path).parts[:1] == (CLUSTER_TREE_ROOT,) else ""
+        # The broker-backed answers say so when the broker could not be asked,
+        # rather than reporting a collision nobody saw.
+        def unchecked(found: str) -> str:
+            return f"the repository could not be checked ({probe.unavailable})" if probe.unavailable else found
+
         reason = None
         if path in taken_paths or (cluster, namespace, name) in taken_names:
             reason = f"another fix this run writes already takes {path} or the name {name}"
         elif name in (candidate.get("namespace_pdbs") or []):
             reason = f"the namespace already has a PodDisruptionBudget named {name}"
-        elif not ours and (target.exists() or probe.has_path(path)):
+        elif not ours and target.exists():
             reason = f"{path} already exists"
+        elif not ours and probe.has_path(path):
+            reason = unchecked(f"{path} already exists")
         elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
-            reason = f"{directory} is inside a Kustomize root, where a new file renders only if listed"
+            reason = unchecked(f"{directory} is inside a Kustomize root, where a new file renders only if listed")
         elif not ours and probe.mentions(name, scope):
-            reason = f"{scope or 'the repository'} already names an object {name}"
-        if reason and probe.unavailable:
-            reason = f"the repository could not be checked ({probe.unavailable})"
+            reason = unchecked(f"{scope or 'the repository'} already names an object {name}")
         if reason:
             log(f"WARNING: {fid}: `finish` does not write its PodDisruptionBudget: {reason}")
             continue
@@ -11350,6 +11372,15 @@ def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, st
             {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
         )
         log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
+
+
+def _path_is_contained(root: Path, path: str) -> bool:
+    """Whether `resolve_inside_repo` would accept `path`, asked without logging."""
+    try:
+        resolve_inside_repo(root, path, "remediation.path")
+    except ValidationError:
+        return False
+    return True
 
 
 def has_run_record(audit_id: str, repo: str | None = None) -> bool:
@@ -13800,8 +13831,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # and the fix reached the ledger as `manual`. A declined fix publishes as
     # `manual` with the reason on its row.
     declines = dict(getattr(args, "decline_fix", None) or [])
+    # A promised path the containment check refused is no fix the sweep would
+    # open: writing at it is what the check stops, so it is not refused again
+    # as unwritten, and publishes `manual` with its SECURITY line as before.
+    sweep_degraded = [fid for fid in degraded if _path_is_contained(root, promised.get(fid, ""))]
     unwritten = (
-        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
+        unwritten_sweep_fixes(findings, manifest, promised, sweep_degraded, audit_id, remediation_prs)
         if findings
         else {}
     )

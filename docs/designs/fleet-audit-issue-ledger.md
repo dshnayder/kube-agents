@@ -134,7 +134,8 @@ findings that have a mergeable diff should arrive ready to merge; the long tail 
 streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
 named in the ledger, in the same section that names what a collector manifest withholds from the
 sweep ([collector design §3.4](fleet-audit-collector-manifest.md)). A finding the floor
-passes over is named there too, as below the floor; `/remediate` reaches it, because an explicit request is not held to the
+passes over is named there too, as below the floor, up to twenty a block and a count of the rest
+(`MAX_WITHHELD_ROWS`); `/remediate` reaches it, because an explicit request is not held to the
 floor.
 
 **Condition 1 is a rank comparison, not an equality**, and the distinction only shows up once the

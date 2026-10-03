@@ -10246,6 +10246,23 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.stdout_json()["prs_still_open"], [])
 
+    def test_a_pull_request_carrying_a_manual_finding_is_reported_through_finish(self):
+        """The wiring, end to end: a finding left `manual` has no branch of its
+        own, so only the pull request's delta block reaches `prs_still_open`;
+        on a finding this run no longer carries, it does not."""
+        doc = make_doc()
+        doc["findings"][0]["remediation"] = {"kind": "manual", "note": "a pull request carries it"}
+        fid = audit_report.derive_finding_id(dict(doc["findings"][0]))
+        carrying = pr(5, "platform-agent/fix-elsewhere", body=audit_report.delta_block([fid]))
+        self.harness.replies["pr list"] = json.dumps([carrying])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_still_open"], ["https://github.com/acme/fleet/pull/5"])
+        self.harness.replies["pr list"] = json.dumps(
+            [pr(5, "platform-agent/fix-elsewhere", body=audit_report.delta_block(["gone"]))]
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_still_open"], [])
+
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
         # have linked it. One extra edit beats making a reader wait a day.
@@ -15252,7 +15269,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
 
-    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=()):
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False):
         manifest = self.manifest()
         manifest["clusters"][0]["candidates"][0].update(
             {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
@@ -15264,6 +15281,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
+            if prime:
+                # As the Config Connector scan does before planning.
+                probe.broker()
             planned, self.answered = audit_report.plan_generated_fixes(
                 findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
             )
@@ -15344,6 +15364,52 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(written, [])
                 # Answered, so `finish` does not refuse over it either.
                 self.assertEqual(self.answered, {"a"})
+
+    def test_a_pull_request_carrying_a_fix_finish_cannot_build_answers_it(self):
+        """No usable selector, so the worker wrote it by hand once; its pull
+        request answers the next run as it would for any other check."""
+        carrying = {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z", "headRefName": "x",
+                    "body": audit_report.delta_block(["a"])}
+        written, _ = self.generate(selector=None, prs=[carrying])
+        self.assertEqual(written, [])
+        self.assertEqual(self.answered, {"a"})
+
+    def test_a_namespace_collision_is_not_blamed_on_the_broker(self):
+        module = mock.MagicMock()
+        module.Workspace.open.side_effect = RuntimeError("store full")
+        self.patch_attr("content_mode", lambda: True)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            self.generate(namespace_pdbs=["a-pdb"], prime=True)
+        self.assertIn("the namespace already has a PodDisruptionBudget named a-pdb", self.generate_err)
+        self.assertNotIn("could not be checked", self.generate_err)
+
+    def test_the_broker_is_asked_about_one_path_once(self):
+        inner = mock.MagicMock()
+        inner.list.return_value = []
+        session = mock.MagicMock()
+        session.__enter__.return_value = inner
+        module = mock.MagicMock()
+        module.Workspace.open.return_value = session
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            for _ in range(3):
+                self.assertFalse(probe.has_path("clusters/kustomization.yaml"))
+        self.assertEqual(inner.list.call_count, 1)
+
+    def test_a_promised_path_the_containment_check_refuses_is_not_refused_again(self):
+        """Writing at it is what the check stops, so the run publishes it
+        `manual` with its SECURITY line rather than telling the worker to write
+        through the link."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        outside = Path(tempfile.mkdtemp(prefix="outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        shutil.rmtree(self.workspace / "clusters", ignore_errors=True)
+        (self.workspace / "clusters").symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIn("SECURITY", self.err)
+        self.assertNotIn("their fix is not written", self.err)
 
     def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
         """The next run's clone no longer holds the file; refusing there would
@@ -19711,8 +19777,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     `major` manifest only on `MAJOR_SWEEP_CHECKS`, and `two_findings`' `major`
     finding is on none of them, so no transcript gains a pull request. And the JSON
     line carries `prs_still_open`, the remediation pull requests already open
-    on findings the run still carries, empty in every scenario here. Nothing
-    else moved.
+    on findings the run still carries, empty in every scenario here. And
+    `two_findings`' `major` finding, below the floor on this stream, is now
+    named in the bodies' below-floor block, and the dry run logs it on
+    stderr. Nothing else moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,
