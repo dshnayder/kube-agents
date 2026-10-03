@@ -19291,6 +19291,17 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
         out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
         self.assertIn("update c --location=us-east4 --project=p --no-enable-dns-access", out)
 
+    def test_a_backticked_update_command_gets_its_dns_command_too(self):
+        """The IP arm treats a backticked span as a command; the DNS arm has to
+        find the same one, or the note closes one endpoint of two."""
+        note = (
+            "Close the public endpoint: `gcloud container clusters update c --location=us-east4 "
+            "--project=p --enable-master-authorized-networks --master-authorized-networks=<CIDR>`"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("update c --location=us-east4 --project=p --no-enable-dns-access", out)
+        self.assertEqual(out.count(audit_report.DNS_ACCESS_FLAG), 1)
+
     def test_a_location_named_only_in_a_comment_is_not_read(self):
         note = (
             "gcloud container clusters update c --project=p --enable-master-authorized-networks "
@@ -19641,13 +19652,20 @@ class TestGcloudFormatQuoting(unittest.TestCase):
             "Confirm the cluster's channel: gcloud container clusters describe c --format='value(x)'",
         )
 
-    def test_a_wrapper_continued_onto_the_next_line_is_untouched(self):
-        for note in (
-            "watch 'gcloud container clusters describe c \\\n  --format=value(status)'",
-            'S="$(gcloud container clusters describe c \\\n  --format=value(status))"',
-        ):
+    def test_a_wrapper_continued_onto_the_next_line_is_quoted_for_that_wrapper(self):
+        """The logical line decides: a single-quoted wrapper opened on the line
+        before still holds the continuation, so it gets double quotes."""
+        cases = {
+            "watch 'gcloud container clusters describe c \\\n  --format=value(status)'": (
+                "watch 'gcloud container clusters describe c \\\n  --format=\"value(status)\"'"
+            ),
+            'S="$(gcloud container clusters describe c \\\n  --format=value(status))"': (
+                'S="$(gcloud container clusters describe c \\\n  --format=\'value(status)\')"'
+            ),
+        }
+        for note, expected in cases.items():
             with self.subTest(note):
-                self.assertEqual(self.quote(note), note)
+                self.assertEqual(self.quote(note), expected)
 
     def test_an_apostrophe_in_the_prose_before_the_span_is_not_a_quote(self):
         self.assertEqual(
@@ -19686,15 +19704,21 @@ class TestGcloudFormatQuoting(unittest.TestCase):
         note = "gcloud x --format 'json(a,b)'"
         self.assertEqual(self.quote(note), note)
 
-    def test_an_expression_inside_a_double_quoted_substitution_is_untouched(self):
-        # The shell reads no subshell inside double quotes, so quotes added
-        # there would reach gcloud as part of the expression.
-        note = 'ep="$(gcloud x describe c --format=value(endpoint))"'
-        self.assertEqual(self.quote(note), note)
+    def test_an_expression_inside_a_double_quoted_substitution_is_quoted(self):
+        # `$(...)` is a fresh parse: the bare `(` is a syntax error there as at
+        # the prompt, and the inner command reads the single quotes.
+        self.assertEqual(
+            self.quote('ep="$(gcloud x describe c --format=value(endpoint))"'),
+            "ep=\"$(gcloud x describe c --format='value(endpoint)')\"",
+        )
 
-    def test_an_expression_inside_a_single_quoted_wrapper_is_untouched(self):
-        note = "watch 'gcloud x describe c --format=value(status)'"
-        self.assertEqual(self.quote(note), note)
+    def test_an_expression_inside_a_single_quoted_wrapper_gets_double_quotes(self):
+        # `watch` hands its string to `sh -c`, which breaks on the bare form;
+        # a single quote would close the wrapper instead.
+        self.assertEqual(
+            self.quote("watch 'gcloud x describe c --format=value(status)'"),
+            "watch 'gcloud x describe c --format=\"value(status)\"'",
+        )
 
     def test_a_closed_double_quoted_string_earlier_on_the_line_does_not_stop_it(self):
         self.assertEqual(
