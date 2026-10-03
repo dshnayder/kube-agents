@@ -15411,6 +15411,36 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("SECURITY", self.err)
         self.assertNotIn("their fix is not written", self.err)
 
+    def test_a_refused_promised_path_leaves_the_declared_shape_too(self):
+        """The degrade makes it `manual`, so without the filter the declared
+        shape refuses it beside the same refused directory."""
+        outside = Path(tempfile.mkdtemp(prefix="outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (self.workspace / "apps").symlink_to(outside, target_is_directory=True)
+        promised = {"a": "apps/a/deploy.yaml"}
+        unwritten = self.unwritten([self.manual()], self.manifest(), promised, [])
+        self.assertTrue(unwritten["a"].declared)
+        self.assertEqual(audit_report.without_refused_paths(unwritten, ["a"], promised, self.workspace), {})
+        kept = audit_report.without_refused_paths(unwritten, ["a"], {"a": "clusters/a/pdb.yaml"}, self.workspace)
+        self.assertIn("a", kept)
+
+    def test_a_backtick_in_a_comment_does_not_hide_the_command(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks  # replace `1.2.3.4/32`, or see "
+            "`gcloud container clusters update other --location=us-west1`"
+        )
+        self.assertEqual(
+            [command.split()[4] for command, _ in audit_report._gcloud_commands(note)], ["c"]
+        )
+
+    def test_a_projection_in_a_plain_double_quoted_argument_is_left_alone(self):
+        """The `(` is already quoted there, and a quote added would reach gcloud."""
+        text = 'gcloud container clusters describe c "--format=value(status)"'
+        self.assertEqual(audit_report.quote_gcloud_format_projections(text), text)
+        wrapped = 'S="$(gcloud container clusters describe c --format=value(status))"'
+        self.assertIn("--format='value(status)'", audit_report.quote_gcloud_format_projections(wrapped))
+
     def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
         """The next run's clone no longer holds the file; refusing there would
         loop, and the sweep reports the live pull request as still open."""

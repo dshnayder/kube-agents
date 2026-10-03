@@ -623,6 +623,8 @@ _GCLOUD_BARE_FORMAT_RE = re.compile(
 # An apostrophe between two word characters is English ("the cluster's
 # channel"), not a shell quote, so the quote-parity test discounts it.
 _WORD_APOSTROPHE_RE = re.compile(r"(?<=\w)'(?=\w)")
+# What opens a command substitution, a fresh parse even inside double quotes.
+COMMAND_SUBSTITUTION = "$("
 
 # The `recommendation` fields that carry a command a reader pastes. `rationale`
 # is argument, never a command, so it is not rewritten.
@@ -3833,7 +3835,8 @@ def normalise_gcloud_enum_values(note: str) -> str:
 
 
 def quote_gcloud_format_projections(text: str) -> str:
-    """Single-quote a bare `--format=value(...)` so pasting it is not a syntax error.
+    """Quote a bare `--format=value(...)` so pasting it is not a syntax error:
+    single quotes, or double quotes inside a single-quoted wrapper.
 
     gcloud accepts the expression unquoted only because it never reaches gcloud
     unquoted: the shell reads `(` first. A reader who copies the Recommendation
@@ -3860,6 +3863,12 @@ def quote_gcloud_format_projections(text: str) -> str:
         if line.count("`") % 2:
             line = line[line.rfind("`") + 1 :]
         line = _WORD_APOSTROPHE_RE.sub("", line)
+        # Inside a plain double-quoted argument (`"--format=value(x)"`) the `(`
+        # is already quoted and any quote added there reaches gcloud; only a
+        # `$(` opened since that quote starts a fresh parse.
+        open_double = line.replace('\\"', "").split('"')
+        if len(open_double) % 2 == 0 and COMMAND_SUBSTITUTION not in open_double[-1]:
+            return match.group(0)
         quote = '"' if line.count("'") % 2 else "'"
         return f"{match.group('flag')}{match.group('sep')}{quote}{match.group('proj')}{quote}"
 
@@ -4025,15 +4034,19 @@ def _gcloud_commands(text: str) -> list[tuple[str, int]]:
     lines = text.split("\n")
     commands: list[tuple[str, int]] = []
     for first, last, _joined in _logical_command_spans(lines):
-        if any("`" in line for line in lines[first : last + 1]):
-            for index in range(first, last + 1):
-                commands.extend(
-                    (span.strip().removeprefix(SHELL_PROMPT), index)
-                    for span in INLINE_CODE_SPAN.findall(lines[index])
-                    if _is_gcloud_command(span)
-                )
-            continue
         code = [_comment_free(line) for line in lines[first : last + 1]]
+        # A backtick in a `#` comment ("replace `1.2.3.4/32`") makes no span
+        # of the command, and a line whose spans hold no gcloud command is
+        # read whole.
+        spans = [
+            (span.strip().removeprefix(SHELL_PROMPT), first + offset)
+            for offset, line in enumerate(code)
+            for span in INLINE_CODE_SPAN.findall(line)
+            if _is_gcloud_command(span)
+        ]
+        if spans:
+            commands.extend(spans)
+            continue
         joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
         if _is_gcloud_command(joined):
             commands.append((joined.strip().removeprefix(SHELL_PROMPT), last))
@@ -11387,6 +11400,21 @@ def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, st
         log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
 
 
+def without_refused_paths(
+    unwritten: dict[str, "UnwrittenFix"], degraded: list[str], promised: dict[str, str], root: Path
+) -> dict[str, "UnwrittenFix"]:
+    """`unwritten` less every degraded fix whose promised path the containment
+    check refused, in either shape.
+
+    Writing at that path is what the check stops, so refusing it would loop;
+    it publishes `manual` with its SECURITY line instead. Both shapes, because
+    the degrade made it `manual`, and the declared shape would otherwise
+    refuse it beside the same refused directory.
+    """
+    refused = {fid for fid in degraded if not _path_is_contained(root, promised.get(fid, ""))}
+    return {fid: fix for fid, fix in unwritten.items() if fid not in refused}
+
+
 def _path_is_contained(root: Path, path: str) -> bool:
     """Whether `resolve_inside_repo` would accept `path`, asked without logging."""
     try:
@@ -13847,11 +13875,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A promised path the containment check refused is no fix the sweep would
     # open: writing at it is what the check stops, so it is not refused again
     # as unwritten, and publishes `manual` with its SECURITY line as before.
-    sweep_degraded = [fid for fid in degraded if _path_is_contained(root, promised.get(fid, ""))]
-    unwritten = (
-        unwritten_sweep_fixes(findings, manifest, promised, sweep_degraded, audit_id, remediation_prs)
+    unwritten = without_refused_paths(
+        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
         if findings
-        else {}
+        else {},
+        degraded,
+        promised,
+        root,
     )
     # A fix `finish` can derive is written rather than refused, but only once
     # the run is past the refusal, so a refused run leaves no file behind.
