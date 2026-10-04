@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the credential proxy client shim.
 
-The shim is what every `kubectl`/`gcloud`/`gh`/`git` in the agent container
-actually is, so what it puts in the request body decides whether a command
+The shim is what every `kubectl`/`gcloud` in the sandbox actually is, so what it puts in the request body decides whether a command
 reaches the right cluster - or is rejected outright.
 
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
@@ -111,15 +110,6 @@ class TestKubeconfigResolution(SubmittedPayloadTestCase):
         # The other path-valued field, and gone for the same reason.
         payload = self.submit(["kubectl", "get", "pods"], {})
         self.assertNotIn("cwd", payload)
-
-    def test_git_and_gh_do_not(self):
-        # Neither reads KUBECONFIG, and an unreadable one is now a hard failure
-        # - so resolving it here would refuse a command with nothing to do with
-        # Kubernetes.
-        for argv in (["git", "status"], ["gh", "pr", "list"]):
-            with self.subTest(argv=argv):
-                payload = self.submit(argv, {"KUBECONFIG": "/nowhere/at/all.yaml"})
-                self.assertNotIn("kubeconfigContext", payload)
 
     def test_absent_when_unset(self):
         payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": ""})
@@ -721,8 +711,6 @@ class StdinGateTest(unittest.TestCase):
             ["kubectl", "apply", "--filename", "-"],
             ["kubectl", "apply", "--filename=-"],
             ["kubectl", "patch", "deploy/x", "--patch-file", "-"],
-            ["gh", "pr", "create", "--title", "t", "--body-file", "-"],
-            ["gh", "issue", "create", "--body-file=-"],
         ):
             with self.subTest(argv=argv):
                 self.assertTrue(credential_proxy_client.reads_stdin(argv))
@@ -736,6 +724,8 @@ class StdinGateTest(unittest.TestCase):
             ["git", "log", "-"],
             ["kubectl", "logs", "-f", "pod/x"],
             ["gh", "pr", "create", "--body", "-"],
+            # gh's flag, gone with its shim.
+            ["gh", "pr", "create", "--body-file", "-"],
         ):
             with self.subTest(argv=argv):
                 self.assertFalse(credential_proxy_client.reads_stdin(argv))
@@ -1092,7 +1082,13 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
             {
                 "list": [
                     {"entries": ["a/0.yaml", "a/1.yaml"], "total": 3, "truncated": True},
-                    {"entries": ["a/2.yaml"], "total": 1, "truncated": False},
+                    {
+                        "entries": ["a/2.yaml"],
+                        "symlinks": ["a/1b.yaml"],
+                        "symlinkedDirectories": [{"path": "a/linked", "target": "../b"}],
+                        "total": 1,
+                        "truncated": False,
+                    },
                 ]
             }
         )
@@ -1100,9 +1096,16 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
         self.assertEqual(["a/0.yaml", "a/1.yaml"], list(first))
         self.assertTrue(first.truncated)
         self.assertEqual(3, first.total)
+        # A broker older than the field reports no symlinks rather than failing.
+        self.assertEqual([], first.symlinks)
+        self.assertEqual([], first.symlinked_directories)
 
         second = workspace.list(prefix="a", after=first[-1])
         self.assertFalse(second.truncated)
+        self.assertEqual(["a/1b.yaml"], second.symlinks)
+        self.assertEqual(
+            [{"path": "a/linked", "target": "../b"}], second.symlinked_directories
+        )
         self.assertEqual(
             {"handle": self.HANDLE, "prefix": "a", "after": "a/1.yaml"},
             self.calls[2][1],
@@ -1462,6 +1465,21 @@ class TestRealShellCommandLines(unittest.TestCase):
 
     A = "gke_acme-evals_us-central1-a_seeded-a"
     B = "gke_acme-evals_us-central1-a_seeded-b"
+
+    def test_the_shim_will_not_run_as_gh_or_git(self):
+        # An image that kept a stray symlink would otherwise forward `git
+        # commit` to a broker whose filesystem is not this one.
+        shim = self.root / "bin" / "credential-proxy-exec"
+        before = len(self.requests)
+        for name in ("gh", "git"):
+            with self.subTest(name=name):
+                (self.root / "bin" / name).symlink_to(shim)
+                completed = subprocess.run(
+                    ["bash", "-c", f"{name} status"],
+                    env=self.env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertNotEqual(0, completed.returncode)
+        self.assertEqual(before, len(self.requests))
 
     def test_and_chained_kubectl_reaches_the_fetched_cluster(self):
         self.assertEqual([f"m -> {self.A}"], self.line("FETCH seeded-a && kubectl get pods m"))
