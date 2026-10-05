@@ -2141,6 +2141,10 @@ Two consequences, both small and both easy to omit:
   Secret the forge's `credentialsRef` names. This is the per-forge guidance
   override that [the Bitbucket check](#checking-it-against-bitbucket) predicted
   would be needed; GitLab needs it first.
+- **So does a GitLab 400.** GitLab answers a request whose fields it validated
+  and refused — a merge request from a branch that was never pushed — with 400,
+  where GitHub answers 422. The shared table has no 400, so the override maps it
+  onto `FORGE_REJECTED`: fix the field, do not retry.
 
 One more property of the token that belongs here because it surfaces elsewhere:
 **a group or project access token authenticates as a bot user** that GitLab

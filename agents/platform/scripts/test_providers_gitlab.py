@@ -313,6 +313,13 @@ class ErrorsTest(unittest.TestCase):
         self.assertEqual("FORGE_UNAUTHENTICATED", error.fields["code"])
         self.assertIn("credentialsRef", str(error))
 
+    def test_a_validation_failure_is_a_bad_argument_not_a_retry(self):
+        # Recorded live: a merge request from a branch that was never pushed.
+        error = providers.forge_error(
+            400, "source_branch: does not exist", forge().error_overrides
+        )
+        self.assertEqual("FORGE_REJECTED", error.fields["code"])
+
 
 class RegistryTest(unittest.TestCase):
     def setUp(self):
