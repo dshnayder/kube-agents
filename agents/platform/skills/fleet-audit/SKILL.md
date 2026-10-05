@@ -363,6 +363,13 @@ a branch it does not have falls back to the base, which is what a first round wa
 
 All three exit 2 in directory mode, where the clone already holds the file.
 
+`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` starts the
+findings document from the collector's manifest: `scope.clusters` with each collected target's
+`checks_run` copied from the commands it ran, `scope.skipped` for every target it could not read, and
+one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
+`recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
+cannot make: write them, and `finish` has nothing else to reject.
+
 ### Step 3 — `finish`
 
 ```bash

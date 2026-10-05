@@ -74,6 +74,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -9424,6 +9425,33 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
         yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
 
 
+# The suffix of the temporary file `--out` writes beside its target before the
+# rename, so a reader of the directory can tell a half-written manifest apart.
+MANIFEST_TEMP_SUFFIX = ".partial"
+
+
+def write_manifest_atomically(path: Path, text: str) -> None:
+    """Write `text` to `path` so a reader sees the whole manifest or none of it.
+
+    A temporary file in the same directory, flushed to disk, then renamed over
+    `path`: a collector killed part-way -- a terminal timeout, a second run
+    started beside the first -- leaves the previous file or no file, never two
+    documents spliced into one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=MANIFEST_TEMP_SUFFIX)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
@@ -9443,6 +9471,13 @@ def main(argv: list[str] | None = None) -> int:
             "repository declares its object; omit and no candidate is annotated"
         ),
     )
+    parser.add_argument(
+        "--out",
+        help=(
+            "write the manifest to this path, atomically, rather than to stdout; "
+            "stdout then carries only the one-line summary"
+        ),
+    )
     args = parser.parse_args(argv)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
@@ -9457,11 +9492,16 @@ def main(argv: list[str] | None = None) -> int:
         workspace = None
     with indexed_workspace(workspace) as indexed:
         manifest = collect_fleet(args.audit, args.project, workspace=indexed)
-    print(json.dumps(manifest, indent=2))
+    if args.out:
+        write_manifest_atomically(Path(args.out), json.dumps(manifest, indent=2) + "\n")
+        print(summary_line(manifest))
+    else:
+        print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):
-        # The manifest is still written -- the shell has already redirected
-        # stdout -- but a run that found nothing to audit is a failed run.
+        # The manifest is still written -- to `--out`, or to a stdout the shell
+        # has already redirected -- but a run that found nothing to audit is a
+        # failed run.
         log(f"WARNING: {manifest['error']}")
         return 1
     return 0

@@ -13181,6 +13181,96 @@ def handle_list(args: argparse.Namespace) -> None:
     )
 
 
+# What `draft` leaves for the worker: the judgement a collector cannot make.
+DRAFT_RECOMMENDATION = {"action": "", "rationale": "", "risk": ""}
+DRAFT_REMEDIATION = {"kind": "manual", "note": ""}
+
+
+def _draft_location(name: str) -> tuple[str, str]:
+    """`(project, location)` off a qualified target name, empty where it has none."""
+    if name.startswith(PROJECT_TARGET_PREFIX):
+        return name[len(PROJECT_TARGET_PREFIX) :], ""
+    parts = name.split(QUALIFIED_TARGET_SEPARATOR)
+    if len(parts) == QUALIFIED_CLUSTER_SEGMENTS:
+        return parts[0], parts[1]
+    return "", ""
+
+
+def draft_findings(manifest: dict, audit_id: str) -> dict:
+    """A findings document holding everything the collector already knows.
+
+    Every target the collector read becomes a `scope.clusters` entry whose
+    `checks_run` is the commands it ran at `rc == 0`; every other target goes to
+    `scope.skipped` with its error; every candidate becomes a finding with its
+    evidence, impact and severity. What is left is the judgement: the
+    `recommendation` fields are empty and the `remediation` is `manual`, for
+    the worker to write. Building this by hand cost every worker five to ten
+    `finish` rejections, and the shortcuts taken to escape them.
+    """
+    roster = set(audit_checks(audit_id))
+    clusters: list[dict] = []
+    skipped: list[dict] = []
+    findings: list[dict] = []
+    for entry in _manifest_clusters(manifest):
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            skipped.append({"cluster": name, "reason": str(entry.get("error") or entry.get("outcome") or "not collected")})
+            continue
+        commands = {
+            str(c.get("check")): str(c.get("command") or "")
+            for c in entry.get("commands") or []
+            if isinstance(c, dict) and c.get("rc") == 0 and str(c.get("check")) in roster
+        }
+        project, location = _draft_location(name)
+        cluster = {
+            "name": name,
+            "location": location or name,
+            "project": project or name,
+            "checks_run": [{"check": check, "command": command} for check, command in sorted(commands.items())],
+        }
+        if CLUSTERS_LISTED_KEY in entry:
+            cluster[CLUSTERS_LISTED_KEY] = entry[CLUSTERS_LISTED_KEY]
+        clusters.append(cluster)
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            check = str(candidate.get("check") or "")
+            obj = str(candidate.get("object") or "")
+            findings.append(
+                {
+                    "id": f"{check}.{name}.{candidate.get('namespace') or '_'}.{obj}",
+                    "check": check,
+                    "severity": str(candidate.get("severity") or ""),
+                    "title": f"{check} on {obj}",
+                    "cluster": str(candidate.get("cluster") or name),
+                    "namespace": str(candidate.get("namespace") or ""),
+                    "object": obj,
+                    "evidence": {
+                        "command": str(candidate.get("command") or commands.get(check, "")),
+                        "excerpt": str(candidate.get("excerpt") or ""),
+                    },
+                    "impact": str(candidate.get("impact") or ""),
+                    "recommendation": dict(DRAFT_RECOMMENDATION),
+                    "remediation": dict(DRAFT_REMEDIATION),
+                }
+            )
+    return {"audit": audit_id, "scope": {"clusters": clusters, "skipped": skipped}, "findings": findings}
+
+
+def handle_draft(args: argparse.Namespace) -> None:
+    """Write the findings document `draft_findings` builds from a manifest."""
+    validate_audit_id(args.audit)
+    manifest = load_manifest(args.manifest_file, args.audit)
+    text = json.dumps(draft_findings(manifest, args.audit), indent=2) + "\n"
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        log(f"draft: wrote {args.out}; fill each finding's recommendation and remediation")
+    else:
+        sys.stdout.write(text)
+
+
 def handle_grep(args: argparse.Namespace) -> None:
     """Search inside the files of the broker's checkout, content mode only.
 
@@ -15287,6 +15377,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_read_branch_argument(fetch_parser)
 
+    draft_parser = subparsers.add_parser(
+        "draft",
+        help="Write a findings document from the collector manifest: scope, "
+        "checks_run, and one finding per candidate with its evidence. The "
+        "recommendation fields are left empty and each remediation `manual`, "
+        "for you to fill before `finish`.",
+    )
+    draft_parser.add_argument("--audit", required=True, help="Audit id.")
+    draft_parser.add_argument("--manifest-file", required=True, help="The manifest the collector wrote.")
+    draft_parser.add_argument("--out", default=None, help="Write the document here rather than to stdout.")
+
     list_parser = subparsers.add_parser(
         "list",
         help="Name the files in the broker's checkout, so a remediation path can be "
@@ -15392,6 +15493,8 @@ def main(argv: list[str] | None = None) -> int:
             handle_list(args)
         elif args.subcommand == "grep":
             handle_grep(args)
+        elif args.subcommand == "draft":
+            handle_draft(args)
         elif args.subcommand == "remediate":
             handle_remediate(args)
         else:

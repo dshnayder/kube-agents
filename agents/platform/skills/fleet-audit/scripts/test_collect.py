@@ -4423,6 +4423,38 @@ class TestCollectFleet(unittest.TestCase):
         self.assertIn("no-pdb: 2; service-selects-nothing: 1", line)
         self.assertIn("clusters[].candidates", line)
 
+    def test_out_writes_the_manifest_to_the_file_and_only_the_summary_to_stdout(self):
+        manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": [{"check": "no-pdb"}]}]}
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            with patch.object(collect, "collect_fleet", return_value=manifest), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out, \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(collect.main(["obtainability-audit", "--out", str(path)]), 0)
+            self.assertEqual(json.loads(path.read_text()), manifest)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
+        self.assertEqual(out.getvalue().strip(), collect.summary_line(manifest))
+
+    def test_a_write_that_dies_part_way_leaves_no_file(self):
+        """A collector killed mid-write, or a second run beside the first, must
+        not leave two documents spliced into one at the path."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+
+            def interrupted(fd):
+                raise KeyboardInterrupt
+
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            path.write_text('{"previous": true}')
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
+
     def test_an_empty_fleet_summary_is_the_count_alone(self):
         manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": []}]}
         self.assertEqual(

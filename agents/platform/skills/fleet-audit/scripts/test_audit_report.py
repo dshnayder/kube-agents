@@ -2708,7 +2708,8 @@ class TestAuditCatalogue(unittest.TestCase):
                 # The prompt may name an interpreter first; drop it and run the
                 # script under this suite's own Python.
                 argv = argv[1:] if argv[0].endswith("python3") else argv
-                script = profile / argv[0]
+                # An absolute path names the profile as the pod mounts it.
+                script = profile / argv[0].removeprefix("/opt/data/profiles/platform/")
                 exercised.add(audit_id)
                 with self.subTest(audit=audit_id, command=invocation):
                     self.assertTrue(script.is_file(), f"{script} does not exist")
@@ -15900,6 +15901,68 @@ class TestUncorroboratedFindings(BaseTestCase):
                     ),
                     set(),
                 )
+
+
+class TestDraftFindings(BaseTestCase):
+    """`draft` builds what the collector knows, so `finish` rejects only the
+    judgement the worker still owes."""
+
+    NAME = "acme/us-east1/prod-us-east"
+
+    def manifest(self):
+        checks = list(audit_report.audit_checks(AUDIT))
+        return {
+            "version": 1,
+            "audit": AUDIT,
+            "clusters": [
+                {
+                    "name": self.NAME,
+                    "outcome": "collected",
+                    "commands": [
+                        {"check": c, "command": f"KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get {c} -A -o json", "rc": 0}
+                        for c in checks
+                    ],
+                    "candidates": [
+                        {
+                            "check": "netpol-missing",
+                            "cluster": self.NAME,
+                            "namespace": "payments",
+                            "object": "Namespace/payments",
+                            "severity": "critical",
+                            "excerpt": "zero NetworkPolicies in payments",
+                            "impact": "All pod-to-pod traffic in payments is unrestricted.",
+                        }
+                    ],
+                },
+                {"name": "acme/us-west1/dr-west", "outcome": "gate-failed", "error": "API server unreachable"},
+            ],
+        }
+
+    def test_the_draft_is_rejected_only_for_the_recommendation(self):
+        draft = audit_report.draft_findings(self.manifest(), AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as rejected:
+            audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        self.assertIn("findings[0].recommendation", str(rejected.exception))
+        for finding in draft["findings"]:
+            finding["recommendation"] = {
+                "action": "Apply a default-deny NetworkPolicy.",
+                "rationale": "Smallest change that closes east-west exposure.",
+                "risk": "Traffic not allowed explicitly stops.",
+            }
+        validated = audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        audit_report.cross_check_manifest(validated, self.manifest())
+        self.assertEqual(draft["scope"]["skipped"], [{"cluster": "acme/us-west1/dr-west", "reason": "API server unreachable"}])
+        self.assertEqual(draft["findings"][0]["remediation"], {"kind": "manual", "note": ""})
+        self.assertEqual(draft["findings"][0]["evidence"]["excerpt"], "zero NetworkPolicies in payments")
+
+    def test_the_subcommand_writes_the_draft(self):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        out = self.tmp_path / "findings.json"
+        self.assertEqual(
+            self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), "--out", str(out)]), 0, self.err
+        )
+        self.assertEqual(json.loads(out.read_text())["findings"][0]["check"], "netpol-missing")
 
 
 class TestUnwrittenSweepFixes(HarnessTestCase):
