@@ -354,6 +354,14 @@ class VcsBroker:
             "this broker does not build."
         )
 
+    def credential_reach(self, forge: Forge) -> tuple[list[str], bool] | None:
+        """What `forge`'s credential can reach, asked through its own transport.
+
+        None when the forge cannot say. Raises what the transport raises; the
+        caller decides what an unanswered question means.
+        """
+        return forge.reach(self._transport(forge, "").api)
+
     def _git_for(self, forge: Forge, repo: str) -> Callable[..., Any]:
         """A git runner carrying whatever config this forge needs on it.
 

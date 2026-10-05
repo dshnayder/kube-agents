@@ -166,6 +166,17 @@ class Forge:
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
 
+    def reach(self, api: Callable) -> tuple[list[str], bool] | None:
+        """The repositories this forge's credential can reach, and whether the
+        list was cut short; None when the forge cannot say.
+
+        Asked once, when the broker starts, so an install can see a token that
+        reaches further than the repositories it manages. A token minted per
+        repository reaches exactly what it was minted for, and its forge has
+        nothing to report.
+        """
+        return None
+
     def read_credential(self, repo: str) -> Credential:
         """A credential that can only read `repo`, for one clone of it.
 

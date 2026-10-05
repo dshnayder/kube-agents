@@ -7159,6 +7159,47 @@ class RolePermitsTest(unittest.TestCase):
                 self.assertEqual([], handler.replies)
 
 
+class CredentialReachTest(unittest.TestCase):
+    """The startup diagnostic for a token that reaches further than the install."""
+
+    def _broker(self, answer):
+        forge = mock.Mock(hosts=("gitlab.example.com",))
+        forge.name = "gitlab"
+        broker = mock.Mock()
+        broker.registry.forges = [forge]
+        if isinstance(answer, Exception):
+            broker.credential_reach.side_effect = answer
+        else:
+            broker.credential_reach.return_value = answer
+        return broker
+
+    def test_unmanaged_repositories_the_token_reaches_are_named(self):
+        broker = self._broker((["acme/infra", "acme/payroll", "team/secret"], False))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(broker)
+        line = "\n".join(logs.output)
+        self.assertIn("reaches 2 repositories this install does not manage", line)
+        self.assertIn("acme/payroll, team/secret", line)
+        self.assertNotIn("acme/infra,", line)
+
+    def test_a_token_that_reaches_only_managed_repositories_is_quiet(self):
+        broker = self._broker((["acme/infra"], False))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            credential_proxy.warn_on_credential_reach(broker)
+
+    def test_a_forge_that_cannot_say_or_cannot_answer_never_raises(self):
+        credential_proxy.warn_on_credential_reach(self._broker(None))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(RuntimeError("down")))
+        self.assertIn("could not ask what the gitlab credential", "\n".join(logs.output))
+
+
 class ManagedRepositoryGateTest(unittest.TestCase):
     """The broker answers "is this a repository we act on" for itself."""
 

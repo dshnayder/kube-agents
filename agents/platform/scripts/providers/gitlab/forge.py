@@ -122,6 +122,30 @@ class GitLabForge(Forge):
             built.append(cls(entry["host"], token_path, entry.get("allowed_paths") or ()))
         return tuple(built)
 
+    #: How many pages of the token account's projects `reach` reads: enough
+    #: for an account that belongs to a thousand projects, which is already the
+    #: finding.
+    REACH_PAGES = 10
+
+    def reach(self, api: Callable) -> tuple[list[str], bool]:
+        """Every project the token's account is a member of.
+
+        A group or project access token reaches its group or project; a
+        personal access token reaches everything its account belongs to, which
+        is why an install on gitlab.com's Free tier wants to see this list.
+        """
+        paths: list[str] = []
+        for page in range(1, self.REACH_PAGES + 1):
+            batch = api(
+                "GET",
+                "projects",
+                params={"membership": "true", "simple": "true", "per_page": MAX_PAGE_SIZE, "page": page},
+            ) or []
+            paths += [str(item.get("path_with_namespace") or "") for item in batch]
+            if len(batch) < MAX_PAGE_SIZE:
+                return [path for path in paths if path], False
+        return [path for path in paths if path], True
+
     # -- identity -----------------------------------------------------------
 
     def parse(self, url: str) -> str:

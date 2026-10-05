@@ -290,6 +290,23 @@ class TranslationTest(unittest.TestCase):
         self.assertEqual("open", issue["state"])
 
 
+class ReachTest(unittest.TestCase):
+    def test_reach_lists_every_project_the_tokens_account_belongs_to(self):
+        page = [{"path_with_namespace": f"acme/p{i}"} for i in range(100)]
+        api = Api(page, [{"path_with_namespace": "other/x"}])
+        paths, cut_short = forge().reach(api)
+        self.assertEqual(101, len(paths))
+        self.assertFalse(cut_short)
+        self.assertEqual({"membership": "true", "simple": "true", "per_page": 100, "page": 1}, api.calls[0][2])
+        self.assertEqual("projects", api.calls[0][1])
+
+    def test_reach_says_when_it_stopped_short(self):
+        page = [{"path_with_namespace": "acme/p"}] * 100
+        api = Api(*([page] * GitLabForge.REACH_PAGES))
+        _, cut_short = forge().reach(api)
+        self.assertTrue(cut_short)
+
+
 class ErrorsTest(unittest.TestCase):
     def test_a_refused_token_names_the_secret(self):
         error = providers.forge_error(401, "401 Unauthorized", forge().error_overrides)

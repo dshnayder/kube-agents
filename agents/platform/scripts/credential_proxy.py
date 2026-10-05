@@ -5208,7 +5208,61 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         executor.vcs_root,
         ",".join(sorted(forge.name for forge in broker.registry.forges)) or "none",
     )
+    # In the background: a forge that is slow to answer must not hold the
+    # broker's start, and the answer is a log line either way.
+    threading.Thread(target=lambda: warn_on_credential_reach(broker), daemon=True).start()
     return broker
+
+
+def warn_on_credential_reach(broker) -> None:
+    """Log, once, every repository a forge's credential reaches and this install
+    does not manage.
+
+    A token an administrator stored -- a personal access token above all --
+    reaches whatever its account can see. The broker refuses every repository
+    outside the managed list either way; this is so the install can see the
+    breadth it is relying on that refusal for, and narrow the account. Never
+    refuses, never raises: a forge that cannot answer is logged as such.
+    """
+    for forge in broker.registry.forges:
+        try:
+            answer = broker.credential_reach(forge)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not a control
+            LOGGER.warning(
+                "could not ask what the %s credential for %s reaches type=%s",
+                forge.name,
+                ",".join(forge.hosts),
+                type(exc).__name__,
+            )
+            continue
+        if answer is None:
+            continue
+        paths, cut_short = answer
+        try:
+            managed = managed_repositories()
+        except Exception as exc:  # noqa: BLE001 - nothing to compare against
+            LOGGER.warning("credential reach not compared: the managed list is unreadable type=%s", type(exc).__name__)
+            continue
+        extra = sorted(
+            path for path in paths if _repository_key(path, forge) not in managed
+        )
+        if not extra:
+            LOGGER.info(
+                "the %s credential for %s reaches %d repositories, all of them managed",
+                forge.name, forge.hosts[0], len(paths),
+            )
+            continue
+        LOGGER.warning(
+            "the %s credential for %s reaches %s%d repositories this install does not "
+            "manage (the broker refuses each of them; an account that belongs only to "
+            "the managed repositories narrows the token): %s%s",
+            forge.name,
+            forge.hosts[0],
+            "at least " if cut_short else "",
+            len(extra),
+            ", ".join(_sanitize_for_logging(path) for path in extra[:20]),
+            " ..." if len(extra) > 20 else "",
+        )
 
 
 def read_only_enforced() -> bool:
