@@ -1328,27 +1328,12 @@ class VcsBroker:
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
 
-# The verbs that leave a mark on the forge, named here so the HTTP layer can
-# refuse an unmanaged repository before one of them runs. The classification
-# lives beside the route table because that is where a new verb gets added, and
-# a verb added to one and not the other is the mistake this placement is meant
-# to make loud.
-#
-# The read verbs are absent from this set on purpose, and what that buys today
-# is narrower than it reads. This set is the HTTP layer's gate, and it covers
-# writes: a write against an unmanaged repository is refused here, before a
-# verb runs. The reads are not gated *here* -- but every verb that spends the
-# credential asks for it through `BrokeredCredential.ensure`, and on the one
-# forge this install ships the credential is minted per managed repository, so
-# the refresh refuses an unmanaged one with the same 403 before any call is
-# made. In practice, then, `capabilities` is the only verb an unmanaged
-# repository can be asked, and `clone`, `proposal-list/view/commits`,
-# `issue-list/view`, `identity` and `branch-view` refuse it too. The intent that reads of a repository this
-# install does not write to should work -- a public upstream, read with no
-# credential at all -- is real and is not implemented by this set; it needs a
-# credential-less read path, which the design lists as open. Until then the
-# managed list is, in effect, a visibility control as well as a write one on
-# that forge, and the test beside this classification says so.
+# The verbs that leave a mark on the forge. Named beside the route table because
+# that is where a new verb gets added, and a verb added to one and not the other
+# is the mistake this placement is meant to make loud. Every one of them, like
+# every read below, is refused at the HTTP layer for a repository this install
+# does not manage; the set is kept because a write is what that refusal exists
+# for, and the classification test reads it.
 WRITE_VERBS = frozenset(
     {
         "publish",
@@ -1365,6 +1350,19 @@ WRITE_VERBS = frozenset(
         "branch-delete",
     }
 )
+
+
+# The verbs the HTTP layer answers for a repository this install does not
+# manage. `capabilities` reports what a forge serves and spends no credential.
+# Every other verb, read or write, is refused at the route first: reads used to
+# be refused only because the one shipped credential asked the managed list
+# while refreshing, and a credential that does not refresh -- a static token
+# scoped to a whole group -- would have been spent on any repository in it.
+# Reading a repository this install does not manage needs a credential-less
+# read path, which the design lists as open; until it exists, the managed list
+# is a visibility control as well as a write one, by design rather than by
+# accident of one forge.
+UNGATED_VERBS = frozenset({"capabilities"})
 
 
 def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
@@ -1403,6 +1401,7 @@ __all__ = [
     "Binding",
     "VcsBroker",
     "AGENT_BRANCH_PREFIX",
+    "UNGATED_VERBS",
     "WRITE_VERBS",
     "max_bundle_bytes",
     "route_table",

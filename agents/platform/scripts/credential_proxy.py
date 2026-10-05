@@ -6794,17 +6794,18 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     return
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
-                # holds the forge credential, so "is this a repository we write
-                # to" can only be answered here. Nothing downstream answers it
+                # holds the forge credential, so "is this a repository we act
+                # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
-                # -- so this is the whole of the check for these routes.
+                # -- so this is the whole of the check for these routes, reads
+                # included (see `vcs_broker.UNGATED_VERBS`).
                 #
                 # Resolved rather than compared as given, because the managed
                 # list holds slugs and a caller may name a repository by URL.
                 # Resolving here also rejects a host this install serves no
                 # credential for before the write verb is entered, which is the
                 # same order `/v1/forge/refresh` uses.
-                if verb in vcs_broker.WRITE_VERBS:
+                if verb not in vcs_broker.UNGATED_VERBS:
                     try:
                         _, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:

@@ -2244,6 +2244,11 @@ class ExecRouteCapacityTest(unittest.TestCase):
             mock.patch.object(
                 credential_proxy.vcs_broker, "route_table", return_value={"probe": verb}
             ),
+            # About the slot, not the managed-repository gate the stand-in
+            # broker has no registry for.
+            mock.patch.object(
+                credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({"probe"})
+            ),
             mock.patch.object(CredentialProxyHandler, "_json", recording),
         ):
             status, body = self.post({}, path="/v1/vcs/probe")
@@ -5894,10 +5899,8 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
     def test_capabilities_is_the_one_verb_an_unmanaged_repository_can_be_asked(self):
-        # The handler's gate covers writes only, so a read reaches its verb --
-        # and `capabilities` is the one verb that never asks for the
-        # credential, so it is the one that actually answers for a repository
-        # this install does not manage.
+        # It spends no credential, so it is the one verb the route lets
+        # through for a repository this install does not manage.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
             return_value=frozenset({"acme/managed"}),
@@ -5910,36 +5913,43 @@ class VcsRouteTest(unittest.TestCase):
         self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
         self.assertNotEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
-    def test_a_credentialed_read_of_an_unmanaged_repository_is_refused_by_the_credential(self):
-        # Review finding: the comment and the test above used to say reads
-        # "stay open". On the shipped forge they do not: every verb that spends
-        # the credential makes it current first, the refresh is where the
-        # managed list is asked (the token is minted per managed repository),
-        # and `BrokeredCredential.ensure` re-raises exactly that refusal. So a
-        # read of an unmanaged repository is a 403 from the credential side,
-        # before any forge call, and this pins that rather than the wish.
-        def refuse(provider, repository):
-            raise PermissionError(f"{repository} is not a repository this install manages")
-
+    def test_a_read_of_an_unmanaged_repository_is_refused_at_the_route(self):
+        # The gate used to cover writes only, and reads were refused because
+        # the one shipped credential happened to ask the managed list while
+        # refreshing. A credential that does not refresh -- a static token,
+        # scoped to a whole group -- would have spent itself on any repository
+        # in that group. The route asks now, before the credential is touched.
+        refreshed = []
         with mock.patch.object(
             credential_proxy, "managed_repositories",
             return_value=frozenset({"acme/managed"}),
         ):
-            status, payload = self._handler(
-                "/v1/vcs/issue-view",
-                {"repository": "https://github.com/acme/not-ours", "number": 1},
-                self.broker(refresh=refuse),
-            )
-        self.assertEqual(HTTPStatus.FORBIDDEN, status)
-        self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+            for verb, extra in (
+                ("issue-view", {"number": 1}),
+                ("proposal-list", {}),
+                ("clone", {}),
+                ("identity", {}),
+            ):
+                with self.subTest(verb=verb):
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}",
+                        {"repository": "https://github.com/acme/not-ours", **extra},
+                        self.broker(refresh=lambda provider, repository: refreshed.append(repository)),
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+        self.assertEqual([], refreshed)
 
     def test_every_write_verb_is_covered_by_the_gate(self):
         # Named against the route table rather than a hand-written list, so a
         # verb added to the broker and not classified fails here instead of
-        # shipping ungated. `capabilities` and `clone` are reads; the rest of
-        # the split is asserted by name.
+        # shipping ungated. Only `capabilities` passes the route ungated; the
+        # read/write split is still asserted by name, because a write is what
+        # the gate exists for.
         routes = set(vcs_broker.route_table(self.broker()))
         self.assertTrue(vcs_broker.WRITE_VERBS <= routes)
+        self.assertEqual({"capabilities"}, set(vcs_broker.UNGATED_VERBS))
+        self.assertFalse(vcs_broker.UNGATED_VERBS & vcs_broker.WRITE_VERBS)
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
@@ -5998,7 +6008,9 @@ class VcsRouteTest(unittest.TestCase):
             raise subprocess.CalledProcessError(128, ["git", "clone"], "", secret)
 
         broker = self.broker(git_runner=explode)
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs, mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset({"acme/infra"})
+        ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
             )
@@ -6014,7 +6026,9 @@ class VcsRouteTest(unittest.TestCase):
             raise ZeroDivisionError("/etc/broker/private-key.pem line 3")
 
         broker = self.broker(git_runner=explode)
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"), mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset({"acme/infra"})
+        ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
             )
