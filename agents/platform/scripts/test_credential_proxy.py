@@ -4285,7 +4285,8 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
-        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+                mock.patch.object(credential_proxy, "_provider_forge"):
             with self.assertRaises(RuntimeError) as raised:
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
@@ -5888,7 +5889,7 @@ class VcsRouteTest(unittest.TestCase):
         # inside the credential refresh, which caught the refusal and logged it.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/publish",
@@ -5903,7 +5904,7 @@ class VcsRouteTest(unittest.TestCase):
         # through for a repository this install does not manage.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/capabilities",
@@ -5922,7 +5923,7 @@ class VcsRouteTest(unittest.TestCase):
         refreshed = []
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
             for verb, extra in (
                 ("issue-view", {"number": 1}),
@@ -5973,7 +5974,7 @@ class VcsRouteTest(unittest.TestCase):
         broker.publish = refuse
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/infra"}),
+            return_value=frozenset({"github:github.com/acme/infra"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/publish",
@@ -6009,7 +6010,7 @@ class VcsRouteTest(unittest.TestCase):
 
         broker = self.broker(git_runner=explode)
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs, mock.patch.object(
-            credential_proxy, "managed_repositories", return_value=frozenset({"acme/infra"})
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/acme/infra"})
         ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
@@ -6027,7 +6028,7 @@ class VcsRouteTest(unittest.TestCase):
 
         broker = self.broker(git_runner=explode)
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"), mock.patch.object(
-            credential_proxy, "managed_repositories", return_value=frozenset({"acme/infra"})
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/acme/infra"})
         ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
@@ -7167,6 +7168,62 @@ class ManagedRepositoryGateTest(unittest.TestCase):
         handler._json = lambda status, payload: handler.replies.append((status, payload))
         return handler
 
+    def test_a_registration_on_one_forge_does_not_admit_the_same_path_on_another(self):
+        # Two forges can each have an `acme/infra`; the key carries the
+        # provider and the host.
+        github = mock.Mock(hosts=("github.com",))
+        github.name = "github"
+        other = mock.Mock(hosts=("git.example.test",))
+        other.name = "gitlab"
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"github:github.com/acme/infra"}),
+        ):
+            self.assertTrue(credential_proxy.repository_is_managed("acme/infra", github))
+            self.assertFalse(credential_proxy.repository_is_managed("acme/infra", other))
+
+    def test_an_entry_typed_for_another_provider_admits_nothing_on_this_one(self):
+        # Review finding: keyed by host alone, a `managed_repos` entry typed
+        # `GitHub` or `gitlab` but naming github.com passed the gate, and the
+        # refresh minted a write token for it. Only `type: github` ever counted.
+        import gitops_workspace
+
+        github = mock.Mock(hosts=("github.com",))
+        github.name = "github"
+        entries = [
+            {"type": "GitHub", "url": "https://github.com/acme/secret"},
+            {"type": "gitlab", "url": "https://github.com/acme/other"},
+        ]
+        with mock.patch.object(gitops_workspace, "get_managed_repo_entries", return_value=entries), \
+                mock.patch.object(credential_proxy, "_managed_repository_cache", None):
+            self.assertFalse(credential_proxy.repository_is_managed("acme/secret", github))
+            self.assertFalse(credential_proxy.repository_is_managed("acme/other", github))
+
+    def test_a_provider_this_install_did_not_build_is_refused_not_defaulted(self):
+        # Review finding: an unknown provider used to fall back to the one
+        # forge's list.
+        executor = CommandExecutor.__new__(CommandExecutor)
+        with mock.patch.object(executor, "_forge_helper", return_value="/x"), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"github:github.com/acme/infra"}),
+                ):
+            with self.assertRaises(PermissionError):
+                executor.refresh_forge_credential("gitlab", "acme/infra")
+
+    def test_a_bare_path_with_no_one_forge_to_mean_is_refused_as_unreadable(self):
+        handler = self._handler()
+        registry = mock.Mock(default=None)
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=registry), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"github:github.com/acme/infra"}),
+                ), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertFalse(handler._repository_is_permitted("acme/infra"))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", payload["code"])
+
     def test_a_managed_repository_passes_silently(self):
         handler = self._handler()
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
@@ -7197,7 +7254,7 @@ class ManagedRepositoryGateTest(unittest.TestCase):
 
     def test_the_comparison_ignores_case(self):
         with mock.patch.object(
-            credential_proxy, "managed_repositories", return_value=frozenset({"gke-labs/kube-agents"})
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/gke-labs/kube-agents"})
         ):
             self.assertTrue(credential_proxy.repository_is_managed("GKE-Labs/Kube-Agents"))
             self.assertFalse(credential_proxy.repository_is_managed("gke-labs/other"))
@@ -8505,10 +8562,10 @@ class RepositoryRoleTest(unittest.TestCase):
     def _lists(self, managed=(), context=()):
         stack = contextlib.ExitStack()
         stack.enter_context(
-            mock.patch("gitops_workspace.get_managed_github_repos", return_value=list(managed))
+            mock.patch("gitops_workspace.get_managed_repo_keys", return_value=[f"github:github.com/{r}".lower() for r in managed])
         )
         stack.enter_context(
-            mock.patch("gitops_workspace.get_context_github_repos", return_value=list(context))
+            mock.patch("gitops_workspace.get_context_repo_keys", return_value=[f"github:github.com/{r}".lower() for r in context])
         )
         return stack
 
@@ -8520,9 +8577,9 @@ class RepositoryRoleTest(unittest.TestCase):
             self.assertEqual("unregistered", credential_proxy.repository_role("someone/else"))
 
     def test_an_unreadable_context_list_raises_rather_than_answering(self):
-        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=[]):
+        with mock.patch("gitops_workspace.get_managed_repo_keys", return_value=[]):
             with mock.patch(
-                "gitops_workspace.get_context_github_repos",
+                "gitops_workspace.get_context_repo_keys",
                 side_effect=RuntimeError("kubectl exited 1"),
             ):
                 with self.assertRaises(RuntimeError):
@@ -8667,7 +8724,8 @@ class ReadCredentialMintTest(unittest.TestCase):
 
     def test_an_absent_helper_is_a_refusal(self):
         executor = self._executor()
-        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"), \
+                mock.patch.object(credential_proxy, "_provider_forge"):
             with self.assertRaises(RuntimeError):
                 executor.mint_read_credential("gitlab", "acme/tf-live")
         self.assertEqual([], executor.calls)
