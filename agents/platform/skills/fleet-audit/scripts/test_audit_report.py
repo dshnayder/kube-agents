@@ -16101,6 +16101,11 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(audit_report.quote_gcloud_format_projections(text), text)
         wrapped = 'S="$(gcloud container clusters describe c --format=value(status))"'
         self.assertIn("--format='value(status)'", audit_report.quote_gcloud_format_projections(wrapped))
+        for wrapper in ('watch "gcloud container clusters describe c --format=value(status)"',
+                        'bash -c "gcloud container clusters describe c --format=value(status)"',
+                        'ssh host "gcloud container clusters describe c --format=value(status)"'):
+            with self.subTest(wrapper):
+                self.assertIn("--format='value(status)'", audit_report.quote_gcloud_format_projections(wrapper))
 
     def test_a_budget_the_collector_withheld_is_not_asked_of_the_worker(self):
         """SOP §3.4: a `maxUnavailable` budget over pods with no scale behind
@@ -19651,6 +19656,19 @@ class TestGcloudEnumCasing(unittest.TestCase):
     def normalise(self, note):
         return audit_report.normalise_gcloud_enum_values(note)
 
+    def test_the_apis_underscore_spelling_is_folded_to_gcloud_s(self):
+        cases = {
+            "--binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE": "--binauthz-evaluation-mode=project-singleton-policy-enforce",
+            "--stack-type=IPV4_IPV6": "--stack-type=ipv4-ipv6",
+            "--in-transit-encryption=INTER_NODE_TRANSPARENT": "--in-transit-encryption=inter-node-transparent",
+            "--private-ipv6-google-access-type=OUTBOUND_ONLY": "--private-ipv6-google-access-type=outbound-only",
+            "--autopilot-general-profile=NO_PERFORMANCE": "--autopilot-general-profile=no-performance",
+            "--logging-variant=max-throughput": "--logging-variant=MAX_THROUGHPUT",
+        }
+        for flag, expected in cases.items():
+            with self.subTest(flag):
+                self.assertEqual(self.normalise(f"gcloud container clusters update c {flag}"), f"gcloud container clusters update c {expected}")
+
     def test_an_enum_flag_after_a_valueless_flag_is_corrected(self):
         # The valueless flag's "value" used to swallow `--release-channel`, and
         # the substitution resumed past it.
@@ -20059,6 +20077,40 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
         note = self.NOTE + "\n# Run --no-enable-dns-access too if the DNS endpoint is open."
         out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
         self.assertIn("--project=adamparco-kage --no-enable-dns-access", out)
+
+    def test_a_backtick_in_the_comment_does_not_hide_the_command_from_the_ip_arm(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=203.0.113.0/24  "
+            "# replace `203.0.113.0/24` with the office CIDR"
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=203.0.113.0/24 "
+            "--no-enable-google-cloud-access  # replace `203.0.113.0/24` with the office CIDR",
+        )
+
+    def test_a_valueless_flag_ahead_of_the_name_does_not_swallow_it(self):
+        note = (
+            "gcloud container clusters update --enable-master-authorized-networks my-cluster "
+            "--location us-east4 --project p --master-authorized-networks=203.0.113.0/24"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("gcloud container clusters update my-cluster --location=us-east4 --project=p --no-enable-dns-access", out)
+
+    def test_a_dns_command_that_cannot_fit_leaves_the_note_and_says_so(self):
+        cidrs = ",".join(f"10.{i // 250}.{i % 250}.0/24" for i in range(160))
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            f"--enable-master-authorized-networks --no-enable-google-cloud-access --master-authorized-networks={cidrs}"
+        )
+        self.assertGreater(len(note), audit_report.MAX_COMMAND_CHARS - 300)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = audit_report.add_dns_access_command(note)
+        self.assertEqual(out, note)
+        self.assertIn("DNS-endpoint command does not fit", err.getvalue())
 
     def test_a_long_note_keeps_the_dns_command_whole_when_rendered(self):
         """`trim_command` clips from the end, so the second command goes

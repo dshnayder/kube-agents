@@ -599,6 +599,13 @@ GCLOUD_LOCATION_FLAG = "--location"
 GCLOUD_PROJECT_FLAG = "--project"
 GCLOUD_LOCATION_FLAGS = (GCLOUD_LOCATION_FLAG, "--region", "--zone")
 CLUSTERS_UPDATE_PREFIX = "gcloud container clusters update"
+# Boolean flags, which take no value: read as taking one, a flag ahead of the
+# cluster name swallows it.
+VALUELESS_GCLOUD_FLAGS = (AUTHORIZED_NETWORKS_FLAG, GOOGLE_CLOUD_ACCESS_FLAG, DNS_ACCESS_FLAG)
+VALUELESS_GCLOUD_FLAG_PREFIXES = ("--enable-", "--no-")
+# The API spells a multi-word enum with `_`; gcloud takes `-`.
+ENUM_API_SEPARATOR = "_"
+ENUM_GCLOUD_SEPARATOR = "-"
 # What `collect._external_control_plane_paths` writes into the excerpt when the
 # DNS endpoint answers external traffic, and the only way this module can tell
 # that arm fired: the excerpt is the collector's own string by the time the
@@ -626,8 +633,6 @@ _GCLOUD_BARE_FORMAT_RE = re.compile(
 # An apostrophe between two word characters is English ("the cluster's
 # channel"), not a shell quote, so the quote-parity test discounts it.
 _WORD_APOSTROPHE_RE = re.compile(r"(?<=\w)'(?=\w)")
-# What opens a command substitution, a fresh parse even inside double quotes.
-COMMAND_SUBSTITUTION = "$("
 
 # The `recommendation` fields that carry a command a reader pastes. `rationale`
 # is argument, never a command, so it is not rewritten.
@@ -3824,11 +3829,17 @@ def validate_findings(data: object, audit_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def _enum_folded(value: str) -> str:
+    """`value` with case and the API's `_` separator folded to gcloud's `-`."""
+    return value.lower().replace(ENUM_API_SEPARATOR, ENUM_GCLOUD_SEPARATOR)
+
+
 def normalise_gcloud_enum_values(note: str) -> str:
     """Rewrite enum flag values in a command to the case gcloud takes.
 
-    Only a value that matches one of that flag's choices case-insensitively is
-    rewritten, and only to that choice. A flag absent from
+    Only a value that matches one of that flag's choices with case and the
+    `_`/`-` separator folded is rewritten, and only to that choice: the API
+    spells `IPV4_IPV6` where gcloud takes `ipv4-ipv6`. A flag absent from
     `GCLOUD_ENUM_FLAG_CHOICES`, or a value that is not one of its choices under
     any casing, is left exactly as written: the note is a command a human will
     paste, and silently changing a value this function does not recognise turns
@@ -3842,7 +3853,7 @@ def normalise_gcloud_enum_values(note: str) -> str:
             return match.group(0)
         value = match.group("value")
         for choice in choices:
-            if value != choice and value.lower() == choice.lower():
+            if value != choice and _enum_folded(value) == _enum_folded(choice):
                 return f"{match.group('flag')}{match.group('sep')}{choice}"
         return match.group(0)
 
@@ -3881,8 +3892,11 @@ def quote_gcloud_format_projections(text: str) -> str:
         # Inside a plain double-quoted argument (`"--format=value(x)"`) the `(`
         # is already quoted and any quote added there reaches gcloud; only a
         # `$(` opened since that quote starts a fresh parse.
+        # Only where the quoted run opens at the flag itself; a wrapper that
+        # re-parses its argument (`watch "…"`, `bash -c "…"`, `"$(…)"`) holds
+        # a command before the flag and breaks on the bare form.
         open_double = line.replace('\\"', "").split('"')
-        if len(open_double) % 2 == 0 and COMMAND_SUBSTITUTION not in open_double[-1]:
+        if len(open_double) % 2 == 0 and not open_double[-1].strip():
             return match.group(0)
         quote = '"' if line.count("'") % 2 else "'"
         return f"{match.group('flag')}{match.group('sep')}{quote}{match.group('proj')}{quote}"
@@ -3960,11 +3974,15 @@ def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
         return f"`{span}`"
 
     for first, last, _joined in _logical_command_spans(lines):
-        if any("`" in line for line in lines[first : last + 1]):
-            for index in range(first, last + 1):
-                lines[index] = INLINE_CODE_SPAN.sub(inline, lines[index])
-            continue
+        # The same choice `_gcloud_commands` makes, on comment-free lines: a
+        # backtick in a `#` comment makes no span of the command, and a line
+        # whose spans hold no gcloud command is read whole.
         code = [_comment_free(line) for line in lines[first : last + 1]]
+        if any(_is_gcloud_command(span) for line in code for span in INLINE_CODE_SPAN.findall(line)):
+            for offset, part in enumerate(code):
+                index = first + offset
+                lines[index] = INLINE_CODE_SPAN.sub(inline, part) + lines[index][len(part) :]
+            continue
         joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
         if (
             _is_gcloud_command(joined)
@@ -4019,7 +4037,12 @@ def _parse_update_target(command: str) -> tuple[str, str, str] | None:
         token = rest[index]
         if token.startswith("--"):
             key, sep, value = token.partition("=")
-            if not sep and index + 1 < len(rest) and not rest[index + 1].startswith("--"):
+            if (
+                not sep
+                and not _is_valueless_flag(key)
+                and index + 1 < len(rest)
+                and not rest[index + 1].startswith("--")
+            ):
                 value, index = rest[index + 1], index + 1
             flags[key] = value
         elif not positional:
@@ -4028,6 +4051,11 @@ def _parse_update_target(command: str) -> tuple[str, str, str] | None:
     location = next((flags[f] for f in GCLOUD_LOCATION_FLAGS if flags.get(f)), "")
     project = flags.get(GCLOUD_PROJECT_FLAG, "")
     return (positional, location, project) if positional and location else None
+
+
+def _is_valueless_flag(flag: str) -> bool:
+    """Whether a `clusters update` flag is a boolean, which takes no value."""
+    return flag in VALUELESS_GCLOUD_FLAGS or flag.startswith(VALUELESS_GCLOUD_FLAG_PREFIXES)
 
 
 def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] | None:
