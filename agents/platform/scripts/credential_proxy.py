@@ -5145,6 +5145,8 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
         base_branch=base_branch,
+        http_timeout=executor.timeout_seconds,
+        http_max_bytes=executor.max_output_bytes,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",

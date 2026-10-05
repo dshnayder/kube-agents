@@ -71,6 +71,7 @@ from typing import Any, Callable
 
 from providers import (
     CliTransport,
+    HttpTransport,
     Forge,
     ForgeUnsupported,
     MAX_PAGE_SIZE,
@@ -89,6 +90,11 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+# The in-process API client's bounds when nothing hands it the executor's: the
+# same order as a forge CLI call is given, and a ceiling on one answer that a
+# page of JSON never approaches.
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+DEFAULT_HTTP_MAX_BYTES = 8 << 20  # 8 MiB
 
 # How many open proposals the `advance` check reads off a branch. One would
 # settle whether any is open; the rest are read because the second half of the
@@ -276,6 +282,9 @@ class VcsBroker:
         cli_runner: Callable[..., subprocess.CompletedProcess] | None = None,
         refresh: Callable[[str, str], None] | None = None,
         base_branch: str | None = None,
+        http_timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+        http_max_bytes: int = DEFAULT_HTTP_MAX_BYTES,
+        http_opener: Callable[..., Any] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -288,6 +297,12 @@ class VcsBroker:
         # built them, and a second number this class merely stored would read
         # like a bound it enforces.
         self._cli_runner = cli_runner or git_runner
+        # The in-process transport has no runner to carry its bounds, so the
+        # broker hands them over itself; `build_vcs_broker` passes the same
+        # timeout and output ceiling the CLI runner enforces.
+        self._http_timeout = http_timeout
+        self._http_max_bytes = http_max_bytes
+        self._http_opener = http_opener
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
@@ -310,21 +325,30 @@ class VcsBroker:
         return Binding(
             forge,
             repo,
-            lambda: self._transport(forge),
+            lambda: self._transport(forge, repo),
             self._git_for(forge, repo),
         )
 
-    def _transport(self, forge: Forge) -> Transport:
+    def _transport(self, forge: Forge, repo: str) -> Transport:
         """The transport the forge declared, constructed here and never there.
 
         A forge names what it needs; the broker owns everything about how the
-        call is made -- the executable, the timeout, the output ceiling. Only
-        the CLI transport exists so far, because it is the only one a forge in
-        this install declares; the seam is what lets the next one be an
-        in-process HTTP client rather than a second subprocess.
+        call is made -- the executable, the timeout, the output ceiling. A CLI
+        forge gets the runner; an HTTP forge gets an in-process client bounded
+        by the same numbers, presenting its credential's headers for `repo`.
         """
         if forge.transport == "cli" and forge.cli:
             return CliTransport(self._cli_runner, forge.cli, forge.error_overrides)
+        if forge.transport == "http" and forge.api_url:
+            return HttpTransport(
+                forge.api_url,
+                lambda: forge.credential.headers(repo),
+                forge.error_overrides,
+                timeout=self._http_timeout,
+                max_bytes=self._http_max_bytes,
+                whoami_route=forge.whoami_route,
+                opener=self._http_opener,
+            )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
             "this broker does not build."
