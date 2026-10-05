@@ -123,7 +123,11 @@ class ConfigurationTest(unittest.TestCase):
 class ProposalTest(unittest.TestCase):
     def test_a_draft_is_a_title_prefix_and_never_doubled(self):
         # The `draft` field is accepted and ignored on create.
-        for title, sent in (("Pin the image", "Draft: Pin the image"), ("Draft: Pin", "Draft: Pin")):
+        for title, sent in (
+            ("Pin the image", "Draft: Pin the image"),
+            ("Draft: Pin", "Draft: Pin"),
+            ("draft: Pin", "draft: Pin"),  # GitLab matches the prefix case-blind
+        ):
             with self.subTest(title=title):
                 api = Api(mr(title=sent, draft=True))
                 forge().proposal_create(api, "acme/infra", {
@@ -157,9 +161,30 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual("text/plain", api.calls[1][4])
 
     def test_a_diff_refused_for_a_reason_other_than_not_ready_is_not_hidden(self):
-        api = Api(mr(), WorkspaceError("gone", status=404))
+        api = Api(mr(), WorkspaceError("forbidden", status=403))
         with self.assertRaises(WorkspaceError):
             forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+
+    def test_an_instance_older_than_raw_diffs_falls_back_and_a_missing_mr_still_fails(self):
+        files = [{"old_path": "a.yaml", "new_path": "a.yaml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}]
+        answer = forge().proposal_view(
+            Api(mr(), WorkspaceError("no route", status=404), files), "acme/infra", {"number": 1, "diff": True}
+        )
+        self.assertIn("diff --git a/a.yaml b/a.yaml", answer["diff"])
+        gone = Api(mr(), WorkspaceError("no route", status=404), WorkspaceError("no mr", status=404))
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(gone, "acme/infra", {"number": 1, "diff": True})
+
+    def test_the_diff_fallback_reads_every_page_and_names_what_it_left_out(self):
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(100)]
+        big = [{"old_path": "huge.bin", "new_path": "huge.bin", "diff": "", "too_large": True}]
+        api = Api(mr(), WorkspaceError("not ready", status=502), page, big)
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertEqual([1, 2], [call[2]["page"] for call in api.calls[2:]])
+        self.assertIn("diff --git a/f99 b/f99", diff)
+        self.assertIn("did not include the changes to huge.bin", diff)
+        capped = Api(mr(), WorkspaceError("not ready", status=502), *([page] * GitLabForge.DIFF_PAGES))
+        self.assertIn("diff cut short", forge().proposal_view(capped, "acme/infra", {"number": 1, "diff": True})["diff"])
 
     def test_an_update_that_changes_nothing_reads_instead_of_writing(self):
         # GitLab answers 400 for an update with no parameters.
@@ -184,14 +209,32 @@ class ProposalTest(unittest.TestCase):
         answer = forge().proposal_commits(api, "acme/infra", {"number": 1})
         self.assertEqual(["old", "new"], [c["sha"] for c in answer["commits"]])
 
+    def test_page_one_holds_the_oldest_commits_however_long_the_mr(self):
+        # 150 commits, which GitLab serves newest first: c150..c51, then c50..c1.
+        newest_first = [{"id": f"c{n}"} for n in range(150, 0, -1)]
+        first = forge().proposal_commits(
+            Api(newest_first[:100], newest_first[100:]), "acme/infra", {"number": 1, "limit": 100}
+        )
+        self.assertEqual(("c1", "c100"), (first["commits"][0]["sha"], first["commits"][-1]["sha"]))
+        self.assertTrue(first["truncated"])
+        second = forge().proposal_commits(
+            Api(newest_first[:100], newest_first[100:]), "acme/infra", {"number": 1, "limit": 100, "page": 2}
+        )
+        self.assertEqual(["c101", "c150"], [second["commits"][0]["sha"], second["commits"][-1]["sha"]])
+        self.assertFalse(second["truncated"])
+
     def test_any_note_takes_an_award_and_already_awarded_is_fine(self):
         api = Api({"id": 1})
         answer = forge().proposal_acknowledge(api, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "review_comment"}})
         self.assertTrue(answer["acknowledged"])
         self.assertEqual("projects/acme%2Finfra/merge_requests/1/notes/9/award_emoji", api.calls[0][1])
         self.assertEqual({"name": "eyes"}, api.calls[0][3])
-        again = Api(WorkspaceError("already awarded", status=409))
+        # GitLab answers a second award with a 404 carrying the validation error.
+        again = Api(WorkspaceError("not found", status=404, detail="404 Award Emoji Name has already been taken Not Found"))
         self.assertTrue(forge().proposal_acknowledge(again, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "issue"}})["acknowledged"])
+        missing = Api(WorkspaceError("not found", status=404, detail="404 Note Not Found"))
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_acknowledge(missing, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "issue"}})
         self.assertFalse(forge().proposal_acknowledge(Api(), "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "review"}})["acknowledged"])
 
 
@@ -279,7 +322,8 @@ class TranslationTest(unittest.TestCase):
     def test_states_and_iids(self):
         cases = (
             ({"state": "opened", "iid": 3, "id": 999}, "open", 3, ""),
-            ({"state": "locked", "iid": 3, "id": 999}, "closed", 3, ""),
+            ({"state": "locked", "iid": 3, "id": 999}, "open", 3, ""),  # being merged
+            ({"state": "closed", "iid": 3, "closed_at": "2026-10-02"}, "closed", 3, "2026-10-02"),
             ({"state": "merged", "iid": 3, "merged_at": "2026-10-01", "closed_at": None}, "merged", 3, "2026-10-01"),
         )
         for node, state, number, closed in cases:

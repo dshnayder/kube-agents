@@ -66,6 +66,9 @@ DEFAULT_LABEL_COLOR = "#6699cc"
 #: says.
 ACKNOWLEDGE_EMOJI = "eyes"
 
+#: The validation message GitLab sends, as a 404, for an emoji already awarded.
+ALREADY_AWARDED = "has already been taken"
+
 
 def _states(neutral: str) -> str:
     """The neutral state as GitLab's `state` parameter."""
@@ -126,6 +129,15 @@ class GitLabForge(Forge):
     #: for an account that belongs to a thousand projects, which is already the
     #: finding.
     REACH_PAGES = 10
+
+    #: How many of a merge request's commits `proposal_commits` reads -- the
+    #: same ceiling GitHub serves for a pull request, so the verb answers the
+    #: same depth on both.
+    COMMIT_CAP = 250
+
+    #: How many pages of per-file diffs the `diffs` fallback reads before it
+    #: says the diff is cut short.
+    DIFF_PAGES = 10
 
     def reach(self, api: Callable) -> tuple[list[str], bool]:
         """Every project the token's account is a member of.
@@ -263,7 +275,7 @@ class GitLabForge(Forge):
 
     def proposal_create(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         title = validate_text(payload.get("title"), "title").strip()
-        if payload.get("draft") and not title.startswith(translate.DRAFT_PREFIXES):
+        if payload.get("draft") and not translate.is_draft_title(title):
             # The `draft` field is accepted and ignored on create; the prefix is
             # what GitLab reads.
             title = f"Draft: {title}"
@@ -328,28 +340,44 @@ class GitLabForge(Forge):
             result["diff"] = self._diff(api, base)
         return result
 
-    @staticmethod
-    def _diff(api: Callable, base: str) -> str:
+    def _diff(self, api: Callable, base: str) -> str:
         """A unified diff of the merge request.
 
         `raw_diffs` is the unified diff itself, and answers 5xx until GitLab
-        has computed it -- seconds after a merge request is opened. The JSON
-        `diffs` endpoint carries the same hunks per file, so that is the
-        fallback rather than a retry loop with a sleep in it.
+        has computed it -- seconds after a merge request is opened -- and 404
+        on a self-managed instance older than the route. The JSON `diffs`
+        endpoint carries the same hunks per file, so that is the fallback
+        rather than a retry loop with a sleep in it. A merge request that does
+        not exist answers 404 there too, so the fallback cannot hide one.
+
+        The fallback is paged, and it says so in the diff when it stops early
+        or when GitLab left a file's hunks out: an omission the caller cannot
+        see reads as a file the change did not touch.
         """
         try:
             return api("GET", f"{base}/raw_diffs", raw="text/plain")
         except WorkspaceError as exc:
-            if exc.status < 500:
+            if exc.status < 500 and exc.status != 404:
                 raise
-        files = api("GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE}) or []
         out = []
-        for item in files:
-            old, new = item.get("old_path") or "", item.get("new_path") or ""
-            out.append(f"diff --git a/{old} b/{new}\n")
-            out.append("--- " + ("/dev/null" if item.get("new_file") else f"a/{old}") + "\n")
-            out.append("+++ " + ("/dev/null" if item.get("deleted_file") else f"b/{new}") + "\n")
-            out.append(item.get("diff") or "")
+        for page in range(1, self.DIFF_PAGES + 1):
+            files = api(
+                "GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE, "page": page}
+            ) or []
+            for item in files:
+                old, new = item.get("old_path") or "", item.get("new_path") or ""
+                out.append(f"diff --git a/{old} b/{new}\n")
+                if not item.get("diff") and (item.get("too_large") or item.get("collapsed")):
+                    out.append(f"# GitLab did not include the changes to {new}: too large to show\n")
+                    continue
+                out.append("--- " + ("/dev/null" if item.get("new_file") else f"a/{old}") + "\n")
+                out.append("+++ " + ("/dev/null" if item.get("deleted_file") else f"b/{new}") + "\n")
+                out.append(item.get("diff") or "")
+            if len(files) < MAX_PAGE_SIZE:
+                return "".join(out)
+        out.append(
+            f"# diff cut short: only the first {self.DIFF_PAGES * MAX_PAGE_SIZE} files are shown\n"
+        )
         return "".join(out)
 
     def proposal_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
@@ -383,18 +411,24 @@ class GitLabForge(Forge):
     def proposal_commits(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))
         limit = validate_limit(payload.get("limit"))
-        params: dict[str, Any] = {"per_page": limit}
         page = validate_page(payload.get("page"))
-        if page > 1:
-            params["page"] = page
-        nodes = api(
-            "GET", f"{self._project(repo)}/merge_requests/{number}/commits", params=params
-        ) or []
-        # GitLab lists a merge request's commits newest first; the verb
-        # promises oldest first, so each page is turned around. A caller after
-        # the tip reads `sourceRevision` off the proposal, as on GitHub.
-        commits = [translate.commit(node) for node in reversed(nodes)]
-        return listing(commits, limit, "commits")
+        # GitLab lists a merge request's commits newest first and has no
+        # parameter to turn that round; the verb promises oldest first, with
+        # page 1 holding the oldest. Reversing each page would not do it -- on
+        # a merge request longer than one page, page 1 would be the newest
+        # commits -- so the list is read whole, up to the ceiling, and paged
+        # here. Past the ceiling it is the newest COMMIT_CAP commits, where
+        # GitHub's is the oldest; a caller after the tip reads `sourceRevision`
+        # off the proposal on both.
+        path = f"{self._project(repo)}/merge_requests/{number}/commits"
+        nodes: list[dict] = []
+        for fetch in range(1, -(-self.COMMIT_CAP // MAX_PAGE_SIZE) + 1):
+            batch = api("GET", path, params={"per_page": MAX_PAGE_SIZE, "page": fetch}) or []
+            nodes.extend(batch)
+            if len(batch) < MAX_PAGE_SIZE:
+                break
+        commits = [translate.commit(node) for node in reversed(nodes[: self.COMMIT_CAP])]
+        return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
 
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # Best-effort by contract. Any note -- conversation or diff -- takes an
@@ -414,8 +448,11 @@ class GitLabForge(Forge):
                 body={"name": ACKNOWLEDGE_EMOJI},
             )
         except WorkspaceError as exc:
-            # Already awarded is the state the caller asked for.
-            if exc.status not in (400, 409):
+            # Already awarded is the state the caller asked for. GitLab says so
+            # with a 404 whose message is the validation error, so the wording
+            # is what tells it from a note that is not there.
+            detail = str(exc.fields.get("detail") or "").lower()
+            if not (exc.status == 404 and ALREADY_AWARDED in detail):
                 raise
         return {"acknowledged": True}
 

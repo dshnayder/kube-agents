@@ -41,6 +41,12 @@ _TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+)?$")
 DRAFT_PREFIXES = ("Draft:", "[Draft]", "(Draft)", "WIP:", "[WIP]")
 
 
+def is_draft_title(title: str) -> bool:
+    """Whether GitLab will read this title as a draft. It matches case-blind."""
+    lowered = title.lower()
+    return lowered.startswith(tuple(prefix.lower() for prefix in DRAFT_PREFIXES))
+
+
 def actor(node: dict[str, Any] | None) -> str:
     """A username. GitLab has no suffix to strip."""
     return str((node or {}).get("username") or "").strip()
@@ -72,7 +78,10 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
     raw_state = str(node.get("state") or "")
     if raw_state == "merged":
         state = "merged"
-    elif raw_state == "opened":
+    elif raw_state in ("opened", "locked"):
+        # `locked` is the moment GitLab is merging it: still open, and a
+        # caller asking "is there an open proposal for my branch" must not
+        # see none and open a second.
         state = "open"
     else:
         state = "closed"

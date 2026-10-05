@@ -2,10 +2,10 @@
 
 > **STATUS — design of record; the seam, the provider layer with GitHub behind
 > it, the sandbox's own git, the consumer migration and the declarative surface
-> are in; the second forge is not.** On `main`, repository identity runs
+> are in.** On `main`, repository identity runs
 > through one parser (`repo_ref.py`); the broker serves the version-control verbs
-> over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
-> is `providers/github/`; the `version-control` skill drives those verbs from a
+> over `/v1/vcs/*` from a forge-neutral `providers/` layer with
+> `providers/github/` and `providers/gitlab/` behind it; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
 > through those verbs rather than by naming GitHub. The sandbox carries no `gh`
 > and no credential shim named `git`. One thing is deliberately left behind and
@@ -14,8 +14,8 @@
 > repositories this install does not manage and does it with a shallow clone —
 > neither of which the verbs offer, the second on purpose
 > ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
-> and `spec.integration.repositories` with only `github` registered, and no
-> second forge exists.
+> and `spec.integration.repositories` with only `github` registered, so a GitLab
+> forge is not yet declared through the CR.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -920,8 +920,8 @@ unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
 forge-neutral. The exception is real and has to be designed for: a status can
-mean different things on different forges. GitLab's 401 most often means a group
-access token reached its expiry after a year, which no refresh path can fix and
+mean different things on different forges. GitLab's 401 most often means its
+stored access token reached its expiry after a year, which no refresh path can fix and
 which wants an operator named rather than a retry; Bitbucket answers 401 for a
 private repository it will not admit exists, where GitHub answers 404. So a forge
 package may supply an override map merged over the shared table — a per-forge
@@ -950,7 +950,7 @@ local process, and the alternative is worse than the cost. An expired GitHub
 token surfaces as `Authentication failed` from inside the broker's own clone,
 which reaches the caller as a clone failure and reads like the repository is
 gone, so inferring expiry from a failure means the first verb after an idle hour
-fails once for a reason the caller cannot act on. GitLab's group access token has
+fails once for a reason the caller cannot act on. A GitLab access token has
 no acquisition step at all, so its strategy does nothing — and says so by being a
 strategy with nothing to do rather than by inheriting a no-op from a default
 shaped around a forge that does.
@@ -1201,7 +1201,7 @@ scattering them is what allows the fourth to become invisible.
 The principle that resolves it: token acquisition is **a strategy selected per
 provider, not a pipeline every forge is fitted into.** GitHub App tokens are
 signature-derived and expire
-hourly, so Minty exists; a GitLab group access token is a long-lived string with
+hourly, so Minty exists; a GitLab access token is a long-lived string with
 no minting step, so for GitLab there is nothing to acquire. An interface built
 around acquisition makes the second forge implement a method that does nothing
 and receive an argument nobody uses, and still leaves it nowhere to put the parts
@@ -1838,7 +1838,7 @@ GitHub's 401 means "credential expired". Guidance keyed only on status is
 therefore not quite forge-neutral. That is why `error_overrides` is a member of
 the interface rather than something invented later: a per-forge map merged over
 the shared table, living in the forge package. GitLab is the first to populate
-it, for its own reading of 401, so by the time Bitbucket arrives the mechanism
+it, for its own readings of 401 and 400, so by the time Bitbucket arrives the mechanism
 has a user and a test rather than being a speculative hook.
 
 What the table shows is that all six differences land in the forge's own
@@ -2161,10 +2161,11 @@ next to the HTTPS round trip.
 
 **Scope enforcement is the broker's job here, and this is a real difference from
 GitHub.** Minty enforces a per-repository permission policy at mint time, so the
-token the broker holds is already narrowed. A group access token is narrowed to
-its group at creation and nothing narrows it further. Two repositories in the
-same group are both reachable with it, and `Registry.resolve`'s host allowlist does
-not care which project inside the host a call names.
+token the broker holds is already narrowed. A GitLab access token is narrowed at
+creation — to its group, its project, or whatever its account belongs to — and
+nothing narrows it further. Every project it can reach is reachable through the
+broker, and `Registry.resolve`'s host allowlist does not care which project
+inside the host a call names.
 
 So `GitLabForge` carries `allowed_paths`, a tuple of namespace prefixes, and
 refuses a repository outside them before the credential is spent — the same
@@ -2180,22 +2181,22 @@ starts with the string `acme/infra` and is a different project.
 The neutral shapes are the ones every forge returns. What follows is the GitLab
 side of each.
 
-| Neutral field       | GitLab source                     | Note                                                           |
-| ------------------- | --------------------------------- | -------------------------------------------------------------- |
-| `number`            | `iid`                             | never `id`                                                     |
-| `state` (proposal)  | `state`                           | `opened`→`open`, `merged`→`merged`, `closed`/`locked`→`closed` |
-| `draft`             | `draft`                           | `work_in_progress` on older instances; read `draft`, fall back |
-| `author`            | `author.username`                 | no `[bot]` suffix to strip                                     |
-| `source` / `target` | `source_branch` / `target_branch` | direct                                                         |
-| `sourceRepo`        | `source_project_id`               | the repository itself when it equals `target_project_id`; `""` for a fork |
-| `sourceRevision`    | `sha`                             | the diff head; GitHub spells it `head.sha`                     |
-| `kind` (comment)    | `position`                        | a diff note is `review_comment`; any other note `issue`        |
-| `ref` (comment)     | `"{kind}-{id}"`                   | note ids are unique across an instance                         |
-| `url`               | `web_url`                         |                                                                |
-| `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                  |
-| `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open    |
-| `body`              | `description`                     | GitLab's name for it                                           |
-| `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                  |
+| Neutral field       | GitLab source                     | Note                                                                                   |
+| ------------------- | --------------------------------- | -------------------------------------------------------------------------------------- |
+| `number`            | `iid`                             | never `id`                                                                             |
+| `state` (proposal)  | `state`                           | `opened`/`locked`→`open` (`locked` is mid-merge), `merged`→`merged`, `closed`→`closed` |
+| `draft`             | `draft`                           | `work_in_progress` on older instances; read `draft`, fall back                         |
+| `author`            | `author.username`                 | no `[bot]` suffix to strip                                                             |
+| `source` / `target` | `source_branch` / `target_branch` | direct                                                                                 |
+| `sourceRepo`        | `source_project_id`               | the repository itself when it equals `target_project_id`; `""` for a fork              |
+| `sourceRevision`    | `sha`                             | the diff head; GitHub spells it `head.sha`                                             |
+| `kind` (comment)    | `position`                        | a diff note is `review_comment`; any other note `issue`                                |
+| `ref` (comment)     | `"{kind}-{id}"`                   | note ids are unique across an instance                                                 |
+| `url`               | `web_url`                         |                                                                                        |
+| `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                                          |
+| `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open                            |
+| `body`              | `description`                     | GitLab's name for it                                                                   |
+| `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                                          |
 
 Three asymmetries are worth their own note, because each one is a place the
 neutral contract was shaped by GitHub and GitLab shows the shape.
@@ -2230,26 +2231,39 @@ neutral `closed` is every proposal no longer open, merged ones included, as
 GitHub's is, and GitLab's `closed` excludes merged — so it is asked as `all` and
 filtered.
 
-Two endpoints need naming because they are not a rename of GitHub's:
+Four endpoints need naming because they are not a rename of GitHub's:
 
 - **Diff.** GitHub serves a diff from the PR endpoint under an `Accept` media
   type. GitLab serves the unified diff at `/merge_requests/{iid}/raw_diffs`,
   which answers 5xx until GitLab has computed the diff — seconds after a merge
-  request opens. The JSON `/diffs` endpoint carries the same hunks per file, so
-  that is the fallback, assembled into a unified diff, rather than a retry loop
-  with a sleep in it. The broker's response ceiling bounds both.
+  request opens — and 404 on a self-managed instance older than the route. The
+  JSON `/diffs` endpoint carries the same hunks per file, so that is the
+  fallback, assembled into a unified diff, rather than a retry loop with a sleep
+  in it. It is paged, and the assembled diff says so when it stops at its page
+  cap or when GitLab left a too-large file's hunks out: an omission the caller
+  cannot see reads as a file the change did not touch. The broker's response
+  ceiling bounds both.
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal
   is created with one.
+- **Commits.** GitLab lists a merge request's commits newest first, with no
+  parameter to turn that round, and the verb promises oldest first with page 1
+  holding the oldest. Reversing each page would put the newest commits on page 1
+  of a long merge request, so the list is read whole up to GitHub's own 250-commit
+  ceiling and paged in the broker.
+- **Acknowledgement** is an award emoji on the note. A second award of the same
+  emoji answers 404 with a validation message, not 409, so "already awarded" is
+  read off the message — a plain 404 is still a note that is not there.
 
-Both are named because getting them wrong is a working-looking module that
+All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
 
 ### GitLab errors
 
-GitLab returns conventional statuses, all of them already in the shared
-status-to-guidance table: 401, 403, 404, 409, 422, 429. Two specifics:
+GitLab returns conventional statuses: 401, 403, 404, 409, 422 and 429 are all in
+the shared status-to-guidance table, and 400 — what GitLab answers for a request
+whose fields it validated and refused — is not. Two specifics:
 
 - The message body is `{"message": …}` or `{"error": …}` depending on endpoint,
   and sometimes a dict of per-field arrays. `detail` takes the first string it
@@ -2259,7 +2273,7 @@ status-to-guidance table: 401, 403, 404, 409, 422, 429. Two specifics:
   override — "A private repository this install's credential cannot see also
   answers 404, so this does not prove the thing does not exist" — which is the
   clearest evidence that keeping the table forge-neutral was worth it: GitLab
-  needs one override, for 401, and not this one.
+  needs two overrides, for 401 and 400, and not this one.
 
 ### What GitLab does not include
 
