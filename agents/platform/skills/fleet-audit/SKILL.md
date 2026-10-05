@@ -1280,8 +1280,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
   as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
   `kind: manifest` and `path`, and run `finish` again. A declared `no-pdb` finding is the exception:
-  `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, unless
-  you pass `--decline-fix` for it on every call, as you must when your SOP keeps it `manual`. One
+  `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, and a
+  `--decline-fix` for it is ignored: leave it `manual`, and never name its declaration's file. One
   whose candidate carries `pod_selector_withheld` (its selector also reaches a DaemonSet's, Job's or
   CronJob's pods) is neither written nor refused: that budget would permit no evictions. A finding the SOP itself makes `manual`, or
   one a pull request already carries, stays `manual`: pass `--decline-fix <id> "<why>"` and the

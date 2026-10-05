@@ -16011,9 +16011,11 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(finding["remediation"]["kind"], "manual")
                 self.assertIn(said, self.generate_err)
 
-    def test_a_declined_fix_or_one_another_pull_request_carries_is_not_written(self):
+    def test_a_declined_budget_is_still_written_but_one_another_pull_request_carries_is_not(self):
+        # A decline of a budget `finish` can write is not taken: the worker's
+        # reason was the shortcut the refusal exists to stop.
         written, _ = self.generate(declines={"a": "a pull request already carries it"})
-        self.assertEqual(written, [])
+        self.assertEqual(written, ["a"])
         for state, fields in {
             "open on another path": {"state": "OPEN", "headRefName": "x"},
             "merged": {"state": "MERGED", "headRefName": "x", "mergedAt": "2026-10-01T00:00:00Z"},
@@ -16106,6 +16108,54 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                         'ssh host "gcloud container clusters describe c --format=value(status)"'):
             with self.subTest(wrapper):
                 self.assertIn("--format='value(status)'", audit_report.quote_gcloud_format_projections(wrapper))
+
+    def test_start_scrubs_every_findings_and_manifest_file_of_the_stream(self):
+        """A worker that skipped a step published an earlier run's
+        `findings_<audit>_fixed.json` as its own."""
+        scratch = Path(audit_report.SCRATCH_DIR)
+        scratch.mkdir(parents=True, exist_ok=True)
+        names = [f"findings_{AUDIT}_fixed.json", f"manifest_{AUDIT}_clean.json", f"findings_{AUDIT}.json"]
+        for name in names:
+            (scratch / name).write_text("{}")
+        other = scratch / "findings_ai-security-audit.json"
+        other.write_text("{}")
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual([n for n in names if (scratch / n).exists()], [])
+        self.assertTrue(other.exists())
+
+    def test_a_findings_document_is_not_a_collector_manifest(self):
+        path = self.tmp_path / "doc.json"
+        path.write_text(json.dumps(make_doc()))
+        with self.assertRaises(audit_report.ValidationError) as refused:
+            audit_report.load_manifest(str(path), AUDIT)
+        self.assertIn("is a findings document", str(refused.exception))
+
+    def test_a_waiver_is_refused_when_the_collector_wrote_this_runs_manifest(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        Path(audit_report.manifest_path_for(AUDIT)).write_text(json.dumps({"clusters": []}))
+        self.assertEqual(self.run_finish(make_doc(), ("--no-collector-manifest", "skipped it")), 2)
+        self.assertIn("pass it with --manifest-file", self.err)
+
+    def test_a_findings_file_written_before_start_is_refused(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        doc_path = self.write_findings(make_doc())
+        os.utime(doc_path, (1, 1))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", doc_path])
+        self.assertEqual(rc, 2)
+        self.assertIn("an earlier run's document", self.err)
+
+    def test_a_budget_named_over_its_workloads_declaration_goes_back_to_manual(self):
+        manifest = self.manifest()
+        finding = self.manual()
+        finding["remediation"] = {"kind": "manifest", "path": "apps/a/deploy.yaml", "note": "pdb"}
+        self.assertEqual(audit_report.demote_fixes_over_declarations([finding], manifest), ["a"])
+        self.assertEqual(finding["remediation"]["kind"], "manual")
+        beside = self.manual()
+        beside["remediation"] = {"kind": "manifest", "path": "apps/a/a-pdb.yaml"}
+        self.assertEqual(audit_report.demote_fixes_over_declarations([beside], manifest), [])
 
     def test_a_budget_the_collector_withheld_is_not_asked_of_the_worker(self):
         """SOP §3.4: a `maxUnavailable` budget over pods with no scale behind

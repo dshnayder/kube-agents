@@ -2053,6 +2053,11 @@ def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
 
 
+def manifest_path_for(audit_id: str) -> str:
+    """Where the stream SOPs tell the collector to write this run's manifest."""
+    return f"{SCRATCH_DIR}/manifest_{audit_id}.json"
+
+
 def run_record_path_for(audit_id: str) -> str:
     """Where `start` records which repositories this run was told to search."""
     return f"{SCRATCH_DIR}/run_{audit_id}.json"
@@ -4472,6 +4477,11 @@ def manifest_predates_run(manifest: dict, audit_id: str) -> tuple[str, str] | No
     return str(finished_raw), str(started_raw)
 
 
+# Keys only a findings document carries; a manifest holding one is the
+# document passed back in as its own corroboration.
+FINDINGS_DOCUMENT_KEYS = frozenset({"findings", "scope"})
+
+
 def load_manifest(path: str, audit_id: str | None = None) -> dict:
     """The collector manifest at `path`, or a ValidationError naming why not.
 
@@ -4500,6 +4510,12 @@ def load_manifest(path: str, audit_id: str | None = None) -> dict:
     clusters = manifest.get("clusters")
     if clusters is not None and not isinstance(clusters, list):
         raise ValidationError(f"--manifest-file: {path}: `clusters` must be a list")
+    if FINDINGS_DOCUMENT_KEYS & set(manifest):
+        raise ValidationError(
+            f"--manifest-file: {path} is a findings document, not a collector manifest; "
+            "pass the file the collector wrote, which corroborates the document rather "
+            "than repeating it."
+        )
     declared_audit = manifest.get("audit")
     if audit_id and declared_audit is not None and str(declared_audit) != audit_id:
         raise ValidationError(
@@ -11400,7 +11416,8 @@ def unwritten_refusal_message(
                     "`resources:` too, or it renders nothing."
                 )
     parts.append(
-        "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
+        "Then run `finish` again. A declared `no-pdb` finding needs neither: leave it "
+        "`manual` and `finish` writes its PodDisruptionBudget. Where the SOP itself makes a finding `manual`, or a "
         "pull request already carries its fix, leave it `manual` and pass "
         "`--decline-fix <id> \"<why>\"` to the next `finish`; the reason is published "
         "on the finding's ledger row. `finish` refuses until each of these is "
@@ -11618,7 +11635,10 @@ def plan_generated_fixes(
     for finding in findings:
         fid = str(finding.get("id", ""))
         fix = unwritten.get(fid)
-        if fix is None or not fix.declared or fid in declines:
+        if fix is None or not fix.declared:
+            continue
+        # A decline stands for every fix but the budget `finish` writes itself.
+        if fid in declines and (candidates.get(derive_finding_id(finding)) or ({}, {}))[1].get("check") != GENERATED_FIX_CHECK:
             continue
         entry, candidate = candidates.get(derive_finding_id(finding)) or ({}, {})
         if candidate.get("check") != GENERATED_FIX_CHECK:
@@ -11731,6 +11751,29 @@ def _path_is_contained(root: Path, path: str) -> bool:
     except ValidationError:
         return False
     return True
+
+
+def demote_fixes_over_declarations(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Set to `manual` every `GENERATED_FIX_CHECK` fix named at its workload's
+    own declaration, returning their ids.
+
+    A worker told the object is declared at a path wrote the new budget there,
+    over the Deployment; the sweep opened that pull request and a merge would
+    delete the workload. Back at `manual`, the planner writes it beside.
+    """
+    declared_at = {
+        _candidate_identity(entry, candidate): str((candidate.get("declaration") or {}).get("path") or "")
+        for entry, candidate in _candidates(manifest)
+        if candidate.get("check") == GENERATED_FIX_CHECK and isinstance(candidate.get("declaration"), dict)
+    }
+    demoted: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        declared = declared_at.get(derive_finding_id(finding), "")
+        if remediation.get("kind") == "manifest" and declared and remediation.get("path") == declared:
+            finding["remediation"] = {"kind": "manual", "note": str(remediation.get("note") or "")}
+            demoted.append(str(finding.get("id", "")))
+    return demoted
 
 
 def has_run_record(audit_id: str, repo: str | None = None) -> bool:
@@ -12858,6 +12901,12 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     # posture it covered.
     Path(run_record_path_for(audit_id)).unlink(missing_ok=True)
     Path(declarations_path_for(audit_id)).unlink(missing_ok=True)
+    # Every findings or manifest file a worker wrote for this stream, under
+    # any name: a later worker that skips a step finds an earlier run's
+    # document beside it and publishes that as its own.
+    for pattern in (f"findings_{audit_id}*.json", f"manifest_{audit_id}*.json"):
+        for stale in Path(SCRATCH_DIR).glob(pattern):
+            stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
@@ -13821,8 +13870,31 @@ def handle_finish(args: argparse.Namespace) -> None:
     release_in_flight(audit_id)
 
 
+def findings_predate_run(path: str, audit_id: str) -> str | None:
+    """`started_at` when the findings file was last written before this run's
+    `start`, else None: such a document is an earlier run's, and publishing it
+    vouches for a fleet as it stood then. Unknown either way reads as fresh."""
+    record = read_run_record(audit_id)
+    started_raw = record.get(RUN_RECORD_STARTED_KEY) if isinstance(record, dict) else None
+    started = parse_gh_timestamp(started_raw)
+    try:
+        written = os.path.getmtime(path)
+    except OSError:
+        return None
+    if started is None or written >= started.timestamp():
+        return None
+    return str(started_raw)
+
+
 def _finish(args: argparse.Namespace, audit_id: str) -> None:
     data = load_findings(args.findings_file, audit_id)
+    stale_since = findings_predate_run(args.findings_file, audit_id)
+    if stale_since:
+        raise ValidationError(
+            f"--findings-file: {args.findings_file} was last written before this run "
+            f"started at {stale_since}; it is an earlier run's document. Write this "
+            "run's findings from this run's collector manifest."
+        )
     # The collector's side of the run, when there is one. A stream in
     # COLLECTOR_AUDITS must pass one of the two flags (checked below, once the
     # waiver is parsed); a stream whose SOP has no collector yet publishes on
@@ -13894,6 +13966,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "--no-collector-manifest: give the reason the collector produced no "
             "manifest; it is published as this run's coverage gap."
         )
+    # A waiver says the collector produced nothing, so it is refused where
+    # the collector wrote this run's manifest: the worker skipped passing it.
+    if waiver and manifest is None:
+        written = Path(manifest_path_for(audit_id))
+        try:
+            fresh = written.is_file() and manifest_predates_run(
+                json.loads(written.read_text(encoding="utf-8")), audit_id
+            ) is None and read_run_record(audit_id) is not None
+        except (OSError, ValueError):
+            fresh = False
+        if fresh:
+            raise ValidationError(
+                f"--no-collector-manifest: the collector wrote {written} during this run; "
+                "pass it with --manifest-file instead of waiving it."
+            )
     # Refused on a dry run too: the publishing call is the one that dropped
     # the flag, so a preview that accepts the omission previews a run the real
     # call will refuse.
@@ -13940,6 +14027,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
 
+    # A PodDisruptionBudget named at the workload's own declaration would be
+    # written over the Deployment it protects; it goes back to `manual`, and
+    # `finish` writes the budget beside the declaration instead.
+    on_declaration = demote_fixes_over_declarations(findings, manifest)
+    for fid in on_declaration:
+        log(f"WARNING: {fid}: a PodDisruptionBudget never goes over the workload's declaration; finish writes it beside")
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report. What each promised is kept for
     # `unwritten_sweep_fixes`, since the degrade blanks the path.
@@ -14252,6 +14345,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         )
     finally:
         probe.close()
+    # A decline of a budget `finish` can write is not taken: the worker's
+    # reason was the shortcut the refusal exists to stop.
+    for fid in sorted(set(declines) & set(planned)):
+        log(f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget itself")
+        declines.pop(fid)
     decline_unwritten_fixes(findings, unwritten, declines)
     remaining = {
         fid: fix
