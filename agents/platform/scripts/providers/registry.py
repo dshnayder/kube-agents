@@ -59,7 +59,11 @@ _UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = 
 # decides what that means for it (see `Forge.for_config`). Set, the file is the
 # whole answer: a forge it does not list is not built.
 FORGES_CONFIG_ENV = "VCS_FORGES_CONFIG"
-_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?")
+# A hostname and nothing else. A port is refused rather than accepted: the
+# repository parser reads a URL's host without its port, so a forge declared at
+# `host:8443` would load and then match no request; until ports are carried
+# through resolution end to end, the misconfiguration stops the build.
+_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 
 
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
@@ -89,7 +93,10 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
         provider = str(item.get("provider") or "").strip().lower()
         host = str(item.get("host") or "").strip().lower()
         if not provider or not _HOST_RE.fullmatch(host):
-            raise ValueError(f"forges[{index}] in {path} needs a provider and a hostname")
+            raise ValueError(
+                f"forges[{index}] in {path} needs a provider and a hostname "
+                "(no scheme, path or port)"
+            )
         allowed = item.get("allowedPaths") or []
         if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
             raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
@@ -136,6 +143,19 @@ class Registry:
         if "forges" not in settings:
             settings["forges"] = load_forge_entries()
         self.forges = build_forges(settings)
+        # An entry no forge class claims is a misspelt provider, or one this
+        # image predates. Building without it would start a broker that refuses
+        # every request at runtime; like the other misconfigurations, it stops
+        # the build instead.
+        known = {cls.name for cls in AVAILABLE}
+        unclaimed = sorted(
+            {entry.get("provider", "") for entry in settings.get("forges") or ()} - known
+        )
+        if unclaimed:
+            raise ValueError(
+                f"no forge in this image serves provider {', '.join(unclaimed)}; "
+                f"this image serves {', '.join(sorted(known))}"
+            )
         # One forge per host. A host two forges claim would be answered by
         # whichever registered first, which is a credential presented by the
         # order of a list; refusing at construction keeps resolution a

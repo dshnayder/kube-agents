@@ -850,6 +850,17 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     """
     try:
         forge, repo = registry.resolve(repository)
+    except providers.WorkspaceError as exc:
+        # Not the lists: the name does not resolve to a forge this install
+        # serves (a bare name with more than one forge, or none built).
+        LOGGER.warning(
+            "content workspace open repo=%s role=unknown: the repository does not "
+            "resolve to a forge this install serves code=%s; cloning without a credential",
+            repository,
+            exc.fields.get("code"),
+        )
+        return providers.NoCredential()
+    try:
         role = repository_role(repo, forge)
     except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
         LOGGER.warning(

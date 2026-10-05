@@ -270,9 +270,12 @@ class StaticFileCredential:
                 status=503,
                 code="FORGE_CREDENTIAL_UNAVAILABLE",
             ) from exc
-        if not token:
+        if not token or "\n" in token or "\r" in token:
+            # Empty, or more than one line: neither is a token, and a second
+            # line would split the credential's two faces -- an invalid header
+            # on the API side, nothing from the git helper on the other.
             raise WorkspaceError(
-                f"the forge credential for {self._host} is empty",
+                f"the forge credential for {self._host} is empty or is not one line",
                 status=503,
                 code="FORGE_CREDENTIAL_UNAVAILABLE",
             )

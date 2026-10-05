@@ -8738,6 +8738,18 @@ class ReadCredentialSelectionTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
 
+    def test_a_name_that_resolves_to_no_forge_is_not_logged_as_unreadable_lists(self):
+        # Review finding: a resolution refusal was logged as "the repository
+        # lists could not be read", sending an operator to the ConfigMap.
+        registry = mock.Mock()
+        registry.resolve.side_effect = providers.ForgeUnsupported("names no host")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential = credential_proxy.read_credential_for(registry, "acme/infra")
+        self.assertIsInstance(credential, providers.NoCredential)
+        joined = "\n".join(logs.output)
+        self.assertIn("does not resolve to a forge", joined)
+        self.assertNotIn("could not be read", joined)
+
     def test_only_a_context_repository_gets_a_credential(self):
         registry = providers.Registry({"mint": lambda provider, repo: "token"})
         with mock.patch.object(credential_proxy, "repository_role", return_value="context"):

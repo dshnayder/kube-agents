@@ -121,12 +121,27 @@ class ConfigurationFileTest(_ConfigCase):
         for entry in (
             {"host": "gitlab.example.com"},
             {"provider": "testforge", "host": "https://gitlab.example.com"},
+            # Review finding: a port loaded and then matched no request,
+            # because resolution reads a URL's host without its port.
+            {"provider": "testforge", "host": "gitlab.example.com:8443"},
             {"provider": "testforge", "host": "gitlab.example.com", "allowedPaths": "acme"},
         ):
             with self.subTest(entry=entry):
                 self.configure({"forges": [entry]})
                 with self.assertRaises(ValueError):
                     registry_module.load_forge_entries()
+
+
+class UnclaimedProviderTest(_ConfigCase):
+    def test_a_provider_no_forge_class_serves_stops_the_build(self):
+        # Review finding: a misspelt provider, or one this image predates,
+        # built a broker with no forges that refused everything at runtime.
+        for provider in ("githib", "gitlab"):
+            with self.subTest(provider=provider):
+                self.configure({"forges": [{"provider": provider, "host": "git.example.test"}]})
+                with self.assertRaises(ValueError) as caught:
+                    providers.Registry()
+                self.assertIn(provider, str(caught.exception))
 
 
 class TwoForgesTest(_ConfigCase):

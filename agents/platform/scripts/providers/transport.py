@@ -28,8 +28,10 @@ What a transport owns, and no forge may:
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Mapping, Protocol
@@ -37,7 +39,7 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
-from .errors import Override, forge_error
+from .errors import Guidance, Override, forge_error
 
 # What a CLI prints when the call reached the forge and the forge said no.
 _HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
@@ -247,6 +249,22 @@ class CliTransport:
         return forge_error(status, detail, self._overrides, message=output)
 
 
+# What a 3xx means here, since no route a forge declares answers with one: the
+# configured host, or something in front of it, is wrong. Retrying changes
+# nothing, and the credential was not sent on.
+_REDIRECTED = Guidance(
+    502,
+    "FORGE_REDIRECTED",
+    "The forge answered with a redirect, which no API route this broker calls "
+    "should do. The credential was not sent on. This install's forge host is "
+    "misconfigured, or something in front of it is redirecting; report it rather "
+    "than retrying.",
+)
+# The size of each read off the socket. Small enough that the call's deadline
+# is checked often against a peer that trickles, large enough that a page of
+# JSON is a handful of reads.
+_READ_CHUNK_BYTES = 64 * 1024
+
 # How much of a refusal's body becomes the detail an override reads. The caller
 # is shown 400 characters of it (`forge_error`); this bounds what is read off
 # the socket to get there.
@@ -276,7 +294,7 @@ def _http_detail(text: str) -> str:
     """
     try:
         body = json.loads(text) if text.strip()[:1] in "{[" else None
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         body = None
     reasons: list[str] = []
 
@@ -364,40 +382,73 @@ class HttpTransport:
             request.add_header("Content-Type", "application/json")
         for name, value in self._headers().items():
             request.add_header(name, value)
+        # One deadline for the whole call. The opener's timeout bounds each
+        # socket operation, and a peer that sends a byte inside every window
+        # would never trip it while holding one of the broker's request slots;
+        # the deadline is the wall-clock bound the CLI runner gets from its
+        # executor.
+        deadline = time.monotonic() + self._timeout
         try:
             with self._open(request, timeout=self._timeout) as response:
-                status = getattr(response, "status", 200)
-                if 300 <= status < 400:
-                    raise forge_error(status, f"the forge answered {status} with a redirect")
-                payload = response.read(self._max_bytes + 1)
+                payload = self._read_within(response, deadline)
         except urllib.error.HTTPError as exc:
             text = (exc.read(_ERROR_BODY_BYTES) or b"").decode("utf-8", "replace")
             return self._refused(exc.code, text)
         except WorkspaceError:
             raise
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # The call never got an answer. The default 0 lands on the "did
-            # not say why" reading, which is the truth.
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+            # The call never got a whole answer: refused, timed out, or a
+            # status line, header or chunked body the peer broke. `urllib`
+            # wraps only the send in `URLError`; `http.client` raises the
+            # rest. The default 0 lands on the "did not say why" reading,
+            # which is the truth.
             raise forge_error(0, f"the forge could not be reached: {type(exc).__name__}") from exc
-        if len(payload) > self._max_bytes:
-            raise WorkspaceError(
-                f"the forge's answer is larger than this broker accepts ({self._max_bytes} bytes)",
-                status=502,
-                code="FORGE_RESPONSE_TOO_LARGE",
-            )
         text = payload.decode("utf-8", "replace")
         if raw:
             return text
         try:
             return json.loads(text or "null")
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise WorkspaceError(
                 "the forge returned something that is not JSON",
                 status=502,
                 code="FORGE_CALL_FAILED",
             ) from exc
 
+    def _read_within(self, response: Any, deadline: float) -> bytes:
+        """The body, read in chunks until EOF, the ceiling, or the deadline.
+
+        `read1` returns what one receive brought rather than waiting for a
+        whole chunk, so the deadline is checked between receives, and the
+        ceiling refuses an oversized answer as soon as it is crossed rather
+        than after the whole body has arrived.
+        """
+        read = getattr(response, "read1", None) or response.read
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            if time.monotonic() > deadline:
+                raise forge_error(0, f"the forge's answer took longer than {self._timeout:g}s")
+            chunk = read(_READ_CHUNK_BYTES)
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if size > self._max_bytes:
+                raise WorkspaceError(
+                    f"the forge's answer is larger than this broker accepts ({self._max_bytes} bytes)",
+                    status=502,
+                    code="FORGE_RESPONSE_TOO_LARGE",
+                )
+            chunks.append(chunk)
+
     def _refused(self, status: int, text: str) -> Any:
+        if 300 <= status < 400:
+            # `_RefuseRedirect` declines every hop, so a 3xx arrives here as an
+            # `HTTPError`; the shared table has no entry for one.
+            raise WorkspaceError(
+                _REDIRECTED.text, status=_REDIRECTED.status, code=_REDIRECTED.code,
+                detail=f"HTTP {status}",
+            )
         raise forge_error(status, _http_detail(text), self._overrides, message=text)
 
     def whoami(self) -> str:

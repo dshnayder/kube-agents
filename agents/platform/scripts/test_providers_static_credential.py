@@ -56,7 +56,9 @@ class CredentialTest(unittest.TestCase):
         self.assertEqual({"Authorization": "Bearer glpat-first"}, credential.headers("a/b"))
 
     def test_a_missing_or_empty_file_is_refused_not_sent_anonymously(self):
-        for content in (None, "", "  \n"):
+        # Review finding: a second line passed, then failed as an invalid
+        # header on the API side and as nothing at all from the git helper.
+        for content in (None, "", "  \n", "glpat-a\nglpat-b\n", "glpat-a\rx"):
             with self.subTest(content=content):
                 if content is None:
                     self.token.unlink(missing_ok=True)

@@ -12,6 +12,7 @@ the credential never follows a redirect.
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import tempfile
@@ -19,6 +20,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import providers
 import vcs_broker
@@ -156,11 +158,53 @@ class BoundsTest(unittest.TestCase):
         opener = transport(None)._open.__self__
         self.assertTrue(any(isinstance(h, _RefuseRedirect) for h in opener.handlers))
 
-    def test_a_redirect_status_is_a_refusal(self):
-        opener = Opener(refusal(302, "moved"))
-        with self.assertRaises(WorkspaceError) as caught:
-            transport(opener).api("GET", "projects")
+    def test_a_redirect_says_the_host_is_misconfigured_not_retry(self):
+        # Review finding: the declined hop arrives as an HTTPError, and a 3xx
+        # has no entry in the shared table, so it read "one retry is
+        # reasonable" -- for a host that will redirect every time.
+        for status in (301, 302, 307):
+            with self.subTest(status=status):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(refusal(status, "moved"))).api("GET", "projects")
+                self.assertEqual("FORGE_REDIRECTED", caught.exception.fields["code"])
+                self.assertIn("misconfigured", str(caught.exception))
+
+    def test_a_broken_response_is_a_call_failure_not_an_opaque_error(self):
+        # Review finding: `urllib` wraps only the send in URLError; a bad
+        # status line or a chunked body cut short raises http.client's own.
+        for raised in (http.client.BadStatusLine("x"), http.client.IncompleteRead(b"{", 9)):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(raised)).api("GET", "projects")
+                self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+
+    def test_a_peer_that_trickles_is_cut_off_at_the_calls_deadline(self):
+        # Review finding: the opener's timeout bounds each receive, so a byte
+        # inside every window held the call -- and a request slot -- forever.
+        class Trickle(_Response):
+            def read1(self, n=-1):
+                return b" "
+
+        clock = iter(range(0, 10_000, 5))
+        opener = Opener(Trickle(b""))
+        with mock.patch("providers.transport.time.monotonic", lambda: next(clock)):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(opener, timeout=30.0).api("GET", "projects")
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+        self.assertIn("longer than 30s", caught.exception.fields["detail"])
+
+    def test_the_ceiling_refuses_before_the_whole_body_arrives(self):
+        reads = []
+
+        class Endless(_Response):
+            def read1(self, n=-1):
+                reads.append(n)
+                return b"x" * 1024
+
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(Endless(b"")), max_bytes=4096).api("GET", "projects")
+        self.assertEqual("FORGE_RESPONSE_TOO_LARGE", caught.exception.fields["code"])
+        self.assertLessEqual(len(reads), 5)
 
 
 class RefusalTest(unittest.TestCase):
@@ -190,6 +234,15 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_plain_text_body_gives_its_first_line(self):
         self.assertIn("upstream gone", self.refuse(500, "upstream gone\nmore").fields["detail"])
+
+    def test_a_body_nested_past_the_recursion_limit_keeps_the_status(self):
+        # Review finding: RecursionError escaped and the 404 was lost.
+        deep = "[" * 100_000 + "]" * 100_000
+        err = self.refuse(404, deep)
+        self.assertEqual("FORGE_NOT_FOUND", err.fields["code"])
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(_Response(deep.encode())), max_bytes=1 << 20).api("GET", "projects")
+        self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
 
     def test_a_forge_override_is_applied(self):
         named = providers.Guidance(401, "FORGE_TOKEN_EXPIRED", "the token in Secret x expired")
