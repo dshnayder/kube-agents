@@ -148,6 +148,13 @@ class Forge:
     # the transport; nothing here makes a call.
     api_url = ""
     whoami_route: tuple[str, str] | None = None
+    # The well-known host this forge answers for when an install has not
+    # configured it, and what is missing then. The registry turns them into a
+    # named gap -- "no credential is configured for <host>" -- rather than a
+    # bare "not a forge this install serves", for a forge configured per host
+    # that builds nothing until it is.
+    default_hosts: tuple[str, ...] = ()
+    unconfigured: tuple[str, ...] = ()
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
     # Whether `proposal-acknowledge` does anything here. A capability rather

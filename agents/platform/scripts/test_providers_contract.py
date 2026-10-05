@@ -163,7 +163,14 @@ class ContractTest(unittest.TestCase):
     def instances(self) -> list[tuple[str, Any, Path]]:
         built = []
         for name, cls in forge_cases():
-            for forge in cls.for_config({}):
+            # A forge configured per host builds nothing from an empty
+            # configuration -- by design, since an install that never set it up
+            # must not grow a second forge -- so it ships the configuration it
+            # is tested under beside its recordings, in the shape the registry
+            # hands `for_config`. A forge that needs none ships none.
+            config_file = fixtures_dir(cls) / "config.json"
+            config = json.loads(config_file.read_text()) if config_file.is_file() else {}
+            for forge in cls.for_config(config):
                 built.append((name, forge, fixtures_dir(cls)))
         self.assertTrue(built, "no forge in AVAILABLE built an instance")
         return built
@@ -405,7 +412,13 @@ class ContractTest(unittest.TestCase):
                         self.assertIn(method, {"GET", "POST", "PATCH", "PUT", "DELETE"})
                         self.assertNotIn("://", path)
                         self.assertFalse(path.startswith("/"))
-                        self.assertIn("acme/infra", path)
+                        # The repository, in the form the forge's API keys
+                        # it by: GitLab's takes the whole path as one
+                        # URL-encoded segment.
+                        self.assertTrue(
+                            "acme/infra" in path or "acme%2Finfra" in path,
+                            f"{path} does not name the repository",
+                        )
                         self.assertIsInstance(params, (dict, type(None)))
                         self.assertIsInstance(body, (dict, type(None)))
 

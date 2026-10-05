@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""What GitLab's forge does that the shared contract cannot see.
+
+    python3 -m pytest -q agents/platform/scripts/test_providers_gitlab.py
+
+`test_providers_contract.py` holds GitLab to the shapes every forge answers in.
+These pin the GitLab-specific decisions behind those shapes: the encoded
+project path, nested groups and `allowedPaths`, the state vocabulary in both
+directions, drafts, notes, the diff fallback, and how write access is asked.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import providers
+from providers import registry as registry_module
+from providers.base import ForgeUnsupported
+from workspace_paths import WorkspaceError
+
+GitLabForge = next(cls for cls in providers.AVAILABLE if cls.name == "gitlab")
+
+
+def forge(host="gitlab.com", allowed=()):
+    return GitLabForge(host, "/var/run/forge/token", allowed)
+
+
+class Api:
+    """Answers each call with the next response; records every call."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, method, path, *, params=None, body=None, raw=None):
+        self.calls.append((method, path, params or {}, body, raw))
+        answer = self.responses.pop(0)
+        if isinstance(answer, WorkspaceError):
+            raise answer
+        return answer
+
+
+def mr(iid=1, state="opened", source_project=1001, target_project=1001, **extra):
+    node = {
+        "id": 50000000 + iid, "iid": iid, "state": state, "title": f"mr {iid}",
+        "source_branch": "platform-agent/x", "target_branch": "main",
+        "source_project_id": source_project, "target_project_id": target_project,
+        "labels": [], "author": {"username": "u"}, "sha": "a" * 40,
+    }
+    node.update(extra)
+    return node
+
+
+class IdentityTest(unittest.TestCase):
+    def test_a_project_is_one_encoded_segment_at_any_depth(self):
+        # The default `quote` leaves `/` alone, which GitLab reads as another
+        # route and answers with a 404 that looks like a permissions problem.
+        api = Api(mr())
+        forge().proposal_view(api, "acme/platform/infra", {"number": 1})
+        self.assertEqual("projects/acme%2Fplatform%2Finfra/merge_requests/1", api.calls[0][1])
+
+    def test_nested_groups_parse_and_a_lone_segment_does_not(self):
+        self.assertEqual("acme/platform/infra", forge().parse("https://gitlab.com/acme/platform/infra.git"))
+        self.assertEqual("acme/infra", forge().parse("gitlab.com/acme/infra"))
+        with self.assertRaises(WorkspaceError):
+            forge().parse("https://gitlab.com/acme")
+
+    def test_another_host_is_not_this_forges_repository(self):
+        with self.assertRaises(WorkspaceError):
+            forge().parse("https://gitlab.example.com/acme/infra")
+
+    def test_allowed_paths_match_whole_segments(self):
+        # `acme/infra-secret` starts with the string `acme/infra`.
+        scoped = forge(allowed=("acme/infra", "Platform"))
+        self.assertEqual("acme/infra", scoped.parse("acme/infra"))
+        self.assertEqual("platform/team/x", scoped.parse("platform/team/x"))
+        with self.assertRaises(WorkspaceError) as caught:
+            scoped.parse("acme/infra-secret")
+        self.assertEqual(403, caught.exception.status)
+        self.assertEqual("REPOSITORY_NOT_ALLOWED", caught.exception.fields["code"])
+
+    def test_clone_url_and_api_root_are_the_configured_hosts(self):
+        self_managed = forge("gitlab.example.com")
+        self.assertEqual("https://gitlab.example.com/acme/infra.git", self_managed.clone_url("acme/infra"))
+        self.assertEqual("https://gitlab.example.com/api/v4", self_managed.api_url)
+        self.assertEqual(("user", "username"), self_managed.whoami_route)
+
+
+class ConfigurationTest(unittest.TestCase):
+    def test_nothing_is_built_unless_configured(self):
+        self.assertEqual((), tuple(GitLabForge.for_config({})))
+        self.assertEqual((), tuple(GitLabForge.for_config({"forges": None})))
+
+    def test_one_instance_per_configured_host(self):
+        built = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": "/t/a", "allowed_paths": ("acme",)},
+            {"provider": "gitlab", "host": "gitlab.example.com", "token_path": "/t/b", "allowed_paths": ()},
+            {"provider": "github", "host": "github.com"},
+        ]})
+        self.assertEqual([("gitlab.com",), ("gitlab.example.com",)], [f.hosts for f in built])
+
+    def test_an_entry_without_a_token_path_stops_the_build(self):
+        with self.assertRaises(ValueError):
+            GitLabForge.for_config({"forges": [{"provider": "gitlab", "host": "gitlab.com"}]})
+
+    def test_the_token_is_read_from_the_file_into_private_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "token"
+            token.write_text("glpat-x\n")
+            built = GitLabForge("gitlab.com", str(token))
+            self.assertEqual({"PRIVATE-TOKEN": "glpat-x"}, built.credential.headers("acme/infra"))
+            self.assertEqual(
+                f"credential.https://gitlab.com.helper",
+                built.credential.git_config("acme/infra")[1][0],
+            )
+
+
+class ProposalTest(unittest.TestCase):
+    def test_a_draft_is_a_title_prefix_and_never_doubled(self):
+        # The `draft` field is accepted and ignored on create.
+        for title, sent in (("Pin the image", "Draft: Pin the image"), ("Draft: Pin", "Draft: Pin")):
+            with self.subTest(title=title):
+                api = Api(mr(title=sent, draft=True))
+                forge().proposal_create(api, "acme/infra", {
+                    "title": title, "source": "platform-agent/x", "target": "main", "draft": True,
+                })
+                self.assertEqual(sent, api.calls[0][3]["title"])
+                self.assertNotIn("draft", api.calls[0][3])
+
+    def test_closed_includes_merged_as_it_does_everywhere(self):
+        api = Api([mr(1, "opened"), mr(2, "merged", merged_at="2026-10-01T00:00:00Z"), mr(3, "closed")])
+        answer = forge().proposal_list(api, "acme/infra", {"state": "closed", "limit": 3})
+        self.assertEqual("all", api.calls[0][2]["state"])
+        self.assertEqual([2, 3], [p["number"] for p in answer["proposals"]])
+        self.assertTrue(answer["truncated"])
+
+    def test_a_forks_branch_of_the_same_name_does_not_answer_for_ours(self):
+        api = Api([mr(1, source_project=2002), mr(2)])
+        answer = forge().proposal_list(api, "acme/infra", {"source": "platform-agent/x", "state": "open"})
+        self.assertEqual("platform-agent/x", api.calls[0][2]["source_branch"])
+        self.assertEqual([2], [p["number"] for p in answer["proposals"]])
+        self.assertEqual("acme/infra", answer["proposals"][0]["sourceRepo"])
+
+    def test_the_diff_falls_back_to_the_json_diffs_until_gitlab_has_computed_it(self):
+        api = Api(
+            mr(),
+            WorkspaceError("not ready", status=502),
+            [{"old_path": "a.yaml", "new_path": "a.yaml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}],
+        )
+        answer = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+        self.assertIn("diff --git a/a.yaml b/a.yaml\n--- a/a.yaml\n+++ b/a.yaml\n@@ -1 +1 @@", answer["diff"])
+        self.assertEqual("text/plain", api.calls[1][4])
+
+    def test_a_diff_refused_for_a_reason_other_than_not_ready_is_not_hidden(self):
+        api = Api(mr(), WorkspaceError("gone", status=404))
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+
+    def test_an_update_that_changes_nothing_reads_instead_of_writing(self):
+        # GitLab answers 400 for an update with no parameters.
+        api = Api(mr())
+        forge().proposal_update(api, "acme/infra", {"number": 1})
+        self.assertEqual("GET", api.calls[0][0])
+
+    def test_labels_travel_in_the_same_update_as_the_text(self):
+        api = Api(mr())
+        forge().proposal_update(api, "acme/infra", {
+            "number": 1, "title": "t", "labelsAdd": ["a", "b"], "labelsRemove": ["c"],
+        })
+        self.assertEqual(
+            {"title": "t", "add_labels": "a,b", "remove_labels": "c"}, api.calls[0][3]
+        )
+
+    def test_commits_come_back_oldest_first(self):
+        api = Api([
+            {"id": "new", "committed_date": "2026-10-02T00:00:00Z"},
+            {"id": "old", "committed_date": "2026-10-01T00:00:00Z"},
+        ])
+        answer = forge().proposal_commits(api, "acme/infra", {"number": 1})
+        self.assertEqual(["old", "new"], [c["sha"] for c in answer["commits"]])
+
+    def test_any_note_takes_an_award_and_already_awarded_is_fine(self):
+        api = Api({"id": 1})
+        answer = forge().proposal_acknowledge(api, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "review_comment"}})
+        self.assertTrue(answer["acknowledged"])
+        self.assertEqual("projects/acme%2Finfra/merge_requests/1/notes/9/award_emoji", api.calls[0][1])
+        self.assertEqual({"name": "eyes"}, api.calls[0][3])
+        again = Api(WorkspaceError("already awarded", status=409))
+        self.assertTrue(forge().proposal_acknowledge(again, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "issue"}})["acknowledged"])
+        self.assertFalse(forge().proposal_acknowledge(Api(), "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "review"}})["acknowledged"])
+
+
+class IssueTest(unittest.TestCase):
+    def test_both_halves_of_the_filter_are_listing_parameters(self):
+        api = Api([])
+        forge().issue_list(api, "acme/infra", {
+            "state": "open", "labels": ["a"], "excludeLabels": ["status:claimed"], "query": "drift",
+        })
+        params = api.calls[0][2]
+        self.assertEqual("opened", params["state"])
+        self.assertEqual("a", params["labels"])
+        self.assertEqual("status:claimed", params["not[labels]"])
+        self.assertEqual("drift", params["search"])
+        self.assertEqual("projects/acme%2Finfra/issues", api.calls[0][1])
+
+    def test_close_sends_the_state_event_and_accepts_the_shared_reasons(self):
+        api = Api({"iid": 4, "state": "closed"})
+        answer = forge().issue_close(api, "acme/infra", {"number": 4, "reason": "not-planned"})
+        self.assertEqual({"state_event": "close"}, api.calls[0][3])
+        self.assertEqual("closed", answer["issue"]["state"])
+        with self.assertRaises(WorkspaceError):
+            forge().issue_close(Api(), "acme/infra", {"number": 4, "reason": "duplicate"})
+
+
+class LabelTest(unittest.TestCase):
+    def test_a_created_label_gets_a_colour_with_its_hash(self):
+        api = Api(WorkspaceError("404 Label Not Found", status=404), {"name": "x", "color": "#6699cc"})
+        answer = forge().label_ensure(api, "acme/infra", {"name": "x"})
+        self.assertEqual("#6699cc", api.calls[1][3]["color"])
+        self.assertEqual("6699cc", answer["label"]["color"])
+        api = Api(WorkspaceError("404", status=404), {"name": "x", "color": "#fbca04"})
+        forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04"})
+        self.assertEqual("#fbca04", api.calls[1][3]["color"])
+
+    def test_a_label_name_is_encoded_in_its_path(self):
+        api = Api({"name": "status:in progress", "color": "#000000"})
+        forge().label_ensure(api, "acme/infra", {"name": "status:in progress"})
+        self.assertEqual("projects/acme%2Finfra/labels/status%3Ain%20progress", api.calls[0][1])
+
+
+class WriteAccessTest(unittest.TestCase):
+    def test_developer_and_above_may_write(self):
+        for level, expected in ((30, True), (40, True), (20, False)):
+            with self.subTest(level=level):
+                api = Api([{"id": 7, "username": "dev"}], {"access_level": level})
+                self.assertIs(expected, forge().can_write(api, "acme/infra", "dev"))
+                self.assertEqual("projects/acme%2Finfra/members/all/7", api.calls[1][1])
+
+    def test_a_stranger_is_no_and_a_failed_lookup_is_not_an_answer(self):
+        self.assertIs(False, forge().can_write(Api([]), "acme/infra", "nobody"))
+        self.assertIs(False, forge().can_write(Api([{"id": 7}], WorkspaceError("x", status=404)), "acme/infra", "dev"))
+        self.assertIsNone(forge().can_write(Api([{"id": 7}], WorkspaceError("x", status=502)), "acme/infra", "dev"))
+        self.assertIsNone(forge().can_write(Api(WorkspaceError("x", status=502)), "acme/infra", "dev"))
+
+
+class TranslationTest(unittest.TestCase):
+    def test_bookkeeping_notes_are_not_comments_and_diff_notes_are_review_comments(self):
+        api = Api({"iid": 1, "state": "opened"}, [
+            {"id": 1, "body": "please fix", "system": False, "author": {"username": "dev"}, "created_at": "1"},
+            {"id": 2, "body": "changed the description", "system": True, "author": {"username": "dev"}, "created_at": "2"},
+            {"id": 3, "body": "this line", "system": False, "author": {"username": "dev"}, "created_at": "3",
+             "position": {"new_path": "a.yaml", "new_line": 4}},
+        ])
+        answer = forge().issue_view(api, "acme/infra", {"number": 1, "comments": True})
+        self.assertEqual([("issue", 1), ("review_comment", 3)], [(c["kind"], c["id"]) for c in answer["comments"]])
+        self.assertEqual(("a.yaml", 4), (answer["comments"][1]["path"], answer["comments"][1]["line"]))
+        self.assertEqual("issue-1", answer["comments"][0]["ref"])
+
+    def test_a_token_bot_user_is_recognised_as_automation(self):
+        # Through a verb, as every caller sees it: the boundary test keeps the
+        # forge's modules behind the package surface.
+        notes = [
+            {"id": i, "body": "x", "system": False, "author": author, "created_at": str(i)}
+            for i, author in enumerate([
+                {"username": "project_1001_bot_3f2a"},
+                {"username": "group_42_bot"},
+                {"username": "x", "bot": True},
+                {"username": "kube-agents-eval-bot"},
+            ])
+        ]
+        answer = forge().issue_view(Api({"iid": 1, "state": "opened"}, notes), "acme/infra", {"number": 1, "comments": True})
+        self.assertEqual([True, True, True, False], [c["bot"] for c in answer["comments"]])
+
+    def test_states_and_iids(self):
+        cases = (
+            ({"state": "opened", "iid": 3, "id": 999}, "open", 3, ""),
+            ({"state": "locked", "iid": 3, "id": 999}, "closed", 3, ""),
+            ({"state": "merged", "iid": 3, "merged_at": "2026-10-01", "closed_at": None}, "merged", 3, "2026-10-01"),
+        )
+        for node, state, number, closed in cases:
+            with self.subTest(state=node["state"]):
+                proposal = forge().proposal_view(Api(node), "acme/infra", {"number": 3})["proposal"]
+                self.assertEqual((state, number, closed), (proposal["state"], proposal["number"], proposal["closed"]))
+        issue = forge().issue_view(Api({"state": "opened", "iid": 2}), "acme/infra", {"number": 2})["issue"]
+        self.assertEqual("open", issue["state"])
+
+
+class ErrorsTest(unittest.TestCase):
+    def test_a_refused_token_names_the_secret(self):
+        error = providers.forge_error(401, "401 Unauthorized", forge().error_overrides)
+        self.assertEqual("FORGE_UNAUTHENTICATED", error.fields["code"])
+        self.assertIn("credentialsRef", str(error))
+
+
+class RegistryTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def configure(self, forges):
+        path = self.dir / "forges.json"
+        path.write_text(json.dumps({"forges": forges}))
+        os.environ[registry_module.FORGES_CONFIG_ENV] = str(path)
+
+    def test_an_unconfigured_gitlab_com_is_a_named_gap_not_a_forge(self):
+        os.environ.pop(registry_module.FORGES_CONFIG_ENV, None)
+        forge_, _ = providers.Registry().resolve("https://gitlab.com/acme/infra")
+        self.assertEqual("gitlab", forge_.name)
+        with self.assertRaises(ForgeUnsupported) as caught:
+            forge_.clone_url("acme/infra")
+        self.assertIn("no credential is configured for gitlab.com", str(caught.exception))
+
+    def test_a_configured_self_managed_gitlab_leaves_gitlab_com_a_gap(self):
+        self.configure([{"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t"}])
+        registry = providers.Registry()
+        self.assertEqual(1, len(registry.forges))
+        stub, _ = registry.resolve("https://gitlab.com/acme/infra")
+        with self.assertRaises(ForgeUnsupported):
+            stub.clone_url("acme/infra")
+
+    def test_github_and_gitlab_resolve_by_host_and_a_bare_name_by_neither(self):
+        self.configure([
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t"},
+        ])
+        registry = providers.Registry()
+        self.assertEqual("gitlab", registry.resolve("https://gitlab.example.com/acme/infra")[0].name)
+        self.assertEqual("gitlab", registry.resolve("gitlab.example.com/acme/sub/infra")[0].name)
+        self.assertEqual("github", registry.resolve("https://github.com/acme/infra")[0].name)
+        with self.assertRaises(ForgeUnsupported):
+            registry.resolve("acme/infra")
+
+    def test_a_gitlab_only_install_keeps_the_bare_name(self):
+        self.configure([{"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t"}])
+        forge_, repo = providers.Registry().resolve("acme/infra")
+        self.assertEqual(("gitlab", "acme/infra"), (forge_.name, repo))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""GitLab: which calls to make, and nothing about how they are made.
+
+One class serves gitlab.com and every self-managed instance: the registry
+builds one instance per configured host, and the host is the only thing that
+differs between them. The transport is the broker's in-process HTTP client;
+the credential is a token an administrator stored in a Secret -- a group or
+project access token, or, on gitlab.com's Free tier where those do not exist,
+a personal access token of an account that exists for this install. The
+mechanism is the same for all three; what differs is how far the token
+reaches, which is why `allowed_paths` is enforced here before a credential is
+spent and the broker's managed list is enforced before that.
+
+What GitLab's API does differently from the shapes every caller expects, and
+where it is absorbed:
+
+- a project is addressed as one URL-encoded segment, `quote(path, safe="")`.
+  The default `quote` leaves `/` alone, which GitLab reads as a different
+  route, and the 404 that answers it reads like a permissions problem;
+- every number is an `iid`, never an `id` (see `translate.py`);
+- states are `opened`/`closed`/`merged` on the way in as well as out;
+- a draft is a title prefix, because the `draft` field is ignored when a merge
+  request is created;
+- notes carry GitLab's own bookkeeping, which is not a conversation;
+- `raw_diffs` answers 5xx until GitLab has computed the diff, so a diff falls
+  back to the JSON `diffs` endpoint and is assembled from it.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import quote
+
+import repo_ref
+
+from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
+from ..credentials import StaticFileCredential
+from ..validate import (
+    MAX_PAGE_SIZE,
+    repo_segments,
+    validate_branch,
+    validate_comment_limit,
+    validate_labels,
+    validate_limit,
+    validate_number,
+    validate_page,
+    validate_state,
+    validate_text,
+)
+from . import translate
+from .errors import ERROR_OVERRIDES
+
+#: GitLab's access level for Developer, the lowest that may push and open a
+#: merge request. Maintainer (40) and Owner (50) are above it.
+DEVELOPER_ACCESS = 30
+
+#: The username git is given beside the token. GitLab reads the token and
+#: accepts any non-empty username for an access token over HTTPS.
+GIT_USERNAME = "oauth2"
+
+#: The colour a label is created with when the caller names none. GitLab
+#: requires one; GitHub picks one itself.
+DEFAULT_LABEL_COLOR = "#6699cc"
+
+#: The emoji `proposal-acknowledge` awards: the same "seen" GitHub's reaction
+#: says.
+ACKNOWLEDGE_EMOJI = "eyes"
+
+
+def _states(neutral: str) -> str:
+    """The neutral state as GitLab's `state` parameter."""
+    return {"open": "opened", "closed": "closed", "all": "all"}[neutral]
+
+
+class GitLabForge(Forge):
+    name = "gitlab"
+    proposal_noun = "merge request"
+    verbs = COLLABORATION_VERBS
+    transport = "http"
+    error_overrides = ERROR_OVERRIDES
+    acknowledges = True
+    whoami_route = ("user", "username")
+    # What an install that has not configured GitLab answers for gitlab.com: a
+    # named gap rather than "not a forge this install serves".
+    default_hosts = ("gitlab.com",)
+    unconfigured = (
+        "no credential is configured for gitlab.com: declare a gitlab forge with "
+        "a credentialsRef on the PlatformAgent",
+    )
+
+    def __init__(
+        self, host: str, token_path: str, allowed_paths: Iterable[str] = ()
+    ) -> None:
+        super().__init__()
+        self.hosts = (host,)
+        self.api_url = f"https://{host}/api/v4"
+        self.credential = StaticFileCredential(
+            token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME
+        )
+        self.allowed_paths = tuple(
+            tuple(segment.casefold() for segment in path.strip("/").split("/"))
+            for path in allowed_paths
+            if path.strip("/")
+        )
+
+    @classmethod
+    def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
+        """One instance per configured GitLab host; none when none is configured.
+
+        gitlab.com and a self-managed instance are the same class with
+        different hosts. Without a configuration nothing is built, and a
+        gitlab.com URL then resolves to the named gap in the registry rather
+        than to a forge with no credential.
+        """
+        built = []
+        for entry in config.get("forges") or ():
+            if entry.get("provider") != cls.name:
+                continue
+            token_path = str(entry.get("token_path") or "")
+            if not token_path:
+                raise ValueError(f"the {cls.name} forge at {entry.get('host')} names no tokenPath")
+            built.append(cls(entry["host"], token_path, entry.get("allowed_paths") or ()))
+        return tuple(built)
+
+    # -- identity -----------------------------------------------------------
+
+    def parse(self, url: str) -> str:
+        """`group/subgroup/project`, nested as deep as GitLab nests.
+
+        Refused when it falls outside `allowed_paths`, compared segment by
+        segment: `acme/infra-secret` starts with the string `acme/infra` and is
+        a different project.
+        """
+        try:
+            parts = repo_segments(url, self.hosts)
+        except repo_ref.RepoRefError as error:
+            raise WorkspaceError(
+                f"{url!r} is not a repository on {self.hosts[0]}; expected group/project"
+            ) from error
+        if len(parts) < 2:
+            raise WorkspaceError(
+                f"{url!r} is not a repository on {self.hosts[0]}; expected group/project"
+            )
+        folded = tuple(part.casefold() for part in parts)
+        if self.allowed_paths and not any(
+            folded[: len(prefix)] == prefix for prefix in self.allowed_paths
+        ):
+            raise WorkspaceError(
+                f"{'/'.join(parts)} is outside the paths this install's {self.name} "
+                f"forge at {self.hosts[0]} is allowed to act on",
+                status=403,
+                code="REPOSITORY_NOT_ALLOWED",
+            )
+        return "/".join(parts)
+
+    def clone_url(self, repo: str) -> str:
+        return f"https://{self.hosts[0]}/{repo}.git"
+
+    @staticmethod
+    def _project(repo: str) -> str:
+        return f"projects/{quote(repo, safe='')}"
+
+    # -- shared by several verbs ------------------------------------------
+
+    @staticmethod
+    def _notes(api: Callable, path: str, limit: int) -> tuple[list, bool]:
+        """Up to `limit` notes from a notes endpoint, oldest first, as comments,
+        and whether it held more.
+
+        `limit` bounds the rows read, as on GitHub, and the page is judged full
+        on what GitLab sent: a page of bookkeeping may still have a person's
+        note behind it, which is exactly what `truncated` has to say. System
+        notes are dropped after the rows are counted.
+        """
+        per_page = min(limit, MAX_PAGE_SIZE)
+        rows: list = []
+        page = 1
+        while True:
+            params: dict[str, Any] = {"sort": "asc", "order_by": "created_at", "per_page": per_page}
+            if page > 1:
+                params["page"] = page
+            batch = api("GET", path, params=params) or []
+            rows += batch
+            full = len(batch) >= per_page
+            if not full or len(rows) >= limit:
+                kept = [
+                    translate.comment(n) for n in rows[:limit] if not translate.is_system_note(n)
+                ]
+                return kept, full or len(rows) > limit
+            page += 1
+
+    @staticmethod
+    def _label_params(payload: dict) -> dict[str, str]:
+        # Validated before any call, so a bad label leaves nothing half-applied.
+        # One update call carries both halves on GitLab, so there is no ordering
+        # between a label write and the text write to get wrong.
+        add = validate_labels(payload.get("labelsAdd"))
+        remove = validate_labels(payload.get("labelsRemove"))
+        params: dict[str, str] = {}
+        if add:
+            params["add_labels"] = ",".join(add)
+        if remove:
+            params["remove_labels"] = ",".join(remove)
+        return params
+
+    def _text_fields(self, payload: dict) -> dict[str, str]:
+        body: dict[str, str] = {}
+        if payload.get("title") is not None:
+            body["title"] = validate_text(payload.get("title"), "title").strip()
+        if payload.get("body") is not None:
+            body["description"] = validate_text(payload.get("body"), "body", required=False)
+        return body
+
+    def can_write(
+        self, api: Callable, repo: str, login: str, bot: bool = False
+    ) -> bool | None:
+        """Whether `login` may push to `repo`: a Developer or above.
+
+        GitLab keys membership on a user id, so the login is looked up first.
+        A login nobody holds, or a member below Developer, is a definitive no;
+        a lookup that failed is not an answer and says so.
+        """
+        if not login:
+            return False
+        try:
+            users = api("GET", "users", params={"username": login}) or []
+        except WorkspaceError:
+            return None
+        if not users:
+            return False
+        user_id = users[0].get("id")
+        try:
+            member = api("GET", f"{self._project(repo)}/members/all/{user_id}")
+        except WorkspaceError as exc:
+            return False if exc.status == 404 else None
+        return int((member or {}).get("access_level") or 0) >= DEVELOPER_ACCESS
+
+    # -- proposals ----------------------------------------------------------
+
+    def proposal_create(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        title = validate_text(payload.get("title"), "title").strip()
+        if payload.get("draft") and not title.startswith(translate.DRAFT_PREFIXES):
+            # The `draft` field is accepted and ignored on create; the prefix is
+            # what GitLab reads.
+            title = f"Draft: {title}"
+        body = {
+            "title": title,
+            "description": validate_text(payload.get("body"), "body", required=False),
+            "source_branch": validate_branch(payload.get("source"), "source"),
+            "target_branch": validate_branch(payload.get("target"), "target"),
+        }
+        node = api("POST", f"{self._project(repo)}/merge_requests", body=body)
+        return {"proposal": translate.proposal(node, repo)}
+
+    def proposal_list(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        limit = validate_limit(payload.get("limit"))
+        neutral = validate_state(payload.get("state"))
+        # The neutral `closed` is every proposal that is no longer open, merged
+        # ones included, as GitHub's is. GitLab's `closed` excludes merged, so
+        # that one is asked as `all` and filtered here.
+        params: dict[str, Any] = {
+            "state": "all" if neutral == "closed" else _states(neutral),
+            "per_page": limit,
+            "order_by": "created_at",
+            "sort": "desc",
+        }
+        page = validate_page(payload.get("page"))
+        if page > 1:
+            params["page"] = page
+        source = payload.get("source")
+        if source is not None:
+            params["source_branch"] = validate_branch(source, "source")
+        target = payload.get("target")
+        if target is not None:
+            params["target_branch"] = validate_branch(target, "target")
+        labels = validate_labels(payload.get("labels"))
+        if labels:
+            # GitLab's `labels` filter matches proposals carrying every one.
+            params["labels"] = ",".join(labels)
+        nodes = api("GET", f"{self._project(repo)}/merge_requests", params=params) or []
+        proposals = [translate.proposal(node, repo) for node in nodes]
+        if neutral == "closed":
+            proposals = [item for item in proposals if item["state"] != "open"]
+        if source is not None:
+            # A branch of the same name on a fork is not this repository's
+            # branch, and must not answer "is there an open proposal for the
+            # branch I just published".
+            proposals = [item for item in proposals if item["sourceRepo"] == repo]
+        # Judged on what GitLab sent: a full page filtered down is still a page.
+        return listing(proposals, limit, "proposals", returned=len(nodes))
+
+    def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        base = f"{self._project(repo)}/merge_requests/{number}"
+        node = api("GET", base)
+        result: dict[str, Any] = {"proposal": translate.proposal(node, repo)}
+        if payload.get("comments"):
+            limit = validate_comment_limit(payload.get("limit"))
+            comments, truncated = self._notes(api, f"{base}/notes", limit)
+            result["comments"] = comments
+            result["commentCount"] = len(comments)
+            result["commentsTruncated"] = truncated
+        if payload.get("diff"):
+            result["diff"] = self._diff(api, base)
+        return result
+
+    @staticmethod
+    def _diff(api: Callable, base: str) -> str:
+        """A unified diff of the merge request.
+
+        `raw_diffs` is the unified diff itself, and answers 5xx until GitLab
+        has computed it -- seconds after a merge request is opened. The JSON
+        `diffs` endpoint carries the same hunks per file, so that is the
+        fallback rather than a retry loop with a sleep in it.
+        """
+        try:
+            return api("GET", f"{base}/raw_diffs", raw="text/plain")
+        except WorkspaceError as exc:
+            if exc.status < 500:
+                raise
+        files = api("GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE}) or []
+        out = []
+        for item in files:
+            old, new = item.get("old_path") or "", item.get("new_path") or ""
+            out.append(f"diff --git a/{old} b/{new}\n")
+            out.append("--- " + ("/dev/null" if item.get("new_file") else f"a/{old}") + "\n")
+            out.append("+++ " + ("/dev/null" if item.get("deleted_file") else f"b/{new}") + "\n")
+            out.append(item.get("diff") or "")
+        return "".join(out)
+
+    def proposal_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api(
+            "POST",
+            f"{self._project(repo)}/merge_requests/{number}/notes",
+            body={"body": validate_text(payload.get("body"), "body")},
+        )
+        return {"comment": translate.comment(node)}
+
+    def proposal_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        body: dict[str, Any] = {**self._label_params(payload), **self._text_fields(payload)}
+        path = f"{self._project(repo)}/merge_requests/{number}"
+        # GitLab refuses an update that changes nothing (400, "at least one
+        # parameter"), where GitHub answers the unchanged proposal; the answer
+        # this verb promises is the proposal as it stands, so read it instead.
+        node = api("PUT", path, body=body) if body else api("GET", path)
+        return {"proposal": translate.proposal(node, repo)}
+
+    def proposal_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api(
+            "PUT",
+            f"{self._project(repo)}/merge_requests/{number}",
+            body={"state_event": "close"},
+        )
+        return {"proposal": translate.proposal(node, repo)}
+
+    def proposal_commits(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        limit = validate_limit(payload.get("limit"))
+        params: dict[str, Any] = {"per_page": limit}
+        page = validate_page(payload.get("page"))
+        if page > 1:
+            params["page"] = page
+        nodes = api(
+            "GET", f"{self._project(repo)}/merge_requests/{number}/commits", params=params
+        ) or []
+        # GitLab lists a merge request's commits newest first; the verb
+        # promises oldest first, so each page is turned around. A caller after
+        # the tip reads `sourceRevision` off the proposal, as on GitHub.
+        commits = [translate.commit(node) for node in reversed(nodes)]
+        return listing(commits, limit, "commits")
+
+    def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # Best-effort by contract. Any note -- conversation or diff -- takes an
+        # award emoji; GitLab keys it on the merge request and the note
+        # together, which is why `number` is in the request shape.
+        number = validate_number(payload.get("number"), "number")
+        comment = payload.get("comment") or {}
+        if not isinstance(comment, dict):
+            raise WorkspaceError("comment must be the {id, kind} of a comment")
+        ident = validate_number(comment.get("id"), "comment.id")
+        if str(comment.get("kind") or "") not in translate.ACKNOWLEDGEABLE:
+            return {"acknowledged": False}
+        try:
+            api(
+                "POST",
+                f"{self._project(repo)}/merge_requests/{number}/notes/{ident}/award_emoji",
+                body={"name": ACKNOWLEDGE_EMOJI},
+            )
+        except WorkspaceError as exc:
+            # Already awarded is the state the caller asked for.
+            if exc.status not in (400, 409):
+                raise
+        return {"acknowledged": True}
+
+    # -- issues -------------------------------------------------------------
+
+    def issue_create(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "title": validate_text(payload.get("title"), "title").strip(),
+            "description": validate_text(payload.get("body"), "body", required=False),
+        }
+        labels = validate_labels(payload.get("labels"))
+        if labels:
+            body["labels"] = ",".join(labels)
+        node = api("POST", f"{self._project(repo)}/issues", body=body)
+        return {"issue": translate.issue(node)}
+
+    def issue_list(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        limit = validate_limit(payload.get("limit"))
+        params: dict[str, Any] = {
+            "state": _states(validate_state(payload.get("state"))),
+            "per_page": limit,
+            "order_by": "created_at",
+            "sort": "desc",
+        }
+        labels = validate_labels(payload.get("labels"))
+        if labels:
+            params["labels"] = ",".join(labels)
+        # Both halves of the filter are GitLab's own parameters on the listing
+        # endpoint -- `not[labels]` and `search` -- so unlike GitHub there is
+        # no second route with its own grammar and ordering.
+        excluded = validate_labels(payload.get("excludeLabels"))
+        if excluded:
+            params["not[labels]"] = ",".join(excluded)
+        query = validate_text(payload.get("query"), "query", required=False).strip()
+        if query:
+            params["search"] = query
+        # GitLab's issues endpoint returns issues only; GitHub's mixes in pull
+        # requests, which is why this side needs no filtering and no paging past
+        # them.
+        nodes = api("GET", f"{self._project(repo)}/issues", params=params) or []
+        return listing([translate.issue(node) for node in nodes], limit, "issues")
+
+    def issue_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        base = f"{self._project(repo)}/issues/{number}"
+        node = api("GET", base)
+        result: dict[str, Any] = {"issue": translate.issue(node)}
+        if payload.get("comments"):
+            limit = validate_comment_limit(payload.get("limit"))
+            comments, truncated = self._notes(api, f"{base}/notes", limit)
+            result["comments"] = comments
+            result["commentCount"] = len(comments)
+            result["commentsTruncated"] = truncated
+        return result
+
+    def issue_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api(
+            "POST",
+            f"{self._project(repo)}/issues/{number}/notes",
+            body={"body": validate_text(payload.get("body"), "body")},
+        )
+        return {"comment": translate.comment(node)}
+
+    def issue_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        body: dict[str, Any] = {**self._label_params(payload), **self._text_fields(payload)}
+        path = f"{self._project(repo)}/issues/{number}"
+        node = api("PUT", path, body=body) if body else api("GET", path)
+        return {"issue": translate.issue(node)}
+
+    def issue_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        reason = validate_text(payload.get("reason"), "reason", required=False).strip()
+        # Validated for parity with every forge; GitLab records no close reason.
+        if reason and reason not in ("completed", "not-planned"):
+            raise WorkspaceError("reason must be one of completed, not-planned")
+        node = api(
+            "PUT", f"{self._project(repo)}/issues/{number}", body={"state_event": "close"}
+        )
+        return {"issue": translate.issue(node)}
+
+    # -- labels -------------------------------------------------------------
+
+    def label_ensure(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # Read, then create or update, as on every forge.
+        name = validate_labels([payload.get("name")])[0]
+        color = validate_text(payload.get("color"), "color", required=False).strip().lstrip("#")
+        description = validate_text(payload.get("description"), "description", required=False)
+        quoted = quote(name, safe="")
+        labels = f"{self._project(repo)}/labels"
+        try:
+            existing = api("GET", f"{labels}/{quoted}")
+        except WorkspaceError as exc:
+            if exc.status != 404:
+                raise
+            body: dict[str, Any] = {"name": name, "color": f"#{color}" if color else DEFAULT_LABEL_COLOR}
+            if description:
+                body["description"] = description
+            node = api("POST", labels, body=body)
+        else:
+            changes: dict[str, Any] = {}
+            if color:
+                changes["color"] = f"#{color}"
+            if description:
+                changes["description"] = description
+            node = api("PUT", f"{labels}/{quoted}", body=changes) if changes else existing
+        return {"label": translate.label(node)}
