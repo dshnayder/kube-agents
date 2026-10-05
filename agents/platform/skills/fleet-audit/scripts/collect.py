@@ -1753,12 +1753,19 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
     # reaches no other controller's pods: a `maxUnavailable` budget over pods
     # with no scale subresource behind them permits no evictions at all.
     selector = workload["spec"].get("selector")
-    if isinstance(selector, dict) and not any(
-        (template["kind"], template["name"]) != (workload["kind"], workload["name"])
-        and selector_matches(selector, template["labels"])
-        for template in context.get("pod_templates", {}).get(workload["ns"], [])
-    ):
-        hit["pod_selector"] = selector
+    if isinstance(selector, dict):
+        shared = sorted(
+            f"{template['kind']}/{template['name']}"
+            for template in context.get("pod_templates", {}).get(workload["ns"], [])
+            if (template["kind"], template["name"]) != (workload["kind"], workload["name"])
+            and selector_matches(selector, template["labels"])
+        )
+        if shared:
+            # Said on the candidate, so `finish` does not then ask the worker
+            # for the budget it would not write itself (SOP §3.4).
+            hit["pod_selector_withheld"] = f"the workload's selector also reaches {', '.join(shared)}'s pods"
+        else:
+            hit["pod_selector"] = selector
     return hit
 
 
@@ -8455,6 +8462,8 @@ def collect_cluster(
             emitted["pod_selector"] = hit["pod_selector"]
         if isinstance(hit.get("namespace_pdbs"), list):
             emitted["namespace_pdbs"] = hit["namespace_pdbs"]
+        if hit.get("pod_selector_withheld"):
+            emitted["pod_selector_withheld"] = hit["pod_selector_withheld"]
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
         # without `--workspace` or when content mode could not copy the whole

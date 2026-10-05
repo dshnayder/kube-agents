@@ -427,7 +427,9 @@ absent on every other run:
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
-degradation as the real run, so the branch names it names are the branch names it would create. It
+degradation as the real run, so the branch names it names are the branch names it would create,
+except a PodDisruptionBudget `finish` would write for a declared `no-pdb` finding, which only the
+real run plans. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
@@ -1198,7 +1200,9 @@ ledger URL never reached the operator who had asked for it.
 Two rules follow, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
-  report, and every report carries `issue_url` in full.
+  report, and every report carries `issue_url` in full, with every URL in `prs_opened` and
+  `prs_still_open`: a fix already waiting for review answers "was a fix proposed?" as much as one
+  this run opened.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and

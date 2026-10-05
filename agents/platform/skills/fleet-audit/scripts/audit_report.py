@@ -11308,19 +11308,25 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
-def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
+def unwritten_refusal_message(
+    unwritten: dict[str, "UnwrittenFix"], notes: dict[str, str] | None = None
+) -> str:
     """What the refusal tells the worker, one list per shape of the shortcut.
 
     The declared list names the object's own file, and says in so many words
     that a new object goes beside it: a worker told only "write the manifest at
     this path" writes a PodDisruptionBudget over the Deployment it protects, and
-    the sweep opens that pull request unasked. It also names the way out for
+    the sweep opens that pull request unasked. `notes` says, per finding, why
+    `finish` did not write a fix it could have (`plan_generated_fixes`), so the
+    worker is not told to write what `finish` judged would not render. It also
+    names the way out for
     a finding the SOP itself makes `manual`, or one a pull request already
     carries: `--decline-fix` with the reason, since every `finish` refuses
     until each listed fix is written or declined.
     """
     named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
+    notes = notes or {}
     parts = [
         f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
@@ -11341,6 +11347,14 @@ def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
             "PodDisruptionBudget, goes in a new file in that file's directory, never "
             "over the file itself."
         )
+        noted = [(fid, notes[fid]) for fid, _ in declared if fid in notes]
+        if noted:
+            parts.append(
+                "`finish` did not write these itself: "
+                + "; ".join(f"{fid}: {why}" for fid, why in noted)
+                + ". Where that is a Kustomize root, list the new file in its "
+                "`kustomization.yaml` `resources:` too, or it renders nothing."
+            )
     parts.append(
         "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
         "pull request already carries its fix, leave it `manual` and pass "
@@ -11400,12 +11414,16 @@ class _RepositoryProbe:
         self._workspace = None
         # Why the broker could not be asked, once it could not.
         self.unavailable = ""
+        # Why the last answer was a yes nobody saw: a call that failed or a
+        # listing that stopped short. Read and cleared by `take_unanswered`.
+        self.unanswered = ""
         self._attempts = 0
         # The clone's YAML, read once for every `mentions` in directory mode,
         # and whether any of it could not be read, which answers every search.
         self._texts: list[tuple[str, str]] | None = None
-        # Content mode's answers to `has_path`, one broker call per path.
-        self._paths: dict[str, bool] = {}
+        # Content mode's answers to `has_path`, one broker call per path, with
+        # why an answer was a default yes.
+        self._paths: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
 
     def broker(self):
@@ -11424,13 +11442,21 @@ class _RepositoryProbe:
                 log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
         return self._workspace
 
+    def take_unanswered(self) -> str:
+        """Why the broker could not answer since the last call, then forget it."""
+        why = self.unavailable or self.unanswered
+        self.unanswered = ""
+        return why
+
     def has_path(self, path: str) -> bool:
         if not content_mode():
             return (self.root / path).exists()
         # Every finding in one cluster tree asks about the same ancestors.
         if path not in self._paths:
-            self._paths[path] = self._broker_has_path(path)
-        return self._paths[path]
+            self.unanswered = ""
+            self._paths[path] = (self._broker_has_path(path), self.unanswered)
+        answer, self.unanswered = self._paths[path]
+        return answer
 
     def _broker_has_path(self, path: str) -> bool:
         workspace = self.broker()
@@ -11438,9 +11464,11 @@ class _RepositoryProbe:
             return True
         try:
             listing = workspace.list(prefix=path)
-        except Exception:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
+        except Exception as exc:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
+            self.unanswered = f"listing {path}: {type(exc).__name__}: {exc}"
             return True
         if getattr(listing, "truncated", False):
+            self.unanswered = f"listing {path} was truncated"
             return True
         return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
 
@@ -11477,7 +11505,8 @@ class _RepositoryProbe:
         try:
             # The broker refuses a path with an empty segment, so no trailing slash.
             found = workspace.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
-        except Exception:  # noqa: BLE001 -- an unanswered search cannot rule it out
+        except Exception as exc:  # noqa: BLE001 -- an unanswered search cannot rule it out
+            self.unanswered = f"searching for {name}: {type(exc).__name__}: {exc}"
             return True
         return not isinstance(found, dict) or int(found.get("total", 1)) > 0
 
@@ -11499,6 +11528,7 @@ def plan_generated_fixes(
     root: Path,
     probe: "_RepositoryProbe",
     audit_id: str = "",
+    notes: dict[str, str] | None = None,
 ) -> tuple[dict[str, tuple[str, str]], set[str]]:
     """`(planned, answered)`: finding id to `(path, text)` for each fix
     `finish` can write itself, and the ids a pull request already answers.
@@ -11560,6 +11590,8 @@ def plan_generated_fixes(
                 answered.add(fid)
                 continue
         if built is None:
+            if notes is not None:
+                notes[fid] = "the collector's selector is not one `policy/v1` takes"
             continue
         try:
             target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
@@ -11577,7 +11609,8 @@ def plan_generated_fixes(
         # The broker-backed answers say so when the broker could not be asked,
         # rather than reporting a collision nobody saw.
         def unchecked(found: str) -> str:
-            return f"the repository could not be checked ({probe.unavailable})" if probe.unavailable else found
+            why = probe.take_unanswered()
+            return f"the repository could not be checked ({why})" if why else found
 
         reason = None
         if path in taken_paths or (cluster, namespace, name) in taken_names:
@@ -11594,6 +11627,9 @@ def plan_generated_fixes(
             reason = unchecked(f"{scope or 'the repository'} already names an object {name}")
         if reason:
             log(f"WARNING: {fid}: `finish` does not write its PodDisruptionBudget: {reason}")
+            # For the refusal, so it does not ask for what `finish` declined.
+            if notes is not None:
+                notes[fid] = reason
             continue
         planned[fid] = (path, text)
         taken_paths.add(path)
@@ -11901,6 +11937,14 @@ def unwritten_sweep_fixes(
         for entry, candidate in _candidates(manifest)
         if isinstance(candidate.get("declaration"), dict)
     }
+    # A budget the collector would not derive (its selector reaches another
+    # controller's pods) is one SOP §3.4 says must not exist, so the worker is
+    # not asked for it either.
+    withheld = {
+        _candidate_identity(entry, candidate)
+        for entry, candidate in _candidates(manifest)
+        if candidate.get("pod_selector_withheld")
+    }
     degraded_set = set(degraded)
     # A declared `manual` fix a pull request the harness did not close already
     # carries -- open, merged, or closed by a person -- is answered; the
@@ -11924,6 +11968,8 @@ def unwritten_sweep_fixes(
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
         if fid in carried and str(finding.get("check") or "") != GENERATED_FIX_CHECK:
+            continue
+        if derive_finding_id(finding) in withheld:
             continue
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
@@ -13864,7 +13910,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # a failed `finish` does not hold a broker slot until the idle reclaim.
     atexit.register(probe.close)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
-        scan = kcc_declarations_via_broker(repo, probe.broker())
+        # The probe's open is the scan's: one that failed is not retried here
+        # with a session the probe does not count.
+        session = probe.broker()
+        scan = (
+            kcc_declarations_via_broker(repo, session)
+            if session is not None
+            else KccBrokerScan({}, False)
+        )
+        if session is None:
+            log(
+                f"WARNING: the Config Connector scan could not open {repo} through the "
+                f"broker ({probe.unavailable}); gcloud fixes publish as written"
+            )
         kcc_prebuilt = scan.declarations
         if scan.truncated:
             log(
@@ -14130,9 +14188,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     # A fix `finish` can derive is written rather than refused, but only once
     # the run is past the refusal, so a refused run leaves no file behind.
+    skipped: dict[str, str] = {}
     try:
         planned, answered = plan_generated_fixes(
-            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
         )
     finally:
         probe.close()
@@ -14143,7 +14202,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         if fid not in declines and fid not in planned and fid not in answered
     }
     if remaining and has_run_record(audit_id, repo):
-        raise ValidationError(unwritten_refusal_message(remaining))
+        raise ValidationError(unwritten_refusal_message(remaining, skipped))
     write_generated_fixes(findings, planned, root)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run

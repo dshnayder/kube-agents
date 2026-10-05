@@ -4256,6 +4256,7 @@ class TestCollectCluster(unittest.TestCase):
                     c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api"
                 )
                 self.assertNotIn("pod_selector", found)
+                self.assertIn(f"{other['kind']}/{other['metadata']['name']}", found["pod_selector_withheld"])
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])

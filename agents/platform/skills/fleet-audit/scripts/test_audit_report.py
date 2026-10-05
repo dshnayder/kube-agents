@@ -16102,6 +16102,60 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         wrapped = 'S="$(gcloud container clusters describe c --format=value(status))"'
         self.assertIn("--format='value(status)'", audit_report.quote_gcloud_format_projections(wrapped))
 
+    def test_a_budget_the_collector_withheld_is_not_asked_of_the_worker(self):
+        """SOP §3.4: a `maxUnavailable` budget over pods with no scale behind
+        them permits no evictions, so the refusal does not demand it."""
+        manifest = self.manifest()
+        manifest["clusters"][0]["candidates"][0]["pod_selector_withheld"] = (
+            "the workload's selector also reaches DaemonSet/agent's pods"
+        )
+        self.assertEqual(self.unwritten([self.manual()], manifest), {})
+
+    def test_the_refusal_says_why_finish_did_not_write_a_fix(self):
+        message = audit_report.unwritten_refusal_message(
+            {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
+            {"a": "apps/a is inside a Kustomize root, where a new file renders only if listed"},
+        )
+        self.assertIn("`finish` did not write these itself: a: apps/a is inside a Kustomize root", message)
+        self.assertIn("`kustomization.yaml` `resources:`", message)
+        self.touch("apps/kustomization.yaml")
+        notes = {}
+        manifest = self.manifest()
+        manifest["clusters"][0]["candidates"][0].update({"pod_selector": self.SELECTOR, "namespace": "web"})
+        finding = _pub("a", "no-pdb", "c1", "Deployment/a", namespace="web")
+        finding["remediation"] = {"kind": "manual", "note": ""}
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.plan_generated_fixes(
+                [finding], manifest, self.unwritten([finding], manifest), {}, [], self.workspace, probe, AUDIT, notes
+            )
+        self.assertIn("Kustomize root", notes["a"])
+
+    def test_a_listing_that_failed_or_stopped_short_is_named_not_called_a_collision(self):
+        class Listing(list):
+            truncated = False
+
+        for name, error, truncated, said in (
+            ("error", RuntimeError("down"), False, "listing apps/a/a-pdb.yaml: RuntimeError: down"),
+            ("truncated", None, True, "listing apps/a/a-pdb.yaml was truncated"),
+        ):
+            with self.subTest(name):
+                inner = mock.MagicMock()
+                listing = Listing([])
+                listing.truncated = truncated
+                inner.list.side_effect = error
+                inner.list.return_value = listing
+                inner.grep.return_value = {"total": 0}
+                session = mock.MagicMock()
+                session.__enter__.return_value = inner
+                module = mock.MagicMock()
+                module.Workspace.open.return_value = session
+                self.patch_attr("content_mode", lambda: True)
+                with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+                    self.generate()
+                self.assertIn(f"could not be checked ({said})", self.generate_err)
+                self.assertNotIn("already exists", self.generate_err)
+
     def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
         """The next run's clone no longer holds the file; refusing there would
         loop, and the sweep reports the live pull request as still open."""
