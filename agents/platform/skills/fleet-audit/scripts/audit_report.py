@@ -601,7 +601,13 @@ GCLOUD_LOCATION_FLAGS = (GCLOUD_LOCATION_FLAG, "--region", "--zone")
 CLUSTERS_UPDATE_PREFIX = "gcloud container clusters update"
 # Boolean flags, which take no value: read as taking one, a flag ahead of the
 # cluster name swallows it.
-VALUELESS_GCLOUD_FLAGS = (AUTHORIZED_NETWORKS_FLAG, GOOGLE_CLOUD_ACCESS_FLAG, DNS_ACCESS_FLAG)
+VALUELESS_GCLOUD_FLAGS = (
+    AUTHORIZED_NETWORKS_FLAG,
+    GOOGLE_CLOUD_ACCESS_FLAG,
+    DNS_ACCESS_FLAG,
+    "--async",
+    "--quiet",
+)
 VALUELESS_GCLOUD_FLAG_PREFIXES = ("--enable-", "--no-")
 # The API spells a multi-word enum with `_`; gcloud takes `-`.
 ENUM_API_SEPARATOR = "_"
@@ -1132,6 +1138,9 @@ PROBE_OPEN_ATTEMPTS = 2
 # reads it: a PDB name collides only inside its own cluster's tree.
 CLUSTER_TREE_ROOT = "clusters"
 CLUSTER_TREE_DEPTH = 2
+# How the planner names a declaration inside a Kustomize root, and what the
+# refusal looks for to add the `resources:` instruction.
+KUSTOMIZE_ROOT_REASON = "inside a Kustomize root"
 # The selector keys `policy/v1` takes, and nothing else.
 LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
@@ -4045,6 +4054,9 @@ def _parse_update_target(command: str) -> tuple[str, str, str] | None:
             ):
                 value, index = rest[index + 1], index + 1
             flags[key] = value
+        elif token.startswith("-"):
+            # A short flag (`-q`) is a boolean, never the name.
+            pass
         elif not positional:
             positional = token
         index += 1
@@ -11380,9 +11392,13 @@ def unwritten_refusal_message(
             parts.append(
                 "`finish` did not write these itself: "
                 + "; ".join(f"{fid}: {why}" for fid, why in noted)
-                + ". Where that is a Kustomize root, list the new file in its "
-                "`kustomization.yaml` `resources:` too, or it renders nothing."
+                + "."
             )
+            if any(KUSTOMIZE_ROOT_REASON in why for _, why in noted):
+                parts.append(
+                    "In a Kustomize root, list the new file in its `kustomization.yaml` "
+                    "`resources:` too, or it renders nothing."
+                )
     parts.append(
         "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
         "pull request already carries its fix, leave it `manual` and pass "
@@ -11391,6 +11407,16 @@ def unwritten_refusal_message(
         "written or declined."
     )
     return " ".join(parts)
+
+
+def _pdb_unbuildable_reason(candidate: dict) -> str:
+    """Why `_pdb_manifest` built nothing for `candidate`, in the refusal's words."""
+    if not candidate.get("pod_selector"):
+        return "the collector attached no selector to write it from"
+    workload = str(candidate.get("object") or "").partition("/")[2]
+    if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
+        return "its name would not be a valid Kubernetes name"
+    return "the collector's selector is not one `policy/v1` takes"
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
@@ -11619,7 +11645,7 @@ def plan_generated_fixes(
                 continue
         if built is None:
             if notes is not None:
-                notes[fid] = "the collector's selector is not one `policy/v1` takes"
+                notes[fid] = _pdb_unbuildable_reason(candidate)
             continue
         try:
             target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
@@ -11650,7 +11676,7 @@ def plan_generated_fixes(
         elif not ours and probe.has_path(path):
             reason = unchecked(f"{path} already exists")
         elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
-            reason = unchecked(f"{directory} is inside a Kustomize root, where a new file renders only if listed")
+            reason = unchecked(f"{directory} is {KUSTOMIZE_ROOT_REASON}, where a new file renders only if listed")
         elif not ours and probe.mentions(name, scope):
             reason = unchecked(f"{scope or 'the repository'} already names an object {name}")
         if reason:
@@ -11969,7 +11995,7 @@ def unwritten_sweep_fixes(
     # controller's pods) is one SOP §3.4 says must not exist, so the worker is
     # not asked for it either.
     withheld = {
-        _candidate_identity(entry, candidate)
+        _candidate_identity(entry, candidate): str(candidate["pod_selector_withheld"])
         for entry, candidate in _candidates(manifest)
         if candidate.get("pod_selector_withheld")
     }
@@ -11987,6 +12013,10 @@ def unwritten_sweep_fixes(
         rank = SEVERITY_RANK.get(str(finding.get("severity") or ""), len(SEVERITIES))
         if rank > (floor_rank if fid in vouched else unvouched_rank):
             continue
+        # Either shape: a promised file for a withheld budget is the same budget.
+        if derive_finding_id(finding) in withheld:
+            log(f"{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
+            continue
         if fid in degraded_set and promised.get(fid):
             as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
             pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
@@ -11996,8 +12026,6 @@ def unwritten_sweep_fixes(
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
         if fid in carried and str(finding.get("check") or "") != GENERATED_FIX_CHECK:
-            continue
-        if derive_finding_id(finding) in withheld:
             continue
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
@@ -13938,9 +13966,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # a failed `finish` does not hold a broker slot until the idle reclaim.
     atexit.register(probe.close)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
-        # The probe's open is the scan's: one that failed is not retried here
-        # with a session the probe does not count.
-        session = probe.broker()
+        # The probe's open is the scan's, and a failed one is retried once on
+        # the probe's count: the backstop keeps its retry, and planning, which
+        # fails safe without the broker, takes none.
+        session = probe.broker() or probe.broker()
         scan = (
             kcc_declarations_via_broker(repo, session)
             if session is not None

@@ -16116,6 +16116,28 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         )
         self.assertEqual(self.unwritten([self.manual()], manifest), {})
 
+    def test_a_promised_file_for_a_withheld_budget_is_not_refused_either(self):
+        manifest = self.manifest()
+        manifest["clusters"][0]["candidates"][0]["pod_selector_withheld"] = "reaches DaemonSet/agent's pods"
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            unwritten = self.unwritten([self.manual()], manifest, {"a": "apps/a/a-pdb.yaml"}, ["a"])
+        self.assertEqual(unwritten, {})
+        self.assertIn("not refused, and stays manual: reaches DaemonSet/agent's pods", err.getvalue())
+
+    def test_a_note_names_why_the_budget_could_not_be_built(self):
+        cases = {
+            "no selector": ({"object": "Deployment/a", "namespace": "web"}, "attached no selector"),
+            "long name": ({"object": "Deployment/" + "a" * 260, "namespace": "web", "pod_selector": self.SELECTOR}, "valid Kubernetes name"),
+        }
+        for name, (candidate, said) in cases.items():
+            with self.subTest(name):
+                self.assertIn(said, audit_report._pdb_unbuildable_reason(candidate))
+        message = audit_report.unwritten_refusal_message(
+            {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
+            {"a": "the collector attached no selector to write it from"},
+        )
+        self.assertNotIn("kustomization.yaml", message)
+
     def test_the_refusal_says_why_finish_did_not_write_a_fix(self):
         message = audit_report.unwritten_refusal_message(
             {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
@@ -20090,6 +20112,15 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
             "--enable-master-authorized-networks --master-authorized-networks=203.0.113.0/24 "
             "--no-enable-google-cloud-access  # replace `203.0.113.0/24` with the office CIDR",
         )
+
+    def test_a_short_flag_or_a_quiet_flag_is_never_the_name(self):
+        for command in (
+            "gcloud container clusters update -q my-c --location us-east4",
+            "gcloud container clusters update --quiet my-c --location us-east4",
+            "gcloud container clusters update --async my-c --location us-east4",
+        ):
+            with self.subTest(command):
+                self.assertEqual(audit_report._parse_update_target(command), ("my-c", "us-east4", ""))
 
     def test_a_valueless_flag_ahead_of_the_name_does_not_swallow_it(self):
         note = (

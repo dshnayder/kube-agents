@@ -1026,6 +1026,10 @@ def limitranges_by_namespace(dump: dict) -> dict[str, list[dict]]:
     return _by_namespace(dump, "LimitRange")
 
 
+# The controllers a disruption budget can count, through their scale subresource.
+SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
+
+
 def pod_templates_by_namespace(dump: dict) -> dict[str, list[dict]]:
     """Every pod template the dump holds, by namespace: `{kind, name, labels}`.
 
@@ -1760,11 +1764,17 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
             if (template["kind"], template["name"]) != (workload["kind"], workload["name"])
             and selector_matches(selector, template["labels"])
         )
-        if shared:
+        unscalable = [name for name in shared if name.partition("/")[0] not in SCALABLE_WORKLOAD_KINDS]
+        if unscalable:
             # Said on the candidate, so `finish` does not then ask the worker
-            # for the budget it would not write itself (SOP §3.4).
-            hit["pod_selector_withheld"] = f"the workload's selector also reaches {', '.join(shared)}'s pods"
-        else:
+            # for a budget SOP §3.4 says must not exist.
+            hit["pod_selector_withheld"] = (
+                f"the workload's selector also reaches {', '.join(unscalable)}'s pods, which no "
+                "scale subresource counts, so a budget over them permits no evictions"
+            )
+        elif not shared:
+            # Shared only with another scalable workload, the budget is valid
+            # but spans both: the worker decides, so nothing is attached.
             hit["pod_selector"] = selector
     return hit
 

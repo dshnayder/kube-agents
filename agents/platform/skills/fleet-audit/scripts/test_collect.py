@@ -4232,6 +4232,8 @@ class TestCollectCluster(unittest.TestCase):
         found = next(c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api")
         self.assertNotIn("pod_selector", found)
         self.assertEqual(found["namespace_pdbs"], [])
+        # Another scalable workload: the budget would be valid, so the worker decides.
+        self.assertNotIn("pod_selector_withheld", found)
 
     def test_a_selector_that_reaches_pods_with_no_scale_behind_them_is_not_carried(self):
         """A DaemonSet's pods, or a CronJob's Jobs': the disruption controller
