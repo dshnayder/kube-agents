@@ -1148,6 +1148,9 @@ GENERATED_FIX_NOTE = (
     "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
     "as the collector read it.)_"
 )
+# A decline naming the pull request that carries the fix: the one a
+# PodDisruptionBudget `finish` would write still takes.
+PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/pull/\d+")
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
@@ -4451,8 +4454,9 @@ def manifest_predates_run(manifest: dict, audit_id: str) -> tuple[str, str] | No
 
     `--manifest-file` is the one input `finish` takes from outside the run, and
     the collectors write it to a fixed path the SOP names in prose rather than
-    one the harness derives from the audit id — so `start` cannot scrub it the
-    way it scrubs the findings file. A run whose worker skipped the collector,
+    one the harness derives from the audit id. `start` scrubs the names the SOPs
+    use, but a collector run before it, or a name it does not know, survives.
+    A run whose worker skipped the collector,
     or whose collector died before writing, therefore finds last week's
     manifest sitting at that path and cross-checks against it: a corroboration
     that vouches for a fleet as it stood a week ago, which is worse than none,
@@ -11416,8 +11420,8 @@ def unwritten_refusal_message(
                     "`resources:` too, or it renders nothing."
                 )
     parts.append(
-        "Then run `finish` again. A declared `no-pdb` finding needs neither: leave it "
-        "`manual` and `finish` writes its PodDisruptionBudget. Where the SOP itself makes a finding `manual`, or a "
+        "Then run `finish` again. A declared `no-pdb` finding `finish` can write is "
+        "never listed here: it writes that PodDisruptionBudget itself. Where the SOP itself makes a finding `manual`, or a "
         "pull request already carries its fix, leave it `manual` and pass "
         "`--decline-fix <id> \"<why>\"` to the next `finish`; the reason is published "
         "on the finding's ledger row. `finish` refuses until each of these is "
@@ -11492,6 +11496,8 @@ class _RepositoryProbe:
         # The clone's YAML, read once for every `mentions` in directory mode,
         # and whether any of it could not be read, which answers every search.
         self._texts: list[tuple[str, str]] | None = None
+        # Working-tree files the name search reads past (`demote_fixes_over_declarations`).
+        self.ignored: set[str] = set()
         # Content mode's answers to `has_path`, one broker call per path, with
         # why an answer was a default yes.
         self._paths: dict[str, tuple[bool, str]] = {}
@@ -11568,7 +11574,9 @@ class _RepositoryProbe:
                             self._unreadable = True
             pattern = re.compile(expression, re.M)
             return self._unreadable or any(
-                pattern.search(body) for path, body in self._texts if path.startswith(prefix)
+                pattern.search(body)
+                for path, body in self._texts
+                if path.startswith(prefix) and path not in self.ignored
             )
         workspace = self.broker()
         if workspace is None:
@@ -11753,9 +11761,9 @@ def _path_is_contained(root: Path, path: str) -> bool:
     return True
 
 
-def demote_fixes_over_declarations(findings: list[dict], manifest: dict | None) -> list[str]:
+def demote_fixes_over_declarations(findings: list[dict], manifest: dict | None) -> dict[str, str]:
     """Set to `manual` every `GENERATED_FIX_CHECK` fix named at its workload's
-    own declaration, returning their ids.
+    own declaration, returning each id with the path it named.
 
     A worker told the object is declared at a path wrote the new budget there,
     over the Deployment; the sweep opened that pull request and a merge would
@@ -11766,14 +11774,20 @@ def demote_fixes_over_declarations(findings: list[dict], manifest: dict | None) 
         for entry, candidate in _candidates(manifest)
         if candidate.get("check") == GENERATED_FIX_CHECK and isinstance(candidate.get("declaration"), dict)
     }
-    demoted: list[str] = []
+    demoted: dict[str, str] = {}
     for finding in findings:
         remediation = finding.get("remediation") or {}
         declared = declared_at.get(derive_finding_id(finding), "")
         if remediation.get("kind") == "manifest" and declared and remediation.get("path") == declared:
             finding["remediation"] = {"kind": "manual", "note": str(remediation.get("note") or "")}
-            demoted.append(str(finding.get("id", "")))
+            demoted[str(finding.get("id", ""))] = declared
     return demoted
+
+
+def decline_names_a_pull_request(reason: str) -> bool:
+    """Whether a decline cites the pull request already carrying the fix: the
+    one reason a PodDisruptionBudget `finish` would write still stands."""
+    return bool(PULL_REQUEST_URL_PATTERN.search(reason))
 
 
 def has_run_record(audit_id: str, repo: str | None = None) -> bool:
@@ -12904,7 +12918,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     # Every findings or manifest file a worker wrote for this stream, under
     # any name: a later worker that skips a step finds an earlier run's
     # document beside it and publishes that as its own.
-    for pattern in (f"findings_{audit_id}*.json", f"manifest_{audit_id}*.json"):
+    for pattern in (f"findings_{audit_id}*.json", f"manifest_{audit_id}*.json", f".manifest_{audit_id}*.partial"):
         for stale in Path(SCRATCH_DIR).glob(pattern):
             stale.unlink(missing_ok=True)
 
@@ -13196,6 +13210,11 @@ def _draft_location(name: str) -> tuple[str, str]:
     return "", ""
 
 
+# What `draft` writes where the collector gave no reason of its own.
+DRAFT_NOT_APPLICABLE_REASON = "the collector found this check does not apply to this cluster"
+DRAFT_UNEVALUATED_LIMITATION = "the collector could not read what these checks need, so they did not run"
+
+
 def draft_findings(manifest: dict, audit_id: str) -> dict:
     """A findings document holding everything the collector already knows.
 
@@ -13232,6 +13251,23 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         }
         if CLUSTERS_LISTED_KEY in entry:
             cluster[CLUSTERS_LISTED_KEY] = entry[CLUSTERS_LISTED_KEY]
+        # What the collector found cannot apply leaves the denominator, as it
+        # does in `finish`'s own reading; left out, every Autopilot or empty
+        # cluster would publish as partially audited.
+        not_applicable = [
+            {"check": str(e.get("check")), "reason": str(e.get("reason") or DRAFT_NOT_APPLICABLE_REASON)}
+            for e in entry.get("checks_not_applicable") or []
+            if isinstance(e, dict) and str(e.get("check")) in roster
+        ]
+        if not_applicable:
+            cluster["checks_not_applicable"] = not_applicable
+        # A check whose read failed neither ran nor was found inapplicable;
+        # `finish` requires it named in `limitations`.
+        unevaluated = sorted(
+            str(e.get("check")) for e in entry.get("checks_unevaluated") or [] if isinstance(e, dict) and e.get("check")
+        )
+        if unevaluated:
+            cluster["limitations"] = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unevaluated)}"
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):
@@ -14064,7 +14100,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             fresh = written.is_file() and manifest_predates_run(
                 json.loads(written.read_text(encoding="utf-8")), audit_id
             ) is None and read_run_record(audit_id) is not None
-        except (OSError, ValueError):
+        except Exception:  # noqa: BLE001 -- an unreadable file is no manifest to pass
             fresh = False
         if fresh:
             raise ValidationError(
@@ -14145,6 +14181,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # One broker session for the run's repository questions; closed after the
     # generated fixes are planned below.
     probe = _RepositoryProbe(repo, root)
+    # The worker's budget is still in those files; it names nothing the
+    # repository holds, so the name search reads past it.
+    probe.ignored = set(on_declaration.values())
     # Closed after planning below, and at exit if anything between raises, so
     # a failed `finish` does not hold a broker slot until the idle reclaim.
     atexit.register(probe.close)
@@ -14438,6 +14477,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A decline of a budget `finish` can write is not taken: the worker's
     # reason was the shortcut the refusal exists to stop.
     for fid in sorted(set(declines) & set(planned)):
+        if decline_names_a_pull_request(declines[fid]):
+            # A person's pull request already carrying the budget is the one
+            # decline the planner cannot see for itself; it stands.
+            planned.pop(fid)
+            continue
         log(f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget itself")
         declines.pop(fid)
     decline_unwritten_fixes(findings, unwritten, declines)

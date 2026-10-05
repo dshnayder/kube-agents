@@ -9428,6 +9428,8 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
 # The suffix of the temporary file `--out` writes beside its target before the
 # rename, so a reader of the directory can tell a half-written manifest apart.
 MANIFEST_TEMP_SUFFIX = ".partial"
+# What `open(..., "w")` would create before the umask.
+MANIFEST_FILE_MODE = 0o666
 
 
 def write_manifest_atomically(path: Path, text: str) -> None:
@@ -9440,6 +9442,11 @@ def write_manifest_atomically(path: Path, text: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=MANIFEST_TEMP_SUFFIX)
+    # `mkstemp` makes the file 0600; the manifest is read by whoever runs
+    # `finish`, so it gets the mode a plain write would have.
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(temporary, MANIFEST_FILE_MODE & ~umask)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
             out.write(text)

@@ -15955,6 +15955,26 @@ class TestDraftFindings(BaseTestCase):
         self.assertEqual(draft["findings"][0]["remediation"], {"kind": "manual", "note": ""})
         self.assertEqual(draft["findings"][0]["evidence"]["excerpt"], "zero NetworkPolicies in payments")
 
+    def test_inapplicable_and_unevaluated_checks_carry_into_the_draft(self):
+        """Left out, an Autopilot cluster publishes as partially audited and a
+        failed read is rejected for its missing `limitations`."""
+        manifest = self.manifest()
+        entry = manifest["clusters"][0]
+        checks = [c["check"] for c in entry["commands"]]
+        na, unevaluated = checks[-1], checks[-2]
+        entry["commands"] = [c for c in entry["commands"] if c["check"] not in (na, unevaluated)]
+        entry["checks_not_applicable"] = [{"check": na, "reason": "Autopilot sets it"}]
+        entry["checks_unevaluated"] = [{"check": unevaluated, "error": "forbidden"}]
+        draft = audit_report.draft_findings(manifest, AUDIT)
+        for finding in draft["findings"]:
+            finding["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        validated = audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        audit_report.cross_check_manifest(validated, manifest)
+        cluster = draft["scope"]["clusters"][0]
+        self.assertEqual(cluster["checks_not_applicable"], [{"check": na, "reason": "Autopilot sets it"}])
+        self.assertNotIn(na, " ".join(audit_report.coverage_gaps(validated)))
+        self.assertIn(unevaluated, cluster["limitations"])
+
     def test_the_subcommand_writes_the_draft(self):
         path = self.tmp_path / "manifest.json"
         path.write_text(json.dumps(self.manifest()), encoding="utf-8")
@@ -16214,11 +16234,35 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         manifest = self.manifest()
         finding = self.manual()
         finding["remediation"] = {"kind": "manifest", "path": "apps/a/deploy.yaml", "note": "pdb"}
-        self.assertEqual(audit_report.demote_fixes_over_declarations([finding], manifest), ["a"])
+        self.assertEqual(audit_report.demote_fixes_over_declarations([finding], manifest), {"a": "apps/a/deploy.yaml"})
         self.assertEqual(finding["remediation"]["kind"], "manual")
         beside = self.manual()
         beside["remediation"] = {"kind": "manifest", "path": "apps/a/a-pdb.yaml"}
-        self.assertEqual(audit_report.demote_fixes_over_declarations([beside], manifest), [])
+        self.assertEqual(audit_report.demote_fixes_over_declarations([beside], manifest), {})
+
+    def test_only_a_decline_citing_a_pull_request_overrules_a_generated_budget(self):
+        self.assertTrue(audit_report.decline_names_a_pull_request("carried by https://github.com/acme/fleet/pull/12"))
+        self.assertFalse(audit_report.decline_names_a_pull_request("Manifest file missing locally."))
+
+    def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
+        """The worker's budget is still in the declaration's file; it names
+        nothing the repository holds."""
+        (self.workspace / "apps/a").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "apps/a/deploy.yaml").write_text("kind: PodDisruptionBudget\nmetadata:\n  name: a-pdb\n")
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        self.assertTrue(probe.mentions("a-pdb"))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        probe.ignored = {"apps/a/deploy.yaml"}
+        self.assertFalse(probe.mentions("a-pdb"))
+
+    def test_a_waiver_with_an_unreadable_manifest_beside_it_is_not_refused_by_a_crash(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        Path(audit_report.manifest_path_for(AUDIT)).write_text("[1, 2]")
+        rc = self.run_finish(make_doc(), ("--no-collector-manifest", "the collector crashed") + declined(make_doc()))
+        self.assertNotIn("Traceback", self.err)
+        self.assertNotIn("pass it with --manifest-file", self.err)
+        self.assertIn(rc, (0, 2))
 
     def test_a_budget_the_collector_withheld_is_not_asked_of_the_worker(self):
         """SOP §3.4: a `maxUnavailable` budget over pods with no scale behind
