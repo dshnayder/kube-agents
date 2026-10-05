@@ -27,6 +27,7 @@ from .credentials import (
     Credential,
     MintedReadCredential,
     NoCredential,
+    StaticFileCredential,
 )
 from .errors import GUIDANCE, Guidance, forge_error
 from .registry import AVAILABLE, Registry, build_forges
@@ -63,6 +64,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "MintedReadCredential",
     "NoCredential",
+    "StaticFileCredential",
     "Registry",
     "SHA_RE",
     "StubForge",
