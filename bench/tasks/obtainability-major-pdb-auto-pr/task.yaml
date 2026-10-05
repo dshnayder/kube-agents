@@ -116,6 +116,12 @@ verification_spec:
       # writing to a repository elsewhere needs this cleared locally.
       owner: gke-agentic
       accepts_stream_pull_request: true
+      # The budget goes beside the Deployment's declaration, never over it:
+      # a fix written over it changes one file and would pass otherwise. The
+      # glob covers the pool's clusters/seeded-a/ and a dev fleet's
+      # clusters/<prefix>-seeded-a/.
+      unchanged_paths:
+        - clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml
   # tool_called cannot see worker mutations (it counts the delegating turn
   # by default, and even under scope: workers a call is intent, not
   # effect), so read-only is asserted against the cluster
