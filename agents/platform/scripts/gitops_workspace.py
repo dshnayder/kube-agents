@@ -1179,6 +1179,17 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
         else:
             ref = repo_ref.try_parse(url)
             item = f"{ref.host}/{'/'.join(ref.segments)}" if ref and ref.host else None
+            if item and len(ref.segments) < MIN_REPOSITORY_DEPTH:
+                # A group, not a project: no forge's `parse` answers with fewer
+                # than two segments, so the key could never be asked for and
+                # every project under it would be refused with nothing pointing
+                # here. The GitHub branch refuses the same shape above.
+                LOGGER.warning(
+                    "Skipping %s repository %r: it names a group or namespace, not a "
+                    "repository; register each repository by its own URL.",
+                    key, url,
+                )
+                continue
         if not item:
             LOGGER.warning(
                 "Skipping %s repository %r: no host and path to key it by. "
@@ -1190,6 +1201,11 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
         if item not in keys:
             keys.append(item)
     return keys
+
+
+#: The fewest path segments any forge's repository has: `owner/name` on
+#: GitHub, `group/project` on GitLab.
+MIN_REPOSITORY_DEPTH = 2
 
 
 def get_managed_repo_keys() -> list[str]:

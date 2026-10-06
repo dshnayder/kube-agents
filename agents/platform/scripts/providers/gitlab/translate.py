@@ -56,36 +56,38 @@ def actor(node: dict[str, Any] | None) -> str:
     return str((node or {}).get("username") or "").strip()
 
 
-#: Service accounts, which a group or project adds as a member so a pipeline
-#: or an integration can act: `service_account_<...>` by default.
-_SERVICE_ACCOUNT_RE = re.compile(r"^service_account_", re.IGNORECASE)
+#: A service account GitLab named itself: `service_account_group_<id>_<hex>`
+#: or `..._project_<id>_<hex>`. Only the default spelling is matched; one
+#: created with a username of its own is told apart where its user object is
+#: read (`GitLabForge.can_write`), not by guessing at names a person could
+#: also choose.
+_SERVICE_ACCOUNT_RE = re.compile(r"^service_account_(group|project)_\d+_[0-9a-f]+$")
 
-#: GitLab's own automation users. A short list of the ones that comment on
-#: issues and merge requests, compared case-blind; an instance that adds its
-#: own is covered by `bot: true` where the payload carries it.
-GITLAB_BOT_USERS = frozenset(
-    {"support-bot", "alert-bot", "gitlab-security-bot", "ghost", "gitlab-duo"}
-)
+#: GitLab's own automation users that comment on issues and merge requests,
+#: compared case-blind. Exact names only: a prefix would also catch a person
+#: who chose a name that starts the same way.
+GITLAB_BOT_USERS = frozenset({"support-bot", "alert-bot", "gitlab-security-bot"})
 
 
 def is_automation(node: dict[str, Any] | None) -> bool:
-    """Whether a note's author is an automation rather than a person.
+    """Whether a note's author is known, from the note alone, to be automation.
 
     `bot` is on the user object only on some endpoints -- a note's `author`
-    carries none -- so the name is what the comment readers can always apply:
-    an access token's bot user, a service account, or one of GitLab's own
-    automation users (a `duo-` review bot among them).
+    carries none -- so what a note alone can say is the names GitLab itself
+    gives automation: an access token's bot user, a default-named service
+    account, or one of GitLab's own automation users. Anything else is not
+    decided here: an automation with a name of its own reads as a person on
+    the note, and is refused where a person would be trusted -- the write
+    check reads its user object, which says `bot` (`GitLabForge.can_write`).
     """
     node = node or {}
     if bool(node.get("bot")):
         return True
     login = actor(node)
-    lowered = login.lower()
     return bool(
         _TOKEN_BOT_RE.match(login)
         or _SERVICE_ACCOUNT_RE.match(login)
-        or lowered in GITLAB_BOT_USERS
-        or lowered.startswith("duo-")
+        or login.lower() in GITLAB_BOT_USERS
     )
 
 

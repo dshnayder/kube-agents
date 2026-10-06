@@ -2063,7 +2063,9 @@ It is not a gap. An **access token** is created once by an administrator,
 stored in a Secret, and lasts up to a year. There is
 nothing to acquire, nothing to sign, and nothing to refresh, and
 `/v1/forge/refresh` for it answers `nothing to refresh` rather than running a
-helper. GitLab's credential
+helper. A host the install recognises and has no forge for answers with that
+forge's gap, `FORGE_UNSUPPORTED`, as the verb after it would — it is not a
+forge with nothing to refresh, because it has no credential at all. GitLab's credential
 work is somewhere else entirely, in two places GitHub's arrangement does not
 force anyone to look at:
 
@@ -2164,10 +2166,16 @@ Two consequences, both small and both easy to omit:
 One more property of the token that belongs here because it surfaces elsewhere:
 **a group or project access token authenticates as a bot user** that GitLab
 creates with it (`group_<id>_bot_…`, or `…_bot1` on older instances), and a
-personal access token as its account. A comment's `bot` flag is read off the
-author's name, because a note's author object carries no `bot` field: a token's
-bot user, a service account (`service_account_…`), or one of GitLab's own
-automation users. Anything that asks "did the agent write this?" — the branch-prefix and
+personal access token as its account. A note's author object carries no `bot`
+field, so a comment's `bot` flag says only what the name alone settles: a
+token's bot user, a service account under GitLab's default name
+(`service_account_group_<id>_<hex>`), or one of GitLab's own automation users,
+matched exactly. A name a person could also choose is not guessed at. An
+automation with a name of its own — a service account created with a custom
+username — reads as a person on the note, and is refused where a person would
+be trusted: the write check reads its user object, which carries `bot`, and
+answers no for an automation whatever its role, so its comments are never
+taken as requests. Anything that asks "did the agent write this?" — the branch-prefix and
 `agent:ignore` rules, `viewer_login`, comment attribution — resolves to that
 login, read from `GET /user`, not to a human's. It is a fact the agent-side
 policy is told rather than infers.
@@ -2193,10 +2201,12 @@ rather than the default that appears when someone omits a field: an entry with
 no `allowedPaths` is refused, and `[]` is how the whole host is asked for. An
 entry that names no namespace — `""`, `"/"`, a template value that rendered empty
 — is refused rather than dropped, since dropping it could leave the list empty.
-A prefix with a segment no repository path can have — empty, spaced, `.`, `..`,
-`.git` or led by a dash, checked with the repository parser's own rule — is
-refused at construction too, because it would match nothing and refuse every
-repository on the host. A GitHub entry refuses `allowedPaths` outright: the App
+Each prefix is read by the parser `parse` uses for a repository, so the two
+cannot disagree: a trailing `.git` comes off and a leading host is lifted, as
+they do for a repository, and a segment the parser refuses — empty, `.`, `..`,
+`.git` or led by a dash — refuses the entry at construction, because a prefix
+`parse` can never match would refuse every repository on the host. Whitespace
+anywhere is refused rather than stripped. A GitHub entry refuses `allowedPaths` outright: the App
 installation's repository selection is what scopes that token, and the same key
 accepted there and ignored would read as narrowing it.
 
@@ -2278,7 +2288,10 @@ Four endpoints need naming because they are not a rename of GitHub's:
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal
-  is created with one.
+  is created with one. Because the marker is the title, a later re-title would
+  silently mark the merge request ready, where GitHub leaves `draft` alone; an
+  update that gives a new title without a draft prefix reads the merge request
+  first and keeps the marker on a draft.
 - **Commits.** GitLab lists a merge request's commits newest first, with no
   parameter to turn that round, and the verb promises oldest first with page 1
   holding the oldest. Reversing each page would put the newest commits on page 1

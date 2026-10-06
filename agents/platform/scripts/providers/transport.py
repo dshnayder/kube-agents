@@ -441,13 +441,25 @@ class HttpTransport:
         now = time.monotonic()
         deadline = now + self._timeout
         outer = self._outer_deadline() if self._outer_deadline else None
-        if outer is not None:
-            deadline = min(deadline, outer)
+        # Which bound cuts this call decides what a cut is reported as: the
+        # forge being slow, or the request having spent its time on earlier
+        # calls -- the second is the case the shared deadline exists for, and
+        # reporting it as a 300s forge would send the operator after the
+        # wrong thing.
+        slow = f"the forge's answer took longer than {self._timeout:g}s"
+        if outer is not None and outer < deadline:
+            deadline = outer
+            slow = "the request's time ran out while the forge was answering"
         if deadline <= now:
             raise forge_error(0, "the request's time ran out before this call to the forge")
+        # The opener gets the transport's own timeout unless the request's
+        # deadline is sooner. Not `deadline - now` unconditionally: at
+        # some monotonic clock readings `(now + t) - now` is not `t`, and
+        # the per-receive bound would drift off the one configured.
+        socket_timeout = self._timeout if deadline == now + self._timeout else deadline - now
         try:
-            with self._open(request, timeout=deadline - now) as response:
-                payload = self._read_within(response, deadline)
+            with self._open(request, timeout=socket_timeout) as response:
+                payload = self._read_within(response, deadline, slow=slow)
         except urllib.error.HTTPError as exc:
             return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
@@ -486,7 +498,9 @@ class HttpTransport:
             payload = b""
         return payload.decode("utf-8", "replace")
 
-    def _read_within(self, response: Any, deadline: float, cap: int | None = None) -> bytes:
+    def _read_within(
+        self, response: Any, deadline: float, cap: int | None = None, slow: str = ""
+    ) -> bytes:
         """The body, read in chunks until EOF, the ceiling, or the deadline.
 
         `read1` returns what one receive brought rather than waiting for a
@@ -500,16 +514,25 @@ class HttpTransport:
         short of its `Content-Length` would otherwise come back as the whole
         answer -- a truncated diff handed over as the diff. `length` is what
         `http.client` still expected; anything left is a broken answer.
+
+        A stall is reported as one, in `slow`'s words, whichever way it shows:
+        the check between receives, or -- the usual shape, since the socket's
+        timeout is the deadline's remainder -- the receive itself timing out.
+        The forge was reached; it stopped answering.
         """
+        slow = slow or f"the forge's answer took longer than {self._timeout:g}s"
         read = getattr(response, "read1", None) or response.read
         chunks: list[bytes] = []
         size = 0
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise forge_error(0, f"the forge's answer took longer than {self._timeout:g}s")
+                raise forge_error(0, slow)
             _settimeout(response, left)
-            chunk = read(_READ_CHUNK_BYTES)
+            try:
+                chunk = read(_READ_CHUNK_BYTES)
+            except TimeoutError as exc:
+                raise forge_error(0, slow) from exc
             if not chunk:
                 if getattr(response, "length", None):
                     raise forge_error(0, "the forge closed the connection before its answer was complete")
