@@ -305,6 +305,14 @@ def _unreachable(exc: BaseException) -> str:
     return f"the forge could not be reached: {type(exc).__name__}"
 
 
+def _broken_answer(exc: BaseException) -> str:
+    """An answer the forge started and broke off, in words that say it answered."""
+    reason = str(exc).strip()[:200]
+    if reason:
+        return f"the forge's answer could not be read: {type(exc).__name__}: {reason}"
+    return f"the forge's answer could not be read: {type(exc).__name__}"
+
+
 def _settimeout(response: Any, seconds: float) -> None:
     """Shorten the socket timeout under a response to `seconds`, if it has one.
 
@@ -464,12 +472,21 @@ class HttpTransport:
             return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
             raise
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-            # The call never got a whole answer: refused, timed out, or a
-            # status line, header or chunked body the peer broke. `urllib`
-            # wraps only the send in `URLError`; `http.client` raises the
-            # rest. The default 0 lands on the "did not say why" reading,
-            # which is the truth.
+        except urllib.error.URLError as exc:
+            # The send failed: a refused connection, an unknown name, a
+            # certificate, a connect timeout. `urllib` wraps only the send.
+            raise forge_error(0, _unreachable(exc)) from exc
+        except TimeoutError as exc:
+            # Bare, so not the send: the request went out and the status line
+            # never came back inside the bound. The forge was reached and
+            # stopped, which is `slow`, not a connectivity problem.
+            raise forge_error(0, slow) from exc
+        except http.client.HTTPException as exc:
+            # A status line, header or chunked body the peer broke: it
+            # answered, and the answer could not be read.
+            raise forge_error(0, _broken_answer(exc)) from exc
+        except OSError as exc:
+            # A reset or a dropped connection after the send.
             raise forge_error(0, _unreachable(exc)) from exc
         text = payload.decode("utf-8", "replace")
         if raw:

@@ -1190,6 +1190,16 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
                     key, url,
                 )
                 continue
+        if not item and kind == GITHUB_REPO_TYPE:
+            # The URL may well have a host and a path; what it lacks is being
+            # a two-segment github.com repository -- most often another
+            # forge's URL typed `github` from habit.
+            LOGGER.warning(
+                "Skipping %s repository %r: it is typed github but is not a "
+                "github.com owner/name repository; correct its type or its URL.",
+                key, url,
+            )
+            continue
         if not item:
             LOGGER.warning(
                 "Skipping %s repository %r: no host and path to key it by. "

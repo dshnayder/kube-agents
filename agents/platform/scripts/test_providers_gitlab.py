@@ -118,6 +118,15 @@ class ConfigurationTest(unittest.TestCase):
         ]})
         self.assertEqual((), whole[0].allowed_paths)
 
+    def test_an_allowed_path_naming_the_host_itself_stops_the_build(self):
+        # Review round 4: `gitlab.com` built a prefix no parsed repository
+        # can start with, refusing every repository on the host.
+        for bad in ("gitlab.com", "gitlab.com/", "/gitlab.com", "GitLab.com"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as caught:
+                    GitLabForge("gitlab.com", "/t", (bad,))
+                self.assertIn("[] for the whole host", str(caught.exception))
+
     def test_an_allowed_path_no_repository_can_have_stops_the_build(self):
         # Review: `acme//infra` or ` acme` matched nothing and refused every
         # repository on the host, one request at a time.
@@ -409,6 +418,23 @@ class WriteAccessTest(unittest.TestCase):
 
 
 class TranslationTest(unittest.TestCase):
+    def test_bookkeeping_rows_do_not_crowd_comments_out_of_the_limit(self):
+        # Review round 4: a merge request's notes are mostly GitLab's own
+        # bookkeeping, and counting those rows against `limit` reported a
+        # short conversation truncated -- which the sweep refuses.
+        def note(i, system):
+            return {"id": i, "body": f"n{i}", "system": system, "author": {"username": "dev"}, "created_at": str(i)}
+
+        api = Api(
+            {"iid": 1, "state": "opened"},
+            [note(1, True), note(2, True), note(3, False)],
+            [note(4, False), note(5, False)],
+        )
+        answer = forge().issue_view(api, "acme/infra", {"number": 1, "comments": True, "limit": 3})
+        self.assertEqual([3, 4, 5], [c["id"] for c in answer["comments"]])
+        self.assertFalse(answer["commentsTruncated"])
+        self.assertEqual(2, api.calls[2][2]["page"])
+
     def test_bookkeeping_notes_are_not_comments_and_diff_notes_are_review_comments(self):
         api = Api({"iid": 1, "state": "opened"}, [
             {"id": 1, "body": "please fix", "system": False, "author": {"username": "dev"}, "created_at": "1"},
