@@ -234,17 +234,24 @@ Nothing dispatches on it, and the gap is already costing something. The operator
 unmarshals whatever type string the ConfigMap holds, the merge writes existing entries back
 verbatim, and `GitHubSpec.GitRepo`'s own comment invites a cluster administrator to register
 repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry therefore survives
-reconciliation intact and reaches the agent — where `get_managed_github_repos()` keeps the `github`
-entries and returns bare slugs. It logs the ones it skips rather than dropping them in silence, so a
-repository an administrator registered is visible as unsupported instead of indistinguishable from
-one that was never registered; it is still skipped, and the discriminator the administrator wrote
-is discarded at the point of that skip.
+reconciliation intact and reaches the agent.
 
-Nothing downstream of it needs the discriminator. The sweep calls `forge.provider_for()` and gets
-the one provider there is, and the host each repository is on is re-read from the repository itself
-when a verb reaches the broker. So the missing half is upstream: `get_managed_github_repos()`
-keeping entries whose `type` is not `github`, and returning a value that still names the host it
-came from. A repository value that names no repository at all is refused before a round trip is
+There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
+pr-conversation, submit-suggestion and the scan gate. It names each entry the way the verbs take it.
+A GitHub entry is its bare `owner/name` while GitHub is the only forge the list names; any other
+forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
+canonical host to leave off; and once the list names a second forge, GitHub's entries are
+`github.com/owner/name` too, because the broker refuses a hostless name then. An entry of a type no
+forge in the image serves, or one that names no host, is logged and skipped, so a repository an
+administrator registered is visible as unsupported instead of indistinguishable from one that was
+never registered. `get_managed_github_repos()` remains for the callers that are GitHub's alone, such
+as the minted-token refresh.
+
+Nothing downstream needs the discriminator beyond that. The sweep calls `forge.provider_for()` and
+gets the broker's provider, and the host each repository is on is re-read from the name itself when
+a verb reaches the broker. What a consumer does need from the entry's `type` is the forge's own
+vocabulary: `gitops_workspace.proposal_noun` reads the registered type's class, so a GitLab
+repository's ledger and `/remediate` replies speak of merge requests. A repository value that names no repository at all is refused before a round trip is
 spent on it, and a host no forge module serves is the broker's refusal, reported to an operator as
 `FORGE_HOST_UNSUPPORTED` — [Repository identity](#repository-identity) covers the parse behind
 both.
@@ -376,8 +383,10 @@ sidecar validates across a trust boundary and must not pull in a module that she
   in for a clone URL.
 - `repo_ref.is_github_slug` is the predicate form, and it is stricter than the depth check alone:
   the value must already _be_ the slug rather than merely normalise to one.
-  `gitops_workspace.is_valid_repo_slug`, `credential_proxy.is_valid_repository` and the inline
-  check in `github_token_refresh.refresh_git_credentials` are calls to it, and all three answer
+  `credential_proxy.is_valid_repository` and the inline check in
+  `github_token_refresh.refresh_git_credentials` are calls to it, and
+  `gitops_workspace.is_valid_repo_slug` starts with it and then admits a host-qualified name
+  (`gitlab.com/acme/platform/infra`, or `github.com/owner/name`) on the same rule. All three answer
   about a string their caller then passes on verbatim — so a predicate that said yes about a value
   it had quietly trimmed would be answering about a string nobody holds.
 - `forge._parse_repo` was the sixth. #504 removed the `SETTINGS.md` path that called it, so it is
