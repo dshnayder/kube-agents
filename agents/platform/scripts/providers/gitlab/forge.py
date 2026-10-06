@@ -419,13 +419,6 @@ class GitLabForge(Forge):
         source = payload.get("source")
         if source is not None:
             params["source_branch"] = validate_branch(source, "source")
-            if page == 1:
-                # Forks are filtered out below, after the page arrives, so a
-                # page of `limit` could be filled by forks' branches of the
-                # same name and hide this repository's own. The first page --
-                # the "is there a proposal for my branch" question -- is read
-                # whole and cut to `limit` after filtering.
-                params["per_page"] = MAX_PAGE_SIZE
         target = payload.get("target")
         if target is not None:
             params["target_branch"] = validate_branch(target, "target")
@@ -433,22 +426,48 @@ class GitLabForge(Forge):
         if labels:
             # GitLab's `labels` filter matches proposals carrying every one.
             params["labels"] = ",".join(labels)
+        if source is not None:
+            return self._own_branch_proposals(api, repo, params, neutral, limit, page)
         nodes = api("GET", f"{self._project(repo)}/merge_requests", params=params) or []
         proposals = [translate.proposal(node, repo) for node in nodes]
         if neutral == "closed":
             proposals = [item for item in proposals if item["state"] != "open"]
-        if source is not None:
-            # A branch of the same name on a fork is not this repository's
-            # branch, and must not answer "is there an open proposal for the
-            # branch I just published".
-            proposals = [item for item in proposals if item["sourceRepo"] == repo]
-            if page == 1:
-                more = len(proposals) > limit or len(nodes) >= MAX_PAGE_SIZE
-                return listing(
-                    proposals[:limit], limit, "proposals", returned=limit if more else 0
-                )
         # Judged on what GitLab sent: a full page filtered down is still a page.
         return listing(proposals, limit, "proposals", returned=len(nodes))
+
+    def _own_branch_proposals(
+        self, api: Callable, repo: str, params: dict, neutral: str, limit: int, page: int
+    ) -> dict[str, Any]:
+        """A source-filtered listing, paged over this repository's own proposals.
+
+        A branch of the same name on a fork is not this repository's branch,
+        and must not answer "is there an open proposal for the branch I just
+        published" -- but forks are only told apart after a page arrives, so
+        GitLab's own pages of `limit` could be filled by forks and hide this
+        repository's. The rows are read in pages of the most GitLab serves,
+        filtered, and paged here, so page 2 continues page 1 rather than
+        coming from a second, differently sized pagination. Bounded by the
+        conversation row bound; a source branch rarely has more than a few.
+        """
+        want = page * limit
+        own: list = []
+        full = False
+        for fetch in range(1, -(-MAX_CONVERSATION_SIZE // MAX_PAGE_SIZE) + 1):
+            batch_params = dict(params, per_page=MAX_PAGE_SIZE, page=fetch)
+            nodes = api("GET", f"{self._project(repo)}/merge_requests", params=batch_params) or []
+            for node in nodes:
+                item = translate.proposal(node, repo)
+                if item["sourceRepo"] != repo:
+                    continue
+                if neutral == "closed" and item["state"] == "open":
+                    continue
+                own.append(item)
+            full = len(nodes) >= MAX_PAGE_SIZE
+            if len(own) > want or not full:
+                break
+        chunk = own[(page - 1) * limit : want]
+        more = len(own) > want or full
+        return listing(chunk, limit, "proposals", returned=limit if more else 0)
 
     def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

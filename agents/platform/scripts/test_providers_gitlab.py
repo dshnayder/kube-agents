@@ -218,6 +218,22 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual([3], [p["number"] for p in answer["proposals"]])
         self.assertFalse(answer["truncated"])
 
+    def test_page_two_of_a_source_filtered_listing_continues_page_one(self):
+        # Review: page 1 came from 100-row pages and page 2 from GitLab's own
+        # `limit`-row pages, so the two overlapped.
+        rows = []
+        for i in range(1, 9):
+            rows += [mr(100 + i, source_project=2002), mr(i)]  # forks interleaved with ours
+        pages = []
+        for page in (1, 2, 3):
+            api = Api(list(rows))
+            answer = forge().proposal_list(
+                api, "acme/infra", {"source": "platform-agent/x", "state": "open", "limit": 3, "page": page}
+            )
+            self.assertEqual((100, 1), (api.calls[0][2]["per_page"], api.calls[0][2]["page"]))
+            pages.append(([p["number"] for p in answer["proposals"]], answer["truncated"]))
+        self.assertEqual([([1, 2, 3], True), ([4, 5, 6], True), ([7, 8], False)], pages)
+
     def test_the_diff_falls_back_to_the_json_diffs_until_gitlab_has_computed_it(self):
         api = Api(
             mr(),
