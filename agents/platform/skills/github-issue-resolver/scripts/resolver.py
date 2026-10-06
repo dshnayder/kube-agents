@@ -755,6 +755,10 @@ def handle_poll(args):
                 "status": "FOUND",
                 "repository": repo,
                 "issue_number": target["number"],
+                # The forge's own link, not one built here: GitLab's issues are
+                # `/-/work_items/<n>` and a self-managed host has no template.
+                # The broker composed it, so it is not the reporter's text.
+                "issue_url": str(target.get("url") or ""),
                 "priority": priority_label,
                 "title": f"<untrusted_title>{sanitized_title}</untrusted_title>",
                 "title_plain": sanitized_title,

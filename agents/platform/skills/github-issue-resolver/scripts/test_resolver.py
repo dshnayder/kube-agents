@@ -621,6 +621,8 @@ class HandlePollTest(ResolverTest):
         # decides: lowest-numbered wins, regardless of listing order.
         self.assertEqual(payload["issue_number"], 7)
         self.assertEqual(payload["repository"], "acme/toolkit")
+        # The forge's own link, for the escalation message to use verbatim.
+        self.assertEqual(payload["issue_url"], "https://forge.invalid/issues/7")
         # The neutral comment shape carries `author` as a login, already
         # normalised by the provider -- not GitHub's `{"login": ...}` node.
         self.assertEqual(payload["comments"][0]["author"], "alice")
