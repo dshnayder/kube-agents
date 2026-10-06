@@ -285,6 +285,7 @@ class VcsBroker:
         http_timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
         http_max_bytes: int = DEFAULT_HTTP_MAX_BYTES,
         http_opener: Callable[..., Any] | None = None,
+        request_deadline: Callable[[], float | None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -303,6 +304,9 @@ class VcsBroker:
         self._http_timeout = http_timeout
         self._http_max_bytes = http_max_bytes
         self._http_opener = http_opener
+        # The deadline of the request slot the calling thread holds: the bound
+        # the CLI runner applies per request, which a per-call timeout is not.
+        self._request_deadline = request_deadline
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
@@ -348,6 +352,7 @@ class VcsBroker:
                 max_bytes=self._http_max_bytes,
                 whoami_route=forge.whoami_route,
                 opener=self._http_opener,
+                outer_deadline=self._request_deadline,
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "

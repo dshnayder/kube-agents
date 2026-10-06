@@ -31,6 +31,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -287,6 +288,23 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _unreachable(exc: BaseException) -> str:
+    """Why the forge could not be reached, in words an operator can act on.
+
+    `URLError` carries the reason -- a refused connection, an unknown name, a
+    certificate -- and the type alone says none of it. A certificate this image
+    does not trust is named outright: no retry fixes it, and a self-managed
+    forge behind a private CA is the case that meets it.
+    """
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
+        return "the forge's TLS certificate is not trusted by this image"
+    reason = str(cause).strip()[:200]
+    if reason:
+        return f"the forge could not be reached: {type(exc).__name__}: {reason}"
+    return f"the forge could not be reached: {type(exc).__name__}"
+
+
 def _settimeout(response: Any, seconds: float) -> None:
     """Shorten the socket timeout under a response to `seconds`, if it has one.
 
@@ -371,6 +389,7 @@ class HttpTransport:
         max_bytes: int,
         whoami_route: tuple[str, str] | None = None,
         opener: Callable[..., Any] | None = None,
+        outer_deadline: Callable[[], float | None] | None = None,
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("a forge API is reached over https only")
@@ -380,6 +399,7 @@ class HttpTransport:
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._whoami_route = whoami_route
+        self._outer_deadline = outer_deadline
         self._open = opener or urllib.request.build_opener(_RefuseRedirect).open
 
     def api(
@@ -414,9 +434,19 @@ class HttpTransport:
         # would never trip it while holding one of the broker's request slots;
         # the deadline is the wall-clock bound the CLI runner gets from its
         # executor.
-        deadline = time.monotonic() + self._timeout
+        #
+        # A verb that loops makes many calls on one request, and the request
+        # holds one broker slot under one shared deadline (`request_slot`);
+        # `outer_deadline` is that one, and no call outlives it.
+        now = time.monotonic()
+        deadline = now + self._timeout
+        outer = self._outer_deadline() if self._outer_deadline else None
+        if outer is not None:
+            deadline = min(deadline, outer)
+        if deadline <= now:
+            raise forge_error(0, "the request's time ran out before this call to the forge")
         try:
-            with self._open(request, timeout=self._timeout) as response:
+            with self._open(request, timeout=deadline - now) as response:
                 payload = self._read_within(response, deadline)
         except urllib.error.HTTPError as exc:
             return self._refused(exc.code, self._error_text(exc, deadline))
@@ -428,7 +458,7 @@ class HttpTransport:
             # wraps only the send in `URLError`; `http.client` raises the
             # rest. The default 0 lands on the "did not say why" reading,
             # which is the truth.
-            raise forge_error(0, f"the forge could not be reached: {type(exc).__name__}") from exc
+            raise forge_error(0, _unreachable(exc)) from exc
         text = payload.decode("utf-8", "replace")
         if raw:
             return text

@@ -102,9 +102,9 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 "provider": provider,
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
-                "allowed_paths": None
-                if allowed is None
-                else tuple(p.strip("/") for p in allowed if p.strip("/")),
+                # Passed through unfiltered: an entry that trims to nothing is
+                # the forge's to refuse, not the loader's to drop.
+                "allowed_paths": None if allowed is None else tuple(allowed),
             }
         )
     return entries
