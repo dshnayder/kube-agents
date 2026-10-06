@@ -182,10 +182,10 @@ class StartupScriptTest(unittest.TestCase):
         self.assertIsNone(cf.check_startup_script("vm-1", "us-central1-a", "Finished running startup scripts.\n"))
 
     def test_the_match_is_case_sensitive(self):
-        """Unchanged from the pre-manifest revision: the markers are matched as
-        literal substrings, so a differently-cased line is not a hit. Pinned so
-        a later 'improvement' to the matcher is a deliberate change to what
-        gets flagged rather than a side effect."""
+        """`STARTUP_FAILURE_PATTERN` is case-sensitive, as the guest agent's
+        lines are, so a differently-cased line is not a hit. Pinned so a later
+        change to the matcher is a deliberate change to what gets flagged
+        rather than a side effect."""
         self.assertIsNone(cf.check_startup_script("vm-1", "us-central1-a", "STARTUP-SCRIPT EXIT STATUS 1\n"))
 
     def test_first_match_wins_and_the_scan_stops(self):
@@ -260,8 +260,15 @@ class OrphanedSnapshotTest(unittest.TestCase):
         link = "https://x/projects/proj-1/zones/us-central1-a/disks/gone"
         self.assertIsNone(cf.check_orphaned_snapshot(self.snapshot(), {link}, NOW))
 
-    def test_does_not_flag_a_snapshot_under_a_resource_policy(self):
-        self.assertIsNone(
+    def test_does_not_flag_a_snapshot_a_schedule_took(self):
+        """A schedule-created snapshot names its schedule; Snapshot carries no
+        `resourcePolicies`, which is a disk field."""
+        for key in ("sourceSnapshotSchedulePolicy", "sourceSnapshotSchedulePolicyId"):
+            with self.subTest(key):
+                self.assertIsNone(
+                    cf.check_orphaned_snapshot(self.snapshot(**{key: "daily"}), set(), NOW)
+                )
+        self.assertIsNotNone(
             cf.check_orphaned_snapshot(self.snapshot(resourcePolicies=["daily"]), set(), NOW)
         )
 
@@ -1461,12 +1468,11 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
         digest = "d41d8cd98f00b204e9800998ecf8427e" + "a" * 32
         self.assertNotIn(digest, cf.redact(f"checksum {digest} ok"))
 
-    def test_the_read_behind_a_candidate_survives_the_command_clip(self):
-        """`_joined_record` clips the join at MAX_COMMAND_CHARS and
-        `adopt_collector_evidence` writes that one string onto every finding of
-        the (target, check). Tail-ordered, a project with more RUNNING
-        instances than the budget holds shipped instance #30's excerpt under a
-        command naming only instances #1-#16."""
+    def test_each_candidate_names_its_own_read_past_the_command_clip(self):
+        """`_joined_record` clips the join at MAX_COMMAND_CHARS, so the slug's
+        record cannot name every failing instance's read. Each candidate
+        carries its own serial read as `command`, which
+        `adopt_collector_evidence` prefers."""
         many = ",".join(
             f'{{"name": "vm-{i:03d}", "status": "RUNNING", '
             f'"zone": "https://x/projects/p1/zones/us-central1-a"}}'
@@ -1478,22 +1484,16 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
             if "instances list" in joined:
                 return run_of(0, f"[{many}]")
             if "get-serial-port-output" in joined:
-                if "vm-059" in joined:
-                    return run_of(0, "startup-script exit status 1\n")
-                return run_of(0, "boot ok\n")
+                return run_of(0, "startup-script exit status 1\n")
             return run_of(0, "[]")
 
         entry = cf.collect_project("p1", run=run)
-        self.assertEqual(
-            [c["object"] for c in entry["candidates"]],
-            ["ComputeInstance/us-central1-a/vm-059"],
-        )
         startup = [c for c in entry["commands"] if c["check"] == cf.STARTUP_SLUG]
-        self.assertEqual(len(startup), 1)
-        command = startup[0]["command"]
-        self.assertLessEqual(len(command), cf.MAX_COMMAND_CHARS)
-        self.assertIn("more read(s)", command, "fixture must overflow the budget")
-        self.assertIn("vm-059", command, "the read behind the published excerpt was clipped away")
+        self.assertIn("more read(s)", startup[0]["command"], "fixture must overflow the budget")
+        self.assertEqual(len(entry["candidates"]), 60)
+        for candidate in entry["candidates"]:
+            instance = candidate["object"].rsplit("/", 1)[1]
+            self.assertIn("get-serial-port-output " + instance + " ", candidate["command"])
 
 
 class MigConvergenceTest(unittest.TestCase):
@@ -1507,11 +1507,6 @@ class MigConvergenceTest(unittest.TestCase):
         self.assertEqual(hit["object"], "ManagedInstanceGroup/us-central1-a/mig-1")
         self.assertIn("creating=2", hit["excerpt"])
         self.assertIn("deleting=1", hit["excerpt"])
-
-    def test_creating_without_retries_is_the_stuck_group(self):
-        hit = cf.check_mig_convergence(mig(creatingWithoutRetries=3))
-        self.assertIn("creatingWithoutRetries=3", hit["excerpt"])
-        self.assertIn("will not retry", hit["impact"])
 
     def test_a_group_only_scaling_up_is_not_a_finding(self):
         """The false positive the check is shaped to avoid. A healthy
@@ -1536,26 +1531,21 @@ class MigConvergenceTest(unittest.TestCase):
         hit = cf.check_mig_convergence(mig(name="batch-workers", creating=1, deleting=1))
         self.assertIsNone(hit["needs_triage"])
 
-    def test_a_stuck_gke_group_is_not_handed_back(self):
-        """The exclusion is about pod-driven churn, and a group that gave up
-        creating is not churning. Marking it would put the only condition this
-        stream can find on a fleet of node pools -- every visible group on the
-        reference install is one -- behind an instruction to consider dropping
-        it."""
-        for name in ("gke-prod-default-pool-1234-grp", "gk3-auto-pool-1-abcd-grp"):
-            hit = cf.check_mig_convergence(mig(name=name, creatingWithoutRetries=2))
-            self.assertIsNone(hit["needs_triage"], name)
+    def test_creating_without_retries_alone_is_not_a_finding(self):
+        """The field counts instances the group will try once each to create;
+        a failed creation lowers `targetSize`, so it says nothing about a
+        stall."""
+        for name in ("mig-1", "gke-prod-default-pool-1234-grp"):
+            self.assertIsNone(cf.check_mig_convergence(mig(name=name, creatingWithoutRetries=3)))
 
-    def test_a_stuck_group_still_fires_on_a_gke_name(self):
-        """Dropping the marker must not drop the candidate with it."""
-        hit = cf.check_mig_convergence(mig(name="gke-prod-default-pool-1234-grp", creatingWithoutRetries=2))
-        self.assertEqual(hit["object"], "ManagedInstanceGroup/us-central1-a/gke-prod-default-pool-1234-grp")
-        self.assertIn("creatingWithoutRetries=2", hit["excerpt"])
+    def test_an_update_in_progress_is_not_a_resize_loop(self):
+        """A rolling update with surge creates and deletes at once by design."""
+        updating = mig(creating=1, deleting=1)
+        updating["status"]["versionTarget"]["isReached"] = False
+        self.assertIsNone(cf.check_mig_convergence(updating))
 
-    def test_both_limbs_at_once_takes_the_resize_loop_and_its_marker(self):
-        """A group can report both. The resize-loop limb is checked first, so
-        the marker follows the limb that actually fired rather than the other
-        one silently clearing it."""
+    def test_a_resize_loop_with_no_retry_creations_keeps_its_marker(self):
+        """`creatingWithoutRetries` alongside the loop changes nothing."""
         hit = cf.check_mig_convergence(
             mig(name="gke-prod-default-pool-1234-grp", creating=1, deleting=1, creatingWithoutRetries=2)
         )
@@ -1719,7 +1709,9 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
 
         def run(argv, **kwargs):
             joined = " ".join(argv)
-            for needle, result in base.items():
+            # Longest needle first, so `node-groups list-nodes ng-1` wins over
+            # `node-groups list-nodes`, which wins over `node-groups list`.
+            for needle, result in sorted(base.items(), key=lambda item: -len(item[0])):
                 if needle in joined:
                     return result
             raise AssertionError(f"unstubbed command: {joined}")
@@ -1807,6 +1799,33 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
         )
         self.assertEqual(entry["outcome"], "collected")
         self.assertIn(cf.SNAPSHOT_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_some_unmeasured_node_groups_are_named_in_limitations(self):
+        """One group measured, one whose `list-nodes` failed: the check keeps
+        its verdict for the first and names the second, rather than reading
+        as run and clean on the project."""
+        groups = [
+            {"name": "ng-1", "zone": "https://x/zones/z1"},
+            {"name": "ng-2", "zone": "https://x/zones/z1"},
+        ]
+        entry = self.run_with(
+            **{
+                "node-groups list-nodes ng-2": run_of(1, "", "PERMISSION_DENIED"),
+                "node-groups list-nodes ng-1": run_of(0, json.dumps([node(cpus=8, used_cpus=1)])),
+                "node-groups list": run_of(0, json.dumps(groups)),
+            }
+        )
+        self.assertNotIn(cf.SOLE_TENANT_SLUG, unevaluated(entry))
+        self.assertIn("measured 1 of 2 node group(s)", entry["limitations"])
+        self.assertIn("ng-2 (z1)", entry["limitations"])
+        record = next(c for c in entry["commands"] if c["check"] == cf.SOLE_TENANT_SLUG)
+        self.assertNotIn("list-nodes ng-2", record["command"])
+
+    def test_a_failed_project_info_read_is_not_recorded_as_run(self):
+        """A failed read published under `rc: 0` claims a command succeeded."""
+        entry = self.run_with(**{"project-info describe": run_of(1, "", "PERMISSION_DENIED")})
+        record = next(c for c in entry["commands"] if c["check"] == cf.STARTUP_SLUG)
+        self.assertNotIn("project-info describe", record["command"])
 
     def test_a_failed_mig_list_gate_fails_the_target(self):
         """Unlike `list-nodes`, the group enumeration is gated: reading zero

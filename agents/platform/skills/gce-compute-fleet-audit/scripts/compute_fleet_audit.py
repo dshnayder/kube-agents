@@ -21,15 +21,16 @@ All four of the SOP's checks are implemented here:
   the RUNNING instances that actually run a startup script — its own metadata
   or the project's common metadata, read with `compute project-info describe` —
   and measures each with `compute instances get-serial-port-output`, matching
-  §2.1's two literal markers in the console text.
+  §2.1's markers (`STARTUP_FAILURE_PATTERN`) in the console text.
 - `mig-convergence-stalled` reads `compute instance-groups managed list` and
-  holds §2.2's two limbs against each group's `currentActions` counters.
+  holds §2.2's resize-loop condition against each group's `currentActions`
+  counters, skipping a group with an update in progress.
 - `sole-tenant-headroom` reads `compute sole-tenancy node-groups list`, then
   `list-nodes` per group, and ratios consumed against total vCPU and memory.
 - `orphaned-snapshots` cross-references `compute snapshots list` against
   `compute disks list` — a snapshot whose `sourceDisk` names neither a live
-  disk's name nor its `selfLink`, carries no `resourcePolicies`, and is older
-  than ninety days.
+  disk's name nor its `selfLink`, was not taken by a snapshot schedule, and is
+  older than ninety days.
 
 The roster was five checks and three of them were declared on every target
 with a reason saying no code performed them, which claimed coverage the run
@@ -66,9 +67,11 @@ Field contracts assumed of `gcloud ... --format=json` output:
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
-  (RFC-3339, `Z`-suffixed) and optionally `resourcePolicies`.
+  (RFC-3339, `Z`-suffixed), and `sourceSnapshotSchedulePolicy` /
+  `sourceSnapshotSchedulePolicyId` where a snapshot schedule took them.
 - `compute instance-groups managed list` items carry `name`, `size`,
-  `targetSize`, a `status` object, a `currentActions` object of thirteen
+  `targetSize`, a `status` object (with `versionTarget.isReached`), a
+  `currentActions` object of thirteen
   integer counters, and a `zone` *or* `region` selfLink — regional MIGs carry
   the latter, so `_scope_of` reads whichever is present. Every counter is read
   through `_count`, which defaults a missing or non-integer one to zero: a
@@ -193,10 +196,6 @@ MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
 
-# §2.1's condition, verbatim: the two literal substrings that mean the guest's
-# startup script exited non-zero. Case-sensitive substring match, no regex —
-# the same test the previous revision of this file ran, kept unchanged so the
-# conversion moves the output shape and not what gets flagged.
 # §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
 # guest agent current images ship logs `Script "startup-script" failed with
 # error: exit status 1` (seen on a Debian 12 VM, 2026-10-06); older agents
@@ -215,6 +214,9 @@ STARTUP_FAILURE_PATTERN = re.compile(
 # the snapshot's first ninety days, and the snapshot age is the conservative
 # side of the difference — it flags later, never earlier.
 ORPHAN_AGE_DAYS = 90
+# The fields a scheduled snapshot carries naming the snapshot schedule that
+# took it (Compute v1 `Snapshot`).
+SNAPSHOT_SCHEDULE_KEYS = ("sourceSnapshotSchedulePolicy", "sourceSnapshotSchedulePolicyId")
 
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
@@ -293,30 +295,26 @@ NO_RUNNING_INSTANCES_REASON = (
 )
 # The metadata keys `google_metadata_script_runner` reads. It runs a startup
 # script only when one of these is set on the instance or in the project's
-# common metadata, and only then does it log the `startup-script exit status N`
-# line §2.1 matches on. Neither set anywhere means the sentence cannot appear.
+# common metadata, and only then does it log any of the failure lines §2.1
+# matches on. Neither set anywhere means none of them can appear.
 STARTUP_SCRIPT_KEYS = ("startup-script", "startup-script-url")
 # The third structural case for §2.1, and the one that hides best: the
 # instances are there, they are RUNNING, their consoles read fine — and not one
 # of them runs a startup script, so the marker the check greps for cannot occur
-# in any of them. Measured live on the reference install: 14 RUNNING instances
-# visible to the platform GSA, 2.4 MB of console text, zero occurrences of
-# `startup-script exit status` in any form, positive or negative, and zero
-# instances carrying either metadata key. Without this branch that reads as a
-# clean pass over the whole fleet.
+# in any of them. A fleet of GKE Standard nodes is exactly this shape: every
+# console reads, none carries a startup-script line of any kind, and no
+# instance sets either metadata key. Without this branch that reads as a clean
+# pass over the whole fleet.
 #
-# "Visible to" carries the weight in that sentence, and the reason has to say so
-# for the same argument `AUTOPILOT_INVISIBLE_NOTE` makes on the two declarations
-# above. The same install runs four Autopilot nodes the identity cannot see, and
-# every one of them *does* set `startup-script` — to `echo
-# startup-script-override`, a stub Google installs to neutralise the hook. So
-# {total} is the visible population rather than the project's, and the earlier
-# wording here — that a GKE node pool bootstraps from `user-data` and `kube-env`
-# and therefore sets no startup script — held for Standard nodes and was false
-# of Autopilot ones, which set all three. Neither slip changes what the check
-# should do, because a stub on a node Google manages is not the operator's to
-# act on; both mislead the reader deciding from the ledger whether to trust a
-# `not applicable` on this slug, which is the one job the reason has.
+# The reason says "visible to the audit identity" for the argument
+# `AUTOPILOT_INVISIBLE_NOTE` makes on the two declarations above. Autopilot
+# nodes, which the identity cannot see, *do* set `startup-script` -- to `echo
+# startup-script-override`, a stub Google installs to neutralise the hook -- so
+# {total} is the visible population rather than the project's, and "a GKE node
+# pool sets no startup script" holds for Standard nodes only. Neither changes
+# what the check should do, because a stub on a node Google manages is not the
+# operator's to act on; both matter to a reader deciding from the ledger
+# whether to trust a `not applicable` on this slug.
 NO_STARTUP_SCRIPT_REASON = (
     "No Compute Engine instance on this project runs a startup script: none of "
     "the {total} RUNNING instance(s) visible to the audit identity carries "
@@ -348,6 +346,16 @@ UNMEASURED_NODE_GROUPS_REASON = (
 UNMEASURED_NODE_GROUPS_LIMITATION = (
     "sole-tenant-headroom could not be evaluated on this project: "
     + UNMEASURED_NODE_GROUPS_REASON
+)
+# Some node groups were measured and some were not: their `list-nodes` failed
+# or carried no figures. The check keeps its verdict for the groups it measured;
+# this names the ones it passed over rather than cleared, as
+# PARTIAL_SERIAL_LIMITATION does for §2.1.
+PARTIAL_NODE_GROUPS_LIMITATION = (
+    "sole-tenant-headroom measured {measured} of {total} node group(s) on this "
+    "project. `compute sole-tenancy node-groups list-nodes` failed or returned "
+    "no resource figures for the rest, which the check passed over rather than "
+    "cleared: {names}."
 )
 UNREAD_SERIAL_REASON = (
     "Every RUNNING instance on this project refused "
@@ -385,7 +393,6 @@ TRIAGE_MAINTENANCE = "maintenance-window"
 TRIAGE_RETENTION_HOLD = "retention-hold"
 
 # Both GKE node-pool MIG spellings: `gke-` for Standard, `gk3-` for Autopilot.
-# Every one of the 79 groups on the reference install carries one of these.
 GKE_MIG_PREFIXES = ("gke-", "gk3-")
 
 REDACTED = "[REDACTED]"
@@ -485,15 +492,16 @@ def output_digest(text: str) -> str:
 def _joined_record(reads: list[tuple[str, Run]]) -> dict:
     """One `commands` entry covering every read that backed one check.
 
-    Both implemented checks take more than one read — an enumeration plus a
-    serial read per instance, an enumeration of disks plus one of snapshots —
-    and publishing only the last names a command that cannot reproduce the
-    verdict, which is the one thing this field exists to allow.
+    Most of the four checks take more than one read — an enumeration plus a
+    serial read per instance, a node-group list plus `list-nodes` per group, an
+    enumeration of disks plus one of snapshots — and publishing only the last
+    names a command that cannot reproduce the verdict, which is the one thing
+    this field exists to allow.
 
     Joined with ` && ` so the field stays a line a reader can paste. `rc` is 0
-    because every read here passed its gate: a gcloud failure raises
-    `GateFailure` before reaching this, and a per-instance serial read that
-    failed is never appended.
+    because only reads that succeeded are appended: a gated failure raises
+    `GateFailure` before reaching this, and a serial, `project-info` or
+    `list-nodes` read that failed is never recorded.
     """
     parts = [command for command, _ in reads]
     joined = " && ".join(parts)
@@ -766,7 +774,7 @@ def active_disk_index(disks: list) -> set[str]:
 
 def check_orphaned_snapshot(snapshot: dict, active_disks: set[str], now: datetime.datetime) -> dict | None:
     """One item from `compute snapshots list`. Flags a snapshot whose source
-    disk is gone, that no resource policy retains, and that is older than
+    disk is gone, that no snapshot schedule took, and that is older than
     ninety days.
 
     A snapshot with no `sourceDisk` at all is never flagged: it is an import or
@@ -782,7 +790,10 @@ def check_orphaned_snapshot(snapshot: dict, active_disks: set[str], now: datetim
         return None
     if source_disk_name in active_disks or source_disk in active_disks:
         return None
-    if snapshot.get("resourcePolicies", []):
+    # A snapshot a schedule took carries the schedule's policy; Snapshot has no
+    # `resourcePolicies` field, which is the disk's. Retained by policy, not
+    # orphaned by neglect.
+    if any(snapshot.get(key) for key in SNAPSHOT_SCHEDULE_KEYS):
         return None
     if not created:
         return None
@@ -842,81 +853,61 @@ def _count(actions: dict, key: str) -> int:
 def check_mig_convergence(mig: dict) -> dict | None:
     """§2.2's condition against one `instance-groups managed list` entry.
 
-    Two limbs, neither of which a healthy group satisfies and both readable
-    from a single point-in-time list:
-
     `creating` and `deleting` both non-zero — the group is adding and removing
     instances at the same moment. A scale-up only creates and a scale-down only
     deletes, so both at once is the resize loop §2.2 was written about, caught
     in the act.
 
-    `creatingWithoutRetries` non-zero — creation failed and the group will not
-    try again, so it sits below target indefinitely. A zonal stockout for the
-    machine type and an instance template that no longer resolves are the two
-    usual causes.
+    Skipped while an update is in progress (`status.versionTarget.isReached`
+    false): a rolling update with surge creates the new instance and deletes
+    the old one at once by design, and a GKE surge upgrade does the same.
+
+    `creatingWithoutRetries` is not a limb. It counts instances the group will
+    try once each to create, and a creation that fails lowers `targetSize`, so
+    a group that gave up reads as converged on its smaller target: no single
+    read can see that stall.
 
     What is deliberately *not* the condition is `status.isStable == false` on
     its own. Instability is the normal state of any group mid-scale, so flagging
-    it would report every healthy autoscaler under load — on the reference
-    install that is all 79 groups the moment a workload arrives. §2.2's original
+    it would report every healthy autoscaler under load. §2.2's original
     wording was a rate (repeated resizes inside fifteen minutes) and no `gcloud`
-    read carries a MIG's resize history to count one; these two limbs are the
-    part of that intent a single read can actually establish, which is why the
-    slug says `convergence-stalled` rather than `autoscaler-flapping`.
+    read carries a MIG's resize history to count one; the resize loop caught in
+    the act is the part of that intent a single read can establish, which is
+    why the slug says `convergence-stalled` rather than `autoscaler-flapping`.
     """
     name = str(mig.get("name", "")).strip()
     actions = mig.get("currentActions")
     if not name or not isinstance(actions, dict):
         return None
+    status = mig.get("status") if isinstance(mig.get("status"), dict) else {}
+    version_target = status.get("versionTarget")
+    if isinstance(version_target, dict) and version_target.get("isReached") is False:
+        return None
 
     creating = _count(actions, "creating")
     deleting = _count(actions, "deleting")
-    without_retries = _count(actions, "creatingWithoutRetries")
-
-    if creating > 0 and deleting > 0:
-        detail = f"creating={creating}, deleting={deleting}"
-        impact = (
-            "The group is adding and removing instances at the same time, "
-            "which is a resize loop rather than a scale event. Every cycle "
-            "pays a full instance boot and the capacity actually serving "
-            "traffic oscillates underneath it."
-        )
-        # §2.2's Do-NOT-flag limb excuses GKE node pools undergoing pod-driven
-        # scale events. The prefix is mechanical, but whether a given churn is
-        # pod-driven is not, so the judgment goes back to the model.
-        triage = TRIAGE_GKE_MIG if name.startswith(GKE_MIG_PREFIXES) else None
-    elif without_retries > 0:
-        detail = f"creatingWithoutRetries={without_retries}"
-        impact = (
-            "Instance creation failed and the group will not retry, so it "
-            "stays below its target size until someone intervenes. Capacity "
-            "planning that assumes the target is met is wrong by that margin."
-        )
-        # No triage on this limb, on either prefix, and the asymmetry is the
-        # point. `creatingWithoutRetries` means the group asked for an instance,
-        # was refused, and gave up -- there is no pod-driven reading of that to
-        # excuse, so the Do-NOT-flag clause the marker stands for cannot be true
-        # of it. Marking it anyway is not a neutral hedge: on a fleet whose every
-        # visible group is a GKE node pool -- 16 of 16 on the reference install
-        # -- it routes the one condition this stream can still find through an
-        # instruction to consider dropping it, and a zonal stockout or an
-        # instance template that no longer resolves reads back to the model as
-        # possible autoscaler noise. Those are the operator's to fix on a node
-        # pool exactly as on any other group.
-        triage = None
-    else:
+    if not (creating > 0 and deleting > 0):
         return None
 
+    # §2.2's Do-NOT-flag limb excuses GKE node pools undergoing pod-driven
+    # scale events. The prefix is mechanical, but whether a given churn is
+    # pod-driven is not, so the judgment goes back to the model.
+    triage = TRIAGE_GKE_MIG if name.startswith(GKE_MIG_PREFIXES) else None
     scope = _scope_of(mig)
-    status = mig.get("status") if isinstance(mig.get("status"), dict) else {}
     return {
         "object": f"ManagedInstanceGroup/{scope}/{name}",
         "excerpt": redact(
             f"{name} ({scope}): size={mig.get('size', '?')} "
             f"targetSize={mig.get('targetSize', '?')} "
-            f"isStable={status.get('isStable')} currentActions {detail}"
+            f"isStable={status.get('isStable')} "
+            f"currentActions creating={creating}, deleting={deleting}"
         )[:MAX_EXCERPT_CHARS],
-        "impact": impact,
+        "impact": (
+            "The group is adding and removing instances at the same time, "
+            "which is a resize loop rather than a scale event. Every cycle "
+            "pays a full instance boot and the capacity actually serving "
+            "traffic oscillates underneath it."
+        ),
         "needs_triage": triage,
     }
 
@@ -1019,8 +1010,8 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     )
 
 
-def _emit(slug: str, hit: dict) -> dict:
-    return {
+def _emit(slug: str, hit: dict, command: str = "") -> dict:
+    emitted = {
         "check": slug,
         "namespace": "",
         "object": hit["object"],
@@ -1029,6 +1020,14 @@ def _emit(slug: str, hit: dict) -> dict:
         "impact": hit["impact"],
         "needs_triage": hit.get("needs_triage"),
     }
+    if command:
+        # The read that produced *this* candidate, for a check that issues one
+        # per instance or node group. The entry's `commands` record joins and
+        # clips every read of the slug, so without it a finding's evidence is
+        # a chain of other instances' reads, possibly clipped before its own.
+        # `adopt_collector_evidence` prefers this field when it is set.
+        emitted["command"] = command
+    return emitted
 
 
 # --------------------------------------------------------------------------- #
@@ -1050,16 +1049,12 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     """The single manifest entry for one project (the manifest's `clusters[]` shape,
     reused for a target that is a project rather than a GKE cluster).
 
-    The name is `project/<id>`, the spelling `networking_audit.py` uses.
-    `audit_report.target_kind` reads the `project/` prefix and answers
-    "project"; the hyphenated `project-<id>` this file used to emit falls
-    through to the bare-name branch and is classified as a *cluster*, so the
-    published scope line called a sweep of one GCP project "1 cluster". There
-    is no ledger to orphan by re-deriving the ids: this stream has never
-    published a GitHub issue — the `audit:gce-compute-fleet-audit` label does
-    not exist on the repository and no report directory for it exists on the
-    install — because until this conversion the collector emitted a findings
-    document nothing consumed.
+    The name is `project/<id>`, the spelling `networking_audit.py` uses, which
+    `audit_report.target_kind` reads as a project. An instance's finding
+    identity is `ComputeInstance/<zone>/<name>`: a GCE instance name is unique
+    per zone, not per project, so the unqualified form lets two VMs derive one
+    finding id, and `validate_findings` refuses the whole document over the
+    collision (`check_startup_script`).
 
     No `autopilot` key: the target stands for a project, and a `false` there
     would read as a fleet of Standard clusters.
@@ -1122,9 +1117,10 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             "--project", project, "--format=json",
         ]
         info_parsed, info_result = run_and_gate(info_argv, run=run)
-        reads.setdefault(STARTUP_SLUG, []).append(
-            (" ".join(info_argv), info_result)
-        )
+        if isinstance(info_parsed, dict):
+            reads.setdefault(STARTUP_SLUG, []).append(
+                (" ".join(info_argv), info_result)
+            )
         project_wide = (
             True
             if not isinstance(info_parsed, dict)
@@ -1147,20 +1143,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 unread.append(f"{instance_name} ({zone})")
                 continue
             hit = check_startup_script(instance_name, zone, result.stdout)
-            # A read that produced a candidate goes to the front of the slug's
-            # provenance list. `_joined_record` clips the join at
-            # MAX_COMMAND_CHARS, and `adopt_collector_evidence` writes that one
-            # string onto every finding of this (target, check) — so on a
-            # project with more RUNNING instances than the budget holds, a
-            # tail-ordered list ships an excerpt from instance #30 under a
-            # command naming only instances #1-#16. Hitting reads first means
-            # the published command always contains the read behind the
-            # published excerpt.
+            reads.setdefault(STARTUP_SLUG, []).append((" ".join(argv), result))
             if hit:
-                reads.setdefault(STARTUP_SLUG, []).insert(1, (" ".join(argv), result))
-                candidates.append(_emit(STARTUP_SLUG, hit))
-            else:
-                reads.setdefault(STARTUP_SLUG, []).append((" ".join(argv), result))
+                candidates.append(_emit(STARTUP_SLUG, hit, " ".join(argv)))
 
         if not instances:
             not_applicable.append(
@@ -1232,6 +1217,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             )
         else:
             measured_any = False
+            unmeasured: list[str] = []
             for group in groups:
                 if not isinstance(group, dict):
                     continue
@@ -1249,21 +1235,17 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 # one unreadable serial console does not. It costs this check
                 # its verdict only if *every* group comes back unmeasurable.
                 if not isinstance(parsed, list):
-                    reads.setdefault(SOLE_TENANT_SLUG, []).append(
-                        (" ".join(nodes_argv), result)
-                    )
+                    unmeasured.append(f"{group_name} ({_scope_of(group)})")
                     continue
+                reads.setdefault(SOLE_TENANT_SLUG, []).append(
+                    (" ".join(nodes_argv), result)
+                )
                 hit, measured = check_sole_tenant_headroom(group, parsed)
                 measured_any = measured_any or measured
+                if not measured:
+                    unmeasured.append(f"{group_name} ({_scope_of(group)})")
                 if hit:
-                    reads.setdefault(SOLE_TENANT_SLUG, []).insert(
-                        1, (" ".join(nodes_argv), result)
-                    )
-                    candidates.append(_emit(SOLE_TENANT_SLUG, hit))
-                else:
-                    reads.setdefault(SOLE_TENANT_SLUG, []).append(
-                        (" ".join(nodes_argv), result)
-                    )
+                    candidates.append(_emit(SOLE_TENANT_SLUG, hit, " ".join(nodes_argv)))
             if not measured_any:
                 unevaluated.append(
                     {
@@ -1272,6 +1254,14 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                     }
                 )
                 limitations.append(UNMEASURED_NODE_GROUPS_LIMITATION.format(groups=len(groups)))
+            elif unmeasured:
+                limitations.append(
+                    PARTIAL_NODE_GROUPS_LIMITATION.format(
+                        measured=len(groups) - len(unmeasured),
+                        total=len(groups),
+                        names=", ".join(sorted(unmeasured)),
+                    )
+                )
 
         # --- 2.5 orphaned snapshots ---------------------------------------- #
         # Both reads are gated: a `disks list` that failed used to skip the

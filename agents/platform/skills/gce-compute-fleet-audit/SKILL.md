@@ -28,7 +28,7 @@ All four roster checks are collector-verified; none is yours to hand-run.
 - `sole-tenant-headroom`: node group reservations at capacity with no failover host spare.
 - `orphaned-snapshots`: Persistent Disk snapshots of deleted disks older than 90 days.
 
-`ops-agent-guest-health` is not on the roster — SOP §2.3 says why, and `finish` rejects any mention of it.
+`ops-agent-guest-health` is not on the roster — SOP §2.3 says why, and `finish` rejects a `checks_run` or a `finding.check` naming it.
 
 ## 3. Hand Findings to Fleet Audit
 

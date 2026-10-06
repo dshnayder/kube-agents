@@ -435,7 +435,8 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # alongside every leaf read that needs one; `networks describe` and
         # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
-        # remediation read. The writes one word away (networks create,
+        # remediation read and the GCE compute collector's §2.1 read of the
+        # project's common metadata. The writes one word away (networks create,
         # routers create, firewall-rules create, security-policies create,
         # project-info add-metadata) stay refused, and the tests assert it.
         ("compute", "networks", "describe"),

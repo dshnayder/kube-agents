@@ -1,13 +1,14 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, five collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, and these collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
 > `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`,
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
-> `fleet_waste.py` one for `fleet-wide-cost-analysis`, and `fleet_stockout.py` one for
-> `stockout-prevention`;
-> each stream's SOP runs its collector and passes the flag, and every other stream
+> `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
+> `stockout-prevention`, and `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
+> `gce-compute-fleet-audit`;
+> each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
 **Scope:** the machine boundary between a per-stream collector script and the fleet-audit harness.
