@@ -345,6 +345,24 @@ def test_an_ordinary_accounts_merge_request_with_no_login_named_is_an_error(
     result = check().verify(30)
     assert result.status == "error"
     assert github_writes.GITLAB_AGENT_LOGIN_ENV_VAR in result.reason
+    # Only !3 was written in the window. !1 and !2 were opened before it and
+    # only closed inside it, which is no write whoever wrote them.
+    assert "!3" in result.reason
+    assert "!1" not in result.reason and "!2" not in result.reason
+
+
+def test_an_ordinary_accounts_merge_request_only_closed_in_the_window_is_no_error(
+    env, gitlab, monkeypatch
+):
+    # Review: `updated_at` moves on a comment, a label or a close by anyone,
+    # so the unnamed path dates a merge request before calling it unknowable.
+    monkeypatch.delenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR)
+    route_recorded(gitlab)
+    listing = [mr for mr in fixture("mrs-updated-desc.json") if mr["iid"] != 3]
+    gitlab.routes[WINDOWED_LISTING] = (200, listing)
+    stash()
+    result = check().verify(30)
+    assert result.status != "error", result.reason
 
 
 def test_a_token_bot_still_counts_when_a_login_is_named(env, gitlab):
@@ -374,6 +392,13 @@ def test_the_tasks_pinned_author_wins_over_the_environment(env, gitlab):
     assert ("pull_request", "platform-agent/writes-mr") in {
         (w["kind"], w["branch"]) for w in result.raw["writes"]
     }
+    # And the environment's login does not count beside the pin: with every
+    # merge request by the login (`eval-maintainer`), a check pinned to
+    # someone else sees no merge request of the agent's.
+    route_recorded(gitlab)
+    stash()
+    pinned = check(author="pinned-agent").verify(30)
+    assert [w for w in pinned.raw["writes"] if w["kind"] == "pull_request"] == []
 
 
 def test_a_forks_merge_request_does_not_shield_a_branch_of_the_same_name(env, gitlab):

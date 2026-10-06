@@ -499,8 +499,12 @@ LEDGER_AUDIT_IDS = frozenset(
 )
 
 # Environment names carrying the read credential, in precedence order. See
-# LedgerIssueContainsVerifier's docstring for what it has to be.
-LEDGER_TOKEN_ENV_VARS = forges.GITHUB_TOKEN_ENV_VARS
+# LedgerIssueContainsVerifier's docstring for what it has to be. A literal
+# rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
+# tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
+# this tuple out of the file, without importing bench, to check that CI mints
+# into the name bench reads first.
+LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
 # which audit that stream is; hack/ci-eval-pr.sh exports both for a case that
@@ -686,17 +690,41 @@ def _gitlab_project_unseen(repo: str, token: str, budget: float) -> str | None:
     so a 404 on an issue or a merge request does not by itself say the object
     is missing: the project read tells a misconfigured credential (an error)
     from a number the agent got wrong (a failed grade).
+
+    Asked only of the project this job is configured for
+    (``_is_configured_gitlab_project``). Any other path in a reply is the
+    agent's own, and a 404 there is graded as absence, as GitHub's
+    ``_resolve`` grades a 404 pair: a mistyped project is the agent's error,
+    not a credential fault to red every repetition with.
     """
     status, _ = _http_get_json(
         forges.gitlab_api_root() + forges.gitlab_project_path(repo), token, budget
     )
     if status == 200:
         return None
+    if status in (401, 403, 404):
+        return (
+            f"GitLab answered {status} for the project {repo} itself: the token behind "
+            f"{forges.GITLAB_TOKEN_ENV_VARS[0]} cannot see it (a private project it is "
+            "not a member of answers 404), so this check could not be evaluated"
+        )
     return (
-        f"GitLab answered {status} for the project {repo} itself: the token behind "
-        f"{forges.GITLAB_TOKEN_ENV_VARS[0]} cannot see it (a private project it is "
-        "not a member of answers 404), so this check could not be evaluated"
+        f"GitLab answered {status} for the project {repo} itself while telling a "
+        "missing object from an unseen project, so this check could not be evaluated"
     )
+
+
+def _is_configured_gitlab_project(repo: str) -> bool:
+    """Whether ``repo`` is the project this job grades against.
+
+    ``BENCH_GITOPS_REPO``, or the stream's repository when a case sets it:
+    the paths configuration names, as opposed to one an agent wrote.
+    """
+    configured = {
+        os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().lower(),
+        _stream_repo(),
+    } - {""}
+    return repo.strip().lower() in configured
 
 
 def _issue_api_url(forge: str, repo: str, number: int) -> str:
@@ -1505,7 +1533,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code == 404:
-                if forge == forges.FORGE_GITLAB:
+                if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -2173,7 +2201,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         slug = f"{repo}!{number}"
         status, mr = _http_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
-            why = _gitlab_project_unseen(repo, token, budget)
+            why = (
+                _gitlab_project_unseen(repo, token, budget)
+                if _is_configured_gitlab_project(repo)
+                else None
+            )
             if why:
                 return "unresolved", f"{slug}: {why}", None
             return "reject", f"{slug}: no such merge request (404)", None
@@ -2261,9 +2293,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
             outcome = self._gitlab_spent_before(base, slug, number, mr, token, budget, started, named)
             if outcome is not None:
                 return outcome
+        # As GitHub's: "an earlier run" only when the widened window is what
+        # admitted it, within the skew allowance.
+        during = (
+            "during this run"
+            if since == started or (started - touched).total_seconds() <= self.max_clock_skew_sec
+            else f"by an earlier run on this audit stream (found already open; "
+            f"{since_what} at {since.isoformat()})"
+        )
         return "pass", (
             f"{slug} was {'opened' if touched == created else 'updated'} at "
-            f"{touched.isoformat()}, during this run, and carries "
+            f"{touched.isoformat()}, {during}, and carries "
             f"{changed if changed is not None else 'an unreported number of'} "
             "changed file(s)"
             + (", on a branch this run's closed merge request had used"

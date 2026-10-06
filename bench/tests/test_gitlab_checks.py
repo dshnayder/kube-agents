@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from kube_agents_bench import forges, transcript, verifiers
+from kube_agents_bench import forges, github_writes, transcript, verifiers
 from kube_agents_bench.verifiers import LedgerIssueContainsVerifier, PullRequestOpenedVerifier
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gitlab"
@@ -103,6 +103,14 @@ def pr_check(**kw) -> PullRequestOpenedVerifier:
 
 
 # --- the URL forms ----------------------------------------------------------
+
+
+def test_the_ledger_token_names_are_the_github_forge_names_as_a_literal():
+    # The CI pool checker parses the literal tuple out of verifiers.py
+    # (scripts/test_verify_ci_pool_project.py); the forge table must agree.
+    assert verifiers.LEDGER_TOKEN_ENV_VARS == forges.GITHUB_TOKEN_ENV_VARS
+    source = Path(verifiers.__file__).read_text()
+    assert 'LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")' in source
 
 
 def test_both_gitlab_issue_url_forms_and_nested_paths_are_read():
@@ -350,16 +358,22 @@ def test_the_closed_merge_request_must_be_named(env, gitlab):
 # --- review round: a project the token cannot see, the stream window, forks --
 
 
-def test_a_merge_request_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab):
+def configured(monkeypatch, repo=REPO):
+    monkeypatch.setenv(github_writes.GITOPS_REPO_ENV_VAR, repo)
+
+
+def test_a_merge_request_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab, monkeypatch):
     # GitLab answers 404, not 403, for a private project the token is not a
     # member of: that is the credential's fault, not a number the agent got wrong.
+    configured(monkeypatch)
     stash(f"Opened {MR3_URL}")
     result = pr_check().verify(30)
     assert result.status == "error"
     assert "cannot see it" in result.reason
 
 
-def test_a_ledger_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab):
+def test_a_ledger_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab, monkeypatch):
+    configured(monkeypatch)
     stash(f"Audit filed: {ISSUE_URL}")
     result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
     assert result.status == "error"
@@ -368,6 +382,35 @@ def test_a_ledger_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab)
     result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
     assert result.status != "error"
     assert "no such issue" in result.reason
+
+
+def test_a_404_on_a_project_the_agent_named_wrongly_is_absence_not_an_error(env, gitlab, monkeypatch):
+    # Review: only the configured project's 404 can be the credential's
+    # fault. A path the agent mistyped is graded as no such object, as
+    # GitHub grades a 404 pair, and its project is never read.
+    configured(monkeypatch)
+    typo = "example-group/infra-typo"
+    stash(f"Opened https://gitlab.com/{typo}/-/merge_requests/3")
+    result = pr_check().verify(30)
+    assert result.status != "error", result.reason
+    assert "no such merge request" in result.reason
+    stash(f"Audit filed: https://gitlab.com/{typo}/-/issues/7")
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status != "error", result.reason
+    assert "no such issue" in result.reason
+    typo_project = "https://gitlab.com/api/v4/projects/example-group%2Finfra-typo"
+    assert typo_project not in gitlab.calls
+
+
+def test_a_project_read_that_is_throttled_is_not_blamed_on_the_token(env, gitlab, monkeypatch):
+    # Review: a 429 or a 5xx on the project read says nothing about the token.
+    configured(monkeypatch)
+    gitlab.routes[PROJECT] = (503, {"message": "unavailable"})
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error"
+    assert "cannot see it" not in result.reason
+    assert "503" in result.reason
 
 
 def stream_env(monkeypatch, repo=REPO):
@@ -388,6 +431,9 @@ def test_accepts_stream_pull_request_widens_the_window_on_gitlab(env, gitlab, mo
     assert pr_check().verify(30).success is False
     result = pr_check(accepts_stream_pull_request=True).verify(30)
     assert result.success is True, result.reason
+    # Review: said as GitHub says it -- not "during this run".
+    assert "by an earlier run on this audit stream" in result.reason
+    assert "during this run" not in result.reason
 
 
 def test_the_widened_window_still_wants_the_streams_branch_and_repository(env, gitlab, monkeypatch):

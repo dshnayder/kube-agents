@@ -672,6 +672,21 @@ def _is_agent_pull(fields: PullFields, author: str, agent_login: str = "") -> bo
     return bool(agent_login) and fields.author.lower() == agent_login.lower()
 
 
+def _written_in_window(client: Any, repo: str, fields: PullFields, since: datetime) -> bool:
+    """Whether a merge request was opened, or pushed to, at or after ``since``.
+
+    The dating the agent's own merge requests get in ``find_writes``, for one
+    whose author nothing identifies: ``updated_at`` alone moves on a comment,
+    a label or a close by anyone.
+    """
+    if fields.created is not None and fields.created >= since:
+        return True
+    if fields.updated is None or fields.updated < since or fields.number is None:
+        return False
+    pushed = client.head_commit_date(repo, fields.number)
+    return pushed is not None and pushed >= since
+
+
 def find_writes(
     client: GitHubClient | GitLabClient,
     repo: str,
@@ -710,7 +725,16 @@ def find_writes(
     for pull in pulls:
         fields = client.pull_fields(pull, repo)
         if not _is_agent_pull(fields, author, agent_login):
-            if unknowable and fields.head_in_repo and not fields.author_is_bot:
+            # Unknowable only for a merge request that would have counted as
+            # a write had it been the agent's -- opened in the window, or with
+            # a head commit the window contains. One that was only commented
+            # on, labelled or closed is no write whoever wrote it.
+            if (
+                unknowable
+                and fields.head_in_repo
+                and not fields.author_is_bot
+                and _written_in_window(client, repo, fields, since)
+            ):
                 unattributed.append(fields.number)
             continue
         ref, created, updated, number = fields.branch, fields.created, fields.updated, fields.number
@@ -742,7 +766,7 @@ def find_writes(
         )
     if unattributed:
         raise GitHubUnreadable(
-            f"merge request(s) {', '.join(f'!{n}' for n in unattributed)} on {repo} were "
+            f"merge request(s) {', '.join(f'!{n}' for n in unattributed if n is not None)} on {repo} were "
             "written in the window by an ordinary account, and nothing says whether it is "
             f"the agent's: set {GITLAB_AGENT_LOGIN_ENV_VAR} to the agent's GitLab username "
             "(an install whose agent holds a personal access token) or give the check an "
