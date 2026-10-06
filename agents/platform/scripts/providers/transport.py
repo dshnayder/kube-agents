@@ -288,6 +288,11 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+#: How much of the request's time earlier calls must have spent before a cut is
+#: reported as the request's deadline rather than as the forge being slow.
+_REQUEST_SPENT_SECONDS = 1.0
+
+
 def _unreachable(exc: BaseException) -> str:
     """Why the forge could not be reached, in words an operator can act on.
 
@@ -456,8 +461,15 @@ class HttpTransport:
         # wrong thing.
         slow = f"the forge's answer took longer than {self._timeout:g}s"
         if outer is not None and outer < deadline:
+            # The shared deadline always cuts the call when it is the sooner
+            # bound. It is named as the cause only when earlier calls spent
+            # real time: the slot is armed with the same timeout a moment
+            # before the first call, so on that call the two differ by the
+            # admission's few milliseconds, and the forge being slow is the
+            # truth.
+            if deadline - outer > _REQUEST_SPENT_SECONDS:
+                slow = "the request's time ran out while the forge was answering"
             deadline = outer
-            slow = "the request's time ran out while the forge was answering"
         if deadline <= now:
             raise forge_error(0, "the request's time ran out before this call to the forge")
         # The opener gets the transport's own timeout unless the request's
@@ -486,8 +498,11 @@ class HttpTransport:
             # answered, and the answer could not be read.
             raise forge_error(0, _broken_answer(exc)) from exc
         except OSError as exc:
-            # A reset or a dropped connection after the send.
-            raise forge_error(0, _unreachable(exc)) from exc
+            # A reset or a dropped connection after the send -- `urllib` wraps
+            # every send-phase failure in `URLError`, above. The forge took the
+            # request and then stopped, which is an answer broken off, not a
+            # forge that could not be reached.
+            raise forge_error(0, _broken_answer(exc)) from exc
         text = payload.decode("utf-8", "replace")
         if raw:
             return text

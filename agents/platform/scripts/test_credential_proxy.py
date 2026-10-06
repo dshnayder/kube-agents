@@ -8538,6 +8538,27 @@ class CredentialReachTest(unittest.TestCase):
         ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
             credential_proxy.warn_on_credential_reach(broker)
 
+    def test_a_token_that_reaches_nothing_is_named_not_reassured(self):
+        # Review: an empty membership logged "reaches 0 repositories, all of
+        # them managed" at INFO, for a token that cannot reach the managed
+        # repositories either.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(([], False)))
+        self.assertIn("reaches no repositories at all", "\n".join(logs.output))
+
+    def test_an_all_managed_count_cut_short_says_at_least(self):
+        # Review: the "at least" the unmanaged branch carries was dropped on
+        # the all-managed one, the branch that reassures.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker((["acme/infra"], True)))
+        self.assertIn("reaches at least 1 repositories, all of them managed", "\n".join(logs.output))
+
     def test_an_unreachable_forge_logs_the_reason_not_only_the_type(self):
         # Review round 2: a TLS or DNS failure logged as `type=WorkspaceError`
         # alone left the operator nothing to act on.
