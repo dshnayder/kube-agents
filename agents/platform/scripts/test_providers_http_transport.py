@@ -171,6 +171,26 @@ class BoundsTest(unittest.TestCase):
         self.assertIn("time ran out", caught.exception.fields["detail"])
         self.assertEqual(1, len(opener.requests))
 
+    def test_a_stall_mid_body_is_reported_as_a_stall_in_the_right_words(self):
+        # Review round 3: the receive timing out inside the read -- the usual
+        # shape of a stall, since the socket's timeout is the deadline's
+        # remainder -- read as "could not be reached", and a cut by the
+        # request's shared deadline was reported as the per-call timeout.
+        class Stalls(_Response):
+            def read1(self, n=-1):
+                raise TimeoutError("timed out")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(Stalls(b"")), timeout=30.0).api("GET", "projects")
+        self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+        self.assertIn("took longer than 30s", caught.exception.fields["detail"])
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(Opener(Stalls(b"")), timeout=30.0, outer_deadline=lambda: 102.0).api(
+                    "GET", "projects"
+                )
+        self.assertIn("request's time ran out while the forge was answering", caught.exception.fields["detail"])
+
     def test_a_timeout_is_a_call_failure(self):
         opener = Opener(TimeoutError("timed out"))
         with self.assertRaises(WorkspaceError) as caught:
@@ -372,13 +392,36 @@ class BrokerBuildsItTest(unittest.TestCase):
         return vcs_broker.VcsBroker(self.root, git_runner=lambda *a, **k: None, **kwargs)
 
     def test_an_http_forge_gets_the_in_process_transport_with_the_brokers_bounds(self):
-        opener = Opener({})
-        broker = self.broker(http_timeout=3.0, http_max_bytes=99, http_opener=opener)
+        opener = Opener({}, {})
+        deadline = [None]
+        broker = self.broker(
+            http_timeout=3.0, http_max_bytes=99, http_opener=opener,
+            request_deadline=lambda: deadline[0],
+        )
         built = broker._transport(_HttpForge(), "acme/infra")
         self.assertIsInstance(built, HttpTransport)
         built.api("GET", "user")
         self.assertEqual([3.0], opener.timeouts)
         self.assertEqual(99, built._max_bytes)
+        # Review round 3: the request slot's deadline reaches the transport
+        # too -- with one second left of the request, the 3s call gets one.
+        deadline[0] = 101.0
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            built.api("GET", "user")
+        self.assertEqual([3.0, 1.0], opener.timeouts)
+
+    def test_the_reach_question_goes_through_the_forges_own_transport(self):
+        # Review round 3: the one line joining the startup diagnostic to the
+        # forge was replaced by a Mock in every test that reached it.
+        opener = Opener([{"path_with_namespace": "acme/infra"}])
+
+        class _Reaches(_HttpForge):
+            def reach(self, api):
+                return [p["path_with_namespace"] for p in api("GET", "projects")], False
+
+        broker = self.broker(http_opener=opener)
+        self.assertEqual((["acme/infra"], False), broker.credential_reach(_Reaches()))
+        self.assertTrue(opener.requests[0].full_url.endswith("/projects"))
 
     def test_an_http_forge_with_no_api_root_is_refused_by_name(self):
         with self.assertRaises(WorkspaceError) as caught:

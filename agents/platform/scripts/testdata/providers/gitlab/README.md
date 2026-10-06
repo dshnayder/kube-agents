@@ -14,6 +14,7 @@ Recorded against gitlab.com's v4 API from a private throwaway project, below the
   - `proposal-list.json` carries three merge requests in the three states the contract asserts: open, merged, and closed and draft.
   - `proposal-view.json`'s notes carry a conversation note, a system note (GitLab's own bookkeeping, which the forge drops) and a diff note, so both neutral comment kinds appear.
   - `issue-view.json` carries a system note too.
+  - `proposal-update.json` opens with the read a re-title makes first (the same merge request under its earlier title, not a draft), so the update is sent as written.
   - These are arrangements of real responses, not invented ones.
 
 GitLab specifics the files pin:

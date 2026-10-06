@@ -137,18 +137,38 @@ class GitLabForge(Forge):
                     f"an allowedPaths entry for {host} names no namespace ({path!r}); "
                     "write the namespace, or [] on its own for the whole host"
                 )
-            segments = trimmed.split("/")
-            # A segment `parse` can never produce -- empty from a doubled
-            # slash, spaced, `.`, `..`, `.git`, or led by a dash -- would match
-            # nothing, and a non-empty list that matches nothing refuses every
-            # repository on the host. Checked with the parser's own rule.
-            if not all(repo_ref.is_safe_segment(segment) for segment in segments):
-                raise ValueError(
-                    f"allowedPaths entry {trimmed!r} for {host} is not a namespace "
-                    "path a repository can have"
-                )
-            prefixes.append(tuple(segment.casefold() for segment in segments))
+            prefixes.append(self._prefix(host, path, trimmed))
         self.allowed_paths = tuple(prefixes)
+
+    @staticmethod
+    def _prefix(host: str, path: str, trimmed: str) -> tuple[str, ...]:
+        """An `allowedPaths` entry as the segments `parse` would compare it to.
+
+        Read by the parser `parse` uses, so the two cannot disagree: a trailing
+        `.git` comes off and a leading host is lifted, exactly as they do for a
+        repository, and a segment the parser refuses -- empty from a doubled
+        slash, `.`, `..`, `.git`, led by a dash -- refuses the entry. An entry
+        `parse` could never match would refuse every repository on the host
+        one request at a time. Whitespace anywhere is refused rather than
+        stripped: it is a typo, and stripping it would be a second, quieter
+        rule beside the parser's.
+        """
+        if any(character.isspace() for character in path):
+            raise ValueError(
+                f"allowedPaths entry {path!r} for {host} contains whitespace"
+            )
+        try:
+            segments = repo_segments(trimmed, (host,))
+        except repo_ref.RepoRefError as error:
+            raise ValueError(
+                f"allowedPaths entry {trimmed!r} for {host} is not a namespace "
+                "path a repository can have"
+            ) from error
+        if not segments:
+            raise ValueError(
+                f"an allowedPaths entry for {host} names no namespace ({path!r})"
+            )
+        return tuple(segment.casefold() for segment in segments)
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -313,6 +333,13 @@ class GitLabForge(Forge):
         GitLab keys membership on a user id, so the login is looked up first.
         A login nobody holds, or a member below Developer, is a definitive no;
         a lookup that failed is not an answer and says so.
+
+        An automation is a no whatever its role. A comment's author carries no
+        `bot` field, so a service account with a name of its own reads as a
+        person until here, where the user object is read: the username search
+        may leave `bot` out for a token that is not an administrator's, so the
+        user itself is asked when it does. Answering yes for one would make
+        another automation's comment a request the agent acts on.
         """
         if not login:
             return False
@@ -323,6 +350,14 @@ class GitLabForge(Forge):
         if not users:
             return False
         user_id = users[0].get("id")
+        bot = users[0].get("bot")
+        if bot is None:
+            try:
+                bot = (api("GET", f"users/{user_id}") or {}).get("bot")
+            except WorkspaceError:
+                return None
+        if bot:
+            return False
         try:
             member = api("GET", f"{self._project(repo)}/members/all/{user_id}")
         except WorkspaceError as exc:
@@ -465,6 +500,15 @@ class GitLabForge(Forge):
         number = validate_number(payload.get("number"))
         body: dict[str, Any] = {**self._label_params(payload), **self._text_fields(payload)}
         path = f"{self._project(repo)}/merge_requests/{number}"
+        if "title" in body and not translate.is_draft_title(body["title"]):
+            # On GitLab the draft marker is the title, and this forge may have
+            # written it itself on create, where the caller never typed it. A
+            # new title without it would mark the merge request ready -- on
+            # GitHub the same call leaves `draft` alone -- so a draft keeps its
+            # marker unless the caller asks otherwise by writing its own.
+            current = api("GET", path) or {}
+            if translate.proposal(current, repo)["draft"]:
+                body["title"] = f"Draft: {body['title']}"
         # GitLab refuses an update that changes nothing (400, "at least one
         # parameter"), where GitHub answers the unchanged proposal; the answer
         # this verb promises is the proposal as it stands, so read it instead.
