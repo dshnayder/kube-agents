@@ -157,6 +157,17 @@ GITHUB_REPO_TYPE = "github"
 #: name that is not a managed repository on another forge is spoken of as.
 DEFAULT_PROPOSAL_NOUN = "pull request"
 
+#: The managed-entry types a forge in this image serves, and what each calls a
+#: change proposal. A table rather than a read of `providers.AVAILABLE`: this
+#: module runs in the sandbox, whose image ships neither `providers/` nor the
+#: broker's dependencies, and an import there would fail every consumer on
+#: every install. Kept in step with the forge classes by
+#: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
+FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+
+#: How a host-qualified name's `/` is spelt in its workspace directory name.
+ENCODED_SEPARATOR = "%2F"
+
 #: The first segment of a host-qualified repository name: a hostname, which has
 #: a dot in it. A GitHub owner cannot contain one, so a name whose first segment
 #: has a dot is never a GitHub `owner/name` read the wrong way round.
@@ -352,17 +363,25 @@ def workspace_path(
 ) -> Path:
     """Where a repository is cloned for `lease`. One clone per lease, per repo.
 
-    `owner/name` lands at `owner__name`, as it always has. A host-qualified
-    name of any depth -- `gitlab.com/acme/platform/infra` -- joins every
-    segment the same way, so a nested path is still one directory under the
-    lease rather than a tree of them. The directory is not decoded back into a
-    host-qualified name (`resolve_repo` reads the lease record for that):
-    segments may themselves contain `__`.
+    `owner/name` lands at `owner__name`, as it always has, and so does
+    `github.com/owner/name`: one repository, one tree, however it is named. A
+    host-qualified name on another forge, at any depth, is one directory with
+    every `/` written as `%2F` -- `gitlab.com%2Facme%2Fplatform%2Finfra`.
+    Joining on `__` would not do: a segment may contain `__`, so `a/b__c` and
+    `a__b/c` would share a tree. `%` is in no segment's charset, so this
+    spelling is injective, never collides with a GitHub `owner__name`, and
+    `resolve_repo` can read the name back off it.
     """
-    segments = str(repo).split("/")
+    host, path = split_host(str(repo))
+    if host == repo_ref.GITHUB_CANONICAL_HOST:
+        host, repo = "", path
+    segments = str(path if host else repo).split("/")
     if len(segments) < 2 or not all(segments):
         raise ValueError(f"expected a repository as owner/name, got {repo!r}")
-    return lease_dir(root if root is not None else default_root(), lease) / "__".join(segments)
+    holder = lease_dir(root if root is not None else default_root(), lease)
+    if host:
+        return holder / f"{host}/{path}".replace("/", ENCODED_SEPARATOR)
+    return holder / "__".join(segments)
 
 
 @contextmanager
@@ -577,6 +596,17 @@ def ensure_workspace(
     lease = sanitize_lease(lease)
     holder = lease_dir(root, lease)
     target = workspace_path(repo, root, lease=lease)
+    host = split_host(repo)[0]
+    if not remote_url and host and host != repo_ref.GITHUB_CANONICAL_HOST:
+        # Directory mode clones with the credential the GitHub CLI installed in
+        # this container, which no other forge's host answers to; a private
+        # project would fail mid-clone as an authentication error naming
+        # nothing. Said up front instead.
+        raise RuntimeError(
+            f"{repo} is on {host}, and a local clone reaches GitHub only: this "
+            "container holds no credential for another forge. Repositories on "
+            "other forges are reached through the broker's verbs."
+        )
     url = remote_url or clone_url(repo)
 
     # Short and shared: everything after it happens inside a directory no other
@@ -721,6 +751,32 @@ def clone_url(repo: str) -> str:
     """
     host, path = split_host(repo)
     return f"https://{host or repo_ref.GITHUB_CANONICAL_HOST}/{path}.git"
+
+
+def qualify(repo: str, managed: list[str] | None = None) -> str:
+    """`repo` as the managed list and the broker spell it on this install.
+
+    A bare `owner/name` is GitHub's, and stays bare while GitHub is the only
+    forge the list names. Once it names a second forge the list spells
+    GitHub's entries `github.com/owner/name` and the broker refuses a hostless
+    name, so a bare one from somewhere older -- a cron's `--repo`, a lease
+    record, a workspace directory from before the second forge -- is lifted to
+    match. Anything already host-qualified is returned unchanged.
+
+    `managed` is the list when the caller has read it already; otherwise it is
+    read here, and a list that cannot be read leaves the name as it was for the
+    caller's own read to fail on.
+    """
+    if not isinstance(repo, str) or not repo_ref.is_github_slug(repo):
+        return repo
+    if managed is None:
+        try:
+            managed = get_managed_repos()
+        except Exception:
+            return repo
+    if any(split_host(name)[0] for name in managed):
+        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{repo}"
+    return repo
 
 
 def split_host(repo: str) -> tuple[str, str]:
@@ -1155,9 +1211,7 @@ def get_managed_repos() -> list[str]:
 
 
 def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
-    import providers
-
-    served = {cls.name for cls in providers.AVAILABLE}
+    served = set(FORGE_PROPOSAL_NOUNS)
     github = [entry["repo"] for entry in _github_entries(
         [e for e in entries if e.get("type") == GITHUB_REPO_TYPE], key, fold_case=False
     )]
@@ -1173,7 +1227,8 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
         if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
             LOGGER.warning(
                 "Skipping %s repository %r: no host and path to name it by. "
-                "Register a %s repository by its URL (https://<host>/<path>).",
+                "Register a %s repository by its URL (https://<host>/<path>); "
+                "a host with a port is not supported.",
                 key, url, kind,
             )
             continue
@@ -1188,9 +1243,9 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
 def proposal_noun(repo: str) -> str:
     """What the forge holding `repo` calls a change proposal.
 
-    Read off the forge class the managed entry was registered for, so a
-    GitLab repository's ledger says "merge request" while every GitHub one,
-    and anything this cannot place, keeps saying "pull request".
+    Read off the type the managed entry was registered as, so a GitLab
+    repository's ledger says "merge request" while every GitHub one, and
+    anything this cannot place, keeps saying "pull request".
     """
     host, _ = split_host(repo) if repo else ("", "")
     if not host or host == repo_ref.GITHUB_CANONICAL_HOST:
@@ -1206,12 +1261,7 @@ def proposal_noun(repo: str) -> str:
             if ref is not None and f"{ref.host}/{ref.path}".lower() == repo.lower():
                 kind = entry.get("type")
                 break
-    import providers
-
-    for cls in providers.AVAILABLE:
-        if cls.name == kind and getattr(cls, "proposal_noun", None):
-            return cls.proposal_noun
-    return DEFAULT_PROPOSAL_NOUN
+    return FORGE_PROPOSAL_NOUNS.get(kind or "", DEFAULT_PROPOSAL_NOUN)
 
 
 def get_managed_github_repos() -> list[str]:
@@ -1265,18 +1315,17 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
                     rel = workspace_p.relative_to(holder.resolve())
                     if rel.parts:
                         clone_segment = rel.parts[0]
+                        if ENCODED_SEPARATOR in clone_segment:
+                            return clone_segment.replace(ENCODED_SEPARATOR, "/")
                         if "__" in clone_segment:
                             owner, sep, name = clone_segment.partition("__")
-                            # A first segment with a dot is a host: the
-                            # name is the lease record's, below, because a
-                            # nested path cannot be read back off `__`.
-                            if owner and name and not HOSTNAME_RE.fullmatch(owner):
-                                return f"{owner}/{name}"
+                            if owner and name:
+                                return qualify(f"{owner}/{name}")
                 except ValueError:
                     pass
                 record = read_lease(holder)
                 if record and record.get("repo"):
-                    return record["repo"]
+                    return qualify(record["repo"])
         except Exception:
             pass
 

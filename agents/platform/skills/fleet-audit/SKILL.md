@@ -187,7 +187,10 @@ the stream's open ledger issue, and clears any findings document a crashed run l
 user asked for a specific repository that is not yet registered, instruct the user or cluster
 administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
 gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
-(`gitlab.com/acme/platform/infra`). It creates **no branch** — there is no report
+(`gitlab.com/acme/platform/infra`). In content mode, a repository on another forge gets its ledger,
+but its remediation files cannot be read or published yet: the broker's file workspace clones GitHub
+only, and `fetch`, `list`, `grep` and the remediation step say so rather than fail mid-way. It
+creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 
 ```json

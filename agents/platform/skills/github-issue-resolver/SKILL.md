@@ -167,7 +167,8 @@ Once your investigation is complete:
        `🚨 **Human Escalation Required — Action Needed:**`
        `- [#<number>](<issue_url>) — <title_plain> — *<1-sentence summary of root cause requiring human intervention>*`
        `<issue_url>` is the `issue_url` from the `poll` output — the forge's own
-       link, which on GitLab is `…/-/work_items/<number>`; never build one.
+       issue URL, used exactly as given (GitLab may answer `…/-/issues/<number>`
+       or `…/-/work_items/<number>`); never build one.
        Keep the title **outside** the link, exactly as above. `title_plain` is
        reporter-written text and the sanitizer does not escape Markdown, so a
        title containing `](` placed inside the link label would close the link

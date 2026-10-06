@@ -41,6 +41,7 @@ from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
     GITOPS_STATE_READ_TIMEOUT_SECONDS,
     get_managed_repos,
     is_valid_repo_slug,
+    qualify,
 )
 
 SCRATCH_DIR = "/opt/data/scratch"
@@ -775,23 +776,31 @@ def handle_poll(args):
     )
 
 
-def _validate_repo_or_exit(repo: str) -> None:
+def _validate_repo_or_exit(repo: str) -> str:
+    """`repo` as the managed list spells it, or a refusal and exit.
+
+    Returned rather than only checked: a bare `owner/name` is lifted to
+    `github.com/owner/name` once the list names a second forge, and that is
+    the spelling the broker then has to be sent.
+    """
     if not repo or not is_valid_repo_slug(repo):
         refuse("INVALID_REPOSITORY", f"Invalid repository format: {repo!r}")
     try:
         managed = get_managed_repos()
     except Exception as e:
         refuse("CONFIGMAP_READ_FAILED", str(e))
+    repo = qualify(repo, managed)
     if repo not in managed:
         refuse(
             "UNMANAGED_REPOSITORY",
             f"Repository {repo!r} is not in the managed repositories list: {managed}",
         )
+    return repo
 
 
 def handle_claim(args):
     repo = args.repo
-    _validate_repo_or_exit(repo)
+    repo = _validate_repo_or_exit(repo)
     issue_num = int(args.issue)
     ensure_labels_exist(repo)
 
@@ -838,7 +847,7 @@ def handle_transition(args):
         )
         sys.exit(1)
 
-    _validate_repo_or_exit(repo)
+    repo = _validate_repo_or_exit(repo)
 
     # The report is read here and sent as the comment's body. A path would not
     # work: this file is on the sandbox's filesystem and the forge call is made

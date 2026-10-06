@@ -164,6 +164,7 @@ def validate_repo(repo: str) -> str:
     if not repo or not gitops_workspace.is_valid_repo_slug(repo):
         raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
     managed = gitops_workspace.get_managed_repos()
+    repo = gitops_workspace.qualify(repo, managed)
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"

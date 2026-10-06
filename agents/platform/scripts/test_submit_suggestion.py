@@ -1724,6 +1724,12 @@ class TestValidateRepo(unittest.TestCase):
                 submit_suggestion.validate_repo("acme/unmanaged")
         self.assertIn("not in the managed repositories list", str(caught.exception))
 
+    def test_a_bare_name_is_lifted_on_an_install_with_a_second_forge(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual("github.com/acme/fleet", submit_suggestion.validate_repo("acme/fleet"))
+
     def test_a_managed_repository_on_another_forge_is_accepted_at_any_depth(self):
         name = "gitlab.com/acme/platform/infra"
         with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):

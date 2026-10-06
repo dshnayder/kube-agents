@@ -12480,6 +12480,33 @@ class TestRefreshOnAnotherForge(unittest.TestCase):
         self.assertEqual(["acme/fleet"], self.refreshed("acme/fleet"))
 
 
+class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):
+    """Content mode's file workspace clones GitHub only, and says so for another forge."""
+
+    def test_the_refusal_names_the_forge_and_spares_github(self):
+        self.assertIsNone(audit_report.content_workspace_refusal("acme/fleet"))
+        self.assertIsNone(audit_report.content_workspace_refusal("github.com/acme/fleet"))
+        refusal = audit_report.content_workspace_refusal("gitlab.com/acme/infra")
+        self.assertIn("clones GitHub repositories only", refusal)
+        self.assertIn("ledger issue is unaffected", refusal)
+
+    def test_a_remediation_on_another_forge_opens_no_workspace(self):
+        client = type(sys)("credential_proxy_client")
+
+        class Workspace:
+            @staticmethod
+            def open(*args, **kwargs):
+                raise AssertionError("the workspace was opened")
+
+        client.Workspace = Workspace
+        with patch.dict(sys.modules, {"credential_proxy_client": client}), \
+                patch.object(audit_report, "_proposal_noun", lambda repo: "merge request"):
+            landed = audit_report._land_group_via_broker(
+                "gitlab.com/acme/infra", "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
+            )
+        self.assertFalse(landed.proposable)
+
+
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
     def setUp(self):
         # Only the path is computed; nothing is created under it.
@@ -18267,6 +18294,17 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(memory["id_scheme"], audit_report.ID_SCHEME)
         runs = list((self.store_dir() / "runs").glob("*.json"))
         self.assertEqual([p.name for p in runs], ["20260801T093000.000000Z.json"])
+
+    def test_the_memory_carries_over_when_a_second_forge_puts_githubs_host_on_the_name(self):
+        # Review: the stored `acme/fleet` was compared to `github.com/acme/fleet`
+        # as a string, so the first run after a second forge lost its delta.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        memory = audit_report.read_report_memory(AUDIT, 42, "github.com/Acme/fleet")
+        self.assertIsNotNone(memory)
+        self.assertEqual(memory["ledger_body"], "body")
+        # And the other way: a memory written under the host-qualified name.
+        audit_report.write_report(AUDIT, self.envelope(repo="github.com/acme/fleet"), NOW.replace(minute=31))
+        self.assertEqual(audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body")
 
     def test_a_report_for_another_ledger_is_not_trusted(self):
         audit_report.write_report(AUDIT, self.envelope(), NOW)

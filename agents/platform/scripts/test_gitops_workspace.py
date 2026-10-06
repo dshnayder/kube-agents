@@ -1652,8 +1652,56 @@ class TestForgeNeutralNames(unittest.TestCase):
 
     def test_a_nested_name_is_one_directory_under_the_lease(self):
         path = gitops_workspace.workspace_path("gitlab.com/acme/platform/infra", "/r", lease="l")
-        self.assertEqual(Path("/r/l/gitlab.com__acme__platform__infra"), path)
+        self.assertEqual(Path("/r/l/gitlab.com%2Facme%2Fplatform%2Finfra"), path)
         self.assertEqual(Path("/r/l/acme__fleet"), gitops_workspace.workspace_path("acme/fleet", "/r", lease="l"))
+        # GitHub named with its host is the same repository, so the same tree.
+        self.assertEqual(Path("/r/l/acme__fleet"), gitops_workspace.workspace_path("github.com/acme/fleet", "/r", lease="l"))
+
+    def test_two_nested_names_never_share_a_tree(self):
+        # Review: joining on `__` put `a/b__c` and `a__b/c` in one directory.
+        one = gitops_workspace.workspace_path("gitlab.com/a/b__c", "/r", lease="l")
+        two = gitops_workspace.workspace_path("gitlab.com/a__b/c", "/r", lease="l")
+        self.assertNotEqual(one, two)
+
+    def test_a_host_qualified_directory_reads_back_to_its_name(self):
+        root = Path(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        holder = gitops_workspace.lease_dir(root, "l")
+        holder.mkdir(parents=True)
+        gitops_workspace.write_lease(holder, "l", "gitlab.com/a/b__c")
+        tree = gitops_workspace.workspace_path("gitlab.com/a/b__c", root, lease="l")
+        tree.mkdir()
+        self.assertEqual("gitlab.com/a/b__c", gitops_workspace.resolve_repo(workspace=tree))
+
+    def test_a_bare_name_is_lifted_once_the_list_names_a_second_forge(self):
+        # Review: an old `--repo owner/name`, lease record or directory was
+        # refused against a list that now spells GitHub with its host.
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        self.assertEqual("github.com/acme/fleet", gitops_workspace.qualify("acme/fleet", mixed))
+        self.assertEqual("acme/fleet", gitops_workspace.qualify("acme/fleet", ["acme/fleet"]))
+        self.assertEqual("gitlab.com/acme/infra", gitops_workspace.qualify("gitlab.com/acme/infra", mixed))
+        with patch("gitops_workspace.get_managed_repos", return_value=mixed):
+            self.assertEqual("github.com/acme/fleet", gitops_workspace.qualify("acme/fleet"))
+        with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("unreadable")):
+            self.assertEqual("acme/fleet", gitops_workspace.qualify("acme/fleet"))
+
+    def test_a_local_clone_of_another_forges_repository_is_refused_up_front(self):
+        # Review: directory mode cloned with GitHub's credential only, so a
+        # private GitLab project failed mid-clone naming nothing.
+        calls = []
+        with self.assertRaises(RuntimeError) as caught:
+            gitops_workspace.ensure_workspace(
+                "gitlab.com/acme/infra", lambda argv, cwd=None, check=True: calls.append(argv),
+                lease="l", root=Path(tempfile.gettempdir()) / "never-used",
+            )
+        self.assertIn("reaches GitHub only", str(caught.exception))
+        self.assertEqual([], calls)
+
+    def test_githubs_noun_is_read_from_the_table_not_the_fallback(self):
+        # Review: asserting "pull request" for GitHub passed even when the
+        # lookup was broken, because the fallback is the same string.
+        with patch.dict(gitops_workspace.FORGE_PROPOSAL_NOUNS, {"github": "change request"}):
+            self.assertEqual("change request", gitops_workspace.proposal_noun("acme/fleet"))
 
     def test_the_forges_noun_comes_from_the_entry_it_was_registered_as(self):
         entries = self.entries(("gitlab", "https://gitlab.example.com/acme/infra"))
@@ -1662,3 +1710,48 @@ class TestForgeNeutralNames(unittest.TestCase):
             self.assertEqual("pull request", gitops_workspace.proposal_noun("acme/fleet"))
             self.assertEqual("pull request", gitops_workspace.proposal_noun("github.com/acme/fleet"))
             self.assertEqual("pull request", gitops_workspace.proposal_noun("code.example/a/b"))
+
+
+class TestForgeTable(unittest.TestCase):
+    """The sandbox-side table of forges, kept in step with the forge classes."""
+
+    def test_the_table_names_every_forge_and_its_noun(self):
+        import providers
+
+        self.assertEqual(
+            {cls.name: cls.proposal_noun for cls in providers.AVAILABLE},
+            gitops_workspace.FORGE_PROPOSAL_NOUNS,
+        )
+
+
+class TestNoBrokerImports(unittest.TestCase):
+    """The sandbox image ships `gitops_workspace` and none of the broker's modules."""
+
+    def test_the_consumers_work_where_providers_cannot_be_imported(self):
+        # Review BLOCKER: a deferred `import providers` failed every consumer
+        # in the sandbox, on GitHub-only installs too.
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/fleet"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
+        ]
+        blocked = {"providers": None, "workspace_paths": None}
+        with patch.dict(sys.modules, blocked), \
+                patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual(
+                ["github.com/acme/fleet", "gitlab.com/acme/infra"], gitops_workspace.get_managed_repos()
+            )
+            self.assertEqual("merge request", gitops_workspace.proposal_noun("gitlab.com/acme/infra"))
+            self.assertTrue(gitops_workspace.is_valid_repo_slug("gitlab.com/acme/infra"))
+
+    def test_the_module_names_no_broker_module_at_all(self):
+        import ast
+
+        tree = ast.parse(Path(gitops_workspace.__file__).read_text())
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        } | {
+            (node.module or "").split(".")[0]
+            for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        }
+        self.assertFalse(imported & {"providers", "workspace_paths", "vcs_broker", "credential_proxy"})

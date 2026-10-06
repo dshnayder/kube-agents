@@ -977,6 +977,15 @@ class ValidateRepoOrExitTest(ResolverTest):
         self.assertIsNone(code)
         self.assertIsNone(payload)
 
+    def test_a_bare_name_is_lifted_on_an_install_with_a_second_forge(self):
+        # Review: a cron's `--repo acme/toolkit` was refused once the list
+        # spelt GitHub with its host, and the broker would have refused it too.
+        with mock.patch.object(
+            resolver, "get_managed_repos",
+            return_value=["github.com/acme/toolkit", "gitlab.com/acme/infra"],
+        ):
+            self.assertEqual("github.com/acme/toolkit", resolver._validate_repo_or_exit("acme/toolkit"))
+
     def test_valid_repo_in_managed_passes(self):
         payload, code = self._validate(
             "acme/toolkit",

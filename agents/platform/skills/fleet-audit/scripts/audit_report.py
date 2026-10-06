@@ -1918,6 +1918,21 @@ def release_in_flight(audit_id: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _ledger_key(repo: object) -> str:
+    """One spelling per ledger: lowercased, with GitHub's host left off.
+
+    A memory written as `acme/gitops` before a second forge was configured is
+    the same ledger as `github.com/acme/gitops` after; comparing the raw
+    strings would read the first run after the upgrade as a different
+    repository and lose the delta.
+    """
+    key = str(repo).lower()
+    prefix = "github.com/"
+    if key.startswith(prefix) and key.count("/") == 2:
+        key = key[len(prefix):]
+    return key
+
+
 def reports_dir_for(audit_id: str, repo: str) -> Path:
     """The store directory for one stream's ledger in one repository.
 
@@ -1933,8 +1948,9 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     # A repository on another forge is named `host/path` at any depth, and its
     # store is that many directories down: a GitHub owner has no dot in it, so
     # `gitlab.com/acme/infra` cannot land on a GitHub owner's directory. GitHub
-    # named with its host, as an install managing two forges names it, is the
-    # same ledger as the bare slug and keeps the bare slug's directory.
+    # named with its host, as an install managing two forges names it, keeps
+    # the bare slug's directory; `read_report_memory` compares the stored name
+    # through `_ledger_key` so the memory in it carries over too.
     segments = str(repo).lower().split("/")
     if len(segments) == 3 and segments[0] == "github.com":
         segments = segments[1:]
@@ -2222,7 +2238,7 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
         return None
     stored_issue = envelope.get("issue_number")
     stored_repo = envelope.get("repo")
-    if stored_issue != issue_number or str(stored_repo).lower() != str(repo).lower():
+    if stored_issue != issue_number or _ledger_key(stored_repo) != _ledger_key(repo):
         log(
             f"Stored report for {audit_id} was written for {stored_repo}#{stored_issue}, "
             f"not the open {repo}#{issue_number}; {MEMORY_UNKNOWABLE}"
@@ -9363,6 +9379,9 @@ def resolve_repo(
         if not gitops_workspace.is_valid_repo_slug(r):
             raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
         managed = gitops_workspace.get_managed_repos()
+        # A bare `owner/name` from a cron or an operator, on an install whose
+        # list now spells GitHub with its host.
+        r = gitops_workspace.qualify(r, managed)
         if managed and r not in managed:
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
@@ -9384,7 +9403,7 @@ def resolve_repo(
             )
             record = gitops_workspace.read_lease(holder)
             if record and record.get("repo"):
-                return record["repo"]
+                return gitops_workspace.qualify(record["repo"])
         except Exception:
             pass
 
@@ -9897,6 +9916,28 @@ def _land_group_via_clone(
     return _GroupPush(base, True)
 
 
+def content_workspace_refusal(repo: str) -> str | None:
+    """Why the broker's file workspace cannot open `repo`, or None if it can.
+
+    The content workspace clones GitHub and nothing else: its managed clones
+    ride the write credential the GitHub CLI installed in the broker, which no
+    other forge's host answers to. A repository on another forge still gets
+    its ledger -- issues and comments go through the verbs, which reach every
+    forge -- but its remediation files cannot be read or published in content
+    mode until the workspace clones from the repository's own forge.
+    """
+    import gitops_workspace
+
+    host, _ = gitops_workspace.split_host(repo)
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return None
+    return (
+        f"{repo} is on {host}, and the broker's file workspace clones GitHub "
+        "repositories only, so its remediation files cannot be read or "
+        "published in content mode yet. The ledger issue is unaffected."
+    )
+
+
 def _land_group_via_broker(
     repo: str,
     audit_id: str,
@@ -9923,6 +9964,10 @@ def _land_group_via_broker(
     """
     import credential_proxy_client
 
+    refusal = content_workspace_refusal(repo)
+    if refusal:
+        log(f"{branch}: {refusal} No {_proposal_noun(repo)} opened.")
+        return _GroupPush("", False)
     changes = {path: snapshot[path] for path in paths}
     with credential_proxy_client.Workspace.open(
         proxy_endpoint(), repo, branch=branch
@@ -11221,6 +11266,9 @@ def handle_fetch(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
+    refusal = content_workspace_refusal(repo) if content_mode() else None
+    if refusal:
+        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"fetch needs the content-passing broker; this run is in directory "
@@ -11269,6 +11317,9 @@ def handle_list(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
+    refusal = content_workspace_refusal(repo) if content_mode() else None
+    if refusal:
+        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"list needs the content-passing broker; this run is in directory "
@@ -11321,6 +11372,9 @@ def handle_grep(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
+    refusal = content_workspace_refusal(repo) if content_mode() else None
+    if refusal:
+        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"grep needs the content-passing broker; this run is in directory "
