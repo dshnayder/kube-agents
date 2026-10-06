@@ -89,6 +89,14 @@ class RequestTest(unittest.TestCase):
         self.assertEqual("application/json", request.get_header("Accept"))
         self.assertEqual([7.0], opener.timeouts)
 
+    def test_the_configured_timeout_reaches_the_opener_exactly_on_a_large_clock(self):
+        # CI: at some monotonic clock readings
+        # `(now + 7.0) - now` is not 7.0 (CI saw 6.999999999999986).
+        opener = Opener([{}])
+        with mock.patch("providers.transport.time.monotonic", return_value=123.456):
+            transport(opener).api("GET", "projects")
+        self.assertEqual([7.0], opener.timeouts)
+
     def test_the_credential_headers_are_read_per_call(self):
         # A rotated token file is the next call's token, with no restart.
         tokens = iter(["old", "new"])

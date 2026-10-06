@@ -198,6 +198,17 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual([2], [p["number"] for p in answer["proposals"]])
         self.assertEqual("acme/infra", answer["proposals"][0]["sourceRepo"])
 
+    def test_forks_of_the_same_branch_name_cannot_crowd_ours_off_the_page(self):
+        # Review (#2437): with limit 1, a fork's same-named branch filled the
+        # page and the filter then left nothing.
+        api = Api([mr(1, source_project=2002), mr(2, source_project=2003), mr(3)])
+        answer = forge().proposal_list(
+            api, "acme/infra", {"source": "platform-agent/x", "state": "open", "limit": 1}
+        )
+        self.assertEqual(100, api.calls[0][2]["per_page"])
+        self.assertEqual([3], [p["number"] for p in answer["proposals"]])
+        self.assertFalse(answer["truncated"])
+
     def test_the_diff_falls_back_to_the_json_diffs_until_gitlab_has_computed_it(self):
         api = Api(
             mr(),
