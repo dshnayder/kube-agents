@@ -317,6 +317,7 @@ def route_with_author(gitlab, user) -> None:
     [
         {"username": "project_70001_bot_3f2a9c"},
         {"username": "group_42_bot_8e1d"},
+        {"username": "project_70001_bot3"},  # older instances: a number, not hex
         {"username": "renamed-automation", "bot": True},
     ],
 )
@@ -332,17 +333,31 @@ def test_a_token_bots_merge_request_is_the_agents_with_no_login_pinned(env, gitl
     }
 
 
-def test_an_ordinary_accounts_merge_request_is_nobodys_until_the_login_is_named(
+def test_an_ordinary_accounts_merge_request_with_no_login_named_is_an_error(
     env, gitlab, monkeypatch
 ):
     # gitlab.com Free: the agent is an ordinary account. Unnamed, a person's
-    # merge request and the agent's look alike, so neither counts -- rather
-    # than every person's counting as the agent's.
+    # merge request and the agent's look alike -- which is not a clean report
+    # but one this check cannot make, and it says so.
     monkeypatch.delenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR)
     route_recorded(gitlab)
     stash()
     result = check().verify(30)
-    assert [w for w in result.raw["writes"] if w["kind"] == "pull_request"] == []
+    assert result.status == "error"
+    assert github_writes.GITLAB_AGENT_LOGIN_ENV_VAR in result.reason
+
+
+def test_a_token_bot_still_counts_when_a_login_is_named(env, gitlab):
+    # The login adds to the token-bot rule; it does not switch it off.
+    listing = fixture("mrs-updated-desc.json")
+    listing[0] = {**listing[0], "author": {"username": "project_70001_bot_3f2a9c"}}
+    route_recorded(gitlab)
+    gitlab.routes[WINDOWED_LISTING] = (200, listing)
+    stash()
+    result = check().verify(30)
+    assert ("pull_request", "platform-agent/writes-mr") in {
+        (w["kind"], w["branch"]) for w in result.raw["writes"]
+    }
 
 
 def test_a_person_is_not_the_agent_when_the_agents_login_is_named(env, gitlab):

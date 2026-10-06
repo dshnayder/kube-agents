@@ -77,14 +77,19 @@ GITLAB_DEFAULT_HOST = "gitlab.com"
 #: ownership test recognises on its own, as it does a GitHub ``[bot]``. On
 #: gitlab.com Free there are no such tokens, and the agent writes as an
 #: ordinary account holding a personal access token -- nothing marks it, so
-#: the run names it here. Unset with no token bot, nothing counts as the
-#: agent's, and the check reports no pull requests rather than every
-#: person's.
+#: the run names it here. It adds to the token-bot rule rather than
+#: replacing it. Unset, an ordinary account's merge request in the window
+#: makes ``github_writes`` an error, since nothing says whose it is.
 GITLAB_AGENT_LOGIN_ENV_VAR = "BENCH_GITLAB_AGENT_LOGIN"
-#: A GitLab project or group access token's bot username. Must match
-#: ``_TOKEN_BOT_RE`` in ``agents/platform/scripts/providers/gitlab/translate.py``,
-#: the broker's own reading of the same marking.
-_GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+)?$")
+#: A GitLab project or group access token's bot username: ``project_<id>_bot``
+#: with a hex suffix (``_<hex>``, current instances) or a number (``<N>``,
+#: older ones), and the same for ``group_``. The same rule the broker's own
+#: GitLab forge applies. Not matched: a GitLab service account
+#: (``service_account_*``), which is an ordinary-looking user an install
+#: names through ``BENCH_GITLAB_AGENT_LOGIN`` like any personal account. The
+#: user object's ``bot`` field would say more, but GitLab leaves it out of a
+#: merge request's ``author``, so the username is what there is.
+_GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+|\d+)?$")
 
 #: The grading credential per forge, first set wins. GitHub's is the
 #: read-scoped installation token ``hack/ci-eval-pr.sh`` mints; GitLab's is a
@@ -92,14 +97,17 @@ _GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+)?$")
 GITHUB_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 GITLAB_TOKEN_ENV_VARS = ("BENCH_GITLAB_TOKEN",)
 
-# One path segment of a repository: GitHub's owner and name, or one of a
-# GitLab project's groups.
+# One path segment of a GitLab project path: a group, a subgroup or the
+# project, which may start with `_` or `.`.
 _SEGMENT = r"[A-Za-z0-9_.][A-Za-z0-9_.-]*"
+# GitHub's two, kept to the segment shape they have always matched: an owner
+# or a name starts with a letter or a digit.
+_GITHUB_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
 _GITHUB_ISSUE_URL_RE = re.compile(
-    rf"https://github\.com/({_SEGMENT}/{_SEGMENT})/issues/(\d+)", re.IGNORECASE
+    rf"https://github\.com/({_GITHUB_SEGMENT}/{_GITHUB_SEGMENT})/issues/(\d+)", re.IGNORECASE
 )
 _GITHUB_PULL_URL_RE = re.compile(
-    rf"https://github\.com/({_SEGMENT}/{_SEGMENT})/pull/(\d+)", re.IGNORECASE
+    rf"https://github\.com/({_GITHUB_SEGMENT}/{_GITHUB_SEGMENT})/pull/(\d+)", re.IGNORECASE
 )
 
 
@@ -123,6 +131,10 @@ def forge_name(environ: Mapping[str, str] | None = None) -> str:
             f"{FORGE_ENV_VAR}={name!r} is not a forge this check reads "
             f"({', '.join(FORGES)}); this check could not be evaluated"
         )
+    if name == FORGE_GITLAB:
+        # Refused here, where every check already turns UnknownForge into an
+        # error, rather than at whichever later read first builds a URL.
+        gitlab_host(environ)
     return name
 
 
@@ -136,8 +148,21 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
 
 
+_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\Z")
+
+
 def gitlab_host(environ: Mapping[str, str] | None = None) -> str:
-    return (_env(environ).get(GITLAB_HOST_ENV_VAR) or GITLAB_DEFAULT_HOST).strip()
+    """The GitLab instance's hostname, refused as :class:`UnknownForge` when
+    ``BENCH_GITLAB_HOST`` carries a scheme, a path or a port: each would be
+    spliced into every API URL and read from somewhere other than the
+    instance it names."""
+    host = (_env(environ).get(GITLAB_HOST_ENV_VAR) or GITLAB_DEFAULT_HOST).strip()
+    if not _HOST_RE.match(host):
+        raise UnknownForge(
+            f"{GITLAB_HOST_ENV_VAR}={host!r} is not a bare hostname (no scheme, path "
+            "or port, e.g. gitlab.example.com); this check could not be evaluated"
+        )
+    return host
 
 
 def gitlab_agent_login(environ: Mapping[str, str] | None = None) -> str:

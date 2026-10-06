@@ -1,6 +1,6 @@
 [
   {
-    "id": 541546530,
+    "id": 50000003,
     "iid": 3,
     "project_id": 40000001,
     "source_project_id": 40000001,
@@ -20,7 +20,7 @@
     "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/3"
   },
   {
-    "id": 541545009,
+    "id": 50000002,
     "iid": 2,
     "project_id": 40000001,
     "source_project_id": 40000001,
@@ -40,7 +40,7 @@
     "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/2"
   },
   {
-    "id": 541544807,
+    "id": 50000001,
     "iid": 1,
     "project_id": 40000001,
     "source_project_id": 40000001,

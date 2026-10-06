@@ -294,6 +294,7 @@ def test_a_merge_request_outside_the_owner_group_is_rejected(env, gitlab):
 
 
 def test_a_missing_merge_request_is_absence_and_a_refused_token_an_error(env, gitlab):
+    gitlab.routes[PROJECT] = (200, {"id": 40000001})
     stash(f"Opened {MR3_URL}")
     result = pr_check().verify(30)
     assert result.status != "error"
@@ -311,14 +312,14 @@ def test_no_merge_request_url_names_gitlab(env, gitlab):
     assert "no gitlab.com merge request URL" in result.reason
 
 
-def route_spent(gitlab, *, carried: bool, named: bool) -> str:
+def route_spent(gitlab, *, carried: bool, named: bool, extra=()) -> str:
     """!3 on the branch closed !1 used, created inside the run."""
     route_mr3(gitlab, source_branch="platform-agent/proto-1")
     closed = fixture("mr-closed.json")
     closed["created_at"] = "2026-10-01T14:59:35.000Z"
     gitlab.routes[
-        f"{PROJECT}/merge_requests?state=closed&source_branch=platform-agent%2Fproto-1&per_page=100"
-    ] = (200, [closed])
+        f"{PROJECT}/merge_requests?state=all&source_branch=platform-agent%2Fproto-1&per_page=100"
+    ] = (200, [closed, *extra])
     commits = [{"id": fixture("commit-by-sha.json")["id"]}]
     if carried:
         commits += fixture("mr-commits.json")
@@ -344,3 +345,98 @@ def test_the_closed_merge_request_must_be_named(env, gitlab):
     result = pr_check(reuses_spent_branch=True).verify(30)
     assert result.success is False
     assert "does not name !1" in result.reason
+
+
+# --- review round: a project the token cannot see, the stream window, forks --
+
+
+def test_a_merge_request_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab):
+    # GitLab answers 404, not 403, for a private project the token is not a
+    # member of: that is the credential's fault, not a number the agent got wrong.
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error"
+    assert "cannot see it" in result.reason
+
+
+def test_a_ledger_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab):
+    stash(f"Audit filed: {ISSUE_URL}")
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status == "error"
+    assert "cannot see it" in result.reason
+    gitlab.routes[PROJECT] = (200, {"id": 40000001})
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status != "error"
+    assert "no such issue" in result.reason
+
+
+def stream_env(monkeypatch, repo=REPO):
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, AUDIT)
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, repo)
+    # The stream's first unit began a day before this run.
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(RUN_START.timestamp() - 86400))
+
+
+def test_accepts_stream_pull_request_widens_the_window_on_gitlab(env, gitlab, monkeypatch):
+    stream_env(monkeypatch)
+    route_mr3(gitlab, created_at="2026-09-30T20:00:00Z", updated_at="2026-09-30T20:00:00Z",
+              source_branch=f"platform-agent/fix-{AUDIT}-1")
+    old = fixture("commit-by-sha.json")
+    old["committed_date"] = "2026-09-30T20:00:00.000+00:00"
+    gitlab.routes[f"{PROJECT}/repository/commits/{fixture('mr-view.json')['sha']}"] = (200, old)
+    stash(f"Opened {MR3_URL}")
+    assert pr_check().verify(30).success is False
+    result = pr_check(accepts_stream_pull_request=True).verify(30)
+    assert result.success is True, result.reason
+
+
+def test_the_widened_window_still_wants_the_streams_branch_and_repository(env, gitlab, monkeypatch):
+    stream_env(monkeypatch)
+    route_mr3(gitlab, created_at="2026-09-30T20:00:00Z", updated_at="2026-09-30T20:00:00Z",
+              source_branch="platform-agent/someone-else")
+    old = fixture("commit-by-sha.json")
+    old["committed_date"] = "2026-09-30T20:00:00.000+00:00"
+    gitlab.routes[f"{PROJECT}/repository/commits/{fixture('mr-view.json')['sha']}"] = (200, old)
+    stash(f"Opened {MR3_URL}")
+    result = pr_check(accepts_stream_pull_request=True).verify(30)
+    assert result.success is False
+    assert "audit stream's `finish` names" in result.reason
+    stream_env(monkeypatch, repo="example-group/other")
+    route_mr3(gitlab, created_at="2026-09-30T20:00:00Z", updated_at="2026-09-30T20:00:00Z",
+              source_branch=f"platform-agent/fix-{AUDIT}-1")
+    gitlab.routes[f"{PROJECT}/repository/commits/{fixture('mr-view.json')['sha']}"] = (200, old)
+    result = pr_check(accepts_stream_pull_request=True).verify(30)
+    assert result.success is False
+    assert "other than this job's" in result.reason
+
+
+def test_a_merged_earlier_merge_request_spends_the_branch_and_a_forks_does_not(env, gitlab):
+    # GitLab's `closed` leaves merged out; `source_branch` alone matches forks.
+    stash(route_spent(gitlab, carried=False, named=True))
+    listing_key = f"{PROJECT}/merge_requests?state=all&source_branch=platform-agent%2Fproto-1&per_page=100"
+    status, listed = gitlab.routes[listing_key]
+    merged = {**listed[0], "state": "merged"}
+    gitlab.routes[listing_key] = (200, [merged])
+    assert pr_check(reuses_spent_branch=True).verify(30).success is True
+    fork = {**listed[0], "source_project_id": 99}
+    gitlab.routes[listing_key] = (200, [fork])
+    result = pr_check(reuses_spent_branch=True).verify(30)
+    assert result.success is False
+    assert "carries no merge request that this run opened and closed" in result.reason
+
+
+@pytest.mark.parametrize("host", ["https://gitlab.example.com", "gitlab.example.com/", "gitlab.example.com:8443", "a b"])
+def test_a_gitlab_host_that_is_not_a_bare_hostname_is_an_error(env, gitlab, monkeypatch, host):
+    monkeypatch.setenv(forges.GITLAB_HOST_ENV_VAR, host)
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error"
+    assert "not a bare hostname" in result.reason
+    assert gitlab.calls == []
+
+
+def test_github_url_shapes_are_mains():
+    # An owner or name starting with `_` or `.` was never a GitHub URL here.
+    assert forges.issue_refs("https://github.com/_a/b/issues/1", "github") == []
+    assert forges.proposal_refs("https://github.com/a/.b/pull/2", "github") == []
+    assert forges.issue_refs("https://gitlab.com/_a/b/-/issues/1", "gitlab") == [("_a/b", 1)]

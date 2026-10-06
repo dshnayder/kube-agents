@@ -679,6 +679,26 @@ def _issue_view(forge: str, payload: dict) -> dict[str, Any]:
     }
 
 
+def _gitlab_project_unseen(repo: str, token: str, budget: float) -> str | None:
+    """Why the token cannot see the GitLab project ``repo``, or None when it can.
+
+    GitLab answers 404, not 403, for a private project the token cannot see,
+    so a 404 on an issue or a merge request does not by itself say the object
+    is missing: the project read tells a misconfigured credential (an error)
+    from a number the agent got wrong (a failed grade).
+    """
+    status, _ = _http_get_json(
+        forges.gitlab_api_root() + forges.gitlab_project_path(repo), token, budget
+    )
+    if status == 200:
+        return None
+    return (
+        f"GitLab answered {status} for the project {repo} itself: the token behind "
+        f"{forges.GITLAB_TOKEN_ENV_VARS[0]} cannot see it (a private project it is "
+        "not a member of answers 404), so this check could not be evaluated"
+    )
+
+
 def _issue_api_url(forge: str, repo: str, number: int) -> str:
     if forge == forges.FORGE_GITLAB:
         return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
@@ -1471,6 +1491,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         budget = single_call_timeout(timeout_sec)
         matches: list[dict[str, Any]] = []
         rejected: list[str] = []
+        unseen: list[str] = []
         for repo, number in seen:
             slug = f"{repo}#{number}"
             url = _issue_api_url(forge, repo, number)
@@ -1484,6 +1505,14 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code == 404:
+                if forge == forges.FORGE_GITLAB:
+                    try:
+                        why = _gitlab_project_unseen(repo, token, budget)
+                    except OSError as exc:
+                        why = f"could not reach the GitLab API for {repo}: {exc}"
+                    if why:
+                        unseen.append(f"{slug}: {why}")
+                        continue
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
             if status_code in (401, 403):
@@ -1537,6 +1566,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 }
             )
 
+        if not matches and unseen:
+            return done(False, "; ".join(unseen + rejected), status="error")
         if not matches:
             return done(
                 False,
@@ -2115,6 +2146,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
         budget: float,
         started: datetime,
         named: set[int],
+        since: datetime | None = None,
+        since_what: str = "this run started",
+        stream_branch: str = "",
     ) -> tuple[str, str, dict | None]:
         """One merge request graded by the clauses :meth:`verify` applies to
         a GitHub pull request: ``("pass", reason, raw)``, ``("reject",
@@ -2127,11 +2161,21 @@ class PullRequestOpenedVerifier(BaseVerifier):
         which one commit read dates. The spent-branch clause lists the closed
         merge requests from the same ``source_branch`` and walks this one's
         commits for their heads.
+
+        ``since``/``since_what``/``stream_branch`` are :meth:`verify`'s
+        widened window for ``accepts_stream_pull_request``, applied as on
+        GitHub: measured from the stream's first unit, and a merge request
+        written only before this run must be in this job's repository on a
+        branch the stream's ``finish`` names.
         """
+        since = started if since is None else since
         base = forges.gitlab_api_root() + forges.gitlab_project_path(repo)
         slug = f"{repo}!{number}"
         status, mr = _http_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
+            why = _gitlab_project_unseen(repo, token, budget)
+            if why:
+                return "unresolved", f"{slug}: {why}", None
             return "reject", f"{slug}: no such merge request (404)", None
         if status == 401:
             return "unresolved", (
@@ -2157,11 +2201,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return "reject", f"{slug}: GitLab returned no readable created_at", None
         updated = _parse_github_time(mr.get("updated_at"))
         touched = updated if updated and updated > created else created
-        age = (started - touched).total_seconds()
+        age = (since - touched).total_seconds()
         if age > self.max_clock_skew_sec:
             return "reject", (
                 f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
-                f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                f"BEFORE {since_what} ({since.isoformat()}) — a leftover "
                 "an earlier run opened, which this run either quoted or "
                 "resubmitted unchanged"
             ), None
@@ -2188,12 +2232,31 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"unexpected GitLab response {status} for {slug}'s head commit; "
                     "this check could not be evaluated"
                 ), None
-        if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+        if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
             return "reject", (
                 f"{slug}: its head commit dates from {pushed.isoformat()}, "
-                f"before this run started ({started.isoformat()}) — this run "
+                f"before {since_what} ({since.isoformat()}) — this run "
                 "wrote to a merge request an earlier one pushed the fix to"
             ), None
+        skew = self.max_clock_skew_sec
+        if stream_branch and (
+            (started - touched).total_seconds() > skew
+            or (pushed and (started - pushed).total_seconds() > skew)
+        ):
+            if repo.lower() != _stream_repo():
+                return "reject", (
+                    f"{slug}: last written or pushed to before this run started, in a "
+                    f"repository other than this job's ({_stream_repo()}) — another "
+                    "job's merge request on the same audit stream, not this one's"
+                ), None
+            head = str(mr.get("source_branch") or "")
+            if not head.startswith(stream_branch):
+                return "reject", (
+                    f"{slug}: last written or pushed to before this run started, on "
+                    f"branch {head or '(unreadable)'!r}, which is not one this audit "
+                    f"stream's `finish` names ({stream_branch}*) — another case's "
+                    "merge request, not the stream's"
+                ), None
         if self.reuses_spent_branch:
             outcome = self._gitlab_spent_before(base, slug, number, mr, token, budget, started, named)
             if outcome is not None:
@@ -2232,7 +2295,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 "evaluated"
             ), None
         status, listed = _http_get_json(
-            f"{base}/merge_requests?state=closed&source_branch="
+            f"{base}/merge_requests?state=all&source_branch="
             f"{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
             budget,
@@ -2245,6 +2308,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         spent = []
         for earlier in listed:
             if not isinstance(earlier, dict) or earlier.get("iid") == number:
+                continue
+            # GitLab's `closed` excludes merged, and `source_branch` alone
+            # matches a fork's branch of the same name.
+            if str(earlier.get("state") or "").lower() not in ("closed", "merged"):
+                continue
+            if earlier.get("source_project_id") != mr.get("target_project_id", mr.get("project_id")):
                 continue
             created = _parse_github_time(earlier.get("created_at"))
             if created and (started - created).total_seconds() <= self.max_clock_skew_sec:
@@ -2411,6 +2480,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     verdict, reason, raw = self._gitlab_candidate(
                         full, number, token, budget, started,
                         {n for o, r, n in seen if f"{o}/{r}".lower() == full.lower()},
+                        since=since, since_what=since_what, stream_branch=stream_branch,
                     )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitLab API for {full}!{number}: {exc}")
@@ -2617,6 +2687,12 @@ class GitHubWritesVerifier(BaseVerifier):
     environment and not from the reply, since the reply of a run that wrote
     where it should not have may say nothing about it.
 
+    ON GITLAB (``BENCH_FORGE=gitlab``) the pull request is a merge request,
+    the agent's when a token bot opened it or when
+    ``BENCH_GITLAB_AGENT_LOGIN`` names its author, and the branch listing
+    needs only the ``read_api`` scope the merge-request listing already
+    wants, so the branch half is observed whenever the merge requests are.
+
     WHAT A CASE MAY REQUEST. A case that asks for a pull request grades it
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
@@ -2707,7 +2783,11 @@ class GitHubWritesVerifier(BaseVerifier):
                 "or this check cannot be evaluated",
                 status="error",
             )
-        repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+        repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip()
+        if forge == forges.FORGE_GITLAB:
+            # A GitLab path is copied out of a URL more often than typed;
+            # GitHub keeps the exact `owner/name` it always required.
+            repo = repo.strip("/")
         if not repo or "/" not in repo:
             return done(False, _NO_GITOPS_REPO_REASON, status="error")
         if self.owner and repo.split("/", 1)[0].lower() != self.owner.lower():

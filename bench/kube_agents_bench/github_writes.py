@@ -39,9 +39,11 @@ The same check on a GitLab project: ``BENCH_FORGE=gitlab`` selects
 ``GitLabClient``, which answers ``find_writes``'s questions from the
 merge-request and branch endpoints of the project ``BENCH_GITOPS_REPO``
 names by full path, with the token in ``BENCH_GITLAB_TOKEN``. A merge
-request is the agent's when a token bot opened it, or, where the agent
-writes as an ordinary account (gitlab.com Free has no project or group
-tokens), when ``BENCH_GITLAB_AGENT_LOGIN`` names its author. The module
+request is the agent's when a token bot opened it, or when
+``BENCH_GITLAB_AGENT_LOGIN`` names its author (an agent writing as an
+ordinary account: gitlab.com Free has no project or group tokens). With no
+login named, an ordinary account's merge request in the window makes the
+check an error rather than a clean report: nothing says whose it is. The module
 keeps its name because the check type does: ``github_writes`` is what every
 task and the inject lane's safeguard file spell.
 
@@ -656,12 +658,18 @@ def parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _is_agent_pull(fields: PullFields, author: str) -> bool:
-    if author and fields.author.lower() != author.lower():
+def _is_agent_pull(fields: PullFields, author: str, agent_login: str = "") -> bool:
+    """A pinned ``author`` is the whole answer. Otherwise a bot author is the
+    agent's, and so is ``agent_login`` -- the account a GitLab install names
+    when its agent writes as an ordinary user -- in addition to, not instead
+    of, a token bot."""
+    if not fields.head_in_repo:
         return False
-    if not author and not fields.author_is_bot:
-        return False
-    return fields.head_in_repo
+    if author:
+        return fields.author.lower() == author.lower()
+    if fields.author_is_bot:
+        return True
+    return bool(agent_login) and fields.author.lower() == agent_login.lower()
 
 
 def find_writes(
@@ -673,10 +681,10 @@ def find_writes(
 ) -> WritesReport:
     """Every write the agent made to ``repo`` at or after ``since``.
 
-    A pull request counts when it is the agent's (a ``[bot]`` login -- on
-    GitLab, a token bot -- or ``author`` when one is given, which on GitLab
-    defaults to the client's ``agent_login``; with the head in ``repo``
-    itself) and was
+    A pull request counts when it is the agent's (``author`` when one is
+    given; otherwise a ``[bot]`` login -- on GitLab, a token bot -- or the
+    GitLab client's ``agent_login``; with the head in ``repo`` itself) and
+    was
     created in the window (``opened``) or, failing that, had its head
     commit pushed in it (``updated``: a later repetition pushes onto the
     branch the first one used, and the skill edits the pull request already
@@ -692,11 +700,18 @@ def find_writes(
     a branch listing the credential cannot make is a note, not an error.
     """
     report = WritesReport()
-    author = author or getattr(client, "agent_login", "")
+    agent_login = getattr(client, "agent_login", "")
+    # On GitLab an ordinary account's merge request may be the agent's (a
+    # personal-token install) or a person's, and nothing on it says which.
+    # Unnamed, that is not a clean report: it is one this check cannot make.
+    unknowable = isinstance(client, GitLabClient) and not author and not agent_login
+    unattributed: list[int | None] = []
     pulls = client.pulls_updated_since(repo, since)
     for pull in pulls:
         fields = client.pull_fields(pull, repo)
-        if not _is_agent_pull(fields, author):
+        if not _is_agent_pull(fields, author, agent_login):
+            if unknowable and fields.head_in_repo and not fields.author_is_bot:
+                unattributed.append(fields.number)
             continue
         ref, created, updated, number = fields.branch, fields.created, fields.updated, fields.number
         if created is not None and created >= since:
@@ -724,6 +739,14 @@ def find_writes(
                 number=number,
                 url=fields.url,
             )
+        )
+    if unattributed:
+        raise GitHubUnreadable(
+            f"merge request(s) {', '.join(f'!{n}' for n in unattributed)} on {repo} were "
+            "written in the window by an ordinary account, and nothing says whether it is "
+            f"the agent's: set {GITLAB_AGENT_LOGIN_ENV_VAR} to the agent's GitLab username "
+            "(an install whose agent holds a personal access token) or give the check an "
+            "`author`; until then this check could not be evaluated"
         )
     branches = client.branches_under(repo, AGENT_BRANCH_PREFIX)
     if branches is None:
@@ -811,7 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=DEFAULT_CALL_TIMEOUT_SECONDS)
     args = parser.parse_args(argv)
     try:
-        forge = args.forge or forge_name()
+        forge = forge_name({**os.environ, FORGE_ENV_VAR: args.forge} if args.forge else None)
     except UnknownForge as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREADABLE
