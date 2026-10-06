@@ -600,7 +600,8 @@ finding the collector clears for the `major` sweep whose candidate carries a `de
 Refusing once was not enough: a worker re-ran `finish` unchanged and the fix reached the ledger as
 `manual`, and refused for good it declined the fix with boilerplate. So a fix `finish` can derive
 it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudget from the
-collector's `pod_selector`, in a new file beside the declaration, unless declined. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
+collector's `pod_selector`, in a new file beside the declaration; a decline of that budget stands
+only when its reason carries the URL of the pull request already carrying it. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the

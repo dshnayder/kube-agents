@@ -16568,9 +16568,27 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         beside["remediation"] = {"kind": "manifest", "path": "apps/a/a-pdb.yaml"}
         self.assertEqual(audit_report.demote_fixes_over_declarations([beside], manifest), {})
 
+    def test_the_dry_run_demotes_a_budget_over_its_declaration_as_the_real_run_does(self):
+        (self.workspace / "apps/a").mkdir(parents=True)
+        (self.workspace / "apps/a/deploy.yaml").write_text("kind: Deployment\n")
+        self.patch_attr("dry_run_repo_root", lambda *a, **k: self.workspace)
+        finding = self.manual()
+        finding["remediation"] = {"kind": "manifest", "path": "apps/a/deploy.yaml", "note": "pdb"}
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            audit_report._handle_finish_dry_run(
+                AUDIT, make_doc(findings=[finding]), NOW, manifest=self.manifest()
+            )
+        self.assertIn("a names its PodDisruptionBudget at the workload's own declaration", err.getvalue())
+        self.assertIn("WOULD OPEN: (no remediation pull requests)", err.getvalue())
+        self.assertNotIn(audit_report.DRY_RUN_PR_SEPARATOR, out.getvalue())
+
     def test_only_a_decline_citing_a_pull_request_overrules_a_generated_budget(self):
         self.assertTrue(audit_report.decline_names_a_pull_request("carried by https://github.com/acme/fleet/pull/12"))
         self.assertFalse(audit_report.decline_names_a_pull_request("Manifest file missing locally."))
+        # Only the URL: the SKILL and SOP say so, and a bare `#41` could as well
+        # be an issue.
+        self.assertFalse(audit_report.decline_names_a_pull_request("#41 already adds this budget"))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
@@ -16613,10 +16631,17 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         cases = {
             "no selector": ({"object": "Deployment/a", "namespace": "web"}, "attached no selector"),
             "long name": ({"object": "Deployment/" + "a" * 260, "namespace": "web", "pod_selector": self.SELECTOR}, "valid Kubernetes name"),
+            "foreign keys": ({"object": "Deployment/a", "namespace": "web", "pod_selector": {"app": "a"}}, "keys `policy/v1` does not take"),
+            "empty selector": ({"object": "Deployment/a", "namespace": "web", "pod_selector": {"matchLabels": {}}}, "select every pod"),
+            "no namespace": ({"object": "Deployment/a", "pod_selector": self.SELECTOR}, "no valid namespace"),
         }
         for name, (candidate, said) in cases.items():
             with self.subTest(name):
                 self.assertIn(said, audit_report._pdb_unbuildable_reason(candidate))
+                self.assertIsNone(audit_report._pdb_manifest(candidate, "a"))
+        buildable = {"object": "Deployment/a", "namespace": "web", "pod_selector": self.SELECTOR}
+        self.assertEqual(audit_report._pdb_unbuildable_reason(buildable), "")
+        self.assertIsNotNone(audit_report._pdb_manifest(buildable, "a"))
         message = audit_report.unwritten_refusal_message(
             {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
             {"a": "the collector attached no selector to write it from"},
@@ -16817,6 +16842,29 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(len(unwritten), 2)
         self.assertEqual(len(planned), 1)
         self.assertIn("another fix this run writes already takes", err.getvalue())
+
+    def test_two_fixes_in_one_namespace_never_take_one_name_from_two_files(self):
+        """`Deployment/api` and `StatefulSet/api` in one namespace, declared in
+        two directories: two paths, one `api-pdb` -- the name clause alone."""
+        manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[])]}
+        findings = []
+        for kind, directory in (("Deployment", "apps/api"), ("StatefulSet", "apps/api-db")):
+            candidate = {**_cand("no-pdb", "c1", f"{kind}/api", namespace="web"), "severity": "major"}
+            candidate.update(
+                {"declaration": {"path": f"{directory}/api.yaml", "directory": directory}, "pod_selector": self.SELECTOR}
+            )
+            manifest["clusters"][0]["candidates"].append(candidate)
+            finding = _pub(f"api-{kind.lower()}", "no-pdb", "c1", f"{kind}/api", namespace="web")
+            finding["severity"] = "major"
+            finding["remediation"] = {"kind": "manual", "note": ""}
+            findings.append(finding)
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            planned, _ = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+        self.assertEqual(len(unwritten), 2)
+        self.assertEqual(len(planned), 1)
+        self.assertIn("the name api-pdb", err.getvalue())
 
     def test_a_broker_that_cannot_be_asked_says_so(self):
         module = mock.MagicMock()
@@ -18014,6 +18062,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        # #9 still names `worker`, a live finding, so only the close keeps it
+        # off the line of pull requests the worker reports as still open.
+        self.assertEqual(payload["prs_still_open"], [])
         self.assertTrue(self.harness.forge_calls("proposal-close"))
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
@@ -20755,6 +20806,23 @@ class TestPublicControlPlaneRepair(unittest.TestCase):
             "--no-enable-google-cloud-access  # replace `203.0.113.0/24` with the office CIDR",
         )
 
+    def test_a_hash_in_prose_does_not_hide_a_backticked_command(self):
+        # `#212` is an issue, not a comment: the line is prose, and every
+        # reader of it -- the IP arm, the DNS arm, the presence test -- sees
+        # the command it introduces.
+        command = (
+            "gcloud container clusters update c --location=us-east4 "
+            "--enable-master-authorized-networks --master-authorized-networks=203.0.113.0/24"
+        )
+        note = f"Tracked in #212; run `{command}` from an admin host."
+        self.assertEqual([c for c, _ in audit_report._gcloud_commands(note)], [command])
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(f"`{command} {audit_report.GOOGLE_CLOUD_ACCESS_FLAG}`", out)
+        self.assertIn(audit_report.DNS_ACCESS_FLAG, out)
+        self.assertTrue(
+            audit_report._command_mentions_flag(out, audit_report.GOOGLE_CLOUD_ACCESS_FLAG)
+        )
+
     def test_a_short_flag_or_a_quiet_flag_is_never_the_name(self):
         for command in (
             "gcloud container clusters update -q my-c --location us-east4",
@@ -21205,12 +21273,31 @@ class TestGcloudFormatQuoting(unittest.TestCase):
         self.assertEqual(self.quote(prose), prose)
 
     def test_every_projection_gcloud_accepts_is_covered(self):
-        for projection in audit_report._GCLOUD_FORMAT_PROJECTIONS:
+        # `gcloud topic formats`, spelled out here rather than read from the
+        # module, so a format missing there fails.
+        for projection in (
+            "config", "csv", "default", "diff", "disable", "flattened", "get", "json",
+            "list", "multi", "none", "object", "table", "text", "value", "yaml",
+        ):
             with self.subTest(projection=projection):
                 self.assertEqual(
                     self.quote("gcloud x --format=%s(a)" % projection),
                     "gcloud x --format='%s(a)'" % projection,
                 )
+
+    def test_attributes_ahead_of_the_projection_are_quoted_with_it(self):
+        for bare, quoted in (
+            ("--format=csv[no-heading](name)", "--format='csv[no-heading](name)'"),
+            ("--format=table[box](name,status)", "--format='table[box](name,status)'"),
+            ('--format=value[separator=","](a,b)', """--format='value[separator=","](a,b)'"""),
+            ("--format=value[separator='|'](a,b)", "--format=\"value[separator='|'](a,b)\""),
+        ):
+            with self.subTest(bare):
+                self.assertEqual(self.quote("gcloud x " + bare), "gcloud x " + quoted)
+
+    def test_an_attribute_holding_both_quotes_is_left_alone(self):
+        text = """gcloud x --format=value[separator='"'](a)"""
+        self.assertEqual(self.quote(text), text)
 
     def test_the_risk_field_is_corrected_by_validation(self):
         # `risk` is the third field carrying a pasteable command and the one

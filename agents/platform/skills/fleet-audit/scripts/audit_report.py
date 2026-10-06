@@ -633,15 +633,21 @@ DNS_ENDPOINT_MARKER = "dnsEndpointConfig.allowExternalTraffic=true"
 # not, and a reader copies those out of the Recommendation and Risk lines just
 # as readily. Match only an unquoted expression: the projection has to follow
 # the separator directly, so an already-correct `--format 'json(a,b)'` does not
-# match and is left alone rather than double-quoted.
-_GCLOUD_FORMAT_PROJECTIONS = ("value", "json", "table", "csv", "yaml", "flattened")
+# match and is left alone rather than double-quoted. The names are gcloud's
+# own (`gcloud topic formats`), and any of them may carry `[attributes]`
+# ahead of the projection -- `csv[no-heading](name)`.
+_GCLOUD_FORMAT_PROJECTIONS = (
+    "config", "csv", "default", "diff", "disable", "flattened", "get", "json",
+    "list", "multi", "none", "object", "table", "text", "value", "yaml",
+)
+_GCLOUD_FORMAT_ATTRIBUTES = r"(?:\[[^\]\n]*\])?"
 # Transforms nest parentheses inside the projection -- `value(zone.basename())`,
 # `table(name,nodePools[].name.list())` -- so the group admits two levels of
 # nesting; a quote anywhere inside still refuses the match.
 _GCLOUD_PROJECTION_BODY = r"\((?:[^()'\"]|\((?:[^()'\"]|\([^()'\"]*\))*\))*\)"
 _GCLOUD_BARE_FORMAT_RE = re.compile(
-    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)%s)"
-    % ("|".join(_GCLOUD_FORMAT_PROJECTIONS), _GCLOUD_PROJECTION_BODY)
+    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)%s%s)"
+    % ("|".join(_GCLOUD_FORMAT_PROJECTIONS), _GCLOUD_FORMAT_ATTRIBUTES, _GCLOUD_PROJECTION_BODY)
 )
 # An apostrophe between two word characters is English ("the cluster's
 # channel"), not a shell quote, so the quote-parity test discounts it.
@@ -3983,8 +3989,16 @@ def quote_gcloud_format_projections(text: str) -> str:
         open_double = line.replace('\\"', "").split('"')
         if len(open_double) % 2 == 0 and not open_double[-1].strip():
             return match.group(0)
-        quote = '"' if line.count("'") % 2 else "'"
-        return f"{match.group('flag')}{match.group('sep')}{quote}{match.group('proj')}{quote}"
+        inside_single = bool(line.count("'") % 2)
+        quote = '"' if inside_single else "'"
+        projection = match.group("proj")
+        # An attribute may quote its own value (`value[separator=','](a,b)`);
+        # the other quote wraps it, where the wrapper leaves that one free.
+        if quote in projection:
+            if inside_single or '"' in projection:
+                return match.group(0)
+            quote = '"'
+        return f"{match.group('flag')}{match.group('sep')}{quote}{projection}{quote}"
 
     return _GCLOUD_BARE_FORMAT_RE.sub(rewrite, text)
 
@@ -4059,10 +4073,10 @@ def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
         return f"`{span}`"
 
     for first, last, _joined in _logical_command_spans(lines):
-        # The same choice `_gcloud_commands` makes, on comment-free lines: a
-        # backtick in a `#` comment makes no span of the command, and a line
+        # The same choice `_gcloud_commands` makes (`_shell_lines`): a
+        # backtick in a command's `#` comment makes no span of it, and a line
         # whose spans hold no gcloud command is read whole.
-        code = [_comment_free(line) for line in lines[first : last + 1]]
+        code = _shell_lines(lines[first : last + 1])
         if any(_is_gcloud_command(span) for line in code for span in INLINE_CODE_SPAN.findall(line)):
             for offset, part in enumerate(code):
                 index = first + offset
@@ -4082,6 +4096,20 @@ def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
 def _is_gcloud_command(text: str) -> bool:
     """True where `text` is a gcloud invocation, a `$ ` prompt allowed."""
     return text.strip().removeprefix(SHELL_PROMPT).startswith(GCLOUD_COMMAND_PREFIX)
+
+
+def _shell_lines(parts: list[str]) -> list[str]:
+    """One logical line's physical `parts` as the shell reads them.
+
+    A `#` ends a command at a comment, so a backtick there makes no span of the
+    command; in prose a `#` is an issue number or a heading ("Tracked in #212;
+    run `gcloud ...`"), and dropping the rest of the line would lose the
+    command it introduces. So the comment comes off only where what is left is
+    a gcloud command.
+    """
+    code = [_comment_free(part) for part in parts]
+    joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
+    return code if _is_gcloud_command(joined) else list(parts)
 
 
 def _comment_free(line: str) -> str:
@@ -4165,10 +4193,10 @@ def _gcloud_commands(text: str) -> list[tuple[str, int]]:
     lines = text.split("\n")
     commands: list[tuple[str, int]] = []
     for first, last, _joined in _logical_command_spans(lines):
-        code = [_comment_free(line) for line in lines[first : last + 1]]
-        # A backtick in a `#` comment ("replace `1.2.3.4/32`") makes no span
-        # of the command, and a line whose spans hold no gcloud command is
-        # read whole.
+        code = _shell_lines(lines[first : last + 1])
+        # A backtick in a command's `#` comment ("replace `1.2.3.4/32`")
+        # makes no span of it, and a line whose spans hold no gcloud command
+        # is read whole.
         spans = [
             (span.strip().removeprefix(SHELL_PROMPT), first + offset)
             for offset, line in enumerate(code)
@@ -11807,13 +11835,22 @@ def unwritten_refusal_message(
 
 
 def _pdb_unbuildable_reason(candidate: dict) -> str:
-    """Why `_pdb_manifest` built nothing for `candidate`, in the refusal's words."""
-    if not candidate.get("pod_selector"):
+    """Why `_pdb_manifest` builds nothing for `candidate`, in the refusal's words,
+    or "" where it builds one. The one place those refusals are decided, so the
+    note the worker reads names the refusal `_pdb_manifest` made."""
+    selector = candidate.get("pod_selector")
+    if not isinstance(selector, dict) or not selector:
         return "the collector attached no selector to write it from"
+    if set(selector) - LABEL_SELECTOR_KEYS:
+        return "the collector's selector has keys `policy/v1` does not take"
+    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
+        return "the collector's selector is empty, and would select every pod in the namespace"
     workload = str(candidate.get("object") or "").partition("/")[2]
     if not KUBERNETES_NAME_PATTERN.match(f"{workload}{GENERATED_PDB_SUFFIX}"):
         return "its name would not be a valid Kubernetes name"
-    return "the collector's selector is not one `policy/v1` takes"
+    if not KUBERNETES_NAME_PATTERN.match(str(candidate.get("namespace") or "")):
+        return "the collector named no valid namespace for it"
+    return ""
 
 
 def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
@@ -11821,19 +11858,15 @@ def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
 
     `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
     collector carries as `pod_selector`. None where that cannot be written
-    safely: no selector, an empty one (which would select every pod in the
-    namespace), keys `policy/v1` does not take, or a name Kubernetes refuses.
+    safely (`_pdb_unbuildable_reason`): no selector, an empty one (which would
+    select every pod in the namespace), keys `policy/v1` does not take, or a
+    name or namespace Kubernetes refuses.
     """
-    selector = candidate.get("pod_selector")
-    if not isinstance(selector, dict) or not selector or set(selector) - LABEL_SELECTOR_KEYS:
+    if _pdb_unbuildable_reason(candidate):
         return None
-    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
-        return None
-    workload = str(candidate.get("object") or "").partition("/")[2]
-    name = f"{workload}{GENERATED_PDB_SUFFIX}"
+    selector = candidate["pod_selector"]
+    name = f"{str(candidate.get('object') or '').partition('/')[2]}{GENERATED_PDB_SUFFIX}"
     namespace = str(candidate.get("namespace") or "")
-    if not (KUBERNETES_NAME_PATTERN.match(name) and KUBERNETES_NAME_PATTERN.match(namespace)):
-        return None
     # JSON is YAML, so the selector is written exactly as it was read.
     text = (
         f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
@@ -13764,6 +13797,14 @@ def _handle_finish_dry_run(
     root = dry_run_repo_root(audit_id, repo=repo)
     log(f"DRY RUN: resolving remediation paths under {root}.")
 
+    # The same demotion the real run applies first: a budget named at the
+    # workload's own declaration publishes `manual` and is written beside,
+    # never over, so the preview must not offer the overwrite as a pull request.
+    for fid in demote_fixes_over_declarations(findings, manifest):
+        log(
+            f"DRY RUN: {fid} names its PodDisruptionBudget at the workload's own "
+            "declaration; it publishes as manual and the real run writes the budget beside."
+        )
     # The same degradation the real run applies, so a dry run shows the body
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
@@ -14864,7 +14905,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # decline the planner cannot see for itself; it stands.
             planned.pop(fid)
             continue
-        log(f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget itself")
+        log(
+            f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget "
+            "itself unless the reason carries the URL of the pull request already carrying it"
+        )
         declines.pop(fid)
     decline_unwritten_fixes(findings, unwritten, declines)
     remaining = {
@@ -15756,7 +15800,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Leave a fix the refusal listed `manual`, for REASON: the SOP makes it "
             "manual, or a pull request already carries it. REASON is published on "
-            "the finding's ledger row. Repeat for more than one."
+            "the finding's ledger row. For a PodDisruptionBudget `finish` writes itself, "
+            "only a REASON carrying that pull request's URL is taken. Repeat for more than one."
         ),
     )
     # One or the other, never both: a waiver says the collector produced no

@@ -32,18 +32,16 @@
 # copy (#2233); without it no candidate carries `declaration` there, nothing
 # is refused or generated, and the case stays red on a content-mode install.
 #
-# REPETITIONS 2 AND 3 share repetition 1's repository and meet its OPEN pull
-# request on the same branch (group_branch_for keys on the path set). The
-# sweep leaves it alone and pushes nothing, `finish` reports it under
-# `prs_still_open`, and the SOP's closing line quotes it. pull_request_opened
-# accepts that pull request because the check sets
-# `accepts_stream_pull_request: true`, which reads "since this repetition
-# started" as "since the first run on this audit stream in this job began";
-# nothing closes it between repetitions. One gap stays in the pool:
-# hack/ci_sweep_agent_pulls.py closes leftovers between leases WITHOUT the
-# `audit:stale-closed` label, and the promotion sweep reads an unlabelled
-# close as a human's rejection, so the next lease never promotes the finding
-# again on the same path.
+# REPETITIONS: in a job with the App key, the repository reset
+# (hack/ci_reset_agent_pulls.py) closes repetition 1's pull request, labelled
+# `audit:stale-closed`, before each later repetition, so each re-proposes and
+# opens its own; the pool sweep labels before it closes too. Where the reset
+# is skipped (no App key, as in a developer loop), repetitions 2 and 3 meet
+# repetition 1's OPEN pull request on the same branch (group_branch_for keys
+# on the path set): the sweep pushes nothing, `finish` reports it under
+# `prs_still_open`, and the SOP's closing line quotes it, which
+# pull_request_opened accepts because the check sets
+# `accepts_stream_pull_request: true`.
 #
 # Isolation class: read-only on the cluster; writes the ledger issue and one
 # remediation pull request to the eval GitOps repo.
@@ -99,8 +97,8 @@ verification_spec:
   # pull_request_opened, not github_writes: it resolves the URL the reply
   # names, refuses a pull request closed unmerged, and requires a head commit
   # pushed since the first run on this audit stream began
-  # (`accepts_stream_pull_request`, see the header), so a later repetition
-  # quoting the stream's open pull request passes. It is also a type in
+  # (`accepts_stream_pull_request`, see the header), so a repetition the
+  # reset skipped, quoting the stream's open pull request, passes. It is also a type in
   # lane.py REQUESTING_CHECK_TYPES, so the inject lane allows this case the
   # one write and runs it in its second phase; a github_writes objective
   # would leave the lane's

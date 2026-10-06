@@ -186,9 +186,11 @@ whose rewrite is usually the better sentence.
 A `no-pdb` candidate also carries `namespace_pdbs`, the names of the budgets already in its
 namespace, and `pod_selector`, the workload's `spec.selector`, but only where that selector reaches
 no other controller's pods in the dump. Where the model left a declared finding of that check
-`manual`, did not decline it, and the `major` sweep would open it, `finish` writes the
+`manual` and the `major` sweep would open it, `finish` writes the
 PodDisruptionBudget the obtainability SOP prescribes from it, `maxUnavailable: 1` in a new file
-beside the declaration, rather than refusing. It writes nothing for an empty or unusable selector,
+beside the declaration, rather than refusing. A `--decline-fix` for that finding stands only when
+its reason carries the URL of the pull request already carrying the budget; any other reason is
+logged as ignored and the budget is written. It writes nothing for an empty or unusable selector,
 a name the namespace or repository already uses, a path that holds a file, a declaration inside a
 Kustomize root, or a finding another pull request already carries; its own open pull request, on
 the branch the generated file names, gets the file written again for the sweep to find.

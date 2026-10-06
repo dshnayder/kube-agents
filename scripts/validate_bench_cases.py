@@ -201,8 +201,7 @@ FIXTURE_NOT_READY = {
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
-        "rather than manual; later repetitions meet repetition 1's open pull "
-        "request, which the case's accepts_stream_pull_request accepts"
+        "rather than manual"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
