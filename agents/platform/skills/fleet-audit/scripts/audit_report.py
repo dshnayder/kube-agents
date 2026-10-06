@@ -638,6 +638,8 @@ _GCLOUD_BARE_FORMAT_RE = re.compile(
 )
 # An apostrophe between two word characters is English ("the cluster's
 # channel"), not a shell quote, so the quote-parity test discounts it.
+# The quotes a shell argument can open with.
+ARGUMENT_QUOTES = ("'", '"')
 _WORD_APOSTROPHE_RE = re.compile(r"(?<=\w)'(?=\w)")
 
 # The `recommendation` fields that carry a command a reader pastes. `rationale`
@@ -3894,6 +3896,10 @@ def quote_gcloud_format_projections(text: str) -> str:
         # single-quoted wrapper -- `watch '...'`, `bash -c '...'` -- the wrapper
         # hands its string to another shell, which breaks on the bare form too,
         # but a single quote would close the wrapper, so double quotes go there.
+        # A quote opening at the flag itself (`'--format=value(x)'`) already
+        # quotes the whole argument; adding another would reach gcloud.
+        if text[: match.start()].endswith(ARGUMENT_QUOTES):
+            return match.group(0)
         # The logical line, not the physical one: a wrapper opened on a line
         # that ends `\` is still open on the continuation.
         lines = text[: match.start()].split("\n")

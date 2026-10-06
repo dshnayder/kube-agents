@@ -16180,6 +16180,14 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             [command.split()[4] for command, _ in audit_report._gcloud_commands(note)], ["c"]
         )
 
+    def test_a_whole_argument_already_quoted_is_left_alone(self):
+        for text in (
+            "gcloud container clusters describe c '--format=value(status)'",
+            'gcloud container clusters describe c "--format=value(status)"',
+        ):
+            with self.subTest(text):
+                self.assertEqual(audit_report.quote_gcloud_format_projections(text), text)
+
     def test_a_projection_in_a_plain_double_quoted_argument_is_left_alone(self):
         """The `(` is already quoted there, and a quote added would reach gcloud."""
         text = 'gcloud container clusters describe c "--format=value(status)"'
