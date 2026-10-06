@@ -52,7 +52,7 @@ This stream's targets are GCP projects, not GKE clusters, so its collector is it
 
 - **Severity**: `critical`
 - **Command**: `gcloud compute instances get-serial-port-output $VM --zone=$ZONE --project=$PROJECT --port=1`
-- **Condition**: VM serial port console output contains fatal startup script errors (`startup-script exit status 1` or `Finished running startup scripts with error`).
+- **Condition**: VM serial port console output contains a fatal startup script error: `Script "startup-script" failed with error` (the current guest agent), or `startup-script exit status <non-zero>` or `Finished running startup scripts with error` (older agents).
 - **Do NOT flag**: GKE node pool instances managed directly by GKE control plane or instances cleanly completing boot without errors.
 - **Remediation**: Correct boot metadata or deployment configuration in instance template or Terraform definition.
 

@@ -197,9 +197,15 @@ SNAPSHOT_SLUG = "orphaned-snapshots"
 # startup script exited non-zero. Case-sensitive substring match, no regex —
 # the same test the previous revision of this file ran, kept unchanged so the
 # conversion moves the output shape and not what gets flagged.
-STARTUP_FAILURE_MARKERS = (
-    "startup-script exit status 1",
-    "Finished running startup scripts with error",
+# §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
+# guest agent current images ship logs `Script "startup-script" failed with
+# error: exit status 1` (seen on a Debian 12 VM, 2026-10-06); older agents
+# printed `startup-script exit status 1` and a closing `Finished running
+# startup scripts with error`. Any non-zero status is a failure, not only 1.
+STARTUP_FAILURE_PATTERN = re.compile(
+    r'Script "startup-script(?:-url)?" failed with error'
+    r"|startup-script(?:-url)? exit status [1-9]\d*"
+    r"|Finished running startup scripts with error"
 )
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
@@ -655,7 +661,7 @@ def refusal_names_project(project: str, stderr: str, *, run: RunFn = default_run
 
 def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dict | None:
     """`serial_text` is one instance's `get-serial-port-output` body. Flags the
-    first line carrying either of §2.1's two fatal markers.
+    first line carrying one of §2.1's fatal markers (`STARTUP_FAILURE_PATTERN`).
 
     First match wins and the scan stops, the same as the pre-manifest revision:
     a boot that failed twice is one degraded instance, not two findings.
@@ -670,7 +676,7 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     reason.
     """
     for line in serial_text.splitlines():
-        if any(marker in line for marker in STARTUP_FAILURE_MARKERS):
+        if STARTUP_FAILURE_PATTERN.search(line):
             return {
                 "object": f"ComputeInstance/{zone}/{instance_name}",
                 "excerpt": redact(line.strip()),

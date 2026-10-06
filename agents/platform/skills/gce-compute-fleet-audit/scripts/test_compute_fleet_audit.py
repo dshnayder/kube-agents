@@ -145,6 +145,35 @@ class StartupScriptTest(unittest.TestCase):
         self.assertEqual(hit["object"], "ComputeInstance/us-central1-a/vm-1")
         self.assertEqual(hit["excerpt"], "startup-script exit status 1")
 
+    def test_the_current_guest_agent_failure_line_is_flagged(self):
+        # As the planted VM's console printed it on 2026-10-06.
+        line = (
+            "2026-10-06T23:14:30.922156+00:00 fa2-gce-startup-fail google_metadata_script_runner[926]: "
+            'Script "startup-script" failed with error: exit status 1'
+        )
+        serial = line + "\n...: Finished running startup scripts\n"
+        hit = cf.check_startup_script("fa2-gce-startup-fail", "us-central1-a", serial)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["excerpt"], line)
+
+    def test_any_non_zero_status_and_the_url_variant_are_flagged(self):
+        for text in (
+            "startup-script exit status 2",
+            "startup-script-url exit status 127",
+            'Script "startup-script-url" failed with error: exit status 3',
+        ):
+            with self.subTest(text):
+                self.assertIsNotNone(cf.check_startup_script("vm-1", "us-central1-a", text + "\n"))
+
+    def test_a_clean_boot_is_not_flagged(self):
+        for text in (
+            "startup-script exit status 0",
+            "Finished running startup scripts",
+            'Script "startup-script" exited successfully',
+        ):
+            with self.subTest(text):
+                self.assertIsNone(cf.check_startup_script("vm-1", "us-central1-a", text + "\n"))
+
     def test_flags_the_finished_with_error_marker(self):
         hit = cf.check_startup_script("vm-2", "us-central1-a", "Finished running startup scripts with error\n")
         self.assertEqual(hit["object"], "ComputeInstance/us-central1-a/vm-2")
