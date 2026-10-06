@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -234,6 +235,51 @@ func TestBrokerForgesListsGitHubFirstAndEachGitLabHostOnce(t *testing.T) {
 		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
+	}
+	// Bot review: the repository on the shadowed forge is withheld too, and the
+	// Degraded message counts what OnRefusedForge returns.
+	if withheld := resolved.OnRefusedForge(); len(withheld) != 1 || withheld[0].ForgeName != "gl-again" {
+		t.Errorf("OnRefusedForge() = %v, expected the repository on the shadowed gl-again forge", withheld)
+	}
+}
+
+// Bot review: allowedPaths took the group of every repository that resolved,
+// so one the status refused -- here for its role -- widened what the broker
+// would spend the token on.
+func TestARefusedRepositoryWidensNothingTheBrokerIsGiven(t *testing.T) {
+	in := &IntegrationSpec{
+		Forges: []ForgeSpec{glForge("gl", "", "acme")},
+		Repositories: []RepositorySpec{
+			repo("gl", "acme/infra", RepositoryRoleGitOps),
+			repo("gl", "other-group/thing", "manged"),
+		},
+	}
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resolved.BrokerForges("/creds")
+	if len(got) != 2 || !slices.Equal(got[1].AllowedPaths, []string{"acme"}) {
+		t.Errorf("BrokerForges = %+v, expected the gitlab entry narrowed to acme alone", got)
+	}
+
+	// A forge whose only repository is refused, with no namespace of its own,
+	// serves nothing: no entry (an empty list is the whole host) and a warning.
+	only := &IntegrationSpec{
+		Forges:       []ForgeSpec{glForge("gl", "", "")},
+		Repositories: []RepositorySpec{repo("gl", "other-group/thing", "manged")},
+	}
+	resolved, err = only.ResolveGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolved.BrokerForges("/creds"); got != nil {
+		t.Errorf("BrokerForges = %+v, expected none for a forge that serves nothing accepted", got)
+	}
+	if warnings := resolved.Warnings(); !slices.ContainsFunc(warnings, func(w string) bool {
+		return strings.Contains(w, "no accepted repository")
+	}) {
+		t.Errorf("Warnings() = %v, expected the serves-nothing warning", warnings)
 	}
 }
 

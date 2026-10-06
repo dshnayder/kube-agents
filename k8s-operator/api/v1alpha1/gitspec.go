@@ -440,16 +440,21 @@ func (r *ResolvedRepository) restatesAccepted(accepted map[string]bool) bool {
 	return false
 }
 
-// OnRefusedForge returns the repositories withheld because their forge's own
-// fields are refused. Problems reports the forge, not them, so a caller that
+// OnRefusedForge returns the repositories withheld because their forge is
+// refused: its own fields are invalid, or another credentialed forge already
+// holds its host. Problems reports the forge, not them, so a caller that
 // explains what is not seeded has to count them itself.
 func (ri *ResolvedIntegration) OnRefusedForge() []*ResolvedRepository {
 	if ri == nil {
 		return nil
 	}
+	_, shadowed := ri.credentialClaims()
 	var withheld []*ResolvedRepository
 	for _, r := range ri.Repositories {
-		if r.Forge != nil && !r.Forge.valid() {
+		if r.Forge == nil {
+			continue
+		}
+		if _, isShadowed := shadowed[r.Forge]; !r.Forge.valid() || isShadowed {
 			withheld = append(withheld, r)
 		}
 	}
@@ -682,10 +687,12 @@ func (ri *ResolvedIntegration) Warnings() []string {
 		return nil
 	}
 	var warnings []string
+	_, rejected := ri.check()
+	accepted := func(r *ResolvedRepository) bool { return !rejected[r] }
 	for _, f := range ri.Forges {
-		if provider, err := f.GitProvider(); err == nil && provider.NeedsCredentials && f.valid() && len(ri.servedNamespaces(f)) == 0 {
+		if provider, err := f.GitProvider(); err == nil && provider.NeedsCredentials && f.valid() && len(ri.servedNamespaces(f, accepted)) == 0 {
 			warnings = append(warnings, fmt.Sprintf(
-				"spec.integration.%s names no namespace and no repository, so the broker is not given it: a %s token is never served for a whole host by implication",
+				"spec.integration.%s names no namespace and no accepted repository, so the broker is not given it: a %s token is never served for a whole host by implication",
 				ri.forgePath(f, ""), provider.Name))
 		}
 		if f.CredentialsSecret != "" && f.Provider == GitProviderGitHub {
@@ -804,15 +811,24 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
 	// the broker refuses the field there.
 	out := []BrokerForge{{Provider: GitProviderGitHub, Host: github.DefaultHost}}
 	claims, _ := ri.credentialClaims()
+	_, rejected := ri.check()
 	for _, f := range claims {
 		provider, _ := f.GitProvider()
+		// The broker serves what the status accepted, not everything that
+		// resolves: a repository refused for its role, or as a second
+		// declaration, widens nothing. A forge left with no group serves
+		// nothing and gets no entry -- an empty list would be the whole host.
+		allowed := ri.servedNamespaces(f, func(r *ResolvedRepository) bool { return !rejected[r] })
+		if len(allowed) == 0 {
+			continue
+		}
 		out = append(out, BrokerForge{
 			Name:              f.Name,
 			Provider:          provider.Name,
 			Host:              provider.canonicalHost(f.Host),
 			CredentialsSecret: f.CredentialsSecret,
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
-			AllowedPaths:      ri.servedNamespaces(f),
+			AllowedPaths:      allowed,
 		})
 	}
 	if len(out) == 1 {
@@ -821,23 +837,23 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
 	return out
 }
 
-// servedNamespaces is the groups the broker serves on a forge: its declared
-// namespace and the namespace of every repository declared on it that
-// resolves, sorted and without repeats. The broker refuses a repository
+// servedNamespaces is the groups a forge serves: its declared namespace and
+// the namespace of every repository declared on it that resolves and that
+// keep admits, sorted and without repeats. The broker refuses a repository
 // outside them before the token is spent, which is the only narrowing a
 // GitLab token gets after it is created.
 //
-// Resolution, not acceptance, because credentialClaims asks this and check()
-// asks credentialClaims. A repository that resolves and is refused for
-// something else -- a second declaration, a bad role -- widens the list by its
-// own group only, and the managed-repository gate still refuses it.
-func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge) []string {
+// credentialClaims asks it with every repository admitted, because check()
+// asks credentialClaims and acceptance is check()'s answer; BrokerForges asks
+// it with only the accepted ones, so the list the broker gets is the one the
+// status describes.
+func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge, keep func(*ResolvedRepository) bool) []string {
 	seen := map[string]bool{}
 	if f.Namespace != "" {
 		seen[strings.Trim(f.Namespace, pathSeparator)] = true
 	}
 	for _, r := range ri.Repositories {
-		if r.Forge != f {
+		if r.Forge != f || !keep(r) {
 			continue
 		}
 		ref, err := r.Resolve()
@@ -855,6 +871,8 @@ func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge) []string {
 	return namespaces
 }
 
+func everyRepository(*ResolvedRepository) bool { return true }
+
 // credentialClaims is the one rule for which credentialed forge holds each
 // host, used by both check() -- which refuses the rest -- and BrokerForges --
 // which hands the claimants to the broker. A forge claims its host when its
@@ -871,7 +889,7 @@ func (ri *ResolvedIntegration) credentialClaims() ([]*ResolvedForge, map[*Resolv
 	shadowed := map[*ResolvedForge]*ResolvedForge{}
 	for _, f := range ri.Forges {
 		provider, err := f.GitProvider()
-		if err != nil || !provider.NeedsCredentials || !f.valid() || len(ri.servedNamespaces(f)) == 0 {
+		if err != nil || !provider.NeedsCredentials || !f.valid() || len(ri.servedNamespaces(f, everyRepository)) == 0 {
 			continue
 		}
 		host := provider.canonicalHost(f.Host)

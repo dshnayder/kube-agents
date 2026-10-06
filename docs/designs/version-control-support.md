@@ -146,8 +146,8 @@ The coupling runs through five layers, each with a different owner and a differe
 4. **The declarative surface.** The CRD declares forges and repositories in
    `spec.integration.forges` and `spec.integration.repositories` and labels each state-ConfigMap
    entry with its forge's provider. Each surface that writes a declaration — the CRD, the chart,
-   the installer and the Terraform composition — takes a forge's provider, host and credential
-   from the administrator rather than assuming the GitHub App.
+   the installer and the Terraform composition — has to take a forge's provider, host and
+   credential from the administrator rather than assume the GitHub App.
 5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
    SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
    are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and

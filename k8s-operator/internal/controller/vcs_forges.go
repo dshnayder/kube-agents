@@ -51,11 +51,11 @@ const (
 	vcsForgesEnv       = "VCS_FORGES_CONFIG"
 	// forgeCredentialsDir holds one directory per credentialed forge, named
 	// for the forge, with the token in it.
-	forgeCredentialsDir = "/var/run/kube-agents/forge-credentials"
+	forgeCredentialsDir = "/var/run/kube-agents/forge-credentials" // #nosec G101 -- Mount path, not a credential
 	// forgeCredentialsVolumePrefix names each forge's Secret volume, by its
 	// position in the rendered configuration: a forge name can be 63
 	// characters, which is a volume name's whole budget.
-	forgeCredentialsVolumePrefix = "vcs-forge-credentials-"
+	forgeCredentialsVolumePrefix = "vcs-forge-credentials-" // #nosec G101 -- Volume name prefix, not a credential
 )
 
 // brokerForges is the forge configuration the declaration hands the broker,

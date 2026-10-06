@@ -18,6 +18,7 @@ package controller
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -81,8 +82,18 @@ func TestAGitHubOnlyBrokerRendersNoForgeConfiguration(t *testing.T) {
 func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	agent := gitlabAgent("gitlab-forge-token")
 
-	// The configuration the broker's registry reads, GitHub first.
+	// The configuration the broker's registry reads, GitHub first. Byte for
+	// byte the golden file, which test_providers_registry_config.py also
+	// builds the broker's registry from: one fixture, read by both sides, so
+	// neither can change the shape alone.
 	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	golden, err := os.ReadFile("testdata/vcs-forges.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw != strings.TrimSpace(string(golden)) {
+		t.Errorf("the rendered forge configuration is not testdata/vcs-forges.golden.json:\n%s", raw)
+	}
 	var document struct {
 		Forges []map[string]any `json:"forges"`
 	}

@@ -156,15 +156,14 @@ class ConfigurationFileTest(_ConfigCase):
 class OperatorRenderedConfigurationTest(_ConfigCase):
     def test_the_shape_the_operator_renders_builds_both_forges(self):
         """The document k8s-operator's BrokerForges renders for a GitHub forge
-        beside a GitLab one, as `vcs_forges_test.go` pins it (that test
-        compares the decoded document, not its bytes). A change to either
+        beside a GitLab one. Read from the golden file `vcs_forges_test.go`
+        compares the operator's render to byte for byte, so a change to either
         side's field names or shape fails one of the two tests."""
-        self.configure(
-            '{"forges":[{"provider":"github","host":"github.com"},'
-            '{"provider":"gitlab","host":"gitlab.com",'
-            '"tokenPath":"/var/run/kube-agents/forge-credentials/gitlab/token",'
-            '"allowedPaths":["acme","platform"]}]}'
+        golden = (
+            Path(__file__).resolve().parents[3]
+            / "k8s-operator/internal/controller/testdata/vcs-forges.golden.json"
         )
+        self.configure(golden.read_text())
         registry = providers.Registry()
         self.assertEqual(["github", "gitlab"], [forge.name for forge in registry.forges])
         forge, repo = registry.resolve("https://gitlab.com/platform/tools")

@@ -541,6 +541,10 @@ class ChartGitIntegrationTest(unittest.TestCase):
         for label, sets, key in (
             ("secret name", (*_forge(0, name="gl", provider="gitlab"),
                              f"{_P}forges[0].credentialsRef.name=Bad_Name"), "credentialsRef.name"),
+            # Bot review: the CRD refuses the name on every provider, so the
+            # chart has to as well -- not only inside the gitlab branch.
+            ("secret name on github", (*_forge(0, name="gh"),
+                                       f"{_P}forges[0].credentialsRef.name=Bad_Name"), "credentialsRef.name"),
             ("github api host", (*_forge(0, name="gl", provider="gitlab", host="api.github.com"), secret), "host"),
             ("githubusercontent", (*_forge(0, name="gl", provider="gitlab", host="raw.githubusercontent.com"), secret), "host"),
             ("long group", (*_forge(0, name="gl", provider="gitlab", namespace="a" * 256), secret), "namespace"),
