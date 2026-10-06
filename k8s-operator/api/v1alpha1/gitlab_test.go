@@ -20,8 +20,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 func gitlabProvider(t *testing.T) *GitProvider {
@@ -37,7 +35,7 @@ func gitlabProvider(t *testing.T) *GitProvider {
 func glForge(name, host, namespace string) ForgeSpec {
 	return ForgeSpec{
 		Name: name, Provider: GitProviderGitLab, Host: host, Namespace: namespace,
-		CredentialsRef: &corev1.LocalObjectReference{Name: name + "-token"},
+		CredentialsRef: &ForgeCredentialsRef{Name: name + "-token"},
 	}
 }
 
@@ -236,5 +234,87 @@ func TestBrokerForgesListsGitHubFirstAndEachGitLabHostOnce(t *testing.T) {
 		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
+	}
+}
+
+// Review: a Secret name the API server refuses in the broker's volume passed
+// admission, and the broker Deployment's apply then failed every reconcile.
+func TestAnInvalidSecretNameIsRefusedAndNotMounted(t *testing.T) {
+	for _, name := range []string{"Bad_Name", "gitlab token", "-x", strings.Repeat("a", 254)} {
+		f := glForge("gl", "", "acme")
+		f.CredentialsRef.Name = name
+		resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{f}}).ResolveGit()
+		problems := resolved.Problems()
+		if len(problems) != 1 || problems[0].Path.String() != "forges[0].credentialsRef" {
+			t.Errorf("%q: Problems() = %v, expected one at forges[0].credentialsRef", name, problems)
+		}
+		if got := resolved.BrokerForges("/creds"); got != nil {
+			t.Errorf("%q: BrokerForges = %+v, expected none", name, got)
+		}
+	}
+}
+
+// Review: check() let the first credentialed forge claim a host even when it
+// was refused or served nothing, while BrokerForges skipped it without
+// claiming -- so status refused the second forge whose token was mounted and
+// served. One rule now: only a valid forge that serves something claims.
+func TestOnlyAForgeTheBrokerIsGivenClaimsItsHost(t *testing.T) {
+	for name, first := range map[string]ForgeSpec{
+		"refused first":        glForge("a", "", "-bad"),
+		"serves-nothing first": glForge("a", "", ""),
+	} {
+		in := &IntegrationSpec{
+			Forges:       []ForgeSpec{first, glForge("b", "", "acme")},
+			Repositories: []RepositorySpec{repo("b", "infra", RepositoryRoleManaged)},
+		}
+		resolved, _ := in.ResolveGit()
+		for _, p := range resolved.Problems() {
+			if p.Path.String() == "forges[1].host" {
+				t.Errorf("%s: the second forge was refused as shadowed: %v", name, p.Err)
+			}
+		}
+		got := resolved.BrokerForges("/creds")
+		if len(got) != 2 || got[1].Name != "b" {
+			t.Errorf("%s: BrokerForges = %+v, expected github and b", name, got)
+		}
+		if len(resolved.Accepted(RepositoryRoleManaged)) != 1 {
+			t.Errorf("%s: b's repository was not accepted", name)
+		}
+	}
+}
+
+func TestAForgeThatServesNothingIsWarnedAbout(t *testing.T) {
+	resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{glForge("gl", "", "")}}).ResolveGit()
+	warnings := resolved.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "forges[0]") {
+		t.Errorf("Warnings() = %v, expected one naming forges[0]", warnings)
+	}
+}
+
+// Review: only three GitHub spellings were refused as a GitLab host.
+func TestNoGitHubNameIsAGitLabHostAndWwwGitLabFolds(t *testing.T) {
+	provider := gitlabProvider(t)
+	for _, host := range []string{"api.github.com", "gist.github.com", "raw.githubusercontent.com", "githubusercontent.com", "x.y.github.com"} {
+		if err := provider.ValidateHost(host); err == nil {
+			t.Errorf("ValidateHost(%q) accepted a GitHub name", host)
+		}
+	}
+	ref, err := provider.Resolve("www.gitlab.com", "https://www.gitlab.com/acme/infra", "")
+	if err != nil || ref.URL() != "https://gitlab.com/acme/infra" {
+		t.Errorf("www.gitlab.com did not fold to gitlab.com: %q, %v", ref.URL(), err)
+	}
+}
+
+// The broker refuses allowedPaths on a github entry; the operator never
+// renders the key there, whatever is declared beside it.
+func TestTheGitHubEntryNeverCarriesAllowedPaths(t *testing.T) {
+	in := &IntegrationSpec{
+		Forges:       []ForgeSpec{ghForge("github", "acme"), glForge("gl", "", "acme")},
+		Repositories: []RepositorySpec{repo("github", "infra", RepositoryRoleGitOps), repo("gl", "infra", RepositoryRoleManaged)},
+	}
+	resolved, _ := in.ResolveGit()
+	raw, _ := json.Marshal(resolved.BrokerForges("/creds")[0])
+	if string(raw) != `{"provider":"github","host":"github.com"}` {
+		t.Errorf("github entry = %s", raw)
 	}
 }

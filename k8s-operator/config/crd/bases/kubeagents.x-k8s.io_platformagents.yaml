@@ -9585,6 +9585,9 @@ spec:
                           repository on another host is refused rather than rewritten into a
                           same-named repository on this one. See
                           docs/designs/version-control-support.md §6.
+
+                          A gitlab forge's credentialsRef is required by the API server too, so it
+                          holds with the webhook off -- the chart ships it off.
                         properties:
                           credentialsRef:
                             description: |-
@@ -9601,16 +9604,16 @@ spec:
                               call, so rotating the token is updating the Secret.
                             properties:
                               name:
-                                default: ""
-                                description: |-
-                                  Name of the referent.
-                                  This field is effectively required, but due to backwards compatibility is
-                                  allowed to be empty. Instances of this type with an empty value here are
-                                  almost certainly wrong.
-                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                description:
+                                  "Name is the Secret's name: a lowercase
+                                  DNS subdomain."
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                                 type: string
+                            required:
+                              - name
                             type: object
-                            x-kubernetes-map-type: atomic
                           host:
                             description: |-
                               Host is the forge hostname. Omit it for the provider's default
@@ -9677,6 +9680,13 @@ spec:
                         required:
                           - name
                         type: object
+                        x-kubernetes-validations:
+                          - message:
+                              "a gitlab forge needs credentialsRef.name: the Secret
+                              holding its access token under the key token"
+                            rule:
+                              "!has(self.provider) || self.provider != 'gitlab'
+                              || has(self.credentialsRef)"
                       maxItems: 16
                       type: array
                       x-kubernetes-list-map-keys:

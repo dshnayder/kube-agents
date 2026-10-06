@@ -147,9 +147,10 @@ var gitProviders = map[string]*GitProvider{
 		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
 	},
 	GitProviderGitLab: {
-		Name:               GitProviderGitLab,
-		DefaultHost:        "gitlab.com",
-		Hosts:              map[string]bool{"gitlab.com": true},
+		Name:        GitProviderGitLab,
+		DefaultHost: "gitlab.com",
+		// www.gitlab.com is a spelling of gitlab.com, and folds to it.
+		Hosts:              map[string]bool{"gitlab.com": true, "www.gitlab.com": true},
 		NamespacePattern:   gitlabNamespaceRegex,
 		MaxNamespaceLength: MaxGitNamespaceLength,
 		MinPathDepth:       gitlabMinPathDepth,
@@ -217,7 +218,7 @@ func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) e
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
 	}
 	for _, name := range providerNames(table) {
-		if other := table[name]; other != p && other.Hosts[trimmed] {
+		if other := table[name]; other != p && other.serves(trimmed) {
 			return fmt.Errorf("host %q is a %s host, not a %s one", host, other.Name, p.Name)
 		}
 	}
@@ -225,6 +226,24 @@ func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) e
 		return fmt.Errorf("host %q is not a hostname", host)
 	}
 	return nil
+}
+
+// serves reports whether host is this provider's: one of its spellings, or any
+// name its egress patterns cover -- api.github.com, gist.github.com and
+// raw.githubusercontent.com are GitHub's however they are spelled, and a
+// self-managed forge declared at one would be handed GitHub's traffic. A
+// wildcard pattern also covers the domain it is rooted at.
+func (p *GitProvider) serves(host string) bool {
+	if p.Hosts[host] {
+		return true
+	}
+	for _, pattern := range p.Egress {
+		domain := strings.TrimPrefix(pattern, "*.")
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
 }
 
 // gitHostRegex is a DNS name: what the CRD's own pattern on ForgeSpec.Host

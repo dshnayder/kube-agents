@@ -14,7 +14,7 @@
 > repositories this install does not manage and does it with a shallow clone —
 > neither of which the verbs offer, the second on purpose
 > ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
-> and `spec.integration.repositories`, with `github` and `gitlab` registered.
+> and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -145,8 +145,9 @@ The coupling runs through five layers, each with a different owner and a differe
    network policy that decides where the pod may reach at all.
 4. **The declarative surface.** The CRD declares forges and repositories in
    `spec.integration.forges` and `spec.integration.repositories` and labels each state-ConfigMap
-   entry with its forge's provider, and registers GitHub and GitLab; the chart takes either, while
-   the installer and the Terraform composition carry GitHub App inputs only.
+   entry with its forge's provider. Each surface that writes a declaration — the CRD, the chart,
+   the installer and the Terraform composition — takes a forge's provider, host and credential
+   from the administrator rather than assuming the GitHub App.
 5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
    SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
    are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and
@@ -1970,7 +1971,22 @@ configuration at all, so its broker is unchanged. Each GitLab entry's `allowedPa
 forge's `namespace` together with the group of every repository accepted on it — the narrowing
 a GitLab token gets nowhere else — and a forge with neither is left out, since an entry with no
 `allowedPaths` is one the broker refuses to build. The broker holds one credential per host, so a second
-credentialed forge at a host already declared is refused at its `host`, naming the first.
+credentialed forge at a host already declared is refused at its `host`, naming the first. A
+forge claims its host only when it is valid and serves something, and the same rule decides
+which forges the broker is given, so a forge the status refuses is never one whose token is
+mounted.
+
+**A mixed install names its repositories by URL.** Once a forge beside GitHub is declared, the
+broker serves more than one forge and refuses a bare `owner/name`, which no longer says which
+forge is meant ([Forge neutrality](#forge-neutrality)). This is a deliberate trade, not a gap: a
+guess would send a GitLab group's name to GitHub. Everything that addresses a repository on such
+an install — a cron, a skill invocation, a `--repo` — spells it `https://<host>/<path>` or
+`<host>/<path>`.
+
+A missing Secret, or one without a `token` key, does not stop the broker: the projection is
+optional, so GitHub and chat keep working, and each call to that forge answers
+`FORGE_CREDENTIAL_UNAVAILABLE` naming the host until the Secret exists. The operator does not
+read the Secret to report it in the status, so that answer is where an administrator sees it.
 
 Validation dispatches on each repository's forge. Its provider parses the repository with its
 host kept, refuses a host that is neither the forge's declared one nor one of its own, and asserts

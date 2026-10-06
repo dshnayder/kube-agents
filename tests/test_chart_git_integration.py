@@ -533,6 +533,27 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"{_P}forges[0].{key}", result.stderr)
 
+    def test_a_gitlab_forge_refuses_what_the_operator_refuses(self):
+        """Chart parity with the operator (review round 1): a Secret name the
+        API server refuses, any GitHub name as the host, an over-long group
+        path, and a second gitlab forge at a host already declared."""
+        secret = f"{_P}forges[0].credentialsRef.name=gitlab-token"
+        for label, sets, key in (
+            ("secret name", (*_forge(0, name="gl", provider="gitlab"),
+                             f"{_P}forges[0].credentialsRef.name=Bad_Name"), "credentialsRef.name"),
+            ("github api host", (*_forge(0, name="gl", provider="gitlab", host="api.github.com"), secret), "host"),
+            ("githubusercontent", (*_forge(0, name="gl", provider="gitlab", host="raw.githubusercontent.com"), secret), "host"),
+            ("long group", (*_forge(0, name="gl", provider="gitlab", namespace="a" * 256), secret), "namespace"),
+            ("second forge at a host", (
+                *_forge(0, name="gl", provider="gitlab"), secret,
+                *_forge(1, name="gl2", provider="gitlab", host="www.gitlab.com"),
+                f"{_P}forges[1].credentialsRef.name=gitlab-token-2"), "host"),
+        ):
+            with self.subTest(case=label):
+                result = _render(_CR_TEMPLATE, *sets)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(key, result.stderr)
+
     def test_the_minter_never_renders_without_a_github_forge(self):
         """A GitLab-only install provisions no GitHub App token minter: the
         minter guard refuses, naming the providers declared."""

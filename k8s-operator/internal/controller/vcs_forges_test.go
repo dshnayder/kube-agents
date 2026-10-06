@@ -32,7 +32,7 @@ func gitlabAgent(secret string) *agentv1alpha1.PlatformAgent {
 	agent := brokerPodAgent()
 	gitlab := agentv1alpha1.ForgeSpec{Name: "gitlab", Provider: "gitlab", Namespace: "acme"}
 	if secret != "" {
-		gitlab.CredentialsRef = &corev1.LocalObjectReference{Name: secret}
+		gitlab.CredentialsRef = &agentv1alpha1.ForgeCredentialsRef{Name: secret}
 	}
 	agent.Spec.Integration.Forges = []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "acme"}, gitlab}
 	agent.Spec.Integration.Repositories = []agentv1alpha1.RepositorySpec{
@@ -171,5 +171,24 @@ func TestTheForgeConfigurationVariableIsTheOperators(t *testing.T) {
 				t.Errorf("%s = %v, expected %v", vcsForgesEnv, got, tc.want)
 			}
 		})
+	}
+}
+
+// Review: the forge configuration rode into the gateway's hash annotation too,
+// so a GitLab change restarted the gateway. Only the broker reads it.
+func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
+	plain := buildCredentialProxyPolicyConfigMap(brokerPodAgent())
+	if gatewayPolicyView(plain) != plain {
+		t.Error("a GitHub-only ConfigMap is not its own gateway view, so the gateway hash would change")
+	}
+	withGitLab := buildCredentialProxyPolicyConfigMap(gitlabAgent("gitlab-forge-token"))
+	gw, _ := getConfigMapHash(gatewayPolicyView(withGitLab))
+	base, _ := getConfigMapHash(plain)
+	broker, _ := getConfigMapHash(withGitLab)
+	if gw != base {
+		t.Error("declaring a GitLab forge changes the gateway's policy hash")
+	}
+	if broker == base {
+		t.Error("declaring a GitLab forge does not change the broker's policy hash")
 	}
 }

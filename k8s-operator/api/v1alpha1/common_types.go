@@ -1355,6 +1355,10 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // repository on another host is refused rather than rewritten into a
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
+//
+// A gitlab forge's credentialsRef is required by the API server too, so it
+// holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1428,7 +1432,21 @@ type ForgeSpec struct {
 	// broker's pod only, never the agent's or the sandbox's, and read on every
 	// call, so rotating the token is updating the Secret.
 	// +optional
-	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
+	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
+}
+
+// ForgeCredentialsRef names the Secret holding a forge's credential. The JSON
+// shape is corev1.LocalObjectReference's, so existing resources apply
+// unchanged; it is a type of its own so the name can carry the Secret-name
+// rule in the schema. The operator mounts the Secret into the broker's pod,
+// and a name the API server refuses there would otherwise pass admission and
+// then fail the broker Deployment's apply on every reconcile.
+type ForgeCredentialsRef struct {
+	// Name is the Secret's name: a lowercase DNS subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
 }
 
 // RepositorySpec declares one repository on a declared forge, and what the

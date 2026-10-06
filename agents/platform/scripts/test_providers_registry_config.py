@@ -146,8 +146,9 @@ class ConfigurationFileTest(_ConfigCase):
 class OperatorRenderedConfigurationTest(_ConfigCase):
     def test_the_shape_the_operator_renders_builds_both_forges(self):
         """The document k8s-operator's BrokerForges renders for a GitHub forge
-        beside a GitLab one, byte for byte as its Go test pins it. A change to
-        either side's idea of the file fails one of the two tests."""
+        beside a GitLab one, as `vcs_forges_test.go` pins it (that test
+        compares the decoded document, not its bytes). A change to either
+        side's field names or shape fails one of the two tests."""
         self.configure(
             '{"forges":[{"provider":"github","host":"github.com"},'
             '{"provider":"gitlab","host":"gitlab.com",'

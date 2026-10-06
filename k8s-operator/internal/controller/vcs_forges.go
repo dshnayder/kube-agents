@@ -151,3 +151,16 @@ func buildVCSForgesVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 	return volumes
 }
+
+// gatewayPolicyView is the policy ConfigMap as the gateway pod's hash
+// annotation reads it: without the forge configuration, which only the broker
+// mounts. Without the key -- every GitHub-only install -- it is the ConfigMap
+// itself, so that annotation is what it always was.
+func gatewayPolicyView(cm *corev1.ConfigMap) *corev1.ConfigMap {
+	if _, ok := cm.Data[vcsForgesKey]; !ok {
+		return cm
+	}
+	view := cm.DeepCopy()
+	delete(view.Data, vcsForgesKey)
+	return view
+}

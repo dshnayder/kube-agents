@@ -20,8 +20,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 func TestParseRepoRefReadsTheHostBeforeThePath(t *testing.T) {
@@ -885,7 +883,7 @@ func TestScopeRefusedIgnoresAContextRestatement(t *testing.T) {
 func TestCredentialsRefOnGitHubIsAWarningNotAnError(t *testing.T) {
 	spec := &IntegrationSpec{Forges: []ForgeSpec{{
 		Name: "github", Namespace: "gke-labs",
-		CredentialsRef: &corev1.LocalObjectReference{Name: "forge-token"},
+		CredentialsRef: &ForgeCredentialsRef{Name: "forge-token"},
 	}}}
 	if err := spec.ValidateGit(); err != nil {
 		t.Fatalf("ValidateGit() = %v", err)

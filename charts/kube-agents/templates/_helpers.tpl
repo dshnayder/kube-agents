@@ -636,6 +636,7 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
+{{- $gitlabHosts := dict -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -652,15 +653,32 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
 {{- end -}}
-{{- if and (eq $provider "gitlab") $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$" $host)) (not (contains "." $host)) (has (lower $host) $githubHosts)) -}}
+{{- if eq $provider "gitlab" -}}
+{{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$" $host)) (not (contains "." $host)) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
 {{- end -}}
-{{- if and (eq $provider "gitlab") (not ($f.credentialsRef | default dict).name) -}}
+{{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
+{{- if not $secret -}}
 {{- fail (printf "platformAgent.integration.forges[%d] is a gitlab forge with no credentialsRef.name; name the Secret that holds its access token under the key token" $i) -}}
+{{- end -}}
+{{- if or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
+{{- end -}}
+{{- /* One credential per host in the broker: www.gitlab.com is gitlab.com. */ -}}
+{{- $glHost := lower ($host | default "gitlab.com") -}}
+{{- if eq $glHost "www.gitlab.com" }}{{ $glHost = "gitlab.com" }}{{ end -}}
+{{- if hasKey $gitlabHosts $glHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one gitlab forge there" $i $glHost (get $gitlabHosts $glHost)) -}}
+{{- end -}}
+{{- $_ := set $gitlabHosts $glHost (toString $i) -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitHub organisation or user name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") (gt (len $namespace) 255) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 255 characters" $i) -}}
 {{- end -}}
 {{- if and (eq $provider "gitlab") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitLab group path" $i $namespace) -}}

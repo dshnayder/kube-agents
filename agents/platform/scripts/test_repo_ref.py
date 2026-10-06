@@ -209,8 +209,9 @@ class IsGithubSlugTest(unittest.TestCase):
     def test_the_owner_slot_may_not_be_a_spelling_of_github(self):
         """`github.com/acme` fails on depth; the other two need the host check.
 
-        Only `github.com` is in `KNOWN_HOSTS`, so it alone is lifted out of the
-        path and leaves a one-segment remainder. `www.` and `ssh.` stay in the
+        Of GitHub's spellings only `github.com` is in `KNOWN_HOSTS` (beside
+        `gitlab.com`), so it alone is lifted out of the path and leaves a
+        one-segment remainder. `www.` and `ssh.` stay in the
         path and would otherwise read as an owner — one GitHub cannot issue,
         since a namespace may not contain a dot, and one that reaches Minty as
         an org name if this predicate says yes.

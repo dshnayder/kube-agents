@@ -1077,7 +1077,7 @@ func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
 				Forges: []agentv1alpha1.ForgeSpec{{
 					Name: "github", Namespace: "gke-labs",
-					CredentialsRef: &corev1.LocalObjectReference{Name: "forge-token"},
+					CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "forge-token"},
 				}},
 			}},
 		},
