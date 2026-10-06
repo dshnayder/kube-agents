@@ -121,10 +121,16 @@ def fixtures_dir(forge_class: type) -> Path:
 
 
 class Recorded:
-    """The transport's `api`, answering from a fixture instead of the network."""
+    """The transport's `api`, answering from a fixture instead of the network.
 
-    def __init__(self, responses: list) -> None:
+    `repeat`, when given, answers every call past the recorded ones: the
+    probe below uses it to say "the forge holds more of the same" to a forge
+    that reads on past a full page.
+    """
+
+    def __init__(self, responses: list, repeat: Any = None) -> None:
         self.responses = list(responses)
+        self.repeat = repeat
         self.calls: list[tuple] = []
 
     def __call__(self, method, path, *, params=None, body=None, raw=None) -> Any:
@@ -134,6 +140,8 @@ class Recorded:
             # models a diff, and none needs to -- it is returned unparsed.
             return "diff --git a/x b/x\n"
         if not self.responses:
+            if self.repeat is not None:
+                return self.repeat
             raise AssertionError(f"the forge made an unfixtured call: {method} {path}")
         answer = self.responses.pop(0)
         # A recorded *refusal*: `{"__status__": 404}` is what the transport
@@ -186,8 +194,8 @@ class ContractTest(unittest.TestCase):
     def load(self, directory: Path, verb: str) -> dict:
         return json.loads((directory / f"{verb}.json").read_text())
 
-    def invoke(self, forge, verb: str, fixture: dict) -> tuple[Any, Recorded]:
-        api = Recorded(fixture["responses"])
+    def invoke(self, forge, verb: str, fixture: dict, repeat: Any = None) -> tuple[Any, Recorded]:
+        api = Recorded(fixture["responses"], repeat)
         method = getattr(forge, verb.replace("-", "_"))
         return method(api, "acme/infra", dict(fixture["payload"])), api
 
@@ -362,6 +370,11 @@ class ContractTest(unittest.TestCase):
         a page after filtering its rows -- a bodiless review is not an
         utterance, but it is still a row the forge sent -- fails on the page
         that holds one.
+
+        A forge may read on past a full page whose rows were not utterances --
+        GitLab's bookkeeping notes fill most of a long merge request's pages.
+        One that does is answered with the filled page again, the forge holding
+        more of the same, and the flag still has to be set.
         """
         for name, forge, directory in self.instances():
             for verb in ("proposal-view", "issue-view"):
@@ -391,6 +404,7 @@ class ContractTest(unittest.TestCase):
                                 "payload": dict(fixture["payload"], limit=limit),
                                 "responses": responses,
                             },
+                            repeat=fixture["responses"][filled],
                         )
                         self.assertTrue(answer["commentsTruncated"])
 
