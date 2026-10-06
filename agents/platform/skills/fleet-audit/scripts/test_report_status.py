@@ -390,5 +390,32 @@ class TestCli(ReportStatusTestCase):
         self.assertEqual(json.loads(result.stdout)["streams"][AUDIT]["liveness"], "completed")
 
 
+
+class TestNestedStores(ReportStatusTestCase):
+    """Review: the reader listed two levels and refused anything but owner/name,
+    so a stream's store for a repository on another forge was unreadable."""
+
+    def test_a_store_at_any_depth_below_a_host_is_listed_and_opened(self):
+        self.write_latest(repo="gitlab.com/acme/platform/infra")
+        self.write_latest(repo="acme/fleet")
+        dirs, unreadable = report_status.scan_repo_dirs(str(self.root), AUDIT)
+        self.assertEqual(["acme/fleet", "gitlab.com/acme/platform/infra"], sorted(dirs))
+        self.assertEqual([], unreadable)
+        path = report_status.store_path(str(self.root), AUDIT, "gitlab.com/acme/platform/infra")
+        self.assertTrue(path.endswith(os.path.join("gitlab.com", "acme", "platform", "infra")))
+
+    def test_github_named_with_its_host_opens_the_slugs_store(self):
+        self.assertEqual(
+            report_status.store_path(str(self.root), AUDIT, "acme/fleet"),
+            report_status.store_path(str(self.root), AUDIT, "github.com/acme/fleet"),
+        )
+
+    def test_a_deep_name_without_a_host_is_still_refused(self):
+        for bad in ("acme/a/b", "gitlab.com/acme/..", "acme"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    report_status.store_path(str(self.root), AUDIT, bad)
+
+
 if __name__ == "__main__":
     unittest.main()

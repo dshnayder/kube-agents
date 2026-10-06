@@ -10379,6 +10379,23 @@ def content_workspace_refusal(repo: str) -> str | None:
     )
 
 
+def content_workspace_repo(repo: str) -> str:
+    """`repo` as the broker's file workspace takes it: GitHub's bare `owner/name`.
+
+    The workspace opens bare GitHub slugs only, and an install managing a
+    second forge spells GitHub's repositories `github.com/owner/name`
+    (`gitops_workspace.qualify`), so that spelling is put back to the slug at
+    the door. Every other name is returned as it is, for
+    `content_workspace_refusal` to have answered first.
+    """
+    import gitops_workspace
+
+    host, path = gitops_workspace.split_host(repo)
+    if host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return path
+    return repo
+
+
 def _land_group_via_broker(
     repo: str,
     audit_id: str,
@@ -10411,7 +10428,7 @@ def _land_group_via_broker(
         return _GroupPush("", False)
     changes = {path: snapshot[path] for path in paths}
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=branch
     ) as workspace:
         continuing = workspace.started_from == f"origin/{branch}"
         result = workspace.commit(
@@ -11222,7 +11239,7 @@ def _clone_step(
         str(CLONE_SCRIPT),
         "clone",
         "--repo",
-        slug,
+        content_workspace_repo(slug),
         "--depth",
         str(CLONE_DEPTH),
         "--into",
@@ -11749,7 +11766,7 @@ def handle_fetch(args: argparse.Namespace) -> None:
 
     written: list[str] = []
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         for path, target in targets.items():
             content = workspace.read(path)
@@ -11792,7 +11809,7 @@ def handle_list(args: argparse.Namespace) -> None:
     import credential_proxy_client
 
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         entries = workspace.list(args.prefix)
         sha = _tree_sha(workspace)
@@ -11847,7 +11864,7 @@ def handle_grep(args: argparse.Namespace) -> None:
     import credential_proxy_client
 
     with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), repo, branch=args.branch
+        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
     ) as workspace:
         result = workspace.grep(
             args.pattern,
@@ -12181,12 +12198,17 @@ def _remediation_outcomes(
     pr_by_finding: dict[str, dict | None],
     opened: list[str],
     noun: str = "pull request",
+    refusal: str = "",
 ) -> dict[str, str]:
     """One sentence per accepted `/remediate` target, for the acknowledgement.
 
     Pure: `pr_by_finding` is expected to be the mapping *after* this run's pull
     requests were opened, so a freshly opened request is named by its URL
     rather than reported as missing.
+
+    `refusal` is why no proposal can be published to this repository at all
+    (`remediation_refusal`). With one, a missing proposal says that instead of
+    promising a retry that would fail the same way.
     """
     just_opened = set(opened)
     outcomes: dict[str, str] = {}
@@ -12209,12 +12231,35 @@ def _remediation_outcomes(
             )
         elif url:
             outcomes[fid] = f"{noun} refreshed — {url}"
+        elif refusal:
+            outcomes[fid] = f"no {noun} was opened: {refusal}"
         else:
             outcomes[fid] = (
                 f"no {noun} was opened; the harness could not publish it "
                 "this run and will retry on the next audit"
             )
     return outcomes
+
+
+def remediation_refusal(repo: str) -> str:
+    """Why no remediation proposal can be published to `repo`, or "".
+
+    Both ways a remediation is published -- the broker's file workspace in
+    content mode, a local clone in directory mode -- reach GitHub only today,
+    so a repository on another forge gets its ledger and no proposal. Said in
+    the `/remediate` reply, because the person who asked reads that, not the
+    log.
+    """
+    import gitops_workspace
+
+    host, _ = gitops_workspace.split_host(repo)
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return ""
+    return (
+        f"{repo} is on {host}, and remediation files are published to GitHub "
+        "repositories only for now, so a retry will not change this. The "
+        "findings stay on the ledger."
+    )
 
 
 def handle_remediate(args: argparse.Namespace) -> None:
@@ -13510,7 +13555,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             repo,
             number,
             requests.accepted_by_comment,
-            _remediation_outcomes(requests, plan, pr_by_finding, prs_opened, _proposal_noun(repo)),
+            _remediation_outcomes(
+                requests,
+                plan,
+                pr_by_finding,
+                prs_opened,
+                _proposal_noun(repo),
+                remediation_refusal(repo),
+            ),
             ledger_comments,
             now,
             _proposal_noun(repo),

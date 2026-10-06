@@ -516,7 +516,7 @@ def handle_prepare(args) -> int:
     # fleet whose cards target several GitOps repositories writes every
     # suggestion to whichever one `resolve_repo` happens to answer with.
     repo = args.repo or gitops_workspace.resolve_repo()
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     proposal = open_proposal(repo, branch)
     if proposal:
@@ -628,7 +628,7 @@ def handle_submit(args) -> int:
     # got past the check below and then died on "no local copy".
     copy_key = vcs_client.key_of(session)
     repo = args.repo or session["spec"]
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     current = vcs_client.current_branch(session)
     if current != branch:

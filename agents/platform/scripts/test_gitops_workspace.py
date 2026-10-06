@@ -1559,8 +1559,6 @@ def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
     return origin
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
 
 
 class TestForgeNeutralNames(unittest.TestCase):
@@ -1755,3 +1753,40 @@ class TestNoBrokerImports(unittest.TestCase):
             for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
         }
         self.assertFalse(imported & {"providers", "workspace_paths", "vcs_broker", "credential_proxy"})
+
+
+
+class TestDottedBareOwner(unittest.TestCase):
+    """Review: a two-segment name with a dotted owner is GitHub's bare slug."""
+
+    def test_two_segments_are_never_host_qualified(self):
+        self.assertEqual(("", "my.org/repo"), gitops_workspace.split_host("my.org/repo"))
+        self.assertEqual(("gitlab.com", "acme/infra"), gitops_workspace.split_host("gitlab.com/acme/infra"))
+
+    def test_the_org_binding_still_refuses_a_dotted_owner(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+            with self.assertRaises(ValueError):
+                gitops_workspace.validate_repo_org("evil.example/repo")
+
+    def test_a_dotted_github_owner_does_not_read_as_a_second_forge(self):
+        self.assertEqual("acme/fleet", gitops_workspace.qualify("acme/fleet", ["acme.io/infra"]))
+        self.assertEqual("https://github.com/my.org/repo.git", gitops_workspace.clone_url("my.org/repo"))
+
+
+class TestPortedHostIsSkipped(unittest.TestCase):
+    """Review: the parser drops a URL's port, so the skip never fired."""
+
+    def test_an_entry_naming_a_port_is_skipped_with_that_reason(self):
+        entries = [
+            {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/infra"},
+            {"type": "gitlab", "url": "gitlab.example.com:8443/acme/infra"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
+        ]
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            names = gitops_workspace._forge_repo_names(entries, "managed_repos")
+        self.assertEqual(["gitlab.com/acme/infra"], names)
+        self.assertEqual(2, sum("a host with a port is not supported" in line for line in logs.output))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

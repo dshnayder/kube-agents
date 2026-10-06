@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import io
+import argparse
 import json
 import os
 import shutil
@@ -1735,6 +1736,27 @@ class TestValidateRepo(unittest.TestCase):
         with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):
             with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
                 self.assertEqual(submit_suggestion.validate_repo(name), name)
+
+
+
+class LiftedNameReachesTheBrokerTest(unittest.TestCase):
+    """Review: `prepare` validated the lifted name and sent the bare one."""
+
+    def test_prepare_asks_the_broker_with_the_lifted_name(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        args = argparse.Namespace(repo="acme/fleet", branch="platform-agent/x")
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_prepare(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
 
 
 if __name__ == "__main__":

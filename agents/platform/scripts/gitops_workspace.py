@@ -780,9 +780,18 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
 
 
 def split_host(repo: str) -> tuple[str, str]:
-    """`(host, path)` for a host-qualified name, `("", repo)` for a bare one."""
+    """`(host, path)` for a host-qualified name, `("", repo)` for a bare one.
+
+    Host-qualified means a hostname followed by at least two more segments.
+    Two segments are always a bare GitHub slug, dotted owner or not:
+    `repo_ref` admits `my.org/repo` as an owner and a name, and reading its
+    first segment as a host would move the org binding, the clone host and the
+    committer address for a name that is still GitHub's. Every forge path this
+    module hands out under a host has at least two segments, so nothing
+    host-qualified is two segments long.
+    """
     first, _, rest = str(repo).partition("/")
-    if rest and HOSTNAME_RE.fullmatch(first):
+    if "/" in rest and HOSTNAME_RE.fullmatch(first):
         return first, rest
     return "", str(repo)
 
@@ -1223,12 +1232,22 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
         if kind not in served:
             LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
             continue
+        if _names_a_port(url):
+            # Before parsing: the parser reads a URL's host without its port
+            # and a bare `host:8443/path` as an scp remote, so either would
+            # come back named on another endpoint than the one registered.
+            LOGGER.warning(
+                "Skipping %s repository %r: a host with a port is not supported; "
+                "the broker serves a forge on its standard HTTPS port only.",
+                key, url,
+            )
+            continue
         ref = repo_ref.try_parse(url)
         if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
             LOGGER.warning(
                 "Skipping %s repository %r: no host and path to name it by. "
-                "Register a %s repository by its URL (https://<host>/<path>); "
-                "a host with a port is not supported.",
+                "Register a %s repository by its URL (https://<host>/<path>), "
+                "with a fully qualified hostname.",
                 key, url, kind,
             )
             continue
@@ -1238,6 +1257,14 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
     if others:
         github = [f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" for slug in github]
     return github + others
+
+
+_PORT_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)", re.I)
+
+
+def _names_a_port(url: str) -> bool:
+    """Whether a registered URL, or a bare `host:port/path`, names a port."""
+    return bool(_PORT_RE.match(str(url).strip()))
 
 
 def proposal_noun(repo: str) -> str:

@@ -1978,8 +1978,9 @@ The operator writes each repository into the state ConfigMap as a `ManagedRepoEn
 is its forge's provider, which is how the discriminator reaches the agent: written down by the
 operator, rather than inferred from the URL's text. The broker's repository gate reads every
 typed entry, keyed by its `type`, host and path, so an entry counts for the provider it names and
-no other. The agent's skills read only `github` entries — an administrator who writes a
-non-GitHub entry straight into the ConfigMap gets one the broker gates on and the skills discard. Entries already in the ConfigMap are kept
+no other. The agent's skills read every `managed_repos` entry whose `type` is a forge the agent
+image serves, named `host/path` for a forge other than GitHub; `context_repos` stays GitHub-only,
+and any other entry is skipped with a warning naming it. Entries already in the ConfigMap are kept
 as written, including fields the operator does not model, such as a context repository's `ref`.
 
 The gateway's FQDN egress policy takes its forge hosts from the declared forges, and always

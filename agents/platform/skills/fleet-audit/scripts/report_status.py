@@ -53,6 +53,9 @@ REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
 # The stored record of the newest run, and the ring of runs beside it.
 LATEST_NAME = "latest.json"
+#: GitHub's host, as a host-qualified name spells it; its store is the bare
+#: slug's (audit_report.reports_dir_for).
+GITHUB_HOST = "github.com"
 RUNS_DIR = "runs"
 # `audit_report.REPORT_STAMP_FORMAT`: a ring entry's name is its envelope's
 # `finished_at` in UTC, in this form, so the two compare as strings.
@@ -143,6 +146,11 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
     for owner in owners:
         if not REPO_SEGMENT_RE.match(owner):
             continue
+        if "." in owner:
+            # A host: a GitHub owner has no dot. Its repositories sit at any
+            # depth below it, and each is the directory holding a store.
+            _scan_host(root, audit_id, owner, dirs, unreadable)
+            continue
         try:
             names = _subdirs(os.path.join(root, audit_id, owner))
         except OSError as exc:
@@ -150,6 +158,41 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
             continue
         dirs.extend(f"{owner}/{name}" for name in names if REPO_SEGMENT_RE.match(name))
     return dirs, unreadable
+
+
+#: How deep below a host the store is searched for repositories: deeper than
+#: any group nesting a forge allows in practice, and a bound on the walk.
+HOST_SCAN_DEPTH = 20
+
+
+def _scan_host(
+    root: str, audit_id: str, host: str, dirs: list[str], unreadable: list[str]
+) -> None:
+    """Every `host/path` store below one host directory, at any depth.
+
+    A directory is a repository's store when it holds `latest.json` or
+    `runs/`, which is all `finish` ever writes there; the walk does not descend
+    into a store. A directory that cannot be listed costs only what is below
+    it, as an unreadable owner does.
+    """
+    pending = [(host, 0)]
+    while pending:
+        rel, depth = pending.pop()
+        path = os.path.join(root, audit_id, *rel.split("/"))
+        try:
+            with os.scandir(path) as entries:
+                names = {entry.name: entry.is_dir() for entry in entries}
+        except OSError as exc:
+            unreadable.append(_failure(f"{rel}/", exc))
+            continue
+        if rel != host and (LATEST_NAME in names or names.get(RUNS_DIR)):
+            dirs.append(rel)
+            continue
+        if depth >= HOST_SCAN_DEPTH:
+            continue
+        for name in sorted(names, reverse=True):
+            if names[name] and REPO_SEGMENT_RE.match(name) and name not in (os.curdir, os.pardir):
+                pending.append((f"{rel}/{name}", depth + 1))
 
 
 def _repo_dirs(root: str, audit_id: str) -> list[str]:
@@ -173,14 +216,21 @@ def repo_ids(root: str, audit_id: str) -> list[str]:
 
 def store_path(root: str, audit_id: str, repo: str) -> str:
     """The directory one stream keeps for one repository. ValueError for a
-    `repo` that is not `owner/name`, so an argument can never walk out of it.
-    Lower-cased as audit_report.reports_dir_for writes it: GitHub's names are
-    not case-sensitive, so neither is the store."""
+    `repo` that is neither `owner/name` nor `host/path`, so an argument can
+    never walk out of it. Lower-cased, and laid out, as
+    audit_report.reports_dir_for writes it: GitHub's names are not
+    case-sensitive, so neither is the store; a repository on another forge is
+    `host/path` that many directories down; and GitHub named with its host
+    shares the bare slug's directory."""
     segments = str(repo).lower().split("/")
-    if len(segments) != 2 or not all(
+    if len(segments) == 3 and segments[0] == GITHUB_HOST:
+        segments = segments[1:]
+    if len(segments) > 2 and "." not in segments[0]:
+        segments = []
+    if len(segments) < 2 or not all(
         REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in segments
     ):
-        raise ValueError(f"repository {repo!r} is not owner/name")
+        raise ValueError(f"repository {repo!r} is not owner/name or host/path")
     return os.path.join(root, audit_id, *segments)
 
 

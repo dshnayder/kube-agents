@@ -13070,6 +13070,50 @@ class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):
         self.assertFalse(landed.proposable)
 
 
+class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
+    """Review: an install with a second forge spells GitHub's repositories
+    `github.com/owner/name`, and the workspace refused that spelling."""
+
+    def test_the_door_puts_github_back_to_the_slug(self):
+        self.assertEqual("acme/fleet", audit_report.content_workspace_repo("github.com/acme/fleet"))
+        self.assertEqual("acme/fleet", audit_report.content_workspace_repo("acme/fleet"))
+        self.assertEqual("gitlab.com/a/b", audit_report.content_workspace_repo("gitlab.com/a/b"))
+
+    def test_a_remediation_opens_the_workspace_with_the_slug(self):
+        client = type(sys)("credential_proxy_client")
+        opened = []
+
+        class Workspace:
+            @staticmethod
+            def open(endpoint, repo, **kwargs):
+                opened.append(repo)
+                raise RuntimeError("stop here")
+
+        client.Workspace = Workspace
+        with patch.dict(sys.modules, {"credential_proxy_client": client}), \
+                patch.object(audit_report, "proxy_endpoint", lambda: "http://proxy"):
+            with self.assertRaises(RuntimeError):
+                audit_report._land_group_via_broker(
+                    "github.com/acme/fleet", "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
+                )
+        self.assertEqual(["acme/fleet"], opened)
+
+
+class TestRemediateReplyNamesTheRefusal(unittest.TestCase):
+    """Review: the reply promised a retry that could not succeed."""
+
+    def test_a_repository_no_proposal_can_reach_says_why(self):
+        requests = type("R", (), {"targets": ["f1"]})()
+        plan = type("P", (), {"already_open": set(), "superseded": set()})()
+        refusal = audit_report.remediation_refusal("gitlab.com/acme/infra")
+        self.assertIn("GitHub repositories only", refusal)
+        outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "merge request", refusal)
+        self.assertIn("a retry will not change this", outcomes["f1"])
+        self.assertNotIn("will retry", outcomes["f1"])
+        self.assertEqual("", audit_report.remediation_refusal("github.com/acme/fleet"))
+        self.assertEqual("", audit_report.remediation_refusal("acme/fleet"))
+
+
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
     def setUp(self):
         # Only the path is computed; nothing is created under it.
