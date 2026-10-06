@@ -9321,6 +9321,18 @@ def refresh_credentials(repo: str | None = None) -> None:
     403 -- is not that condition, and stays the error it is.
     """
     from github_token_refresh import refresh_git_credentials
+    import gitops_workspace
+
+    # Only GitHub's credential is minted per repository and needs this. A
+    # repository on another forge is reached with a stored token the broker
+    # reads per call, so there is nothing to refresh -- and the refresh path
+    # takes only a bare `owner/name`. GitHub named with its host, as an install
+    # managing two forges names it, is refreshed as the slug.
+    host, path = gitops_workspace.split_host(repo) if repo else ("", repo)
+    if host and host != gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        log(f"No credential refresh for {repo}: its forge's token is stored, not minted.")
+        return
+    repo = path if host else repo
 
     endpoint = proxy_endpoint()
     if not endpoint:
