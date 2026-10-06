@@ -305,13 +305,20 @@ func TestAnInvalidSecretNameIsRefusedAndNotMounted(t *testing.T) {
 // claiming -- so status refused the second forge whose token was mounted and
 // served. One rule now: only a valid forge that serves something claims.
 func TestOnlyAForgeTheBrokerIsGivenClaimsItsHost(t *testing.T) {
-	for name, first := range map[string]ForgeSpec{
-		"refused first":        glForge("a", "", "-bad"),
-		"serves-nothing first": glForge("a", "", ""),
+	for name, tc := range map[string]struct {
+		first ForgeSpec
+		repos []RepositorySpec
+	}{
+		"refused first":        {glForge("a", "", "-bad"), nil},
+		"serves-nothing first": {glForge("a", "", ""), nil},
+		// Review round 2: a's only repository resolves but is refused for its
+		// own reason, so a serves nothing the status accepts -- it must not
+		// claim the host either, or b is shadowed and the broker gets neither.
+		"only repository refused first": {glForge("a", "", ""), []RepositorySpec{repo("a", "x/y", "manged")}},
 	} {
 		in := &IntegrationSpec{
-			Forges:       []ForgeSpec{first, glForge("b", "", "acme")},
-			Repositories: []RepositorySpec{repo("b", "infra", RepositoryRoleManaged)},
+			Forges:       []ForgeSpec{tc.first, glForge("b", "", "acme")},
+			Repositories: append(append([]RepositorySpec{}, tc.repos...), repo("b", "infra", RepositoryRoleManaged)),
 		}
 		resolved, _ := in.ResolveGit()
 		for _, p := range resolved.Problems() {

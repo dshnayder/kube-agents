@@ -571,13 +571,8 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		return nil, nil
 	}
 	var problems []IntegrationProblem
-	rejected := map[*ResolvedRepository]bool{}
 	add := func(path IntegrationFieldPath, value string, err error) {
 		problems = append(problems, IntegrationProblem{Path: path, Value: value, Err: err})
-	}
-	reject := func(r *ResolvedRepository, path IntegrationFieldPath, value string, err error) {
-		add(path, value, err)
-		rejected[r] = true
 	}
 
 	_, shadowedBy := ri.credentialClaims()
@@ -605,6 +600,27 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		if err := f.credentialsProblem(provider); err != nil {
 			add(ri.forgePath(f, gitCredentialsField), f.CredentialsSecret, err)
 		}
+	}
+
+	repoProblems, rejected := ri.checkRepositories(shadowedBy)
+	return append(problems, repoProblems...), rejected
+}
+
+// checkRepositories is check()'s repository half. shadowedBy is the claims'
+// answer: a repository on a shadowed forge is refused with it. Asked with no
+// claims at all, it answers which repositories are acceptable for their own
+// reasons -- role, namespace, syntax, duplicates -- which is what
+// credentialClaims needs to decide whether a forge serves anything, without
+// asking the claims it is deciding.
+func (ri *ResolvedIntegration) checkRepositories(shadowedBy map[*ResolvedForge]*ResolvedForge) ([]IntegrationProblem, map[*ResolvedRepository]bool) {
+	var problems []IntegrationProblem
+	rejected := map[*ResolvedRepository]bool{}
+	add := func(path IntegrationFieldPath, value string, err error) {
+		problems = append(problems, IntegrationProblem{Path: path, Value: value, Err: err})
+	}
+	reject := func(r *ResolvedRepository, path IntegrationFieldPath, value string, err error) {
+		add(path, value, err)
+		rejected[r] = true
 	}
 
 	gitops := 0
@@ -843,10 +859,12 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
 // outside them before the token is spent, which is the only narrowing a
 // GitLab token gets after it is created.
 //
-// credentialClaims asks it with every repository admitted, because check()
-// asks credentialClaims and acceptance is check()'s answer; BrokerForges asks
-// it with only the accepted ones, so the list the broker gets is the one the
-// status describes.
+// credentialClaims asks it with the repositories acceptable for their own
+// reasons (checkRepositories with no claims), because check() asks
+// credentialClaims and so cannot be asked back; BrokerForges and Warnings ask
+// it with the accepted ones. The two sets differ only by shadowing, which
+// removes whole forges, so a forge serves something by one measure exactly
+// when it does by the other.
 func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge, keep func(*ResolvedRepository) bool) []string {
 	seen := map[string]bool{}
 	if f.Namespace != "" {
@@ -871,8 +889,6 @@ func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge, keep func(*Res
 	return namespaces
 }
 
-func everyRepository(*ResolvedRepository) bool { return true }
-
 // credentialClaims is the one rule for which credentialed forge holds each
 // host, used by both check() -- which refuses the rest -- and BrokerForges --
 // which hands the claimants to the broker. A forge claims its host when its
@@ -887,9 +903,16 @@ func (ri *ResolvedIntegration) credentialClaims() ([]*ResolvedForge, map[*Resolv
 	var claims []*ResolvedForge
 	byHost := map[string]*ResolvedForge{}
 	shadowed := map[*ResolvedForge]*ResolvedForge{}
+	// What a forge serves is measured by the repositories acceptable for
+	// their own reasons, the same set BrokerForges and Warnings measure it by
+	// once shadowing is applied: a forge whose only repository is refused
+	// serves nothing, so it neither reaches the broker nor shadows a forge
+	// that would.
+	_, ownRejected := ri.checkRepositories(nil)
+	acceptable := func(r *ResolvedRepository) bool { return !ownRejected[r] }
 	for _, f := range ri.Forges {
 		provider, err := f.GitProvider()
-		if err != nil || !provider.NeedsCredentials || !f.valid() || len(ri.servedNamespaces(f, everyRepository)) == 0 {
+		if err != nil || !provider.NeedsCredentials || !f.valid() || len(ri.servedNamespaces(f, acceptable)) == 0 {
 			continue
 		}
 		host := provider.canonicalHost(f.Host)
