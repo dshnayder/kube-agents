@@ -1766,6 +1766,47 @@ class TestNoBrokerImports(unittest.TestCase):
         }
         self.assertFalse(imported & {"providers", "workspace_paths", "vcs_broker", "credential_proxy"})
 
+    def test_nothing_the_sandbox_ships_imports_a_broker_module(self):
+        # Review: the guard above parsed `gitops_workspace` alone, so a deferred
+        # broker import in a consumer -- the BLOCKER's exact shape -- would pass
+        # it. Every module the sandbox image ships is read off the Dockerfile's
+        # COPY lists, plus every skill's scripts, and walked whole: `ast.walk`
+        # sees an import inside a function as well as one at the top.
+        import ast
+        import glob
+        import re
+
+        repo = Path(__file__).resolve().parents[3]
+        dockerfile = (repo / "deploy" / "sandbox" / "Dockerfile").read_text()
+        shipped: dict[str, set[str]] = {}
+        for block in re.findall(r"^COPY (?!--)((?:[^\n]*\\\n)+[^\n]*)$", dockerfile, re.M):
+            parts = block.replace("\\\n", " ").split()
+            dest = parts[-1]
+            for src in parts[:-1]:
+                if src.endswith(".py") and src.startswith("agents/"):
+                    shipped.setdefault(src, set()).add(dest)
+        self.assertIn("agents/platform/skills/github-issue-resolver/scripts/resolver.py", shipped)
+        self.assertIn("agents/platform/scripts/gitops_workspace.py", shipped)
+        for path in glob.glob(str(repo / "agents/platform/skills/*/scripts/*.py")):
+            if not Path(path).name.startswith("test_"):
+                shipped.setdefault(str(Path(path).relative_to(repo)), set()).add("/opt/defaults/skills/")
+        broker = {"providers", "vcs_broker", "credential_proxy"}
+        offenders = []
+        for src, dests in sorted(shipped.items()):
+            tree = ast.parse((repo / src).read_text())
+            imported = {
+                alias.name.split(".")[0]
+                for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+            } | {
+                (node.module or "").split(".")[0]
+                for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and not node.level
+            }
+            # The trusted closure ships no `workspace_paths` either.
+            barred = broker | ({"workspace_paths"} if "/opt/vcs/libexec/platform/" in dests else set())
+            if imported & barred:
+                offenders.append(f"{src}: {sorted(imported & barred)}")
+        self.assertEqual([], offenders)
+
 
 
 class TestDottedBareOwner(unittest.TestCase):
@@ -1798,6 +1839,21 @@ class TestPortedHostIsSkipped(unittest.TestCase):
             names = gitops_workspace._forge_repo_names(entries, "managed_repos")
         self.assertEqual(["gitlab.com/acme/infra"], names)
         self.assertEqual(2, sum("a host with a port is not supported" in line for line in logs.output))
+
+
+class TestGroupEntryIsSkipped(unittest.TestCase):
+    """Review: `https://gitlab.com/acme` came out as `gitlab.com/acme`, which
+    every consumer then read as a bare GitHub `owner/name`."""
+
+    def test_an_entry_naming_a_group_is_skipped_as_the_broker_skips_it(self):
+        entries = [
+            {"type": "gitlab", "url": "https://gitlab.com/acme"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
+        ]
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            names = gitops_workspace._forge_repo_names(entries, "managed_repos")
+        self.assertEqual(["gitlab.com/acme/infra"], names)
+        self.assertIn("names a group or namespace", "\n".join(logs.output))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -59,11 +59,17 @@ class ReportStatusTestCase(unittest.TestCase):
             },
         }
         envelope.update(overrides)
-        directory = self.root / audit / repo / "runs"
+        # A host-qualified name goes where the writer puts it; anything else is
+        # written as spelled, so a test can lay down a mixed-case directory.
+        if "." in repo.split("/")[0]:
+            store = Path(report_status.store_path(str(self.root), audit, repo))
+        else:
+            store = self.root / audit / repo
+        directory = store / "runs"
         directory.mkdir(parents=True, exist_ok=True)
         text = json.dumps(envelope)
         (directory / "20260801T093000.000000Z.json").write_text(text)
-        (self.root / audit / repo / "latest.json").write_text(text)
+        (store / "latest.json").write_text(text)
 
     def write_note(self, audit=AUDIT, age_s=60.0, text=None):
         path = self.scratch / f"inflight_{audit}.json"
@@ -402,7 +408,20 @@ class TestNestedStores(ReportStatusTestCase):
         self.assertEqual(["acme/fleet", "gitlab.com/acme/platform/infra"], sorted(dirs))
         self.assertEqual([], unreadable)
         path = report_status.store_path(str(self.root), AUDIT, "gitlab.com/acme/platform/infra")
-        self.assertTrue(path.endswith(os.path.join("gitlab.com", "acme", "platform", "infra")))
+        self.assertTrue(path.endswith(os.path.join("gitlab.com", "acme%2Fplatform%2Finfra")))
+
+    def test_a_project_or_group_named_runs_is_not_taken_for_a_store(self):
+        # Review: with one directory per segment, a project `gitlab.com/acme/runs`
+        # made `gitlab.com/acme` read as a store holding a run named latest.json.
+        self.write_latest(repo="gitlab.com/acme/runs")
+        self.write_latest(repo="gitlab.com/runs/infra")
+        self.write_latest(repo="gitlab.com/acme/latest.json")
+        dirs, unreadable = report_status.scan_repo_dirs(str(self.root), AUDIT)
+        self.assertEqual(
+            ["gitlab.com/acme/latest.json", "gitlab.com/acme/runs", "gitlab.com/runs/infra"],
+            sorted(dirs),
+        )
+        self.assertEqual([], unreadable)
 
     def test_github_named_with_its_host_opens_the_slugs_store(self):
         self.assertEqual(

@@ -51,6 +51,10 @@ INFLIGHT_SUFFIX = ".json"
 # segment of the `owner/name` a store directory is keyed on, never `.`/`..`.
 REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
+#: How a store directory below a host spells the `/` between path segments,
+#: as audit_report.reports_dir_for writes it.
+STORE_PATH_SEPARATOR = "%2F"
+
 # The stored record of the newest run, and the ring of runs beside it.
 LATEST_NAME = "latest.json"
 #: GitHub's host, as a host-qualified name spells it; its store is the bare
@@ -147,8 +151,8 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
         if not REPO_SEGMENT_RE.match(owner):
             continue
         if "." in owner:
-            # A host: a GitHub owner has no dot. Its repositories sit at any
-            # depth below it, and each is the directory holding a store.
+            # A host: a GitHub owner has no dot. Each directory below it is
+            # one repository's store, its path spelled with `%2F`.
             _scan_host(root, audit_id, owner, dirs, unreadable)
             continue
         try:
@@ -160,39 +164,28 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
     return dirs, unreadable
 
 
-#: How deep below a host the store is searched for repositories: deeper than
-#: any group nesting a forge allows in practice, and a bound on the walk.
-HOST_SCAN_DEPTH = 20
-
-
 def _scan_host(
     root: str, audit_id: str, host: str, dirs: list[str], unreadable: list[str]
 ) -> None:
-    """Every `host/path` store below one host directory, at any depth.
+    """Every `host/path` store below one host directory.
 
-    A directory is a repository's store when it holds `latest.json` or
-    `runs/`, which is all `finish` ever writes there; the walk does not descend
-    into a store. A directory that cannot be listed costs only what is below
-    it, as an unreadable owner does.
+    One level, as for a GitHub owner: each directory below the host is one
+    repository's store, named for its path with every `/` spelled `%2F`. A
+    name that does not decode to two or more valid segments is not a store.
+    No walk, so nothing has to be guessed from a directory's children -- a
+    project or group named `runs` is just a segment in a name.
     """
-    pending = [(host, 0)]
-    while pending:
-        rel, depth = pending.pop()
-        path = os.path.join(root, audit_id, *rel.split("/"))
-        try:
-            with os.scandir(path) as entries:
-                names = {entry.name: entry.is_dir() for entry in entries}
-        except OSError as exc:
-            unreadable.append(_failure(f"{rel}/", exc))
-            continue
-        if rel != host and (LATEST_NAME in names or names.get(RUNS_DIR)):
-            dirs.append(rel)
-            continue
-        if depth >= HOST_SCAN_DEPTH:
-            continue
-        for name in sorted(names, reverse=True):
-            if names[name] and REPO_SEGMENT_RE.match(name) and name not in (os.curdir, os.pardir):
-                pending.append((f"{rel}/{name}", depth + 1))
+    try:
+        names = _subdirs(os.path.join(root, audit_id, host))
+    except OSError as exc:
+        unreadable.append(_failure(f"{host}/", exc))
+        return
+    for name in names:
+        parts = name.split(STORE_PATH_SEPARATOR)
+        if len(parts) >= 2 and all(
+            REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in parts
+        ):
+            dirs.append(f"{host}/{'/'.join(parts)}")
 
 
 def _repo_dirs(root: str, audit_id: str) -> list[str]:
@@ -220,7 +213,7 @@ def store_path(root: str, audit_id: str, repo: str) -> str:
     never walk out of it. Lower-cased, and laid out, as
     audit_report.reports_dir_for writes it: GitHub's names are not
     case-sensitive, so neither is the store; a repository on another forge is
-    `host/path` that many directories down; and GitHub named with its host
+    one directory below its host, the path spelled with `%2F`; and GitHub named with its host
     shares the bare slug's directory."""
     segments = str(repo).lower().split("/")
     if len(segments) == 3 and segments[0] == GITHUB_HOST:
@@ -231,6 +224,8 @@ def store_path(root: str, audit_id: str, repo: str) -> str:
         REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in segments
     ):
         raise ValueError(f"repository {repo!r} is not owner/name or host/path")
+    if len(segments) > 2:
+        segments = [segments[0], STORE_PATH_SEPARATOR.join(segments[1:])]
     return os.path.join(root, audit_id, *segments)
 
 

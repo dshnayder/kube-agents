@@ -1267,6 +1267,16 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
                 key, url, kind,
             )
             continue
+        if len(ref.segments) < MIN_REPOSITORY_DEPTH:
+            # As `_repository_keys` skips it on the broker side: one segment
+            # below the host is a group or namespace, and `host/group` would
+            # read downstream as a bare GitHub `owner/name`.
+            LOGGER.warning(
+                "Skipping %s repository %r: it names a group or namespace, not a "
+                "repository; register each repository in it by its own URL.",
+                key, url,
+            )
+            continue
         name = f"{ref.host}/{ref.path}"
         if name not in others:
             others.append(name)

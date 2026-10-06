@@ -13031,8 +13031,9 @@ class TestNoPullRequestOnGitLab(unittest.TestCase):
     Live on a GitLab install the ledger said "pull request" in a paragraph the
     per-section tests did not reach. So this renders a full ledger, with every
     section a real run can write, and every comment and reply the audit posts,
-    and reads all of it for the GitHub word -- then checks GitHub's text is the
-    same with the noun named as without it.
+    and reads all of it for the GitHub word. Then the same renders, for GitHub,
+    against `testdata/github_texts.golden.json`: what the code before the noun
+    was threaded through wrote, with the noun left out and with it named.
     """
 
     WORD = re.compile(r"pull[ -]request", re.IGNORECASE)
@@ -13048,7 +13049,10 @@ class TestNoPullRequestOnGitLab(unittest.TestCase):
             "commands": ["kubectl get networkpolicy -A -o json"],
         }
 
-    def texts(self, noun):
+    def texts(self, noun=None):
+        # `noun` only when named, so the same renders run on code that predates
+        # the parameter: that is how the GitHub golden below was made.
+        kw = {} if noun is None else {"noun": noun}
         findings = [
             manifest_finding("crit-open", "a.yaml"),
             manifest_finding("crit-pr", "b.yaml"),
@@ -13084,65 +13088,73 @@ class TestNoPullRequestOnGitLab(unittest.TestCase):
             held_overflow=2,
             held_carried=True,
             new_ids={"crit-open"},
-            noun=noun,
+            **kw,
         ).body
         out = [body]
         out.append(
             audit_report.render_delta_comment(
-                AUDIT, ["crit-open"], ["gone-1"], findings, {"gone-1": "Gone"}, NOW, gaps=gaps, noun=noun
+                AUDIT, ["crit-open"], ["gone-1"], findings, {"gone-1": "Gone"}, NOW, gaps=gaps, **kw
             )
         )
         empty = make_doc(findings=[])
         for clean_gaps in ([], gaps, [audit_report.LOST_MEMORY_GAP]):
-            out.append(audit_report.render_clean_comment(AUDIT, empty, NOW, gaps=clean_gaps, noun=noun))
+            out.append(audit_report.render_clean_comment(AUDIT, empty, NOW, gaps=clean_gaps, **kw))
         out.append(
             audit_report.render_held_comment(
-                AUDIT, empty, [self.held_entry(9)], NOW, collector=[], carried=[], noun=noun
+                AUDIT, empty, [self.held_entry(9)], NOW, collector=[], carried=[], **kw
             )
         )
         out.append(
             audit_report.render_remediation_pr_body(
-                AUDIT, findings[:2], issue_number=7, generated_at=NOW, noun=noun
+                AUDIT, findings[:2], issue_number=7, generated_at=NOW, **kw
             )
         )
-        out.append(audit_report.render_stale_close_comment(AUDIT, findings[:1], NOW, pr_number=3, noun=noun))
+        out.append(audit_report.render_stale_close_comment(AUDIT, findings[:1], NOW, pr_number=3, **kw))
         out.append(
             audit_report.render_stale_close_comment(
                 AUDIT,
                 findings[:1],
                 NOW,
                 pr_number=3,
-                reason=audit_report.SHARED_ACCOUNT_STALE_REASON.format(noun=noun),
-                noun=noun,
+                reason=audit_report.SHARED_ACCOUNT_STALE_REASON.format(noun=noun or "pull request"),
+                **kw,
             )
         )
-        out.append(audit_report.render_persists_comment(AUDIT, findings[2], NOW, noun))
+        out.append(audit_report.render_persists_comment(AUDIT, findings[2], NOW, **kw))
         request = {"author": "operator", "targets": ["crit-open"], "comment_id": "IC_9"}
         for mode in ({}, {"held": True}, {"lost_memory": True, "partial": True}):
             out.append(
                 audit_report.render_clean_remediate_answer(
-                    AUDIT, request, NOW, closing=False, noun=noun, **mode
+                    AUDIT, request, NOW, closing=False, **kw, **mode
                 )
             )
         comments = [
             {"id": "IC_1", "body": "/remediate crit-open", "authorAssociation": "NONE", "author": {"login": "stranger"}},
             {"id": "IC_2", "body": "/remediate major-g", "authorAssociation": "MEMBER", "author": {"login": "operator"}},
         ]
-        requests = audit_report.parse_remediate_commands(comments, findings, noun=noun)
+        requests = audit_report.parse_remediate_commands(comments, findings, **kw)
         out += [audit_report.render_refusal_comment(r, NOW) for r in requests.refusals]
         out += [
-            audit_report.collector_hold_reason("x", noun),
-            audit_report.collector_candidate_reason("x", noun),
-            audit_report.declared_reason("x", {"path": "intent.yaml"}, noun),
+            audit_report.collector_hold_reason("x", **kw),
+            audit_report.collector_candidate_reason("x", **kw),
+            audit_report.declared_reason("x", {"path": "intent.yaml"}, **kw),
         ]
         plan = audit_report.PromotionPlan([], [], [])
         outcomes = audit_report._remediation_outcomes(
-            audit_report.RemediateRequests(["crit-open"], [], {}), plan, {}, [], noun
+            audit_report.RemediateRequests(["crit-open"], [], {}), plan, {}, [], **kw
         )
-        out.append(audit_report.render_ack_comment("IC_2", ["crit-open"], outcomes, NOW, noun))
+        out.append(audit_report.render_ack_comment("IC_2", ["crit-open"], outcomes, NOW, **kw))
         with tempfile.TemporaryDirectory() as root:
-            out.append(str(audit_report.remediation_file_problem(findings[0], Path(root), noun)))
+            out.append(str(audit_report.remediation_file_problem(findings[0], Path(root), **kw)))
         return [text for text in out if text]
+
+    def test_github_writes_exactly_what_it_wrote_before_the_noun(self):
+        # Review: the docstring claimed this and no method checked it. The
+        # golden was rendered by this class's `texts()` on the code before the
+        # noun parameter existed, so it is the GitHub text as shipped.
+        golden = json.loads((Path(__file__).parent / "testdata" / "github_texts.golden.json").read_text())
+        self.assertEqual(golden, self.texts())
+        self.assertEqual(golden, self.texts("pull request"))
 
     def test_nothing_the_audit_writes_on_gitlab_says_pull_request(self):
         texts = self.texts("merge request")
@@ -13173,6 +13185,19 @@ class TestRefreshOnAnotherForge(unittest.TestCase):
         self.assertEqual(["acme/fleet"], self.refreshed("acme/fleet"))
 
 
+class TestRunRecordAcrossSpellings(BaseTestCase):
+    """Review: `start` records the lifted `github.com/owner/name` on an install
+    with a second forge, and a dry run's bare `--repo owner/name` read no record."""
+
+    def test_the_bare_and_the_host_qualified_github_name_read_one_record(self):
+        self.record_run(repo="github.com/acme/fleet")
+        self.assertIsNotNone(audit_report.read_run_record(DECLARING_AUDIT, "acme/fleet"))
+        self.assertIsNotNone(audit_report.read_run_record(DECLARING_AUDIT, "GitHub.com/Acme/Fleet"))
+        # Still one repository's record, not anyone's.
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "acme/other"))
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
+
+
 class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):
     """Content mode's file workspace clones GitHub only, and says so for another forge."""
 
@@ -13182,6 +13207,34 @@ class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):
         refusal = audit_report.content_workspace_refusal("gitlab.com/acme/infra")
         self.assertIn("clones GitHub repositories only", refusal)
         self.assertIn("ledger issue is unaffected", refusal)
+
+    def test_the_declared_intent_search_asks_before_it_clones(self):
+        # Review: the search was the one content-mode read with no up-front
+        # refusal, so the workspace's 400 surfaced as a clone that "exited 1".
+        audit_report.set_content_mode(True)
+        self.addCleanup(audit_report.set_content_mode, False)
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(audit_report, "_clone_for_search") as clone, \
+                contextlib.redirect_stderr(err):
+            result = audit_report.discover_declarations(
+                DECLARING_AUDIT, "gitlab.com/acme/infra", Path(tmp), []
+            )
+        clone.assert_not_called()
+        self.assertEqual(([], [], []), result)
+        self.assertIn("gitlab.com/acme/infra: not searched", err.getvalue())
+        self.assertIn("clones GitHub repositories only", err.getvalue())
+
+    def test_the_withheld_postures_gap_names_why_another_forge_was_not_searched(self):
+        gap = audit_report._declared_intent_gap({
+            audit_report.POSTURES_WITHHELD_KEY: {
+                "findings": [], "run_record": True,
+                "unsearched": ["gitlab.com/acme/infra", "acme/fleet"],
+            }
+        })
+        self.assertIn("gitlab.com/acme/infra (its forge's files cannot be read in content mode yet)", gap)
+        self.assertIn(", acme/fleet", gap)
+        self.assertNotIn("acme/fleet (", gap)
 
     def test_a_remediation_on_another_forge_opens_no_workspace(self):
         client = type(sys)("credential_proxy_client")
@@ -13254,7 +13307,7 @@ class TestLedgerStoreForNestedPaths(unittest.TestCase):
 
     def test_a_nested_gitlab_path_is_that_many_directories_down(self):
         self.assertEqual(
-            Path(self.root, "compliance-audit", "gitlab.com", "acme", "platform", "infra"),
+            Path(self.root, "compliance-audit", "gitlab.com", "acme%2Fplatform%2Finfra"),
             audit_report.reports_dir_for("compliance-audit", "gitlab.com/Acme/platform/infra"),
         )
 

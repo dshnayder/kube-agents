@@ -1758,6 +1758,32 @@ class LiftedNameReachesTheBrokerTest(unittest.TestCase):
                 submit_suggestion.handle_prepare(args)
         self.assertEqual(["github.com/acme/fleet"], seen)
 
+    def test_submit_asks_the_broker_with_the_lifted_name(self):
+        # Review: only `prepare` was pinned; reverting `submit`'s
+        # `repo = validate_repo(repo)` left the suite green, and the broker
+        # refuses the bare name once it serves a second forge.
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        session = {"spec": "acme/fleet", "path": "/scratch/acme__fleet", "key": "platform-agent/x"}
+        args = argparse.Namespace(
+            repo="acme/fleet", branch="platform-agent/x", title="t", body="b",
+            body_file=None, keep_description=False,
+        )
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion.vcs_client, "resolve_session", return_value=session), \
+                mock.patch.object(submit_suggestion.vcs_client, "key_of", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion.vcs_client, "current_branch", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_submit(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -188,8 +188,9 @@ user asked for a specific repository that is not yet registered, instruct the us
 administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
 gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
 (`gitlab.com/acme/platform/infra`). In content mode, a repository on another forge gets its ledger,
-but its remediation files cannot be read or published yet: the broker's file workspace clones GitHub
-only, and `fetch`, `list`, `grep` and the remediation step say so rather than fail mid-way. It
+but its files cannot be read or published yet: the broker's file workspace clones GitHub only, and
+`fetch`, `list`, `grep`, the remediation step and the declared-intent search say so rather than fail
+mid-way. It
 creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 

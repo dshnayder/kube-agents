@@ -502,6 +502,10 @@ ROOT_UID = 0
 # directory under its stream's.
 REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 
+#: How a store directory below a host spells the `/` between path segments.
+#: Kept equal to `report_status.STORE_PATH_SEPARATOR`, which reads it back.
+STORE_PATH_SEPARATOR = "%2F"
+
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
 # re-propose a fix it withdrew on its own: strip the label and the close becomes
@@ -2018,8 +2022,11 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     # directories for it would each trust a memory the other has moved past.
     #
     # A repository on another forge is named `host/path` at any depth, and its
-    # store is that many directories down: a GitHub owner has no dot in it, so
-    # `gitlab.com/acme/infra` cannot land on a GitHub owner's directory. GitHub
+    # store is one directory below the host, the path with each `/` spelled
+    # `%2F` -- the layout the workspace directories use. Not one directory per
+    # segment: a reader then has to guess where a store starts, and a project
+    # or group named `runs` reads as one. A GitHub owner has no dot in it, so
+    # `gitlab.com/...` cannot land on a GitHub owner's directory. GitHub
     # named with its host, as an install managing two forges names it, keeps
     # the bare slug's directory; `read_report_memory` compares the stored name
     # through `_ledger_key` so the memory in it carries over too.
@@ -2034,6 +2041,8 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     ):
         raise ValueError(f"repository {repo!r} is not owner/name or host/path")
     root = Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR)
+    if len(segments) > 2:
+        segments = [segments[0], STORE_PATH_SEPARATOR.join(segments[1:])]
     return root.joinpath(audit_id, *segments)
 
 
@@ -4756,7 +4765,15 @@ def _declared_intent_gap(data: dict) -> str | None:
     findings = list(held.get("findings") or [])
     unsearched = [str(slug) for slug in held.get("unsearched") or []]
     if held.get("run_record"):
-        where = f"repositories not searched: {', '.join(unsearched)}"
+        # A repository the content workspace cannot open says so, rather than
+        # reading like a search that failed.
+        named_unsearched = [
+            f"{slug} (its forge's files cannot be read in content mode yet)"
+            if content_workspace_refusal(slug) is not None
+            else slug
+            for slug in unsearched
+        ]
+        where = f"repositories not searched: {', '.join(named_unsearched)}"
     else:
         where = "no run record from `start`, so every repository counts as unsearched"
     if findings:
@@ -10404,8 +10421,9 @@ def content_workspace_refusal(repo: str) -> str | None:
         return None
     return (
         f"{repo} is on {host}, and the broker's file workspace clones GitHub "
-        "repositories only, so its remediation files cannot be read or "
-        "published in content mode yet. The ledger issue is unaffected."
+        "repositories only, so its files -- remediation targets and declared "
+        "intent alike -- cannot be read or published in content mode yet. The "
+        "ledger issue is unaffected."
     )
 
 
@@ -10989,7 +11007,10 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     context = data.get("context_repos")
     if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
         return None
-    if repo and recorded.strip().lower() != repo.strip().lower():
+    # Through `_ledger_key`: `start` records the name it resolved, which on an
+    # install with a second forge is `github.com/owner/name`, while a dry run
+    # takes `--repo` as given -- the bare `owner/name` the SKILL prescribes.
+    if repo and _ledger_key(recorded.strip()) != _ledger_key(repo.strip()):
         return None
     searched = data.get(RUN_RECORD_SEARCHED_KEY)
     sources = data.get(RUN_RECORD_SOURCES_KEY)
@@ -11480,6 +11501,13 @@ def discover_declarations(
                     log(f"WARNING: {slug}: no commit sha for the checkout; not searched.")
                     continue
             else:
+                # Asked before the clone, as `fetch`, `list`, `grep` and the
+                # remediation step ask it: otherwise the workspace's own
+                # refusal surfaces as a clone that "exited 1".
+                refusal = content_workspace_refusal(slug)
+                if refusal is not None:
+                    log(f"WARNING: {slug}: not searched. {refusal}")
+                    continue
                 into = Path(tempfile.mkdtemp(prefix=CLONE_TMP_PREFIX, dir=SCRATCH_DIR))
                 copied = _clone_for_search(slug, ref, audit_id, into)
                 if copied is None:
