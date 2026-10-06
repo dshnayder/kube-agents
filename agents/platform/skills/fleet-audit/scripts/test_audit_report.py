@@ -15,6 +15,7 @@ import copy
 import fnmatch
 import importlib.util
 import io
+import argparse
 import json
 import fcntl
 import os
@@ -13356,6 +13357,26 @@ class TestRemediateReplyNamesTheRefusal(unittest.TestCase):
         self.assertNotIn("will retry", outcomes["f1"])
         self.assertEqual("", audit_report.remediation_refusal("github.com/acme/fleet"))
         self.assertEqual("", audit_report.remediation_refusal("acme/fleet"))
+
+
+class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
+    """Review round 4: `remediate --finding` on a repository on another forge
+    printed `status: REMEDIATED` with nothing opened and no reason."""
+
+    def test_the_command_refuses_with_the_reason_before_it_plans(self):
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                args = argparse.Namespace(
+                    audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+                    finding=["f1"], dry_run=dry_run, manifest_file=None, issue=None,
+                )
+                with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                        patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "read_run_record",
+                                     side_effect=AssertionError("planned past the refusal")):
+                    with self.assertRaises(audit_report.ValidationError) as caught:
+                        audit_report.handle_remediate(args)
+                self.assertIn("GitHub repositories only", str(caught.exception))
 
 
 class TestLedgerStoreForNestedPaths(unittest.TestCase):

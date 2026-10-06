@@ -12380,6 +12380,13 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # back for want of a declared-intent search, and a pull request for one of
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    # Where no proposal can be published, say so before planning one: the
+    # other surfaces refuse up front, and a run that reached the push would
+    # report REMEDIATED with nothing opened and the reason only in the log. A
+    # dry run named for such a repository would preview a body no run sends.
+    refusal = remediation_refusal(repo_hint) if repo_hint else ""
+    if refusal:
+        raise ValidationError(refusal)
     record = read_run_record(audit_id, repo=repo_hint)
     # The same hold `finish` applies from the collector manifest, when the
     # caller has one. An id the document lacks and the collector still flags

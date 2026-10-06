@@ -1082,6 +1082,21 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
     return _parse_repos_json(repos_str, key)
 
 
+def mounted_repo_entries(key: str) -> list[dict[str, str]]:
+    """One repository list from the mounted state file only; [] without one.
+
+    For a caller on a hot path that must not shell out: no kubectl fallback,
+    and an unreadable or absent file answers empty rather than raising.
+    """
+    state_file = _state_key_path(key)
+    if not state_file.is_file():
+        return []
+    try:
+        return _parse_repos_json(state_file.read_text(encoding="utf-8"), key)
+    except Exception:  # noqa: BLE001 - empty is the documented answer
+        return []
+
+
 def get_managed_repo_entries() -> list[dict[str, str]]:
     """Reads managed repos from the mounted state file or falls back to ConfigMap via kubectl."""
     return _read_state_key(MANAGED_REPOS_KEY)

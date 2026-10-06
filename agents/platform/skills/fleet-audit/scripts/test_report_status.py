@@ -401,6 +401,15 @@ class TestNestedStores(ReportStatusTestCase):
     """Review: the reader listed two levels and refused anything but owner/name,
     so a stream's store for a repository on another forge was unreadable."""
 
+    def test_every_spelling_keys_to_the_name_the_scanner_lists(self):
+        for typed, key in (
+            ("acme/fleet", "acme/fleet"),
+            ("GitHub.com/Acme/Fleet", "acme/fleet"),
+            ("gitlab.com/acme/platform/infra", "gitlab.com/acme/platform/infra"),
+        ):
+            with self.subTest(typed=typed):
+                self.assertEqual(key, report_status.store_key("/r", "compliance-audit", typed))
+
     def test_a_store_at_any_depth_below_a_host_is_listed_and_opened(self):
         self.write_latest(repo="gitlab.com/acme/platform/infra")
         self.write_latest(repo="acme/fleet")

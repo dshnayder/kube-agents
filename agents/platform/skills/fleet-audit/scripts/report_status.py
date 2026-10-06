@@ -238,6 +238,19 @@ def store_path(root: str, audit_id: str, repo: str) -> str:
     return os.path.join(root, audit_id, *segments)
 
 
+def store_key(root: str, audit_id: str, repo: str) -> str:
+    """The name `scan_repo_dirs` lists for the store `store_path` opens.
+
+    Every spelling `store_path` accepts for one repository -- bare `owner/name`,
+    `github.com/owner/name`, any casing -- maps to one directory, and this is
+    that directory's name as the scanner spells it. A reader comparing a typed
+    name against the listing compares this, so the two spellings cannot
+    disagree about whether the store is there. ValueError as `store_path`.
+    """
+    rel = os.path.relpath(store_path(root, audit_id, repo), os.path.join(root, audit_id))
+    return rel.replace(os.sep, "/").replace(STORE_PATH_SEPARATOR, "/")
+
+
 def in_flight_ids(scratch: str) -> list[str]:
     """Every stream with an in-flight note, sorted; [] when there is none.
 
