@@ -37,7 +37,9 @@ def main(argv: list[str]) -> int:
             token = handle.read().strip()
     except OSError:
         return 0
-    if not token or "\n" in token:
+    # The rule `providers.credentials.is_token` applies, kept in step by hand:
+    # this script imports nothing of the broker's.
+    if not (token and token.isascii() and token.isprintable() and " " not in token):
         return 0
     sys.stdout.write(f"username={username}\npassword={token}\n")
     return 0

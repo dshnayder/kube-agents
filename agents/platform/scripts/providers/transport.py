@@ -270,6 +270,9 @@ _READ_CHUNK_BYTES = 64 * 1024
 # the socket to get there.
 _ERROR_BODY_BYTES = 16 * 1024
 
+#: How deep `_http_detail` looks for a reason inside an error body.
+_DETAIL_DEPTH = 8
+
 
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     """A 3xx is an answer, not a hop.
@@ -282,6 +285,24 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
         return None
+
+
+def _settimeout(response: Any, seconds: float) -> None:
+    """Shorten the socket timeout under a response to `seconds`, if it has one.
+
+    `http.client` keeps the socket two private attributes down (`fp.raw._sock`;
+    an `HTTPError` holds the response one level further, as `fp`). Where the
+    chain is not there -- a test double, or a future `http.client` -- the
+    opener's timeout still bounds each receive and the deadline is still
+    checked between them.
+    """
+    node = response
+    for _ in range(2):
+        sock = getattr(getattr(getattr(node, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(seconds)
+            return
+        node = getattr(node, "fp", None)
 
 
 def _http_detail(text: str) -> str:
@@ -298,15 +319,21 @@ def _http_detail(text: str) -> str:
         body = None
     reasons: list[str] = []
 
-    def collect(value: Any, prefix: str = "") -> None:
+    def collect(value: Any, prefix: str = "", depth: int = 0) -> None:
+        # Bounded, because `json.loads` accepts nesting deeper than Python's
+        # frame limit: a body it parsed can still overflow a walk of it, and
+        # the overflow would cost the refusal its status. No forge nests a
+        # reason this deep.
+        if depth > _DETAIL_DEPTH:
+            return
         if isinstance(value, str) and value.strip():
             reasons.append(f"{prefix}{value.strip()}")
         elif isinstance(value, list):
             for item in value:
-                collect(item, prefix)
+                collect(item, prefix, depth + 1)
         elif isinstance(value, dict):
             for key, item in value.items():
-                collect(item, f"{key}: ")
+                collect(item, f"{key}: ", depth + 1)
 
     if isinstance(body, dict):
         for key in ("message", "error", "error_description", "errors"):
@@ -392,8 +419,7 @@ class HttpTransport:
             with self._open(request, timeout=self._timeout) as response:
                 payload = self._read_within(response, deadline)
         except urllib.error.HTTPError as exc:
-            text = (exc.read(_ERROR_BODY_BYTES) or b"").decode("utf-8", "replace")
-            return self._refused(exc.code, text)
+            return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
             raise
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
@@ -415,24 +441,53 @@ class HttpTransport:
                 code="FORGE_CALL_FAILED",
             ) from exc
 
-    def _read_within(self, response: Any, deadline: float) -> bytes:
+    def _error_text(self, exc: urllib.error.HTTPError, deadline: float) -> str:
+        """What a refusal said, read under the same deadline as an answer.
+
+        Best-effort: the status is the refusal, and the body only explains
+        it. So a body that stalls, breaks off or resets yields what arrived
+        rather than an exception -- raised here, inside the `except
+        HTTPError` handler, none of the call's own failure handling would
+        see it, and the forge's status would be lost to a bare 500.
+        """
+        try:
+            payload = self._read_within(exc, deadline, cap=_ERROR_BODY_BYTES)
+        except (WorkspaceError, http.client.HTTPException, OSError, ValueError):
+            payload = b""
+        return payload.decode("utf-8", "replace")
+
+    def _read_within(self, response: Any, deadline: float, cap: int | None = None) -> bytes:
         """The body, read in chunks until EOF, the ceiling, or the deadline.
 
         `read1` returns what one receive brought rather than waiting for a
-        whole chunk, so the deadline is checked between receives, and the
-        ceiling refuses an oversized answer as soon as it is crossed rather
-        than after the whole body has arrived.
+        whole chunk, and the socket's timeout is re-armed with what is left
+        of the deadline before each one, so no single receive outlasts it.
+        The ceiling refuses an oversized answer as soon as it is crossed
+        rather than after the whole body has arrived; `cap` instead stops
+        there and returns what it has, for a body that is only explanation.
+
+        `read1` answers `b""` at EOF without raising, so a body the peer cut
+        short of its `Content-Length` would otherwise come back as the whole
+        answer -- a truncated diff handed over as the diff. `length` is what
+        `http.client` still expected; anything left is a broken answer.
         """
         read = getattr(response, "read1", None) or response.read
         chunks: list[bytes] = []
         size = 0
         while True:
-            if time.monotonic() > deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 raise forge_error(0, f"the forge's answer took longer than {self._timeout:g}s")
+            _settimeout(response, left)
             chunk = read(_READ_CHUNK_BYTES)
             if not chunk:
+                if getattr(response, "length", None):
+                    raise forge_error(0, "the forge closed the connection before its answer was complete")
                 return b"".join(chunks)
             size += len(chunk)
+            if cap is not None and size >= cap:
+                chunks.append(chunk)
+                return b"".join(chunks)[:cap]
             if size > self._max_bytes:
                 raise WorkspaceError(
                     f"the forge's answer is larger than this broker accepts ({self._max_bytes} bytes)",

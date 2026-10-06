@@ -230,7 +230,10 @@ class Registry:
             )
         forge = self.hosts.get(host) if host else self.default
         if forge is None:
-            known = ", ".join(sorted(self.hosts)) or "none"
+            # The forges built, not every host in the table: a placeholder for
+            # an unconfigured forge is in the table so it can name its gap,
+            # and listing it here would call it configured.
+            known = ", ".join(sorted(h for f in self.forges for h in f.hosts)) or "none"
             raise ForgeUnsupported(
                 f"{host or 'a bare owner/name'} is not a forge this install "
                 f"serves. Configured: {known}."

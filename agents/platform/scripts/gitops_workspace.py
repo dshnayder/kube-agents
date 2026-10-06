@@ -1038,7 +1038,9 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
             item = f"{ref.host}/{'/'.join(ref.segments)}" if ref and ref.host else None
         if not item:
             LOGGER.warning(
-                "Skipping %s repository %r: no host and path to key it by.", key, url
+                "Skipping %s repository %r: no host and path to key it by. "
+                "Register a %s repository by its URL (https://<host>/<path>).",
+                key, url, kind,
             )
             continue
         item = f"{kind}:{item.lower()}"

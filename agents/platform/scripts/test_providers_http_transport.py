@@ -193,6 +193,35 @@ class BoundsTest(unittest.TestCase):
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
         self.assertIn("longer than 30s", caught.exception.fields["detail"])
 
+    def test_a_body_cut_short_of_its_length_is_a_call_failure_not_the_answer(self):
+        # Review round 2: `read1` answers b"" at EOF without raising, so a
+        # diff the peer cut short came back as the whole diff.
+        class CutShort(_Response):
+            length = 40  # what http.client still expected when the peer closed
+
+        for raw in (None, "text/plain"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(CutShort(b"diff --git a/x"))).api("GET", "diff", raw=raw)
+                self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+                self.assertIn("before its answer was complete", caught.exception.fields["detail"])
+
+    def test_each_receive_is_bounded_by_what_is_left_of_the_deadline(self):
+        # Review round 2: the opener's full timeout bounded every receive, so
+        # one byte just inside the deadline bought another whole window.
+        armed = []
+
+        class Sock:
+            def settimeout(self, seconds):
+                armed.append(seconds)
+
+        response = _Response(b"{}")
+        response.fp = mock.Mock(raw=mock.Mock(_sock=Sock()))
+        clock = iter([0.0, 4.0, 6.0])
+        with mock.patch("providers.transport.time.monotonic", lambda: next(clock)):
+            transport(Opener(response), timeout=7.0).api("GET", "projects")
+        self.assertEqual([3.0, 1.0], armed)
+
     def test_the_ceiling_refuses_before_the_whole_body_arrives(self):
         reads = []
 
@@ -243,6 +272,33 @@ class RefusalTest(unittest.TestCase):
         with self.assertRaises(WorkspaceError) as caught:
             transport(Opener(_Response(deep.encode())), max_bytes=1 << 20).api("GET", "projects")
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+
+    def test_a_body_the_parser_accepts_but_nests_past_the_frame_limit_keeps_the_status(self):
+        # Review round 2: the C scanner's nesting budget is larger than
+        # Python's frame limit, so this parses -- and the walk overflowed.
+        deep = "[" * 1_500 + '"why"' + "]" * 1_500
+        self.assertEqual("FORGE_NOT_FOUND", self.refuse(404, deep).fields["code"])
+
+    def test_a_refusal_whose_body_breaks_off_or_stalls_keeps_its_status(self):
+        # Review round 2: the error body was read outside the deadline and
+        # outside the failure handling, so a reset or a stall became a bare
+        # exception and the forge's status was lost.
+        class Broken(io.BytesIO):
+            def read1(self, n=-1):
+                raise ConnectionResetError("reset")
+
+        class Trickle(io.BytesIO):
+            def read1(self, n=-1):
+                return b" "
+
+        for body in (Broken(b""), Trickle(b"")):
+            with self.subTest(body=type(body).__name__):
+                exc = urllib.error.HTTPError(f"{BASE}/x", 404, "refused", {}, body)
+                clock = iter(range(0, 10_000, 5))
+                with mock.patch("providers.transport.time.monotonic", lambda: next(clock)):
+                    with self.assertRaises(WorkspaceError) as caught:
+                        transport(Opener(exc), timeout=30.0).api("GET", "projects/1")
+                self.assertEqual("FORGE_NOT_FOUND", caught.exception.fields["code"])
 
     def test_a_forge_override_is_applied(self):
         named = providers.Guidance(401, "FORGE_TOKEN_EXPIRED", "the token in Secret x expired")

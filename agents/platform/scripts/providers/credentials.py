@@ -211,6 +211,16 @@ _HELPER_ARGUMENT_RE = re.compile(r"[A-Za-z0-9._/-]+")
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?")
 
 
+
+def is_token(token: str) -> bool:
+    """Whether a token file's stripped contents can be a token at all.
+
+    One line of printable ASCII with no spaces: what every forge issues, and
+    the only thing an HTTP header carries unchanged. Kept in step by hand with
+    `git_credential_token_file.py`, which cannot import it.
+    """
+    return bool(token) and token.isascii() and token.isprintable() and " " not in token
+
 class StaticFileCredential:
     """A long-lived token an administrator put in a Secret, read from its file.
 
@@ -270,12 +280,15 @@ class StaticFileCredential:
                 status=503,
                 code="FORGE_CREDENTIAL_UNAVAILABLE",
             ) from exc
-        if not token or "\n" in token or "\r" in token:
-            # Empty, or more than one line: neither is a token, and a second
-            # line would split the credential's two faces -- an invalid header
-            # on the API side, nothing from the git helper on the other.
+        if not is_token(token):
+            # Empty, more than one line, or carrying a character no forge
+            # token has -- a byte-order mark, a smart quote from a copy-paste.
+            # None is a token, and each splits the credential's two faces: an
+            # invalid header on the API side, a 401 or nothing from the git
+            # helper on the other. Refused here, by the same rule the helper
+            # applies, so both faces say the same thing.
             raise WorkspaceError(
-                f"the forge credential for {self._host} is empty or is not one line",
+                f"the forge credential for {self._host} is empty or is not one line of printable ASCII",
                 status=503,
                 code="FORGE_CREDENTIAL_UNAVAILABLE",
             )

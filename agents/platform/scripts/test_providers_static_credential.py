@@ -58,7 +58,12 @@ class CredentialTest(unittest.TestCase):
     def test_a_missing_or_empty_file_is_refused_not_sent_anonymously(self):
         # Review finding: a second line passed, then failed as an invalid
         # header on the API side and as nothing at all from the git helper.
-        for content in (None, "", "  \n", "glpat-a\nglpat-b\n", "glpat-a\rx"):
+        # Review round 2: a byte-order mark or a copy-pasted non-ASCII
+        # character passed and died as a bare 500 inside the header encoder.
+        for content in (
+            None, "", "  \n", "glpat-a\nglpat-b\n", "glpat-a\rx",
+            "\ufeffglpat-a\n", "glpat\u2011a", "glpat a",
+        ):
             with self.subTest(content=content):
                 if content is None:
                     self.token.unlink(missing_ok=True)
@@ -149,6 +154,15 @@ class GitAsksTheHelperTest(unittest.TestCase):
         done = self.fill("github.com")
         self.assertNotIn("glpat-secret", done.stdout)
         self.assertNotIn("ambient-write-token", done.stdout)
+
+    def test_a_token_the_api_side_refuses_gives_git_nothing_either(self):
+        # Review round 2: the helper still passed a carriage return (and a
+        # byte-order mark) that `_token()` refuses, splitting the two faces.
+        for content in ("glpat-a\rx\n", "\ufeffglpat-a\n"):
+            with self.subTest(content=content):
+                self.token.write_text(content, encoding="utf-8")
+                done = self.fill(HOST, ambient=False)
+                self.assertNotIn("password=", done.stdout)
 
     def test_a_missing_file_gives_git_nothing_rather_than_a_traceback(self):
         self.token.unlink()

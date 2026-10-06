@@ -98,8 +98,11 @@ class ConfigurationFileTest(_ConfigCase):
         registry = providers.Registry()
         self.assertEqual((), registry.forges)
         self.assertIsNone(registry.default)
-        with self.assertRaises(ForgeUnsupported):
+        with self.assertRaises(ForgeUnsupported) as caught:
             registry.resolve("acme/infra")
+        # Review round 2: the placeholders for unconfigured forges were
+        # listed as configured, pointing the operator at the wrong thing.
+        self.assertIn("Configured: none", str(caught.exception))
 
     def test_an_enterprise_host_is_refused_until_it_is_served(self):
         self.configure({"forges": [{"provider": "github", "host": "github.example.com"}]})
