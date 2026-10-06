@@ -33,12 +33,16 @@ ACKNOWLEDGEABLE = frozenset({CONVERSATION, DIFF_NOTE})
 #: How GitLab names the bot user behind a project or group access token.
 #: `bot` is on the user object only on some endpoints, so the name is the
 #: fallback the comment readers can always apply.
-_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+)?$")
+#: Current instances name them `project_<id>_bot_<hex>`; older ones numbered
+#: each further token's user `project_<id>_bot1`, `_bot2`, and kept the names.
+_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+|\d+)?$")
 
-#: What GitLab puts in front of a draft's title. Reported as `draft`, and kept
-#: in `title` as GitLab returns it, because a caller that compares a title it
-#: wrote with the one it reads back wrote the prefix too.
-DRAFT_PREFIXES = ("Draft:", "[Draft]", "(Draft)", "WIP:", "[WIP]")
+#: The title prefixes GitLab reads as a draft, case-blind. Reported as
+#: `draft`, and kept in `title` as GitLab returns it, because a caller that
+#: compares a title it wrote with the one it reads back wrote the prefix too.
+#: `WIP:` is not here: GitLab stopped reading it in 16.0, so a title that
+#: starts with it still needs `Draft:` in front to be one.
+DRAFT_PREFIXES = ("Draft:", "[Draft]", "(Draft)")
 
 
 def is_draft_title(title: str) -> bool:

@@ -108,6 +108,24 @@ class ConfigurationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             GitLabForge.for_config({"forges": [{"provider": "gitlab", "host": "gitlab.com"}]})
 
+    def test_the_whole_host_is_allowed_only_when_asked_for(self):
+        # Review: omitting allowedPaths silently granted the whole host.
+        with self.assertRaises(ValueError) as caught:
+            GitLabForge.for_config({"forges": [{"provider": "gitlab", "host": "gitlab.com", "token_path": "/t"}]})
+        self.assertIn("[] for the whole host", str(caught.exception))
+        whole = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": "/t", "allowed_paths": ()},
+        ]})
+        self.assertEqual((), whole[0].allowed_paths)
+
+    def test_an_allowed_path_no_repository_can_have_stops_the_build(self):
+        # Review: `acme//infra` or ` acme` matched nothing and refused every
+        # repository on the host, one request at a time.
+        for bad in ("acme//infra", " acme", "acme/in fra"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    GitLabForge("gitlab.com", "/t", (bad,))
+
     def test_the_token_is_read_from_the_file_into_private_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             token = Path(tmp) / "token"
@@ -127,6 +145,7 @@ class ProposalTest(unittest.TestCase):
             ("Pin the image", "Draft: Pin the image"),
             ("Draft: Pin", "Draft: Pin"),
             ("draft: Pin", "draft: Pin"),  # GitLab matches the prefix case-blind
+            ("WIP: Pin", "Draft: WIP: Pin"),  # GitLab stopped reading WIP in 16.0
         ):
             with self.subTest(title=title):
                 api = Api(mr(title=sent, draft=True))
@@ -153,7 +172,7 @@ class ProposalTest(unittest.TestCase):
     def test_the_diff_falls_back_to_the_json_diffs_until_gitlab_has_computed_it(self):
         api = Api(
             mr(),
-            WorkspaceError("not ready", status=502),
+            WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"),
             [{"old_path": "a.yaml", "new_path": "a.yaml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}],
         )
         answer = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
@@ -164,6 +183,32 @@ class ProposalTest(unittest.TestCase):
         api = Api(mr(), WorkspaceError("forbidden", status=403))
         with self.assertRaises(WorkspaceError):
             forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+
+    def test_the_brokers_own_refusal_of_a_diff_is_not_refetched_page_by_page(self):
+        # Review: a raw diff over the ceiling (or past the deadline) is a 502
+        # the transport made, and the fallback fetched the same diff again.
+        for code in ("FORGE_RESPONSE_TOO_LARGE", "FORGE_CALL_FAILED"):
+            with self.subTest(code=code):
+                api = Api(mr(), WorkspaceError("refused", status=502, code=code))
+                with self.assertRaises(WorkspaceError):
+                    forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+                self.assertEqual(2, len(api.calls))
+
+    def test_the_assembled_fallback_stops_at_its_own_ceiling(self):
+        big = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "x" * 50_000} for i in range(100)]
+        api = Api(mr(), WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"), big)
+        with mock.patch.object(GitLabForge, "DIFF_FALLBACK_CHARS", 1_000_000):
+            diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertIn("diff cut short: stopped after", diff)
+        self.assertEqual(3, len(api.calls))
+
+    def test_a_label_gitlab_reads_as_a_keyword_is_refused_in_a_filter(self):
+        # Review: `labels=None` lists unlabelled items, the wrong set, silently.
+        for verb, field in (("issue_list", "labels"), ("issue_list", "excludeLabels"), ("proposal_list", "labels")):
+            for name in ("None", "any"):
+                with self.subTest(verb=verb, field=field, name=name):
+                    with self.assertRaises(WorkspaceError):
+                        getattr(forge(), verb)(Api(), "acme/infra", {field: [name]})
 
     def test_an_instance_older_than_raw_diffs_falls_back_and_a_missing_mr_still_fails(self):
         files = [{"old_path": "a.yaml", "new_path": "a.yaml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}]
@@ -178,12 +223,12 @@ class ProposalTest(unittest.TestCase):
     def test_the_diff_fallback_reads_every_page_and_names_what_it_left_out(self):
         page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(100)]
         big = [{"old_path": "huge.bin", "new_path": "huge.bin", "diff": "", "too_large": True}]
-        api = Api(mr(), WorkspaceError("not ready", status=502), page, big)
+        api = Api(mr(), WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"), page, big)
         diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
         self.assertEqual([1, 2], [call[2]["page"] for call in api.calls[2:]])
         self.assertIn("diff --git a/f99 b/f99", diff)
         self.assertIn("did not include the changes to huge.bin", diff)
-        capped = Api(mr(), WorkspaceError("not ready", status=502), *([page] * GitLabForge.DIFF_PAGES))
+        capped = Api(mr(), WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"), *([page] * GitLabForge.DIFF_PAGES))
         self.assertIn("diff cut short", forge().proposal_view(capped, "acme/infra", {"number": 1, "diff": True})["diff"])
 
     def test_an_update_that_changes_nothing_reads_instead_of_writing(self):
@@ -312,12 +357,13 @@ class TranslationTest(unittest.TestCase):
             for i, author in enumerate([
                 {"username": "project_1001_bot_3f2a"},
                 {"username": "group_42_bot"},
+                {"username": "project_1001_bot2"},  # an older instance's numbering
                 {"username": "x", "bot": True},
                 {"username": "kube-agents-eval-bot"},
             ])
         ]
         answer = forge().issue_view(Api({"iid": 1, "state": "opened"}, notes), "acme/infra", {"number": 1, "comments": True})
-        self.assertEqual([True, True, True, False], [c["bot"] for c in answer["comments"]])
+        self.assertEqual([True, True, True, True, False], [c["bot"] for c in answer["comments"]])
 
     def test_states_and_iids(self):
         cases = (
@@ -388,7 +434,7 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("no credential is configured for gitlab.com", str(caught.exception))
 
     def test_a_configured_self_managed_gitlab_leaves_gitlab_com_a_gap(self):
-        self.configure([{"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t"}])
+        self.configure([{"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t", "allowedPaths": []}])
         registry = providers.Registry()
         self.assertEqual(1, len(registry.forges))
         stub, _ = registry.resolve("https://gitlab.com/acme/infra")
@@ -398,7 +444,7 @@ class RegistryTest(unittest.TestCase):
     def test_github_and_gitlab_resolve_by_host_and_a_bare_name_by_neither(self):
         self.configure([
             {"provider": "github", "host": "github.com"},
-            {"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t"},
+            {"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/t", "allowedPaths": []},
         ])
         registry = providers.Registry()
         self.assertEqual("gitlab", registry.resolve("https://gitlab.example.com/acme/infra")[0].name)
@@ -408,7 +454,7 @@ class RegistryTest(unittest.TestCase):
             registry.resolve("acme/infra")
 
     def test_a_gitlab_only_install_keeps_the_bare_name(self):
-        self.configure([{"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t"}])
+        self.configure([{"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []}])
         forge_, repo = providers.Registry().resolve("acme/infra")
         self.assertEqual(("gitlab", "acme/infra"), (forge_.name, repo))
 

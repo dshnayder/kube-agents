@@ -876,6 +876,32 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     return forge.read_credential(repo)
 
 
+#: The one forge the content workspace clones from.
+CONTENT_WORKSPACE_PROVIDER = "github"
+
+
+def _hosted(repository: object, provider: str) -> object:
+    """A bare `owner/name` put on ``provider``'s host; anything else unchanged.
+
+    For callers that know their forge but were handed a name without a host:
+    the content workspace, which is GitHub by construction, and the
+    `/v1/github/refresh` alias, which older agent images call with a bare slug.
+    With one forge the registry would have read the name the same way; with
+    two it refuses a hostless name, rightly for a caller that does not know
+    which forge it means. A provider this install did not build leaves the
+    name as it was, for the registry to refuse in its own words.
+    """
+    if not provider or not isinstance(repository, str):
+        return repository
+    if "://" in repository or repository.count("/") != 1:
+        return repository
+    try:
+        host = _provider_forge(provider).hosts[0]
+    except (PermissionError, IndexError):
+        return repository
+    return f"https://{host}/{repository}"
+
+
 def require_managed_workspace(store, handle: object) -> None:
     """Refuse a workspace write to a repository this install does not manage.
 
@@ -899,7 +925,11 @@ def require_managed_workspace(store, handle: object) -> None:
 
     repository = store.get(handle).repo
     try:
-        permitted = repository_is_managed(repository)
+        # The content workspace clones `https://github.com/<owner>/<name>` and
+        # nothing else, so its repository is GitHub's whatever else the install
+        # serves. Asked of the GitHub forge by name: with a second forge there
+        # is no install-wide default to fall back on.
+        permitted = repository_is_managed(repository, _provider_forge(CONTENT_WORKSPACE_PROVIDER))
     except Exception as exc:
         LOGGER.warning(
             "refusing a workspace write: the managed-repository list could not "
@@ -5170,7 +5200,12 @@ def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
         executor.workspace_dir,
         executor.execute_workspace_git,
         base_branch=base_branch,
-        credential_for=lambda repository: read_credential_for(registry, repository),
+        # Lifted to the host the workspace clones from, for the reason
+        # `require_managed_workspace` gives: a bare name does not resolve once
+        # the install serves a second forge.
+        credential_for=lambda repository: read_credential_for(
+            registry, _hosted(repository, CONTENT_WORKSPACE_PROVIDER)
+        ),
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
@@ -6800,7 +6835,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
-            forge, repository = forge_registry().resolve(payload.get("repository"))
+            forge, repository = forge_registry().resolve(
+                _hosted(payload.get("repository"), provider)
+            )
             named = provider or payload.get("provider") or forge.name
             if named != forge.name:
                 raise ValueError(

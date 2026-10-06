@@ -104,6 +104,14 @@ class ConfigurationFileTest(_ConfigCase):
         # listed as configured, pointing the operator at the wrong thing.
         self.assertIn("Configured: none", str(caught.exception))
 
+    def test_absent_allowed_paths_are_kept_apart_from_an_empty_list(self):
+        self.configure({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "testforge", "host": "a.example.com", "allowedPaths": []},
+        ]})
+        entries = registry_module.load_forge_entries()
+        self.assertEqual([None, ()], [e["allowed_paths"] for e in entries])
+
     def test_an_enterprise_host_is_refused_until_it_is_served(self):
         self.configure({"forges": [{"provider": "github", "host": "github.example.com"}]})
         with self.assertRaises(ValueError) as caught:

@@ -89,15 +89,22 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 f"forges[{index}] in {path} needs a provider and a hostname "
                 "(no scheme, path or port)"
             )
-        allowed = item.get("allowedPaths") or []
-        if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
+        # Absent is kept apart from empty: a forge whose credential reaches a
+        # whole host may require the administrator to say so (`[]`) rather
+        # than get it by leaving the field out.
+        allowed = item.get("allowedPaths")
+        if allowed is not None and (
+            not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed)
+        ):
             raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
         entries.append(
             {
                 "provider": provider,
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
-                "allowed_paths": tuple(p.strip("/") for p in allowed if p.strip("/")),
+                "allowed_paths": None
+                if allowed is None
+                else tuple(p.strip("/") for p in allowed if p.strip("/")),
             }
         )
     return entries

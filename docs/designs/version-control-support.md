@@ -2171,7 +2171,11 @@ So `GitLabForge` carries `allowed_paths`, a tuple of namespace prefixes, and
 refuses a repository outside them before the credential is spent — the same
 placement as the host allowlist and for the same reason. An empty
 `allowed_paths` means the whole host, which must be a deliberate configuration
-rather than the default that appears when someone omits a field.
+rather than the default that appears when someone omits a field: an entry with
+no `allowedPaths` is refused, and `[]` is how the whole host is asked for. A
+prefix with a segment no repository path can have — empty, or carrying a space —
+is refused at construction too, because it would match nothing and refuse every
+repository on the host.
 
 Prefix matching is on **path segments, not string prefix**. `acme/infra-secret`
 starts with the string `acme/infra` and is a different project.
@@ -2241,8 +2245,11 @@ Four endpoints need naming because they are not a rename of GitHub's:
   fallback, assembled into a unified diff, rather than a retry loop with a sleep
   in it. It is paged, and the assembled diff says so when it stops at its page
   cap or when GitLab left a too-large file's hunks out: an omission the caller
-  cannot see reads as a file the change did not touch. The broker's response
-  ceiling bounds both.
+  cannot see reads as a file the change did not touch. The fallback is taken
+  only for GitLab's own 5xx or 404, never for the broker's own refusal of the
+  raw diff as too large or too slow, which would fetch the same diff again; and
+  it stops, saying so, once the assembled diff passes the broker's default
+  response ceiling, since each page being under it does not bound ten of them.
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal

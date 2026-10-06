@@ -66,6 +66,14 @@ DEFAULT_LABEL_COLOR = "#6699cc"
 #: says.
 ACKNOWLEDGE_EMOJI = "eyes"
 
+#: The guidance code for a forge's own 5xx, as opposed to a refusal the
+#: transport made for it.
+FORGE_UNAVAILABLE = "FORGE_UNAVAILABLE"
+
+#: The label filter values GitLab reads as keywords, case-blind: `None` lists
+#: what has no label, `Any` what has one. There is no way to escape them.
+RESERVED_LABEL_FILTERS = frozenset({"none", "any"})
+
 #: The validation message GitLab sends, as a 404, for an emoji already awarded.
 ALREADY_AWARDED = "has already been taken"
 
@@ -74,6 +82,23 @@ def _states(neutral: str) -> str:
     """The neutral state as GitLab's `state` parameter."""
     return {"open": "opened", "closed": "closed", "all": "all"}[neutral]
 
+
+
+def _filter_labels(raw: Any) -> list[str]:
+    """`validate_labels`, refusing the names GitLab's filter reads as keywords.
+
+    A label titled `None` or `Any` exists happily on GitLab, but filtering on
+    it lists items with no label or with any label -- the wrong set, with no
+    error -- so the filter refuses it rather than answering for another one.
+    """
+    labels = validate_labels(raw)
+    reserved = [label for label in labels if label.casefold() in RESERVED_LABEL_FILTERS]
+    if reserved:
+        raise WorkspaceError(
+            f"GitLab reads {reserved[0]!r} in a label filter as a keyword, not a "
+            "label name, and offers no way to escape it; filter on another label"
+        )
+    return labels
 
 class GitLabForge(Forge):
     name = "gitlab"
@@ -105,6 +130,16 @@ class GitLabForge(Forge):
             for path in allowed_paths
             if path.strip("/")
         )
+        for prefix in self.allowed_paths:
+            # A segment no repository path can have -- empty from a doubled
+            # slash, or carrying a space -- would match nothing, and a
+            # non-empty list that matches nothing refuses every repository
+            # on the host. Said at construction, naming the entry.
+            if not all(repo_ref.SEGMENT_RE.fullmatch(segment) for segment in prefix):
+                raise ValueError(
+                    f"allowedPaths entry {'/'.join(prefix)!r} for {host} is not a "
+                    "namespace path (letters, digits, '_', '.', '-' between single slashes)"
+                )
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -122,7 +157,16 @@ class GitLabForge(Forge):
             token_path = str(entry.get("token_path") or "")
             if not token_path:
                 raise ValueError(f"the {cls.name} forge at {entry.get('host')} names no tokenPath")
-            built.append(cls(entry["host"], token_path, entry.get("allowed_paths") or ()))
+            allowed = entry.get("allowed_paths")
+            if allowed is None:
+                # A GitLab token reaches whatever its account or group does,
+                # and these prefixes are what narrows it before it is spent.
+                # The whole host is allowed only when asked for.
+                raise ValueError(
+                    f"the {cls.name} forge at {entry.get('host')} names no allowedPaths: "
+                    "list the namespaces it may reach, or [] for the whole host"
+                )
+            built.append(cls(entry["host"], token_path, allowed))
         return tuple(built)
 
     #: How many pages of the token account's projects `reach` reads: enough
@@ -138,6 +182,11 @@ class GitLabForge(Forge):
     #: How many pages of per-file diffs the `diffs` fallback reads before it
     #: says the diff is cut short.
     DIFF_PAGES = 10
+
+    #: Roughly how much of the assembled fallback diff is kept before it says
+    #: it stopped: each page is under the transport's ceiling, but ten of them
+    #: together need not be. The broker's default response ceiling.
+    DIFF_FALLBACK_CHARS = 4 * 1024 * 1024
 
     def reach(self, api: Callable) -> tuple[list[str], bool]:
         """Every project the token's account is a member of.
@@ -309,7 +358,7 @@ class GitLabForge(Forge):
         target = payload.get("target")
         if target is not None:
             params["target_branch"] = validate_branch(target, "target")
-        labels = validate_labels(payload.get("labels"))
+        labels = _filter_labels(payload.get("labels"))
         if labels:
             # GitLab's `labels` filter matches proposals carrying every one.
             params["labels"] = ",".join(labels)
@@ -357,9 +406,14 @@ class GitLabForge(Forge):
         try:
             return api("GET", f"{base}/raw_diffs", raw="text/plain")
         except WorkspaceError as exc:
-            if exc.status < 500 and exc.status != 404:
+            # GitLab's own 5xx or 404 only. The transport's own refusals --
+            # an answer over the broker's ceiling, a deadline that passed --
+            # come back as 502 too, and falling back on those would fetch the
+            # very diff the ceiling refused, ten pages at a time.
+            if not (exc.status == 404 or exc.fields.get("code") == FORGE_UNAVAILABLE):
                 raise
-        out = []
+        out: list[str] = []
+        size = 0
         for page in range(1, self.DIFF_PAGES + 1):
             files = api(
                 "GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE, "page": page}
@@ -373,6 +427,12 @@ class GitLabForge(Forge):
                 out.append("--- " + ("/dev/null" if item.get("new_file") else f"a/{old}") + "\n")
                 out.append("+++ " + ("/dev/null" if item.get("deleted_file") else f"b/{new}") + "\n")
                 out.append(item.get("diff") or "")
+                size += len(item.get("diff") or "")
+            if size > self.DIFF_FALLBACK_CHARS:
+                out.append(
+                    f"# diff cut short: stopped after {size} characters of changes\n"
+                )
+                return "".join(out)
             if len(files) < MAX_PAGE_SIZE:
                 return "".join(out)
         out.append(
@@ -477,13 +537,13 @@ class GitLabForge(Forge):
             "order_by": "created_at",
             "sort": "desc",
         }
-        labels = validate_labels(payload.get("labels"))
+        labels = _filter_labels(payload.get("labels"))
         if labels:
             params["labels"] = ",".join(labels)
         # Both halves of the filter are GitLab's own parameters on the listing
         # endpoint -- `not[labels]` and `search` -- so unlike GitHub there is
         # no second route with its own grammar and ordering.
-        excluded = validate_labels(payload.get("excludeLabels"))
+        excluded = _filter_labels(payload.get("excludeLabels"))
         if excluded:
             params["not[labels]"] = ",".join(excluded)
         query = validate_text(payload.get("query"), "query", required=False).strip()

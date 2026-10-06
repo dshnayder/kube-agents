@@ -2,7 +2,7 @@
 
 The same contract `test_providers_contract.py` holds every forge to, and the same file shape as `../github/README.md` describes: `payload` is the request the broker receives, and `responses` are the API answers in the order the forge asks for them. `{"__status__": N}` is a recorded refusal.
 
-`config.json` is what this forge is built from for the contract. GitLab is configured per host and builds nothing from an empty configuration, so it ships the entry the registry would hand `for_config`: gitlab.com, a token path, and no `allowed_paths`.
+`config.json` is what this forge is built from for the contract. GitLab is configured per host and builds nothing from an empty configuration, so it ships the entry the registry would hand `for_config`: gitlab.com, a token path, and an explicit empty `allowed_paths`: the whole host, which GitLab is only given when asked for.
 
 ## Provenance
 

@@ -6074,6 +6074,56 @@ class VcsRouteTest(unittest.TestCase):
             credential_proxy.build_vcs_broker(overlapping)
 
 
+class TwoForgeInstallTest(unittest.TestCase):
+    """Review: an install serving GitHub and GitLab has no one forge to default
+    to, and the callers that held a bare GitHub name stopped working on it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+        ]}))
+        for patcher in (
+            mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.registry = credential_proxy.providers.Registry()
+        self.assertIsNone(self.registry.default)
+        for patcher in (
+            mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry),
+            mock.patch.object(
+                credential_proxy, "managed_repositories",
+                return_value=frozenset({"github:github.com/acme/infra"}),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_workspace_write_to_a_managed_github_repository_still_passes(self):
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="acme/infra")
+        credential_proxy.require_managed_workspace(store, "h")
+        store.get.return_value = mock.Mock(repo="acme/other")
+        with self.assertRaises(Exception) as caught:
+            credential_proxy.require_managed_workspace(store, "h")
+        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
+
+    def test_a_bare_name_the_caller_knows_the_forge_of_still_resolves(self):
+        # The content workspace's read credential and the older images'
+        # `/v1/github/refresh` both hold a bare GitHub name.
+        lifted = credential_proxy._hosted("acme/infra", "github")
+        self.assertEqual("https://github.com/acme/infra", lifted)
+        forge, repo = self.registry.resolve(lifted)
+        self.assertEqual(("github", "acme/infra"), (forge.name, repo))
+        for unchanged in ("https://gitlab.com/a/b/c", "a/b/c", None):
+            self.assertEqual(unchanged, credential_proxy._hosted(unchanged, "github"))
+        self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "bitbucket"))
+
+
 class WorkspaceRouteTest(unittest.TestCase):
     """Two claims about the routes that a behavioural test cannot make.
 
@@ -6201,7 +6251,7 @@ class WorkspaceRouteTest(unittest.TestCase):
         with mock.patch.object(
             credential_proxy,
             "repository_is_managed",
-            side_effect=lambda repo: seen.append(repo) or True,
+            side_effect=lambda repo, forge=None: seen.append(repo) or True,
         ):
             credential_proxy.require_managed_workspace(store, "h")
         self.assertEqual(["acme/unmanaged"], seen)
