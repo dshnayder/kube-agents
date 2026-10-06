@@ -160,9 +160,14 @@ class BoundsTest(unittest.TestCase):
         cert = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
         with self.assertRaises(WorkspaceError) as caught:
             transport(Opener(urllib.error.URLError(cert))).api("GET", "x")
-        self.assertEqual(
-            "the forge's TLS certificate is not trusted by this image", caught.exception.fields["detail"]
-        )
+        self.assertIn("TLS certificate failed verification", caught.exception.fields["detail"])
+        # Review (#2439): the verifier's own reason was dropped, so an expired
+        # certificate or a hostname mismatch read as a private CA.
+        expired = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        expired.verify_message = "certificate has expired"
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(expired))).api("GET", "x")
+        self.assertIn("certificate has expired", caught.exception.fields["detail"])
 
     def test_no_call_outlives_the_requests_shared_deadline(self):
         # Review round 2: each call took a fresh full timeout, so a verb that
@@ -241,6 +246,17 @@ class BoundsTest(unittest.TestCase):
                 with self.assertRaises(WorkspaceError) as caught:
                     transport(Opener(raised)).api("GET", "projects")
                 self.assertIn("answer could not be read", caught.exception.fields["detail"])
+
+    def test_a_connect_cut_by_the_requests_spent_deadline_says_so(self):
+        # Review (#2439): the connect arm said "could not be reached" for a
+        # cut the request's own budget made.
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(
+                    Opener(urllib.error.URLError(TimeoutError("timed out"))),
+                    timeout=30.0, outer_deadline=lambda: 105.0,
+                ).api("GET", "projects")
+        self.assertIn("request's time ran out while connecting", caught.exception.fields["detail"])
 
     def test_a_connect_failure_still_reads_as_unreachable(self):
         with self.assertRaises(WorkspaceError) as caught:

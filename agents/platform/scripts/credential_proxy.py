@@ -7428,7 +7428,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
             forge, repository = forge_registry().resolve(
-                _hosted(payload.get("repository"), provider)
+                # The forge the request names, whether the route implies it
+                # (the alias) or the body says it (`/v1/forge/refresh`).
+                _hosted(payload.get("repository"), provider or str(payload.get("provider") or ""))
             )
             named = provider or payload.get("provider") or forge.name
             if named != forge.name:

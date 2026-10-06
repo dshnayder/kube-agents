@@ -2338,8 +2338,9 @@ surprise:
   specified rather than a gap. Any instance this is exercised against has to
   carry a certificate the sandbox image already trusts, or have TLS terminated
   by something that does. The refusal names itself — "the forge's TLS
-  certificate is not trusted by this image" — rather than reading as a call to
-  retry.
+  certificate failed verification by this image", followed by the verifier's
+  own reason, such as an unknown issuer, a hostname mismatch or an expired
+  certificate — rather than reading as a call to retry.
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.

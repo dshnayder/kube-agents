@@ -7154,6 +7154,25 @@ class TwoForgeInstallTest(unittest.TestCase):
         self.assertEqual([("github", "acme/infra")], calls)
         self.assertEqual(HTTPStatus.OK, replies[-1][0])
 
+    def test_the_forge_neutral_refresh_lifts_a_bare_name_the_body_places(self):
+        # Review (#2439): only the alias lifted; `/v1/forge/refresh` with
+        # `{"provider": "github"}` in the body was refused as hostless.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps({"provider": "github", "repository": "acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        calls = []
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler.log_message = lambda *args: None
+        handler._handle_forge_refresh()
+        self.assertEqual([("github", "acme/infra")], calls)
+        self.assertEqual(HTTPStatus.OK, replies[-1][0])
+
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
