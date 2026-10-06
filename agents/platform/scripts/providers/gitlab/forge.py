@@ -125,21 +125,29 @@ class GitLabForge(Forge):
         self.credential = StaticFileCredential(
             token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME
         )
-        self.allowed_paths = tuple(
-            tuple(segment.casefold() for segment in path.strip("/").split("/"))
-            for path in allowed_paths
-            if path.strip("/")
-        )
-        for prefix in self.allowed_paths:
-            # A segment no repository path can have -- empty from a doubled
-            # slash, or carrying a space -- would match nothing, and a
-            # non-empty list that matches nothing refuses every repository
-            # on the host. Said at construction, naming the entry.
-            if not all(repo_ref.SEGMENT_RE.fullmatch(segment) for segment in prefix):
+        prefixes = []
+        for path in allowed_paths:
+            trimmed = path.strip("/")
+            # An entry that names no namespace -- `""`, `"/"`, a template value
+            # that rendered empty -- is refused rather than dropped: dropped,
+            # it could leave the list empty, and empty is the whole host.
+            if not trimmed:
                 raise ValueError(
-                    f"allowedPaths entry {'/'.join(prefix)!r} for {host} is not a "
-                    "namespace path (letters, digits, '_', '.', '-' between single slashes)"
+                    f"an allowedPaths entry for {host} names no namespace ({path!r}); "
+                    "write the namespace, or [] on its own for the whole host"
                 )
+            segments = trimmed.split("/")
+            # A segment `parse` can never produce -- empty from a doubled
+            # slash, spaced, `.`, `..`, `.git`, or led by a dash -- would match
+            # nothing, and a non-empty list that matches nothing refuses every
+            # repository on the host. Checked with the parser's own rule.
+            if not all(repo_ref.is_safe_segment(segment) for segment in segments):
+                raise ValueError(
+                    f"allowedPaths entry {trimmed!r} for {host} is not a namespace "
+                    "path a repository can have"
+                )
+            prefixes.append(tuple(segment.casefold() for segment in segments))
+        self.allowed_paths = tuple(prefixes)
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -342,7 +350,10 @@ class GitLabForge(Forge):
         neutral = validate_state(payload.get("state"))
         # The neutral `closed` is every proposal that is no longer open, merged
         # ones included, as GitHub's is. GitLab's `closed` excludes merged, so
-        # that one is asked as `all` and filtered here.
+        # that one is asked as `all` and filtered here -- which makes a closed
+        # page a page of `all` with the open ones taken out: it can be short,
+        # or empty, while closed ones exist further on, and `truncated` is
+        # judged on what GitLab sent so it says so.
         params: dict[str, Any] = {
             "state": "all" if neutral == "closed" else _states(neutral),
             "per_page": limit,

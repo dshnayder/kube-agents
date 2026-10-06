@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import ssl
 import tempfile
 import unittest
 import urllib.error
@@ -141,6 +142,34 @@ class BoundsTest(unittest.TestCase):
             transport(opener).api("GET", "projects")
         self.assertEqual(502, caught.exception.status)
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+
+    def test_a_connect_failure_names_its_reason_and_an_untrusted_certificate_plainly(self):
+        # Review round 2: only the exception type reached the caller and the
+        # log, so a TLS or DNS failure read as "retry once".
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError("[Errno -2] Name or service not known"))).api("GET", "x")
+        self.assertIn("Name or service not known", caught.exception.fields["detail"])
+        cert = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(cert))).api("GET", "x")
+        self.assertEqual(
+            "the forge's TLS certificate is not trusted by this image", caught.exception.fields["detail"]
+        )
+
+    def test_no_call_outlives_the_requests_shared_deadline(self):
+        # Review round 2: each call took a fresh full timeout, so a verb that
+        # loops could hold a request slot for many times the broker's bound.
+        now = [100.0]
+        opener = Opener({"ok": True}, {"ok": True})
+        api = transport(opener, timeout=30.0, outer_deadline=lambda: 103.0)
+        with mock.patch("providers.transport.time.monotonic", lambda: now[0]):
+            api.api("GET", "projects")
+            self.assertEqual(3.0, opener.timeouts[0])
+            now[0] = 104.0
+            with self.assertRaises(WorkspaceError) as caught:
+                api.api("GET", "projects")
+        self.assertIn("time ran out", caught.exception.fields["detail"])
+        self.assertEqual(1, len(opener.requests))
 
     def test_a_timeout_is_a_call_failure(self):
         opener = Opener(TimeoutError("timed out"))
