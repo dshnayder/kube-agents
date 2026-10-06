@@ -16,7 +16,10 @@
 
 The fixtures under ``fixtures/gitlab/`` are a scratch project on gitlab.com
 as its API answered on 2026-10-01, trimmed to the fields the client reads
-and anonymised (group, author and project id replaced). Merge requests !1
+and anonymised (group, author and project id replaced). The author is the
+ordinary account the recording ran as, which is how the agent writes on
+gitlab.com Free (a personal access token: no token bot marks it), so the
+recorded-project tests pin it through ``BENCH_GITLAB_AGENT_LOGIN``. Merge requests !1
 and !2 were opened and closed at 14:57Z; !3 was opened at 14:59:51Z from
 ``platform-agent/writes-mr``; ``platform-agent/writes-orphan`` was pushed at
 14:59:50Z with no merge request. ``branch-404.json`` is GitLab's answer for
@@ -40,6 +43,8 @@ PROJECT = "https://gitlab.com/api/v4/projects/example-group%2Finfra"
 # Thirty seconds before !3 was opened; less the default two-minute skew the
 # window opens at 14:57:30Z, after !1 and !2 were created and before they
 # were closed.
+#: The recording account, standing in for the agent's dedicated account.
+AGENT = "eval-maintainer"
 RUN_START = datetime(2026, 10, 1, 14, 59, 30, tzinfo=timezone.utc)
 MR3_URL = f"https://gitlab.com/{REPO}/-/merge_requests/3"
 WINDOWED_LISTING = (
@@ -64,6 +69,7 @@ def env(monkeypatch):
     monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv(github_writes.GITOPS_REPO_ENV_VAR, REPO)
+    monkeypatch.setenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR, AGENT)
 
 
 @pytest.fixture
@@ -130,6 +136,7 @@ def test_a_merge_request_reads_as_the_pull_request_find_writes_wants():
         branch="platform-agent/writes-mr",
         head_in_repo=True,
         author="eval-maintainer",
+        author_is_bot=False,
         created=datetime(2026, 10, 1, 14, 59, 51, 560000, tzinfo=timezone.utc),
         updated=datetime(2026, 10, 1, 14, 59, 52, 865000, tzinfo=timezone.utc),
         url=MR3_URL,
@@ -291,6 +298,82 @@ def test_a_nested_project_passes_the_owner_pin_on_its_top_group(env, gitlab, mon
     result = check().verify(30)
     assert result.status != "error", result.reason
     assert result.success is False
+
+
+# --- whose merge request it is ----------------------------------------------
+
+
+def as_author(listing, user):
+    return [{**mr, "author": user} for mr in listing]
+
+
+def route_with_author(gitlab, user) -> None:
+    route_recorded(gitlab)
+    gitlab.routes[WINDOWED_LISTING] = (200, as_author(fixture("mrs-updated-desc.json"), user))
+
+
+@pytest.mark.parametrize(
+    "user",
+    [
+        {"username": "project_70001_bot_3f2a9c"},
+        {"username": "group_42_bot_8e1d"},
+        {"username": "renamed-automation", "bot": True},
+    ],
+)
+def test_a_token_bots_merge_request_is_the_agents_with_no_login_pinned(env, gitlab, monkeypatch, user):
+    # A project or group access token writes as a bot user: the GitLab
+    # counterpart of GitHub's `[bot]`, recognised without being told.
+    monkeypatch.delenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR)
+    route_with_author(gitlab, user)
+    stash()
+    result = check().verify(30)
+    assert ("pull_request", "platform-agent/writes-mr") in {
+        (w["kind"], w["branch"]) for w in result.raw["writes"]
+    }
+
+
+def test_an_ordinary_accounts_merge_request_is_nobodys_until_the_login_is_named(
+    env, gitlab, monkeypatch
+):
+    # gitlab.com Free: the agent is an ordinary account. Unnamed, a person's
+    # merge request and the agent's look alike, so neither counts -- rather
+    # than every person's counting as the agent's.
+    monkeypatch.delenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR)
+    route_recorded(gitlab)
+    stash()
+    result = check().verify(30)
+    assert [w for w in result.raw["writes"] if w["kind"] == "pull_request"] == []
+
+
+def test_a_person_is_not_the_agent_when_the_agents_login_is_named(env, gitlab):
+    route_with_author(gitlab, {"username": "a-maintainer"})
+    stash()
+    result = check().verify(30)
+    assert [w for w in result.raw["writes"] if w["kind"] == "pull_request"] == []
+
+
+def test_the_tasks_pinned_author_wins_over_the_environment(env, gitlab):
+    route_with_author(gitlab, {"username": "pinned-agent"})
+    stash()
+    result = check(author="pinned-agent").verify(30)
+    assert ("pull_request", "platform-agent/writes-mr") in {
+        (w["kind"], w["branch"]) for w in result.raw["writes"]
+    }
+
+
+def test_a_forks_merge_request_does_not_shield_a_branch_of_the_same_name(env, gitlab):
+    # As GitHub's all_pull_heads since #2263: only a head in the project
+    # itself makes a branch "behind a merge request".
+    route_recorded(gitlab)
+    whole = fixture("mrs-all.json")
+    whole.append({**whole[0], "iid": 9, "source_branch": "platform-agent/writes-orphan",
+                  "source_project_id": 99})
+    gitlab.routes[WHOLE_LISTING] = (200, whole)
+    stash()
+    result = check().verify(30)
+    assert ("branch", "platform-agent/writes-orphan") in {
+        (w["kind"], w["branch"]) for w in result.raw["writes"]
+    }
 
 
 def test_the_cli_reads_a_gitlab_project(env, monkeypatch, capsys):

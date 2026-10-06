@@ -60,6 +60,8 @@ from typing import Any
 
 import yaml
 
+from kube_agents_bench import forges
+
 __all__ = [
     "LaneSafeguardsError",
     "append_lane_safeguards",
@@ -93,6 +95,9 @@ TASK_FILE = "task.yaml"
 #: that cuts the API path short passes an "is there a slash" test and fails
 #: every call; ``\Z`` because ``$`` also matches before a trailing newline.
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+#: A GitLab project in the same strictness, less the segment count: its
+#: full path, ``group/subgroup/.../project``, as deep as the groups nest.
+GITLAB_PROJECT_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\Z")
 
 
 class LaneSafeguardsError(ValueError):
@@ -150,15 +155,28 @@ def load_lane_safeguards(path: str | Path) -> list[dict[str, Any]]:
     return entries
 
 
-def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
+def check_repository(
+    safeguards: list[dict[str, Any]], repo: str, forge: str | None = None
+) -> None:
     """Refuse a repository the lane's own entries would refuse at grading.
 
     A ``github_writes`` leaf that pins ``owner`` errors on every repetition
     when ``BENCH_GITOPS_REPO`` sits elsewhere, and a lane that starts on such
     a repository spends a lease to grade nothing. Known before the fan-out
     from the file and the value, so it is refused here.
+
+    The shape is the forge's (``forge``, else ``BENCH_FORGE``): GitHub's
+    ``owner/name``, or a GitLab project's full path, whose top group is
+    the owner a lane entry pins -- as the safeguard itself reads it.
     """
-    if not REPO_SLUG_RE.match(repo):
+    try:
+        forge = forges.forge_name(None if forge is None else {forges.FORGE_ENV_VAR: forge})
+    except forges.UnknownForge as exc:
+        raise LaneSafeguardsError(str(exc)) from exc
+    if forge == forges.FORGE_GITLAB:
+        if not GITLAB_PROJECT_RE.match(repo):
+            raise LaneSafeguardsError(f"{repo!r} is not a GitLab project path (group/.../project)")
+    elif not REPO_SLUG_RE.match(repo):
         raise LaneSafeguardsError(f"{repo!r} is not an owner/name repository")
     owner = repo.split("/", 1)[0]
     for entry in safeguards:
@@ -311,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--gitops-repo",
         default="",
-        help="the owner/name the safeguards will read; refused when a lane entry pins another owner",
+        help="the owner/name (GitLab: the project's full path) the safeguards will read; "
+        "refused when a lane entry pins another owner",
     )
     parser.add_argument("tasks", nargs="+", help="task.yaml paths to copy")
     args = parser.parse_args(argv)

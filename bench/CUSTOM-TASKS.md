@@ -641,6 +641,16 @@ and the same module lists a run's leftovers for the job log after the fan-out; i
 the job's repository reset does, before each unit that may write
 ([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md), 5.5).
 
+On a GitLab project (`BENCH_FORGE=gitlab`, `BENCH_GITOPS_REPO` the project's full path, the token
+in `BENCH_GITLAB_TOKEN`, a self-managed instance in `BENCH_GITLAB_HOST`) the same check reads merge
+requests and branches. GitLab has no `[bot]` suffix. A project or group access token writes as a
+bot user (`project_<id>_bot_<hex>`, `group_<id>_bot_<hex>`, or `bot: true`), which counts as the
+agent's on its own. On gitlab.com Free there are no such tokens, and the agent writes as an
+ordinary account holding a personal access token, so the run names that account in
+`BENCH_GITLAB_AGENT_LOGIN`; a case's `author` still wins over it. With neither, no merge request
+counts as the agent's, rather than every person's. The branch half needs only the `read_api` scope
+the merge-request listing already wants.
+
 ##### Addressing a seeded-fleet fixture by role
 
 `resource_property` reads whatever cluster the ambient kubeconfig points at. For a task grading
