@@ -121,10 +121,22 @@ class ConfigurationTest(unittest.TestCase):
     def test_an_allowed_path_no_repository_can_have_stops_the_build(self):
         # Review: `acme//infra` or ` acme` matched nothing and refused every
         # repository on the host, one request at a time.
-        for bad in ("acme//infra", " acme", "acme/in fra"):
+        # Review round 2: and the segments `parse` refuses -- `.`, `..`,
+        # `.git`, a leading dash -- which `SEGMENT_RE` alone admitted.
+        for bad in ("acme//infra", " acme", "acme/in fra", "acme/..", ".", "-acme", "acme/.git"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     GitLabForge("gitlab.com", "/t", (bad,))
+
+    def test_an_allowed_path_that_names_no_namespace_is_refused_not_dropped(self):
+        # Review round 2: `[""]`, `["/"]` and `["//"]` trimmed to nothing and
+        # left the list empty -- the whole host.
+        for bad in ("", "/", "//"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as caught:
+                    GitLabForge("gitlab.com", "/t", (bad,))
+                self.assertIn("names no namespace", str(caught.exception))
+        self.assertEqual((("acme",),), GitLabForge("gitlab.com", "/t", ("/acme/",)).allowed_paths)
 
     def test_the_token_is_read_from_the_file_into_private_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,11 +371,16 @@ class TranslationTest(unittest.TestCase):
                 {"username": "group_42_bot"},
                 {"username": "project_1001_bot2"},  # an older instance's numbering
                 {"username": "x", "bot": True},
+                # Review round 2: service accounts and GitLab's own bots.
+                {"username": "service_account_group_42_a1b2"},
+                {"username": "Support-Bot"},
+                {"username": "GitLab-Security-Bot"},
+                {"username": "duo-code-review-bot"},
                 {"username": "kube-agents-eval-bot"},
             ])
         ]
         answer = forge().issue_view(Api({"iid": 1, "state": "opened"}, notes), "acme/infra", {"number": 1, "comments": True})
-        self.assertEqual([True, True, True, True, False], [c["bot"] for c in answer["comments"]])
+        self.assertEqual([True] * 8 + [False], [c["bot"] for c in answer["comments"]])
 
     def test_states_and_iids(self):
         cases = (

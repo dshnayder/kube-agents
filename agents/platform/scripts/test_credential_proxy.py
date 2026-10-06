@@ -4285,8 +4285,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
+        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None))
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
-                mock.patch.object(credential_proxy, "_provider_forge"):
+                mock.patch.object(credential_proxy, "_provider_forge", return_value=brokered):
             with self.assertRaises(RuntimeError) as raised:
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
@@ -6112,6 +6113,74 @@ class TwoForgeInstallTest(unittest.TestCase):
             credential_proxy.require_managed_workspace(store, "h")
         self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
 
+    def _gitlab_only(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            return credential_proxy.providers.Registry()
+
+    def test_an_install_with_no_github_forge_refuses_a_workspace_write_as_not_managed(self):
+        # Review round 2: it answered 503 "list unavailable", which is false
+        # and invites a retry; the workspace has no forge to write through.
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="acme/infra")
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()):
+            with self.assertRaises(Exception) as caught:
+                credential_proxy.require_managed_workspace(store, "h")
+        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
+        self.assertIn("serves github repositories only", str(caught.exception))
+
+    def test_an_install_with_no_github_forge_clones_the_workspace_without_a_credential(self):
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential = credential_proxy._workspace_credential(self._gitlab_only(), "acme/infra")
+        self.assertIsInstance(credential, providers.NoCredential)
+        self.assertIn("serves no github forge", "\n".join(logs.output))
+
+    def test_a_forge_with_nothing_to_refresh_says_so_instead_of_failing(self):
+        # Review round 2: the route ran a helper GitLab does not ship and
+        # answered 502 "credential refresh failed" on every call.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+        ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: self.fail("helper was run")
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+        ):
+            executor.refresh_forge_credential("gitlab", "acme/infra")
+
+    def test_an_entry_typed_for_no_forge_here_is_named_once(self):
+        # Review round 2: `GitLab` or `gitlab-selfmanaged` keyed silently and
+        # admitted nothing, with nothing pointing at the entry.
+        with mock.patch.object(credential_proxy, "_warned_repository_types", set()):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                credential_proxy._warn_on_unserved_types(
+                    frozenset({"github:github.com/a/b", "GitLab:gitlab.com/a/b"})
+                )
+            self.assertEqual(1, len(logs.output))
+            self.assertIn("'GitLab' match no forge", logs.output[0])
+            with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                credential_proxy._warn_on_unserved_types(frozenset({"GitLab:gitlab.com/c/d"}))
+
     def test_a_bare_name_the_caller_knows_the_forge_of_still_resolves(self):
         # The content workspace's read credential and the older images'
         # `/v1/github/refresh` both hold a bare GitHub name.
@@ -7242,6 +7311,17 @@ class CredentialReachTest(unittest.TestCase):
             return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
         ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
             credential_proxy.warn_on_credential_reach(broker)
+
+    def test_an_unreachable_forge_logs_the_reason_not_only_the_type(self):
+        # Review round 2: a TLS or DNS failure logged as `type=WorkspaceError`
+        # alone left the operator nothing to act on.
+        refusal = providers.WorkspaceError(
+            "x", status=502, code="FORGE_CALL_FAILED",
+            detail="the forge's TLS certificate is not trusted by this image",
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(refusal))
+        self.assertIn("TLS certificate is not trusted", "\n".join(logs.output))
 
     def test_a_forge_that_cannot_say_or_cannot_answer_never_raises(self):
         credential_proxy.warn_on_credential_reach(self._broker(None))

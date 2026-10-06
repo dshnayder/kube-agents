@@ -1369,7 +1369,10 @@ every transport is a subprocess, which GitLab is the case that breaks.
 **So: an in-process `HttpTransport` built on `urllib`.** The broker constructs
 it; a forge never does. It is the broker that owns the timeout, the response
 size cap, the redaction of the token out of anything logged, and the mapping
-from HTTP status to the shared error contract.
+from HTTP status to the shared error contract. The timeout is the request's, not
+the call's: a verb that pages makes many calls on one request slot, and each is
+cut to what is left of that slot's shared deadline, the bound the CLI path's
+commands already share.
 
 Two things this changes that are worth being explicit about, because they are
 the cost side:
@@ -2048,7 +2051,9 @@ read the absence as a gap to be filled.
 
 It is not a gap. An **access token** is created once by an administrator,
 stored in a Secret, and lasts up to a year. There is
-nothing to acquire, nothing to sign, and nothing to refresh. GitLab's credential
+nothing to acquire, nothing to sign, and nothing to refresh, and
+`/v1/forge/refresh` for it answers `nothing to refresh` rather than running a
+helper. GitLab's credential
 work is somewhere else entirely, in two places GitHub's arrangement does not
 force anyone to look at:
 
@@ -2148,8 +2153,11 @@ Two consequences, both small and both easy to omit:
 
 One more property of the token that belongs here because it surfaces elsewhere:
 **a group or project access token authenticates as a bot user** that GitLab
-creates with it (`group_<id>_bot_…`), and a personal access token as its
-account. Anything that asks "did the agent write this?" — the branch-prefix and
+creates with it (`group_<id>_bot_…`, or `…_bot1` on older instances), and a
+personal access token as its account. A comment's `bot` flag is read off the
+author's name, because a note's author object carries no `bot` field: a token's
+bot user, a service account (`service_account_…`), or one of GitLab's own
+automation users. Anything that asks "did the agent write this?" — the branch-prefix and
 `agent:ignore` rules, `viewer_login`, comment attribution — resolves to that
 login, read from `GET /user`, not to a human's. It is a fact the agent-side
 policy is told rather than infers.
@@ -2172,10 +2180,15 @@ refuses a repository outside them before the credential is spent — the same
 placement as the host allowlist and for the same reason. An empty
 `allowed_paths` means the whole host, which must be a deliberate configuration
 rather than the default that appears when someone omits a field: an entry with
-no `allowedPaths` is refused, and `[]` is how the whole host is asked for. A
-prefix with a segment no repository path can have — empty, or carrying a space —
-is refused at construction too, because it would match nothing and refuse every
-repository on the host.
+no `allowedPaths` is refused, and `[]` is how the whole host is asked for. An
+entry that names no namespace — `""`, `"/"`, a template value that rendered empty
+— is refused rather than dropped, since dropping it could leave the list empty.
+A prefix with a segment no repository path can have — empty, spaced, `.`, `..`,
+`.git` or led by a dash, checked with the repository parser's own rule — is
+refused at construction too, because it would match nothing and refuse every
+repository on the host. A GitHub entry refuses `allowedPaths` outright: the App
+installation's repository selection is what scopes that token, and the same key
+accepted there and ignored would read as narrowing it.
 
 Prefix matching is on **path segments, not string prefix**. `acme/infra-secret`
 starts with the string `acme/infra` and is a different project.
@@ -2233,7 +2246,9 @@ mapping belongs in `GitLabForge`, on both directions, and `validate_state`'s
 neutral vocabulary does not change. One value does not map one to one: the
 neutral `closed` is every proposal no longer open, merged ones included, as
 GitHub's is, and GitLab's `closed` excludes merged — so it is asked as `all` and
-filtered.
+filtered. A `closed` page is therefore a page of `all` with the open ones taken
+out: it can come back short, or empty, while closed proposals exist further on,
+and `truncated` says so.
 
 Four endpoints need naming because they are not a rename of GitHub's:
 
@@ -2293,7 +2308,9 @@ surprise:
   instance fails to connect — and that failure is the design behaving as
   specified rather than a gap. Any instance this is exercised against has to
   carry a certificate the sandbox image already trusts, or have TLS terminated
-  by something that does.
+  by something that does. The refusal names itself — "the forge's TLS
+  certificate is not trusted by this image" — rather than reading as a call to
+  retry.
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
