@@ -143,6 +143,23 @@ class ConfigurationFileTest(_ConfigCase):
                     registry_module.load_forge_entries()
 
 
+class OperatorRenderedConfigurationTest(_ConfigCase):
+    def test_the_shape_the_operator_renders_builds_both_forges(self):
+        """The document k8s-operator's BrokerForges renders for a GitHub forge
+        beside a GitLab one, byte for byte as its Go test pins it. A change to
+        either side's idea of the file fails one of the two tests."""
+        self.configure(
+            '{"forges":[{"provider":"github","host":"github.com"},'
+            '{"provider":"gitlab","host":"gitlab.com",'
+            '"tokenPath":"/var/run/kube-agents/forge-credentials/gitlab/token",'
+            '"allowedPaths":["acme","platform"]}]}'
+        )
+        registry = providers.Registry()
+        self.assertEqual(["github", "gitlab"], [forge.name for forge in registry.forges])
+        forge, repo = registry.resolve("https://gitlab.com/platform/tools")
+        self.assertEqual(("gitlab", "platform/tools"), (forge.name, repo))
+
+
 class UnclaimedProviderTest(_ConfigCase):
     def test_a_provider_no_forge_class_serves_stops_the_build(self):
         # Review finding: a misspelt provider, or one this image predates,

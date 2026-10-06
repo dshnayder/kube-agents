@@ -601,7 +601,9 @@ this, and the minter guard is the reason it has to be one answer.
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
 are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, and a repository must name a
+namespace a GitHub organisation or user name, a GitLab forge needs a
+credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
+is a GitLab group path, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
@@ -615,11 +617,12 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
-list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the host list
+mirrors githubHosts, and the GitLab namespace pattern mirrors
+gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" -}}
+{{- $registered := list "github" "gitlab" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
@@ -649,9 +652,18 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
 {{- end -}}
+{{- if and (eq $provider "gitlab") $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$" $host)) (not (contains "." $host)) (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") (not ($f.credentialsRef | default dict).name) -}}
+{{- fail (printf "platformAgent.integration.forges[%d] is a gitlab forge with no credentialsRef.name; name the Secret that holds its access token under the key token" $i) -}}
+{{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitHub organisation or user name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitLab group path" $i $namespace) -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}

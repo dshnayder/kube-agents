@@ -31,9 +31,8 @@ package v1alpha1
 // a table entry rather than widening a shared check.
 // `docs/designs/version-control-support.md` §6 is the design.
 //
-// Only GitHub is registered. The dispatch is what this file delivers; the
-// GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest,
-// because a provider the CRD accepts and the agent discards is a
+// GitHub and GitLab are registered, each with the agent-side provider that
+// honours it, because a provider the CRD accepts and the agent discards is a
 // worse failure than one the CRD refuses.
 
 import (
@@ -47,6 +46,10 @@ const (
 	// GitProviderGitHub is the `provider` value naming GitHub, and the `type` of
 	// a `managed_repos` entry the agent has a provider for.
 	GitProviderGitHub = "github"
+
+	// GitProviderGitLab names GitLab: gitlab.com, or a self-managed instance
+	// at the host the forge declares.
+	GitProviderGitLab = "gitlab"
 
 	// DefaultGitProvider is assumed when a forge's `provider` is
 	// omitted, and is what the deprecated `spec.integration.github` alias means.
@@ -64,7 +67,18 @@ const (
 
 	// githubPathDepth is GitHub's rule: a repository is exactly `owner/name`.
 	githubPathDepth = 2
+
+	// gitlabMinPathDepth is GitLab's floor: a project sits under at least one
+	// group or user. Groups nest, so there is no ceiling.
+	gitlabMinPathDepth = 2
 )
+
+// gitlabNamespaceRegex is a GitLab group path: one or more segments, each
+// starting with a letter, digit or underscore and not ending in a dot. The
+// whole path is bounded by MaxGitNamespaceLength. RE2 matches in linear
+// time, so the nested repetition cannot backtrack.
+var gitlabNamespaceRegex = regexp.MustCompile(
+	`^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$`)
 
 // githubHosts is every spelling of GitHub that can appear in a remote this
 // install produces. `ssh.github.com` is the SSH-over-443 endpoint. An
@@ -104,6 +118,16 @@ type GitProvider struct {
 	// its clone endpoints, and any host it serves content from. They cover
 	// every entry in Hosts, so a declaration naming one of those adds nothing.
 	Egress []string
+	// SelfManaged admits a declared host outside Hosts: an instance of this
+	// forge at a hostname its operator chose. A host another registered
+	// provider serves is still refused, and a repository on such a forge must
+	// name the declared host or none -- see Resolve.
+	SelfManaged bool
+	// NeedsCredentials is a forge whose credential an administrator supplies
+	// in the Secret credentialsRef names, rather than one the install mints.
+	// A forge of this provider without credentialsRef is refused: the broker
+	// has nothing to call it with.
+	NeedsCredentials bool
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -121,6 +145,22 @@ var gitProviders = map[string]*GitProvider{
 		// sit under githubusercontent.com; api.github.com and codeload under
 		// the wildcard.
 		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
+	},
+	GitProviderGitLab: {
+		Name:               GitProviderGitLab,
+		DefaultHost:        "gitlab.com",
+		Hosts:              map[string]bool{"gitlab.com": true},
+		NamespacePattern:   gitlabNamespaceRegex,
+		MaxNamespaceLength: MaxGitNamespaceLength,
+		MinPathDepth:       gitlabMinPathDepth,
+		// Unbounded: groups nest.
+		MaxPathDepth: 0,
+		// The API and clones are gitlab.com itself; registry and pages
+		// content sit under the wildcard. A self-managed host is added as a
+		// literal by EgressPatterns.
+		Egress:           []string{"gitlab.com", "*.gitlab.com"},
+		SelfManaged:      true,
+		NeedsCredentials: true,
 	},
 }
 
@@ -160,16 +200,46 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 }
 
 // ValidateHost reports whether a declared host is one this provider serves.
-// An empty host is the provider's default and is always allowed.
+// An empty host is the provider's default and is always allowed. A
+// self-managed provider also serves a host of its operator's choosing, but
+// never one another registered provider claims: a GitLab forge declared at
+// github.com would otherwise send GitHub's repositories a GitLab token.
 func (p *GitProvider) ValidateHost(host string) error {
+	return p.validateHost(host, gitProviders)
+}
+
+func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) error {
 	trimmed := lowerASCII(strings.TrimSpace(host))
-	if trimmed == "" {
+	if trimmed == "" || p.Hosts[trimmed] {
 		return nil
 	}
-	if !p.Hosts[trimmed] {
+	if !p.SelfManaged {
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
 	}
+	for _, name := range providerNames(table) {
+		if other := table[name]; other != p && other.Hosts[trimmed] {
+			return fmt.Errorf("host %q is a %s host, not a %s one", host, other.Name, p.Name)
+		}
+	}
+	if !gitHostRegex.MatchString(trimmed) || !strings.Contains(trimmed, ".") {
+		return fmt.Errorf("host %q is not a hostname", host)
+	}
 	return nil
+}
+
+// gitHostRegex is a DNS name: what the CRD's own pattern on ForgeSpec.Host
+// admits, repeated here so a spec built in Go is held to it too.
+var gitHostRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
+
+// canonicalHost is the host a repository on a forge declared at host
+// resolves to: a spelling of one of this provider's hosts folds to
+// DefaultHost, and a self-managed host is itself, lowered.
+func (p *GitProvider) canonicalHost(host string) string {
+	trimmed := lowerASCII(strings.TrimSpace(host))
+	if trimmed == "" || p.Hosts[trimmed] {
+		return p.DefaultHost
+	}
+	return trimmed
 }
 
 // ValidateNamespace applies this forge's grammar to an owning organisation,
@@ -221,7 +291,16 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	if err := p.ValidateHost(host); err != nil {
 		return RepoRef{}, err
 	}
-	canonical := p.DefaultHost
+	canonical := p.canonicalHost(host)
+	// The hosts a repository on this forge may name. A self-managed forge is
+	// one instance at one host, so a repository naming any other -- gitlab.com
+	// on a forge declared at gitlab.example.com -- is refused, never moved onto
+	// the declared host. That is the rule the shared resolver promises every
+	// provider: a declared host never replaces a host the repository names.
+	ownHosts := p.Hosts
+	if canonical != p.DefaultHost {
+		ownHosts = map[string]bool{canonical: true}
+	}
 
 	// Every spelling of this provider's host lifts out of a schemeless path,
 	// not just DefaultHost. The parser this replaces stripped both
@@ -230,11 +309,11 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// a namespace, because each contains a dot and GitHub's owner grammar
 	// allows none. repo_ref.py's KNOWN_HOSTS is narrower, and the Go side is
 	// the one bound by what the CRD already admitted.
-	ref, err := parseRepoRef(repository, p.schemelessHosts())
+	ref, err := parseRepoRef(repository, p.liftableHosts(canonical))
 	if err != nil {
 		return RepoRef{}, err
 	}
-	if ref.Host != "" && ref.Host != canonical && !p.Hosts[ref.Host] {
+	if ref.Host != "" && lowerASCII(ref.Host) != canonical && !ownHosts[lowerASCII(ref.Host)] {
 		return RepoRef{}, fmt.Errorf("repository %q names host %q, which is not a %s host",
 			repository, ref.Host, p.Name)
 	}
@@ -248,7 +327,7 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// `/github.com` and `github.com.git/` spell that name as `/infra` and
 	// `infra.git/` spell `infra`.
 	if raw := strings.TrimSpace(repository); bare && strings.HasSuffix(raw, pathSeparator) &&
-		p.schemelessHosts()[lowerASCII(strings.Trim(raw, pathSeparator))] {
+		p.liftableHosts(canonical)[lowerASCII(strings.Trim(raw, pathSeparator))] {
 		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, strings.Trim(raw, pathSeparator))
 	}
 	// A dotted first segment the namespace grammar refuses is a host, most
@@ -304,6 +383,18 @@ func (p *GitProvider) schemelessHosts() map[string]bool {
 	for host := range p.Hosts {
 		hosts[host] = true
 	}
+	return hosts
+}
+
+// liftableHosts is what Resolve lifts out of a schemeless path on a forge
+// whose canonical host is canonical: this provider's own spellings, and a
+// self-managed host. The provider's own spellings stay liftable on a
+// self-managed forge so that `gitlab.com/g/p` is read as naming gitlab.com
+// and refused by the host check, rather than as a three-segment path in a
+// group called gitlab.com.
+func (p *GitProvider) liftableHosts(canonical string) map[string]bool {
+	hosts := p.schemelessHosts()
+	hosts[canonical] = true
 	return hosts
 }
 

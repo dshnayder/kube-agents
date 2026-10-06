@@ -192,8 +192,25 @@ func (f *ResolvedForge) valid() bool {
 	return validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) == nil &&
 		provider.ValidateHost(f.Host) == nil &&
 		validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength) == nil &&
-		provider.ValidateNamespace(f.Namespace) == nil
+		provider.ValidateNamespace(f.Namespace) == nil &&
+		f.credentialsProblem(provider) == nil
 }
+
+// credentialsProblem is why a forge whose provider needs an administrator's
+// credential cannot be served, or nil. Without the Secret the broker has no
+// token to call the forge with, so a repository on it would be seeded into a
+// list the broker then refuses on every call.
+func (f *ResolvedForge) credentialsProblem(provider *GitProvider) error {
+	if provider.NeedsCredentials && f.CredentialsSecret == "" {
+		return fmt.Errorf("provider %s needs credentialsRef: a Secret holding the forge's access token under the key %q",
+			provider.Name, ForgeCredentialsTokenKey)
+	}
+	return nil
+}
+
+// ForgeCredentialsTokenKey is the key the operator projects out of a forge's
+// credentialsRef Secret, and the file name the broker reads it from.
+const ForgeCredentialsTokenKey = "token"
 
 // EffectiveNamespace is the namespace a bare repository name is qualified by:
 // the repository's own, else its forge's.
@@ -545,11 +562,27 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		rejected[r] = true
 	}
 
+	// The broker holds one credential per host, so a second forge needing one
+	// at a host already declared cannot be served: its repositories would be
+	// called with the first forge's token and refused outside its groups.
+	credentialedHosts := map[string]*ResolvedForge{}
+	shadowed := map[*ResolvedForge]bool{}
 	for _, f := range ri.Forges {
 		provider, err := f.GitProvider()
 		if err != nil {
 			add(ri.forgePath(f, gitProviderField), f.Provider, err)
 			continue
+		}
+		if provider.NeedsCredentials && provider.ValidateHost(f.Host) == nil {
+			host := provider.canonicalHost(f.Host)
+			if first, dup := credentialedHosts[host]; dup {
+				shadowed[f] = true
+				add(ri.forgePath(f, gitHostField), f.Host, fmt.Errorf(
+					"%s is already served by %s; the broker holds one credential per host, so declare one forge there and give its token the groups both need",
+					host, ri.forgePath(first, "").String()))
+			} else {
+				credentialedHosts[host] = f
+			}
 		}
 		if err := validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength); err != nil {
 			add(ri.forgePath(f, gitHostField), f.Host, err)
@@ -560,6 +593,9 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
 		} else if err := provider.ValidateNamespace(f.Namespace); err != nil {
 			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
+		}
+		if err := f.credentialsProblem(provider); err != nil {
+			add(ri.forgePath(f, gitCredentialsField), f.CredentialsSecret, err)
 		}
 	}
 
@@ -581,7 +617,7 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 				fmt.Errorf("forge %q is not declared in integration.forges", r.ForgeName))
 			continue
 		}
-		if !r.Forge.valid() {
+		if !r.Forge.valid() || shadowed[r.Forge] {
 			// The forge's own problem is reported against the forge.
 			rejected[r] = true
 			continue
@@ -708,4 +744,117 @@ func ForgeEgressPatterns(in *IntegrationSpec) []string {
 		}
 	}
 	return patterns
+}
+
+// BrokerForge is one entry of the forge configuration the credential broker
+// builds its forges from (VCS_FORGES_CONFIG). The JSON names are the broker's:
+// `providers.registry.load_forge_entries` reads them.
+// +kubebuilder:object:generate=false
+type BrokerForge struct {
+	// Name is the declared forge's name, which the operator mounts its
+	// credential under. Not read by the broker.
+	Name     string `json:"-"`
+	Provider string `json:"provider"`
+	Host     string `json:"host"`
+	// CredentialsSecret is the Secret the token is projected from. Not read by
+	// the broker, which is handed the file instead.
+	CredentialsSecret string `json:"-"`
+	TokenPath         string `json:"tokenPath,omitempty"`
+	// AllowedPaths is never empty on an entry BrokerForges makes for a
+	// credentialed forge, and absent on GitHub's, whose minter scopes it.
+	AllowedPaths []string `json:"allowedPaths,omitempty"`
+}
+
+// BrokerForges is the forge configuration this declaration hands the
+// credential broker, or nil when it needs none.
+//
+// Nil -- no configuration at all -- is what keeps a GitHub-only install
+// exactly as it was: the broker builds GitHub alone when nothing names a
+// configuration. Only a valid forge of a provider that needs an
+// administrator's credential makes one, and then GitHub is always its first
+// entry. A configuration is the broker's whole answer, and an install that
+// declares a GitLab forge still carries its GitHub App and may have GitHub
+// repositories registered in the gitops-state ConfigMap by hand; dropping
+// GitHub from the broker would leave those served by nothing. ForgeEgressPatterns
+// keeps GitHub for the same reason.
+//
+// One entry per host. The broker refuses two forges claiming a host, so a
+// second declaration at a host already listed is dropped here, where the
+// first one keeps it, rather than crash-looping the broker.
+//
+// tokenDir is where the operator mounts the forge credentials; each forge's
+// token is <tokenDir>/<forge name>/token.
+func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
+	if ri == nil {
+		return nil
+	}
+	github, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		panic(err) // the registry always carries GitHub; see ForgeEgressPatterns
+	}
+	out := []BrokerForge{{Provider: GitProviderGitHub, Host: github.DefaultHost}}
+	hosts := map[string]bool{github.DefaultHost: true}
+	for _, f := range ri.Forges {
+		provider, err := f.GitProvider()
+		if err != nil || !provider.NeedsCredentials || !f.valid() {
+			continue
+		}
+		host := provider.canonicalHost(f.Host)
+		if hosts[host] {
+			continue
+		}
+		served := ri.servedNamespaces(f)
+		if len(served) == 0 {
+			// Nothing to serve, and the broker refuses an entry that does not
+			// say which groups it may act on: an empty list there means the
+			// whole host, which is never this declaration's to imply.
+			continue
+		}
+		hosts[host] = true
+		out = append(out, BrokerForge{
+			Name:              f.Name,
+			Provider:          provider.Name,
+			Host:              host,
+			CredentialsSecret: f.CredentialsSecret,
+			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
+			AllowedPaths:      served,
+		})
+	}
+	if len(out) == 1 {
+		return nil
+	}
+	return out
+}
+
+// servedNamespaces is the groups the broker serves on a forge: its declared
+// namespace and the namespace of every repository accepted on it, sorted and
+// without repeats. The broker refuses a repository outside them before the
+// token is spent, which is the only narrowing a GitLab token gets after it is
+// created. Empty when the forge names no namespace and has no accepted
+// repository; BrokerForges then hands the broker no entry for it rather than
+// one serving the whole host.
+func (ri *ResolvedIntegration) servedNamespaces(f *ResolvedForge) []string {
+	seen := map[string]bool{}
+	if f.Namespace != "" {
+		seen[strings.Trim(f.Namespace, pathSeparator)] = true
+	}
+	for _, role := range []string{RepositoryRoleGitOps, RepositoryRoleManaged, RepositoryRoleContext} {
+		for _, r := range ri.Accepted(role) {
+			if r.Forge != f {
+				continue
+			}
+			ref, err := r.Resolve()
+			if err != nil {
+				continue
+			}
+			segments := ref.Segments()
+			seen[strings.Join(segments[:len(segments)-1], pathSeparator)] = true
+		}
+	}
+	namespaces := make([]string, 0, len(seen))
+	for namespace := range seen {
+		namespaces = append(namespaces, namespace)
+	}
+	slices.Sort(namespaces)
+	return namespaces
 }

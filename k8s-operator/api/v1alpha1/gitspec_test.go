@@ -459,14 +459,14 @@ func TestValidationDispatchesOnTheDeclaredProvider(t *testing.T) {
 	}
 }
 
-func TestOnlyGitHubIsRegistered(t *testing.T) {
+func TestTheRegistryIsTheProvidersTheAgentServes(t *testing.T) {
 	// A provider the CRD accepts and the agent has no implementation for is a
 	// worse failure than one the CRD refuses, so the registry and the enum in
 	// ForgeSpec.Provider grow together with the agent-side provider. If this
 	// fails, check that the CRD enum was widened to match.
 	names := GitProviderNames()
-	if len(names) != 1 || names[0] != GitProviderGitHub {
-		t.Errorf("GitProviderNames() = %v, expected only %q", names, GitProviderGitHub)
+	if strings.Join(names, ",") != GitProviderGitHub+","+GitProviderGitLab {
+		t.Errorf("GitProviderNames() = %v, expected %q and %q", names, GitProviderGitHub, GitProviderGitLab)
 	}
 }
 
@@ -632,9 +632,13 @@ func TestProblemsNameTheFieldAtFault(t *testing.T) {
 			Repositories: []RepositorySpec{repo("github", "git@gitlab.com:group/project.git", RepositoryRoleManaged)}},
 			want: []string{"repositories[0].repository"}},
 		{name: "unregistered provider", spec: &IntegrationSpec{
+			Forges:       []ForgeSpec{{Name: "bb", Provider: "bitbucket"}},
+			Repositories: []RepositorySpec{repo("bb", "group/project", RepositoryRoleGitOps)}},
+			want: []string{"forges[0].provider"}},
+		{name: "gitlab without credentials", spec: &IntegrationSpec{
 			Forges:       []ForgeSpec{{Name: "gl", Provider: "gitlab"}},
 			Repositories: []RepositorySpec{repo("gl", "group/project", RepositoryRoleGitOps)}},
-			want: []string{"forges[0].provider"}},
+			want: []string{"forges[0].credentialsRef"}},
 		{name: "github namespace grammar", spec: &IntegrationSpec{
 			Forges: []ForgeSpec{ghForge("github", "group.with_dots")}},
 			want: []string{"forges[0].namespace"}},
@@ -915,7 +919,8 @@ func TestForgeEgressPatternsNeverDropGitHub(t *testing.T) {
 			Forges: []ForgeSpec{ghForge("github", "gke-labs")},
 			GitHub: &GitHubSpec{GitRepo: "other/repo"},
 		},
-		"unregistered provider":      {Forges: []ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+		"unregistered provider":      {Forges: []ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
+		"gitlab with no credentials": {Forges: []ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
 		"host github does not serve": {Forges: []ForgeSpec{{Name: "gh", Host: "gitlab.example.com"}}},
 	}
 	for name, in := range cases {

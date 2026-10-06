@@ -484,27 +484,78 @@ class ChartGitIntegrationTest(unittest.TestCase):
         """The CRD's enum would reject it at apply; the chart names the values
         key while the administrator is still looking at their values file."""
         result = _render(
-            _CR_TEMPLATE, *_forge(0, name="gitlab", provider="gitlab")
+            _CR_TEMPLATE, *_forge(0, name="bitbucket", provider="bitbucket")
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].provider", result.stderr)
 
-    def test_the_minter_never_renders_without_a_github_forge(self):
-        """Asserts the outcome, not which guard produced it.
+    def test_a_gitlab_forge_renders_as_the_lists_with_its_secret(self):
+        """GitLab is never the alias: the alias has no provider, host or
+        credentialsRef to carry it in."""
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.example.com",
+                    namespace="acme/platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            *_repo(0, forge="gitlab", repository="infra", role="gitops"),
+            *_repo(1, forge="gitlab", repository="acme/platform/tools/app", role="managed"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["forges"],
+            [{"name": "gitlab", "provider": "gitlab", "host": "gitlab.example.com",
+              "namespace": "acme/platform", "credentialsRef": {"name": "gitlab-token"}}],
+        )
+        self.assertEqual(len(integration["repositories"]), 2)
 
-        With `github` the only registered provider,
-        `kube-agents.forgeProviders` refuses `gitlab` before
-        `github-minter.yaml`'s own check can fire. Both guards must hold: the
-        minter one is what keeps a GitLab-only install from provisioning a
-        GitHub App token minter once the registry widens.
-        """
+    def test_a_gitlab_forge_without_a_secret_fails_naming_it(self):
+        """The broker would have no token to call GitLab with; the operator
+        refuses the forge too, and this says so at `helm template`."""
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="gitlab", provider="gitlab", namespace="acme"),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0]", result.stderr)
+        self.assertIn("credentialsRef", result.stderr)
+
+    def test_a_gitlab_forge_refuses_a_github_host_and_a_bad_group(self):
+        for label, fields, key in (
+            ("github host", {"host": "github.com"}, "host"),
+            ("not a hostname", {"host": "gitlab_example"}, "host"),
+            ("bad group", {"namespace": "-acme"}, "namespace"),
+        ):
+            with self.subTest(case=label):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="gitlab", provider="gitlab", **fields),
+                    f"{_P}forges[0].credentialsRef.name=gitlab-token",
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{key}", result.stderr)
+
+    def test_the_minter_never_renders_without_a_github_forge(self):
+        """A GitLab-only install provisions no GitHub App token minter: the
+        minter guard refuses, naming the providers declared."""
         result = _render(
             _MINTER_TEMPLATE,
             *_MINTER,
             *_forge(0, name="gitlab", provider="gitlab"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("declares no github forge", result.stderr)
         self.assertNotIn("kind: Deployment", result.stdout)
+
+    def test_the_minter_renders_beside_a_gitlab_forge_when_github_is_declared(self):
+        result = _render(
+            _MINTER_TEMPLATE,
+            *_MINTER,
+            *_forge(0, name="github", provider="github"),
+            *_forge(1, name="gitlab", provider="gitlab"),
+            f"{_P}forges[1].credentialsRef.name=gitlab-token",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("name: github-token-minter", result.stdout)
 
     def test_the_no_repository_sentinel_does_not_collide_with_the_lists(self):
         """`None` means no repository, so it is not a second declaration.

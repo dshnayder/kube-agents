@@ -403,7 +403,7 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 			ReadOnly:  true,
 		})
 	}
-	return mounts
+	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
 // buildCredentialProxyFederationEnv points the proxy's Google clients at a token
@@ -570,6 +570,7 @@ var (
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	volumes = append(volumes, buildGitopsStateVolume(agent))
+	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
