@@ -908,7 +908,7 @@ SHARED_ACCOUNT_SHIELD_NAMES = 3
 SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemonset", "cronjob", "pod"})
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
-    "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
+    "ServiceAccount's token, so the shared-account fix this {noun} proposes would remove "
     "it; the remaining findings are manual, per pod spec."
 )
 SHARED_ACCOUNT_STALE_RESOLUTION = (
@@ -6544,7 +6544,7 @@ def is_machine_author(comment: dict) -> bool:
     )
 
 
-def collector_hold_reason(target: str) -> str:
+def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a collector-held finding is neither refused nor acted on.
 
     The finding is on the ledger under _Held by the collector_ and absent from
@@ -6557,13 +6557,13 @@ def collector_hold_reason(target: str) -> str:
         f"`{target}` rides this ledger's hidden block because the collector still "
         "emits a candidate for it and this run's document did not carry it; it is "
         "released when the collector stops emitting it or a `declared` entry "
-        "covers it. There is no finding in the document to open a pull request "
+        f"covers it. There is no finding in the document to open a {noun} "
         "from. The request stands: the first run whose document carries the "
         "finding acts on it, and one where the collector no longer sees it says so"
     )
 
 
-def collector_candidate_reason(target: str) -> str:
+def collector_candidate_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a still-flagged id that was never on the ledger is deferred.
 
     The sibling of `collector_hold_reason` for an id the collector emits and
@@ -6575,7 +6575,7 @@ def collector_candidate_reason(target: str) -> str:
         f"`{target}` is not in this run's document, but the collector emits it "
         "as a candidate this run's document did not carry; it is listed under "
         "`unpublished_candidates` on the run's JSON line. There is no finding in "
-        "the document to open a pull request from. The request stands: the first "
+        f"the document to open a {noun} from. The request stands: the first "
         "run whose document carries the finding acts on it, and one where the "
         "collector no longer sees it says so"
     )
@@ -6592,7 +6592,7 @@ def deferral_reason(target: str) -> str:
     )
 
 
-def declared_reason(target: str, entry: dict) -> str:
+def declared_reason(target: str, entry: dict, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a declared posture is refused, with the file that covers it.
 
     A refusal, not a deferral: a declaration is an owner's standing choice,
@@ -6610,7 +6610,7 @@ def declared_reason(target: str, entry: dict) -> str:
         f"`{target}` is a posture a repository declaration covers — "
         f"`{where}` — so this "
         "run lists it under _Declared intent_ rather than as a finding, and a "
-        "pull request for it would contradict the ledger. Remove the "
+        f"{noun} for it would contradict the ledger. Remove the "
         "declaration; the finding returns on the next run, and a new request "
         "then opens it"
     )
@@ -6637,6 +6637,7 @@ def parse_remediate_commands(
     declared: list[dict] | None = None,
     collector_held: set[str] | None = None,
     collector_flagged: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -6739,8 +6740,8 @@ def parse_remediate_commands(
                         # reason teaches the reader to discount the next one.
                         f"@{author} is not recorded as a collaborator on this "
                         f"repository (`authorAssociation: {association or 'NONE'}`), "
-                        "so this command was not acted on. A remediation pull "
-                        "request may only be requested by someone who could merge it."
+                        f"so this command was not acted on. A remediation {noun} "
+                        "may only be requested by someone who could merge it."
                     ],
                 }
             )
@@ -6787,16 +6788,16 @@ def parse_remediate_commands(
                 deferred.append(deferral_reason(target))
                 continue
             if target in held_ids:
-                deferred.append(collector_hold_reason(target))
+                deferred.append(collector_hold_reason(target, noun))
                 continue
             if target in flagged_ids:
-                deferred.append(collector_candidate_reason(target))
+                deferred.append(collector_candidate_reason(target, noun))
                 continue
             # After the two deferrals, for the reason `handle_finish` gives on
             # the clean branch: a deferral's marker is not an answer and this
             # refusal's is. The sets are disjoint either way.
             if target in covered:
-                reasons.append(declared_reason(target, covered[target]))
+                reasons.append(declared_reason(target, covered[target], noun))
                 continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
@@ -6842,7 +6843,7 @@ def parse_remediate_commands(
                 reasons.append(
                     f"`{target}` has a `{kind}` remediation, not a `manifest` one. "
                     "Only a finding whose fix is a file in this repository can become "
-                    "a pull request; run the command in the report instead"
+                    f"a {noun}; run the command in the report instead"
                     + _promotable_hint(promotable)
                 )
                 continue
@@ -7478,6 +7479,7 @@ def render_finding(
     state: str | None = None,
     pr_url: str | None = None,
     new: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -7512,7 +7514,7 @@ def render_finding(
             lines.append(
                 "  The proposed fix was merged and this finding still reproduces. "
                 "The remediation was incomplete, or something outside this "
-                "repository reverted it — the merged pull request is not reopened."
+                f"repository reverted it — the merged {noun} is not reopened."
             )
     lines.append("")
 
@@ -7584,6 +7586,7 @@ def select_rendered_findings(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     new_ids: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -7610,6 +7613,7 @@ def select_rendered_findings(
             state=(states or {}).get(fid),
             pr_url=(pr_urls or {}).get(fid),
             new=fid in (new_ids or set()),
+            noun=noun,
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -7680,7 +7684,7 @@ def _render_header(audit_id: str, noun: str = "pull request") -> list[str]:
         "passed its gates as `pending_remediation_requests`. Only when a "
         "collaborator asks the agent directly, in the agent's own task, does the "
         "fix go through the fleet-audit skill's `remediate` command — never "
-        "through `submit-suggestion`, whose pull requests this audit cannot "
+        f"through `submit-suggestion`, whose {noun}s this audit cannot "
         "deduplicate, refresh, or close._",
     ]
 
@@ -7873,6 +7877,7 @@ def _render_findings(
     pr_urls: dict[str, str] | None = None,
     gaps: list[str] | None = None,
     new_ids: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -7906,7 +7911,7 @@ def _render_findings(
 
     new_ids = new_ids or set()
     rendered, omitted = select_rendered_findings(
-        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids
+        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids, noun=noun
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -7942,6 +7947,7 @@ def _render_findings(
                 state=states.get(fid),
                 pr_url=pr_urls.get(fid),
                 new=fid in new_ids,
+                noun=noun,
             )
 
     if omitted:
@@ -8018,7 +8024,7 @@ def _finding_identity_lines(fid: str, title: str, cluster: str, namespace: str, 
     ]
 
 
-def _render_held_overflow(overflow: int) -> list[str]:
+def _render_held_overflow(overflow: int, noun: str = DEFAULT_PROPOSAL_NOUN) -> list[str]:
     """The line every tier ends with when `MAX_HELD_IDS` left held findings out."""
     if not overflow:
         return []
@@ -8027,7 +8033,7 @@ def _render_held_overflow(overflow: int) -> list[str]:
         f"_The collector still flags {overflow} more that this ledger has stopped "
         f"tracking: it holds at most {MAX_HELD_IDS} at once, lowest ids first. They "
         "stay on each run's JSON line as `unpublished_candidates` while the collector "
-        "flags them, and their pull requests stay open._",
+        f"flags them, and their {noun}s stay open._",
     ]
 
 
@@ -8038,6 +8044,7 @@ def _render_collector_held(
     overflow: int = 0,
     preview: bool = False,
     carried: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     """The previous findings this run carries forward because the collector still flags them.
 
@@ -8061,14 +8068,14 @@ def _render_collector_held(
     """
     if not held:
         return []
-    noun = "finding" if len(held) == 1 else "findings"
+    count_word = "finding" if len(held) == 1 else "findings"
     out = ["", HELD_SECTION_BEGIN, HELD_SECTION_HEADING, ""]
     if carried:
         # No collector ran this run, so nothing here may read as this run's
         # observation: the rows are held from a previous run's manifest, and
         # the command line, where there is one, is the last one recorded.
         out.append(
-            f"{len(held)} previous {noun} held from a previous run's manifest; this run "
+            f"{len(held)} previous {count_word} held from a previous run's manifest; this run "
             "passed none and cannot release them. Each stays until a manifest run no "
             "longer emits it or a `declared` entry covers it; a `resolved_because` "
             "entry does not release it. The automatic sweep passes over these; a "
@@ -8086,7 +8093,7 @@ def _render_collector_held(
         )
     else:
         out.append(
-            f"{len(held)} previous {noun} this run's document did not carry, kept on "
+            f"{len(held)} previous {count_word} this run's document did not carry, kept on "
             "the ledger because the collector still emits a candidate for each: the "
             "condition is still observed, so it is not resolved. Each stays until the "
             "collector stops emitting it or a `declared` entry covers it; a "
@@ -8132,11 +8139,16 @@ def _render_collector_held(
                 "there this run and still flags this object."
             )
         out.append(f"- **Finding id:** `{fid}`")
-    return out + _render_held_overflow(overflow) + _held_span_close(held)
+    return out + _render_held_overflow(overflow, noun) + _held_span_close(held)
 
 
 def _render_held_note(
-    held: list[dict], *, overflow: int = 0, preview: bool = False, carried: bool = False
+    held: list[dict],
+    *,
+    overflow: int = 0,
+    preview: bool = False,
+    carried: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     """The third tier for the held section: the count, and where the ids are.
 
@@ -8187,7 +8199,7 @@ def _render_held_note(
         HELD_SECTION_HEADING,
         "",
         opening,
-    ] + _render_held_overflow(overflow) + _held_span_close(held)
+    ] + _render_held_overflow(overflow, noun) + _held_span_close(held)
 
 
 def _held_span_close(held: list[dict]) -> list[str]:
@@ -8212,6 +8224,7 @@ def _render_withheld(
     findings: list[dict],
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
@@ -8244,9 +8257,9 @@ def _render_withheld(
     if withheld:
         out += [
             "",
-            f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
-            f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-            "one bad night cannot bury this repository in generated pull requests. "
+            f"{len(withheld)} finding(s) qualify for an automatic remediation {noun} "
+            f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+            f"one bad night cannot bury this repository in generated {noun}s. "
             "Comment `/remediate <finding-id>` to open any of them now — an explicit "
             "request is not capped.",
             "",
@@ -8530,6 +8543,7 @@ def render_issue_body(
         findings,
         uncorroborated=list(uncorroborated or []),
         needs_triage=list(needs_triage or []),
+        noun=noun,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -8569,6 +8583,7 @@ def render_issue_body(
             pr_urls=pr_urls,
             gaps=gaps,
             new_ids=new_ids,
+            noun=noun,
         )
 
     findings_lines, omitted = select(0)
@@ -8599,7 +8614,11 @@ def render_issue_body(
     held_section: list[str] = _render_held_ids_only(held_entries)
     for candidate_section in (
         _render_collector_held(
-            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+            held_entries,
+            overflow=held_overflow,
+            preview=held_preview,
+            carried=held_carried,
+            noun=noun,
         ),
         _render_collector_held(
             held_entries,
@@ -8607,9 +8626,14 @@ def render_issue_body(
             overflow=held_overflow,
             preview=held_preview,
             carried=held_carried,
+            noun=noun,
         ),
         _render_held_note(
-            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+            held_entries,
+            overflow=held_overflow,
+            preview=held_preview,
+            carried=held_carried,
+            noun=noun,
         ),
     ):
         if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
@@ -8663,6 +8687,7 @@ def render_delta_comment(
     *,
     omitted: int = 0,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str | None:
     """The delta comment, or None when nothing changed (silence beats noise).
 
@@ -8733,7 +8758,7 @@ def render_delta_comment(
             "",
             f"**Coverage of this run is partial** ({len(gaps)} hold(s) declared "
             "beside the document), so nothing above is reported as resolved and no "
-            "remediation pull request was retired:",
+            f"remediation {noun} was retired:",
             "",
         ]
         out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_DELTA_ROWS]]
@@ -8750,6 +8775,7 @@ def render_clean_comment(
     generated_at: datetime,
     *,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
 
@@ -8797,7 +8823,7 @@ def render_clean_comment(
             "**This is not an all-clear, and the ledger stays open.** With no "
             "trusted record of the findings this ledger carries, the run cannot "
             "tell whether they were fixed, so nothing has been reported as "
-            "resolved and no remediation pull request has been closed. "
+            f"resolved and no remediation {noun} has been closed. "
             + LOST_RECORD_WAY_OUT,
             "",
             f"Why the ledger stays open ({len(gaps)}):",
@@ -8812,7 +8838,7 @@ def render_clean_comment(
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
-            "nothing has been reported as resolved and no remediation pull request "
+            f"nothing has been reported as resolved and no remediation {noun} "
             "has been closed. "
             + (
                 # Beside a lost record, complete coverage no longer closes it:
@@ -8945,6 +8971,7 @@ def render_held_comment(
     collector: list[str] | None = None,
     carried: list[str] | None = None,
     gaps: list[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Comment posted when a clean run is refused its close (`HELD`).
 
@@ -8976,10 +9003,10 @@ def render_held_comment(
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
     if len(clusters) > len(shown):
         names += f", and {len(clusters) - len(shown)} more"
-    noun = "finding" if len(held) == 1 else "findings"
+    count_word = "finding" if len(held) == 1 else "findings"
     out = [
         f"### `{audit_id}` found nothing — but did not account for {len(held)} "
-        f"previous {noun}, so the ledger stays open",
+        f"previous {count_word}, so the ledger stays open",
         "",
         f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
         f"{len(clusters)} audited cluster(s): {names}.",
@@ -8989,7 +9016,7 @@ def render_held_comment(
         "on that cluster — yet the document neither reports the finding again nor "
         "carries a `resolved_because` entry saying what that check showed. From "
         'here "fixed" and "not written down" are the same absence, so nothing has '
-        "been reported as resolved, no remediation pull request has been closed, "
+        f"been reported as resolved, no remediation {noun} has been closed, "
         "and the ledger stays open. It closes on the next run that reports each of "
         "these again, or says per finding why it is gone; `start` lists them "
         "under `carried`.",
@@ -9089,6 +9116,7 @@ def render_remediation_pr_body(
     *,
     issue_number: int | None,
     generated_at: datetime,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """The body of one remediation pull request.
 
@@ -9103,8 +9131,8 @@ def render_remediation_pr_body(
 
     out = [
         f"Proposed fix for {findings_phrase(len(ordered))} from the "
-        f"`{audit_id}` audit. The audit inspected the fleet read-only; this pull "
-        "request is the only thing it proposes to change, and applying it is a "
+        f"`{audit_id}` audit. The audit inspected the fleet read-only; this "
+        f"{noun} is the only thing it proposes to change, and applying it is a "
         "human decision.",
     ]
     if issue_number:
@@ -9114,7 +9142,7 @@ def render_remediation_pr_body(
 
     out += ["", "## Findings this fixes", ""]
     for finding in ordered:
-        out += render_finding(finding)
+        out += render_finding(finding, noun=noun)
         out.append("")
 
     out += ["## Files", ""]
@@ -9126,8 +9154,8 @@ def render_remediation_pr_body(
         "---",
         "",
         f"Generated by the Platform Agent `{audit_id}` watchdog at "
-        f"{generated_at.isoformat()}. If this fix is wrong, close this pull "
-        "request — the finding stays on the ledger and no replacement is opened "
+        f"{generated_at.isoformat()}. If this fix is wrong, close this {noun} "
+        "— the finding stays on the ledger and no replacement is opened "
         "automatically.",
         "",
         delta_block(ids),
@@ -9153,6 +9181,7 @@ def render_stale_close_comment(
     pr_number: int | str = 0,
     reason: str = "",
     resolution: str = "",
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Why a remediation pull request is being closed unmerged.
 
@@ -9165,7 +9194,7 @@ def render_stale_close_comment(
         reason
         or (
             f"Closing unmerged: as of {stamp} the `{audit_id}` audit no longer "
-            "reproduces the finding(s) this pull request was opened for. Something "
+            f"reproduces the finding(s) this {noun} was opened for. Something "
             "else fixed them, or the objects are gone."
         ),
         "",
@@ -9190,7 +9219,7 @@ def render_stale_close_comment(
         # every reader a fresh pull request writes a cheque the harness does not
         # cash, and the ones it silently fails are precisely the low-severity
         # findings nobody is watching for.
-        "The branch is left in place, and this pull request is labelled "
+        f"The branch is left in place, and this {noun} is labelled "
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
@@ -9208,7 +9237,7 @@ def render_stale_close_comment(
 
 
 def render_persists_comment(
-    audit_id: str, finding: dict, generated_at: datetime
+    audit_id: str, finding: dict, generated_at: datetime, noun: str = DEFAULT_PROPOSAL_NOUN
 ) -> str:
     """Said once, on a merged pull request whose finding still reproduces."""
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
@@ -9218,7 +9247,7 @@ def render_persists_comment(
         f"reproduces `{finding.get('id', '')}` — {_cell(finding.get('title', ''))}.",
         "",
         "Either the remediation was incomplete, or something outside this "
-        "repository reverted it. This pull request is **not** reopened: it "
+        f"repository reverted it. This {noun} is **not** reopened: it "
         "merged, and reopening it would misrepresent history. The finding "
         "stays on the ledger, flagged, until it stops reproducing.",
         "",
@@ -9301,6 +9330,7 @@ def render_clean_remediate_answer(
     held: bool = False,
     lost_memory: bool = False,
     partial: bool = False,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """Said once per `/remediate` standing on a ledger that came back clean.
 
@@ -9331,7 +9361,7 @@ def render_clean_remediate_answer(
                 if targets
                 else "which findings the ledger carried."
             )
-            + " A pull request here would propose a fix for a finding whose "
+            + f" A {noun} here would propose a fix for a finding whose "
             "state this run did not establish."
         )
     elif held:
@@ -9339,7 +9369,7 @@ def render_clean_remediate_answer(
             f"The {audit_name(audit_id)} audit found **0 findings** on this run, but "
             "it did not account for the findings this ledger was carrying"
             + (f" — {named} among them" if targets else "")
-            + ", so nothing has been reported as resolved. A pull request here "
+            + f", so nothing has been reported as resolved. A {noun} here "
             "would propose a fix for a finding whose state this run did not "
             "establish."
         )
@@ -9351,11 +9381,11 @@ def render_clean_remediate_answer(
                 if targets
                 else ", so there is nothing left to remediate."
             )
-            + " A pull request here would propose a change nobody needs."
+            + f" A {noun} here would propose a change nobody needs."
         )
     out = [
         f"@{request.get('author', 'someone')} — that `/remediate` was read on "
-        f"{stamp}, and no pull request was opened.",
+        f"{stamp}, and no {noun} was opened.",
         "",
         middle,
         "",
@@ -10484,7 +10514,11 @@ def open_remediation_pr(
     base = landed.base
 
     body = render_remediation_pr_body(
-        audit_id, group, issue_number=issue_number, generated_at=generated_at
+        audit_id,
+        group,
+        issue_number=issue_number,
+        generated_at=generated_at,
+        noun=_proposal_noun(repo),
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
@@ -10590,6 +10624,7 @@ def close_stale_remediation_prs(
     but the close is retried until it succeeds — the marker records that the
     announcement happened, not that the pull request shut.
     """
+    noun = _proposal_noun(repo)
     closed: list[str] = []
     branch_by_finding = branch_by_finding or {}
     shielded_ids = shielded_ids or set()
@@ -10667,14 +10702,14 @@ def close_stale_remediation_prs(
         reason = ""
         resolution = ""
         if only_shielded:
-            reason = SHARED_ACCOUNT_STALE_REASON
+            reason = SHARED_ACCOUNT_STALE_REASON.format(noun=noun)
             resolution = SHARED_ACCOUNT_STALE_RESOLUTION
         elif persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
                 f"findings onto `{head}`. The set of files this fix would touch "
                 "has changed, so the work now lives on a different branch — "
-                "this pull request would conflict with it."
+                f"this {noun} would conflict with it."
             )
 
         # Label first, and refuse to close without it. The label is the only
@@ -10707,7 +10742,13 @@ def close_stale_remediation_prs(
                 repo,
                 number,
                 render_stale_close_comment(
-                    audit_id, findings, generated_at, pr_number=number, reason=reason, resolution=resolution
+                    audit_id,
+                    findings,
+                    generated_at,
+                    pr_number=number,
+                    reason=reason,
+                    resolution=resolution,
+                    noun=noun,
                 ),
                 what="stale-close comment",
             )
@@ -10734,6 +10775,7 @@ def comment_on_merged_but_persisting(
     than by mutating the trigger, and the pull request is never reopened: it
     merged, and reopening it would misrepresent history.
     """
+    noun = _proposal_noun(repo)
     for finding in sort_findings(findings):
         fid = str(finding.get("id", ""))
         pr = pr_by_finding.get(fid)
@@ -10753,7 +10795,7 @@ def comment_on_merged_but_persisting(
         post_pr_comment(
             repo,
             number,
-            render_persists_comment(audit_id, finding, generated_at),
+            render_persists_comment(audit_id, finding, generated_at, noun),
             what="merged-but-persists comment",
         )
 
@@ -11009,7 +11051,9 @@ def load_findings(path: str, audit_id: str) -> dict:
     return validate_findings(data, audit_id)
 
 
-def remediation_file_problem(finding: dict, root: Path) -> str | None:
+def remediation_file_problem(
+    finding: dict, root: Path, noun: str = DEFAULT_PROPOSAL_NOUN
+) -> str | None:
     """`None` if this finding's fix is a readable file inside `root`; else why not.
 
     Split out so the question can be asked without being answered destructively.
@@ -11036,17 +11080,19 @@ def remediation_file_problem(finding: dict, root: Path) -> str | None:
         return (
             f"named `{path}` as the fix, but that path does not resolve to a "
             "real file inside the repository, so nothing was read from it and "
-            "no pull request can be opened"
+            f"no {noun} can be opened"
         )
     if resolved.is_file():
         return None
     return (
-        f"named `{path}` as the fix but did not write it, so no pull "
-        "request can be opened for this finding"
+        f"named `{path}` as the fix but did not write it, so no {noun} "
+        "can be opened for this finding"
     )
 
 
-def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
+def degrade_missing_remediations(
+    findings: list[dict], root: Path, noun: str = DEFAULT_PROPOSAL_NOUN
+) -> list[str]:
     """Downgrade manifest findings whose file was never written, and report them.
 
     This used to raise, which is the wrong shape of failure by a wide margin.
@@ -11067,7 +11113,7 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     """
     degraded: list[str] = []
     for finding in findings:
-        reason = remediation_file_problem(finding, root)
+        reason = remediation_file_problem(finding, root, noun)
         if reason is None:
             continue
         remediation = finding.get("remediation") or {}
@@ -11898,6 +11944,7 @@ def _handle_finish_dry_run(
     manifest: dict | None = None,
     waiver: str = "",
 ) -> None:
+    noun = _proposal_noun(repo)
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
@@ -11908,7 +11955,7 @@ def _handle_finish_dry_run(
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
     # `handle_finish` does.
-    degraded = degrade_missing_remediations(findings, root)
+    degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
@@ -11989,6 +12036,7 @@ def _handle_finish_dry_run(
                     now,
                     collector=[entry["id"] for entry in preview_held],
                     gaps=gaps,
+                    noun=noun,
                 )
             )
             return
@@ -11999,7 +12047,7 @@ def _handle_finish_dry_run(
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        print(render_clean_comment(audit_id, data, now, gaps=gaps))
+        print(render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
@@ -12084,7 +12132,7 @@ def _handle_finish_dry_run(
         print("")
         print(
             render_remediation_pr_body(
-                audit_id, group, issue_number=None, generated_at=now
+                audit_id, group, issue_number=None, generated_at=now, noun=noun
             )
         )
 
@@ -12374,12 +12422,17 @@ def handle_remediate(args: argparse.Namespace) -> None:
             log(f"WOULD OPEN: {group_branch_for(audit_id, group)}")
             print(
                 render_remediation_pr_body(
-                    audit_id, group, issue_number=args.issue, generated_at=now
+                    audit_id,
+                    group,
+                    issue_number=args.issue,
+                    generated_at=now,
+                    noun=_proposal_noun(opt_repo),
                 )
             )
         return
 
     repo = repo_hint or resolve_repo(audit_id=audit_id, repo=opt_repo)
+    noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -12390,7 +12443,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # file would answer a request for thirty fixes with zero, which is both
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
-    degraded = set(degrade_missing_remediations(findings, root))
+    degraded = set(degrade_missing_remediations(findings, root, noun))
     refused = [fid for fid in args.finding if fid in degraded]
     requested = [fid for fid in args.finding if fid not in degraded]
     for fid in refused:
@@ -12632,13 +12685,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         return
 
     repo = repo_hint
+    noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
 
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report.
-    for fid in degrade_missing_remediations(findings, root):
+    for fid in degrade_missing_remediations(findings, root, noun):
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
@@ -12997,9 +13051,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held]
                                 + [
-                                    collector_hold_reason(t)
+                                    collector_hold_reason(t, noun)
                                     if t in held_ids
-                                    else collector_candidate_reason(t)
+                                    else collector_candidate_reason(t, noun)
                                     for t in flagged
                                 ],
                             }
@@ -13017,7 +13071,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                                 "comment_id": request.get("comment_id", ""),
                                 "author": request.get("author", "someone"),
                                 "reasons": [
-                                    declared_reason(t, covered_by_id[t]) for t in covered
+                                    declared_reason(t, covered_by_id[t], noun)
+                                    for t in covered
                                 ],
                             }
                         ],
@@ -13036,6 +13091,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         held=bool(unaccounted) and not gaps,
                         lost_memory=bool(lost_gaps),
                         partial=len(gaps) > len(lost_gaps),
+                        noun=noun,
                     ),
                     what="/remediate answer on a clean run",
                 )
@@ -13071,6 +13127,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         collector=held_collector_ids,
                         carried=held_carried_ids,
                         gaps=gaps,
+                        noun=noun,
                     ),
                     what="held-open comment over partial coverage",
                 )
@@ -13078,7 +13135,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 post_comment(
                     repo,
                     existing_issue,
-                    render_clean_comment(audit_id, data, now, gaps=gaps),
+                    render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun),
                     what="partial all-clear comment",
                 )
             log(
@@ -13102,6 +13159,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     now,
                     collector=held_collector_ids,
                     carried=held_carried_ids,
+                    noun=noun,
                 ),
                 what="held-open comment",
             )
@@ -13115,7 +13173,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now, gaps=gaps),
+                render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun),
                 what="all-clear comment",
             )
             # Completed, not "not planned": a closed ledger means the fleet is
@@ -13325,6 +13383,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         declared=declared,
         collector_held=held_ids,
         collector_flagged=candidate_only,
+        noun=noun,
     )
     plan = promotion_candidates(
         findings,
@@ -13588,6 +13647,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 now,
                 omitted=len(rendered.omitted),
                 gaps=collector_gaps,
+                noun=noun,
             )
             if comment:
                 post_comment(repo, number, comment, what="delta comment")

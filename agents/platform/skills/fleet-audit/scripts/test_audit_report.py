@@ -13013,7 +13013,9 @@ class TestTheForgesNoun(unittest.TestCase):
         header = "\n".join(audit_report._render_header("compliance-audit", "merge request"))
         self.assertIn("separate remediation merge requests", header)
         self.assertIn("can become a merge request.", header)
-        self.assertNotIn("pull request", header.split("/remediate")[0])
+        # The whole header, not the part before `/remediate`: the agent-facing
+        # paragraph after it said "pull requests" on GitLab (live, ka-gitlab-g4).
+        self.assertNotIn("pull request", header)
 
     def test_the_noun_is_read_from_the_registered_entry(self):
         entries = [{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra"}]
@@ -13021,6 +13023,134 @@ class TestTheForgesNoun(unittest.TestCase):
             self.assertEqual("merge request", audit_report._proposal_noun("gitlab.example.com/acme/platform/infra"))
             self.assertEqual("pull request", audit_report._proposal_noun("acme/fleet"))
         self.assertEqual("pull request", audit_report._proposal_noun(None))
+
+
+class TestNoPullRequestOnGitLab(unittest.TestCase):
+    """Everything the audit writes on a GitLab repository says "merge request".
+
+    Live on a GitLab install the ledger said "pull request" in a paragraph the
+    per-section tests did not reach. So this renders a full ledger, with every
+    section a real run can write, and every comment and reply the audit posts,
+    and reads all of it for the GitHub word -- then checks GitHub's text is the
+    same with the noun named as without it.
+    """
+
+    WORD = re.compile(r"pull[ -]request", re.IGNORECASE)
+
+    def held_entry(self, index):
+        return {
+            "id": derived_id(fid=f"held-{index}"),
+            "title": f"Held finding {index}",
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": f"Namespace/held-{index}",
+            "commands": ["kubectl get networkpolicy -A -o json"],
+        }
+
+    def texts(self, noun):
+        findings = [
+            manifest_finding("crit-open", "a.yaml"),
+            manifest_finding("crit-pr", "b.yaml"),
+            manifest_finding("crit-persists", "c.yaml"),
+            manifest_finding("crit-withdrawn", "d.yaml"),
+            manifest_finding("crit-refused", "e.yaml"),
+            manifest_finding("crit-withheld", "f.yaml"),
+            make_finding(fid="major-g", severity="major", remediation={"kind": "gcloud", "note": "g"}),
+            make_finding(fid="minor-m", severity="minor"),
+        ]
+        url = "https://forge.example/acme/infra/-/merge_requests/"
+        states = {
+            "crit-open": audit_report.STATE_OPEN,
+            "crit-pr": audit_report.STATE_PR_OPEN,
+            "crit-persists": audit_report.STATE_PR_MERGED_PERSISTS,
+            "crit-withdrawn": audit_report.STATE_WITHDRAWN,
+            "crit-refused": audit_report.STATE_REFUSED,
+        }
+        pr_urls = {fid: f"{url}{i}" for i, fid in enumerate(states, 1)}
+        gaps = ["prod-us-east: netpol-missing did not run"]
+        doc = make_doc(findings=findings)
+        body = audit_report.render_issue_body(
+            doc,
+            generated_at=NOW,
+            audit_id=AUDIT,
+            states=states,
+            pr_urls=pr_urls,
+            withheld=["crit-withheld"],
+            gaps=gaps,
+            uncorroborated=["crit-open"],
+            needs_triage=["major-g"],
+            held=[self.held_entry(i) for i in range(3)],
+            held_overflow=2,
+            held_carried=True,
+            new_ids={"crit-open"},
+            noun=noun,
+        ).body
+        out = [body]
+        out.append(
+            audit_report.render_delta_comment(
+                AUDIT, ["crit-open"], ["gone-1"], findings, {"gone-1": "Gone"}, NOW, gaps=gaps, noun=noun
+            )
+        )
+        empty = make_doc(findings=[])
+        for clean_gaps in ([], gaps, [audit_report.LOST_MEMORY_GAP]):
+            out.append(audit_report.render_clean_comment(AUDIT, empty, NOW, gaps=clean_gaps, noun=noun))
+        out.append(
+            audit_report.render_held_comment(
+                AUDIT, empty, [self.held_entry(9)], NOW, collector=[], carried=[], noun=noun
+            )
+        )
+        out.append(
+            audit_report.render_remediation_pr_body(
+                AUDIT, findings[:2], issue_number=7, generated_at=NOW, noun=noun
+            )
+        )
+        out.append(audit_report.render_stale_close_comment(AUDIT, findings[:1], NOW, pr_number=3, noun=noun))
+        out.append(
+            audit_report.render_stale_close_comment(
+                AUDIT,
+                findings[:1],
+                NOW,
+                pr_number=3,
+                reason=audit_report.SHARED_ACCOUNT_STALE_REASON.format(noun=noun),
+                noun=noun,
+            )
+        )
+        out.append(audit_report.render_persists_comment(AUDIT, findings[2], NOW, noun))
+        request = {"author": "operator", "targets": ["crit-open"], "comment_id": "IC_9"}
+        for mode in ({}, {"held": True}, {"lost_memory": True, "partial": True}):
+            out.append(
+                audit_report.render_clean_remediate_answer(
+                    AUDIT, request, NOW, closing=False, noun=noun, **mode
+                )
+            )
+        comments = [
+            {"id": "IC_1", "body": "/remediate crit-open", "authorAssociation": "NONE", "author": {"login": "stranger"}},
+            {"id": "IC_2", "body": "/remediate major-g", "authorAssociation": "MEMBER", "author": {"login": "operator"}},
+        ]
+        requests = audit_report.parse_remediate_commands(comments, findings, noun=noun)
+        out += [audit_report.render_refusal_comment(r, NOW) for r in requests.refusals]
+        out += [
+            audit_report.collector_hold_reason("x", noun),
+            audit_report.collector_candidate_reason("x", noun),
+            audit_report.declared_reason("x", {"path": "intent.yaml"}, noun),
+        ]
+        plan = audit_report.PromotionPlan([], [], [])
+        outcomes = audit_report._remediation_outcomes(
+            audit_report.RemediateRequests(["crit-open"], [], {}), plan, {}, [], noun
+        )
+        out.append(audit_report.render_ack_comment("IC_2", ["crit-open"], outcomes, NOW, noun))
+        with tempfile.TemporaryDirectory() as root:
+            out.append(str(audit_report.remediation_file_problem(findings[0], Path(root), noun)))
+        return [text for text in out if text]
+
+    def test_nothing_the_audit_writes_on_gitlab_says_pull_request(self):
+        texts = self.texts("merge request")
+        self.assertGreater(len(texts), 15)
+        for text in texts:
+            found = self.WORD.search(text)
+            self.assertIsNone(found, f"...{text[max(found.start() - 120, 0):found.end() + 40]}..." if found else "")
+        self.assertIn("merge request", "\n".join(texts))
 
 
 class TestRefreshOnAnotherForge(unittest.TestCase):
