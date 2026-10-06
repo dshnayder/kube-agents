@@ -332,6 +332,33 @@ EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 # name-only check would pass it.
 VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
 
+# The managed OpenTelemetry collection scope the host cluster must carry. The
+# operator's collector discovery (k8s-operator/internal/controller/telemetry.go)
+# finds the gke-managed-otel collector only on a cluster with this scope; on
+# any other it resolves status.telemetry.otlpEndpointSource to None, wires the
+# agent with OTEL_SDK_DISABLED=true, and the install exports no traces: the
+# project's Cloud Trace stays empty, and nothing on the lease says so. Neither
+# google provider has a field for it, so full-install cannot set it:
+# scripts/provision_ci_pool_project.sh sets it with a post-apply
+# `gcloud container clusters update --managed-otel-scope` (the value there is
+# a copy of this one, and the tests pin the two equal), and this is the read
+# half. The fleet clusters are not held to it: nothing reads their traces.
+HOST_OTEL_SCOPE = "COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+REPAIR_HOST_OTEL_SCOPE = (
+    f"gcloud container clusters update {HOST_CLUSTER} --project={{project_id}} --location=us-central1 "
+    f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
+)
+FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
+# Findings a leased run passes with. Every other finding reds the run that
+# leases the project -- a missing grant, API, key or cluster is a 403 or a
+# missing resource in the agent's transcript -- and the health bot's pool-drift
+# advice tells the pull request so. A host cluster without the scope installs,
+# serves and grades like any other; only its traces are missing. The bot reads
+# this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
+# health.py's rule 3e) before wording the advice, so a 403 on a project whose
+# findings are all here is reported as the change's to read, not the pool's.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
+
 DEFAULT_GITHUB_APP_ID = 4675512
 
 # The first commit a GitOps repository needs before the broker can open a
@@ -346,38 +373,53 @@ GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # The declared-intent note provisioning seeds after the first commit
 # (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
-# obtainability-declared-intent-no-finding case fails on a project whose
+# declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, and token-reader's mounted token, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: notification-relay runs without a PodDisruptionBudget on purpose
+title: seeded-intent and seeded-token carry three postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
     object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
+  - check: default-sa-automount
+    namespace: seeded-token
+    object: Deployment/token-reader
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-obtainability audit lists this posture under Declared intent rather than as a finding."""
-# The stream whose declared-intent step reads the note; its `declarable` set is
-# the policy the check defers to.
-GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
-# The one declaration the audit's parser (audit_report.py parse_declarations)
-# must find in the note's `declares` list. A file that has the path but not
-# this declares nothing, and the case fails on that project with a
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
+in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
+design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
+The obtainability and compliance audits list the three postures under Declared intent rather than
+as findings."""
+# The declarations the audits' parser (audit_report.py parse_declarations) must
+# find in the note's `declares` list, each with the stream whose `declarable`
+# set is the policy for it. A file that has the path but not these declares
+# nothing, and the declared-intent cases fail on that project with a
 # presence-only check green -- which is why presence alone is not the check.
-GITOPS_INTENT_NOTE_DECLARATION = {
-    "check": "no-pdb",
-    "namespace": "seeded-intent",
-    "object": "Deployment/notification-relay",
-}
+# The nightly cases that fail on a project whose note is missing or unread,
+# one per declaring stream, named in this check's messages.
+GITOPS_INTENT_NOTE_CASES = (
+    "obtainability-declared-intent-no-finding",
+    "compliance-declared-intent-no-finding",
+    "compliance-declared-token-shields-siblings",
+)
+GITOPS_INTENT_NOTE_DECLARATIONS = (
+    ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
+    ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
+    ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
+)
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -1996,9 +2038,9 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
 
 
 def check_gke_and_state(project_id: str) -> CheckResult:
-    """Verify the host cluster, its CMEK state, the seeded clusters' names, and the state bucket.
+    """Verify the host cluster, its CMEK state and managed-OTel scope, the seeded clusters' names, and the state bucket.
 
-    Names and encryption only. Whether those clusters hold the planted fixtures is
+    Names, encryption and the host's telemetry scope only. Whether those clusters hold the planted fixtures is
     check_seeded_fleet_fixtures() below, and the two are far apart: an apply
     that created the clusters and died before the Kubernetes provider ran
     satisfies every assertion here.
@@ -2011,19 +2053,20 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     clusters_checked = False
     bucket_checked = False
 
-    # name and encryption state in one listing: a separate describe would need
-    # the cluster's location, which this call is what would have told us.
+    # name, encryption state and managed-OTel scope in one listing: a separate
+    # describe would need the cluster's location, which this call is what
+    # would have told us.
     rc, out, err = run_cmd([
         "gcloud", "container", "clusters", "list",
         f"--project={project_id}",
-        "--format=value(name,databaseEncryption.state)",
+        "--format=value(name,databaseEncryption.state,managedOpentelemetryConfig.scope)",
     ])
     if rc != 0:
         if not _record_unreadable(
             err,
             f"Failed listing clusters: {err.strip()}",
             f"Could not list the clusters in {project_id}, so neither the four expected clusters nor "
-            f"{HOST_CLUSTER}'s CMEK state was checked",
+            f"{HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked",
             details,
             warnings,
         ):
@@ -2032,18 +2075,23 @@ def check_gke_and_state(project_id: str) -> CheckResult:
         partial = next((line.strip() for line in err.splitlines() if PARTIAL_LISTING_RE.search(line)), err.strip())
         warnings.append(Unread(
             f"Could not list all the clusters in {project_id} ({partial}), so neither the four expected "
-            f"clusters nor {HOST_CLUSTER}'s CMEK state was checked"
+            f"clusters nor {HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked"
         ))
     else:
         clusters_checked = True
 
     encryption_by_cluster = {}
+    otel_scope_by_cluster = {}
     if clusters_checked:
         for line in out.splitlines():
             if not line.strip():
                 continue
-            fields = line.split()
+            # `value()` joins its columns with tabs and leaves an unset one
+            # empty, so the split is on the tab: a whitespace split would
+            # collapse an unset CMEK state and read the scope as the state.
+            fields = line.split("\t")
             encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
+            otel_scope_by_cluster[fields[0]] = fields[2] if len(fields) > 2 else ""
 
         missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
         if missing_clusters:
@@ -2063,6 +2111,15 @@ def check_gke_and_state(project_id: str) -> CheckResult:
                     f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
                     "encrypted, so this is drift",
                     REPAIR_HOST_CMEK,
+                )
+            scope = otel_scope_by_cluster[HOST_CLUSTER]
+            if scope != HOST_OTEL_SCOPE:
+                passed = False
+                _drift(
+                    details, findings, FINDING_HOST_OTEL_SCOPE,
+                    f"{HOST_CLUSTER} managedOpentelemetryConfig.scope is '{scope or 'unset'}', not "
+                    f"{HOST_OTEL_SCOPE}; an install on it finds no managed collector and exports no traces",
+                    REPAIR_HOST_OTEL_SCOPE.format(project_id=project_id),
                 )
 
     # `buckets describe` needs storage.buckets.get, which `storage ls` does not,
@@ -2086,11 +2143,11 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     if not passed:
         message = "GKE/state resources missing"
     elif clusters_checked and bucket_checked:
-        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, managed-OTel scope, and state bucket present"
     else:
         verified = []
         unchecked = []
-        (verified if clusters_checked else unchecked).append("clusters and CMEK")
+        (verified if clusters_checked else unchecked).append("clusters, CMEK and managed-OTel scope")
         (verified if bucket_checked else unchecked).append("state bucket")
         prefix = f"{'; '.join(verified)} present; " if verified else ""
         message = f"{prefix}{'; '.join(unchecked)} not checked"
@@ -2465,52 +2522,56 @@ def _load_audit_report():
 
 
 def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional[str]:
-    """Why the audit would not join `body`'s declaration to the fixture's finding, or None when it would.
+    """Why an audit would not join one of `body`'s declarations to its fixture finding, or None when every one joins.
 
     Not a copy of the parser: the note goes through the audit's own
-    `parse_declarations` (frontmatter delimiters, YAML and its error classes,
-    `type`, `declares`, the item shape, the `cluster` rule) and the surviving
-    items are compared on the audit's own join key, which folds
+    `parse_declarations` once, over the union of the declarable sets of the streams in GITOPS_INTENT_NOTE_DECLARATIONS
+    (frontmatter delimiters, YAML and its error classes, `type`, `declares`,
+    the item shape, the `cluster` rule, that stream's `declarable` set) and
+    the surviving items are compared on the audit's own join key, which folds
     `Deployment/notification-relay`, `deployment/notification-relay` and
     `Deployment / notification-relay` to one. The join is the audit's too:
     `apply_declarations` files clustered items under their cluster and the
     rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
-    note is good when ANY matching item is fleet-wide, whatever else it lists.
-    A note the parser reads nothing from is explained by the parser itself
-    (`explain_empty_declarations`, the same ladder `parse_declarations`
-    walks), so the reason printed cannot drift from the verdict.
+    declaration is good when ANY matching item is fleet-wide, whatever else
+    the note lists. A note the parser reads nothing from is explained by the
+    parser itself (`explain_empty_declarations`, the same ladder
+    `parse_declarations` walks), so the reason printed cannot drift from the
+    verdict.
     """
     if audit is None:
         audit = _load_audit_report()
-    # The audit's own policy for which slugs a note may justify, not a local
-    # copy of it: if no-pdb ever leaves the obtainability stream's declarable
-    # set, this check rejects the note the day the audit does.
-    declarable = audit.audit_declarable_checks(GITOPS_INTENT_NOTE_AUDIT)
-    entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
-    if not entries:
+    # One parse over the union of the streams' declarable sets, so the two
+    # items are read in one pass and neither draws the other stream's note on
+    # stderr; each stream's item is then matched among the entries of its own
+    # check. The policy is still the audit's: a slug that leaves its stream's
+    # set leaves the union, and this check rejects the note the day the audit does.
+    declarable_by_stream = {stream: audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS}
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        if wanted_item["check"] not in declarable_by_stream[stream]:
+            return f"{wanted_item['check']} is no longer a check {stream} lets a declaration justify"
+    union = frozenset().union(*declarable_by_stream.values())
+    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
+    if not all_entries:
         # The reason is the parser's own (`explain_empty_declarations` walks
         # the ladder `parse_declarations` walks); None means the note had
         # items and the parser skipped every one, logging a WARNING each.
         reason = audit.explain_empty_declarations(body)
-        return reason or (
-            f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-            f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']} "
-            "(the parser skipped every item; its WARNING lines above say why)"
-        )
-    wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
-    matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
-    if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
-        return None
-    if matching:
-        clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
-        return (
-            f"its only matching declaration(s) name cluster {', '.join(clusters)}, so the audit joins them to "
-            "that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
-        )
-    return (
-        f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-        f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']}"
-    )
+        return reason or "the parser skipped every declares item (its WARNING lines above say why)"
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        entries = [e for e in all_entries if str(e.get("check", "")) == wanted_item["check"]]
+        wanted = audit._declaration_key(wanted_item, with_cluster=False)
+        matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
+        if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
+            continue
+        if matching:
+            clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
+            return (
+                f"its only matching {wanted_item['check']} declaration(s) name cluster {', '.join(clusters)}, so the "
+                "audit joins them to that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
+            )
+        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace']}"
+    return None
 
 
 def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:
@@ -2578,7 +2639,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             False,
             f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
             f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
-            f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
+            f"readable, {' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project until the note "
             f"is seeded: {gitops_note_seed_command(repo_slug)}",
         )
 
@@ -2636,7 +2697,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audit reads no declaration from it: "
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audits do not read every declaration the fixture needs from it: "
             f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
     # The audit reads notes only under the paths `.kube-agents/intent.yaml`
@@ -2714,7 +2775,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         False,
         f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
         f"the audit's search to {', '.join(prefixes)}, every one of which exists, so the audit never reads the note and "
-        f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
+        f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
         f"`paths`, or move the note under one of them.",
     )
 
