@@ -416,6 +416,13 @@ class WriteAccessTest(unittest.TestCase):
         self.assertIsNone(forge().can_write(Api([person], WorkspaceError("x", status=502)), "acme/infra", "dev"))
         self.assertIsNone(forge().can_write(Api(WorkspaceError("x", status=502)), "acme/infra", "dev"))
 
+    def test_an_author_the_caller_marks_as_a_bot_is_no_without_a_lookup(self):
+        # Review (#2437): `bot=True` from the broker was discarded and the
+        # answer re-derived with up to two user lookups.
+        api = Api()
+        self.assertIs(False, forge().can_write(api, "acme/infra", "project_1_bot_ab", bot=True))
+        self.assertEqual([], api.calls)
+
     def test_an_automation_is_never_a_writer_whatever_its_name_or_role(self):
         # Review round 3: a service account named like a person, holding
         # Developer, read as a person and its comments became requests.

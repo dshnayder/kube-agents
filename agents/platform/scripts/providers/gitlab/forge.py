@@ -359,6 +359,11 @@ class GitLabForge(Forge):
         """
         if not login:
             return False
+        if bot:
+            # The caller already knows: the comment's author was read as an
+            # automation (this forge's own `is_automation`). No lookup can
+            # turn that into a writer, so none is spent.
+            return False
         try:
             users = api("GET", "users", params={"username": login}) or []
         except WorkspaceError:
