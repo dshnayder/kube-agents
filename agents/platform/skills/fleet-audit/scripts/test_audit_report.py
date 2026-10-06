@@ -12428,6 +12428,69 @@ class TestRemediationOutcomes(unittest.TestCase):
         self.assertIn("no pull request was opened", out["a"])
 
 
+class TestTheForgesNoun(unittest.TestCase):
+    """A GitLab repository's ledger speaks of merge requests, GitHub's of pull requests."""
+
+    def test_the_outcomes_and_the_acknowledgement_use_the_forges_noun(self):
+        plan = audit_report.PromotionPlan([], [], [])
+        requests = audit_report.RemediateRequests(["a", "b"], [], {})
+        out = audit_report._remediation_outcomes(
+            requests, plan, {"a": {"url": "https://gitlab.com/acme/infra/-/merge_requests/4"}}, [], "merge request"
+        )
+        self.assertEqual("merge request refreshed — https://gitlab.com/acme/infra/-/merge_requests/4", out["a"])
+        self.assertIn("no merge request was opened", out["b"])
+        self.assertNotIn("pull request", " ".join(out.values()))
+        ack = audit_report.render_ack_comment(
+            "IC_1", ["a", "c"], out, audit_report.datetime(2026, 10, 6, tzinfo=audit_report.timezone.utc), "merge request"
+        )
+        self.assertIn("`c` — no merge request was opened", ack)
+
+    def test_the_ledger_header_uses_it_and_github_is_unchanged(self):
+        self.assertEqual(audit_report._render_header("compliance-audit"), audit_report._render_header("compliance-audit", "pull request"))
+        header = "\n".join(audit_report._render_header("compliance-audit", "merge request"))
+        self.assertIn("separate remediation merge requests", header)
+        self.assertIn("can become a merge request.", header)
+        self.assertNotIn("pull request", header.split("/remediate")[0])
+
+    def test_the_noun_is_read_from_the_registered_entry(self):
+        entries = [{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra"}]
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual("merge request", audit_report._proposal_noun("gitlab.example.com/acme/platform/infra"))
+            self.assertEqual("pull request", audit_report._proposal_noun("acme/fleet"))
+        self.assertEqual("pull request", audit_report._proposal_noun(None))
+
+
+class TestLedgerStoreForNestedPaths(unittest.TestCase):
+    def setUp(self):
+        # Only the path is computed; nothing is created under it.
+        self.root = "/reports"
+        patcher = patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_nested_gitlab_path_is_that_many_directories_down(self):
+        self.assertEqual(
+            Path(self.root, "compliance-audit", "gitlab.com", "acme", "platform", "infra"),
+            audit_report.reports_dir_for("compliance-audit", "gitlab.com/Acme/platform/infra"),
+        )
+
+    def test_github_named_with_its_host_keeps_the_bare_slugs_ledger(self):
+        self.assertEqual(
+            audit_report.reports_dir_for("compliance-audit", "acme/fleet"),
+            audit_report.reports_dir_for("compliance-audit", "github.com/Acme/fleet"),
+        )
+
+    def test_a_deep_path_without_a_host_or_with_a_climb_is_refused(self):
+        for repo in ("acme/platform/infra", "gitlab.com/acme/../infra", "gitlab.com/acme"):
+            with self.subTest(repo=repo):
+                if repo == "gitlab.com/acme":
+                    # Two segments read as owner/name, as before.
+                    audit_report.reports_dir_for("compliance-audit", repo)
+                    continue
+                with self.assertRaises(ValueError):
+                    audit_report.reports_dir_for("compliance-audit", repo)
+
+
 # --------------------------------------------------------------------------- #
 # Body budget bookkeeping
 # --------------------------------------------------------------------------- #
@@ -12563,31 +12626,31 @@ class TestRepoResolution(BaseTestCase):
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
 
     def test_all_sources_failing_names_sources(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: None
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 audit_report.resolve_repo()
         self.assertIn("ConfigMap", str(caught.exception))
         self.assertIn("origin remote", str(caught.exception))
 
     def test_explicit_repo_in_managed_repos_succeeds(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/first", "acme/second"]):
             self.assertEqual(audit_report.resolve_repo(repo="acme/first"), "acme/first")
 
     def test_explicit_repo_not_in_managed_repos_raises(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/first", "acme/second"]):
             with self.assertRaises(ValueError) as caught:
                 audit_report.resolve_repo(repo="acme/unregistered")
             self.assertIn("not in the managed repositories list", str(caught.exception))
 
-    def test_explicit_repo_raises_when_get_managed_github_repos_fails(self):
+    def test_explicit_repo_raises_when_get_managed_repos_fails(self):
         with patch(
-            "gitops_workspace.get_managed_github_repos",
+            "gitops_workspace.get_managed_repos",
             side_effect=RuntimeError("kubectl failed: Forbidden"),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -13076,7 +13139,7 @@ class ContentModeTestCase(BaseTestCase):
         )
         managed = patch.object(
             gitops_workspace,
-            "get_managed_github_repos",
+            "get_managed_repos",
             return_value=["acme/fleet"],
         )
         managed.start()

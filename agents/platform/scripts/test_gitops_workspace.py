@@ -782,14 +782,14 @@ class TestResolveRepo(WorkspaceTestCase):
         # than the one it exercises. That branch is not taken here, but the
         # stub should not be what decides that.
         module.get_current_git_repo = lambda cwd=None: "acme/from-remote"
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(
                 gitops_workspace.resolve_repo(),
                 "acme/from-remote",
             )
 
     def test_raises_when_configmap_read_fails(self):
-        with patch("gitops_workspace.get_managed_github_repos", side_effect=RuntimeError("kubectl failed: Forbidden")):
+        with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("kubectl failed: Forbidden")):
             with self.assertRaises(RuntimeError) as ctx:
                 gitops_workspace.resolve_repo()
             self.assertIn("kubectl failed: Forbidden", str(ctx.exception))
@@ -1501,11 +1501,11 @@ class TestContextRepos(WorkspaceTestCase):
         )
 
     def test_single_repo_in_configmap_succeeds(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/single"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/single"]):
             self.assertEqual(gitops_workspace.resolve_repo(), "acme/single")
 
     def test_multiple_repos_in_configmap_raises_error(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/first", "acme/second"]):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()
             self.assertIn("Multiple repositories configured", str(caught.exception))
@@ -1513,7 +1513,7 @@ class TestContextRepos(WorkspaceTestCase):
     def test_all_sources_failing_raises_runtime_error(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda cwd=None: None
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()
         self.assertIn("ConfigMap", str(caught.exception))
@@ -1561,3 +1561,104 @@ def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestForgeNeutralNames(unittest.TestCase):
+    """A managed repository on another forge, named the way the verbs take it."""
+
+    @staticmethod
+    def entries(*pairs):
+        return [{"type": kind, "url": url} for kind, url in pairs]
+
+    def names(self, *pairs):
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=self.entries(*pairs)):
+            return gitops_workspace.get_managed_repos()
+
+    def test_a_github_only_list_is_the_bare_slugs_it_always_was(self):
+        self.assertEqual(
+            ["Acme/Fleet", "acme/other"],
+            self.names(("github", "https://github.com/Acme/Fleet"), ("github", "acme/other")),
+        )
+
+    def test_another_forges_entry_is_named_with_its_host_at_any_depth(self):
+        self.assertEqual(
+            ["gitlab.example.com/acme/platform/infra"],
+            self.names(("gitlab", "https://gitlab.example.com/acme/platform/infra.git")),
+        )
+
+    def test_a_second_forge_qualifies_githubs_names_too(self):
+        # The broker refuses a name with no host once it serves two forges.
+        self.assertEqual(
+            ["github.com/acme/fleet", "gitlab.com/acme/infra"],
+            self.names(("github", "https://github.com/acme/fleet"), ("gitlab", "https://gitlab.com/acme/infra")),
+        )
+
+    def test_an_entry_with_no_host_or_no_provider_is_skipped_and_says_why(self):
+        with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+            self.assertEqual([], self.names(("gitlab", "acme/infra"), ("forgejo", "https://code.example/a/b")))
+        joined = "\n".join(logs.output)
+        self.assertIn("Register a gitlab repository by its URL", joined)
+        self.assertIn("no provider for type 'forgejo'", joined)
+
+    def test_a_host_qualified_name_is_valid_and_a_lookalike_is_not(self):
+        valid = ("acme/fleet", "gitlab.com/acme/infra", "gitlab.com/acme/platform/infra", "github.com/acme/fleet")
+        invalid = (
+            "github.com/acme/fleet/extra",  # GitHub never nests
+            "www.github.com/acme/fleet",    # only the canonical spelling is a name
+            "https://gitlab.com/acme/x",    # a URL is not a name
+            "gitlab.com/acme/../x",
+            "gitlab.com/-acme/x",
+            "GitLab.com/acme/x",            # the name is what it normalises to, or nothing
+            "gitlab.com/acme/x/",
+        )
+        for repo in valid:
+            with self.subTest(repo=repo):
+                self.assertTrue(gitops_workspace.is_valid_repo_slug(repo))
+        for repo in invalid:
+            with self.subTest(repo=repo):
+                self.assertFalse(gitops_workspace.is_valid_repo_slug(repo))
+
+    def test_the_namespace_binding_is_a_segment_prefix(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "acme/platform"}, clear=False):
+            self.assertEqual(
+                "gitlab.com/acme/platform/infra",
+                gitops_workspace.validate_repo_org("gitlab.com/acme/platform/infra"),
+            )
+            for outside in ("gitlab.com/acme/platform-x/infra", "gitlab.com/acme/infra"):
+                with self.subTest(repo=outside), self.assertRaises(ValueError):
+                    gitops_workspace.validate_repo_org(outside)
+
+    def test_the_github_minters_org_does_not_bind_another_forge(self):
+        env = {"GITHUB_ORG": "acme"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GITOPS_ORG", None)
+            self.assertEqual("gitlab.com/elsewhere/infra", gitops_workspace.validate_repo_org("gitlab.com/elsewhere/infra"))
+            with self.assertRaises(ValueError):
+                gitops_workspace.validate_repo_org("elsewhere/fleet")
+
+    def test_the_clone_and_the_committer_are_on_the_repositorys_own_host(self):
+        self.assertEqual("https://github.com/acme/fleet.git", gitops_workspace.clone_url("acme/fleet"))
+        self.assertEqual(
+            "https://gitlab.example.com/acme/platform/infra.git",
+            gitops_workspace.clone_url("gitlab.example.com/acme/platform/infra"),
+        )
+        calls = []
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_AUTHOR_EMAIL", None)
+            gitops_workspace.configure_identity(Path("."), lambda argv, cwd: calls.append(argv), repo="gitlab.com/acme/infra")
+            gitops_workspace.configure_identity(Path("."), lambda argv, cwd: calls.append(argv))
+        emails = [argv[-1] for argv in calls if argv[2] == "user.email"]
+        self.assertEqual(["platform-agent@users.noreply.gitlab.com", "platform-agent@users.noreply.github.com"], emails)
+
+    def test_a_nested_name_is_one_directory_under_the_lease(self):
+        path = gitops_workspace.workspace_path("gitlab.com/acme/platform/infra", "/r", lease="l")
+        self.assertEqual(Path("/r/l/gitlab.com__acme__platform__infra"), path)
+        self.assertEqual(Path("/r/l/acme__fleet"), gitops_workspace.workspace_path("acme/fleet", "/r", lease="l"))
+
+    def test_the_forges_noun_comes_from_the_entry_it_was_registered_as(self):
+        entries = self.entries(("gitlab", "https://gitlab.example.com/acme/infra"))
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual("merge request", gitops_workspace.proposal_noun("gitlab.example.com/acme/infra"))
+            self.assertEqual("pull request", gitops_workspace.proposal_noun("acme/fleet"))
+            self.assertEqual("pull request", gitops_workspace.proposal_noun("github.com/acme/fleet"))
+            self.assertEqual("pull request", gitops_workspace.proposal_noun("code.example/a/b"))

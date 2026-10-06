@@ -39,7 +39,7 @@ import sandbox_exec  # noqa: E402 — needs the sys.path lines above
 import vcs_client  # noqa: E402 — needs the sys.path lines above
 from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
     GITOPS_STATE_READ_TIMEOUT_SECONDS,
-    get_managed_github_repos,
+    get_managed_repos,
     is_valid_repo_slug,
 )
 
@@ -87,7 +87,7 @@ FORWARD_TIMEOUT_PER_REPO_S = 300
 # What the margin has to cover, and it is not a round number: the gate starts
 # its clock at `subprocess.run`, and everything this process does before
 # `sandbox_exec.run` is entered is spent inside that window. Nearly all of it is
-# one thing -- this process's own `get_managed_github_repos()`, the same
+# one thing -- this process's own `get_managed_repos()`, the same
 # ConfigMap read the gate already paid, bounded by the timeout below. A fixed 15
 # did not cover it: on a slow API server -- which is exactly when that read is
 # slow -- the gate's kill landed first, and an outer kill reaches this process
@@ -206,7 +206,7 @@ def _forward_timeout(argv) -> int:
     repos = 1
     if argv and argv[0] == "poll":
         try:
-            repos = max(1, len(get_managed_github_repos()))
+            repos = max(1, len(get_managed_repos()))
         except Exception:
             repos = 1
     return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
@@ -623,7 +623,7 @@ def _fetch_comments(repo: str, number) -> tuple[list, bool]:
 
 def handle_poll(args):
     try:
-        repos = get_managed_github_repos()
+        repos = get_managed_repos()
     except Exception as e:
         refuse("CONFIGMAP_READ_FAILED", str(e))
 
@@ -775,7 +775,7 @@ def _validate_repo_or_exit(repo: str) -> None:
     if not repo or not is_valid_repo_slug(repo):
         refuse("INVALID_REPOSITORY", f"Invalid repository format: {repo!r}")
     try:
-        managed = get_managed_github_repos()
+        managed = get_managed_repos()
     except Exception as e:
         refuse("CONFIGMAP_READ_FAILED", str(e))
     if repo not in managed:

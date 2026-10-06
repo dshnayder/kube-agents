@@ -485,6 +485,10 @@ REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 # a veto. Every proposal listing carries its labels, so it costs no extra call.
 STALE_CLOSED_LABEL = "audit:stale-closed"
 
+# What a remediation is called when the forge's own noun cannot be read. Every
+# GitHub repository is spoken of this way; a GitLab one as a "merge request".
+DEFAULT_PROPOSAL_NOUN = "pull request"
+
 # Wildcard stagers that must never reach `git add` — an audit stages named
 # remediation files only, never the whole working tree.
 FORBIDDEN_ADD_PATHSPECS = {".", "-A", "--all", "-a", "*", ":/", "./", ":"}
@@ -1925,14 +1929,24 @@ def reports_dir_for(audit_id: str, repo: str) -> Path:
     # Lower-cased because GitHub's names are not case-sensitive: `--repo
     # Acme/GitOps` and a ConfigMap's `acme/gitops` are one ledger, and two
     # directories for it would each trust a memory the other has moved past.
+    #
+    # A repository on another forge is named `host/path` at any depth, and its
+    # store is that many directories down: a GitHub owner has no dot in it, so
+    # `gitlab.com/acme/infra` cannot land on a GitHub owner's directory. GitHub
+    # named with its host, as an install managing two forges names it, is the
+    # same ledger as the bare slug and keeps the bare slug's directory.
     segments = str(repo).lower().split("/")
-    if len(segments) != 2 or not all(
+    if len(segments) == 3 and segments[0] == "github.com":
+        segments = segments[1:]
+    if len(segments) > 2 and "." not in segments[0]:
+        segments = []
+    if len(segments) < 2 or not all(
         REPORT_REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir)
         for part in segments
     ):
-        raise ValueError(f"repository {repo!r} is not owner/name")
+        raise ValueError(f"repository {repo!r} is not owner/name or host/path")
     root = Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR)
-    return root / audit_id / segments[0] / segments[1]
+    return root.joinpath(audit_id, *segments)
 
 
 def _redact_document(value: object) -> object:
@@ -7169,19 +7183,34 @@ def select_rendered_findings(
     return ordered[:fitted], ordered[fitted:]
 
 
-def _render_header(audit_id: str) -> list[str]:
+def _proposal_noun(repo: str | None) -> str:
+    """What `repo`'s forge calls a change proposal; "pull request" when unsure.
+
+    Read from the managed entry the repository was registered as, with no
+    forge call: the ledger body is rendered in a dry run too, and a GitHub
+    repository answers without reading anything.
+    """
+    try:
+        import gitops_workspace
+
+        return gitops_workspace.proposal_noun(repo) if repo else DEFAULT_PROPOSAL_NOUN
+    except Exception:
+        return DEFAULT_PROPOSAL_NOUN
+
+
+def _render_header(audit_id: str, noun: str = "pull request") -> list[str]:
     return [
         f"This issue is the ledger for the `{audit_id}` audit. It is rewritten in "
         "full on every run — hand edits to this description will be lost, and the "
         "audit will never open a second ledger for this stream. It closes when the "
         "audit comes back clean.",
         "",
-        "Fixes are proposed as separate remediation pull requests, one per group of "
+        f"Fixes are proposed as separate remediation {noun}s, one per group of "
         "findings that share a file, linked from each finding below. **A human "
         "reviewer** can ask for one that was not opened automatically by commenting "
         "`/remediate <finding-id>` (or `/remediate all`) — the commenter must be a "
         "collaborator on this repository, and only a finding whose remediation is a "
-        "file in this repository can become a pull request.",
+        f"file in this repository can become a {noun}.",
         "",
         # The paragraph above is an instruction, and the audit agent is one of
         # the readers of this body. On issue #29 it read that line, followed it,
@@ -8009,6 +8038,7 @@ def render_issue_body(
     held_overflow: int = 0,
     held_preview: bool = False,
     held_carried: bool = False,
+    noun: str = "pull request",
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -8045,7 +8075,7 @@ def render_issue_body(
     # table already shows every gap the document authored.
     extra_gaps = [gap for gap in gaps if gap not in document_gaps]
 
-    fixed: list[str] = _render_header(audit_id)
+    fixed: list[str] = _render_header(audit_id, noun)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id, extra_gaps=extra_gaps)
     fixed += _render_declared_intent_search(data)
     withheld_section = _render_withheld(
@@ -8788,6 +8818,7 @@ def render_ack_comment(
     accepted: list[str],
     outcomes: dict[str, str],
     generated_at: datetime,
+    noun: str = "pull request",
 ) -> str:
     """Said once per `/remediate` the harness *did* act on.
 
@@ -8799,7 +8830,7 @@ def render_ack_comment(
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [f"That `/remediate` was processed on {stamp}:", ""]
     for fid in accepted:
-        out.append(f"- `{fid}` — {outcomes.get(fid, 'no pull request was opened')}")
+        out.append(f"- `{fid}` — {outcomes.get(fid, f'no {noun} was opened')}")
     out += ["", acked_marker(comment_id)]
     return "\n".join(out)
 
@@ -9318,8 +9349,8 @@ def resolve_repo(
     if repo and str(repo).strip():
         r = str(repo).strip()
         if not gitops_workspace.is_valid_repo_slug(r):
-            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
-        managed = gitops_workspace.get_managed_github_repos()
+            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
+        managed = gitops_workspace.get_managed_repos()
         if managed and r not in managed:
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
@@ -10276,6 +10307,7 @@ def ack_remediate_requests(
     outcomes: dict[str, str],
     existing_comments: list[dict],
     generated_at: datetime,
+    noun: str = "pull request",
 ) -> None:
     """Answer each acted-on `/remediate` exactly once, on the same guard as refusals."""
     for comment_id, accepted in accepted_by_comment.items():
@@ -10288,7 +10320,7 @@ def ack_remediate_requests(
         post_comment(
             repo,
             issue_number,
-            render_ack_comment(comment_id, accepted, outcomes, generated_at),
+            render_ack_comment(comment_id, accepted, outcomes, generated_at, noun),
             what="/remediate acknowledgement",
         )
 
@@ -10574,7 +10606,7 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
         reset=reset,
         owner=f"fleet-audit:{audit_id}",
     )
-    gitops_workspace.configure_identity(target, _workspace_runner)
+    gitops_workspace.configure_identity(target, _workspace_runner, repo=repo)
     set_workspace(target)
     return target
 
@@ -11470,6 +11502,7 @@ def _handle_finish_dry_run(
         data,
         generated_at=now,
         audit_id=audit_id,
+        noun=_proposal_noun(repo),
         gaps=gaps,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
@@ -11618,6 +11651,7 @@ def _remediation_outcomes(
     plan: PromotionPlan,
     pr_by_finding: dict[str, dict | None],
     opened: list[str],
+    noun: str = "pull request",
 ) -> dict[str, str]:
     """One sentence per accepted `/remediate` target, for the acknowledgement.
 
@@ -11631,24 +11665,24 @@ def _remediation_outcomes(
         pr = pr_by_finding.get(fid) or {}
         url = str(pr.get("url") or "")
         if url and url in just_opened:
-            outcomes[fid] = f"pull request opened — {url}"
+            outcomes[fid] = f"{noun} opened — {url}"
         elif fid in plan.already_open:
             outcomes[fid] = (
-                f"a pull request is already open — {url or 'see the table above'}; "
+                f"a {noun} is already open — {url or 'see the table above'}; "
                 "its labels were re-asserted and its diff left untouched rather "
                 "than force-pushed over"
             )
         elif fid in plan.superseded:
             outcomes[fid] = (
-                f"not re-opened — {url or 'the pull request'} was closed by a "
+                f"not re-opened — {url or 'the ' + noun} was closed by a "
                 "person *after* this request was written, so the close answers "
                 f"it. Comment `/remediate {fid}` again to overrule that."
             )
         elif url:
-            outcomes[fid] = f"pull request refreshed — {url}"
+            outcomes[fid] = f"{noun} refreshed — {url}"
         else:
             outcomes[fid] = (
-                "no pull request was opened; the harness could not publish it "
+                f"no {noun} was opened; the harness could not publish it "
                 "this run and will retry on the next audit"
             )
     return outcomes
@@ -12535,7 +12569,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
             rendered = render_issue_body(
-                data, generated_at=now, audit_id=audit_id, gaps=gaps
+                data, generated_at=now, audit_id=audit_id, gaps=gaps,
+                noun=_proposal_noun(repo),
             )
             invalidate_report_memory(audit_id, repo)
             opened = forge(
@@ -12756,6 +12791,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         data,
         generated_at=now,
         audit_id=audit_id,
+        noun=_proposal_noun(repo),
         gaps=gaps,
         states=states,
         pr_urls=pr_urls,
@@ -12902,6 +12938,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 data,
                 generated_at=now,
                 audit_id=audit_id,
+                noun=_proposal_noun(repo),
                 gaps=gaps,
                 states=states,
                 pr_urls=pr_urls,
@@ -12924,9 +12961,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             repo,
             number,
             requests.accepted_by_comment,
-            _remediation_outcomes(requests, plan, pr_by_finding, prs_opened),
+            _remediation_outcomes(requests, plan, pr_by_finding, prs_opened, _proposal_noun(repo)),
             ledger_comments,
             now,
+            _proposal_noun(repo),
         )
 
     if status == "UPDATED" and number is not None:

@@ -298,7 +298,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         for name, value in (
             ("resolve_repo", lambda workspace=None: "acme/infra"),
-            ("get_managed_github_repos", lambda: []),
+            ("get_managed_repos", lambda: []),
         ):
             patch = mock.patch.object(gitops_workspace, name, value)
             patch.start()
@@ -914,7 +914,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/infra"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/infra"]
         ):
             with self.assertRaises(ValueError) as caught:
                 self.run_subject("prepare", "--branch", "b", "--repo", "other/elsewhere")
@@ -927,7 +927,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # empty allowlist -- after which every `--repo` the model names is
         # accepted whenever that read hiccups, and the suite stays green.
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -1019,7 +1019,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         prepared = self.prepare()
         self.edit(prepared)
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -1702,7 +1702,7 @@ class TestValidateRepo(unittest.TestCase):
 
     def test_an_unreadable_managed_list_is_refused_rather_than_read_as_empty(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("kubectl failed: Forbidden")),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -1712,17 +1712,23 @@ class TestValidateRepo(unittest.TestCase):
     def test_an_empty_managed_list_means_no_allowlist_is_configured(self):
         # The other reading of an empty list, and the reason the one above
         # matters: "" and "the read failed" must not arrive at the same place.
-        with mock.patch.object(gitops_workspace, "get_managed_github_repos", lambda: []):
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: []):
             with mock.patch.object(gitops_workspace, "validate_repo_org", lambda repo: repo):
                 self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
 
     def test_a_repository_outside_a_populated_managed_list_is_refused(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/managed"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/managed"]
         ):
             with self.assertRaises(ValueError) as caught:
                 submit_suggestion.validate_repo("acme/unmanaged")
         self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_a_managed_repository_on_another_forge_is_accepted_at_any_depth(self):
+        name = "gitlab.com/acme/platform/infra"
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual(submit_suggestion.validate_repo(name), name)
 
 
 if __name__ == "__main__":
