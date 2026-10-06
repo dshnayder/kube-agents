@@ -13177,6 +13177,22 @@ class TestRefreshOnAnotherForge(unittest.TestCase):
             audit_report.refresh_credentials(repo)
         return calls
 
+    def test_the_labels_the_audit_ensures_on_gitlab_say_merge_request(self):
+        # Review round 3: `ensure_labels` posts its descriptions on every run and
+        # `audit:remediation` still said "Pull request"; `texts()` never saw it.
+        entries = [{"type": "gitlab", "url": "https://gitlab.com/acme/infra"}]
+        posted = []
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries), \
+                patch.object(audit_report, "try_forge", side_effect=lambda verb, repo, payload: posted.append(payload)):
+            audit_report.ensure_labels("gitlab.com/acme/infra", "compliance-audit")
+        text = "\n".join(p["description"] for p in posted)
+        self.assertNotIn("pull request", text.lower())
+        self.assertIn("Merge request proposing a fix", text)
+        posted.clear()
+        with patch.object(audit_report, "try_forge", side_effect=lambda verb, repo, payload: posted.append(payload)):
+            audit_report.ensure_labels("acme/fleet", "compliance-audit")
+        self.assertIn("Pull request proposing a fix for one group of audit findings", [p["description"] for p in posted])
+
     def test_a_gitlab_repository_is_not_sent_to_the_github_refresh(self):
         self.assertEqual([], self.refreshed("gitlab.com/acme/platform/infra"))
 
@@ -13196,6 +13212,51 @@ class TestRunRecordAcrossSpellings(BaseTestCase):
         # Still one repository's record, not anyone's.
         self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "acme/other"))
         self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
+
+
+class TestTheNounIsResolvedOncePerFinish(HarnessTestCase):
+    """Review round 3: `_finish` bound the noun and then looked it up again at
+    every posting site -- each a managed-list read on GitLab that falls back to
+    "pull request" on failure, so one transient read could split the wording."""
+
+    def test_finish_resolves_the_noun_once(self):
+        calls = []
+        real = audit_report._proposal_noun
+
+        def counting(repo):
+            calls.append(repo)
+            return real(repo)
+
+        self.patch_attr("_proposal_noun", counting)
+        self.run_finish(make_doc(findings=[manifest_finding("crit-open", "a.yaml")]))
+        self.assertEqual(1, len(calls), calls)
+
+
+class TestDryRunNounWithoutRepo(unittest.TestCase):
+    """Review round 3: a dry run with no `--repo` previewed GitHub's noun for a
+    GitLab repository it resolved anyway."""
+
+    def test_the_dry_run_takes_the_noun_from_the_repository_it_resolves(self):
+        entries = [{"type": "gitlab", "url": "https://gitlab.com/acme/infra"}]
+        with patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual("gitlab.com/acme/infra", audit_report._dry_run_repo("compliance-audit", None))
+            self.assertEqual("merge request", audit_report._proposal_noun(audit_report._dry_run_repo("compliance-audit", None)))
+        with patch.object(audit_report, "resolve_repo", side_effect=ValueError("no repo")):
+            self.assertIsNone(audit_report._dry_run_repo("compliance-audit", None))
+        self.assertEqual("acme/fleet", audit_report._dry_run_repo("compliance-audit", "acme/fleet"))
+
+
+class TestDeclarationsAcrossSpellings(BaseTestCase):
+    """Review round 3: `read_declarations` made the raw comparison `read_run_record`
+    no longer makes, so a bare dry run applied none of the declarations."""
+
+    def test_the_bare_and_the_host_qualified_github_name_read_one_file(self):
+        Path(audit_report.declarations_path_for(DECLARING_AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(DECLARING_AUDIT, "github.com/acme/fleet", [{"id": "d1"}])
+        self.assertEqual([{"id": "d1"}], audit_report.read_declarations(DECLARING_AUDIT, "acme/fleet"))
+        self.assertEqual([], audit_report.read_declarations(DECLARING_AUDIT, "acme/other"))
+        self.assertEqual([], audit_report.read_declarations(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
 
 
 class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):

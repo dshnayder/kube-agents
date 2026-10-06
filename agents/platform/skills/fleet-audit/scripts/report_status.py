@@ -151,8 +151,8 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
         if not REPO_SEGMENT_RE.match(owner):
             continue
         if "." in owner:
-            # A host: a GitHub owner has no dot. Each directory below it is
-            # one repository's store, its path spelled with `%2F`.
+            # A host, or a GitHub owner with a dot in it (`repo_ref` admits
+            # `my.org/repo`). `_scan_host` tells them apart by layout.
             _scan_host(root, audit_id, owner, dirs, unreadable)
             continue
         try:
@@ -182,6 +182,15 @@ def _scan_host(
         return
     for name in names:
         parts = name.split(STORE_PATH_SEPARATOR)
+        if len(parts) == 1:
+            # No `%2F`: not a store below a host, which always spells a path of
+            # two or more segments that way, but a repository directory below a
+            # dotted GitHub owner -- the two-level `owner/name` store
+            # `reports_dir_for` writes for `my.org/repo`. Read off the layout,
+            # as `store_path` opens it, rather than off the dot in the name.
+            if REPO_SEGMENT_RE.match(name) and name not in (os.curdir, os.pardir):
+                dirs.append(f"{host}/{name}")
+            continue
         if len(parts) >= 2 and all(
             REPO_SEGMENT_RE.match(part) and part not in (os.curdir, os.pardir) for part in parts
         ):

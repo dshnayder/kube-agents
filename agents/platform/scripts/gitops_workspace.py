@@ -756,18 +756,27 @@ def clone_url(repo: str) -> str:
 def qualify(repo: str, managed: list[str] | None = None) -> str:
     """`repo` as the managed list and the broker spell it on this install.
 
-    A bare `owner/name` is GitHub's, and stays bare while GitHub is the only
-    forge the list names. Once it names a second forge the list spells
-    GitHub's entries `github.com/owner/name` and the broker refuses a hostless
-    name, so a bare one from somewhere older -- a cron's `--repo`, a lease
-    record, a workspace directory from before the second forge -- is lifted to
-    match. Anything already host-qualified is returned unchanged.
+    GitHub's repositories have two spellings and the list uses one at a time:
+    bare `owner/name` while GitHub is the only forge it names, and
+    `github.com/owner/name` once it names a second -- the broker then refuses
+    a hostless name. A name from somewhere that saw the other period -- a
+    cron's `--repo`, a lease record, a workspace directory, the list's own
+    output copied while a second forge was registered -- is turned into the
+    current spelling either way, so every gate can compare it with the list
+    as written. A repository on another forge is returned unchanged.
 
     `managed` is the list when the caller has read it already; otherwise it is
     read here, and a list that cannot be read leaves the name as it was for the
     caller's own read to fail on.
     """
-    if not isinstance(repo, str) or not repo_ref.is_github_slug(repo):
+    if not isinstance(repo, str):
+        return repo
+    host, path = split_host(repo)
+    if repo_ref.is_github_slug(repo):
+        bare = repo
+    elif host == repo_ref.GITHUB_CANONICAL_HOST and repo_ref.is_github_slug(path):
+        bare = path
+    else:
         return repo
     if managed is None:
         try:
@@ -775,8 +784,8 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
         except Exception:
             return repo
     if any(split_host(name)[0] for name in managed):
-        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{repo}"
-    return repo
+        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
+    return bare
 
 
 def split_host(repo: str) -> tuple[str, str]:

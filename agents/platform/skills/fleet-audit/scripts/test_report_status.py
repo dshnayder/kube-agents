@@ -423,6 +423,16 @@ class TestNestedStores(ReportStatusTestCase):
         )
         self.assertEqual([], unreadable)
 
+    def test_a_dotted_github_owners_store_is_listed_and_queryable(self):
+        # Review round 3: `my.org/repo` is a two-level owner/name store, and the
+        # reader took the dotted owner for a host and listed nothing below it.
+        self.write_latest(repo="my.org/repo")
+        self.write_latest(repo="gitlab.com/acme/infra")
+        dirs, unreadable = report_status.scan_repo_dirs(str(self.root), AUDIT)
+        self.assertEqual(["gitlab.com/acme/infra", "my.org/repo"], sorted(dirs))
+        self.assertEqual([], unreadable)
+        self.assertIn("my.org/repo", report_status.repo_ids(str(self.root), AUDIT))
+
     def test_github_named_with_its_host_opens_the_slugs_store(self):
         self.assertEqual(
             report_status.store_path(str(self.root), AUDIT, "acme/fleet"),

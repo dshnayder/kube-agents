@@ -1706,6 +1706,17 @@ class TestForgeNeutralNames(unittest.TestCase):
         with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("unreadable")):
             self.assertEqual("acme/fleet", gitops_workspace.qualify("acme/fleet"))
 
+    def test_a_host_qualified_github_name_is_lowered_once_the_list_is_bare_again(self):
+        # Review round 3: a `--repo github.com/acme/fleet` written while a second
+        # forge was registered was refused after that forge was removed.
+        self.assertEqual("acme/fleet", gitops_workspace.qualify("github.com/acme/fleet", ["acme/fleet"]))
+        self.assertEqual(
+            "github.com/acme/fleet",
+            gitops_workspace.qualify("github.com/acme/fleet", ["github.com/acme/fleet", "gitlab.com/a/b"]),
+        )
+        # Not GitHub-shaped, so not GitHub's to lower.
+        self.assertEqual("github.com/a/b/c", gitops_workspace.qualify("github.com/a/b/c", ["acme/fleet"]))
+
     def test_a_local_clone_of_another_forges_repository_is_refused_up_front(self):
         # Review: directory mode cloned with GitHub's credential only, so a
         # private GitLab project failed mid-clone naming nothing.
@@ -1745,6 +1756,27 @@ class TestForgeTable(unittest.TestCase):
         )
 
 
+def _shipped_python(dockerfile: str) -> dict[str, set[str]]:
+    """Every `agents/**/*.py` a Dockerfile COPYs, mapped to its destinations.
+
+    Every COPY instruction: one line or continued with `\\`, with flags
+    (`--chmod=`, `--chown=`) or without. A flag is not a source; `--from=` copies
+    from another stage, whose sources are never repository paths.
+    """
+    import re
+
+    shipped: dict[str, set[str]] = {}
+    for block in re.findall(r"^COPY\b((?:[^\n]*\\\n)*[^\n]*)$", dockerfile, re.M):
+        parts = [p for p in block.replace("\\\n", " ").split() if not p.startswith("--")]
+        if len(parts) < 2:
+            continue
+        dest = parts[-1]
+        for src in parts[:-1]:
+            if src.endswith(".py") and src.startswith("agents/"):
+                shipped.setdefault(src, set()).add(dest)
+    return shipped
+
+
 class TestNoBrokerImports(unittest.TestCase):
     """The sandbox image ships `gitops_workspace` and none of the broker's modules."""
 
@@ -1777,6 +1809,27 @@ class TestNoBrokerImports(unittest.TestCase):
         }
         self.assertFalse(imported & {"providers", "workspace_paths", "vcs_broker", "credential_proxy"})
 
+    def test_the_copy_reader_sees_every_shape_of_copy(self):
+        # Review round 3: the reader matched only multi-line, flag-less COPYs, so a
+        # module shipped by a one-line or `--chmod=` COPY escaped the guard.
+        dockerfile = "\n".join([
+            "COPY agents/platform/scripts/one.py /opt/defaults/scripts/",
+            "COPY --chmod=0755 agents/platform/scripts/two.py /opt/defaults/scripts/two.py",
+            "COPY --chown=agent:agent \\",
+            "  agents/platform/scripts/three.py \\",
+            "  agents/platform/scripts/four.py /opt/vcs/libexec/platform/",
+            "COPY --from=builder /src/agents/x.py /opt/x.py",
+        ])
+        self.assertEqual(
+            {
+                "agents/platform/scripts/one.py": {"/opt/defaults/scripts/"},
+                "agents/platform/scripts/two.py": {"/opt/defaults/scripts/two.py"},
+                "agents/platform/scripts/three.py": {"/opt/vcs/libexec/platform/"},
+                "agents/platform/scripts/four.py": {"/opt/vcs/libexec/platform/"},
+            },
+            _shipped_python(dockerfile),
+        )
+
     def test_nothing_the_sandbox_ships_imports_a_broker_module(self):
         # Review: the guard above parsed `gitops_workspace` alone, so a deferred
         # broker import in a consumer -- the BLOCKER's exact shape -- would pass
@@ -1789,13 +1842,7 @@ class TestNoBrokerImports(unittest.TestCase):
 
         repo = Path(__file__).resolve().parents[3]
         dockerfile = (repo / "deploy" / "sandbox" / "Dockerfile").read_text()
-        shipped: dict[str, set[str]] = {}
-        for block in re.findall(r"^COPY (?!--)((?:[^\n]*\\\n)+[^\n]*)$", dockerfile, re.M):
-            parts = block.replace("\\\n", " ").split()
-            dest = parts[-1]
-            for src in parts[:-1]:
-                if src.endswith(".py") and src.startswith("agents/"):
-                    shipped.setdefault(src, set()).add(dest)
+        shipped = _shipped_python(dockerfile)
         self.assertIn("agents/platform/skills/github-issue-resolver/scripts/resolver.py", shipped)
         self.assertIn("agents/platform/scripts/gitops_workspace.py", shipped)
         for path in glob.glob(str(repo / "agents/platform/skills/*/scripts/*.py")):

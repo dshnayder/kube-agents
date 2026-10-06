@@ -7641,6 +7641,22 @@ def select_rendered_findings(
     return ordered[:fitted], ordered[fitted:]
 
 
+def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
+    """The repository a dry run previews, `--repo` or else resolved best-effort.
+
+    For the noun: without `--repo` the dry run still resolves the repository to
+    find its manifests, and a preview that said "pull request" for a GitLab
+    repository would not be the body `finish` publishes. Nothing here fails
+    the dry run; an unresolvable repository previews GitHub's noun as before.
+    """
+    if repo:
+        return repo
+    try:
+        return resolve_repo(audit_id=audit_id)
+    except Exception:  # noqa: BLE001 - a preview's wording, never a gate
+        return None
+
+
 def _proposal_noun(repo: str | None) -> str:
     """What `repo`'s forge calls a change proposal; "pull request" when unsure.
 
@@ -9949,7 +9965,10 @@ def current_branch() -> str:
     return (res.stdout or "").strip()
 
 
-def ensure_labels(repo: str, audit_id: str) -> None:
+def ensure_labels(repo: str, audit_id: str, noun: str | None = None) -> None:
+    # The forge's own word: GitLab PUTs the description on every run, so the
+    # label on every merge request would otherwise name a pull request.
+    noun = noun or _proposal_noun(repo)
     labels = [
         (
             "agent:audit",
@@ -9964,7 +9983,7 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         (
             "audit:remediation",
             "0E8A16",
-            "Pull request proposing a fix for one group of audit findings",
+            f"{noun.capitalize()} proposing a fix for one group of audit findings",
         ),
         (
             # Load-bearing, not decorative: `pr_closed_by_harness` reads this
@@ -10451,6 +10470,7 @@ def _land_group_via_broker(
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
+    noun: str | None = None,
 ) -> _GroupPush:
     """Hand the broker the group's bytes and let it own the branch.
 
@@ -10472,7 +10492,7 @@ def _land_group_via_broker(
 
     refusal = content_workspace_refusal(repo)
     if refusal:
-        log(f"{branch}: {refusal} No {_proposal_noun(repo)} opened.")
+        log(f"{branch}: {refusal} No {noun or _proposal_noun(repo)} opened.")
         return _GroupPush("", False)
     changes = {path: snapshot[path] for path in paths}
     with credential_proxy_client.Workspace.open(
@@ -10513,6 +10533,7 @@ def open_remediation_pr(
     issue_number: int | None,
     existing: dict | None,
     generated_at: datetime,
+    noun: str | None = None,
 ) -> str | None:
     """Land the group's files on their own branch, then open or refresh its PR.
 
@@ -10523,7 +10544,7 @@ def open_remediation_pr(
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
     landed = (
-        _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
+        _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot, noun=noun)
         if content_mode()
         else _land_group_via_clone(audit_id, group, branch, paths, snapshot, root)
     )
@@ -10536,7 +10557,7 @@ def open_remediation_pr(
         group,
         issue_number=issue_number,
         generated_at=generated_at,
-        noun=_proposal_noun(repo),
+        noun=noun or _proposal_noun(repo),
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
@@ -10614,6 +10635,7 @@ def close_stale_remediation_prs(
     *,
     branch_by_finding: dict[str, str] | None = None,
     shielded_ids: set[str] | None = None,
+    noun: str | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -10642,7 +10664,7 @@ def close_stale_remediation_prs(
     but the close is retried until it succeeds — the marker records that the
     announcement happened, not that the pull request shut.
     """
-    noun = _proposal_noun(repo)
+    noun = noun or _proposal_noun(repo)
     closed: list[str] = []
     branch_by_finding = branch_by_finding or {}
     shielded_ids = shielded_ids or set()
@@ -10786,6 +10808,7 @@ def comment_on_merged_but_persisting(
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
     generated_at: datetime,
+    noun: str | None = None,
 ) -> None:
     """Say once, on the merged pull request, that its finding still reproduces.
 
@@ -10793,7 +10816,7 @@ def comment_on_merged_but_persisting(
     than by mutating the trigger, and the pull request is never reopened: it
     merged, and reopening it would misrepresent history.
     """
-    noun = _proposal_noun(repo)
+    noun = noun or _proposal_noun(repo)
     for finding in sort_findings(findings):
         fid = str(finding.get("id", ""))
         pr = pr_by_finding.get(fid)
@@ -10979,7 +11002,10 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return []
     recorded = data.get("repo")
-    if repo and (not isinstance(recorded, str) or recorded.strip().lower() != repo.strip().lower()):
+    # Compared as one ledger, for `read_run_record`'s reason: `start` records the
+    # lifted `github.com/owner/name` on an install with a second forge, and a
+    # dry run's bare `--repo owner/name` names the same repository.
+    if repo and (not isinstance(recorded, str) or _ledger_key(recorded.strip()) != _ledger_key(repo.strip())):
         return []
     entries = data.get(DECLARATIONS_KEY)
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
@@ -11972,7 +11998,7 @@ def _handle_finish_dry_run(
     manifest: dict | None = None,
     waiver: str = "",
 ) -> None:
-    noun = _proposal_noun(repo)
+    noun = _proposal_noun(_dry_run_repo(audit_id, repo))
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
@@ -12124,7 +12150,7 @@ def _handle_finish_dry_run(
         data,
         generated_at=now,
         audit_id=audit_id,
-        noun=_proposal_noun(repo),
+        noun=noun,
         gaps=gaps,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
@@ -12175,6 +12201,7 @@ def _open_promoted_prs(
     root: Path,
     issue_number: int | None,
     generated_at: datetime,
+    noun: str | None = None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
 
@@ -12224,6 +12251,7 @@ def _open_promoted_prs(
                     issue_number=issue_number,
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
+                    noun=noun,
                 )
             except BrokerUnavailable:
                 # The broker is gone, not this group: the next group would fail
@@ -12454,7 +12482,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
                     group,
                     issue_number=args.issue,
                     generated_at=now,
-                    noun=_proposal_noun(opt_repo),
+                    noun=_proposal_noun(_dry_run_repo(audit_id, opt_repo)),
                 )
             )
         return
@@ -12463,7 +12491,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    ensure_labels(repo, audit_id)
+    ensure_labels(repo, audit_id, noun=noun)
 
     # A named finding whose manifest was never written cannot become a pull
     # request, so it is refused — but only it. `/remediate all` expands to
@@ -12555,6 +12583,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         root=root,
         issue_number=issue_number,
         generated_at=now,
+        noun=noun,
     )
     print(
         json.dumps(
@@ -12716,7 +12745,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    ensure_labels(repo, audit_id)
+    ensure_labels(repo, audit_id, noun=noun)
 
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report.
@@ -13022,6 +13051,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # body budget dropped — is still a fix for a live condition.
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
                 shielded_ids=shielded_ids,
+                noun=noun,
             )
         )
         conversation_unread = False
@@ -13228,7 +13258,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # something to say, and it must land somewhere durable.
             rendered = render_issue_body(
                 data, generated_at=now, audit_id=audit_id, gaps=gaps,
-                noun=_proposal_noun(repo),
+                noun=noun,
             )
             invalidate_report_memory(audit_id, repo)
             opened = forge(
@@ -13470,7 +13500,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         data,
         generated_at=now,
         audit_id=audit_id,
-        noun=_proposal_noun(repo),
+        noun=noun,
         gaps=gaps,
         states=states,
         pr_urls=pr_urls,
@@ -13554,7 +13584,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     # A merged fix whose finding still reproduces is said once, on the pull
     # request, and the pull request is never reopened.
-    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
+    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now, noun=noun)
 
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over incomplete coverage that assertion is unfounded, so nothing is
@@ -13579,6 +13609,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             previous_titles,
             {},
             now,
+            noun=noun,
             branch_by_finding={
                 str(finding.get("id", "")): group_branch_for(audit_id, group)
                 for group in remediation_groups(findings)
@@ -13596,6 +13627,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         root=root,
         issue_number=number,
         generated_at=now,
+        noun=noun,
     )
 
     # What the live ledger renders once this branch is done, for the store.
@@ -13619,7 +13651,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 data,
                 generated_at=now,
                 audit_id=audit_id,
-                noun=_proposal_noun(repo),
+                noun=noun,
                 gaps=gaps,
                 states=states,
                 pr_urls=pr_urls,
@@ -13647,12 +13679,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 plan,
                 pr_by_finding,
                 prs_opened,
-                _proposal_noun(repo),
+                noun,
                 remediation_refusal(repo),
             ),
             ledger_comments,
             now,
-            _proposal_noun(repo),
+            noun,
         )
 
     if status == "UPDATED" and number is not None:
