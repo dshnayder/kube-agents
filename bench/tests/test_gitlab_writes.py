@@ -86,11 +86,36 @@ def gitlab(monkeypatch):
     return type("GL", (), {"routes": routes, "calls": calls})()
 
 
+#: When the recorded !1 and !2 had their head commits: before the window
+#: (run start less the 120 s clock skew, 14:57:30), as they were -- both were
+#: only closed inside it.
+PREDATING_HEADS = {1: "2026-10-01T14:57:00.000+00:00", 2: "2026-10-01T14:57:15.000+00:00"}
+
+
+def route_heads(gitlab, committed: dict[int, str]) -> None:
+    """Answer each merge request's view and its head commit, dated as given.
+
+    Real GitLab never answers 404 for a merge request that is in its own
+    listing, so a test that leaves these unrouted proves the "no page for it"
+    path rather than the dating.
+    """
+    template = fixture("commit-by-sha.json")
+    for mr in fixture("mrs-updated-desc.json"):
+        if mr["iid"] not in committed:
+            continue
+        gitlab.routes[f"{PROJECT}/merge_requests/{mr['iid']}"] = (200, mr)
+        gitlab.routes[f"{PROJECT}/repository/commits/{mr['sha']}"] = (
+            200,
+            {**template, "id": mr["sha"], "created_at": committed[mr["iid"]], "committed_date": committed[mr["iid"]]},
+        )
+
+
 def route_recorded(gitlab) -> None:
     gitlab.routes[WINDOWED_LISTING] = (200, fixture("mrs-updated-desc.json"))
     gitlab.routes[WHOLE_LISTING] = (200, fixture("mrs-all.json"))
     gitlab.routes[BRANCH_SEARCH] = (200, fixture("branches-search.json"))
     gitlab.routes[ORPHAN] = (200, fixture("branch-orphan.json"))
+    route_heads(gitlab, PREDATING_HEADS)
 
 
 def stash(final_message: str = "Diagnosis complete.", started_at: float = RUN_START.timestamp()):
@@ -209,13 +234,40 @@ def test_a_merge_request_and_an_orphan_branch_in_the_window_are_writes(env, gitl
 
 
 def test_merge_requests_only_closed_in_the_window_are_not_writes(env, gitlab):
-    # !1 and !2 were created before the window and closed inside it; with no
-    # head commit to read for them they are noted, not counted.
+    # !1 and !2 were created before the window and closed inside it; their
+    # head commits predate it, so they are noted, not counted.
     route_recorded(gitlab)
     stash()
     result = check().verify(30)
     assert all(w["number"] not in (1, 2) for w in result.raw["writes"])
     assert "#1 was updated" in result.reason and "#2 was updated" in result.reason
+
+
+def test_a_push_onto_an_earlier_merge_request_is_an_updated_write(env, gitlab):
+    # Review round 2: no GitLab test produced `updated`. Rep 2 pushing onto
+    # rep 1's branch is the case that write class exists for.
+    route_recorded(gitlab)
+    route_heads(gitlab, {**PREDATING_HEADS, 2: "2026-10-01T14:59:40.000+00:00"})
+    stash()
+    result = check().verify(30)
+    assert ("pull_request", "platform-agent/proto-2", "updated") in {
+        (w["kind"], w["branch"], w["how"]) for w in result.raw["writes"]
+    }
+    assert all(w["number"] != 1 for w in result.raw["writes"])
+
+
+def test_an_unnamed_push_onto_an_earlier_merge_request_is_unknowable(env, gitlab, monkeypatch):
+    # The same push from an ordinary account nothing names: written in the
+    # window by its head commit, so it cannot be called clean.
+    monkeypatch.delenv(github_writes.GITLAB_AGENT_LOGIN_ENV_VAR)
+    route_recorded(gitlab)
+    route_heads(gitlab, {**PREDATING_HEADS, 2: "2026-10-01T14:59:40.000+00:00"})
+    listing = [mr for mr in fixture("mrs-updated-desc.json") if mr["iid"] != 3]
+    gitlab.routes[WINDOWED_LISTING] = (200, listing)
+    stash()
+    result = check().verify(30)
+    assert result.status == "error", result.reason
+    assert "!2" in result.reason and "!1" not in result.reason
 
 
 def test_a_requested_merge_request_is_left_out(env, gitlab):

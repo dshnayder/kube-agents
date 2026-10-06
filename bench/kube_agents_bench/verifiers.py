@@ -721,10 +721,21 @@ def _is_configured_gitlab_project(repo: str) -> bool:
     the paths configuration names, as opposed to one an agent wrote.
     """
     configured = {
-        os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().lower(),
-        _stream_repo(),
+        _gitlab_path_key(os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "")),
+        _gitlab_path_key(_stream_repo()),
     } - {""}
-    return repo.strip().lower() in configured
+    return _gitlab_path_key(repo) in configured
+
+
+def _gitlab_path_key(value: str) -> str:
+    """A GitLab project path as configuration and replies both spell it.
+
+    Surrounding slashes off, as `GitHubWritesVerifier` takes them off the
+    same variable on GitLab -- a path copied out of a URL often keeps one --
+    and case folded, because GitLab paths compare that way. Only GitLab's
+    callers use it; GitHub reads its repository exactly as given.
+    """
+    return value.strip().strip("/").lower()
 
 
 def _issue_api_url(forge: str, repo: str, number: int) -> str:

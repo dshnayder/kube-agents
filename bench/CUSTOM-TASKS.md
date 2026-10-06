@@ -448,8 +448,12 @@ On a GitLab project (`BENCH_FORGE=gitlab`) the token is `BENCH_GITLAB_TOKEN` ins
 project access token, or a dedicated account's personal access token, with `read_api` and at least
 the Reporter role. A self-managed instance is named in `BENCH_GITLAB_HOST`, a bare hostname (a
 scheme, path or port is an error). GitLab answers `404`, not `403`, for a private project the
-token cannot see, so a `404` on the issue is followed by a read of the project: a project the token
-cannot see is an error, and only a project it can see with no such issue is a fail.
+token cannot see. So when the issue is in the configured project (`BENCH_GITOPS_REPO`, or the
+audit stream's repository when the case has one), a `404` on it is followed by a read of the
+project: a project the token cannot see is an error, and only a project it can see with no such
+issue is a fail. A `404` in any other project, a path the agent wrote rather than one configuration
+names, is graded as absence, a fail; that includes every `404` on a run that exports neither
+variable.
 
 Everything this check needs and cannot get is an error rather than a fail: no transcript, no
 run-start clock, no token, an unreachable API, a `401`/`403`. Everything it can observe and finds
@@ -541,7 +545,8 @@ clauses from GitLab's merge request view: `merged` is a state of its own, `chang
 file count (`"1000+"` past GitLab's cap, null while the diff is computed, neither read as zero), and
 the head `sha` dates the push. `accepts_stream_pull_request` widens the window the same way, and
 `reuses_spent_branch` lists the earlier merge requests from the same source branch in the project
-itself, closed or merged. A `404` on a project the token cannot see is an error, as for the ledger.
+itself, closed or merged. A `404` in the configured project is followed by the same project read as
+for the ledger, and a `404` anywhere else is absence.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
 mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`

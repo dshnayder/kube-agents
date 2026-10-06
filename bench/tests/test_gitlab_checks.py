@@ -384,6 +384,21 @@ def test_a_ledger_404_on_a_project_the_token_cannot_see_is_an_error(env, gitlab,
     assert "no such issue" in result.reason
 
 
+def test_a_configured_path_copied_with_its_leading_slash_is_still_the_configured_project(env, gitlab, monkeypatch):
+    # Review round 2: `github_writes` strips a leading slash from the GitLab
+    # path and the project-read decision did not, so the same configuration
+    # graded a project the token cannot see as the agent's failure.
+    configured(monkeypatch, "/" + REPO)
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error", result.reason
+    assert "cannot see it" in result.reason
+    stash(f"Audit filed: {ISSUE_URL}")
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status == "error", result.reason
+    assert "cannot see it" in result.reason
+
+
 def test_a_404_on_a_project_the_agent_named_wrongly_is_absence_not_an_error(env, gitlab, monkeypatch):
     # Review: only the configured project's 404 can be the credential's
     # fault. A path the agent mistyped is graded as no such object, as
