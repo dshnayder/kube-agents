@@ -7118,6 +7118,42 @@ class TwoForgeInstallTest(unittest.TestCase):
             credential_proxy.require_managed_workspace(store, "h")
         self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
 
+    def test_the_workspace_credential_resolves_a_bare_github_name_through_the_seam(self):
+        # Review round 4: the cases above call `_hosted` directly, so dropping
+        # it from `_workspace_credential` kept the suite green. Driven through
+        # the production seam on the two-forge registry, the bare name has to
+        # reach the role lookup on the GitHub forge.
+        seen = []
+
+        def role(repository, forge=None):
+            seen.append((repository, forge.name if forge else None))
+            return credential_proxy.ROLE_UNREGISTERED
+
+        with mock.patch.object(credential_proxy, "repository_role", side_effect=role):
+            credential_proxy._workspace_credential(self.registry, "acme/infra")
+        self.assertEqual([("acme/infra", "github")], seen)
+
+    def test_the_github_refresh_alias_accepts_an_older_images_bare_slug(self):
+        # Review round 4: the alias branch was driven by no test. An older
+        # agent image posts `{"repository": "owner/name"}` to
+        # `/v1/github/refresh`; on a two-forge broker it has to refresh, not
+        # be refused as hostless.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps({"repository": "acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        calls = []
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler.log_message = lambda *args: None
+        handler._handle_forge_refresh(provider="github")
+        self.assertEqual([("github", "acme/infra")], calls)
+        self.assertEqual(HTTPStatus.OK, replies[-1][0])
+
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

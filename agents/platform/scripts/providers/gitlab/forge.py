@@ -36,6 +36,7 @@ import repo_ref
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import StaticFileCredential
 from ..validate import (
+    MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
     repo_segments,
     validate_branch,
@@ -168,6 +169,15 @@ class GitLabForge(Forge):
             raise ValueError(
                 f"an allowedPaths entry for {host} names no namespace ({path!r})"
             )
+        # Checked on the normalised prefix, not the input: a parsed repository
+        # never starts with its own host, so a prefix that does matches
+        # nothing. The bare host is the spelling someone meaning "the whole
+        # host" writes; `[]` is that.
+        if segments[0].casefold() == host.casefold():
+            raise ValueError(
+                f"allowedPaths entry {path!r} names the host {host}, not a namespace "
+                "on it; list namespaces, or [] for the whole host"
+            )
         return tuple(segment.casefold() for segment in segments)
 
     @classmethod
@@ -281,27 +291,34 @@ class GitLabForge(Forge):
         """Up to `limit` notes from a notes endpoint, oldest first, as comments,
         and whether it held more.
 
-        `limit` bounds the rows read, as on GitHub, and the page is judged full
-        on what GitLab sent: a page of bookkeeping may still have a person's
-        note behind it, which is exactly what `truncated` has to say. System
-        notes are dropped after the rows are counted.
+        `limit` counts comments, as it does on GitHub, where a row of the
+        conversation endpoint is one. Here most rows of a long merge request
+        are GitLab's own bookkeeping -- "added 1 commit", a label change, an
+        approval -- so this reads on past them until it has `limit` comments or
+        GitLab runs out, within `MAX_CONVERSATION_SIZE` rows, the shape
+        `GitHubForge._issue_pages` uses for GitHub's own leak of proposals into
+        issues. Counting rows instead would report a twelve-comment
+        conversation truncated, and the sweep refuses a truncated one.
+
+        A page is still judged full on the rows GitLab sent -- that is what
+        says GitLab may hold more -- but a full page whose slots went to
+        bookkeeping is a reason to read the next one, not to stop. Truncated
+        when the last page read was full or more than `limit` comments
+        survived.
         """
         per_page = min(limit, MAX_PAGE_SIZE)
-        rows: list = []
-        page = 1
-        while True:
+        kept: list = []
+        full = False
+        for page in range(1, -(-MAX_CONVERSATION_SIZE // per_page) + 1):
             params: dict[str, Any] = {"sort": "asc", "order_by": "created_at", "per_page": per_page}
             if page > 1:
                 params["page"] = page
             batch = api("GET", path, params=params) or []
-            rows += batch
+            kept += [translate.comment(n) for n in batch if not translate.is_system_note(n)]
             full = len(batch) >= per_page
-            if not full or len(rows) >= limit:
-                kept = [
-                    translate.comment(n) for n in rows[:limit] if not translate.is_system_note(n)
-                ]
-                return kept, full or len(rows) > limit
-            page += 1
+            if len(kept) >= limit or not full:
+                break
+        return kept[:limit], full or len(kept) > limit
 
     @staticmethod
     def _label_params(payload: dict) -> dict[str, str]:

@@ -204,6 +204,22 @@ class BoundsTest(unittest.TestCase):
         with self.assertRaises(WorkspaceError) as caught:
             transport(opener).api("GET", "projects")
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+        # Review round 4: a bare timeout is the wait for the status line --
+        # the forge was reached and stopped -- not "could not be reached".
+        self.assertIn("took longer than 7s", caught.exception.fields["detail"])
+        self.assertNotIn("could not be reached", caught.exception.fields["detail"])
+
+    def test_an_answer_the_forge_broke_off_says_it_answered(self):
+        for raised in (http.client.BadStatusLine("x"), http.client.IncompleteRead(b"{", 9)):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(raised)).api("GET", "projects")
+                self.assertIn("answer could not be read", caught.exception.fields["detail"])
+
+    def test_a_connect_failure_still_reads_as_unreachable(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(TimeoutError("timed out")))).api("GET", "projects")
+        self.assertIn("could not be reached", caught.exception.fields["detail"])
 
     def test_a_redirect_is_never_followed(self):
         # The credential rides in a header; a hop would present it to wherever

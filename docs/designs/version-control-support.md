@@ -2232,8 +2232,10 @@ Each prefix is read by the parser `parse` uses for a repository, so the two
 cannot disagree: a trailing `.git` comes off and a leading host is lifted, as
 they do for a repository, and a segment the parser refuses — empty, `.`, `..`,
 `.git` or led by a dash — refuses the entry at construction, because a prefix
-`parse` can never match would refuse every repository on the host. Whitespace
-anywhere is refused rather than stripped. A GitHub entry refuses `allowedPaths` outright: the App
+`parse` can never match would refuse every repository on the host. So does a
+prefix that is the host itself, such as `gitlab.com`: a parsed repository never
+starts with its own host, and the spelling is what someone writes who means the
+whole host, which is `[]`. Whitespace anywhere is refused rather than stripped. A GitHub entry refuses `allowedPaths` outright: the App
 installation's repository selection is what scopes that token, and the same key
 accepted there and ignored would read as narrowing it.
 The operator derives the list rather than asking for it: the forge's declared
@@ -2291,6 +2293,10 @@ What is left maps onto the neutral kinds the consumers already read rather than
 a new one: a note on a line of the diff is a `review_comment`, any other note an
 `issue` comment — the conversation, which is where a caller looks for its own
 markers. A new kind would have made every GitLab conversation invisible to them.
+Because bookkeeping fills most of a long merge request's notes, `limit` counts
+comments, not rows: a full page whose slots went to system notes is a reason to
+read the next page, within the conversation's row bound, and `truncated` is
+still judged on whether the last page read was full.
 
 **State vocabulary differs on the way in as well as out.** `validate_state`
 accepts `open`, `closed`, `all` and the verbs pass the result straight into a
