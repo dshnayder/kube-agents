@@ -7342,6 +7342,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if not self._repository_is_permitted(repository, forge):
             return
 
+        # A host this install recognises and has no forge for answers with its
+        # own gap, the same 501 the verb that follows would give -- not as a
+        # forge with nothing to refresh, which it is not: it has no credential.
+        if isinstance(forge, providers.StubForge):
+            unsupported = providers.ForgeUnsupported(f"{forge.name}: {forge.missing[0]}")
+            self._json(HTTPStatus(unsupported.status), _redacted_fields(unsupported))
+            return
+
         # A forge whose credential strategy is not a brokered one has nothing
         # to make current -- a stored token is read from its file on every
         # call -- and says so, rather than running a helper it does not ship

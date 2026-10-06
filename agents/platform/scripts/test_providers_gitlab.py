@@ -128,6 +128,23 @@ class ConfigurationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     GitLabForge("gitlab.com", "/t", (bad,))
 
+    def test_an_allowed_path_is_read_as_parse_reads_a_repository(self):
+        # Review round 3: `acme/infra.git` (a clone URL's tail) and
+        # `gitlab.com/acme` (the host-led shorthand) built, and `parse`
+        # strips the one and lifts the other, so neither ever matched.
+        for written, prefix in (
+            ("acme/infra.git", ("acme", "infra")),
+            ("gitlab.com/acme", ("acme",)),
+            ("https://gitlab.com/Acme/Platform", ("acme", "platform")),
+        ):
+            with self.subTest(written=written):
+                built = GitLabForge("gitlab.com", "/t", (written,))
+                self.assertEqual((prefix,), built.allowed_paths)
+        built = GitLabForge("gitlab.com", "/t", ("acme/infra.git",))
+        self.assertEqual("acme/infra", built.parse("https://gitlab.com/acme/infra.git"))
+        with self.assertRaises(ValueError):
+            GitLabForge("gitlab.com", "/t", ("https://github.com/acme",))
+
     def test_an_allowed_path_that_names_no_namespace_is_refused_not_dropped(self):
         # Review round 2: `[""]`, `["/"]` and `["//"]` trimmed to nothing and
         # left the list empty -- the whole host.
@@ -250,13 +267,28 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual("GET", api.calls[0][0])
 
     def test_labels_travel_in_the_same_update_as_the_text(self):
-        api = Api(mr())
+        api = Api(mr(), mr())
         forge().proposal_update(api, "acme/infra", {
             "number": 1, "title": "t", "labelsAdd": ["a", "b"], "labelsRemove": ["c"],
         })
         self.assertEqual(
-            {"title": "t", "add_labels": "a,b", "remove_labels": "c"}, api.calls[0][3]
+            {"title": "t", "add_labels": "a,b", "remove_labels": "c"}, api.calls[1][3]
         )
+
+    def test_a_new_title_keeps_a_draft_a_draft(self):
+        # Review round 3: on GitLab the marker is the title, which this forge
+        # may have written on create; a re-title without it marked the merge
+        # request ready, where GitHub leaves `draft` alone.
+        api = Api(mr(draft=True, title="Draft: Pin"), mr(draft=True))
+        forge().proposal_update(api, "acme/infra", {"number": 1, "title": "Pin to v2"})
+        self.assertEqual(("GET", "PUT"), (api.calls[0][0], api.calls[1][0]))
+        self.assertEqual("Draft: Pin to v2", api.calls[1][3]["title"])
+        ready = Api(mr(draft=False), mr())
+        forge().proposal_update(ready, "acme/infra", {"number": 1, "title": "Pin to v2"})
+        self.assertEqual("Pin to v2", ready.calls[1][3]["title"])
+        own = Api(mr())
+        forge().proposal_update(own, "acme/infra", {"number": 1, "title": "Draft: mine"})
+        self.assertEqual(("PUT", "Draft: mine"), (own.calls[0][0], own.calls[0][3]["title"]))
 
     def test_commits_come_back_oldest_first(self):
         api = Api([
@@ -337,15 +369,32 @@ class WriteAccessTest(unittest.TestCase):
     def test_developer_and_above_may_write(self):
         for level, expected in ((30, True), (40, True), (20, False)):
             with self.subTest(level=level):
-                api = Api([{"id": 7, "username": "dev"}], {"access_level": level})
+                api = Api([{"id": 7, "username": "dev", "bot": False}], {"access_level": level})
                 self.assertIs(expected, forge().can_write(api, "acme/infra", "dev"))
                 self.assertEqual("projects/acme%2Finfra/members/all/7", api.calls[1][1])
 
     def test_a_stranger_is_no_and_a_failed_lookup_is_not_an_answer(self):
+        person = {"id": 7, "bot": False}
         self.assertIs(False, forge().can_write(Api([]), "acme/infra", "nobody"))
-        self.assertIs(False, forge().can_write(Api([{"id": 7}], WorkspaceError("x", status=404)), "acme/infra", "dev"))
-        self.assertIsNone(forge().can_write(Api([{"id": 7}], WorkspaceError("x", status=502)), "acme/infra", "dev"))
+        self.assertIs(False, forge().can_write(Api([person], WorkspaceError("x", status=404)), "acme/infra", "dev"))
+        self.assertIsNone(forge().can_write(Api([person], WorkspaceError("x", status=502)), "acme/infra", "dev"))
         self.assertIsNone(forge().can_write(Api(WorkspaceError("x", status=502)), "acme/infra", "dev"))
+
+    def test_an_automation_is_never_a_writer_whatever_its_name_or_role(self):
+        # Review round 3: a service account named like a person, holding
+        # Developer, read as a person and its comments became requests.
+        # The username search may leave `bot` out (a non-admin token): then
+        # the user itself is read.
+        listed = Api([{"id": 7, "username": "ci-deployer", "bot": True}])
+        self.assertIs(False, forge().can_write(listed, "acme/infra", "ci-deployer"))
+        self.assertEqual(1, len(listed.calls))
+        asked = Api([{"id": 7, "username": "ci-deployer"}], {"id": 7, "bot": True})
+        self.assertIs(False, forge().can_write(asked, "acme/infra", "ci-deployer"))
+        self.assertEqual("users/7", asked.calls[1][1])
+        person = Api([{"id": 8, "username": "dev"}], {"id": 8, "bot": False}, {"access_level": 30})
+        self.assertIs(True, forge().can_write(person, "acme/infra", "dev"))
+        unread = Api([{"id": 7, "username": "x"}], WorkspaceError("x", status=502))
+        self.assertIsNone(forge().can_write(unread, "acme/infra", "x"))
 
 
 class TranslationTest(unittest.TestCase):
@@ -375,12 +424,16 @@ class TranslationTest(unittest.TestCase):
                 {"username": "service_account_group_42_a1b2"},
                 {"username": "Support-Bot"},
                 {"username": "GitLab-Security-Bot"},
-                {"username": "duo-code-review-bot"},
+                # Review round 3: names a person can also choose are people
+                # here; an automation behind one is refused by the write check.
                 {"username": "kube-agents-eval-bot"},
+                {"username": "duo-arch"},
+                {"username": "service_account_fan"},
+                {"username": "ghost"},
             ])
         ]
         answer = forge().issue_view(Api({"iid": 1, "state": "opened"}, notes), "acme/infra", {"number": 1, "comments": True})
-        self.assertEqual([True] * 8 + [False], [c["bot"] for c in answer["comments"]])
+        self.assertEqual([True] * 7 + [False] * 4, [c["bot"] for c in answer["comments"]])
 
     def test_states_and_iids(self):
         cases = (

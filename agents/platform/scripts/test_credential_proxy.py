@@ -6914,6 +6914,9 @@ class VcsRouteTest(unittest.TestCase):
         broker = credential_proxy.build_vcs_broker(self.executor)
         self.assertIsNotNone(broker)
         self.assertTrue(broker.registry.forges)
+        # Review round 3: the request slot's deadline is what the broker
+        # hands every HTTP forge call; nothing pinned that it is handed over.
+        self.assertEqual(self.executor.request_deadline, broker._request_deadline)
 
         overlapping = CommandExecutor.__new__(CommandExecutor)
         overlapping.vcs_root = self.executor.workspace_dir / "vcs"
@@ -6987,6 +6990,34 @@ class TwoForgeInstallTest(unittest.TestCase):
             credential = credential_proxy._workspace_credential(self._gitlab_only(), "acme/infra")
         self.assertIsInstance(credential, providers.NoCredential)
         self.assertIn("serves no github forge", "\n".join(logs.output))
+
+    def test_a_host_with_no_forge_answers_its_gap_not_nothing_to_refresh(self):
+        # Review round 3: a GitHub-only install's placeholder for gitlab.com
+        # carries no credential, and the route answered 200 "nothing to
+        # refresh" for it.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("VCS_FORGES_CONFIG", None)
+            github_only = credential_proxy.providers.Registry()
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a placeholder")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=github_only), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+                ):
+            handler._handle_forge_refresh()
+        self.assertEqual(1, len(replies))
+        status, payload = replies[0]
+        self.assertEqual(HTTPStatus.NOT_IMPLEMENTED, status)
+        self.assertEqual("FORGE_UNSUPPORTED", payload["code"])
 
     def test_a_forge_with_nothing_to_refresh_says_so_instead_of_failing(self):
         # Review round 2: the route ran a helper GitLab does not ship and
