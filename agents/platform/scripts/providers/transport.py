@@ -297,13 +297,16 @@ def _unreachable(exc: BaseException) -> str:
     """Why the forge could not be reached, in words an operator can act on.
 
     `URLError` carries the reason -- a refused connection, an unknown name, a
-    certificate -- and the type alone says none of it. A certificate this image
-    does not trust is named outright: no retry fixes it, and a self-managed
-    forge behind a private CA is the case that meets it.
+    certificate -- and the type alone says none of it. A certificate that fails
+    verification is named outright, with the verifier's own reason: no retry
+    fixes it, and "unable to get local issuer" (a private CA), "Hostname
+    mismatch" and "certificate has expired" each send the operator somewhere
+    different.
     """
     cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
-        return "the forge's TLS certificate is not trusted by this image"
+        why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
+        return f"the forge's TLS certificate failed verification by this image: {why}"
     reason = str(cause).strip()[:200]
     if reason:
         return f"the forge could not be reached: {type(exc).__name__}: {reason}"
@@ -487,6 +490,10 @@ class HttpTransport:
         except urllib.error.URLError as exc:
             # The send failed: a refused connection, an unknown name, a
             # certificate, a connect timeout. `urllib` wraps only the send.
+            # A connect cut short by the request's shared deadline, after
+            # earlier calls spent it, is the request's time, not the forge.
+            if isinstance(exc.reason, TimeoutError) and slow.startswith("the request's time"):
+                raise forge_error(0, "the request's time ran out while connecting to the forge") from exc
             raise forge_error(0, _unreachable(exc)) from exc
         except TimeoutError as exc:
             # Bare, so not the send: the request went out and the status line
