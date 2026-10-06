@@ -199,6 +199,32 @@ class BoundsTest(unittest.TestCase):
                 )
         self.assertIn("request's time ran out while the forge was answering", caught.exception.fields["detail"])
 
+    def test_the_first_call_under_a_slot_stalling_is_the_forge_being_slow(self):
+        # Review: the slot is armed with the same timeout a moment before the
+        # first call, so `outer < deadline` by milliseconds and every stall
+        # read as the request's time running out, even on the only call.
+        class Stalls(_Response):
+            def read1(self, n=-1):
+                raise TimeoutError("timed out")
+
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(Opener(Stalls(b"")), timeout=30.0, outer_deadline=lambda: 129.99).api(
+                    "GET", "projects"
+                )
+        self.assertIn("took longer than 30s", caught.exception.fields["detail"])
+
+    def test_a_reset_after_the_send_is_an_answer_broken_off_not_unreachable(self):
+        # Review: `urllib` wraps send-phase failures in URLError, so a bare
+        # OSError is a forge that took the request and then stopped.
+        for raised in (ConnectionResetError("reset by peer"), ssl.SSLEOFError("EOF")):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(raised)).api("GET", "projects")
+                detail = caught.exception.fields["detail"]
+                self.assertIn("answer could not be read", detail)
+                self.assertNotIn("could not be reached", detail)
+
     def test_a_timeout_is_a_call_failure(self):
         opener = Opener(TimeoutError("timed out"))
         with self.assertRaises(WorkspaceError) as caught:

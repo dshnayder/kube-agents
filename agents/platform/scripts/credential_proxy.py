@@ -5785,10 +5785,21 @@ def warn_on_credential_reach(broker) -> None:
         extra = sorted(
             path for path in paths if _repository_key(path, forge) not in managed
         )
+        if not paths:
+            # Not reassuring: a token that belongs to nothing cannot reach the
+            # managed repositories either, and this line is where an operator
+            # finds that out before the first verb does.
+            LOGGER.warning(
+                "the %s credential for %s reaches no repositories at all; every call "
+                "to this forge's managed repositories will be refused by the forge "
+                "until its account or token is given access to them",
+                forge.name, forge.hosts[0],
+            )
+            continue
         if not extra:
             LOGGER.info(
-                "the %s credential for %s reaches %d repositories, all of them managed",
-                forge.name, forge.hosts[0], len(paths),
+                "the %s credential for %s reaches %s%d repositories, all of them managed",
+                forge.name, forge.hosts[0], "at least " if cut_short else "", len(paths),
             )
             continue
         LOGGER.warning(
