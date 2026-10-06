@@ -155,9 +155,7 @@ def load_lane_safeguards(path: str | Path) -> list[dict[str, Any]]:
     return entries
 
 
-def check_repository(
-    safeguards: list[dict[str, Any]], repo: str, forge: str | None = None
-) -> None:
+def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
     """Refuse a repository the lane's own entries would refuse at grading.
 
     A ``github_writes`` leaf that pins ``owner`` errors on every repetition
@@ -165,12 +163,12 @@ def check_repository(
     a repository spends a lease to grade nothing. Known before the fan-out
     from the file and the value, so it is refused here.
 
-    The shape is the forge's (``forge``, else ``BENCH_FORGE``): GitHub's
+    The shape is the forge's (``BENCH_FORGE``): GitHub's
     ``owner/name``, or a GitLab project's full path, whose top group is
     the owner a lane entry pins -- as the safeguard itself reads it.
     """
     try:
-        forge = forges.forge_name(None if forge is None else {forges.FORGE_ENV_VAR: forge})
+        forge = forges.forge_name()
     except forges.UnknownForge as exc:
         raise LaneSafeguardsError(str(exc)) from exc
     if forge == forges.FORGE_GITLAB:

@@ -301,10 +301,16 @@ def test_a_merge_request_outside_the_owner_group_is_rejected(env, gitlab):
     assert gitlab.calls == []
 
 
-def test_a_missing_merge_request_is_absence_and_a_refused_token_an_error(env, gitlab):
+def test_a_missing_merge_request_is_absence_and_a_refused_token_an_error(env, gitlab, monkeypatch):
+    # Configured, so the 404 on !3 asks whether the project itself is
+    # visible -- and it is, so the 404 is the merge request's absence.
+    # Review: unconfigured, the project read was never made and the test
+    # passed the way the misnamed-project test does.
+    configured(monkeypatch)
     gitlab.routes[PROJECT] = (200, {"id": 40000001})
     stash(f"Opened {MR3_URL}")
     result = pr_check().verify(30)
+    assert PROJECT in gitlab.calls
     assert result.status != "error"
     assert "no such merge request" in result.reason
     gitlab.routes[f"{PROJECT}/merge_requests/3"] = (401, {"message": "401 Unauthorized"})
@@ -449,6 +455,21 @@ def test_accepts_stream_pull_request_widens_the_window_on_gitlab(env, gitlab, mo
     # Review: said as GitHub says it -- not "during this run".
     assert "by an earlier run on this audit stream" in result.reason
     assert "during this run" not in result.reason
+
+
+def test_a_stream_repository_spelled_with_a_slash_is_still_this_jobs(env, gitlab, monkeypatch):
+    # Review: the configured-project decision normalised the stream
+    # repository and the widened-window clause compared it raw, so a slash
+    # copied out of a URL turned this job's own merge request into another's.
+    stream_env(monkeypatch, repo=f"/{REPO}/")
+    route_mr3(gitlab, created_at="2026-09-30T20:00:00Z", updated_at="2026-09-30T20:00:00Z",
+              source_branch=f"platform-agent/fix-{AUDIT}-1")
+    old = fixture("commit-by-sha.json")
+    old["committed_date"] = "2026-09-30T20:00:00.000+00:00"
+    gitlab.routes[f"{PROJECT}/repository/commits/{fixture('mr-view.json')['sha']}"] = (200, old)
+    stash(f"Opened {MR3_URL}")
+    result = pr_check(accepts_stream_pull_request=True).verify(30)
+    assert result.success is True, result.reason
 
 
 def test_the_widened_window_still_wants_the_streams_branch_and_repository(env, gitlab, monkeypatch):

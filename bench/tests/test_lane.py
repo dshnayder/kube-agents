@@ -160,8 +160,9 @@ def test_a_third_segment_is_still_refused_on_github(monkeypatch):
     monkeypatch.delenv("BENCH_FORGE", raising=False)
     with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
         lane.check_repository([], "gke-agentic/pool/infra")
+    monkeypatch.setenv("BENCH_FORGE", "bitbucket")
     with pytest.raises(lane.LaneSafeguardsError, match="BENCH_FORGE"):
-        lane.check_repository([], "gke-agentic/x", forge="bitbucket")
+        lane.check_repository([], "gke-agentic/x")
 
 
 def test_a_task_with_no_spec_gains_one(tmp_path):

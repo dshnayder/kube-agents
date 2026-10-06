@@ -2286,7 +2286,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             (started - touched).total_seconds() > skew
             or (pushed and (started - pushed).total_seconds() > skew)
         ):
-            if repo.lower() != _stream_repo():
+            # Through the same key the configured-project decision uses: a
+            # stream repository copied from a URL can keep a slash.
+            if _gitlab_path_key(repo) != _gitlab_path_key(_stream_repo()):
                 return "reject", (
                     f"{slug}: last written or pushed to before this run started, in a "
                     f"repository other than this job's ({_stream_repo()}) — another "
