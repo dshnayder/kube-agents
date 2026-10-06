@@ -25,7 +25,8 @@ costs a call or two rather than 30 a minute. Each open and close is logged at in
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel thread's first ask becomes its session title, set right after a
+channel thread's first ask (or a clicked choice's label, offered by
+``slack_ux_clicks`` before its turn runs) becomes its session title, set right after a
 ``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
 session yet. A failed rename keeps the ask for the next ``processing`` sent;
 Slack's ``invalid_name`` refusal is logged at warning, once per thread and
@@ -78,12 +79,13 @@ Planning Agent's turn, and the cards would run on.
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
-thread showed before this module. A posted plan holds ``processing`` while
-those cards roll and ``suspended`` while they wait on the user; a plan refused
-on its first post holds no status. A settle still edits a posted plan, best
-effort, so an edit refused once, for a rate limit say, does not leave its rows
-showing as running. Everything here is in process, like the progress-line map:
-a gateway restart forgets the plan, and the next note starts a new one. A
+thread showed before this module. A plan holds ``processing`` while
+those cards roll and ``suspended`` while they wait on the user, clearing the
+session when its cards settle, even if its initial post was refused by Slack.
+A settle still edits a posted plan, best effort, so an edit refused once,
+for a rate limit say, does not leave its rows showing as running. Everything
+here is in process, like the progress-line map: a gateway restart forgets
+the plan, and the next note starts a new one. A
 card that settles with no plan left closes the thread's session, or suspends
 it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
@@ -177,12 +179,24 @@ _warned_missing = False
 class _Row:
     """One card's row. A plain class, for the reason ``slack_ux_reactions._Ask`` is."""
 
-    __slots__ = ("archived", "last_event_id", "lines", "status", "task_id", "title")
+    __slots__ = (
+        "archived", "last_event_id", "lines", "note", "result", "status", "steps", "task_id", "title",
+    )
 
     def __init__(self, task_id: str, title: str) -> None:
         self.task_id = task_id
         self.title = title
         self.lines: list[str] = []
+        #: Every note the row took, past the last :data:`slack_status.STEPS_MAX`
+        #: kept; a dashboard move is not one. A new plan starts it again.
+        self.steps = 0
+        #: The latest of those notes, or :data:`ARCHIVED_NOTE` once archived by
+        #: hand: what a running or failed row's title shows. A move lands in
+        #: ``lines`` without touching it.
+        self.note = ""
+        #: The completed event's summary line, which the settled row shows; the
+        #: card's title when it is empty.
+        self.result = ""
         self.status = ""
         self.last_event_id = 0
         self.archived = False
@@ -230,6 +244,10 @@ _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 _lapsed: OrderedDict[tuple, list] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
+#: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
+#: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
+#: and :func:`set_thread_status` reads this once to send the wait instead.
+_orphan_waits: OrderedDict[tuple, str] = OrderedDict()
 
 
 def enabled() -> bool:
@@ -284,15 +302,20 @@ async def set_thread_status(
     caller only hands over when the SDK has Agent Sessions.
     """
     wanted = _status.session_status(status)
+    key = (str(chat_id), str(thread_ts))
+    orphan = False
     if wanted == _status.SESSION_CLOSED:
         # A Planning Agent turn ends with a clear; the thread's plan outlives it.
-        wanted = _plan_session(str(chat_id), str(thread_ts)) or wanted
-    key = (str(chat_id), str(thread_ts))
+        planned = _plan_session(*key)
+        orphan = not planned and key in _orphan_waits
+        wanted = planned or _orphan_waits.get(key, "") or wanted
     sent = _sessions.get(key)
     now = time.monotonic()
     if sent and sent[0] == wanted and (
         wanted != _status.SESSION_PROCESSING or now - sent[1] < SESSION_REFRESH_SECONDS
     ):
+        if orphan:
+            _orphan_waits.pop(key, None)
         return
     try:
         client = adapter._get_client(chat_id, team_id=team_id)
@@ -300,6 +323,9 @@ async def set_thread_status(
     except Exception as exc:  # noqa: BLE001 — upstream debug-logs its own failures too
         logger.debug("[Slack] agents.sessions.setStatus %s: %s", fail_label, exc)
         return
+    if orphan:
+        # Read once, and only once sent, so a refused send leaves it for the retry.
+        _orphan_waits.pop(key, None)
     if not sent or sent[0] != wanted:
         logger.info("slack_ux_status: session %s in %s/%s", wanted, chat_id, thread_ts)
     _remember(_sessions, key, (wanted, now), SESSIONS_MAX)
@@ -338,10 +364,10 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
     """The session status the thread's plans hold, or ``""`` when no card runs or waits.
 
     A card runs on a plan touched within :data:`PLAN_HOLD_SECONDS`: a row
-    running, or a card rolling after its posted plan fell back. A set-aside
-    plan is untouched that long unless a card on it was answered since. A
-    card waiting on the user, on any of the thread's plans, holds
-    ``suspended``.
+    running, or a card rolling after its plan fell back (including when its
+    initial post was refused). A set-aside plan is untouched that long
+    unless a card on it was answered since. A card waiting on the user, on
+    any of the thread's plans, holds ``suspended``.
     """
     key = (chat_id, thread_ts)
     plan = _plans.get(key)
@@ -355,11 +381,11 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
 
 
 def _running(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+    return bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
 
 
 def _waiting(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.waiting) or any(
+    return bool(plan.waiting) or any(
         row.status == _status.TASK_PENDING for row in plan.rows.values()
     )
 
@@ -420,15 +446,14 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
 
     :func:`_plan_session` reads the current plan and any set aside: a card
     running opens the session, one waiting on the user suspends it, nothing
-    clears it. Sent on every note and settle that moves a posted plan:
+    clears it. Sent on every note and settle that moves a plan:
     :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
-    call per note, beside the note's own edit. A plan that never posted set no
-    status, so it sends none.
+    call per note, beside the note's own edit. An unposted plan sends status
+    during note delivery and card settlement, keeping the thread's session in
+    sync with its rolling and waiting cards.
     """
-    if not plan.ts:
-        return
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
     setter = getattr(adapter, "_set_thread_status", None)
@@ -584,8 +609,9 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
             "slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key,
         )
         posted = next((old for old in reversed(evicted) if old.ts), None)
-        if posted is not None:
-            await _session(adapter, old_key, posted)
+        sender = posted or (evicted[-1] if evicted else None)
+        if sender is not None:
+            await _session(adapter, old_key, sender)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -599,9 +625,8 @@ async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
     while len(_plans) > PLANS_MAX:
         old_key, old = _plans.popitem(last=False)
         _disarm(old)
-        if old.ts:
-            logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
-            await _session(adapter, old_key, old)
+        logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
+        await _session(adapter, old_key, old)
 
 
 def _roll(adapter: Any, key: tuple, plan: _Plan, card: str) -> None:
@@ -616,7 +641,7 @@ def _settled(plan: _Plan) -> bool:
     return not plan.rolling and not any(_live(row) for row in plan.rows.values())
 
 
-def _move(row: _Row, kind: str) -> bool:
+def _move(row: _Row, kind: str, result: str = "") -> bool:
     """Apply a terminal or silent event to the card's row; False when it moves nothing."""
     if row.archived:
         return False  # upstream never unarchives, so a later event is a redelivery
@@ -625,6 +650,7 @@ def _move(row: _Row, kind: str) -> bool:
             return False  # archived after it finished: its row stands
         # Archived by hand: nothing else will settle the row.
         row.lines = [*row.lines, ARCHIVED_NOTE][-_status.STEPS_MAX:]
+        row.note = ARCHIVED_NOTE
         row.status = _status.TASK_ERROR
         row.archived = True
         return True
@@ -633,6 +659,8 @@ def _move(row: _Row, kind: str) -> bool:
     if status is None or (kind == UNBLOCKED_KIND and row.status not in resumable):
         return False  # nothing to move, or an unblocked replay
     row.status = status
+    if status == _status.TASK_COMPLETE:
+        row.result = result
     return True
 
 
@@ -649,7 +677,7 @@ def _park(plan: _Plan, card: str, status: str | None, done: bool) -> bool:
 
 
 async def _settle_lapsed(
-    adapter: Any, key: tuple, card: str, kind: str, status: str | None, done: bool,
+    adapter: Any, key: tuple, card: str, kind: str, status: str | None, done: bool, result: str = "",
 ) -> _Plan | None:
     """Settle the card on the plans the lapse set aside.
 
@@ -668,7 +696,7 @@ async def _settle_lapsed(
         if done:
             old.rolling.discard(card)
         row = old.rows.get(card)
-        if row is not None and _move(row, kind):
+        if row is not None and _move(row, kind, result):
             if row.status == _status.TASK_RUNNING:
                 # Before the render's await, as in deliver_row: an expiry due
                 # during it must not drop the plan the card resumes on.
@@ -701,6 +729,7 @@ async def _settle_lapsed(
 
 async def _settle_current(
     adapter: Any, key: tuple, plan: _Plan, card: str, kind: str, status: str | None, done: bool,
+    result: str = "",
 ) -> bool:
     """Settle the card on the thread's current plan; True when anything moved."""
     unrolled = done and card in plan.rolling
@@ -708,7 +737,7 @@ async def _settle_current(
     if done:
         plan.rolling.discard(card)
     row = plan.rows.get(card)
-    moved = row is not None and _move(row, kind)
+    moved = row is not None and _move(row, kind, result)
     if not (moved or unrolled or parked):
         return False
     plan.touched = time.monotonic()
@@ -783,8 +812,7 @@ async def deliver_row(
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
-        if plan.ts:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     row = plan.rows.get(card)
     created = row is None
@@ -792,8 +820,10 @@ async def deliver_row(
         row = plan.rows[card] = _Row(card, title)
     if event_id and event_id <= row.last_event_id:
         return True  # an at-least-once replay already on the row
-    previous = (list(row.lines), row.status, row.last_event_id)
+    previous = (list(row.lines), row.steps, row.note, row.status, row.last_event_id)
     row.lines = [*row.lines, line][-_status.STEPS_MAX:]
+    row.steps += 1
+    row.note = line
     row.status = _status.TASK_RUNNING
     row.last_event_id = max(row.last_event_id, event_id)
     # Before the render's await, so a lapse due during it sees the note and
@@ -804,25 +834,27 @@ async def deliver_row(
             # Never shown, so no event could settle it: the card is rolling now.
             del plan.rows[card]
         else:
-            row.lines, row.status, row.last_event_id = previous
+            row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
-        if plan.ts:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     _arm(adapter, key, plan)
     await _session(adapter, key, plan)
     return True
 
 
-async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
-    """Settle the card's row after a terminal event, on the thread's plan and on any set aside."""
+async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> None:
+    """Settle the card's row after a terminal event, on the thread's plan and on any set aside.
+
+    ``result`` is a completed card's one line, which its row shows once settled.
+    """
     key = _thread(sub)
     card = str(sub.get("task_id") or "")
     status = _status.task_status(kind)
     done = kind == ARCHIVED_KIND or status in (_status.TASK_COMPLETE, _status.TASK_ERROR)
-    sender = await _settle_lapsed(adapter, key, card, kind, status, done)
+    sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
     plan = _plans.get(key)
-    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done) and plan.ts:
+    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result):
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)
@@ -847,14 +879,21 @@ async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None
     elif status == _status.TASK_PENDING:
         wanted = _status.SESSION_SUSPENDED
     else:
+        # The card runs again, so a wait whose send failed is over too.
+        _orphan_waits.pop(key, None)
         return
     sent = _sessions.get(key)
     setter = getattr(adapter, "_set_thread_status", None)
     if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
         return
     chat_id, thread_ts = key
-    phrase = "" if wanted == _status.SESSION_CLOSED else wanted
+    # The legacy setter takes free text, so it gets only a clear, as from
+    # :func:`_session`; the Agent Sessions path turns it back into the wait.
+    if wanted == _status.SESSION_SUSPENDED:
+        _remember(_orphan_waits, key, wanted, SESSIONS_MAX)
+    else:
+        _orphan_waits.pop(key, None)
     try:
-        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, phrase, PLAN_STATUS_LABEL)
+        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, "", PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the session status after a restart failed: %s", exc)
