@@ -371,3 +371,98 @@ func TestTheGitHubEntryNeverCarriesAllowedPaths(t *testing.T) {
 		t.Errorf("github entry = %s", raw)
 	}
 }
+
+// Review round 3: GitLab's group grammar admits a dot, so a path or namespace
+// starting with a forge host passed as a group, and the broker -- which lifts
+// such a segment off as a host -- refused the rendered allowedPaths and did not
+// start. A host is never a group, on any spelling the broker could lift.
+func TestAForgeHostIsNeverAGitLabGroup(t *testing.T) {
+	provider := gitlabProvider(t)
+	for _, tc := range []struct{ host, repository, namespace string }{
+		{"", "github.com/acme/infra", ""},
+		{"", "gitlab.com/acme/infra", "x"}, // lifted as the forge's own host; accepted
+		{"gitlab.example.com", "gitlab.example.com/acme/infra", ""}, // lifted, accepted
+		{"gitlab.example.com", "gitlab.com/acme/infra", ""},
+		{"", "proj", "gitlab.com/acme"},
+		{"", "proj", "github.com"},
+		{"gitlab.example.com", "proj", "gitlab.example.com/acme"},
+	} {
+		_, err := provider.Resolve(tc.host, tc.repository, tc.namespace)
+		// The forge's own host, spelled schemeless, lifts as that host.
+		lifted := (tc.host == "" && tc.repository == "gitlab.com/acme/infra") ||
+			(tc.host == "gitlab.example.com" && tc.repository == "gitlab.example.com/acme/infra")
+		if lifted && err != nil {
+			t.Errorf("Resolve(%q, %q, %q): the forge's own host should lift, got %v", tc.host, tc.repository, tc.namespace, err)
+		}
+		if !lifted && err == nil {
+			t.Errorf("Resolve(%q, %q, %q) accepted a path starting with a forge host", tc.host, tc.repository, tc.namespace)
+		}
+	}
+	for _, tc := range []struct{ host, namespace string }{
+		{"", "gitlab.com"}, {"", "gitlab.com/acme"}, {"", "github.com"},
+		{"gitlab.example.com", "gitlab.example.com"},
+	} {
+		if err := provider.ValidateNamespaceOn(tc.host, tc.namespace); err == nil {
+			t.Errorf("ValidateNamespaceOn(%q, %q) accepted a host as a group", tc.host, tc.namespace)
+		}
+	}
+	// A dotted group that is not a host stays a group.
+	if _, err := provider.Resolve("", "my.group/infra", ""); err != nil {
+		t.Errorf("a dotted group was refused: %v", err)
+	}
+	if err := provider.ValidateNamespaceOn("", "my.group/sub"); err != nil {
+		t.Errorf("a dotted namespace was refused: %v", err)
+	}
+	// And the forge is refused for it, so nothing reaches the broker.
+	in := &IntegrationSpec{Forges: []ForgeSpec{glForge("gl", "", "gitlab.com")}}
+	resolved, _ := in.ResolveGit()
+	if got := resolved.BrokerForges("/creds"); got != nil {
+		t.Errorf("BrokerForges rendered a forge whose namespace is a host: %+v", got)
+	}
+}
+
+// Review round 3: a GitLab URL longer than the broker's parser reads was
+// accepted here and refused on every call there.
+func TestARepositoryLongerThanTheBrokerReadsIsRefused(t *testing.T) {
+	provider := gitlabProvider(t)
+	group := strings.Repeat("g", 60) + "/" + strings.Repeat("h", 60) + "/" + strings.Repeat("i", 60) + "/" + strings.Repeat("j", 60)
+	if _, err := provider.Resolve("", "https://gitlab.com/"+group+"/infra", ""); err == nil {
+		t.Errorf("a %d-character URL was accepted", len("https://gitlab.com/"+group+"/infra"))
+	}
+	if _, err := provider.Resolve("", "https://gitlab.com/acme/platform/infra", ""); err != nil {
+		t.Errorf("an ordinary nested URL was refused: %v", err)
+	}
+}
+
+// Review round 3: a shadowed forge with a repository but no namespace was
+// warned "serves nothing" on top of its host refusal.
+func TestAShadowedForgeIsNotWarnedAsServingNothing(t *testing.T) {
+	in := &IntegrationSpec{
+		Forges:       []ForgeSpec{glForge("a", "", "acme"), glForge("b", "", "")},
+		Repositories: []RepositorySpec{repo("b", "other/thing", RepositoryRoleManaged)},
+	}
+	resolved, _ := in.ResolveGit()
+	for _, w := range resolved.Warnings() {
+		if strings.Contains(w, "forges[1]") {
+			t.Errorf("the shadowed forge was warned as serving nothing: %s", w)
+		}
+	}
+}
+
+// Review round 3: a repository on a shadowed forge claimed no URL, so a later
+// entry naming the same repository -- a duplicate when the claims were measured
+// -- was accepted once shadowing applied, and seeded with no broker entry
+// serving it.
+func TestShadowingDoesNotFreeADuplicate(t *testing.T) {
+	in := &IntegrationSpec{
+		Forges: []ForgeSpec{glForge("a", "", "other"), glForge("b", "", "acme"), glForge("c", "", "")},
+		Repositories: []RepositorySpec{
+			repo("b", "acme/x", RepositoryRoleManaged),
+			repo("c", "acme/x", RepositoryRoleManaged),
+		},
+	}
+	resolved, _ := in.ResolveGit()
+	if got := resolved.Accepted(RepositoryRoleManaged); len(got) != 0 {
+		t.Errorf("a repository the claims measured as a duplicate was accepted: %+v", got)
+	}
+}

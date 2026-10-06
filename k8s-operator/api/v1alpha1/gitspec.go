@@ -194,7 +194,7 @@ func (f *ResolvedForge) valid() bool {
 	return validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) == nil &&
 		provider.ValidateHost(f.Host) == nil &&
 		validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength) == nil &&
-		provider.ValidateNamespace(f.Namespace) == nil &&
+		provider.ValidateNamespaceOn(f.Host, f.Namespace) == nil &&
 		f.credentialsProblem(provider) == nil
 }
 
@@ -594,7 +594,7 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		}
 		if err := validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength); err != nil {
 			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
-		} else if err := provider.ValidateNamespace(f.Namespace); err != nil {
+		} else if err := provider.ValidateNamespaceOn(f.Host, f.Namespace); err != nil {
 			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
 		}
 		if err := f.credentialsProblem(provider); err != nil {
@@ -618,14 +618,20 @@ func (ri *ResolvedIntegration) checkRepositories(shadowedBy map[*ResolvedForge]*
 	add := func(path IntegrationFieldPath, value string, err error) {
 		problems = append(problems, IntegrationProblem{Path: path, Value: value, Err: err})
 	}
+	// A repository on a shadowed forge is refused with the forge, whose
+	// problem is reported against the forge; its own problems are not added.
+	shadowedNow := false
 	reject := func(r *ResolvedRepository, path IntegrationFieldPath, value string, err error) {
-		add(path, value, err)
+		if !shadowedNow {
+			add(path, value, err)
+		}
 		rejected[r] = true
 	}
 
 	gitops := 0
 	seen := map[string]int{}
 	for _, r := range ri.Repositories {
+		shadowedNow = false
 		if r.Role == RepositoryRoleGitOps {
 			gitops++
 			if gitops > 1 {
@@ -641,16 +647,23 @@ func (ri *ResolvedIntegration) checkRepositories(shadowedBy map[*ResolvedForge]*
 				fmt.Errorf("forge %q is not declared in integration.forges", r.ForgeName))
 			continue
 		}
-		if _, shadowed := shadowedBy[r.Forge]; !r.Forge.valid() || shadowed {
+		if !r.Forge.valid() {
 			// The forge's own problem is reported against the forge.
 			rejected[r] = true
 			continue
 		}
+		// A repository on a shadowed forge goes through every check below,
+		// with its problems withheld, so it still claims its URL: shadowing
+		// then cannot free a later entry this pass would otherwise have
+		// refused as its duplicate. That keeps this pass's answer equal to the
+		// one credentialClaims measured with no claims, less the shadowed
+		// forges' own repositories.
+		_, shadowedNow = shadowedBy[r.Forge]
 		provider, _ := r.Forge.GitProvider()
 		if err := validateDeclaredValue(gitNamespaceField, r.Namespace, MaxGitNamespaceLength); err != nil {
 			reject(r, ri.repositoryPath(r, gitNamespaceField), r.Namespace, err)
 			continue
-		} else if err := provider.ValidateNamespace(r.Namespace); err != nil {
+		} else if err := provider.ValidateNamespaceOn(r.Forge.Host, r.Namespace); err != nil {
 			reject(r, ri.repositoryPath(r, gitNamespaceField), r.Namespace, err)
 			continue
 		}
@@ -693,6 +706,9 @@ func (ri *ResolvedIntegration) checkRepositories(shadowedBy map[*ResolvedForge]*
 		if !rejected[r] {
 			seen[key] = r.Index
 		}
+		if shadowedNow {
+			rejected[r] = true
+		}
 	}
 	return problems, rejected
 }
@@ -704,9 +720,14 @@ func (ri *ResolvedIntegration) Warnings() []string {
 	}
 	var warnings []string
 	_, rejected := ri.check()
+	_, shadowedBy := ri.credentialClaims()
 	accepted := func(r *ResolvedRepository) bool { return !rejected[r] }
 	for _, f := range ri.Forges {
-		if provider, err := f.GitProvider(); err == nil && provider.NeedsCredentials && f.valid() && len(ri.servedNamespaces(f, accepted)) == 0 {
+		// A shadowed forge is refused for its host, which says why the broker
+		// is not given it; "serves nothing" would send the administrator after
+		// a namespace instead.
+		_, shadowed := shadowedBy[f]
+		if provider, err := f.GitProvider(); err == nil && provider.NeedsCredentials && f.valid() && !shadowed && len(ri.servedNamespaces(f, accepted)) == 0 {
 			warnings = append(warnings, fmt.Sprintf(
 				"spec.integration.%s names no namespace and no accepted repository, so the broker is not given it: a %s token is never served for a whole host by implication",
 				ri.forgePath(f, ""), provider.Name))

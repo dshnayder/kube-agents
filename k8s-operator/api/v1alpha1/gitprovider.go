@@ -261,6 +261,52 @@ func (p *GitProvider) canonicalHost(host string) string {
 	return trimmed
 }
 
+// BrokerMaxRepoRefLength is the longest repository reference the credential
+// broker parses: repo_ref.py's MAX_REPO_LENGTH, applied to the whole value. A
+// repository the operator seeds into managed_repos is read back by that parser,
+// so one longer than this would be accepted here and refused there on every
+// call. GitHub's own limits keep a github.com URL far below it; a nested GitLab
+// group path can reach it.
+const BrokerMaxRepoRefLength = 256
+
+// isForgeHost reports whether a path segment is a forge's host rather than a
+// group: a spelling of any registered provider's host, or this forge's own
+// declared host. GitLab's group grammar admits a dot, so its grammar alone
+// cannot tell `github.com` or `gitlab.example.com` from a group named
+// `my.group`; the broker lifts such a first segment off as a host and then
+// refuses it, so a namespace or a repository path starting with one is refused
+// here, where the status can name it, rather than rendered into a forge
+// configuration the broker will not start with.
+func isForgeHost(segment, canonical string) bool {
+	s := lowerASCII(strings.TrimSpace(segment))
+	if s == "" {
+		return false
+	}
+	if s == canonical {
+		return true
+	}
+	for _, provider := range gitProviders {
+		if provider.Hosts[s] {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateNamespaceOn is ValidateNamespace for a namespace declared on a forge
+// at host: the grammar, and a first segment that is not a forge host.
+func (p *GitProvider) ValidateNamespaceOn(host, namespace string) error {
+	if err := p.ValidateNamespace(namespace); err != nil {
+		return err
+	}
+	trimmed := strings.Trim(strings.TrimSpace(namespace), pathSeparator)
+	if first, _, _ := strings.Cut(trimmed, pathSeparator); isForgeHost(first, p.canonicalHost(host)) {
+		return fmt.Errorf("%s namespace %q starts with %q, which is a forge host, not a group; name the group alone",
+			p.Name, trimmed, first)
+	}
+	return nil
+}
+
 // ValidateNamespace applies this forge's grammar to an owning organisation,
 // user, or group path. An empty namespace is allowed: it may be inferable from
 // the repository, and the caller decides whether it had to be present.
@@ -353,7 +399,8 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// often another forge's (`gitlab.com/group/project`). Said here, the
 	// refusal names it; left to the depth check, it would send the
 	// administrator to shorten the path instead.
-	if first, _, isPath := strings.Cut(ref.Path, pathSeparator); bare && isPath && strings.Contains(first, ".") && p.ValidateNamespace(first) != nil {
+	if first, _, isPath := strings.Cut(ref.Path, pathSeparator); bare && isPath && strings.Contains(first, ".") &&
+		(p.ValidateNamespace(first) != nil || isForgeHost(first, canonical)) {
 		return RepoRef{}, fmt.Errorf("repository %q starts with %q, which reads as a host %s does not serve; a repository on another forge needs a forge of its own",
 			repository, first, p.Name)
 	}
@@ -368,6 +415,13 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	}
 
 	segments := ref.Segments()
+	// The namespace prepended above is checked the same way: a declared
+	// namespace that starts with a host would seed a path the broker reads with
+	// that host lifted off.
+	if len(segments) > 0 && isForgeHost(segments[0], canonical) {
+		return RepoRef{}, fmt.Errorf("repository %q resolves to a path starting with %q, which is a forge host, not a group",
+			repository, segments[0])
+	}
 	for _, segment := range segments {
 		if !safeRepoSegment(segment) {
 			return RepoRef{}, fmt.Errorf("invalid repository path segment %q", segment)
@@ -384,6 +438,10 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	resolvedNamespace := strings.Join(segments[:len(segments)-1], pathSeparator)
 	if err := p.ValidateNamespace(resolvedNamespace); err != nil {
 		return RepoRef{}, fmt.Errorf("repository %q resolves to %w", repository, err)
+	}
+	if n := len(ref.URL()); n > BrokerMaxRepoRefLength {
+		return RepoRef{}, fmt.Errorf("repository %q resolves to a %d-character URL; the credential broker reads at most %d",
+			repository, n, BrokerMaxRepoRefLength)
 	}
 	return ref, nil
 }
