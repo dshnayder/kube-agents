@@ -170,9 +170,17 @@ class ContractTest(unittest.TestCase):
             # hands `for_config`. A forge that needs none ships none.
             config_file = fixtures_dir(cls) / "config.json"
             config = json.loads(config_file.read_text()) if config_file.is_file() else {}
-            for forge in cls.for_config(config):
+            from_this = list(cls.for_config(config))
+            # Per forge, not on the whole list: one forge building is no
+            # evidence that another did, and a forge that built nothing would
+            # drop out of every property below without a failure.
+            self.assertTrue(
+                from_this,
+                f"{name} built no instance from "
+                f"{'its config.json' if config_file.is_file() else 'an empty configuration and ships no config.json'}",
+            )
+            for forge in from_this:
                 built.append((name, forge, fixtures_dir(cls)))
-        self.assertTrue(built, "no forge in AVAILABLE built an instance")
         return built
 
     def load(self, directory: Path, verb: str) -> dict:

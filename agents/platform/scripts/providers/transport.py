@@ -452,8 +452,13 @@ class HttpTransport:
             slow = "the request's time ran out while the forge was answering"
         if deadline <= now:
             raise forge_error(0, "the request's time ran out before this call to the forge")
+        # The opener gets the transport's own timeout unless the request's
+        # deadline is sooner. Not `deadline - now` unconditionally: at
+        # some monotonic clock readings `(now + t) - now` is not `t`, and
+        # the per-receive bound would drift off the one configured.
+        socket_timeout = self._timeout if deadline == now + self._timeout else deadline - now
         try:
-            with self._open(request, timeout=deadline - now) as response:
+            with self._open(request, timeout=socket_timeout) as response:
                 payload = self._read_within(response, deadline, slow=slow)
         except urllib.error.HTTPError as exc:
             return self._refused(exc.code, self._error_text(exc, deadline))

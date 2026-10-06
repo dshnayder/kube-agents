@@ -401,6 +401,13 @@ class GitLabForge(Forge):
         source = payload.get("source")
         if source is not None:
             params["source_branch"] = validate_branch(source, "source")
+            if page == 1:
+                # Forks are filtered out below, after the page arrives, so a
+                # page of `limit` could be filled by forks' branches of the
+                # same name and hide this repository's own. The first page --
+                # the "is there a proposal for my branch" question -- is read
+                # whole and cut to `limit` after filtering.
+                params["per_page"] = MAX_PAGE_SIZE
         target = payload.get("target")
         if target is not None:
             params["target_branch"] = validate_branch(target, "target")
@@ -417,6 +424,11 @@ class GitLabForge(Forge):
             # branch, and must not answer "is there an open proposal for the
             # branch I just published".
             proposals = [item for item in proposals if item["sourceRepo"] == repo]
+            if page == 1:
+                more = len(proposals) > limit or len(nodes) >= MAX_PAGE_SIZE
+                return listing(
+                    proposals[:limit], limit, "proposals", returned=limit if more else 0
+                )
         # Judged on what GitLab sent: a full page filtered down is still a page.
         return listing(proposals, limit, "proposals", returned=len(nodes))
 

@@ -5683,8 +5683,14 @@ def warn_on_credential_reach(broker) -> None:
         except Exception as exc:  # noqa: BLE001 - a diagnostic, not a control
             # The guidance detail, when there is one, is the reason -- a
             # refused connection, an untrusted certificate -- and is what an
-            # operator acts on; it carries no token.
-            detail = (getattr(exc, "fields", None) or {}).get("detail", "")
+            # operator acts on; it carries no token. A broker refusal with no
+            # detail -- a token file that is missing or empty -- says its
+            # reason in the message and its code, which name the host and
+            # never the token.
+            fields = getattr(exc, "fields", None) or {}
+            detail = fields.get("detail", "")
+            if not detail and isinstance(exc, providers.WorkspaceError):
+                detail = f"{fields.get('code', '')}: {exc}".strip(": ")
             LOGGER.warning(
                 "could not ask what the %s credential for %s reaches type=%s%s",
                 forge.name,

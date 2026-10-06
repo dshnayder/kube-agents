@@ -8358,6 +8358,20 @@ class CredentialReachTest(unittest.TestCase):
             credential_proxy.warn_on_credential_reach(self._broker(refusal))
         self.assertIn("TLS certificate is not trusted", "\n".join(logs.output))
 
+    def test_a_missing_token_logs_its_reason_and_code(self):
+        # Review (#2439): the token-file refusal carries no detail, and the
+        # log line read `type=WorkspaceError` alone for the routine case of
+        # a Secret not mounted yet.
+        refusal = providers.WorkspaceError(
+            "the forge credential for gitlab.com could not be read: FileNotFoundError",
+            status=503, code="FORGE_CREDENTIAL_UNAVAILABLE",
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(refusal))
+        out = "\n".join(logs.output)
+        self.assertIn("FORGE_CREDENTIAL_UNAVAILABLE", out)
+        self.assertIn("could not be read: FileNotFoundError", out)
+
     def test_a_forge_that_cannot_say_or_cannot_answer_never_raises(self):
         credential_proxy.warn_on_credential_reach(self._broker(None))
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
