@@ -5018,6 +5018,21 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             # `coverage_gaps` turns the limitation into a gap, so the run
             # reports itself partial and names the target whose coverage rests
             # on work the manifest cannot check.
+            # The same holds for a check declared inapplicable there: the
+            # collector read nothing, so nothing corroborates that a check
+            # cannot apply, and a target with every check declared so would
+            # otherwise publish as fully covered.
+            declared_na = checks_na(cluster)
+            if declared_na and not claimed and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares {len(declared_na)} check(s) "
+                    f"inapplicable, but the collector manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    f"{_collector_error(manifest_cluster)}. Nothing was read there, so "
+                    "nothing shows a check cannot apply. Put it in scope.skipped with "
+                    "the collector's error as the reason, or say in this target's "
+                    "`limitations` what you checked by hand."
+                )
             if claimed and not str(cluster.get("limitations", "")).strip():
                 raise ValidationError(
                     f"scope.clusters: {name!r} claims {len(claimed)} check(s) ran, "

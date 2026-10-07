@@ -416,7 +416,8 @@ REDACTED = "[REDACTED]"
 # that a startup script is known to echo, matched before the line is published.
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN[^-]{0,64}PRIVATE KEY-----"),
-    re.compile(r"ya29\.[A-Za-z0-9_\-]{10,}"),
+    # `ya29.c.` is the service-account form a metadata-server token takes.
+    re.compile(r"ya29\.(?:c\.)?[A-Za-z0-9_\-]{10,}"),
     re.compile(r"AIza[A-Za-z0-9_\-]{20,}"),
     re.compile(r"(?i)\b(?:bearer|token|password|passwd|secret|api[_-]?key)\b[\"'\s:=]+\S+"),
     # A long unbroken run of encoded material — a key or a JWT segment. The
@@ -1418,7 +1419,10 @@ def unenumerated_entry(notes: list[str]) -> dict:
         "project": "",
         "location": GLOBAL_LOCATION,
         "outcome": OUTCOME_GATE_FAILED,
-        "error": f"{'; '.join(notes)}. {UNENUMERATED_TAIL}"[:ERROR_CLIP_CHARS],
+        # The notes are clipped, not the tail: the tail is what says the
+        # fleet's size is unknown, and a long `projects list` refusal would
+        # otherwise push it out.
+        "error": f"{'; '.join(notes)[: ERROR_CLIP_CHARS - len(UNENUMERATED_TAIL) - 2]}. {UNENUMERATED_TAIL}",
     }
 
 

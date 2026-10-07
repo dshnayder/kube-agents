@@ -234,6 +234,12 @@ class StartupScriptTest(unittest.TestCase):
         )
         self.assertNotIn("ya29.c.b0Aaekm1J", hit["excerpt"])
 
+    def test_a_service_account_token_with_no_keyword_before_it_is_redacted(self):
+        # Short of the 40-character catch-all and with no `token` word to
+        # trip the keyword pattern: only the `ya29` pattern can catch it.
+        hit = cf.check_startup_script("vm-1", "us-central1-a", "ya29.c.b0Aaekm1Jxxxxxxxxxxxxxxxxxxxxxx startup-script exit status 1\n")
+        self.assertNotIn("b0Aaekm1J", hit["excerpt"])
+
 
 class RunningInstancesTest(unittest.TestCase):
     def test_keeps_running_instances_and_splits_the_zone(self):
@@ -2056,6 +2062,15 @@ class UnenumeratedTargetTest(unittest.TestCase):
         self.assertEqual(row["outcome"], "gate-failed")
         self.assertIn("PERMISSION_DENIED", row["error"])
         self.assertIn(cf.UNENUMERATED_TAIL, row["error"])
+
+    def test_a_long_listing_refusal_keeps_the_tail(self):
+        manifest = self.manifest(
+            {"GCP_PROJECT_ID": "p-host"},
+            discovery_run(list_rc=1, list_stderr="ERROR: (gcloud.projects.list) " + "x" * 400),
+        )
+        row = self.row(manifest)
+        self.assertTrue(row["error"].endswith(cf.UNENUMERATED_TAIL))
+        self.assertLessEqual(len(row["error"]), cf.ERROR_CLIP_CHARS)
 
     def test_a_narrowed_run_puts_the_row_in_the_manifest(self):
         row = self.row(self.manifest({}, discovery_run(), "cli-proj"))

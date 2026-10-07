@@ -15993,6 +15993,28 @@ class TestCrossCheckManifest(unittest.TestCase):
                 ]
                 audit_report.cross_check_manifest(doc, self.unreadable(outcome))
 
+    def test_an_unreadable_target_cannot_be_declared_all_inapplicable(self):
+        """Without this, a gate-failed target listed with every check in
+        `checks_not_applicable` publishes as fully covered over a read that
+        never happened."""
+        roster = audit_report.audit_target_checks(AUDIT, "prod-eu-west")
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                doc = self.doc(["no-requests"])
+                doc["scope"]["clusters"].append(
+                    {
+                        "name": "prod-eu-west",
+                        "checks_run": [],
+                        "checks_not_applicable": [
+                            {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                        ],
+                    }
+                )
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(doc, self.unreadable(outcome))
+                self.assertIn("declares", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
     def test_scope_clusters_with_limitations_also_accounts_for_it(self):
         doc = self.doc(["no-requests"])
         doc["scope"]["clusters"].append(
