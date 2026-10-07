@@ -3,6 +3,7 @@
 
 import datetime
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -24,6 +25,12 @@ FRESH_STAMP = "2026-09-01T00:00:00.000-08:00"
 
 def run_of(rc: int, stdout: str = "", stderr: str = "") -> cf.Run:
     return cf.Run(["gcloud"], rc, stdout, stderr, 0.01)
+
+
+class Unstubbed(BaseException):
+    """A call no stub modelled. A `BaseException`, so `collect_fleet`'s
+    `except Exception` cannot turn it into an ordinary gate-failed row: the
+    test errors naming the command instead."""
 
 
 def unevaluated(entry: dict) -> dict:
@@ -229,6 +236,13 @@ class StartupScriptTest(unittest.TestCase):
         hit = cf.check_startup_script("gke-pool-1-abcd", "us-central1-a", "startup-script exit status 1\n")
         self.assertEqual(hit["needs_triage"], cf.TRIAGE_GKE_NODE)
 
+    def test_a_prefixed_credential_name_is_redacted(self):
+        for line in ("DB_PASSWORD=hunter2 startup-script exit status 1", "GITHUB_TOKEN=abc123 startup-script exit status 1"):
+            with self.subTest(line):
+                hit = cf.check_startup_script("vm-1", "us-central1-a", line + "\n")
+                self.assertNotIn("hunter2", hit["excerpt"])
+                self.assertNotIn("abc123", hit["excerpt"])
+
     def test_a_secret_in_the_serial_line_never_reaches_the_excerpt(self):
         hit = cf.check_startup_script("vm-1", "us-central1-a", "token: ya29.c.b0Aaekm1Jxxxxxxxxxxxxxxxxxxxxxx startup-script exit status 1\n"
         )
@@ -350,7 +364,7 @@ class CollectProjectTest(unittest.TestCase):
             for needle, result in responses.items():
                 if needle in joined:
                     return result
-            raise AssertionError(f"unstubbed command: {joined}")
+            raise Unstubbed(f"unstubbed command: {joined}")
 
         return run
 
@@ -1146,7 +1160,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             for needle, result in responses.items():
                 if needle in joined:
                     return result
-            raise AssertionError(f"unstubbed command: {joined}")
+            raise Unstubbed(f"unstubbed command: {joined}")
 
         return cf.collect_fleet("proj-1", run=run)
 
@@ -1451,7 +1465,7 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
             for needle, result in stubs.items():
                 if needle in joined:
                     return result
-            raise AssertionError(f"unstubbed command: {joined}")
+            raise Unstubbed(f"unstubbed command: {joined}")
 
         return run
 
@@ -1775,6 +1789,57 @@ class AutoscalingNodeGroupReadTest(unittest.TestCase):
         self.assertNotIn("sole-tenant-headroom", entry.get("limitations", ""))
 
 
+class ExcludedNodeGroupCountTest(unittest.TestCase):
+    def test_an_excluded_group_is_not_counted_as_measured(self):
+        groups = json.dumps([
+            {"name": "ng-auto", "zone": "https://x/projects/proj-1/zones/us-central1-a", "autoscalingPolicy": {"mode": "ON"}},
+            {"name": "ng-fixed", "zone": "https://x/projects/proj-1/zones/us-central1-a"},
+            {"name": "ng-ok", "zone": "https://x/projects/proj-1/zones/us-central1-a"},
+        ])
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "instances list" in joined:
+                return run_of(0, one_running_instance())
+            if "get-serial-port-output" in joined:
+                return run_of(0, "boot ok\n")
+            if "project-info describe" in joined:
+                return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
+            if "list-nodes ng-fixed" in joined:
+                return run_of(1, "", "PERMISSION_DENIED")
+            if "list-nodes ng-ok" in joined:
+                return run_of(0, json.dumps([node()]))
+            if "node-groups list" in joined:
+                return run_of(0, groups)
+            return run_of(0, "[]")
+
+        entry = cf.collect_project("proj-1", run=run)
+        self.assertIn("measured 1 of 2 node group(s)", entry["limitations"])
+
+
+class NothingCollectedTest(unittest.TestCase):
+    def test_a_run_that_read_no_target_carries_a_top_level_error(self):
+        with patch.dict(os.environ, {**NO_PROJECT_ENV, "MONITORED_PROJECT_IDS": "p-a"}):
+            manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(1, "", "ERROR: instances list timed out"))
+        self.assertIn("no project could be read", manifest["error"])
+        self.assertFalse([c for c in manifest["clusters"] if c.get("outcome") == "collected"])
+
+    def test_a_run_with_a_collected_target_has_no_error(self):
+        def run(argv, **kwargs):
+            if "instances list" in " ".join(argv):
+                return run_of(0, one_running_instance())
+            return run_of(0, "[]")
+
+        with patch.dict(os.environ, {**NO_PROJECT_ENV, "MONITORED_PROJECT_IDS": "p-a"}):
+            manifest = cf.collect_fleet(run=run)
+        self.assertNotIn("error", manifest)
+
+    def test_main_exits_non_zero_when_nothing_was_collected(self):
+        with patch.object(cf, "collect_fleet", return_value={"clusters": [], "error": "no project could be read"}):
+            with patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(cf.main([]), 1)
+
+
 class NewChecksInCollectProjectTest(unittest.TestCase):
     """The two checks wired through `collect_project`, where the manifest
     dispositions are actually decided."""
@@ -1807,7 +1872,7 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
             for needle, result in sorted(base.items(), key=lambda item: -len(item[0])):
                 if needle in joined:
                     return result
-            raise AssertionError(f"unstubbed command: {joined}")
+            raise Unstubbed(f"unstubbed command: {joined}")
 
         return cf.collect_project("proj-1", run=run)
 

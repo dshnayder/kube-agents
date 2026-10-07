@@ -3511,7 +3511,9 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # accounted for there, so it needs no limitations note and adds no gap
         # -- a GCP project holding no instance, MIG, node group or snapshot is
         # the standing example, and a note would hold every run partial for as
-        # long as that project exists.
+        # long as that project exists. Only on a stream whose collector can
+        # corroborate the declarations (`cross_check_manifest`): elsewhere
+        # nothing checks them, and this would be a command-free all-clear.
         checks_run = cluster.get("checks_run")
         cluster_label = str(cluster.get("name", "")) or "this cluster"
         if not isinstance(checks_run, list):
@@ -3523,7 +3525,11 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"it is an audit that did not run. {_sop_pointer(audit_id)}"
             )
         target_roster = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
-        every_check_inapplicable = bool(target_roster) and target_roster <= set(checks_na(cluster))
+        every_check_inapplicable = (
+            audit_id in COLLECTOR_AUDITS
+            and bool(target_roster)
+            and target_roster <= set(checks_na(cluster))
+        )
         if (
             not checks_run
             and not str(cluster.get("limitations", "")).strip()
@@ -5006,6 +5012,22 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 "entry has it, verbatim."
             )
         if not manifest_cluster:
+            # A target the collector never named: nothing corroborates a claim
+            # that every check is inapplicable there, which `validate_findings`
+            # would otherwise accept as full coverage.
+            roster = set(audit_target_checks(audit_id, name))
+            if (
+                roster
+                and not checks_ran(cluster)
+                and roster <= set(checks_na(cluster))
+                and not str(cluster.get("limitations", "")).strip()
+            ):
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares every check inapplicable, but "
+                    f"the collector manifest for {audit_id} does not name it, so "
+                    "nothing corroborates that. Name the checks you ran there, say in "
+                    "its `limitations` why none could run, or leave it out."
+                )
             continue
         claimed = checks_ran(cluster)
         if manifest_cluster.get("outcome") != MANIFEST_OUTCOME_COLLECTED:

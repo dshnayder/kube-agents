@@ -419,7 +419,10 @@ SECRET_PATTERNS = (
     # `ya29.c.` is the service-account form a metadata-server token takes.
     re.compile(r"ya29\.(?:c\.)?[A-Za-z0-9_\-]{10,}"),
     re.compile(r"AIza[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"(?i)\b(?:bearer|token|password|passwd|secret|api[_-]?key)\b[\"'\s:=]+\S+"),
+    # The lead admits a prefixed name (`DB_PASSWORD=`, `GITHUB_TOKEN=`), which
+    # the bare word misses because `_` is a word character; audit_report's
+    # `_SECRET_KEY_RE` carries the same lead for the same reason.
+    re.compile(r"(?i)\b(?:[A-Za-z0-9]+[_.\-])*(?:bearer|token|password|passwd|secret|api[_-]?key)\b[\"'\s:=]+\S+"),
     # A long unbroken run of encoded material — a key or a JWT segment. The
     # uppercase-or-`+` lookahead is what keeps this from swallowing the
     # excerpt's diagnostic content: the previous form,
@@ -1250,6 +1253,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             )
         else:
             measured_any = False
+            excluded = 0
             unmeasured: list[str] = []
             for group in groups:
                 if not isinstance(group, dict):
@@ -1261,6 +1265,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                     # Excluded by §2.4, so neither read nor counted unmeasured:
                     # a refused `list-nodes` on it must not make the run partial.
                     measured_any = True
+                    excluded += 1
                     continue
                 nodes_argv = [
                     "gcloud", "compute", "sole-tenancy", "node-groups",
@@ -1295,8 +1300,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             elif unmeasured:
                 limitations.append(
                     PARTIAL_NODE_GROUPS_LIMITATION.format(
-                        measured=len(groups) - len(unmeasured),
-                        total=len(groups),
+                        measured=len(groups) - len(unmeasured) - excluded,
+                        total=len(groups) - excluded,
                         names=", ".join(sorted(unmeasured)),
                     )
                 )
@@ -1455,7 +1460,7 @@ def collect_fleet(
     if notes:
         entries.append(unenumerated_entry(notes))
 
-    return {
+    manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
         "audit": AUDIT_ID,
@@ -1463,6 +1468,16 @@ def collect_fleet(
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "clusters": entries,
     }
+    # No target was read. The design's top-level `error` says so, and the SOP
+    # answers it by not calling `finish`: the run has nothing to publish, and
+    # `finish` would refuse it on shape rather than on this reason.
+    if not any(entry.get("outcome") == OUTCOME_COLLECTED for entry in entries):
+        reasons = [str(entry.get("error", "")) for entry in entries if entry.get("error")]
+        manifest["error"] = (
+            f"no project could be read: {len(entries)} target(s), none collected"
+            + (f"; {reasons[0]}" if reasons else "")
+        )[:ERROR_CLIP_CHARS]
+    return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1491,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"failed to write {args.output}: {exc}")
             return 1
     print(text)
-    return 0
+    return 1 if manifest.get("error") else 0
 
 
 if __name__ == "__main__":

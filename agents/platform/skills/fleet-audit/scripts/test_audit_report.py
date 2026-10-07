@@ -8870,11 +8870,12 @@ class TestAiSecurityAuditStream(BaseTestCase):
         # into `checks_not_applicable` would not even reach this line.
         self.assertIn("is now clean", self.out)
 
-    def test_the_whole_roster_excused_as_not_applicable_is_accounted_for(self):
-        """Every check named inapplicable with a reason accounts for the whole
-        roster, so it validates without a `limitations` note and holds nothing
-        partial. The SOP still sends model-free clusters down the `checks_run`
-        path, because there the checks did run; this pins the harness rule."""
+    def test_the_whole_roster_excused_without_a_collector_publishes_nothing(self):
+        """With no collector to corroborate them (this class runs with
+        `COLLECTOR_AUDITS` empty), declarations of inapplicability do not
+        satisfy the empty-`checks_run` rule: that would be a command-free
+        all-clear. The SOP sends model-free clusters down the `checks_run`
+        path, because there the checks did run."""
         excused = {
             "name": "prod-us-east",
             "location": "us-east1",
@@ -8888,9 +8889,8 @@ class TestAiSecurityAuditStream(BaseTestCase):
         doc = make_doc(audit=self.STREAM, findings=[], clusters=[excused])
 
         rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
-        self.assertEqual(rc, 0, self.err)
-        self.assertNotIn("checks_run: empty for prod-us-east", self.err)
-        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        self.assertEqual(rc, 2)
+        self.assertIn("checks_run: empty for prod-us-east", self.err)
 
     def test_a_finding_from_every_check_renders_over_a_complete_coverage_row(self):
         """Each of the six reaches the body, above a scope table reading 6/6.
@@ -12927,6 +12927,27 @@ class TestChecksRun(unittest.TestCase):
         self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
         self.assertEqual(audit_report.coverage_gaps(doc), [])
 
+    def test_every_check_inapplicable_needs_a_collector_stream(self):
+        stream = "gcp-networking-fabric-audit"
+        self.assertNotIn(stream, audit_report.COLLECTOR_AUDITS)
+        roster = audit_report.audit_target_checks(stream, "project/acme-prod")
+        doc = make_doc(
+            audit=stream,
+            findings=[],
+            clusters=[
+                {
+                    "name": "project/acme-prod",
+                    "location": "global",
+                    "project": "acme-prod",
+                    "checks_run": [],
+                    "checks_not_applicable": [{"check": c, "reason": self.NA_REASON} for c in roster],
+                }
+            ],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, stream)
+        self.assertIn("checks_run: empty", str(exc.exception))
+
     def test_a_target_with_some_checks_inapplicable_and_none_run_is_rejected(self):
         roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
         doc = make_doc(
@@ -16014,6 +16035,22 @@ class TestCrossCheckManifest(unittest.TestCase):
                     audit_report.cross_check_manifest(doc, self.unreadable(outcome))
                 self.assertIn("declares", str(ctx.exception))
                 self.assertIn(outcome, str(ctx.exception))
+
+    def test_a_target_the_manifest_never_names_cannot_be_declared_all_inapplicable(self):
+        doc = self.doc(["no-requests"])
+        roster = audit_report.audit_target_checks(doc["audit"], "some-other-cluster")
+        doc["scope"]["clusters"].append(
+            {
+                "name": "some-other-cluster",
+                "checks_run": [],
+                "checks_not_applicable": [
+                    {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                ],
+            }
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, self.manifest())
+        self.assertIn("does not name it", str(ctx.exception))
 
     def test_scope_clusters_with_limitations_also_accounts_for_it(self):
         doc = self.doc(["no-requests"])
