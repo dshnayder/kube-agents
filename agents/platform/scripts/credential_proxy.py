@@ -1093,13 +1093,18 @@ def _hosted(repository: object, provider: str) -> object:
     """
     if not provider or not isinstance(repository, str):
         return repository
-    if "://" in repository or repository.count("/") != 1:
+    # Hostless as the parser reads it, not by counting slashes: `owner/name.git`
+    # and `owner/name/` are bare names, `gitlab.com/group` is not.
+    ref = repo_ref.try_parse(repository)
+    if ref is None or ref.host or len(ref.segments) != 2:
         return repository
-    try:
-        host = _provider_forge(provider).hosts[0]
-    except (PermissionError, IndexError):
+    # Only when exactly one built forge carries the provider: with two (say
+    # gitlab.com and a self-managed instance) a bare name means neither, and
+    # picking the first would place it on a host the caller never named.
+    forges = [forge for forge in forge_registry().forges if forge.name == provider]
+    if len(forges) != 1 or not forges[0].hosts:
         return repository
-    return f"https://{host}/{repository}"
+    return f"https://{forges[0].hosts[0]}/{'/'.join(ref.segments)}"
 
 
 def _workspace_credential(registry: providers.Registry, repository: str) -> providers.Credential:
