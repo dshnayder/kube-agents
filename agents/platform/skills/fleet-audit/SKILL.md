@@ -1,6 +1,6 @@
 ---
 name: fleet-audit
-description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests on GitHub repositories.
+description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
 ---
 
 # fleet-audit — Audit Findings to a Ledger Issue
@@ -187,10 +187,11 @@ the stream's open ledger issue, and clears any findings document a crashed run l
 user asked for a specific repository that is not yet registered, instruct the user or cluster
 administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
 gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
-(`gitlab.com/acme/platform/infra`). In content mode, a repository on another forge gets its ledger,
-but its files cannot be read or published yet: the broker's file workspace clones GitHub only, and
-`fetch`, `list`, `grep`, the remediation step and the declared-intent search say so rather than fail
-mid-way. It
+(`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
+from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
+work the same way on every forge, and a remediation on GitLab is a merge request. In directory mode
+the local clone reaches GitHub only, so a repository on another forge gets its ledger and no
+remediation. It
 creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 

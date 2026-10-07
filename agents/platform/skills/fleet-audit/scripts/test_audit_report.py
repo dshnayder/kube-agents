@@ -14277,59 +14277,54 @@ class TestDeclarationsAcrossSpellings(BaseTestCase):
         self.assertEqual([], audit_report.read_declarations(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
 
 
-class TestContentWorkspaceIsGitHubOnly(unittest.TestCase):
-    """Content mode's file workspace clones GitHub only, and says so for another forge."""
+class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
+    """Content mode's file workspace clones a repository from its own forge."""
 
-    def test_the_refusal_names_the_forge_and_spares_github(self):
-        self.assertIsNone(audit_report.content_workspace_refusal("acme/fleet"))
-        self.assertIsNone(audit_report.content_workspace_refusal("github.com/acme/fleet"))
-        refusal = audit_report.content_workspace_refusal("gitlab.com/acme/infra")
-        self.assertIn("clones GitHub repositories only", refusal)
-        self.assertIn("ledger issue is unaffected", refusal)
-
-    def test_the_declared_intent_search_asks_before_it_clones(self):
-        # Review: the search was the one content-mode read with no up-front
-        # refusal, so the workspace's 400 surfaced as a clone that "exited 1".
+    def setUp(self):
         audit_report.set_content_mode(True)
         self.addCleanup(audit_report.set_content_mode, False)
-        err = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(audit_report, "_clone_for_search") as clone, \
-                contextlib.redirect_stderr(err):
-            result = audit_report.discover_declarations(
-                DECLARING_AUDIT, "gitlab.com/acme/infra", Path(tmp), []
-            )
-        clone.assert_not_called()
-        self.assertEqual(([], [], []), result)
-        self.assertIn("gitlab.com/acme/infra: not searched", err.getvalue())
-        self.assertIn("clones GitHub repositories only", err.getvalue())
 
-    def test_the_withheld_postures_gap_names_why_another_forge_was_not_searched(self):
+    def test_the_declared_intent_search_clones_a_repository_on_another_forge(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(audit_report, "SCRATCH_DIR", Path(tmp)), \
+                patch.object(audit_report, "_clone_for_search", return_value=None) as clone, \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_report.discover_declarations(DECLARING_AUDIT, "gitlab.com/acme/infra", Path(tmp), [])
+        clone.assert_called_once()
+        self.assertEqual("gitlab.com/acme/infra", clone.call_args.args[0])
+
+    def test_the_withheld_postures_gap_names_the_repositories_plainly(self):
         gap = audit_report._declared_intent_gap({
             audit_report.POSTURES_WITHHELD_KEY: {
                 "findings": [], "run_record": True,
                 "unsearched": ["gitlab.com/acme/infra", "acme/fleet"],
             }
         })
-        self.assertIn("gitlab.com/acme/infra (its forge's files cannot be read in content mode yet)", gap)
-        self.assertIn(", acme/fleet", gap)
-        self.assertNotIn("acme/fleet (", gap)
+        self.assertIn("repositories not searched: gitlab.com/acme/infra, acme/fleet", gap)
 
-    def test_a_remediation_on_another_forge_opens_no_workspace(self):
+    def test_a_remediation_opens_the_workspace_with_the_name_its_forge_resolves(self):
+        opened = []
         client = type(sys)("credential_proxy_client")
 
         class Workspace:
             @staticmethod
-            def open(*args, **kwargs):
-                raise AssertionError("the workspace was opened")
+            def open(endpoint, repo, branch=None):
+                opened.append(repo)
+                raise RuntimeError("stop after the open")
 
         client.Workspace = Workspace
-        with patch.dict(sys.modules, {"credential_proxy_client": client}), \
-                patch.object(audit_report, "_proposal_noun", lambda repo: "merge request"):
-            landed = audit_report._land_group_via_broker(
-                "gitlab.com/acme/infra", "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
-            )
-        self.assertFalse(landed.proposable)
+        for repo, expected in (("gitlab.com/acme/infra", "gitlab.com/acme/infra"), ("github.com/acme/fleet", "acme/fleet")):
+            with self.subTest(repo=repo), patch.dict(sys.modules, {"credential_proxy_client": client}), \
+                    patch.object(audit_report, "proxy_endpoint", return_value="http://broker"), \
+                    patch.object(audit_report, "_proposal_noun", lambda repo: "merge request"):
+                with self.assertRaises(RuntimeError):
+                    audit_report._land_group_via_broker(
+                        repo, "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
+                    )
+        self.assertEqual(["gitlab.com/acme/infra", "acme/fleet"], opened)
+
+    def test_content_mode_refuses_no_remediation_for_its_forge(self):
+        self.assertEqual("", audit_report.remediation_refusal("gitlab.com/acme/infra"))
 
 
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
@@ -14368,7 +14363,7 @@ class TestRemediateReplyNamesTheRefusal(unittest.TestCase):
         requests = type("R", (), {"targets": ["f1"]})()
         plan = type("P", (), {"already_open": set(), "superseded": set()})()
         refusal = audit_report.remediation_refusal("gitlab.com/acme/infra")
-        self.assertIn("GitHub repositories only", refusal)
+        self.assertIn("directory mode", refusal)
         outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "merge request", refusal)
         self.assertIn("a retry will not change this", outcomes["f1"])
         self.assertNotIn("will retry", outcomes["f1"])
@@ -14393,7 +14388,24 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                                      side_effect=AssertionError("planned past the refusal")):
                     with self.assertRaises(audit_report.ValidationError) as caught:
                         audit_report.handle_remediate(args)
-                self.assertIn("GitHub repositories only", str(caught.exception))
+                self.assertIn("directory mode", str(caught.exception))
+
+    def test_in_content_mode_a_gitlab_repository_goes_on_to_plan(self):
+        # The content workspace clones from the repository's own forge, so the
+        # refusal is directory mode's alone: here `remediate` reaches planning.
+        audit_report.set_content_mode(True)
+        self.addCleanup(audit_report.set_content_mode, False)
+        args = argparse.Namespace(
+            audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+            finding=["f1"], dry_run=False, manifest_file=None, issue=None,
+        )
+        reached = RuntimeError("reached planning")
+        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch.object(audit_report, "read_run_record", side_effect=reached):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.handle_remediate(args)
+        self.assertIs(reached, caught.exception)
 
     def test_a_dry_run_without_repo_refuses_what_it_resolves(self):
         # Review round 5: with no `--repo` the dry run resolved the repository
@@ -14408,7 +14420,7 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                              side_effect=AssertionError("planned past the refusal")):
             with self.assertRaises(audit_report.ValidationError) as caught:
                 audit_report.handle_remediate(args)
-        self.assertIn("GitHub repositories only", str(caught.exception))
+        self.assertIn("directory mode", str(caught.exception))
 
 
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
