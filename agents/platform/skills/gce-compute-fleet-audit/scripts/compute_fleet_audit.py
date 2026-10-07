@@ -9,8 +9,8 @@ Ships alongside its SOP as this stream's own collector rather than folded
 into `fleet-audit/scripts/collect.py`: that driver enumerates GKE clusters and
 fetches per-cluster kubeconfigs, neither of which this stream needs — its
 targets are GCP projects, read directly with `gcloud compute`. It emits the
-run manifest that design's §2 specifies, the same one `collect.py` and
-`networking_audit.py` emit, so `audit_report.py finish --manifest-file` cross-checks the model's
+run manifest that design's §2 specifies, the same one `collect.py` emits, so
+`audit_report.py finish --manifest-file` cross-checks the model's
 `checks_run` against what actually ran. It used to print a whole findings
 document instead, which no reader joins on: `adopt_collector_evidence` never
 saw it and the model's retyped excerpts shipped in place of the observed ones.
@@ -116,18 +116,18 @@ AUDIT_ID = "gce-compute-fleet-audit"
 
 MANIFEST_VERSION = 1
 
-# A digest of this file, published in the manifest. `audit_report.py` compares
-# it against the previous run's to tell a finding that stopped reproducing from
-# a check that stopped looking. It has to agree across every collector: the
-# comparison is between one run's revision and the last one's, so a file that
-# truncated differently would report a moved collector on the run that changed
-# it.
+# A digest of this file, published as `checks_revision`. The manifest contract
+# (docs/designs/fleet-audit-collector-manifest.md §2) carries it unread today,
+# reserved for the run-over-run comparison that tells a finding that stopped
+# reproducing from a check that stopped looking.
 REVISION_DIGEST_CHARS = 12
 CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
 DEFAULT_TIMEOUT_S = 60
+# The return code `timeout(1)` uses, recorded for a read that ran out of time.
+TIMEOUT_RC = 124
 MAX_WORKERS = 8
 # `audit_report.validate_check_command`'s ceiling, restated rather than
 # imported because this script ships standalone. An over-length `command` is
@@ -206,6 +206,9 @@ STARTUP_FAILURE_PATTERN = re.compile(
     r"|startup-script(?:-url)? exit status [1-9]\d*"
     r"|Finished running startup scripts with error"
 )
+# What `google_metadata_script_runner` prints as each startup-script run
+# begins, on old and current guest agents alike.
+STARTUP_RUN_MARKER = "Starting startup scripts"
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
 # which is what this collector can see; §2.5 words the condition as the source
@@ -454,7 +457,7 @@ def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
     except Exception as exc:  # gcloud missing, permission denied on exec, etc.
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -683,7 +686,11 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     `Router/<region>/<name>` and `ForwardingRule/<scope>/<name>` for the same
     reason.
     """
-    for line in serial_text.splitlines():
+    lines = serial_text.splitlines()
+    # The console buffer outlives a guest reboot, so a failure an operator has
+    # since fixed is still in it. Only the last startup-script run counts.
+    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_MARKER in line]
+    for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
                 "object": f"ComputeInstance/{zone}/{instance_name}",
@@ -833,7 +840,7 @@ def _scope_of(resource: dict) -> str:
         value = resource.get(key)
         if value:
             return _last_segment(str(value))
-    return "unknown"
+    return UNRESOLVED_PROJECT
 
 
 def _count(actions: dict, key: str) -> int:

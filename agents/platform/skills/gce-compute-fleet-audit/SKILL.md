@@ -24,7 +24,7 @@ Read the manifest and follow `governance/gce_compute_fleet_sop.md` §2, which ow
 All four roster checks are collector-verified; none is yours to hand-run.
 
 - `gce-startup-script-status`: serial console boot failures and startup script errors.
-- `mig-convergence-stalled`: MIGs creating and deleting at once, or unable to create at all.
+- `mig-convergence-stalled`: MIGs creating and deleting at once (a resize loop).
 - `sole-tenant-headroom`: node group reservations at capacity with no failover host spare.
 - `orphaned-snapshots`: Persistent Disk snapshots of deleted disks older than 90 days.
 

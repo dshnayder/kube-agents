@@ -1,6 +1,6 @@
 # SOP: GCE Compute Engine and MIG Fleet Audit (Daily Governance)
 
-**Purpose:** Sweep all managed GCE Compute Engine instances and Managed Instance Groups (MIGs) across target GCP projects for failed startup scripts, MIGs that cannot converge on their target size, sole-tenant headroom exhaustion, and orphaned storage snapshots. The question this audit answers for a platform admin is: _which standalone VMs or MIG instances have failed startup scripts, which MIGs are stuck in a resize loop or unable to create instances at all, and which storage snapshots belong to deleted disks?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
+**Purpose:** Sweep all managed GCE Compute Engine instances and Managed Instance Groups (MIGs) across target GCP projects for failed startup scripts, MIGs that cannot converge on their target size, sole-tenant headroom exhaustion, and orphaned storage snapshots. The question this audit answers for a platform admin is: _which standalone VMs or MIG instances have failed startup scripts, which MIGs are stuck in a resize loop, and which storage snapshots belong to deleted disks?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
 
 **Cron:** id `gce-compute-fleet-audit`, schedule `45 7 * * *` (daily 07:45 UTC).
 
@@ -88,7 +88,7 @@ A project reserving no sole-tenant node groups gets a `checks_not_applicable` en
 
 - **Severity**: `minor`
 - **Command**: `gcloud compute snapshots list --project=$PROJECT --format=json`
-- **Condition**: Snapshot references source disk that has been deleted > 90 days ago and is not retained by any active backup policy.
+- **Condition**: Snapshot older than 90 days whose `sourceDisk` matches no live disk in the project, and that no snapshot schedule took.
 - **Do NOT flag**: Snapshots retained under explicit long-term legal hold or active compliance backup schedules.
 - **Remediation**: Clean up obsolete orphaned snapshot via `kind: gcloud`.
 

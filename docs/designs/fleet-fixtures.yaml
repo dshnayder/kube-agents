@@ -166,6 +166,16 @@ fixtures:
       from node boot-disk time and a rolling node recreation resets the gate.
       The least dependable fixture here.
 
+  - role: startup-fail-vm
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - instance/startup-fail
+    defect: >-
+      A standalone e2-micro, <prefix>-startup-fail, whose startup script
+      exits 1 on every boot, so the guest agent's failure line is on its
+      serial console from the first boot onward.
+
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
     available_from_day: 30

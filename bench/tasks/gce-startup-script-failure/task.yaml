@@ -42,11 +42,15 @@ domain: fleet-audits
 owner: maintainers
 
 verification_spec:
-  # Graded against the LEDGER's finding ids (scope: finding_ids), as
-  # consistency-no-environment-label explains: an id carries the check slug
-  # and the object, and the rendered body's evidence table restates every
-  # roster slug on every run, so only a filed finding satisfies it.
-  - name: a-startup-script-finding-was-filed-against-the-planted-vm
+  # The slug against the LEDGER's finding ids (scope: finding_ids), as
+  # consistency-no-environment-label explains: an id carries the check slug,
+  # and the rendered body's evidence table restates every roster slug on every
+  # run, so only a filed finding satisfies it. The VM's name cannot be graded
+  # there: `_shorten_id` clips an id to MAX_FINDING_ID, and the zone in
+  # `ComputeInstance/<zone>/<name>` pushes the clip into the name on every pool
+  # project. It is graded against the body instead, which names an instance
+  # only in a finding: the scope table lists projects, not VMs.
+  - name: a-startup-script-finding-was-filed
     role: objective
     # assert, not converge: the ledger is written once, at `finish`.
     mode: assert
@@ -54,4 +58,11 @@ verification_spec:
       type: ledger_issue_contains
       audit: gce-compute-fleet-audit
       scope: finding_ids
-      required_phrases: ["gce-startup-script-status", "startup-fail"]
+      required_phrases: ["gce-startup-script-status"]
+  - name: the-ledger-names-the-planted-vm
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      required_phrases: ["startup-fail"]
