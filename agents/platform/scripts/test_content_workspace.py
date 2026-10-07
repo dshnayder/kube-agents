@@ -2062,33 +2062,6 @@ class OtherForgeTest(unittest.TestCase):
         self.assertIn("https://github.com/acme/fleet.git", runner.calls[clone][0])
         self.assertEqual([], self.located)
 
-    def test_a_name_no_served_forge_owns_is_refused_and_never_a_url(self):
-        runner = ConfigRecordingRunner()
-        for refused in ("evil.example.com/acme/infra", "https://gitlab.com/acme/infra.git"):
-            with self.subTest(refused=refused):
-                with self.assertRaises(ContentWorkspaceError):
-                    self.store(runner).open(refused)
-        with self.assertRaises(ContentWorkspaceError):
-            self.store(runner, locate=False).open("gitlab.com/acme/platform/infra")
-        self.assertNotIn("clone", runner.subcommands)
-
-    def test_push_carries_the_clones_credential_and_a_github_managed_push_carries_none(self):
-        credential = FakeCredential(self.HELPER)
-        runner = ConfigRecordingRunner({"diff --cached": FakeResult(1)})
-        store = self.store(runner, lambda repo: credential if repo.startswith("gitlab.com/") else None)
-        for repo, expected in (("gitlab.com/acme/platform/infra", self.HELPER), ("acme/fleet", ())):
-            with self.subTest(repo=repo):
-                workspace = store.open(repo)
-                store.commit(
-                    workspace.handle, "platform-agent/change", "feat: a change",
-                    [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
-                )
-                runner.calls.clear()
-                runner.configs.clear()
-                store.push(workspace.handle, "platform-agent/change")
-                push = runner.subcommands.index("push")
-                self.assertEqual(expected, runner.configs[push])
-
 
 class IdleReclaimTest(unittest.TestCase):
     """A dead worker's workspace expires and a live one's does not.

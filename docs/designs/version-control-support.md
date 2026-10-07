@@ -2327,17 +2327,21 @@ What a clone presents follows the forge's credential:
   managed repository rides the write credential the CLI installed in the broker,
   so its clone, fetch and push carry no credential of their own.
 - **GitLab's credential is a stored token, with nothing ambient behind it.** A
-  managed or context repository's clone, fetch and push present it through the
-  forge's credential helper, so the token never enters argv, the environment or
-  the tree. An unregistered repository presents nothing, as on GitHub.
+  managed repository's clone, fetch and push present it through the forge's
+  credential helper, so the token never enters argv, the environment or the tree.
+  The token is asked for again before every fetch and push, so a repository
+  unregistered after `open` stops receiving it. An unregistered repository
+  presents nothing, as on GitHub.
 
-GitLab has no read-only variant of that token here, so **a context repository's
-fetch presents the same token a managed repository's does**. What keeps a context
-repository read-only is the write gate: `commit` and `push` resolve the
-repository's own forge and refuse anything that forge's managed list does not
-hold. A read-only GitLab token for context repositories would close the gap; it
-would be a second Secret and a second `Credential`, and nothing here depends on
-its absence.
+**A context repository never receives the write token.** It gets the forge's
+read-only credential when the forge offers one, and GitLab's stored token has no
+read-only variant here, so a GitLab context repository is cloned with no
+credential. That reads a public project and refuses a private one at the clone,
+with a log line saying why. A read-only GitLab token for context repositories
+would lift that: a second Secret and a second `Credential`, with nothing here
+depending on its absence. The write gate is unchanged: `commit` and `push`
+resolve the repository's own forge and refuse anything that forge's managed list
+does not hold.
 
 ### GitLab errors
 

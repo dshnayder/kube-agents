@@ -7080,6 +7080,144 @@ class VcsRouteTest(unittest.TestCase):
             credential_proxy.build_vcs_broker(overlapping)
 
 
+class ContentWorkspaceOnGitLabTest(unittest.TestCase):
+    """The content workspace end to end on a real two-forge registry: the real
+    locate, the real credential selector, the real token-file credential, and
+    a store recording every git call it makes."""
+
+    TOKEN = "glpat-SENTINEL-must-never-appear"
+
+    def setUp(self):
+        import content_workspace
+        self.cw = content_workspace
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        token = self.base / "token"
+        token.write_text(self.TOKEN)
+        path = self.base / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(token), "allowedPaths": ["acme"]},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            self.registry = credential_proxy.providers.Registry()
+        self.managed = {"gitlab:gitlab.com/acme/infra", "github:github.com/acme/fleet"}
+        self.context = {"gitlab:gitlab.com/acme/notes"}
+        for patcher in (
+            mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry),
+            mock.patch.object(credential_proxy, "managed_repositories", side_effect=lambda: frozenset(self.managed)),
+            mock.patch.object(credential_proxy, "context_repositories", side_effect=lambda: frozenset(self.context)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (self.base / "data").mkdir()
+        self.calls = []
+
+        def runner(argv, cwd, config=()):
+            self.calls.append((list(argv), tuple(config)))
+            result = types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+            if "diff" in argv and "--cached" in argv:
+                result.exit_code = 1
+            return result
+
+        self.store = content_workspace.ContentWorkspaceStore(
+            self.base / "trees", self.base / "data", runner,
+            credential_for=lambda repo: credential_proxy._workspace_credential(self.registry, repo),
+            locate=credential_proxy._workspace_locate,
+        )
+
+    def _config_of(self, subcommand):
+        return [config for argv, config in self.calls if argv[1] == subcommand]
+
+    def _commit(self, handle):
+        self.store.commit(
+            handle, "platform-agent/change", "feat: a change",
+            [self.cw.Change(self.cw.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+        )
+
+    def test_a_managed_gitlab_clone_carries_the_helper_scoped_to_its_host_and_never_the_token(self):
+        workspace = self.store.open("gitlab.com/acme/infra")
+        clone = next(argv for argv, _ in self.calls if argv[1] == "clone")
+        self.assertIn("https://gitlab.com/acme/infra.git", clone)
+        config = dict(self._config_of("clone")[0])
+        self.assertEqual("", config["credential.helper"])
+        self.assertIn("credential.https://gitlab.com.helper", config)
+        self.assertNotIn(self.TOKEN, json.dumps(self.calls))
+        self.assertEqual("gitlab.com/acme/infra", workspace.repo)
+
+    def test_a_context_gitlab_repository_never_gets_the_write_token(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+
+    def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
+        with self.assertRaises(self.cw.ContentWorkspaceError):
+            self.store.open("gitlab.com/other/infra")
+        self.assertEqual([], self._config_of("clone"))
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="gitlab.com/other/infra")
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(store, "h")
+
+    def test_a_forge_the_install_names_but_has_no_credential_for_is_refused(self):
+        path = self.base / "github-only.json"
+        path.write_text(json.dumps({"forges": [{"provider": "github", "host": "github.com"}]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            github_only = credential_proxy.providers.Registry()
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=github_only):
+            for refused in ("gitlab.com/acme/infra", "evil.example.com/acme/infra"):
+                with self.subTest(refused=refused):
+                    with self.assertRaises(self.cw.ContentWorkspaceError):
+                        credential_proxy._workspace_locate(refused)
+
+    def test_a_stored_token_is_withdrawn_when_the_repository_is_unregistered_after_open(self):
+        workspace = self.store.open("gitlab.com/acme/infra")
+        self.managed.discard("gitlab:gitlab.com/acme/infra")
+        self.calls.clear()
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, workspace.handle)
+        self._commit(workspace.handle)
+        self.assertEqual([()], self._config_of("fetch"))
+
+    def test_a_gitlab_push_carries_the_helper_and_a_github_push_carries_nothing(self):
+        gitlab = self.store.open("gitlab.com/acme/infra")
+        self._commit(gitlab.handle)
+        self.calls.clear()
+        self.store.push(gitlab.handle, "platform-agent/change")
+        self.assertIn("credential.https://gitlab.com.helper", dict(self._config_of("push")[0]))
+        github = self.store.open("acme/fleet")
+        self.assertIsInstance(github.credential, credential_proxy.providers.NoCredential)
+        self._commit(github.handle)
+        self.calls.clear()
+        self.store.push(github.handle, "platform-agent/change")
+        self.assertEqual([()], self._config_of("push"))
+
+    def test_a_github_handle_opened_as_context_pushes_on_the_ambient_credential(self):
+        # Review: push carried the read mint's layer, which clears
+        # `credential.helper`, so a repository promoted to managed after `open`
+        # pushed with no credential at all.
+        from providers.credentials import MintedReadCredential
+        import content_workspace
+        mint = MintedReadCredential("github", lambda provider, repo: "ghs_minted", "github.com")
+        store = content_workspace.ContentWorkspaceStore(
+            self.base / "trees2", self.base / "data",
+            lambda argv, cwd, config=(): self.calls.append((list(argv), tuple(config)))
+            or types.SimpleNamespace(exit_code=1 if ("diff" in argv and "--cached" in argv) else 0, stdout="", stderr=""),
+            credential_for=lambda repo: mint,
+        )
+        workspace = store.open("acme/tf-live")
+        store.commit(
+            workspace.handle, "platform-agent/change", "feat: a change",
+            [content_workspace.Change(content_workspace.repo_relative("m.yaml"), b"x\n")],
+        )
+        self.calls.clear()
+        store.push(workspace.handle, "platform-agent/change")
+        self.assertEqual([()], self._config_of("push"))
+
+
 class TwoForgeInstallTest(unittest.TestCase):
     """Review: an install serving GitHub and GitLab has no one forge to default
     to, and the callers that held a bare GitHub name stopped working on it."""
@@ -7124,28 +7262,6 @@ class TwoForgeInstallTest(unittest.TestCase):
             with self.subTest(refused=refused):
                 with self.assertRaises(content_workspace.ContentWorkspaceError):
                     credential_proxy._workspace_locate(refused)
-
-    def test_a_gitlab_clone_presents_the_forges_token_for_managed_and_context_only(self):
-        managed = frozenset({"github:github.com/acme/infra", "gitlab:gitlab.com/acme/infra"})
-        context = frozenset({"gitlab:gitlab.com/acme/notes"})
-        gitlab = next(f for f in self.registry.forges if f.name == "gitlab")
-        with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed), \
-                mock.patch.object(credential_proxy, "context_repositories", return_value=context):
-            for repo, expected in (
-                ("gitlab.com/acme/infra", gitlab.credential),
-                ("gitlab.com/acme/notes", gitlab.credential),
-            ):
-                with self.subTest(repo=repo):
-                    self.assertIs(expected, credential_proxy._workspace_credential(self.registry, repo))
-            self.assertIsInstance(
-                credential_proxy._workspace_credential(self.registry, "gitlab.com/acme/other"),
-                credential_proxy.providers.NoCredential,
-            )
-            # GitHub is unchanged: a managed repository rides the ambient helper.
-            self.assertIsInstance(
-                credential_proxy._workspace_credential(self.registry, "acme/infra"),
-                credential_proxy.providers.NoCredential,
-            )
 
     def test_a_workspace_write_to_a_gitlab_repository_asks_that_forges_list(self):
         import content_workspace

@@ -920,9 +920,14 @@ class ContentWorkspaceStore:
         credential.ensure(repo)
         return credential
 
-    @staticmethod
-    def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
+    def _remote_config(self, workspace: Workspace) -> tuple[tuple[str, str], ...]:
         """The git config a fetch of this workspace carries.
+
+        A stored token -- a forge's long-lived credential, not a mint -- is
+        asked for again rather than reused: the repository may have been
+        unregistered since `open`, and a token presented for the handle's whole
+        lifetime would outlive the role that earned it. What the selector
+        answers now is what is presented, and nothing when it answers nothing.
 
         Made current again first rather than replayed from the clone: the
         clone-time token may have expired over the workspace's lifetime, and a
@@ -935,8 +940,25 @@ class ContentWorkspaceStore:
         """
         if workspace.credential is None:
             return ()
+        if getattr(workspace.credential, "stored_token", False):
+            current = self._credential(workspace.repo)
+            return tuple(current.git_config(workspace.repo)) if current is not None else ()
         workspace.credential.ensure(workspace.repo)
         return tuple(workspace.credential.git_config(workspace.repo))
+
+    def _push_config(self, workspace: Workspace) -> tuple[tuple[str, str], ...]:
+        """The git config a push carries: a stored token's, and nothing else.
+
+        A GitHub repository this install manages pushes on the write credential
+        the GitHub CLI installed in the broker, exactly as it always has, and a
+        GitHub handle opened as context holds a read mint whose layer clears
+        that helper -- carrying it would leave a repository promoted to managed
+        since `open` pushing with no credential at all. Only a stored token,
+        with nothing ambient behind it, is presented on the push.
+        """
+        if not getattr(workspace.credential, "stored_token", False):
+            return ()
+        return self._remote_config(workspace)
 
     def _where(self, repo: object) -> tuple[str, str]:
         """`repo`'s canonical name and the URL its clone is made from.
@@ -1700,7 +1722,7 @@ class ContentWorkspaceStore:
                 workspace,
                 ["push", "--force-with-lease", "origin", branch],
                 check=False,
-                config=self._remote_config(workspace),
+                config=self._push_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
                 stderr = (getattr(result, "stderr", "") or "").lower()

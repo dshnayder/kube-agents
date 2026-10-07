@@ -14323,8 +14323,14 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
                     )
         self.assertEqual(["gitlab.com/acme/infra", "acme/fleet"], opened)
 
-    def test_content_mode_refuses_no_remediation_for_its_forge(self):
-        self.assertEqual("", audit_report.remediation_refusal("gitlab.com/acme/infra"))
+    def test_content_mode_refuses_only_a_host_no_managed_entry_names(self):
+        managed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        with patch("gitops_workspace.get_managed_repos", return_value=managed):
+            self.assertEqual("", audit_report.remediation_refusal("gitlab.com/acme/infra"))
+            self.assertEqual("", audit_report.remediation_refusal("acme/fleet"))
+            refusal = audit_report.remediation_refusal("gitlab.example.com/acme/infra")
+        self.assertIn("not a forge this install serves", refusal)
+        self.assertIn("a retry will not change this", refusal)
 
 
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):

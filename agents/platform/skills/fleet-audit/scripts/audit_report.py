@@ -14727,6 +14727,36 @@ def _remediation_outcomes(
     return outcomes
 
 
+def _unserved_host_refusal(repo: str, host: str) -> str:
+    """Why content mode cannot publish to `repo`'s host, or "".
+
+    The broker's file workspace clones from any forge the install serves, and
+    the managed list is the sandbox's view of which those are: a non-GitHub
+    host no managed entry names is one the broker would refuse at the open, a
+    failure the person who asked would read as a broken run. Said up front
+    instead. A list that cannot be read refuses nothing here; the broker still
+    refuses an unserved host itself.
+    """
+    import gitops_workspace
+
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return ""
+    try:
+        served = {
+            gitops_workspace.split_host(entry)[0]
+            for entry in gitops_workspace.get_managed_repos()
+        }
+    except Exception:  # noqa: BLE001 - advisory; the broker is the gate
+        return ""
+    if host in served:
+        return ""
+    return (
+        f"{repo} is on {host}, which is not a forge this install serves -- no "
+        "managed repository names it -- so a retry will not change this. The "
+        "findings stay on the ledger."
+    )
+
+
 def remediation_refusal(repo: str) -> str:
     """Why no remediation proposal can be published to `repo`, or "".
 
@@ -14739,9 +14769,9 @@ def remediation_refusal(repo: str) -> str:
     """
     import gitops_workspace
 
-    if content_mode():
-        return ""
     host, _ = gitops_workspace.split_host(repo)
+    if content_mode():
+        return _unserved_host_refusal(repo, host)
     if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
         return ""
     return (
