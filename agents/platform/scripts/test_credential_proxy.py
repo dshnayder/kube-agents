@@ -7173,6 +7173,23 @@ class TwoForgeInstallTest(unittest.TestCase):
         self.assertEqual([("github", "acme/infra")], calls)
         self.assertEqual(HTTPStatus.OK, replies[-1][0])
 
+    def test_the_lift_reads_hostless_as_the_parser_does_and_needs_one_forge(self):
+        # Review (#2439): `_hosted` counted slashes, and took the first forge
+        # carrying the provider.
+        self.assertEqual("https://github.com/acme/infra", credential_proxy._hosted("acme/infra.git", "github"))
+        self.assertEqual("github.com/acme", credential_proxy._hosted("github.com/acme", "github"))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+            {"provider": "gitlab", "host": "gitlab.example.com", "tokenPath": "/u", "allowedPaths": []},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            two = credential_proxy.providers.Registry()
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=two):
+            self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "gitlab"))
+
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
