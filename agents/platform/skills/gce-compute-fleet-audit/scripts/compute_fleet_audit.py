@@ -202,7 +202,7 @@ SNAPSHOT_SLUG = "orphaned-snapshots"
 # printed `startup-script exit status 1` and a closing `Finished running
 # startup scripts with error`. Any non-zero status is a failure, not only 1.
 STARTUP_FAILURE_PATTERN = re.compile(
-    r'Script "startup-script(?:-url)?" failed with error'
+    r'Script "(?:windows-)?startup-script(?:-[a-z0-9]+)?" failed with error'
     r"|startup-script(?:-url)? exit status [1-9]\d*"
     r"|Finished running startup scripts with error"
 )
@@ -300,7 +300,16 @@ NO_RUNNING_INSTANCES_REASON = (
 # script only when one of these is set on the instance or in the project's
 # common metadata, and only then does it log any of the failure lines §2.1
 # matches on. Neither set anywhere means none of them can appear.
-STARTUP_SCRIPT_KEYS = ("startup-script", "startup-script-url")
+# The Linux keys and the Windows ones (`windows-startup-script-ps1`, `-cmd`,
+# `-bat`, `-url`); the guest agent runs whichever the instance sets.
+STARTUP_SCRIPT_KEYS = (
+    "startup-script",
+    "startup-script-url",
+    "windows-startup-script-ps1",
+    "windows-startup-script-cmd",
+    "windows-startup-script-bat",
+    "windows-startup-script-url",
+)
 # The third structural case for §2.1, and the one that hides best: the
 # instances are there, they are RUNNING, their consoles read fine — and not one
 # of them runs a startup script, so the marker the check greps for cannot occur
@@ -320,9 +329,9 @@ STARTUP_SCRIPT_KEYS = ("startup-script", "startup-script-url")
 # whether to trust a `not applicable` on this slug.
 NO_STARTUP_SCRIPT_REASON = (
     "No Compute Engine instance on this project runs a startup script: none of "
-    "the {total} RUNNING instance(s) visible to the audit identity carries "
-    "`startup-script` or `startup-script-url` in its metadata and the project's "
-    "common metadata sets neither, so `google_metadata_script_runner` never "
+    "the {total} RUNNING instance(s) visible to the audit identity carries a "
+    "startup-script key (Linux or Windows) in its metadata and the project's "
+    "common metadata sets none, so `google_metadata_script_runner` never "
     "runs and the exit status §2.1 matches on cannot appear in any console. "
     "Structural, not a missed read. A GKE Standard node pool is the ordinary "
     "way to reach this branch: its nodes bootstrap from `user-data` and "

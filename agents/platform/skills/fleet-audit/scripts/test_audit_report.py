@@ -17914,14 +17914,23 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_waste
         import patch_readiness
 
+        # The GCE stream's collector ships in its own skill, beside its SOP.
+        spec = importlib.util.spec_from_file_location(
+            "compute_fleet_audit",
+            Path(__file__).resolve().parents[2] / "gce-compute-fleet-audit" / "scripts" / "compute_fleet_audit.py",
+        )
+        compute_fleet_audit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compute_fleet_audit)
+
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+            compute_fleet_audit.AUDIT_ID,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
 
     def test_streams_with_no_collector_are_not_held_to_it(self):
-        for audit in ("gce-compute-fleet-audit", "gcp-networking-fabric-audit"):
+        for audit in ("gcp-networking-fabric-audit",):
             with self.subTest(audit=audit):
                 self.assertIn(audit, audit_report.AUDITS)
                 self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)

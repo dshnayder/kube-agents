@@ -686,9 +686,11 @@ resource "google_compute_disk" "orphan_pd" {
 # The script exits 1 on every boot, so the line is on the console from the
 # first boot onward, with no age gate. The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
-# account: the VM does nothing but fail.
+# account: the VM does nothing but fail. The name leads with `startup-fail-`
+# so the case can grade `/startup-fail-`, which only the finding's object path
+# (`ComputeInstance/<zone>/<name>`) carries; a command names it after a space.
 resource "google_compute_instance" "startup_fail" {
-  name         = "${var.cluster_prefix}-startup-fail"
+  name         = "startup-fail-${var.cluster_prefix}"
   machine_type = "e2-micro"
   zone         = var.zone
 

@@ -176,6 +176,10 @@ class StartupScriptTest(unittest.TestCase):
         failing_again = serial + 'google_metadata_script_runner[812]: Script "startup-script" failed with error: exit status 2\n'
         self.assertIsNotNone(cf.check_startup_script("vm-1", "us-central1-a", failing_again))
 
+    def test_a_windows_startup_script_failure_is_flagged(self):
+        line = 'GCEMetadataScripts: Script "windows-startup-script-ps1" failed with error: exit status 1'
+        self.assertIsNotNone(cf.check_startup_script("win-1", "us-central1-a", line + "\n"))
+
     def test_a_clean_boot_is_not_flagged(self):
         for text in (
             "startup-script exit status 0",
