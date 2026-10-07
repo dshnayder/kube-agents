@@ -622,6 +622,11 @@ GitRunner = Callable[..., object]
 # repository registration, which is the property `require_managed_workspace`
 # in the broker relies on.
 CredentialFor = Callable[[str], object]
+#: A repository on another forge, to its canonical name and the clone URL its
+#: forge composes -- or a `ContentWorkspaceError` when no forge this install
+#: serves owns it. Injected rather than imported, so this module never learns
+#: what a forge is and stays testable without one.
+Locate = Callable[[str], "tuple[str, str]"]
 
 
 class ContentWorkspaceStore:
@@ -647,6 +652,7 @@ class ContentWorkspaceStore:
         base_branch: str = "",
         credential_for: CredentialFor | None = None,
         clock: Callable[[], float] = time.monotonic,
+        locate: Locate | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -675,6 +681,7 @@ class ContentWorkspaceStore:
             or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
         )
         self._credential_for = credential_for
+        self._locate = locate
         # Monotonic, and injected so a test can drive the idle clock.
         self._clock = clock
         self._workspaces: dict[str, Workspace] = {}
@@ -931,6 +938,24 @@ class ContentWorkspaceStore:
         workspace.credential.ensure(workspace.repo)
         return tuple(workspace.credential.git_config(workspace.repo))
 
+    def _where(self, repo: object) -> tuple[str, str]:
+        """`repo`'s canonical name and the URL its clone is made from.
+
+        A bare `owner/name` is GitHub's, as it has always been, and its URL is
+        composed here. Anything else is handed to `locate`, which answers for
+        the forges this install serves: the forge parses the name -- nesting,
+        allowed paths -- and composes the URL. With no `locate`, or a name no
+        served forge owns, the open is refused: the caller names a repository,
+        never a host or a URL.
+        """
+        if isinstance(repo, str) and is_owner_name(repo):
+            return repo, f"https://github.com/{repo}.git"
+        if self._locate is not None and isinstance(repo, str) and repo.strip():
+            return self._locate(repo)
+        raise ContentWorkspaceError(
+            "repo must be owner/name, or a repository on a forge this install serves"
+        )
+
     # -- lifecycle -------------------------------------------------------
 
     def open(
@@ -964,8 +989,7 @@ class ContentWorkspaceStore:
         branch exists on the remote and would answer from the base instead
         while reporting that it had looked.
         """
-        if not isinstance(repo, str) or not is_owner_name(repo):
-            raise ContentWorkspaceError("repo must be owner/name")
+        repo, url = self._where(repo)
         depth = check_depth(depth)
         if depth is not None and branch is not None:
             raise ContentWorkspaceError(
@@ -1018,7 +1042,6 @@ class ContentWorkspaceStore:
             handle = os.urandom(16).hex()
             tree = self.tree_root / handle
             tree.mkdir(parents=True, exist_ok=False)
-            url = f"https://github.com/{repo}.git"
             # Which credential, if any, this clone presents is decided by the
             # broker from the repository's registered role: a read-only token
             # for a context repository, nothing added for anything else. It is
@@ -1026,8 +1049,9 @@ class ContentWorkspaceStore:
             # other git this store runs -- everything else is local.
             credential = self._credential(repo)
             remote_config = tuple(credential.git_config(repo)) if credential else ()
-            # The URL is composed here from a validated `owner/name`, never taken
-            # from the caller: a caller-supplied URL is `url.<host>.insteadOf` by
+            # The URL was composed by `_where` -- from a validated `owner/name`,
+            # or by the forge that owns the repository -- and never taken from
+            # the caller: a caller-supplied URL is `url.<host>.insteadOf` by
             # another route, and the whole point of this module is that the agent
             # does not choose where the credentials go.
             # Everything from here to the registration is undone on failure. The
@@ -1667,10 +1691,16 @@ class ContentWorkspaceStore:
                 raise ContentWorkspaceError(
                     f"nothing has been committed on '{branch}' in this workspace"
                 )
+            # The clone's own credential, made current: nothing for a GitHub
+            # repository this install manages, which pushes on the write
+            # credential the GitHub CLI installed in the broker, as it always
+            # has; the forge's token helper for a repository on a forge whose
+            # credential is a stored token, since nothing ambient answers there.
             result = self._git(
                 workspace,
                 ["push", "--force-with-lease", "origin", branch],
                 check=False,
+                config=self._remote_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
                 stderr = (getattr(result, "stderr", "") or "").lower()

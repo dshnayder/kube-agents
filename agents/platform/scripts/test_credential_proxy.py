@@ -7109,6 +7109,58 @@ class TwoForgeInstallTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    def test_the_workspace_locates_a_host_qualified_repository_through_its_forge(self):
+        self.assertEqual(
+            ("gitlab.com/acme/infra", "https://gitlab.com/acme/infra.git"),
+            credential_proxy._workspace_locate("gitlab.com/acme/infra"),
+        )
+        # GitHub's comes back as the bare name the store keys it by.
+        self.assertEqual(
+            ("acme/infra", "https://github.com/acme/infra.git"),
+            credential_proxy._workspace_locate("github.com/acme/infra"),
+        )
+        import content_workspace
+        for refused in ("evil.example.com/acme/infra", "bitbucket.org/acme/infra"):
+            with self.subTest(refused=refused):
+                with self.assertRaises(content_workspace.ContentWorkspaceError):
+                    credential_proxy._workspace_locate(refused)
+
+    def test_a_gitlab_clone_presents_the_forges_token_for_managed_and_context_only(self):
+        managed = frozenset({"github:github.com/acme/infra", "gitlab:gitlab.com/acme/infra"})
+        context = frozenset({"gitlab:gitlab.com/acme/notes"})
+        gitlab = next(f for f in self.registry.forges if f.name == "gitlab")
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed), \
+                mock.patch.object(credential_proxy, "context_repositories", return_value=context):
+            for repo, expected in (
+                ("gitlab.com/acme/infra", gitlab.credential),
+                ("gitlab.com/acme/notes", gitlab.credential),
+            ):
+                with self.subTest(repo=repo):
+                    self.assertIs(expected, credential_proxy._workspace_credential(self.registry, repo))
+            self.assertIsInstance(
+                credential_proxy._workspace_credential(self.registry, "gitlab.com/acme/other"),
+                credential_proxy.providers.NoCredential,
+            )
+            # GitHub is unchanged: a managed repository rides the ambient helper.
+            self.assertIsInstance(
+                credential_proxy._workspace_credential(self.registry, "acme/infra"),
+                credential_proxy.providers.NoCredential,
+            )
+
+    def test_a_workspace_write_to_a_gitlab_repository_asks_that_forges_list(self):
+        import content_workspace
+        store = mock.Mock()
+        managed = frozenset({"gitlab:gitlab.com/acme/infra"})
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed):
+            store.get.return_value = mock.Mock(repo="gitlab.com/acme/infra")
+            credential_proxy.require_managed_workspace(store, "h")
+            store.get.return_value = mock.Mock(repo="gitlab.com/acme/other")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
+            store.get.return_value = mock.Mock(repo="evil.example.com/acme/infra")
+            with self.assertRaises(content_workspace.RepositoryNotManaged):
+                credential_proxy.require_managed_workspace(store, "h")
+
     def test_a_workspace_write_to_a_managed_github_repository_still_passes(self):
         store = mock.Mock()
         store.get.return_value = mock.Mock(repo="acme/infra")
@@ -7362,6 +7414,15 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler.workspaces = store
         handler._workspace_route(route, payload)
         return store
+
+    def test_open_passes_a_host_qualified_name_to_the_store_and_still_refuses_a_bad_slug(self):
+        import content_workspace
+        store = self._route("open", {"repo": "gitlab.com/acme/platform/infra"})
+        store.open.assert_called_once_with("gitlab.com/acme/platform/infra", None, None, None, caller=None)
+        for bad in ("acme/..", "", None, 7):
+            with self.subTest(bad=bad):
+                with self.assertRaises(content_workspace.ContentWorkspaceError):
+                    self._route("open", {"repo": bad})
 
     def test_open_hands_the_caller_label_to_the_store(self):
         store = self._route("open", {"repo": "acme/fleet", "caller": "t_f660e9c5"})

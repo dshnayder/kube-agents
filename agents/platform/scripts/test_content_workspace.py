@@ -2012,6 +2012,84 @@ class CloneCredentialTest(unittest.TestCase):
         self.assertEqual([], list(store.tree_root.iterdir()))
 
 
+class OtherForgeTest(unittest.TestCase):
+    """A repository on another forge: cloned from the URL its forge composes."""
+
+    HELPER = (
+        ("credential.helper", ""),
+        ("credential.https://gitlab.com.helper", "/opt/helper /var/run/token oauth2"),
+    )
+    URL = "https://gitlab.com/acme/platform/infra.git"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.located = []
+
+    def locate(self, repo):
+        self.located.append(repo)
+        if repo.startswith("gitlab.com/"):
+            return repo, self.URL
+        raise ContentWorkspaceError(f"{repo} is not a repository on a forge this install serves")
+
+    def store(self, runner, credential_for=None, locate=True):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner, credential_for=credential_for,
+            locate=self.locate if locate else None,
+        )
+
+    def test_a_host_qualified_repository_clones_from_its_forges_url_with_its_credential(self):
+        credential = FakeCredential(self.HELPER)
+        asked = []
+        runner = ConfigRecordingRunner()
+        store = self.store(runner, lambda repo: asked.append(repo) or credential)
+        workspace = store.open("gitlab.com/acme/platform/infra")
+        clone = runner.subcommands.index("clone")
+        self.assertIn(self.URL, runner.calls[clone][0])
+        self.assertNotIn("github.com", " ".join(runner.calls[clone][0]))
+        self.assertEqual(self.HELPER, runner.configs[clone])
+        self.assertEqual(["gitlab.com/acme/platform/infra"], asked)
+        self.assertEqual("gitlab.com/acme/platform/infra", workspace.repo)
+
+    def test_a_bare_name_is_still_githubs_and_never_asks_the_locator(self):
+        runner = ConfigRecordingRunner()
+        store = self.store(runner)
+        store.open("acme/fleet")
+        clone = runner.subcommands.index("clone")
+        self.assertIn("https://github.com/acme/fleet.git", runner.calls[clone][0])
+        self.assertEqual([], self.located)
+
+    def test_a_name_no_served_forge_owns_is_refused_and_never_a_url(self):
+        runner = ConfigRecordingRunner()
+        for refused in ("evil.example.com/acme/infra", "https://gitlab.com/acme/infra.git"):
+            with self.subTest(refused=refused):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store(runner).open(refused)
+        with self.assertRaises(ContentWorkspaceError):
+            self.store(runner, locate=False).open("gitlab.com/acme/platform/infra")
+        self.assertNotIn("clone", runner.subcommands)
+
+    def test_push_carries_the_clones_credential_and_a_github_managed_push_carries_none(self):
+        credential = FakeCredential(self.HELPER)
+        runner = ConfigRecordingRunner({"diff --cached": FakeResult(1)})
+        store = self.store(runner, lambda repo: credential if repo.startswith("gitlab.com/") else None)
+        for repo, expected in (("gitlab.com/acme/platform/infra", self.HELPER), ("acme/fleet", ())):
+            with self.subTest(repo=repo):
+                workspace = store.open(repo)
+                store.commit(
+                    workspace.handle, "platform-agent/change", "feat: a change",
+                    [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+                )
+                runner.calls.clear()
+                runner.configs.clear()
+                store.push(workspace.handle, "platform-agent/change")
+                push = runner.subcommands.index("push")
+                self.assertEqual(expected, runner.configs[push])
+
+
 class IdleReclaimTest(unittest.TestCase):
     """A dead worker's workspace expires and a live one's does not.
 
