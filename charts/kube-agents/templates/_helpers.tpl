@@ -660,7 +660,8 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
-{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$" $host)) (not (contains "." $host)) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
+{{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
 {{- end -}}
 {{- if not $secret -}}
@@ -683,6 +684,17 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if and (eq $provider "gitlab") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitLab group path" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace -}}
+{{- /* As the operator: GitLab refuses a segment ending in .git or .atom, and the broker would read such a prefix with the suffix trimmed. */ -}}
+{{- if regexMatch "(?i)\\.(git|atom)(/|$)" $namespace -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q; a GitLab group segment may not end in .git or .atom" $i $namespace) -}}
+{{- end -}}
+{{- /* A first segment that is a forge host is a host, not a group: the operator refuses it, so the chart does, naming the values key. */ -}}
+{{- $first := lower (first (splitList "/" $namespace)) -}}
+{{- if or (has $first (list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com")) (eq $first (lower ($host | default "gitlab.com"))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which starts with the forge host %q; name the group alone" $i $namespace $first) -}}
+{{- end -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}

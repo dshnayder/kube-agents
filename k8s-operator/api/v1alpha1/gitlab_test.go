@@ -124,7 +124,10 @@ func TestASelfManagedHostIsTheForgesOwnAndNeverRewritesAnother(t *testing.T) {
 	if _, err := provider.Resolve("", "https://gitlab.example.com/acme/infra", ""); err == nil {
 		t.Error("a gitlab.com forge accepted a self-managed instance's repository")
 	}
-	for _, bad := range []string{"localhost", "gitlab_example.com", "-gitlab.example.com"} {
+	// Review round 4: the regex had no label structure, so an empty or
+	// dash-edged label passed and reached the egress policy and the broker.
+	for _, bad := range []string{"localhost", "gitlab_example.com", "-gitlab.example.com",
+		"gitlab..example.com", "gitlab.-x.com", "gitlab.x-.com"} {
 		if err := provider.ValidateHost(bad); err == nil {
 			t.Errorf("ValidateHost(%q) accepted something that is not a hostname", bad)
 		}
@@ -380,7 +383,7 @@ func TestAForgeHostIsNeverAGitLabGroup(t *testing.T) {
 	provider := gitlabProvider(t)
 	for _, tc := range []struct{ host, repository, namespace string }{
 		{"", "github.com/acme/infra", ""},
-		{"", "gitlab.com/acme/infra", "x"}, // lifted as the forge's own host; accepted
+		{"", "gitlab.com/acme/infra", "x"},                          // lifted as the forge's own host; accepted
 		{"gitlab.example.com", "gitlab.example.com/acme/infra", ""}, // lifted, accepted
 		{"gitlab.example.com", "gitlab.com/acme/infra", ""},
 		{"", "proj", "gitlab.com/acme"},
@@ -464,5 +467,25 @@ func TestShadowingDoesNotFreeADuplicate(t *testing.T) {
 	resolved, _ := in.ResolveGit()
 	if got := resolved.Accepted(RepositoryRoleManaged); len(got) != 0 {
 		t.Errorf("a repository the claims measured as a duplicate was accepted: %+v", got)
+	}
+}
+
+func TestAGitLabNamespaceSegmentMayNotEndInAReservedSuffix(t *testing.T) {
+	// Review round 4: GitLab refuses a path ending in .git or .atom, and the
+	// broker trims a trailing .git off an allowedPaths entry, so a namespace
+	// the operator accepted named a different group in the broker.
+	provider := gitlabProvider(t)
+	for _, bad := range []string{"acme.git", "acme/infra.git", "acme.atom/infra", "acme/INFRA.GIT"} {
+		if err := provider.ValidateNamespace(bad); err == nil {
+			t.Errorf("ValidateNamespace(%q) accepted a reserved suffix", bad)
+		}
+		if _, err := provider.Resolve("", "proj", bad); err == nil {
+			t.Errorf("Resolve(proj, namespace %q) accepted a reserved suffix", bad)
+		}
+	}
+	for _, ok := range []string{"acme", "acme/git-tools", "acme/infra.gitops"} {
+		if err := provider.ValidateNamespace(ok); err != nil {
+			t.Errorf("ValidateNamespace(%q) refused a valid group: %v", ok, err)
+		}
 	}
 }

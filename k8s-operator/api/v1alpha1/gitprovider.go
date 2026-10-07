@@ -40,6 +40,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -123,6 +125,11 @@ type GitProvider struct {
 	// provider serves is still refused, and a repository on such a forge must
 	// name the declared host or none -- see Resolve.
 	SelfManaged bool
+	// ReservedSegmentSuffixes are endings the forge refuses on a group or
+	// project path segment. GitLab refuses `.git` and `.atom`; a namespace
+	// segment ending in one would be read by the broker with the clone
+	// suffix trimmed, so the two would disagree on what the token may reach.
+	ReservedSegmentSuffixes []string
 	// NeedsCredentials is a forge whose credential an administrator supplies
 	// in the Secret credentialsRef names, rather than one the install mints.
 	// A forge of this provider without credentialsRef is refused: the broker
@@ -159,8 +166,9 @@ var gitProviders = map[string]*GitProvider{
 		// The API and clones are gitlab.com itself; registry and pages
 		// content sit under the wildcard. A self-managed host is added as a
 		// literal by EgressPatterns.
-		Egress:           []string{"gitlab.com", "*.gitlab.com"},
-		SelfManaged:      true,
+		Egress:                  []string{"gitlab.com", "*.gitlab.com"},
+		SelfManaged:             true,
+		ReservedSegmentSuffixes: []string{".git", ".atom"},
 		NeedsCredentials: true,
 	},
 }
@@ -222,7 +230,10 @@ func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) e
 			return fmt.Errorf("host %q is a %s host, not a %s one", host, other.Name, p.Name)
 		}
 	}
-	if !gitHostRegex.MatchString(trimmed) || !strings.Contains(trimmed, ".") {
+	// A DNS subdomain label by label, and at least two labels: the regex this
+	// replaced admitted `gitlab..example.com` and `gitlab.-x.com`, which then
+	// reached the egress policy and the broker as a host nothing resolves.
+	if len(validation.IsDNS1123Subdomain(trimmed)) > 0 || !strings.Contains(trimmed, ".") {
 		return fmt.Errorf("host %q is not a hostname", host)
 	}
 	return nil
@@ -245,10 +256,6 @@ func (p *GitProvider) serves(host string) bool {
 	}
 	return false
 }
-
-// gitHostRegex is a DNS name: what the CRD's own pattern on ForgeSpec.Host
-// admits, repeated here so a spec built in Go is held to it too.
-var gitHostRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
 
 // canonicalHost is the host a repository on a forge declared at host
 // resolves to: a spelling of one of this provider's hosts folds to
@@ -321,6 +328,13 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 	}
 	if !p.NamespacePattern.MatchString(trimmed) {
 		return fmt.Errorf("invalid %s namespace %q", p.Name, trimmed)
+	}
+	for _, segment := range strings.Split(trimmed, pathSeparator) {
+		for _, suffix := range p.ReservedSegmentSuffixes {
+			if strings.HasSuffix(lowerASCII(segment), suffix) {
+				return fmt.Errorf("invalid %s namespace %q: a segment may not end in %q", p.Name, trimmed, suffix)
+			}
+		}
 	}
 	return nil
 }

@@ -1422,7 +1422,7 @@ type ForgeSpec struct {
 	// than only in the webhook so the API server still refuses whitespace and
 	// control characters when the operator runs with ENABLE_WEBHOOKS=false.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`
 	// +optional
 	Host string `json:"host,omitempty"`
 

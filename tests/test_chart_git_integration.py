@@ -548,6 +548,18 @@ class ChartGitIntegrationTest(unittest.TestCase):
             ("github api host", (*_forge(0, name="gl", provider="gitlab", host="api.github.com"), secret), "host"),
             ("githubusercontent", (*_forge(0, name="gl", provider="gitlab", host="raw.githubusercontent.com"), secret), "host"),
             ("long group", (*_forge(0, name="gl", provider="gitlab", namespace="a" * 256), secret), "namespace"),
+            # Bot review round 4: a dash-edged or empty label passed the
+            # chart's regex; the operator's DNS-subdomain check refuses it.
+            ("empty label", (*_forge(0, name="gl", provider="gitlab", host="gitlab..example.com"), secret), "host"),
+            ("dash-edged label", (*_forge(0, name="gl", provider="gitlab", host="gitlab.x-.com"), secret), "host"),
+            # A forge host as the first group segment, and a reserved suffix.
+            ("host as group", (*_forge(0, name="gl", provider="gitlab", namespace="gitlab.com"), secret), "namespace"),
+            ("host as group prefix", (*_forge(0, name="gl", provider="gitlab", namespace="gitlab.com/acme"), secret), "namespace"),
+            ("github host as group", (*_forge(0, name="gl", provider="gitlab", namespace="github.com/acme"), secret), "namespace"),
+            ("own host as group", (*_forge(0, name="gl", provider="gitlab", host="gitlab.example.com",
+                                          namespace="gitlab.example.com/team"), secret), "namespace"),
+            (".git segment", (*_forge(0, name="gl", provider="gitlab", namespace="acme/infra.git"), secret), "namespace"),
+            (".atom segment", (*_forge(0, name="gl", provider="gitlab", namespace="acme.atom"), secret), "namespace"),
             ("second forge at a host", (
                 *_forge(0, name="gl", provider="gitlab"), secret,
                 *_forge(1, name="gl2", provider="gitlab", host="www.gitlab.com"),

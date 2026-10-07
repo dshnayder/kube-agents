@@ -9628,7 +9628,7 @@ spec:
                               than only in the webhook so the API server still refuses whitespace and
                               control characters when the operator runs with ENABLE_WEBHOOKS=false.
                             maxLength: 253
-                            pattern: ^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$
+                            pattern: ^$|^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$
                             type: string
                           name:
                             description: |-
