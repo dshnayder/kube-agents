@@ -14752,8 +14752,7 @@ def _unserved_host_refusal(repo: str, host: str) -> str:
         return ""
     return (
         f"{repo} is on {host}, which is not a forge this install serves -- no "
-        "managed repository names it -- so a retry will not change this. The "
-        "findings stay on the ledger."
+        "managed repository names it -- so a retry will not change this."
     )
 
 
@@ -14763,9 +14762,9 @@ def remediation_refusal(repo: str) -> str:
     In content mode the broker's file workspace clones from the repository's
     own forge, so every forge gets its proposal. In directory mode the local
     clone rides the credential the GitHub CLI installed and reaches GitHub
-    only, so a repository on another forge gets its ledger and no proposal.
-    Said in the `/remediate` reply, because the person who asked reads that,
-    not the log.
+    only; `start` and `finish` stop at that clone for a repository on another
+    forge, so this answer is for a direct `remediate` call there. Said in the
+    reply, because the person who asked reads that, not the log.
     """
     import gitops_workspace
 
@@ -14777,7 +14776,7 @@ def remediation_refusal(repo: str) -> str:
     return (
         f"{repo} is on {host}, and this run is in directory mode, whose local "
         "clone reaches GitHub only, so a retry will not change this. Content "
-        "mode publishes to every forge. The findings stay on the ledger."
+        "mode publishes to every forge."
     )
 
 
@@ -14801,6 +14800,10 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # dry run would preview a body no run sends -- with or without `--repo`,
     # since without it the dry run still resolves the repository it previews.
     refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
+    # failed read falls back to "pull request", so a lookup per group could
+    # preview one group as a merge request and the next as a pull request.
+    dry_noun = _proposal_noun(refusal_repo) if args.dry_run else ""
     refusal = remediation_refusal(refusal_repo) if refusal_repo else ""
     if refusal:
         raise ValidationError(refusal)
@@ -14906,7 +14909,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
                     group,
                     issue_number=args.issue,
                     generated_at=now,
-                    noun=_proposal_noun(_dry_run_repo(audit_id, opt_repo)),
+                    noun=dry_noun,
                 )
             )
         return

@@ -189,9 +189,9 @@ administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as
 gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
 (`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
 from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
-work the same way on every forge, and a remediation on GitLab is a merge request. In directory mode
-the local clone reaches GitHub only, so a repository on another forge gets its ledger and no
-remediation. It
+work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
+serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
+elsewhere stop at the clone, with no ledger written. Run the audit in content mode for those. It
 creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 

@@ -2063,6 +2063,19 @@ class OtherForgeTest(unittest.TestCase):
         self.assertEqual([], self.located)
 
 
+    def test_a_host_and_one_segment_is_not_a_slug_and_is_never_cloned_from_github(self):
+        # Review (#2549): `github.com/acme` passed the two-part check and was
+        # cloned from https://github.com/github.com/acme.git on the ambient
+        # credential. A GitHub owner never has a dot; a host always does.
+        for name in ("github.com/acme", "github.com/acme.git", "gitlab.com/acme"):
+            with self.subTest(name=name):
+                runner = ConfigRecordingRunner()
+                store = self.store(runner, locate=False)
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open(name)
+                self.assertNotIn("clone", runner.subcommands)
+
+
 class IdleReclaimTest(unittest.TestCase):
     """A dead worker's workspace expires and a live one's does not.
 

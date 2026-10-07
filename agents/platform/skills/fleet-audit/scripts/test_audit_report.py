@@ -11625,6 +11625,20 @@ class TestRemediateSubcommand(HarnessTestCase):
         # make — so it says why the link is missing instead of just omitting it.
         self.assertIn("the 'Part of #N' link is omitted", self.err)
 
+    def test_dry_run_resolves_the_repository_and_noun_once_for_all_groups(self):
+        # Review (#2549): each group re-read the repository and the noun.
+        calls = []
+        real = audit_report._proposal_noun
+        self.patch_attr("_proposal_noun", lambda repo: calls.append(repo) or real(repo))
+        doc = make_doc(findings=[
+            make_finding(fid="a", remediation={"kind": "manifest", "path": "a.yaml", "note": "x"}),
+            make_finding(fid="b", remediation={"kind": "manifest", "path": "b.yaml", "note": "y"}),
+        ])
+        rc = self.run_remediate(doc, [derived_id(fid="a"), derived_id(fid="b")], ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(2, self.err.count("WOULD OPEN:"), self.err)
+        self.assertEqual(1, len(calls), calls)
+
     def test_dry_run_links_the_ledger_when_it_is_named(self):
         self.run_remediate(make_doc(), [derived_id()], ["--dry-run", "--issue", "42"])
         self.assertIn("Part of #42", self.out)

@@ -970,7 +970,7 @@ class ContentWorkspaceStore:
         served forge owns, the open is refused: the caller names a repository,
         never a host or a URL.
         """
-        if isinstance(repo, str) and is_owner_name(repo):
+        if isinstance(repo, str) and is_bare_github_name(repo):
             return repo, f"https://github.com/{repo}.git"
         if self._locate is not None and isinstance(repo, str) and repo.strip():
             return self._locate(repo)
@@ -1065,10 +1065,12 @@ class ContentWorkspaceStore:
             tree = self.tree_root / handle
             tree.mkdir(parents=True, exist_ok=False)
             # Which credential, if any, this clone presents is decided by the
-            # broker from the repository's registered role: a read-only token
-            # for a context repository, nothing added for anything else. It is
-            # applied to this clone and to the fetch in `commit`, and to no
-            # other git this store runs -- everything else is local.
+            # broker from the repository's registered role and forge: a
+            # read-only token for a context repository, a stored token for a
+            # managed one on a forge that has no ambient helper, nothing added
+            # for anything else. It is applied to this clone, to the fetch in
+            # `commit` and, for a stored token, to `push` -- and to no other git
+            # this store runs; everything else is local.
             credential = self._credential(repo)
             remote_config = tuple(credential.git_config(repo)) if credential else ()
             # The URL was composed by `_where` -- from a validated `owner/name`,
@@ -1752,6 +1754,18 @@ def is_owner_name(value: str) -> bool:
     if len(parts) != 2:
         return False
     return all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", part) and part not in (".", "..") for part in parts)
+
+
+def is_bare_github_name(value: str) -> bool:
+    """A bare GitHub `owner/name`: `is_owner_name`, with no dot in the owner.
+
+    A GitHub owner never carries a dot and a host always does, so this is what
+    tells `github.com/acme` -- a host and one segment, which no forge serves --
+    from a slug. Read as a slug it would be cloned from
+    `https://github.com/github.com/acme.git` on the ambient credential; read as
+    a host-qualified name it goes to the forge locator, which refuses it.
+    """
+    return is_owner_name(value) and "." not in value.split("/", 1)[0]
 
 
 def _remove_tree(path: Path) -> int:

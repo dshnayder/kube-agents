@@ -1047,13 +1047,19 @@ def _provider_forge(provider: str) -> providers.Forge:
 
 
 def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The credential the broker's own clone of ``repository`` presents.
+    """The credential the broker's clone, fetch or push of ``repository`` presents.
 
-    A context repository gets the forge's read-only credential; anything else
-    gets none, and that "none" is not the same thing for the two remaining
-    roles. A managed repository rides the ambient write credential the CLI
-    installed, as it always has, so the broker adds nothing. An unregistered
-    one is a public upstream read with no credential at all, as it always was.
+    Asked at `open`, and again before every fetch and push of a handle whose
+    credential is a stored token, so a repository unregistered meanwhile stops
+    getting it. By role:
+
+    - managed: on a forge whose credential is a token an administrator stored
+      (GitLab), that token, through the forge's helper; on GitHub, nothing --
+      the clone and push ride the ambient write credential the CLI installed,
+      as they always have;
+    - context: the forge's read-only credential, and never the write token; a
+      forge that offers none clones with no credential;
+    - unregistered: no credential at all, a public upstream read.
 
     An unreadable list is logged and answered with no credential rather than
     raised: this is not an authorization check -- `open` has none by design --
@@ -1083,7 +1089,7 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
             type(exc).__name__,
         )
         return providers.NoCredential()
-    LOGGER.info("content workspace open repo=%s role=%s", repository, role)
+    LOGGER.info("content workspace credential repo=%s role=%s", repository, role)
     if role == ROLE_MANAGED and _holds_stored_token(forge):
         # A forge whose credential is a token an administrator stored has no
         # ambient helper behind it, so a managed repository's clone, fetch and
@@ -1120,7 +1126,8 @@ def _holds_stored_token(forge: providers.Forge) -> bool:
     )
 
 
-#: The one forge the content workspace clones from.
+#: The forge a bare `owner/name` means to the content workspace. A
+#: host-qualified name is cloned from the forge that serves its host.
 CONTENT_WORKSPACE_PROVIDER = "github"
 
 
@@ -1180,7 +1187,7 @@ def _is_bare_name(repository: object) -> bool:
     """Whether ``repository`` is a bare `owner/name`: GitHub's, to the workspace."""
     import content_workspace
 
-    return isinstance(repository, str) and content_workspace.is_owner_name(repository)
+    return isinstance(repository, str) and content_workspace.is_bare_github_name(repository)
 
 
 def _workspace_locate(repository: str) -> tuple[str, str]:
