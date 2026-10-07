@@ -567,7 +567,8 @@ A `gitops` or `managed` repository entry names it in `baseBranch`
 the base of every accepted repository that sets one into the broker container's
 environment as one variable, `CREDENTIAL_PROXY_PINNED_BASES`: a JSON array of
 `{"repository": "https://<host>/<path>", "branch": "<base>"}`, the host being
-the forge's canonical one. `spec.deployment.env` can never set it, and the
+the forge's canonical one and the path as that forge reads it, nested groups
+included on GitLab. `spec.deployment.env` can never set it, and the
 broker refuses to start on a value it cannot read. Nothing reaches the agent
 container or the sandbox, and the sandbox's environment is never consulted: the
 skills ask the broker for the base, so a branch name an agent exports changes
@@ -575,8 +576,8 @@ nothing. A `CREDENTIAL_PROXY_BASE_BRANCH` in `spec.deployment.env`, or failing
 that a `GITOPS_BASE_BRANCH`, still reaches the broker and joins the protected
 branches above, but pins no target, because nothing names its repository. A
 repository is its host and path, compared without regard to case; a request
-that names no host is on its forge's canonical host, so the same `owner/name`
-on another host is another repository and is not pinned. For a pinned
+that names no host is on its forge's canonical host, so the same path on
+another host, or on another forge, is another repository and is not pinned. For a pinned
 repository every door that chooses a target holds it to the base and compares
 branch names exactly: the base is accepted as `<base>` or `refs/heads/<base>`,
 and `heads/<base>` is another branch.
