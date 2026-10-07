@@ -2310,6 +2310,35 @@ Four endpoints need naming because they are not a rename of GitHub's:
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
 
+### GitLab in the content workspace
+
+The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
+the install serves. The caller names a repository and never a host or a URL:
+
+- **A bare `owner/name` is GitHub's,** and the workspace composes its github.com URL
+  as it always has.
+- **A host-qualified name is resolved through the forges the install serves.** The
+  forge parses it (nested groups, `allowed_paths`) and composes the clone URL with
+  `clone_url`. A name no served forge owns is refused before anything is cloned.
+
+What a clone presents follows the forge's credential:
+
+- **GitHub is unchanged.** A context repository gets a read-only minted token. A
+  managed repository rides the write credential the CLI installed in the broker,
+  so its clone, fetch and push carry no credential of their own.
+- **GitLab's credential is a stored token, with nothing ambient behind it.** A
+  managed or context repository's clone, fetch and push present it through the
+  forge's credential helper, so the token never enters argv, the environment or
+  the tree. An unregistered repository presents nothing, as on GitHub.
+
+GitLab has no read-only variant of that token here, so **a context repository's
+fetch presents the same token a managed repository's does**. What keeps a context
+repository read-only is the write gate: `commit` and `push` resolve the
+repository's own forge and refuse anything that forge's managed list does not
+hold. A read-only GitLab token for context repositories would close the gap; it
+would be a second Secret and a second `Credential`, and nothing here depends on
+its absence.
+
 ### GitLab errors
 
 GitLab returns conventional statuses: 401, 403, 404, 409, 422 and 429 are all in
