@@ -195,8 +195,6 @@ STARTUP_SLUG = "gce-startup-script-status"
 MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
-# The four checks this stream's roster holds.
-ROSTER_SLUGS = (STARTUP_SLUG, MIG_SLUG, SOLE_TENANT_SLUG, SNAPSHOT_SLUG)
 
 # §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
 # guest agent current images ship logs `Script "startup-script" failed with
@@ -936,6 +934,21 @@ def check_mig_convergence(mig: dict) -> dict | None:
     }
 
 
+def autoscales(group: dict) -> bool:
+    """§2.4's Do-NOT-flag limb: a node group that grows itself is not short of
+    headroom, it is between sizes. Decided from the group's own field, so it is
+    applied rather than handed back as triage, and before any per-node read.
+
+    Named positively rather than as "anything but OFF". The Compute v1
+    discovery document gives `mode` four values — MODE_UNSPECIFIED, OFF, ON,
+    ONLY_SCALE_OUT — and only the last two actually add nodes. Excluding on
+    "not OFF" would drop a MODE_UNSPECIFIED group out of the check silently,
+    reporting headroom it never measured as headroom it found adequate.
+    """
+    policy = group.get("autoscalingPolicy")
+    return str((policy or {}).get("mode", "")).strip().upper() in AUTOSCALING_MODES
+
+
 def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, bool]:
     """§2.4's condition against one node group and its `list-nodes` result.
 
@@ -957,19 +970,9 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     if not name:
         return None, False
 
-    # §2.4's Do-NOT-flag limb: a node group that grows itself is not short of
-    # headroom, it is between sizes. Applied here rather than handed back as
-    # triage because the mode is a field on the group, not a judgment, and
-    # before the nodes are read, since such a group may have scaled to none.
-    #
-    # Named positively rather than as "anything but OFF". The Compute v1
-    # discovery document gives `mode` four values — MODE_UNSPECIFIED, OFF, ON,
-    # ONLY_SCALE_OUT — and only the last two actually add nodes. Excluding on
-    # "not OFF" would drop a MODE_UNSPECIFIED group out of the check silently,
-    # reporting headroom it never measured as headroom it found adequate.
-    policy = group.get("autoscalingPolicy")
-    mode = str((policy or {}).get("mode", "")).strip().upper()
-    if mode in AUTOSCALING_MODES:
+    # §2.4's Do-NOT-flag limb (`autoscales`). `collect_project` does not read
+    # such a group's nodes at all; this keeps the function right on its own.
+    if autoscales(group):
         return None, True
     # A group holding no nodes has no host to lose: the read established that,
     # which is a verdict rather than a missing one.
@@ -1253,6 +1256,11 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 group_name = str(group.get("name", "")).strip()
                 if not group_name:
                     continue
+                if autoscales(group):
+                    # Excluded by §2.4, so neither read nor counted unmeasured:
+                    # a refused `list-nodes` on it must not make the run partial.
+                    measured_any = True
+                    continue
                 nodes_argv = [
                     "gcloud", "compute", "sole-tenancy", "node-groups",
                     "list-nodes", group_name, f"--zone={_scope_of(group)}",
@@ -1332,15 +1340,6 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             "outcome": OUTCOME_GATE_FAILED,
             "error": str(exc)[:ERROR_CLIP_CHARS],
         }
-
-    # A project where every check is structurally inapplicable -- no instance,
-    # MIG, node group or snapshot -- holds nothing to audit, like one whose
-    # Compute API is off, and is left out the same way. Listed, it would carry
-    # no `checks_run` and owe `finish` a limitations note, and that note would
-    # hold every run partial for as long as the project exists.
-    if not candidates and not unevaluated and {e["check"] for e in not_applicable} >= set(ROSTER_SLUGS):
-        log(f"{project}: no instance, MIG, node group or snapshot; nothing to audit, left out")
-        return None
 
     # Neither kind of declaration records a command: one that ran corroborates
     # exactly the `checks_run` claim each exists to refuse.

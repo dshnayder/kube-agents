@@ -637,7 +637,8 @@ field, and publishes nothing:
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
 
-  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran.
+  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran, or every
+  check it is answerable for is in its `checks_not_applicable` with a reason (that one adds no gap).
   Enumerating a cluster and checking nothing on it is not a clean cluster — it is an audit that did
   not happen, and without this field the harness cannot tell the two apart. See
   [Scope, skipped, and limitations](#scope-skipped-and-limitations).

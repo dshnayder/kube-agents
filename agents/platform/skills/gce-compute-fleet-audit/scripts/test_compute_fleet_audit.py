@@ -1077,15 +1077,22 @@ class CollectFleetTest(unittest.TestCase):
         )
         self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"gate-failed"})
 
-    def test_a_project_holding_nothing_to_audit_is_left_out(self):
-        """No instance, MIG, node group or snapshot: all four checks are
-        inapplicable, and listed it could only publish with a limitations note
-        that holds every run partial, so it is left out like a project whose
-        Compute API is off."""
+    def test_a_project_holding_nothing_to_audit_is_listed_with_every_check_inapplicable(self):
+        """No instance, MIG, node group or snapshot. Listed with all four
+        reasons and no limitations note: `finish` takes that as accounted for,
+        and a single-project install still has a target to publish."""
+        import audit_report as ar
+
         with self.env(MONITORED_PROJECT_IDS="p-empty"):
             manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(0, "[]"))
-        self.assertEqual([c["name"] for c in manifest["clusters"]], [cf.UNENUMERATED_PROJECTS_TARGET])
-        self.assertIsNone(cf.collect_project("p-empty", run=lambda argv, **kw: run_of(0, "[]")))
+        entry = next(c for c in manifest["clusters"] if c["name"] == "project/p-empty")
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry["commands"], [])
+        self.assertNotIn("limitations", entry)
+        self.assertEqual(
+            {e["check"] for e in entry["checks_not_applicable"]},
+            set(ar.audit_target_checks(cf.AUDIT_ID, entry["name"])),
+        )
 
     def test_the_manifest_carries_the_top_level_contract(self):
         manifest = cf.collect_fleet("proj-1", run=self.stub())
@@ -1731,6 +1738,35 @@ class SoleTenantHeadroomTest(unittest.TestCase):
         hit, measured = cf.check_sole_tenant_headroom(self.GROUP, nodes)
         self.assertTrue(measured)
         self.assertIsNotNone(hit)
+
+
+class AutoscalingNodeGroupReadTest(unittest.TestCase):
+    def test_an_autoscaling_group_is_not_read_and_does_not_make_the_run_partial(self):
+        seen = []
+        groups = json.dumps([{
+            "name": "ng-auto", "zone": "https://x/projects/proj-1/zones/us-central1-a",
+            "autoscalingPolicy": {"mode": "ON"},
+        }])
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            seen.append(joined)
+            if "instances list" in joined:
+                return run_of(0, one_running_instance())
+            if "get-serial-port-output" in joined:
+                return run_of(0, "boot ok\n")
+            if "project-info describe" in joined:
+                return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
+            if "list-nodes" in joined:
+                return run_of(1, "", "PERMISSION_DENIED compute.nodeGroups.listNodes")
+            if "node-groups list" in joined:
+                return run_of(0, groups)
+            return run_of(0, "[]")
+
+        entry = cf.collect_project("proj-1", run=run)
+        self.assertFalse([c for c in seen if "list-nodes" in c])
+        self.assertNotIn(cf.SOLE_TENANT_SLUG, unevaluated(entry))
+        self.assertNotIn("sole-tenant-headroom", entry.get("limitations", ""))
 
 
 class NewChecksInCollectProjectTest(unittest.TestCase):

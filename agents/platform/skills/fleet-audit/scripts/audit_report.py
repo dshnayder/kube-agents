@@ -3505,6 +3505,13 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # run goes partial, so the ledger cannot close and nothing is announced
         # as resolved. What is refused is the *silent* zero, which is what
         # published five clean reports on a fleet that was not.
+        #
+        # A zero that is not silent either: a target whose whole roster sits in
+        # `checks_not_applicable`, each with its reason. Every check is
+        # accounted for there, so it needs no limitations note and adds no gap
+        # -- a GCP project holding no instance, MIG, node group or snapshot is
+        # the standing example, and a note would hold every run partial for as
+        # long as that project exists.
         checks_run = cluster.get("checks_run")
         cluster_label = str(cluster.get("name", "")) or "this cluster"
         if not isinstance(checks_run, list):
@@ -3515,7 +3522,13 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "Zero checks on a cluster you could read is not a clean result — "
                 f"it is an audit that did not run. {_sop_pointer(audit_id)}"
             )
-        if not checks_run and not str(cluster.get("limitations", "")).strip():
+        target_roster = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
+        every_check_inapplicable = bool(target_roster) and target_roster <= set(checks_na(cluster))
+        if (
+            not checks_run
+            and not str(cluster.get("limitations", "")).strip()
+            and not every_check_inapplicable
+        ):
             raise ValidationError(
                 f"scope.clusters[{i}].checks_run: empty for {cluster_label}, which "
                 "claims the cluster was read and nothing was checked on it. That is "
@@ -3523,8 +3536,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "ran, or — if nothing could run there — say why in that cluster's "
                 "limitations, or move it to scope.skipped with a reason. A check "
                 "that cannot apply to this cluster goes in checks_not_applicable "
-                f"with its reason, but a cluster where nothing applies still owes "
-                f"a limitations note. {_sop_pointer(audit_id)}"
+                "with its reason; a cluster where every check is listed there "
+                f"needs nothing more. {_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
         for j, entry in enumerate(checks_run):

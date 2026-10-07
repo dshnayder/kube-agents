@@ -8870,15 +8870,11 @@ class TestAiSecurityAuditStream(BaseTestCase):
         # into `checks_not_applicable` would not even reach this line.
         self.assertIn("is now clean", self.out)
 
-    def test_the_whole_roster_excused_as_not_applicable_publishes_nothing(self):
-        """The shape the SOP used to prescribe, and the validator refuses.
-
-        `checks_not_applicable` does not satisfy the empty-`checks_run` rule —
-        only a `limitations` note does, and a `limitations` note would pin the
-        daily stream at `partial: true` forever. So there is no way to write
-        this document that both validates and closes the ledger, which is why
-        the SOP has to send model-free clusters down the `checks_run` path.
-        """
+    def test_the_whole_roster_excused_as_not_applicable_is_accounted_for(self):
+        """Every check named inapplicable with a reason accounts for the whole
+        roster, so it validates without a `limitations` note and holds nothing
+        partial. The SOP still sends model-free clusters down the `checks_run`
+        path, because there the checks did run; this pins the harness rule."""
         excused = {
             "name": "prod-us-east",
             "location": "us-east1",
@@ -8892,8 +8888,9 @@ class TestAiSecurityAuditStream(BaseTestCase):
         doc = make_doc(audit=self.STREAM, findings=[], clusters=[excused])
 
         rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
-        self.assertEqual(rc, 2)
-        self.assertIn("checks_run: empty for prod-us-east", self.err)
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("checks_run: empty for prod-us-east", self.err)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
 
     def test_a_finding_from_every_check_renders_over_a_complete_coverage_row(self):
         """Each of the six reaches the body, above a scope table reading 6/6.
@@ -12911,6 +12908,38 @@ class TestChecksRun(unittest.TestCase):
         )
         self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
         self.assertTrue(audit_report.coverage_gaps(doc))
+
+    NA_REASON = "nothing of the kind this check reads exists on this target, so there is nothing for it to evaluate"
+
+    def test_a_target_with_every_check_inapplicable_is_accounted_for(self):
+        """Every check named with its reason is not a silent zero: accepted with
+        no limitations note, and no coverage gap holds the run partial."""
+        roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                self._cluster(
+                    checks_run=[],
+                    checks_not_applicable=[{"check": c, "reason": self.NA_REASON} for c in roster],
+                )
+            ],
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_a_target_with_some_checks_inapplicable_and_none_run_is_rejected(self):
+        roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
+        doc = make_doc(
+            clusters=[
+                self._cluster(
+                    checks_run=[],
+                    checks_not_applicable=[{"check": c, "reason": self.NA_REASON} for c in roster[1:]],
+                )
+            ],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].checks_run", str(exc.exception))
 
     def test_checks_run_of_the_wrong_type_is_rejected(self):
         doc = make_doc(clusters=[self._cluster(checks_run="privileged-container")])
