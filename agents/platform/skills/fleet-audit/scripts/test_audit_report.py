@@ -14167,6 +14167,21 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                         audit_report.handle_remediate(args)
                 self.assertIn("GitHub repositories only", str(caught.exception))
 
+    def test_a_dry_run_without_repo_refuses_what_it_resolves(self):
+        # Review round 5: with no `--repo` the dry run resolved the repository
+        # for its body but not for the refusal, and previewed a merge request.
+        args = argparse.Namespace(
+            audit="compliance-audit", findings_file="f.json", repo=None,
+            finding=["f1"], dry_run=True, manifest_file=None, issue=None,
+        )
+        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch.object(audit_report, "read_run_record",
+                             side_effect=AssertionError("planned past the refusal")):
+            with self.assertRaises(audit_report.ValidationError) as caught:
+                audit_report.handle_remediate(args)
+        self.assertIn("GitHub repositories only", str(caught.exception))
+
 
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
     def setUp(self):

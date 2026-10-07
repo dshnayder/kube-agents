@@ -1845,7 +1845,9 @@ class TestNoBrokerImports(unittest.TestCase):
         shipped = _shipped_python(dockerfile)
         self.assertIn("agents/platform/skills/github-issue-resolver/scripts/resolver.py", shipped)
         self.assertIn("agents/platform/scripts/gitops_workspace.py", shipped)
-        for path in glob.glob(str(repo / "agents/platform/skills/*/scripts/*.py")):
+        # Recursive: the Dockerfile copies the whole skills tree, so a helper
+        # nested anywhere under a skill ships too.
+        for path in glob.glob(str(repo / "agents/platform/skills/**/*.py"), recursive=True):
             if not Path(path).name.startswith("test_"):
                 shipped.setdefault(str(Path(path).relative_to(repo)), set()).add("/opt/defaults/skills/")
         broker = {"providers", "vcs_broker", "credential_proxy"}

@@ -14509,8 +14509,10 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # Where no proposal can be published, say so before planning one: the
     # other surfaces refuse up front, and a run that reached the push would
     # report REMEDIATED with nothing opened and the reason only in the log. A
-    # dry run named for such a repository would preview a body no run sends.
-    refusal = remediation_refusal(repo_hint) if repo_hint else ""
+    # dry run would preview a body no run sends -- with or without `--repo`,
+    # since without it the dry run still resolves the repository it previews.
+    refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    refusal = remediation_refusal(refusal_repo) if refusal_repo else ""
     if refusal:
         raise ValidationError(refusal)
     record = read_run_record(audit_id, repo=repo_hint)
