@@ -1306,7 +1306,7 @@ GENERATED_FIX_NOTE = (
 # PodDisruptionBudget `finish` would write still takes.
 # A proposal's URL on either forge: GitHub's `/pull/<n>`, GitLab's
 # `/-/merge_requests/<n>`.
-PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|-/merge_requests)/\d+")
+PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_requests)/\d+")
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
